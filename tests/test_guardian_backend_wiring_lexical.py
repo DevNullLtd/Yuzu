@@ -53,12 +53,14 @@ SRC = ROOT / "server" / "core" / "src"
 # LocalNetworkApi / the DexApi's observer provider): agent_service_ holds &health_store_
 # (set_health_store), gateway_service_ is built with &health_store_, network_routes_ holds the
 # LocalNetworkApi built from it, heartbeat_ingestion_ calls upsert on it, and rest_api_v1_,
-# mcp_server_ and dex_routes_ hold the DexApi whose observer provider is a lambda that captures
-# `this` and calls health_store_.dex_observer_for. All must be destroyed BEFORE it. A borrower added
-# later is NOT covered until it is added here.
+# mcp_server_, dex_routes_, device_lens_routes_ (register_routes takes the DexApi) and
+# settings_routes_ (the Scoring tab's set_dex_apps_fn lambda captures the same shared DexApi) hold
+# the DexApi whose observer provider is a lambda that captures `this` and calls
+# health_store_.dex_observer_for. All must be destroyed BEFORE it. A borrower added later is NOT
+# covered until it is added here.
 HOLDERS = ("rest_api_v1_", "mcp_server_", "device_routes_", "crypto_device_api_",
            "agent_service_", "gateway_service_", "network_routes_", "heartbeat_ingestion_",
-           "dex_routes_")
+           "dex_routes_", "settings_routes_", "device_lens_routes_")
 STALENESS_CALLS = (
     # (file, call prefix that must be followed by an argument naming the constant)
     ("server.cpp", "recompute_metrics("),

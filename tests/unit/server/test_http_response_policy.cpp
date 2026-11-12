@@ -71,9 +71,9 @@ TEST_CASE("brotli_compress: round trip for an empty body, a short body, a page a
     std::string noise(4096, '\0');
     for (auto& c : noise)
         c = static_cast<char>(rng() & 0xFF);
-    // Quality 11 costs about a millisecond per kilobyte, so its leg runs on bodies of at most 150 KB;
+    // Quality 11 costs about a millisecond per kilobyte, so its leg runs on a body of about 20 KB;
     // the 2.5 MB body is encoded at the configured quality only (a few milliseconds).
-    const std::string page = synthetic_page(150'000);
+    const std::string page = synthetic_page(20'000);
     for (const std::string& in : {std::string{}, std::string("hello"), page, noise}) {
         for (const int q : {kDynamicBrotliQuality, 11}) {
             INFO("quality " << q << ", " << in.size() << " bytes");
@@ -86,6 +86,11 @@ TEST_CASE("brotli_compress: round trip for an empty body, a short body, a page a
     std::string out;
     REQUIRE(brotli_compress(big, kDynamicBrotliQuality, out));
     CHECK(decode(out, big.size()) == big);
+    // The result holds the encoded bytes, not the encoder's worst-case allocation (about the size of
+    // the input): every standard library gives a freshly assigned string a capacity within a small
+    // rounding of its size, so a generous bound still fails on a kept MaxCompressedSize buffer.
+    INFO("encoded " << out.size() << " bytes, capacity " << out.capacity());
+    CHECK(out.capacity() <= out.size() * 2 + 64);
 }
 
 TEST_CASE("dynamic compression uses the configured quality", "[http_response_policy][brotli]") {
@@ -95,7 +100,7 @@ TEST_CASE("dynamic compression uses the configured quality", "[http_response_pol
     // tell the qualities apart.
     constexpr int kMeasuredQuality = 5;
     constexpr int kHttplibQuality = 11;
-    const std::string page = synthetic_page(150'000);
+    const std::string page = synthetic_page(20'000);
     std::string at_measured, at_httplib;
     REQUIRE(brotli_compress(page, kMeasuredQuality, at_measured));
     REQUIRE(brotli_compress(page, kHttplibQuality, at_httplib));

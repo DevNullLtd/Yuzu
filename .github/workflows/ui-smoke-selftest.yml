@@ -15,6 +15,9 @@ on:
     branches: [main, dev]
     paths:
       - 'server/core/src/*_ui.cpp'
+      - 'server/core/src/dex_pane.hpp'
+      - 'server/core/src/dex_routes.cpp'
+      - 'server/core/src/plural.hpp'
       - 'server/core/static/**'
       - 'tests/puppeteer/**'
       - 'tests/unit/server/golden/dex/apps__*.html'

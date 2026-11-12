@@ -27,8 +27,9 @@ bool brotli_compress(std::string_view in, int quality, std::string& out) {
                                reinterpret_cast<const uint8_t*>(in.data()), &n,
                                reinterpret_cast<uint8_t*>(buf.data())))
         return false;
-    buf.resize(n);
-    out = std::move(buf);
+    // Copy out only the encoded bytes: moving `buf` would keep its MaxCompressedSize capacity (about
+    // the size of the input) alive on the response for as long as a slow client takes to read it.
+    out.assign(buf.data(), n);
     return true;
 }
 

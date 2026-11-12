@@ -1653,4 +1653,52 @@ TEST_CASE("DexApi: the observer provider is called once with the scope's ids and
     CHECK(calls == 2);
 }
 
+// The observer split is an optional addition to a read that already succeeded: a provider that
+// throws must not discard the read. The API contains it once, for every caller.
+TEST_CASE("DexApi: an observer provider that throws leaves a successful Apps read intact with the "
+          "split unset",
+          "[pg][dex][apps_model][observer]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_apps_fixture(store);
+    using yuzu::server::DexObserverState;
+    int calls = 0;
+    const auto throwing = [&](const std::vector<std::string>&) -> std::vector<DexObserverState> {
+        ++calls;
+        throw std::runtime_error("observer boom\nsecond line");
+    };
+    const auto baseline = make_local_dex_api(&store, fleet23)->apps("7d", "all");
+    REQUIRE_FALSE(baseline.degraded);
+    REQUIRE_FALSE(baseline.apps.empty());
+
+    const auto api = make_local_dex_api(&store, fleet23, {}, throwing);
+    std::string log;
+    yuzu::server::DexAppsModel m;
+    {
+        yuzu::test::LogCapture cap;
+        m = api->apps("7d", "all");
+        (void)api->apps("7d", "all"); // the immediate repeat is demoted: one warning per interval
+        cap.stop();
+        log = cap.text();
+    }
+    CHECK(calls == 2);
+    CHECK_FALSE(m.degraded);
+    CHECK(m.degraded_reason.empty());
+    CHECK_FALSE(m.observer_state); // unset, as with no source wired
+    CHECK(m.population == baseline.population);
+    CHECK(m.apps_total == baseline.apps_total);
+    REQUIRE(m.apps.size() == baseline.apps.size());
+    for (std::size_t i = 0; i < m.apps.size(); ++i)
+        CHECK(m.apps[i].subject == baseline.apps[i].subject);
+    // The exception text is neutralised (the newline folds to '_': one log line). The first call
+    // warns; the repeat inside the interval is demoted to debug, so exactly one warning.
+    const std::string line = "[warning] DexApi::apps: observer state unavailable: observer boom_second line";
+    std::size_t n = 0;
+    for (auto p = log.find(line); p != std::string::npos; p = log.find(line, p + 1))
+        ++n;
+    CHECK(n == 1);
+}
+
 // The route-level cases (throwing or unwired DexApi) live in test_dex_routes.cpp.

@@ -219,6 +219,9 @@ Coverage coverage(const std::string& scope,
         bool any_quiet = false;
         c.line += ". Complete and partial describe what the agent collects on each platform by design. " +
                   observer_text(*observers, any_quiet);
+        // "&#39;" is what html_escape writes for an apostrophe; this sentence is emitted unescaped.
+        c.line += " Armed means the device&#39;s observer is running with at least one source; it does "
+                  "not confirm that every crash source on the device is readable.";
         if (any_quiet)
             c.line += " A device that is not armed or not reporting may not be sending all of its crash "
                       "and hang signals (collection can be incomplete or unavailable), so a quiet list "

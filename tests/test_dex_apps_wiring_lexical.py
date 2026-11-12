@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """#7520 / #7519 wiring pins for the DEX Apps page (lexical, no build required).
 
-Two properties the C++ unit tests cannot see, because each is a property of which source line
+Three properties the C++ unit tests cannot see, because each is a property of which source line
 hands what to whom, not of behaviour:
 
   1. THE PAGE HAS ITS API. server.cpp must call `dex_routes_->set_dex_api(<x>)` with the very
@@ -14,13 +14,18 @@ hands what to whom, not of behaviour:
      they inject their own provider. The destruction order that makes the provider safe
      (health_store_ declared before every DexApi holder) is pinned by
      test_guardian_backend_wiring_lexical.py.
+  3. THE STATEMENT-TIMEOUT SERIES EXISTS AT ZERO. The Apps read counts
+     `yuzu_server_guardian_read_degrade_total{reason="statement_timeout",source="guardian_state"}`;
+     server.cpp must create that series at boot, or the first timeout appears as a series that
+     did not exist a scrape ago and `rate()` cannot see it. The store tests count through their own
+     registry, so only this pin sees the boot-time seed go missing.
 
 `//` and block comments are stripped before matching, so prose cannot satisfy a check. The
 self-test applies in-memory mutations and requires problems() to report each one.
 
 WHAT THIS DOES NOT PROVE (a lexical gate is not a C++ lexer): that the lambda returns what the
-accessor returns, or that the call sits on the path the server takes at boot; only that the two
-lines exist and name each other.
+accessor returns, or that a call sits on the path the server takes at boot; only that the lines
+exist and name each other.
 
 Usage: python3 tests/test_dex_apps_wiring_lexical.py
 """
@@ -47,6 +52,11 @@ def problems(server_text: str) -> list:
     if "health_store_.dex_observer_for" not in args:
         found.append("server.cpp: the make_local_dex_api call does not pass an observer provider that "
                      "reads health_store_.dex_observer_for (the Apps page would never show the live split)")
+    if not any('"yuzu_server_guardian_read_degrade_total"' in a and '"statement_timeout"' in a
+               and '"guardian_state"' in a for a in call_args(code, "metrics_.counter(")):
+        found.append("server.cpp: no metrics_.counter( pre-seed of yuzu_server_guardian_read_degrade_total "
+                     "with reason statement_timeout and source guardian_state (the first Apps statement "
+                     "timeout would be invisible to rate())")
     sets = [a.strip() for a in call_args(code, "dex_routes_->set_dex_api(")]
     if not sets:
         found.append("server.cpp: no call to dex_routes_->set_dex_api( (the Apps tab would answer not_wired)")
@@ -73,6 +83,9 @@ class DexAppsWiring(unittest.TestCase):
                                                          "dex_routes_->set_dex_api(nullptr);"),
             "observer provider removed": mutated("health_store_.dex_observer_for(",
                                                  "health_store_.something_else("),
+            "statement_timeout pre-seed removed": mutated(
+                '{{"reason", "statement_timeout"}, {"source", "guardian_state"}}',
+                '{{"reason", "statement_timeout"}, {"source", "guardian_census_device"}}'),
         }
         for label, text in cases.items():
             self.assertTrue(problems(text), f"mutation not reported: {label}")

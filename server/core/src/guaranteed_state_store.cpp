@@ -86,9 +86,11 @@ constexpr const char* kDegradeSourceCensus = "guardian_census";
 // no gauge, so folding it into "guardian_census" would make request noise mask a
 // real gauge freeze and would make a per-device 503 read as a stale gauge.
 constexpr const char* kDegradeSourceCensusDevice = "guardian_census_device";
-// SQLSTATE 57014 (query_canceled) from the per-device read's statement timeout:
-// the retained pending backlog is too large for the time budget, so a retry fails
-// identically. Counted on kDegradeSourceCensusDevice only.
+// SQLSTATE 57014 (query_canceled) from a statement timeout. On kDegradeSourceCensusDevice
+// (the per-device read's own budget) the retained pending backlog is too large for the time
+// budget, so a retry fails identically. On kDegradeSource (the Apps stability read, cancelled
+// at the pool's 30 s statement timeout) the chosen window is too heavy for the load: a shorter
+// window or less load clears it.
 constexpr const char* kReasonStatementTimeout = dex_read_fault_token(DexReadFault::kStatementTimeout);
 // Sample the per-site degrade WARN so a sustained PG outage cannot flood the
 // log — the counter is the continuous signal, the log a sampled breadcrumb.
@@ -293,17 +295,24 @@ void bump_policy_generation_on(PGconn* conn) {
 // `std::expected<Result, DexReadFault>`; the metric label of a fault it returns is that fault's
 // token. A caller that passes `timeout_sampler` gives the statement-timeout log line its own
 // sampler, so a run of other faults cannot suppress it and the reverse (the counter increments
-// either way).
+// either way). A caller that passes `fault_detail` fills it from `body` with a bounded, already
+// sanitised description of a failed statement (SQLSTATE and where it applies); the sampled warn
+// appends it. It never carries SQL text and is never a metric label.
 template <typename Result, typename Body>
 std::expected<Result, DexReadFault>
 dex_read_faulted(bool open, pg::PgPool& pool, yuzu::MetricsRegistry* metrics, const char* method,
-                 DegradeSampler& sampler, Body&& body, DegradeSampler* timeout_sampler = nullptr) {
+                 DegradeSampler& sampler, Body&& body, DegradeSampler* timeout_sampler = nullptr,
+                 const std::string* fault_detail = nullptr) {
     const auto degrade = [&](DexReadFault f, const char* what) {
         DegradeSampler& s =
             (f == DexReadFault::kStatementTimeout && timeout_sampler) ? *timeout_sampler : sampler;
         if (const auto d = note_read_degrade(metrics, dex_read_fault_token(f), kDegradeSource, s);
-            d.should_log)
-            spdlog::warn("GuaranteedStateStore::{}: {}", method, what);
+            d.should_log) {
+            if (fault_detail && !fault_detail->empty())
+                spdlog::warn("GuaranteedStateStore::{}: {} ({})", method, what, *fault_detail);
+            else
+                spdlog::warn("GuaranteedStateStore::{}: {}", method, what);
+        }
         return std::unexpected(f);
     };
     if (!open)
@@ -2327,6 +2336,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
     }
     const std::string cap_subject_array = pg::to_text_array(cap_subject_views);
     const std::string cap_value_array = pg::to_text_array(cap_value_views);
+    std::string fault_detail; // set by the body on a failed statement; the sampled warn appends it
     return dex_read_faulted<std::vector<DexAppStabilityRow>>(
         open_, pool_, metrics_, "dex_app_stability", sampler,
         [&](PGconn* conn) -> std::expected<std::vector<DexAppStabilityRow>, DexReadFault> {
@@ -2421,9 +2431,21 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
                 // statement arrives here as SQLSTATE 57014. It also covers an administrator
                 // cancel, which is why the page says "took too long", never "timed out because".
                 const char* state = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-                return std::unexpected(state && std::string_view(state) == "57014"
-                                           ? DexReadFault::kStatementTimeout
-                                           : DexReadFault::kQueryError);
+                const bool timed_out = state && std::string_view(state) == "57014";
+                fault_detail = "sqlstate=" + ::yuzu::log_key_token(state ? state : "?");
+                if (timed_out) {
+                    // `since` is the cutoff the requested window resolved to; the days token is not
+                    // known at this layer.
+                    fault_detail += " since=" + ::yuzu::log_key_token(since) +
+                                    " platform=" + ::yuzu::log_key_token(platform.empty() ? "all" : platform);
+                } else {
+                    // The first line of the server's message only; the rest is statement context.
+                    std::string_view msg = PQresultErrorMessage(res.get());
+                    msg = msg.substr(0, msg.find('\n'));
+                    fault_detail += " error=" + ::yuzu::log_key_token(msg);
+                }
+                return std::unexpected(timed_out ? DexReadFault::kStatementTimeout
+                                                 : DexReadFault::kQueryError);
             }
             std::vector<DexAppStabilityRow> out;
             const int n = PQntuples(res.get());
@@ -2448,7 +2470,7 @@ GuaranteedStateStore::dex_app_stability_checked(const std::string& since, const 
             }
             return out;
         },
-        &timeout_sampler);
+        &timeout_sampler, &fault_detail);
 }
 
 std::vector<DexAppCrashCount>

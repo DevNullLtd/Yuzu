@@ -22,7 +22,8 @@
 /// at `kDynamicBrotliQuality`; the body then carries `Content-Encoding: br`, which makes httplib skip
 /// its own pass. The set of responses that are compressed does not change (the decision is httplib's
 /// own `encoding_type`). Chunked and ranged responses and file-backed content still take httplib's
-/// own path.
+/// own path. The plaintext redirect listener is registered stage-less (`StageRequirement::ExemptNoStage`)
+/// and so is neither post-read-staged nor wrapped in this policy, by design.
 
 #include <httplib.h>
 
@@ -36,9 +37,10 @@ namespace yuzu::server {
 ///   quality  4:  4 ms /  153,569 and 11 ms / 443,603    quality  9:  18 ms / 133,201 and  57 ms / 450,329
 ///   quality  5:  9 ms /  138,803 and 26 ms / 466,539    quality 10: 636 ms / 126,208 and 1,054 ms / 395,258
 ///   quality  6: 11 ms /  137,009 and 26 ms / 460,110    quality 11: 2,465 ms / 110,473 and 2,748 ms / 367,465
-/// No quality below 10 is within 10 percent of quality 11's size, and quality 10 and above cost 70 to 120
-/// times as much worker time; quality 5 is the cheap end of the plateau (qualities 5 to 9 differ in size
-/// by under 6 percent, and 9 costs twice as much). The output is about 25 percent larger than quality 11's.
+/// No quality below 10 is within 10 percent of quality 11's size. Against quality 5, quality 10 costs about
+/// 41 times (the JSON body) to 71 times (the Apps page) the worker time and quality 11 about 106 to 274
+/// times; quality 5 is the cheap end of the plateau (qualities 5 to 9 differ in size by under 6 percent, and
+/// 9 costs twice as much). The output is about 25 percent larger than quality 11's.
 inline constexpr int kDynamicBrotliQuality = 5;
 
 /// True for the paths that keep answering HEAD: the unauthenticated probes (`health::is_probe_path`)

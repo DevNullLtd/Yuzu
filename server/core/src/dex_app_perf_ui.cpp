@@ -446,7 +446,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         scope_name = "a management group";
         for (const auto& g : groups)
             if (g.id == scope_group_id) {
-                scope_name = esc(g.name);
+                scope_name = esc_text(g.name);
                 break;
             }
     } else if (is_model) {
@@ -500,7 +500,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         for (const auto& g : groups) {
             const bool on = (g.id == scope_group_id);
             h += "<option value=\"" + esc(g.id) + "\"" + (on ? " selected" : "") + ">" +
-                 esc(g.name) + "</option>";
+                 esc_text(g.name) + "</option>";
         }
         h += "</select></div>";
     }

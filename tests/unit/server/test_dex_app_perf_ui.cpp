@@ -625,6 +625,31 @@ TEST_CASE("render_dex_app_perf_trend: the active device-model cohort prints a ma
     CHECK(has(h, std::string("<option value=\"Lat") + kZwsp + "itude\" selected>"));
 }
 
+TEST_CASE("render_dex_app_perf_trend: a management-group name with invisible characters prints markers in "
+          "the subtitle and the option text and keeps the option value untouched",
+          "[dex][app_perf][ui][marking]") {
+    AppPerfVersionSummary v1;
+    v1.version = "1.0";
+    v1.latest_day = 200;
+    v1.device_count = 5;
+    v1.cpu_mean = 3.0;
+    const std::string name = std::string("Eng") + kRlo + "ops" + kZwsp + "team";
+    const std::string marked = "Eng&lt;U+202E&gt;ops&lt;U+200B&gt;team";
+    std::vector<DexGroupOption> groups = {{.id = "g1", .name = name}};
+    for (const std::string& scope : {std::string("g1"), std::string()}) {
+        INFO("scope group = '" << scope << "'");
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, scope, groups, 10, 7);
+        // The option text is a text node: the markers are printed, the raw characters never are.
+        CHECK(has(h, "<option value=\"g1\"" + std::string(scope.empty() ? "" : " selected") + ">" + marked +
+                         "</option>"));
+        CHECK_FALSE(has(h, kRlo));
+        CHECK_FALSE(has(h, kZwsp));
+    }
+    // The group scope names itself in the subtitle, also marked.
+    CHECK(has(render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 7),
+              "across <b>" + marked + "</b>"));
+}
+
 TEST_CASE("render_dex_app_perf_picker: a search query with a zero-width character keeps raw bytes in "
           "the search box",
           "[dex][app_perf][ui][marking]") {

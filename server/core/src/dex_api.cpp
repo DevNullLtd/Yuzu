@@ -7,8 +7,11 @@
 #include "refusal_log_throttle.hpp"    // bounds the policy-unavailable warning
 #include "runtime_config_store.hpp"    // dex_score_policy_store_reader
 
+#include <yuzu/log_token.hpp> // log_key_token: neutralise and cap an exception's text
+
 #include <spdlog/spdlog.h>
 
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -110,8 +113,25 @@ public:
         // The live observer split is read only after a successful read, from the same snapshot and
         // the same ids the population was counted from, so the split and the population cannot
         // disagree. A refused or failed read never pays the pass; no observer source = unknown.
-        if (!m.degraded && online && observer_fn_)
-            m.observer_state = dex_apps_observer_split(*fleet, scope, observer_fn_(*online));
+        // The split is an optional addition to a read that already succeeded, so a provider that
+        // throws is contained here, once for the REST, MCP and page callers alike: the model keeps
+        // every figure and `observer_state` stays unset, the same as no source wired.
+        if (!m.degraded && online && observer_fn_) {
+            const auto failed = [this](const std::string& what) {
+                // One line per interval, not per request.
+                if (refusal_warn_throttle_.should_warn("observer_unavailable"))
+                    spdlog::warn("DexApi::apps: observer state unavailable: {}", what);
+                else
+                    spdlog::debug("DexApi::apps: observer state unavailable: {}", what);
+            };
+            try {
+                m.observer_state = dex_apps_observer_split(*fleet, scope, observer_fn_(*online));
+            } catch (const std::exception& e) {
+                failed(::yuzu::log_key_token(e.what()));
+            } catch (...) {
+                failed("non-standard exception");
+            }
+        }
         return m;
     }
 
@@ -188,7 +208,7 @@ private:
     FleetFn fleet_fn_;
     DexScorePolicyFn policy_fn_;
     DexObserverFn observer_fn_;
-    mutable RefusalLogThrottle refusal_warn_throttle_; ///< bounds the repeated-refusal warnings (score_policy_unavailable, invalid_scope)
+    mutable RefusalLogThrottle refusal_warn_throttle_; ///< bounds the repeated warnings (score_policy_unavailable, invalid_scope, observer_unavailable)
 };
 
 std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,

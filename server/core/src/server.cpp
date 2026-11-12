@@ -4404,19 +4404,21 @@ public:
         // census pending-evidence COUNT read only (the gauge keeps its last value);
         // "guardian_census_device" (#7217) is the per-device unrepresented-pending
         // reads behind the device-compliance and all-guards routes (fail-hard: REST
-        // 503 / MCP error), and is the only source with the extra reason
-        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
-        // retry usually fails identically). Pre-seeded below (same closed
-        // {reason x source} cross-product pre-seed pattern as
-        // yuzu_server_kek_operations_total above) so absent()/rate() alerting
-        // is meaningful before the first degrade ever fires.
+        // 503 / MCP error). The extra reason "statement_timeout" (SQLSTATE 57014) is counted
+        // on two sources: guardian_census_device (most likely a retained-backlog symptom whose
+        // retry usually fails identically) and guardian_state (the Apps read cancelled at the
+        // pool's 30 s statement timeout; a shorter window or less load clears it).
+        // Pre-seeded below (same closed {reason x source} cross-product pre-seed
+        // pattern as yuzu_server_kek_operations_total above) so absent()/rate()
+        // alerting is meaningful before the first degrade ever fires.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
                           "Guardian rules/status/DEX reads that returned degraded (could not "
                           "read) rather than a genuine result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
                           "concurrency_budget for a guardian_state read refused over its "
                           "in-flight budget, plus statement_timeout for a guardian_census_device "
-                          "read that exceeded its time budget) and source "
+                          "read that exceeded its time budget or a guardian_state Apps read "
+                          "cancelled at the statement timeout) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
                           "served; guardian_rules = authoritative rule/status reads, fail-hard, "
                           "push/reconcile aborts rather than fans out empty; guardian_census = "
@@ -4435,9 +4437,12 @@ public:
         // The Apps stability read's in-flight budget refusal (guardian_state only).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "concurrency_budget"}, {"source", "guardian_state"}});
-        // The per-device unrepresented-pending read's statement timeout (guardian_census_device only).
+        // The statement timeout of the per-device unrepresented-pending read (guardian_census_device)
+        // and of the Apps stability read (guardian_state).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "statement_timeout"}, {"source", "guardian_census_device"}});
+        metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                         {{"reason", "statement_timeout"}, {"source", "guardian_state"}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
