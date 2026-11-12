@@ -10,9 +10,10 @@ All examples assume you have downloaded the release assets from
 that the tag under verification is `v0.11.0`. Substitute as needed.
 
 > **Warning: older release pages show a wildcard command.** The GitHub release
-> pages for v0.7.0-rc1 to v0.15.0 (18 pages, all published before the fix in
-> #7529) print a `cosign verify-blob` command whose identity is a wildcard
-> (`--certificate-identity-regexp '.*'`). A wildcard accepts a signature from
+> pages for v0.7.0-rc1 to v0.15.0 (18 of the 22 pages published in that range,
+> all published before the fix in #7529) print a `cosign verify-blob` command
+> whose identity is a wildcard (`--certificate-identity-regexp '.*'`); the other
+> 4 carry no cosign command. A wildcard accepts a signature from
 > any GitHub repository, so it proves almost nothing. Do not copy it: use the
 > exact, tag-bound commands on this page.
 

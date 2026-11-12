@@ -678,9 +678,11 @@ class VerifyTests(unittest.TestCase):
             self.assertIn(f"{use} {gated}", step3)
         self.assertIn("does NOT cover an image that was mirrored", top)
         # the macOS README only points at that flow, before the xattr line
+        self.assertIn("Clear quarantine only if you verified the image by digest", mac)
         self.assertIn("@sha256:", mac)
         self.assertNotIn("cosign verify", mac)
         self.assertLess(mac.index("@sha256:"), mac.index("xattr -dr com.apple.quarantine"))
+        self.assertLess(mac.index("Clear quarantine only if"), mac.index("xattr -dr com.apple.quarantine"))
         self.assertIn("SmartScreen", top)
         self.assertIn("Gatekeeper", top)
         self.assertIn("NOT Authenticode-signed today, #239", win)
