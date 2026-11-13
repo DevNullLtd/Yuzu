@@ -9298,8 +9298,8 @@ tests:
   # The series is built in five blocks of exactly 60 samples a minute apart (0, 3600, 7200, 10800 and
   # 14400 s: each value is the Unix time of the first minute of its block), so each block spans one
   # hour. The worst staleness in the model is the last sample of a block, 59 minutes after its
-  # timestamp, 3540 s, far below 7200 s. It pins that an hourly-advancing timestamp never fires, not
-  # the exact threshold.
+  # timestamp, 3540 s, far below 7200 s. It pins only that an hourly-advancing timestamp does not fire at
+  # the sampled evaluation points, not the exact threshold.
   - interval: 1m
     name: pg collation check stale - a timestamp that advances hourly stays quiet
     input_series:

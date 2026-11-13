@@ -49,10 +49,6 @@ Invariants:
      before the join `pg_collation_recheck_->stop();`: the check in flight is told to stop at the
      start of teardown, so it overlaps the rest of it instead of being added after it.
 
-  13. The join `pg_collation_recheck_->stop();` comes AFTER `leader_elector_->resign();`,
-     `audit_store_->stop_cleanup();` and `offload_target_store_->flush_all();` in stop(): the join
-     can wait out a check stuck against a frozen backend, and a kill during that wait must not skip
-     the lease release or the flushes (it is the last step before the pool is reset).
   11. The recheck construction is guarded by exactly
      `if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {` (both
      conditions present and negated): an inverted or half-dropped guard compiles, passes every
@@ -61,6 +57,11 @@ Invariants:
      appears exactly once, before the constructor-time report, and `metrics_.describe(` is called
      once for each of the mismatch gauge, the check counter and the last-completed gauge. A dropped
      seed makes the first failure after a restart invisible to `increase()`.
+
+  13. The join `pg_collation_recheck_->stop();` comes AFTER `leader_elector_->resign();`,
+     `audit_store_->stop_cleanup();` and `offload_target_store_->flush_all();` in stop(): the join
+     can wait out a check stuck against a frozen backend, and a kill during that wait must not skip
+     the lease release or the flushes (it is the last step before the pool is reset).
 
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
@@ -533,6 +534,15 @@ class PgCollationCheckWiring(unittest.TestCase):
         j = i + len(STOP)
         rest = self.src[:i] + "(void)0;" + self.src[j:]
         k = rest.index("leader_elector_->resign();")
+        m = rest[:k] + STOP + "\n            " + rest[k:]
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_JOIN_LATE])
+
+    def test_join_moved_before_the_audit_cleanup(self):
+        i = self.src.index(STOP)
+        j = i + len(STOP)
+        rest = self.src[:i] + "(void)0;" + self.src[j:]
+        k = rest.index("audit_store_->stop_cleanup();")
         m = rest[:k] + STOP + "\n            " + rest[k:]
         self.assertNotEqual(m, self.src)
         self.assertEqual(problems(m), [MSG_JOIN_LATE])

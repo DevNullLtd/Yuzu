@@ -6252,7 +6252,7 @@ a rollback is genuinely needed.
   grace, and 205 s leaves only 5 s. If your network drops packets or you expect
   the fallback path, raise `TimeoutStopSec` (systemd) or `stop_grace_period`
   (compose) to 240 s or more.
-  The #3495 reorder leaves the total and each stage's own bound unchanged, only their relative sequence is. **(#3495) The policy
+  The #3495 reorder leaves the total and each stage's own bound unchanged; only their relative sequence changed. **(#3495) The policy
   evaluation, pre-flight runner, quarantine containment reconciler, and
   schedule tick background threads' gRPC dispatch calls now ride on the
   same 5 s gRPC shutdown deadline bucket above, not a separate stage** —
