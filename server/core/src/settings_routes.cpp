@@ -44,6 +44,7 @@
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
 #include "mgmt_group_error.hpp"       // mgmt_group_error_is_store_fault (management-group create)
+#include "mgmt_group_limits.hpp"      // name / parent id bounds and the clean-text rule
 #include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
@@ -7027,6 +7028,16 @@ void SettingsRoutes::register_routes(
             res.set_content("<span class=\"feedback-error\">" + html_escape(text) + "</span>",
                             "text/html; charset=utf-8");
         };
+        // The name and the parent id are bounded and held to clean text before any store read
+        // or `attempted` row (mgmt_group_limits.hpp). Fixed text, never the caller's value.
+        if (!mgmt_group_name_ok(name)) {
+            refuse_text(std::string(kMgmtGroupNameInvalidText));
+            return;
+        }
+        if (!mgmt_group_id_ok(parent_id)) { // an id like this names no group
+            refuse_text("parent group not found");
+            return;
+        }
         // A fault of the store itself: fixed text, never the store's own (libpq) message.
         const auto store_fault = [&]() {
             static const std::string kMsg = "Management group store unavailable, try again";

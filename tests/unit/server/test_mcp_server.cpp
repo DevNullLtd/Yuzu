@@ -29095,6 +29095,78 @@ TEST_CASE("MCP create_management_group: refusals decided without a write burn no
     }
 }
 
+TEST_CASE("MCP create_management_group: an over-long or unclean name or parent id is refused with "
+          "no management_group.create row",
+          "[mcp][management_group][mgmt-audit-first][security]") {
+    McpTestServer ts; // no store wired: every refusal below is decided before the store gate
+    ts.start();
+
+    SECTION("300 B, 3 KB and 3 MiB names are refused (the bound is 256)") {
+        for (const std::size_t n : {std::size_t{300}, std::size_t{3 * 1024},
+                                    std::size_t{3 * 1024 * 1024}}) {
+            auto res = ts.call(mg_create_body({{"name", std::string(n, 'n')}}));
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("a 20-iteration retry loop of 3 KB names writes no row") {
+        for (int i = 0; i < 20; ++i) {
+            auto res = ts.call(mg_create_body({{"name", std::string(3 * 1024, 'r')}}, i + 1));
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("a newline, a NUL, a tab or a DEL in the name is invalid params with fixed text") {
+        for (const auto& name :
+             {std::string("line1\nline2"), std::string("nul\0byte", 8), std::string("tab\there"),
+              std::string("del\x7f")}) {
+            auto res = ts.call(mg_create_body({{"name", name}}));
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "group name must be at most 256 bytes and must not contain control characters "
+                  "or invalid UTF-8");
+        }
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("a control byte in the parent id names no group: invalid params, no row") {
+        auto res = ts.call(mg_create_body({{"name", "child"}, {"parent_id", "ab\ncd"}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "parent group not found");
+        CHECK(mg_create_rows(ts).empty());
+    }
+}
+
+TEST_CASE("MCP create_management_group: a name of exactly 256 bytes is accepted",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", std::string(256, 'n')}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(mg_create_rows(ts).size() == 2); // attempted + success
+    CHECK(store.list_groups().size() == 1);
+}
+
 TEST_CASE("MCP create_management_group: a validate_new_group refusal is a client error and "
           "burns no management_group.create row",
           "[mcp][pg][management_group][mgmt-audit-first]") {
@@ -29833,6 +29905,40 @@ TEST_CASE("MCP add_management_group_member: refusals decided without a write bur
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == kInternalError);
         CHECK(mg_add_rows(ts).empty());
+    }
+}
+
+TEST_CASE("MCP add_management_group_member: an over-long agent id is refused with no row, 256 "
+          "bytes is accepted",
+          "[mcp][pg][management_group][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+
+    SECTION("257 B, 3 KB and 3 MiB agent ids, repeated 20 times") {
+        for (int i = 0; i < 20; ++i) {
+            for (const std::size_t n : {std::size_t{257}, std::size_t{3 * 1024}}) {
+                auto res = ts.call(mg_add_body(f.gid, std::string(n, 'a'), i + 1));
+                REQUIRE(res);
+                auto body = nlohmann::json::parse(res->body);
+                REQUIRE(body.contains("error"));
+                CHECK(body["error"]["code"] == kInvalidParams);
+            }
+        }
+        auto huge = ts.call(mg_add_body(f.gid, std::string(3 * 1024 * 1024, 'a')));
+        REQUIRE(huge);
+        CHECK(nlohmann::json::parse(huge->body).contains("error"));
+        CHECK(mg_add_rows(ts).empty());
+        CHECK(f.store.get_members(f.gid).empty());
+    }
+    SECTION("exactly 256 bytes is accepted") {
+        auto res = ts.call(mg_add_body(f.gid, std::string(256, 'a')));
+        REQUIRE(res);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("error"));
+        CHECK(mg_add_rows(ts).size() == 2); // attempted + success
+        CHECK(f.store.get_members(f.gid).size() == 1);
     }
 }
 

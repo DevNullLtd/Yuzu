@@ -942,14 +942,16 @@ TEST_CASE("POST /management-groups/{id}/members: matching is exact, a case-only 
     CHECK(h.audits[1].detail == "agent-abc agent_known=0");
 }
 
-TEST_CASE("POST /management-groups/{id}/members: an id the enrolment store cannot hold (a comma, "
-          "over 256 bytes) is unknown, not unreadable, and is still added",
+TEST_CASE("POST /management-groups/{id}/members: an id the enrolment store cannot hold (a comma) "
+          "is unknown, not unreadable, and is still added",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    // An id over 256 bytes is refused by the route before it reaches the lookup (the length
+    // bound equals the enrolment store's own), so the comma is the one input the store refuses
+    // that a member add can still carry.
     AuditFirstHarness h(/*with_auth_db=*/true);
     const std::string gid = make_group(h, "invalid-input");
 
-    const std::string id = GENERATE(std::string("web,01"), std::string(257, 'a'));
-    INFO("agent id length " << id.size());
+    const std::string id = "web,01";
 
     auto res = h.add_member(gid, add_body(id).dump());
     REQUIRE(res);
@@ -1038,4 +1040,165 @@ TEST_CASE("POST /management-groups/{id}/members: the lookup never refuses, and a
     CHECK(res->has_header("Sec-Audit-Failed"));
     CHECK(res->body.find("known") == std::string::npos);
     CHECK(h.member_count(gid) == 0);
+}
+
+// ── F1 (Gate 7): over-long or unclean group names and agent ids are refused BEFORE any row ──────
+
+namespace {
+
+std::string json_body(const std::string& key, const std::string& value) {
+    return nlohmann::json{{key, value}}.dump();
+}
+
+} // namespace
+
+TEST_CASE("POST /management-groups: an over-long or unclean name is a 400 before any audit row "
+          "and creates nothing",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const auto groups_before = h.group_count();
+
+    SECTION("a name one byte over the bound (257) is refused; exactly 256 is accepted") {
+        auto over = h.create(json_body("name", std::string(257, 'n')));
+        REQUIRE(over);
+        CHECK(over->status == 400);
+        CHECK(over->body.find("at most 256 bytes") != std::string::npos);
+        CHECK(h.audits.empty());
+        CHECK(h.group_count() == groups_before);
+
+        auto at_bound = h.create(json_body("name", std::string(256, 'n')));
+        REQUIRE(at_bound);
+        CHECK(at_bound->status == 201);
+        CHECK(h.audit_count(kCreate, "attempted") == 1);
+        CHECK(h.audit_count(kCreate, "success") == 1);
+    }
+    SECTION("300 B, 3 KB and a ~3 MiB name") {
+        for (const std::size_t n : {std::size_t{300}, std::size_t{3 * 1024},
+                                    std::size_t{3 * 1024 * 1024}}) {
+            auto res = h.create(json_body("name", std::string(n, 'x')));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.size() < 1024); // the value is never echoed
+            CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+        }
+        CHECK(h.audits.empty());
+        CHECK(h.group_count() == groups_before);
+    }
+    SECTION("a retry loop of 20 over-long creates writes no row and never turns into a 503") {
+        for (int i = 0; i < 20; ++i) {
+            auto res = h.create(json_body("name", std::string(3 * 1024, 'r')));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        CHECK(h.audits.empty());
+        CHECK(h.group_count() == groups_before);
+    }
+    SECTION("a newline, a NUL, a tab and a DEL in the name (invalid UTF-8 cannot reach this "
+            "route: the JSON parser refuses it first)") {
+        for (const auto& name :
+             {std::string("line1\nline2"), std::string("nul\0byte", 8), std::string("tab\there"),
+              std::string("del\x7f")}) {
+            auto res = h.create(json_body("name", name));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("control characters") != std::string::npos);
+        }
+        auto raw = h.create(std::string("{\"name\":\"bad\xff\xfe\"}"));
+        REQUIRE(raw);
+        CHECK(raw->status == 400);
+        CHECK(h.audits.empty());
+        CHECK(h.group_count() == groups_before);
+    }
+    SECTION("an over-long or unclean parent id names no group: 400, no row") {
+        for (const auto& pid : {std::string(300, 'a'), std::string(3 * 1024, 'b'),
+                                std::string("ab\ncd")}) {
+            auto res = h.create(
+                nlohmann::json{{"name", "child"}, {"parent_id", pid}}.dump());
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("parent group not found") != std::string::npos);
+        }
+        CHECK(h.audits.empty());
+        CHECK_FALSE(h.group_exists("child"));
+    }
+}
+
+TEST_CASE("POST /management-groups/{id}/members: an over-long agent id is a 400 with no row, 256 is "
+          "accepted",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "limits-add");
+
+    SECTION("257 B, 3 KB and a ~3 MiB agent id: no row of any kind") {
+        for (const std::size_t n : {std::size_t{257}, std::size_t{3 * 1024},
+                                    std::size_t{3 * 1024 * 1024}}) {
+            auto res = h.add_member(gid, json_body("agent_id", std::string(n, 'a')));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("at most 256 bytes") != std::string::npos);
+        }
+        CHECK(h.audits.empty());
+        CHECK(h.member_count(gid) == 0);
+    }
+    SECTION("a 20-iteration retry loop writes no row") {
+        for (int i = 0; i < 20; ++i) {
+            auto res = h.add_member(gid, json_body("agent_id", std::string(3 * 1024, 'a')));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        CHECK(h.audits.empty());
+    }
+    SECTION("exactly 256 bytes is accepted") {
+        auto res = h.add_member(gid, json_body("agent_id", std::string(256, 'a')));
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(h.audit_count(kAdd, "attempted") == 1);
+        CHECK(h.member_count(gid) == 1);
+    }
+    SECTION("a group id longer than the bound names no group: 404, no row") {
+        auto res = h.add_member(std::string(3 * 1024, 'a'), R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(h.audits.empty());
+    }
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an over-long agent id or group id is "
+          "refused with no row, 256 is accepted",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "limits-remove");
+    REQUIRE(h.mgmt_bundle->add_member(gid, std::string(256, 'a')).has_value());
+
+    SECTION("257 B and 3 KB agent ids: 400, no row, member untouched") {
+        for (const std::size_t n : {std::size_t{257}, std::size_t{3 * 1024}}) {
+            auto res = h.remove_member(gid, std::string(n, 'a'));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("at most 256 bytes") != std::string::npos);
+        }
+        CHECK(h.audits.empty());
+        CHECK(h.member_count(gid) == 1);
+    }
+    SECTION("a 20-iteration retry loop writes no row") {
+        for (int i = 0; i < 20; ++i) {
+            auto res = h.remove_member(gid, std::string(3 * 1024, 'a'));
+            REQUIRE(res);
+            CHECK(res->status == 400);
+        }
+        CHECK(h.audits.empty());
+    }
+    SECTION("exactly 256 bytes is accepted and removes the member") {
+        auto res = h.remove_member(gid, std::string(256, 'a'));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(h.audit_count(kRemove, "attempted") == 1);
+        CHECK(h.member_count(gid) == 0);
+    }
+    SECTION("a group id longer than the bound names no group: 404, no row") {
+        auto res = h.remove_member(std::string(3 * 1024, 'a'), "agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(h.audits.empty());
+    }
 }

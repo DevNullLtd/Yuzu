@@ -591,3 +591,68 @@ TEST_CASE("Settings group create: a missing group store refuses with the fixed t
     CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
     CHECK(calls.empty());
 }
+
+TEST_CASE("Settings group create: an over-long or unclean name or parent id is refused with fixed "
+          "text, no row and no group",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    const std::string fixed_name_text =
+        "group name must be at most 256 bytes and must not contain control characters or invalid "
+        "UTF-8";
+
+    // No multi-MiB case: httplib answers 413 to an urlencoded body over its own cap before the
+    // handler runs (and the sink models that), so a larger form never reaches this route.
+    SECTION("257 B, 300 B and 3 KB names; 256 B is accepted") {
+        for (const std::size_t n : {std::size_t{257}, std::size_t{300}, std::size_t{3 * 1024}}) {
+            auto res = h.create(std::string(n, 'n'));
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body ==
+                  "<span class=\"feedback-error\">" + fixed_name_text + "</span>");
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+
+        auto ok = h.create(std::string(256, 'n'));
+        REQUIRE(ok);
+        CHECK(h.create_rows().size() == 2); // attempted + success
+        CHECK(h.group_names().size() == 1);
+    }
+    SECTION("a 20-iteration retry loop of 3 KB names writes no row") {
+        for (int i = 0; i < 20; ++i) {
+            auto res = h.create(std::string(3 * 1024, 'r'));
+            REQUIRE(res);
+            CHECK(res->body.find(fixed_name_text) != std::string::npos);
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+    }
+    SECTION("a newline, a NUL, a DEL and invalid UTF-8 in the name") {
+        for (const auto& name :
+             {std::string("line1\nline2"), std::string("nul\0byte", 8), std::string("del\x7f"),
+              std::string("bad\xff\xfe utf8")}) {
+            auto res = h.create(name);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body.find(fixed_name_text) != std::string::npos);
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+    }
+    SECTION("an over-long or unclean parent id names no group") {
+        for (const auto& pid : {std::string(300, 'a'), std::string(3 * 1024, 'b'),
+                                std::string("ab\ncd"), std::string("bad\xff")}) {
+            auto res = h.sink.Post("/api/settings/management-groups",
+                                   "name=Child&parent_id=" + httplib::encode_uri_component(pid) +
+                                       "&membership_type=static",
+                                   "application/x-www-form-urlencoded");
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK(res->body ==
+                  "<span class=\"feedback-error\">parent group not found</span>");
+        }
+        CHECK(h.calls.empty());
+        CHECK(h.group_names().empty());
+    }
+}

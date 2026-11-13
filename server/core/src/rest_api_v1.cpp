@@ -21,6 +21,7 @@
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
 #include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp" // name / agent id / group id bounds and clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
 #include "app_perf_compare.hpp" // app_perf_param_valid — shared cap + control-char/NUL re-floor
@@ -4751,6 +4752,22 @@ void RestApiV1::register_routes(
         g.membership_type = body.value("membership_type", "static");
         g.scope_expression = body.value("scope_expression", "");
 
+        // The name and the parent id are bounded and held to clean text BEFORE any store read or
+        // `attempted` row (mgmt_group_limits.hpp): each value lands in two audit rows, and a name
+        // the unique index cannot hold would otherwise read as a retryable store fault. The
+        // refusal text is fixed, never the caller's value; nothing is written.
+        if (!mgmt_group_name_ok(g.name)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, std::string(kMgmtGroupNameInvalidText)),
+                            "application/json");
+            return;
+        }
+        if (!mgmt_group_id_ok(g.parent_id)) { // an id like this names no group
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "parent group not found"), "application/json");
+            return;
+        }
+
         // The checks create_group runs before its insert, decided here so a refusal burns no
         // `attempted` row. A fault of the store itself is a retryable 503, never a 400.
         if (auto valid = mgmt_store->validate_new_group(g); !valid) {
@@ -4993,22 +5010,9 @@ void RestApiV1::register_routes(
 
     // The member and role id fields reach a text bind: a control byte or an
     // invalid UTF-8 sequence is refused up front (400) instead of becoming a
-    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (same rule).
-    const auto mgmt_text_ok = [](std::string_view s) {
-        if (!rbac_text_is_clean(s))
-            return false;
-        for (std::size_t i = 0; i < s.size();) {
-            if (static_cast<unsigned char>(s[i]) < 0x80) {
-                ++i;
-                continue;
-            }
-            const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-            if (len == 0)
-                return false;
-            i += len;
-        }
-        return true;
-    };
+    // retryable store fault. Twin: mgmt_text_ok in mcp_server.cpp (the same predicate,
+    // mgmt_group_text_is_clean).
+    const auto mgmt_text_ok = [](std::string_view s) { return mgmt_group_text_is_clean(s); };
 
     // True only when the store answered authoritatively that the group does not
     // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -5074,6 +5078,10 @@ void RestApiV1::register_routes(
                   }
 
                   auto group_id = req.matches[1].str();
+                  if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                      mgmt_group_not_found(res);
+                      return;
+                  }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded() || !body.is_object()) {
                       res.status = 400;
@@ -5085,6 +5093,16 @@ void RestApiV1::register_routes(
                   if (agent_id.empty()) {
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "agent_id required"), "application/json");
+                      return;
+                  }
+                  // Bounded before anything else reads or records it (mgmt_group_limits.hpp):
+                  // no row, fixed text. An id within the bound that holds a control byte or
+                  // invalid UTF-8 keeps its `denied` row below.
+                  if (!mgmt_group_agent_id_length_ok(agent_id)) {
+                      res.status = 400;
+                      res.set_content(
+                          detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                          "application/json");
                       return;
                   }
                   if (!mgmt_text_ok(agent_id)) {
@@ -5166,6 +5184,17 @@ void RestApiV1::register_routes(
 
             auto group_id = req.matches[1].str();
             auto agent_id = req.matches[2].str();
+            if (group_id.size() > kMgmtGroupIdMaxBytes) { // names no group; no row
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "group not found"), "application/json");
+                return;
+            }
+            if (!mgmt_group_agent_id_length_ok(agent_id)) { // no row; an unclean id keeps its denied row
+                res.status = 400;
+                res.set_content(detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
+                                "application/json");
+                return;
+            }
             if (!mgmt_text_ok(agent_id)) {
                 audit_fn(req, "management_group.remove_member", "denied", "ManagementGroup",
                          group_id, "invalid_agent_id");

@@ -64,6 +64,7 @@
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `agent_known` audit flag, REST and MCP
 #include "mgmt_group_error.hpp"            // mgmt_group_error_is_store_fault: one classifier for REST and MCP
+#include "mgmt_group_limits.hpp"           // name / group id bounds and the clean-text rule (REST, MCP, Settings)
 #include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
@@ -6980,22 +6981,13 @@ MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
 
 // The management-group id fields reach a text bind: a control byte or an invalid
 // UTF-8 sequence is refused as invalid params instead of surfacing as a retryable
-// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (same rule).
-bool mgmt_text_ok(std::string_view s) {
-    if (!rbac_text_is_clean(s))
-        return false;
-    for (std::size_t i = 0; i < s.size();) {
-        if (static_cast<unsigned char>(s[i]) < 0x80) {
-            ++i;
-            continue;
-        }
-        const std::size_t len = ::yuzu::utf8_sequence_length(s, i);
-        if (len == 0)
-            return false;
-        i += len;
-    }
-    return true;
-}
+// store fault. Twin: mgmt_text_ok in rest_api_v1.cpp (the same predicate,
+// mgmt_group_text_is_clean).
+bool mgmt_text_ok(std::string_view s) { return mgmt_group_text_is_clean(s); }
+static_assert(kMgmtGroupNameMaxLen == kMgmtGroupNameMaxBytes,
+              "the MCP schema bound for a group name and the handler bound must agree");
+static_assert(kMgmtGroupIdMaxLen == kMgmtGroupIdMaxBytes,
+              "the MCP schema bound for a group id and the handler bound must agree");
 
 // True only when the store answered authoritatively that the group does not
 // exist (a failed read is not "absent"). Used after a write failed to tell a
@@ -13717,6 +13709,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (args.contains("scope_expression") && !args["scope_expression"].is_string()) {
                     res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
+                                    "application/json");
+                    return;
+                }
+                // The length bound is enforced above; the name and the parent id are also held
+                // to clean text (mgmt_group_limits.hpp) before any store read or `attempted`
+                // row, with a fixed refusal text. Only the tool-level mcp.* row is written.
+                if (!mgmt_group_name_ok(name)) {
+                    mcp_audit("denied", "invalid_name");
+                    res.set_content(a4_error(kInvalidParams, std::string(kMgmtGroupNameInvalidText)),
+                                    "application/json");
+                    return;
+                }
+                if (!mgmt_group_id_ok(param_str(args, "parent_id"))) { // names no group
+                    mcp_audit("denied", "invalid_parent_id");
+                    res.set_content(a4_error(kInvalidParams, "parent group not found"),
                                     "application/json");
                     return;
                 }
