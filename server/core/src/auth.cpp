@@ -1826,36 +1826,6 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         // rejected by step 3.
         session_copy = session_from_row(found->value().row, found->value().db_now_ms);
         from_store = true;
-
-        // Account gate: a session built from a store row is served only while its LOCAL
-        // account is active, so a session whose account is inactive or deleted is rejected on
-        // every replica, whether or not the deactivation's own session wipe persisted.
-        // Federated (oidc, saml) sessions are keyed on a principal that need not be an
-        // `auth.users` account (a ':' is not a valid account name), so only `local` sessions are
-        // gated. Skipped when no AuthDB is wired (test wiring only; production wires both
-        // stores). `user_exists` is active-only, own-schema,
-        // bounded-lease and tells an unreadable account store from an absent account: an
-        // unreadable store fails closed. Nothing is cached on either refusal.
-        if (auth_db_ && session_copy->auth_source == "local") {
-            const auto active = auth_db_->user_exists(session_copy->username);
-            if (!active) {
-                spdlog::warn("validate_session: account state for '{}' unreadable, refusing the "
-                             "session",
-                             ::yuzu::log_key_token(session_copy->username));
-                note_session_store_degrade("account_state");
-                return std::nullopt;
-            }
-            if (!*active) {
-                // Debug, not warn: a replayed cookie would log once per request; the counter
-                // is the signal.
-                spdlog::debug("validate_session: refusing a session whose account '{}' is not "
-                              "active",
-                              ::yuzu::log_key_token(session_copy->username));
-                if (metrics_)
-                    metrics_->counter("yuzu_auth_session_account_inactive_total").increment();
-                return std::nullopt;
-            }
-        }
     }
 
     // Adjudication uses the LOCAL MONOTONIC deadlines derived at populate (immune
@@ -1909,6 +1879,15 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         return std::nullopt;
     }
 
+    // Account gate. A session built from a store row (the cold-miss read in step 2 or the
+    // idle re-read in step 4; both set `from_store`) is served and cached only while
+    // session_account_admits holds: a session whose LOCAL account is inactive or deleted is
+    // rejected on every replica, whether or not the deactivation's own session wipe
+    // persisted. It runs after the expiry and idle verdicts above so an expired or idled-out
+    // row never costs an account read, and before step 5 so nothing refused is cached.
+    if (from_store && !session_account_admits(key, *session_copy))
+        return std::nullopt;
+
     // 5. Slide the activity window (throttled), mirror it durably, and (re)cache.
     const auto touch_granularity =
         idle_enabled ? (std::min)(session_inactivity_ / 4, std::chrono::seconds(30))
@@ -1949,17 +1928,71 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
     {
         std::unique_lock wlock(mu_);
         // Insert only if no cache invalidation ran since this validation started
-        // (ADR-0012 section 4 guarded-insert rule). On a mismatch the session is still
-        // returned to THIS caller, whose request is concurrent with the invalidation
-        // and linearises before it, but it is not cached: a refusal here would reject
-        // an unrelated in-flight request on every sign-in anywhere, and a retry would
-        // add a second read for nothing. The next request finds no entry and reads the
-        // authoritative row. The mint insert in persist_new_session is deliberately
-        // unguarded: the post-mint recheck erases this replica's entries on its own.
+        // (ADR-0012 section 4, rule 2). The epoch moves with every clear of the cache
+        // (the generation poll). On a mismatch the session is
+        // still returned to THIS caller, whose request is concurrent with the invalidation
+        // and linearises before it, but it is not cached: a refusal here would reject an
+        // unrelated in-flight request whenever any session anywhere is created or revoked,
+        // and a retry would add a second read for nothing. The next request finds no entry
+        // and reads the authoritative row. The mint insert in persist_new_session is
+        // deliberately unguarded: the post-mint recheck compares only role, credential hash
+        // and active state, and revokes the account's sessions on a divergence in those; it
+        // does not otherwise evict a freshly minted entry.
         if (session_cache_epoch_ == cache_epoch)
             sessions_[key] = *session_copy;
     }
     return session_copy;
+}
+
+bool AuthManager::session_account_admits(const std::string& key, const Session& session) const {
+    // Closed three-way on the stored auth source. `local` sessions are keyed on an `auth.users`
+    // account; federated (oidc, saml) principals need not be one (a ':' is not a valid account
+    // name), so they pass; anything else, empty included, has no production writer and is
+    // refused rather than guessed at.
+    bool admit = false;
+    if (session.auth_source == "local") {
+        if (!auth_db_) {
+            admit = true; // test wiring only; production wires both stores
+        } else {
+            // `user_exists` is active-only, own-schema and bounded-lease, and tells an
+            // unreadable account store from an absent account: an unreadable store refuses.
+            const auto active = auth_db_->user_exists(session.username);
+            if (!active) {
+                spdlog::warn("validate_session: account state for '{}' unreadable (AuthDB error "
+                             "{}), refusing the session",
+                             ::yuzu::log_key_token(session.username),
+                             static_cast<int>(active.error()));
+                note_session_store_degrade("account_state");
+            } else if (!*active) {
+                // Debug, not warn: a replayed cookie would log once per request; the counter
+                // is the signal.
+                spdlog::debug("validate_session: refusing a session whose account '{}' is not "
+                              "active",
+                              ::yuzu::log_key_token(session.username));
+                if (metrics_)
+                    metrics_->counter("yuzu_auth_session_account_inactive_total").increment();
+            } else {
+                admit = true;
+            }
+        }
+    } else if (session.auth_source == "oidc" || session.auth_source == "saml") {
+        admit = true;
+    } else {
+        // Plain warn: no production writer stores another source, so this is not a replay
+        // flood; the counter is the alertable signal.
+        spdlog::warn("validate_session: refusing a session with unknown auth source '{}'",
+                     ::yuzu::log_key_token(session.auth_source));
+        if (metrics_)
+            metrics_->counter("yuzu_auth_session_unknown_source_total").increment();
+    }
+    if (!admit) {
+        // Erase on EVERY refusal (fail closed: the next request goes cold). A copy can be
+        // cached from before a stale-distrust window, where it was not consulted; leaving it
+        // would flip this refusal back to a grant as soon as trust returns.
+        std::unique_lock wlock(mu_);
+        sessions_.erase(key);
+    }
+    return admit;
 }
 
 bool AuthManager::invalidate_session(const std::string& token) {

@@ -1017,6 +1017,15 @@ private:
     std::optional<Session> validate_session_durable(const std::string& token,
                                                     bool idle_enabled) const;
 
+    /// Account gate for a session built from a store row (the only way a session reaches the
+    /// `validate_session_durable` cache). Closed three-way on `auth_source`: `local` is
+    /// served only while its `auth.users` account is active (skipped when no AuthDB is wired,
+    /// test wiring only); `oidc` and `saml` pass (their principal need not be a local
+    /// account); ANY other value, empty included, is refused. On every refusal the cache entry
+    /// for `key` is also erased, so a copy cached before a stale-distrust window cannot flip
+    /// a refusal back to a grant when trust returns. Called with no lock held.
+    [[nodiscard]] bool session_account_admits(const std::string& key, const Session& session) const;
+
 public:
 
     /// Destroy a session (logout).
@@ -1809,7 +1818,7 @@ private:
     // section as every `sessions_.clear()` (the generation poll is the only one).
     // `validate_session_durable` captures it under its step-1 shared lock and inserts
     // its session at the tail only if it is unchanged, so a validation that straddles
-    // a clear cannot put the session back (ADR-0012 section 4 guarded-insert rule).
+    // a clear cannot put the session back (ADR-0012 section 4, rule 2).
     mutable std::uint64_t session_cache_epoch_ = 0;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.

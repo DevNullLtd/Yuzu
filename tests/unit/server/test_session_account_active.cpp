@@ -537,7 +537,7 @@ TEST_CASE("account gate: an idle re-read that crosses a deactivation is refused 
     REQUIRE(b.validate_session(token).has_value()); // warm
 
     // The cached entry looks idle, so the next validation re-reads the durable row (a second,
-    // store-derived session that is not passed through the cold-path gate), then parks.
+    // store-derived session, which passes the same account gate as the cold read), then parks.
     b.idle_session_for_test(token, std::chrono::minutes(11));
     HeldValidation held;
     held.install(b);
@@ -547,6 +547,32 @@ TEST_CASE("account gate: an idle re-read that crosses a deactivation is refused 
     CHECK_FALSE(poll_and_validate(b, token).has_value());
 
     CHECK(held.release_and_join().has_value());
+    check_stays_refused(b, token);
+}
+
+TEST_CASE("account gate: the idle re-read is gated, so a warm session of an inactive account is "
+          "refused once it looks idle (T-R3, gate form)",
+          "[auth][session_store][account_active][pg]") {
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    b.set_session_inactivity(std::chrono::seconds(600));
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(b.validate_session(token).has_value()); // warm and not idle
+
+    // Direct SQL moves no generation, so no poll can clear B's cache whatever the timing: the
+    // only path that reads the row again is the idle re-read below.
+    f.exec_sql("UPDATE auth.users SET is_active = false WHERE username = 'alice'");
+    REQUIRE(b.validate_session(token).has_value()); // still served from the warm cache
+    const double before = f.counter(kInactiveCounter);
+
+    b.idle_session_for_test(token, std::chrono::minutes(11)); // the cached copy now looks idle
+    CHECK_FALSE(b.validate_session(token).has_value());
+    // The counter moving proves the refusal came from the gate on the idle re-read (the row
+    // itself is fresh and not idle, so without the gate the session is served).
+    CHECK(f.counter(kInactiveCounter) == before + 1.0);
     check_stays_refused(b, token);
 }
 
@@ -672,6 +698,107 @@ TEST_CASE("account gate: a replica that cannot read the generation distrusts its
     b.expire_session_generation_poll_for_test();
     CHECK_FALSE(b.validate_session(token).has_value());
     meta_gone.repair();
+}
+
+TEST_CASE("account gate: the auth source is a closed three-way; oidc and saml pass without an "
+          "account read (T-3way)",
+          "[auth][session_store][account_active][pg]") {
+    constexpr const char* kUnknownCounter = "yuzu_auth_session_unknown_source_total";
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+
+    // The table CHECK only forbids engine_token on a human row, so any other source value can
+    // be stored; the gate must refuse every one that is not local, oidc or saml.
+    for (const char* source : {"api_token", ""}) {
+        const auto token = a.create_local_session_for_test("alice", Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        {
+            auto lease = f.db.pool().acquire();
+            REQUIRE(lease);
+            yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE session_store.sessions SET auth_source = $1 WHERE "
+                "token_hash = $2",
+                std::vector<std::string>{source, AuthManager::sha256_hex(token)});
+        }
+        auto& cold = f.add();
+        const double before = f.counter(kUnknownCounter);
+        const double inactive = f.counter(kInactiveCounter);
+        CHECK_FALSE(cold.validate_session(token).has_value());
+        CHECK(f.counter(kUnknownCounter) == before + 1.0);
+        CHECK(f.counter(kInactiveCounter) == inactive); // not an account verdict
+        check_stays_refused(cold, token);
+    }
+
+    // The unknown-source refusal does not depend on an AuthDB being wired.
+    {
+        const auto token = a.create_local_session_for_test("alice", Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        f.exec_sql("UPDATE session_store.sessions SET auth_source = 'api_token' WHERE username = "
+                   "'alice' AND token_hash = '" +
+                   AuthManager::sha256_hex(token) + "'");
+        auto& no_db = f.add(/*with_auth_db=*/false);
+        const double before = f.counter(kUnknownCounter);
+        CHECK_FALSE(no_db.validate_session(token).has_value());
+        CHECK(f.counter(kUnknownCounter) == before + 1.0);
+    }
+
+    // oidc and saml rows pass with NO account read: the account store is made unreadable, and
+    // neither the degrade counter nor the refusal counters move.
+    const std::string iss = "https://idp.example";
+    const auto oidc = a.create_oidc_session("Fed One", "one@example.com", "sub-one", iss);
+    const auto saml = a.create_saml_session("saml.user@example.com", "https://sp.example");
+    REQUIRE_FALSE(oidc.empty());
+    REQUIRE_FALSE(saml.empty());
+    auto& c = f.add();
+    const double degrade0 = f.degrade("account_state");
+    const double unknown0 = f.counter(kUnknownCounter);
+    const double inactive0 = f.counter(kInactiveCounter);
+    {
+        yuzu::test::SqlFault users_gone{f.db.pool(), "ALTER TABLE auth.users RENAME TO users_gone",
+                                        "ALTER TABLE auth.users_gone RENAME TO users"};
+        users_gone.arm();
+        CHECK(c.validate_session(oidc).has_value());
+        CHECK(c.validate_session(saml).has_value());
+        users_gone.repair();
+    }
+    CHECK(f.degrade("account_state") == degrade0);
+    CHECK(f.counter(kUnknownCounter) == unknown0);
+    CHECK(f.counter(kInactiveCounter) == inactive0);
+}
+
+TEST_CASE("account gate: a refusal while the cache is distrusted erases the cached entry, so it "
+          "does not flip back to a grant when trust returns (CH-3 pin)",
+          "[auth][session_store][account_active][pg]") {
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(b.validate_session(token).has_value()); // B's cache is warm
+
+    // Direct SQL: the account is inactive but no generation moved, so nothing clears B's cache.
+    f.exec_sql("UPDATE auth.users SET is_active = false WHERE username = 'alice'");
+
+    // B can no longer read the generation, and its view ages past the stale-serve bound: the
+    // warm entry is distrusted, the row is read cold, and the gate refuses.
+    {
+        yuzu::test::SqlFault meta_gone{
+            f.db.pool(), "ALTER TABLE session_store.session_meta RENAME TO session_meta_gone",
+            "ALTER TABLE session_store.session_meta_gone RENAME TO session_meta"};
+        meta_gone.arm();
+        b.age_session_generation_refresh_for_test(std::chrono::seconds(31));
+        b.expire_session_generation_poll_for_test();
+        CHECK_FALSE(b.validate_session(token).has_value());
+        meta_gone.repair();
+    }
+
+    // Trust returns: a successful poll that reads an UNCHANGED generation (no clear). The
+    // refusal must have erased the cached entry, or it would be served again here.
+    CHECK_FALSE(poll_and_validate(b, token).has_value());
+    check_stays_refused(b, token);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════

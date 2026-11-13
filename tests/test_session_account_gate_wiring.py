@@ -17,9 +17,13 @@ comment-stripped text, not a proof.
         SessionGenerationMode::kNoSessionStore`: the mode follows whether a SessionStore is
         wired, and a bare no-store literal at a production call site would silently skip the bump.
         The ternary is the one allowed shape; it needs no helper.
-  (iv)  in `validate_session_durable`, the account gate (`auth_db_->user_exists(`) appears exactly
-        once, after the first store-row `session_from_row(` and before the step-3 expiry test, and
-        both refusals return `std::nullopt`.
+  (iv)  every session built from a store row passes ONE gate: in `validate_session_durable` each
+        `session_from_row(` is followed by `from_store = true;`, and the single
+        `if (from_store && !session_account_admits(key, *session_copy)) return std::nullopt;`
+        comes after the last of them, after the idle re-read's expiry test, and before the cache
+        insert. The account read (`auth_db_->user_exists(`) lives only in
+        `session_account_admits`, which counts a degrade, closes on `auth_source` (three
+        comparisons) and erases the cached entry on every refusal (`if (!admit)`).
   (v)   the validate tail's cache insert is the only `sessions_[key] = *session_copy` and is
         guarded by `session_cache_epoch_ == cache_epoch`.
   (vi)  the cache epoch is incremented in the same block as the single `sessions_.clear()`.
@@ -115,18 +119,34 @@ def check_auth(auth_src: str):
     if body is None:
         return fails + ["(iv) validate_session_durable not found"]
     # (iv)
-    gate = [m.start() for m in re.finditer(r"auth_db_->user_exists\(", body)]
-    row = body.find("session_from_row(")
-    step3 = body.find("if (expired_now(*session_copy))")
-    if len(gate) != 1 or row == -1 or step3 == -1 or not (row < gate[0] < step3):
-        fails.append("(iv) the account gate (auth_db_->user_exists) must appear exactly once in "
-                     "validate_session_durable, after session_from_row and before the step-3 "
-                     "expiry test")
+    gates = [m.start() for m in re.finditer(r"session_account_admits\(", body)]
+    rows = [m.start() for m in re.finditer(r"session_from_row\(", body)]
+    call = re.search(r"if \(from_store && !session_account_admits\(key, \*session_copy\)\) "
+                     r"\{? ?return std::nullopt;", body)
+    last_expiry = body.rfind("if (expired_now(*session_copy))")
+    insert = body.find("sessions_[key] = *session_copy;")
+    if (len(gates) != 1 or not call or not rows or last_expiry == -1 or insert == -1
+            or "user_exists(" in body
+            or body.count("from_store = true;") != len(rows)
+            or not (rows[-1] < last_expiry < gates[0] < insert)):
+        fails.append("(iv) validate_session_durable must pass every store-built session through "
+                     "exactly one `if (from_store && !session_account_admits(key, *session_copy)) "
+                     "return std::nullopt;`, after the last session_from_row and its expiry test, "
+                     "before the cache insert, with `from_store = true;` after each "
+                     "session_from_row and no user_exists call of its own")
+    helper = function_body(flat, "AuthManager::session_account_admits(")
+    if helper is None:
+        fails.append("(iv) AuthManager::session_account_admits not found")
     else:
-        region = body[gate[0]:step3]
-        if len(re.findall(r"return std::nullopt;", region)) < 2 or "note_session_store_degrade(" not in region:
-            fails.append("(iv) both account-gate refusals (inactive, unreadable) must return "
-                         "std::nullopt, and the unreadable one must count a store degrade")
+        refuse = re.search(r"if \(!admit\) \{[^}]*sessions_\.erase\(key\);", helper)
+        if (helper.count("auth_db_->user_exists(") != 1
+                or "note_session_store_degrade(" not in helper
+                or helper.count("auth_source ==") != 3
+                or not refuse or "return admit;" not in helper):
+            fails.append("(iv) session_account_admits must call auth_db_->user_exists exactly "
+                         "once, count a store degrade, compare auth_source exactly three times "
+                         "(local, oidc, saml), erase the cached entry under `if (!admit)` and "
+                         "return admit")
     # (v)
     inserts = re.findall(r"sessions_\[key\] = \*session_copy;", body)
     guarded = re.findall(
@@ -165,12 +185,20 @@ def _selfcheck() -> None:
     auth = ("auto r = rbac_store_->deactivate_account(u, session_store_ ? SessionGenerationMode::kBumpSessionGeneration"
             " : SessionGenerationMode::kNoSessionStore);\n"
             "void f() { sessions_.clear();\n ++session_cache_epoch_; }\n"
+            "bool AuthManager::session_account_admits(const std::string& key, const Session& s) const {\n"
+            " bool admit = false;\n"
+            " if (s.auth_source == \"local\") { if (!auth_db_) { admit = true; } else {\n"
+            "  auto a = auth_db_->user_exists(s.username);\n"
+            "  if (!a) { note_session_store_degrade(op); } else if (!*a) { x(); } else { admit = true; } }\n"
+            " } else if (s.auth_source == \"oidc\" || s.auth_source == \"saml\") { admit = true; }\n"
+            " else { y(); }\n"
+            " if (!admit) { std::unique_lock w(mu_); sessions_.erase(key); }\n"
+            " return admit; }\n"
             "std::optional<Session> AuthManager::validate_session_durable(const std::string& t) const {\n"
-            " auto s = session_from_row(row, now);\n"
-            " if (auth_db_ && s.auth_source == \"local\") { auto a = auth_db_->user_exists(s.username);\n"
-            "  if (!a) { note_session_store_degrade(op); return std::nullopt; }\n"
-            "  if (!*a) { return std::nullopt; } }\n"
+            " auto s = session_from_row(row, now); from_store = true;\n"
             " if (expired_now(*session_copy)) { return std::nullopt; }\n"
+            " if (from_store && !session_account_admits(key, *session_copy))\n"
+            "  return std::nullopt;\n"
             " { std::unique_lock w(mu_); if (session_cache_epoch_ == cache_epoch)\n"
             "   sessions_[key] = *session_copy; }\n return session_copy; }\n")
     if check_auth(auth):
@@ -178,9 +206,22 @@ def _selfcheck() -> None:
     bad = {
         "(iii) bare literal": auth.replace(TERNARY, "SessionGenerationMode::kNoSessionStore"),
         "(iii) second mention": auth + "x(SessionGenerationMode::kNoSessionStore);\n",
-        "(iv) gate removed": auth.replace("auth_db_->user_exists(", "auth_db_->other("),
-        "(iv) gate after step 3": auth.replace("if (expired_now(*session_copy)) { return std::nullopt; }", "")
-                                      + "",
+        "(iv) gate call removed": auth.replace(
+            "if (from_store && !session_account_admits(key, *session_copy))\n  return std::nullopt;",
+            ""),
+        "(iv) gate before the expiry test": auth.replace(
+            "if (from_store && !session_account_admits(key, *session_copy))\n  return std::nullopt;\n",
+            "").replace(
+            " if (expired_now(*session_copy)) { return std::nullopt; }\n",
+            " if (from_store && !session_account_admits(key, *session_copy))\n"
+            "  return std::nullopt;\n if (expired_now(*session_copy)) { return std::nullopt; }\n"),
+        "(iv) a store row not marked from_store": auth.replace(" from_store = true;\n", "\n"),
+        "(iv) account read outside the helper": auth.replace(
+            " auto s = session_from_row(row, now);",
+            " auto q = auth_db_->user_exists(n); auto s = session_from_row(row, now);"),
+        "(iv) no erase on refusal": auth.replace("sessions_.erase(key);", ""),
+        "(iv) fourth source arm": auth.replace('s.auth_source == "oidc"',
+                                               's.auth_source == "x" || s.auth_source == "oidc"'),
         "(v) epoch guard removed": auth.replace("if (session_cache_epoch_ == cache_epoch)", ""),
         "(vi) increment removed": auth.replace("++session_cache_epoch_;", ""),
         "(vi) increment moved": auth.replace("sessions_.clear();\n ++session_cache_epoch_;",
