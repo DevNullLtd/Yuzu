@@ -858,7 +858,7 @@ and counts in `yuzu_server_gateway_route_desync_total` under the outcome named, 
 
 | Server WARN line (start) | Outcome | Event | Kind |
 |---|---|---|---|
-| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded and this replica holds no matching local session` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; the same notification is accepted once it reads again |
+| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded; the gateway sends the notice again and it is accepted once the directory reads` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; every CONNECTED is refused while it cannot, and the gateway's resend (#5695) is accepted once it reads again |
 | `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
 | `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
 | `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
@@ -3901,8 +3901,8 @@ failures now count toward the shared breaker (see below).
   record a notification"); an older gateway ignores `acknowledged=false` and does
   not retry. The server counts it under
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
-  outcome `connected_unverified` (the directory read failed and this replica
-  holds no matching local session) or `stale_connected_session` (the directory
+  outcome `connected_unverified` (the directory read failed; a CONNECTED is never
+  accepted unverified, whatever this replica holds locally) or `stale_connected_session` (the directory
   row or the local registry names a different session). The same holds for the
   `op="announce_connected"` refusals `session_held_by_other_agent` and the
   affinity pre-check `cluster_affinity_violation`, which answer
@@ -4382,21 +4382,24 @@ that the replica does not hold is neither acknowledged nor listed (so the
 gateway does not re-register in a storm). `ProxyInventory` for a session id the
 directory does not know keeps `received=false` (the agent retries); a local
 hint helps only on a degraded read or for a session that lost a race.
-`NotifyStreamStatus` CONNECTED, when the directory read fails, is accepted only
-if this replica holds the matching local session (the session it registered
-for that agent, which the directory confirmed at `ProxyRegister`), and is
-otherwise rejected (`acknowledged=false`) and counted under
+`NotifyStreamStatus` CONNECTED, when the directory read fails, is always
+rejected (`acknowledged=false`), whatever session this replica holds locally,
+and counted under
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="connected_unverified"}`.
-A delayed CONNECTED for a session this replica has since superseded is counted
-the same way (a successful read counts it as `stale_connected_session`).
+A replica cannot tell from its own state whether another replica has since
+registered the agent again, so it does not guess. A successful read counts a
+delayed CONNECTED for a session this replica has since superseded as
+`stale_connected_session`.
 `yuzu_gw_upstream_notify_dropped_total` does not count a rejected CONNECTED.
 A gateway that includes #5695 counts it in
 `yuzu_gw_upstream_notify_unacknowledged_total{event="connected"}` and sends it
 again after a backoff while it holds the session, so a `connected_unverified`
 rejection is put right once the directory reads again (see "When the server
-does not record a notification"). An older gateway does not retry it: that
-server counter is then the only signal, and an agent whose current session was
-rejected keeps heartbeating but cannot receive commands until it reconnects. When the read succeeds, the local fallback applies only if
+does not record a notification"). Until then the agent keeps heartbeating but
+is not dispatchable from that replica, for the outage plus up to 60 s (the
+gateway's resend backoff cap). An older gateway does not retry it: that
+server counter is then the only signal, and the agent cannot receive commands
+until it reconnects. When the read succeeds, the local fallback applies only if
 the directory row is absent or tombstoned, or the session is one this replica
 recorded as having lost a race; a row with a different session id rejects the
 CONNECTED (`stale_connected_session`). A DISCONNECTED proceeds on the local

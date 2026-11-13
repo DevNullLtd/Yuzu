@@ -467,6 +467,9 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // fires only after a hand-dropped index; every match is still returned).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "session_lookup"}, {"outcome", "ambiguous_session"}});
+        // #6339: the local session map and the directory row name different agents.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "session_lookup"}, {"outcome", "agent_mismatch"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_inventory"}, {"outcome", "unknown_session"}});
     }
@@ -526,15 +529,17 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
             by_session[*rr.route.session_id].push_back(&rr);
 
     std::size_t ambiguous = 0;
+    std::size_t agent_mismatch = 0;
     std::unordered_set<std::string> lost_race_ids;
-    std::unordered_set<std::string> local_ids;
+    // session_id -> the agent THIS replica's hint map names for it.
+    std::unordered_map<std::string, std::string> local_agent;
     {
         std::lock_guard lock(sessions_mu_);
         for (const auto& id : ids) {
             if (lost_race_sessions_.contains(id))
                 lost_race_ids.insert(id);
-            if (gateway_sessions_.contains(id))
-                local_ids.insert(id);
+            if (auto lit = gateway_sessions_.find(id); lit != gateway_sessions_.end())
+                local_agent.emplace(id, lit->second);
         }
     }
     for (const auto& id : ids) {
@@ -552,10 +557,33 @@ GatewayUpstreamServiceImpl::resolve_sessions(const std::vector<std::string>& ses
                 ++ambiguous;
             continue;
         }
-        out.resolved.emplace(id, it->second.front()->route.agent_id);
+        const auto& row_agent = it->second.front()->route.agent_id;
+        const auto lit = local_agent.find(id);
+        // #6339 (ADR-2002 7f): the local hint map must not name a DIFFERENT agent than the
+        // directory row for the same session id. Believing the row alone would attribute a
+        // heartbeat or inventory report to the row's agent while this replica holds the id for
+        // another, which is how an agent that presents a victim's session id gets the victim's
+        // heartbeat. Refuse it (not resolved, not acted on) and let it fall through to the
+        // callers' unknown handling, which lists it so the gateway replays ProxyRegister and the
+        // register path decides who holds the id.
+        if (lit != local_agent.end() && lit->second != row_agent) {
+            if (out.agent_mismatch.insert(id).second)
+                ++agent_mismatch;
+            continue;
+        }
+        out.resolved.emplace(id, row_agent);
         out.from_store.insert(id);
-        if (!local_ids.contains(id))
+        if (lit == local_agent.end())
             out.store_only.insert(id);
+    }
+    if (agent_mismatch > 0) {
+        if (warn_slot_due("session_agent_mismatch"))
+            spdlog::warn("[gateway] GatewayRouteStore session lookup: {} session id(s) name a "
+                         "different agent in this replica's session map than in the directory; "
+                         "refused and listed for replay (logged at most once per 5s)",
+                         agent_mismatch);
+        record_directory_desync(metrics_, "session_lookup", "agent_mismatch",
+                                static_cast<double>(agent_mismatch));
     }
     if (ambiguous > 0) {
         if (warn_slot_due("ambiguous_session")) {
@@ -1773,8 +1801,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
     // handle the agent's ProxyRegister. `received=false` is the agent's retry
     // nack. A degraded read with a local hint still resolves (and ingests);
     // an unknown, ambiguous or unhinted-degraded id is nacked. Only `unknown`
-    // is counted as a desync here: ambiguous and degraded were already counted
-    // by resolve_sessions under their own labels.
+    // is counted as a desync here: ambiguous, agent-mismatch and degraded were already
+    // counted by resolve_sessions under their own labels.
     std::string agent_id;
     {
         const auto resolution = resolve_sessions({request->session_id()});
@@ -1788,6 +1816,11 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         } else if (resolution.ambiguous.contains(request->session_id())) {
             spdlog::warn("[gateway] ProxyInventory: session {} is ambiguous in the route "
                          "directory; refusing",
+                         onbehalf::sanitize_for_log(request->session_id(), 64));
+        } else if (resolution.agent_mismatch.contains(request->session_id())) {
+            // Counted as agent_mismatch by resolve_sessions; not an unknown session.
+            spdlog::warn("[gateway] ProxyInventory: session {} names a different agent here than "
+                         "in the route directory; refusing",
                          onbehalf::sanitize_for_log(request->session_id(), 64));
         } else {
             record_directory_desync(metrics_, "proxy_inventory", "unknown_session");

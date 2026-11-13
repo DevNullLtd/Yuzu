@@ -2977,6 +2977,35 @@ TEST_CASE("WS-5 BatchHeartbeat: a NON-OWNING replica resolves a session known on
     CHECK(other.desync("renew_leases", "unknown_session") == 1);
 }
 
+// #6339 (UP-1): this replica's session map names agent Y for session S while the directory row
+// for S names agent X. The row alone used to win, attributing the heartbeat to X.
+TEST_CASE("WS-5 BatchHeartbeat: a session the local map and the directory attribute to DIFFERENT "
+          "agents is refused and listed for replay, never attributed (#6339)",
+          "[pg][gateway_route_wiring][ws5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+
+    const std::string sid = owner.register_live("yuzu_test_6339_local");
+    // Control: before any divergence the same heartbeat is acknowledged.
+    {
+        auto ok = owner.heartbeat({sid});
+        REQUIRE(ok.acknowledged_count() == 1);
+        REQUIRE(listed_unknown(ok).empty());
+    }
+    CHECK(owner.desync("session_lookup", "agent_mismatch") == 0);
+
+    // The directory now says a DIFFERENT agent holds S; the local map still says _local.
+    const std::string sql = "UPDATE gateway_route_store.agent_routes SET agent_id = "
+                            "'yuzu_test_6339_row' WHERE agent_id = 'yuzu_test_6339_local'";
+    raw_exec(db.dsn(), sql.c_str());
+
+    auto resp = owner.heartbeat({sid});
+    CHECK(resp.acknowledged_count() == 0); // not attributed to either agent
+    CHECK(listed_unknown(resp) == std::vector<std::string>{sid}); // listed so the gateway replays
+    CHECK(owner.desync("session_lookup", "agent_mismatch") == 1);
+    CHECK(owner.desync("session_lookup", "ambiguous_session") == 0);
+}
+
 TEST_CASE("WS-5 BatchHeartbeat: server-only restart reconcile lists the directory-known "
           "session once then the replayed ProxyRegister repopulates the local registry",
           "[pg][gateway_route_wiring][ws5]") {
