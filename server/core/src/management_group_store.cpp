@@ -26,6 +26,7 @@
 #include <system_error>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -238,8 +239,8 @@ void ManagementGroupStore::set_rbac_enabled_probe(std::function<bool()> probe) {
 
 // ── Group CRUD ───────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string>
-ManagementGroupStore::create_group(const ManagementGroup& group) {
+std::expected<void, std::string>
+ManagementGroupStore::validate_new_group(const ManagementGroup& group) const {
     if (!open_)
         return std::unexpected("database not open");
     if (group.name.empty())
@@ -258,6 +259,15 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
         if (ancestors->size() >= 5)
             return std::unexpected("maximum hierarchy depth (5) exceeded");
     }
+    return {};
+}
+
+std::expected<std::string, std::string>
+ManagementGroupStore::create_group(const ManagementGroup& group) {
+    // The single copy of the pre-insert checks. A caller that already ran
+    // `validate_new_group` is re-validated here: create_group is the authority.
+    if (auto valid = validate_new_group(group); !valid)
+        return std::unexpected(std::move(valid.error()));
 
     auto id = group.id.empty() ? generate_id() : group.id;
     auto now = now_secs();
