@@ -4,6 +4,8 @@
 **Date:** 2026-04-04
 **Audience:** Engineering, Security, Product, Operations, GTM, Executive Leadership
 
+> **Scope note (deployment contract).** Remarks in this document about rolling upgrades, rollbacks, mixed replicas or an earlier binary are hazard disclosures for the control they sit under, not statements that such an operation is supported. This build supports a fresh database only, with every writer on this build; no rolling, mixed-build or rollback operation is supported (`docs/user-manual/upgrading.md`, "Deployment contract (hard cutover)").
+
 ---
 
 ## 1) Executive Summary
@@ -716,7 +718,7 @@ step-up endpoint (verify `amr` before enabling; see
 
 *Second residual, CC8.1 (maker-checker on scheduled runs), closed by #6096:* every approval stamp,
 submission time included, is now database time, and a scheduled ticket is marked used when its
-occurrence is queued, so one approval runs at most one occurrence regardless of server clocks, once every replica runs the fixed binary. Further small
+occurrence is queued, so one approval runs at most one occurrence regardless of server clocks, once every replica runs the fixed binary. See the scope note at the top of this document. Further small
 residuals (database-clock steps expiring approved tickets, a stale `approved`
 status on lists until the next sweep, no approval or schedule alert rules) are tracked in #6097 and
 #6098. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can

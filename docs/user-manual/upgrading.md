@@ -7,6 +7,7 @@ and no rollback. An enrolled account that reads factor generation `0` (a databas
 on the step-up routes, approvals and JIT elevation until `yuzu-server --mfa-reset` clears its factor. A database written by the released v0.15.0 build or by any earlier release is a database
 written by an earlier build: deploy a fresh database. Read
 [the cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079).
+A statement elsewhere on this page that a rollback, a mixed fleet or an in-place upgrade is safe or supported describes that one change in an earlier release and does not apply to this build; the "Deployment contract (hard cutover)" governs.
 
 ## ⚠️ Breaking: result sets that are pending, failed or incomplete are refused where they could be misread
 
@@ -1620,34 +1621,24 @@ upgrading, run the read-only check and rename anything it lists**: see
 
 **2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
 `approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
-every existing row reads as "binds no request, excludes nobody" and behaves as before. The
+a row that sets none of them reads as "binds no request, excludes nobody". The
 migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
-`approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
-replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
+`approvals`. If a long-running or idle-in-transaction session holds that table, the replica
+cannot finish the migration and refuses to start (`Refusing to start: approval manager
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
 it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
-claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
-two separate transactions, and one already at v2 runs only v3. The v3 step is idempotent
-(`ADD COLUMN IF NOT EXISTS`), so a development or UAT database that ran an earlier build of this
-branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
-column that already exists.
+claimed v2 first, so a fresh database applies each approvals step in its own transaction. The v3
+step is idempotent (`ADD COLUMN IF NOT EXISTS`).
 
-- **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
-  tickets it and this build mint, all of which are unbound. The migration runner applies only
-  versions above the one stored for the store and has no newer-schema refusal, so an older binary
-  starts against a newer database: a build with neither change against a v2 or v3 database, and a
-  build with the #6096 change but not this one (highest version 2) against a v3 database. That is
-  established by reading the runner; it has not been exercised as a live rolling restart.
-- **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
-  which is the case for this whole release: the previous build ignores the columns and the
-  default-empty values lose nothing. Rolling back across the #6096 change as well has its own
-  consequences, described in that section.
-- **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
-  `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
-  redeems without comparing the frozen request. The change that first creates a bound ticket
-  (#6063) must not do so until every replica runs a build that includes this migration, and must
-  define what rollback means after that point. Until it does, a row with a non-empty
-  `request_json` is not expected to exist; if you find one, do not roll back.
+- **Mixed builds are outside the contract.** This release supports a fresh database only (see
+  "Deployment contract (hard cutover)" in the Forensics section of this page), so running this build
+  beside an earlier one is not supported.
+- **A return to the previous build** is outside the "Deployment contract (hard cutover)" in the
+  Forensics section of this page, so it is not a supported operation.
+- **A bound ticket needs every replica on this build.** The change that first creates a bound ticket
+  (#6063) must not mint one on a deployment where any replica runs an earlier build; that is outside the
+  "Deployment contract (hard cutover)". Until it ships, a row with a non-empty `request_json` is not expected
+  to exist; if you find one, the database was written outside that contract.
 
 **3. A new audit action and metric: `approval.precondition_denied` and
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
@@ -9246,7 +9237,7 @@ behave identically.
 cleanly into `failed` instead of spinning. Recovery procedure:
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md).
 
-**Rollback to a pre-AuthDB release** (only if you have not yet
+**Rollback to a pre-AuthDB release** (historical: v0.12.0, the retired SQLite `auth.db`; not a supported rollback for this build. Applies only if you have not yet
 written user state via the new dashboard):
 
 1. Stop the v0.12.0 server.
@@ -9336,17 +9327,15 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 
 **If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
-> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
 ## Rollback
 
-If an upgrade causes issues:
-
-1. Stop the new version
-2. Restore the backed-up `.db` and `.cfg` files
-3. Start the previous version binary
-
-**Important:** Rolling back after a schema migration requires restoring the database files from backup. The old binary cannot read the new schema.
+A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this
+page, and this page documents no rollback procedure. Recovery is to roll forward on the build that wrote the
+database, or to restore a backup taken from this deployment into a fresh deployment (see "Backup recommendation" in [Server Administration](server-admin.md));
+a database or backup written by an earlier build is unsupported. Whether an earlier binary works against a newer
+schema depends on the migration (see "When a server build finds its database ahead of it").
 
 ## Troubleshooting
 

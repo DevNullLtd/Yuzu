@@ -1397,7 +1397,7 @@ replica, review the window's `auth.login` and `mfa.enroll.verified` rows afterwa
 **During a rolling upgrade.** Counters are per replica. An un-upgraded replica still reports a Shape 1
 fault as `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` (and at sign-in also
 `yuzu_auth_read_degrade_total{route="login"}`) with a `store_unavailable` audit detail. Alert on both signals
-until every replica runs the same build.
+until every replica runs the same build. This applies to the #6995 signals only: the #6079 build is a hard cutover with no rolling or mixed-version window (see "Deployment contract (hard cutover)" in [Upgrading](../user-manual/upgrading.md)).
 
 ## Enrolling a non-admin approver
 
