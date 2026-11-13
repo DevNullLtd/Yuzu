@@ -27,7 +27,10 @@
 /// Events are an **immutable audit-style log** — intentionally no foreign key
 /// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
 /// When a rule is deleted, its historical events remain for forensic review.
-/// Time-based expiry is the single retention mechanism.
+/// Time-based expiry is the single retention mechanism for events. An agent decommission
+/// (`delete_agent`) does not change that: it retires the agent's pending census evidence (clears
+/// the pending flag of its pending events) and deletes its census rows, and no event row is
+/// deleted.
 ///
 /// ── Posture (ADR-0012 §1 / ADR-0038), split by table family ─────────────────
 ///  - **Rules + meta reads — AUTHORITATIVE, type-distinguishable** (the
@@ -52,9 +55,9 @@
 ///    dropped enforcement-history row is re-derivable from the agent's next
 ///    report cycle; ingest must never block the gRPC thread. Infra-level
 ///    drops (pool exhaustion / lease timeout / BEGIN-prepare-exec-commit
-///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family (ADR-0037
-///    label convention) IN ADDITION to the existing four-way
-///    `EventInsertOutcome` classification + its per-outcome atomics below.
+///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family
+///    (ADR-0037 label convention) IN ADDITION to the existing four-way `EventInsertOutcome`
+///    classification + its per-outcome atomics below.
 ///  - **Status upserts — fail-soft**; the census upsert has its own failure counter and runs in
 ///    the event transaction under a savepoint (ADR-0038 Update, 2026-10-31, #5674); status READS
 ///    stay type-distinguishable (see above).
@@ -99,6 +102,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -323,6 +327,18 @@ public:
     std::expected<void, std::string> create_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> update_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> delete_rule(const std::string& rule_id);
+    /// Decommission erasure (ADR-0024 Decision 11 cascade member, #5675). One transaction in the
+    /// census writers' lock order: the agent's pending events are locked in `ingest_seq` order and
+    /// retired (`projection_pending = false`), then the agent's census rows are deleted. No rule
+    /// row is locked. True iff the transaction committed; zero rows is still true (idempotent).
+    /// False on an empty id, a store that is not open, a lease timeout, a failed statement or a
+    /// failed COMMIT (the whole transaction is rolled back). The event log and the DEX
+    /// observations are NOT erased (they expire by retention, which is 30 days by default; rows
+    /// written while the retention setting is 0 or below never expire). This is not a rule
+    /// mutation: no policy-generation bump, no `on_rule_mutation_` hook, no push. A still-running
+    /// agent's next census-bearing event (after a state change, an agent restart or a rule push;
+    /// not on a schedule) re-creates its row (stop the agent first).
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
     /// Three-state read (ADR-0038 catastrophic-read set): found / genuinely
     /// absent (`std::nullopt`) / degraded (`std::unexpected`). Callers MUST
     /// treat a degrade as "cannot verify" (503), never as "not found" (404).

@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 
 using namespace yuzu::installed_apps::inventory;
 
@@ -209,8 +210,22 @@ TEST_CASE("parse_dpkg_inv_line keeps installed+held, drops the rest (matches PR 
         CHECK_FALSE(parse_dpkg_inv_line("bash\ti\t1.0-1\tamd64\tX").has_value());
         CHECK_FALSE(parse_dpkg_inv_line("bash\t\t1.0-1\tamd64\tX").has_value());
     }
+    SECTION("a tab inside the Maintainer keeps the row; the publisher is the head segment") {
+        const auto r = parse_dpkg_inv_line("bash\tii\t1:5.2.21-2ubuntu4\tamd64\tAcme\tLabs <a@x>");
+        REQUIRE(r.has_value());
+        CHECK(r->name == "bash");
+        CHECK(r->epoch == "1");
+        CHECK(r->version == "5.2.21");
+        CHECK(r->release == "2ubuntu4");
+        CHECK(r->arch == "amd64");
+        CHECK(r->publisher == "Acme");
+        // the not-installed states stay excluded when the maintainer carries a tab
+        CHECK_FALSE(parse_dpkg_inv_line("old-pkg\trc\t1.0-1\tamd64\tAcme\tLabs").has_value());
+        CHECK_FALSE(parse_dpkg_inv_line("stray-pkg\tun\t1.0-1\tamd64\tAcme\tLabs").has_value());
+    }
     SECTION("wrong token count is dropped") {
         CHECK_FALSE(parse_dpkg_inv_line("bash\tii\t1.0-1").has_value());
+        CHECK_FALSE(parse_dpkg_inv_line("bash\tii\t1.0-1\tamd64").has_value()); // four tokens
         CHECK_FALSE(parse_dpkg_inv_line("").has_value());
     }
 }
@@ -227,9 +242,10 @@ TEST_CASE("rpm_sig_present treats only a real stored-tag value as present",
 TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR #1804's "
           "rpm_sig_present exactly)",
           "[installed_apps][inventory]") {
+    // Field order: NAME EPOCH VERSION RELEASE ARCH INSTALLTIME SIGPGP RSAHEADER VENDOR PACKAGER
     SECTION("fully populated, payload+header both signed") {
         const auto r = parse_rpm_inv_line(
-            "bash\t0\t5.2.21\t3.fc40\tx86_64\tFedora Project\tMon 01 Jan 2026\tsigpgpblob\trsahdrblob\tFedora Project");
+            "bash\t0\t5.2.21\t3.fc40\tx86_64\tMon 01 Jan 2026\tsigpgpblob\trsahdrblob\tFedora Project\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->name == "bash");
         CHECK(r->epoch == "0");
@@ -244,31 +260,31 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
     }
     SECTION("header-signed only (SIGPGP (none)) still reads signed -- the modern RHEL/Fedora case") {
         const auto r = parse_rpm_inv_line(
-            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\trsahdrblob\tFedora Project");
+            "openssl\t1\t3.1.4\t1.fc40\tx86_64\td\t(none)\trsahdrblob\tFedora Project\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "signed");
     }
     SECTION("payload-signed only (RSAHEADER (none)) still reads signed") {
         const auto r =
-            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\tsigpgpblob\t(none)\tFedora Project");
+            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\td\tsigpgpblob\t(none)\tFedora Project\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "signed");
     }
     SECTION("both tags absent reads unsigned") {
         const auto r =
-            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t(none)\t(none)\tFedora Project");
+            parse_rpm_inv_line("openssl\t1\t3.1.4\t1.fc40\tx86_64\td\t(none)\t(none)\tFedora Project\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "unsigned");
     }
     SECTION("old-rpm literal %{...} echo on both tags reads unsigned, never a false positive") {
         const auto r = parse_rpm_inv_line(
-            "openssl\t1\t3.1.4\t1.fc40\tx86_64\tFedora Project\td\t%{SIGPGP}\t%{RSAHEADER}\tFedora Project");
+            "openssl\t1\t3.1.4\t1.fc40\tx86_64\td\t%{SIGPGP}\t%{RSAHEADER}\tFedora Project\tFedora Project");
         REQUIRE(r.has_value());
         CHECK(r->signature_status == "unsigned");
     }
     SECTION("(none) epoch/arch/packager map to honest-empty") {
         const auto r = parse_rpm_inv_line(
-            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\t(none)\tTue 02 Jan 2026\t(none)\t(none)\t(none)");
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tTue 02 Jan 2026\t(none)\t(none)\t(none)\t(none)");
         REQUIRE(r.has_value());
         CHECK(r->epoch.empty());
         CHECK(r->arch.empty());
@@ -279,37 +295,119 @@ TEST_CASE("parse_rpm_inv_line maps (none) and pins signature values (matches PR 
         // Shape of a Rocky Linux 9 row (rpm 4.16): PACKAGER is the build system's address,
         // VENDOR the org.
         const auto rocky = parse_rpm_inv_line(
-            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tRocky Linux Build System (Peridot) "
-            "<releng@rockylinux.org>\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
-            "Rocky Enterprise Software Foundation");
+            "libgcc\t(none)\t11.4.1\t2.1.el9\taarch64\tSun Nov 19 22:25:36 2023\t(none)\t89024a04\t"
+            "Rocky Enterprise Software Foundation\t"
+            "Rocky Linux Build System (Peridot) <releng@rockylinux.org>");
         REQUIRE(rocky.has_value());
         CHECK(rocky->publisher == "Rocky Enterprise Software Foundation");
         // VENDOR (none), PACKAGER set: the fallback is the packager, not an empty publisher.
         const auto fallback = parse_rpm_inv_line(
-            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\tFedora (43) Signing\td\t(none)\t(none)\t(none)");
+            "gpg-pubkey\t(none)\tabc123\t4f2a6fd2\t(none)\td\t(none)\t(none)\t(none)\tFedora (43) Signing");
         REQUIRE(fallback.has_value());
         CHECK(fallback->publisher == "Fedora (43) Signing");
         // both unset: empty, the agent core labels it via:rpm
-        const auto none = parse_rpm_inv_line("p\t0\t1\t1\tnoarch\t(none)\td\t(none)\t(none)\t(none)");
+        const auto none = parse_rpm_inv_line("p\t0\t1\t1\tnoarch\td\t(none)\t(none)\t(none)\t(none)");
         REQUIRE(none.has_value());
         CHECK(none->publisher.empty());
         // an old rpm echoes an unknown tag as the literal format string: never a publisher
         const auto echoed_vendor = parse_rpm_inv_line(
-            "p\t0\t1\t1\tnoarch\tAcme Packager\td\t(none)\t(none)\t%{VENDOR}");
+            "p\t0\t1\t1\tnoarch\td\t(none)\t(none)\t%{VENDOR}\tAcme Packager");
         REQUIRE(echoed_vendor.has_value());
         CHECK(echoed_vendor->publisher == "Acme Packager");
         const auto echoed_both = parse_rpm_inv_line(
-            "p\t0\t1\t1\tnoarch\t%{PACKAGER}\td\t(none)\t(none)\t%{VENDOR}");
+            "p\t0\t1\t1\tnoarch\td\t(none)\t(none)\t%{VENDOR}\t%{PACKAGER}");
         REQUIRE(echoed_both.has_value());
         CHECK(echoed_both->publisher.empty());
     }
-    SECTION("wrong token count is dropped") {
-        CHECK_FALSE(parse_rpm_inv_line("bash\t0\t5.2.21").has_value());
-        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\tonly-eight-tokens").has_value());
-        // a nine-token row (no VENDOR column) is the wrong shape: dropped
-        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\t(none)\t(none)").has_value());
-        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\tX\td\t(none)\t(none)\tV\textra").has_value());
+    SECTION("a tab inside a free-text tag keeps the row; the publisher is the head segment") {
+        // VENDOR carries a tab: the fixed fields are exact and the row is kept.
+        const auto vendor = parse_rpm_inv_line(
+            "bash\t0\t5.2.21\t3.fc40\tx86_64\tMon 01 Jan 2026\tsigpgpblob\trsahdrblob\t"
+            "Acme\tLabs\tFedora Project");
+        REQUIRE(vendor.has_value());
+        CHECK(vendor->name == "bash");
+        CHECK(vendor->epoch == "0");
+        CHECK(vendor->version == "5.2.21");
+        CHECK(vendor->release == "3.fc40");
+        CHECK(vendor->arch == "x86_64");
+        CHECK(vendor->install_date == "Mon 01 Jan 2026");
+        CHECK(vendor->signature_status == "signed");
+        CHECK(vendor->publisher == "Acme");
+        // PACKAGER carries a tab, VENDOR unset: the packager's head segment is the fallback.
+        const auto packager = parse_rpm_inv_line(
+            "p\t0\t1\t1\tnoarch\td\t(none)\t(none)\t(none)\tJane\tDoe <jane@example.org>");
+        REQUIRE(packager.has_value());
+        CHECK(packager->version == "1");
+        CHECK(packager->arch == "noarch");
+        CHECK(packager->publisher == "Jane");
+        // VENDOR whose first byte is a tab: its head segment is empty, so the next token is used
+        // (pinned: the row is kept either way).
+        const auto leading = parse_rpm_inv_line(
+            "p\t0\t1\t1\tnoarch\td\t(none)\t(none)\t\tLabs\tFedora Project");
+        REQUIRE(leading.has_value());
+        CHECK(leading->name == "p");
+        CHECK(leading->publisher == "Labs");
     }
+    SECTION("token count: nine tokens keep the row, eight or fewer are dropped") {
+        const auto nine = parse_rpm_inv_line("p\t0\t1\t1\tnoarch\td\t(none)\t(none)\tVendorOnly");
+        REQUIRE(nine.has_value());
+        CHECK(nine->publisher == "VendorOnly");
+        CHECK_FALSE(parse_rpm_inv_line("bash\t0\t5.2.21").has_value());
+        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\td\tonly-seven-tokens").has_value());
+        CHECK_FALSE(parse_rpm_inv_line("p\t0\t1\t1\tnoarch\td\t(none)\t(none)").has_value());
+    }
+}
+
+
+TEST_CASE("kRpmInvQueryFormat feeds parse_rpm_inv_line: every tag lands in its slot",
+          "[installed_apps][inventory]") {
+    // The producer half of the rpm contract. Each tag of the REAL query format expands to a
+    // distinct value and the resulting line is parsed, so reordering the format moves a value
+    // out of the slot the parser reads it from.
+    const auto value_for = [](std::string_view tag) -> std::string {
+        if (tag == "%{NAME}") return "pkg";
+        if (tag == "%{EPOCH}") return "7";
+        if (tag == "%{VERSION}") return "1.2";
+        if (tag == "%{RELEASE}") return "3.el9";
+        if (tag == "%{ARCH}") return "aarch64";
+        if (tag == "%{INSTALLTIME:date}") return "Mon 01 Jan 2026";
+        if (tag == "%{SIGPGP}") return "sigpgpblob";
+        if (tag == "%{RSAHEADER}") return "(none)";
+        if (tag == "%{VENDOR}") return "VendorCo";
+        if (tag == "%{PACKAGER}") return "Jane Packager";
+        return {};
+    };
+
+    std::string fmt{kRpmInvQueryFormat};
+    REQUIRE_FALSE(fmt.empty());
+    REQUIRE(fmt.back() == '\n');
+    fmt.pop_back();
+    const auto tags = detail::split_tabs(fmt);
+    REQUIRE(tags.size() == 10);
+    // The two free-text tags are the last two, in this order.
+    CHECK(tags[8] == "%{VENDOR}");
+    CHECK(tags[9] == "%{PACKAGER}");
+
+    std::string line;
+    for (std::size_t i = 0; i < tags.size(); ++i) {
+        const std::string v = value_for(tags[i]);
+        INFO("unmapped rpm tag: " << tags[i]);
+        REQUIRE_FALSE(v.empty());
+        if (i != 0)
+            line += '\t';
+        line += v;
+    }
+
+    const auto r = parse_rpm_inv_line(line);
+    REQUIRE(r.has_value());
+    CHECK(r->name == "pkg");
+    CHECK(r->epoch == "7");
+    CHECK(r->version == "1.2");
+    CHECK(r->release == "3.el9");
+    CHECK(r->arch == "aarch64");
+    CHECK(r->install_date == "Mon 01 Jan 2026");
+    CHECK(r->signature_status == "signed");
+    CHECK(r->publisher == "VendorCo"); // VENDOR, not PACKAGER
 }
 
 TEST_CASE("parse_pacman_inv_line splits name and EVR", "[installed_apps][inventory]") {

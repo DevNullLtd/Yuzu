@@ -28,6 +28,7 @@
 
 #include "runtimes_win_parsers.hpp"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -99,10 +100,41 @@ TEST_CASE("runtimes win: finish_rows sorts, dedupes and refuses rows past the by
     CHECK(acc.reason() == "tok");
 }
 
+TEST_CASE("runtimes win: drive_relative_name splits a drive path and refuses every spelling the NT "
+          "open would resolve differently",
+          "[runtimes][jvm][windows]") {
+    using yuzu::win::drive_relative_name;
+    const auto ok = [](const std::wstring& in, const std::wstring& want) {
+        INFO("accepts " << std::string(in.begin(), in.end()));
+        const auto r = drive_relative_name(in);
+        REQUIRE(r.has_value());
+        CHECK(*r == want);
+    };
+    ok(L"C:\\Program Files\\Temurin\\release", L"Program Files\\Temurin\\release");
+    ok(L"C:/jdk/release", L"jdk\\release");                // either separator, folded to a backslash
+    ok(L"d:\\jdk/bin\\release", L"jdk\\bin\\release");   // mixed separators, lower-case drive
+    ok(L"C:\\release", L"release");
+
+    const std::vector<std::wstring> refused{
+             L"", L"C:", L"C:\\", L"C:/",                // no remainder
+             L"\\\\host\\share\\release", L"\\\\?\\C:\\jdk\\release", // UNC / device paths
+             L"release", L"jdk\\release", L"1:\\jdk\\release",     // relative, not a drive letter
+             L"C:jdk\\release",                                   // drive-relative, no separator
+             L"C:\\jdk\\..\\release", L"C:\\jdk\\.\\release", L"C:\\..\\release", // dot segments
+             L"C:\\a\\\\b", L"C:\\a//b", L"C:\\jdk\\",          // empty segments
+             L"C:\\jdk.\\release", L"C:\\jdk \\release", L"C:\\jdk\\release.", L"C:\\jdk\\release ", // trailing . or space
+             std::wstring{L"C:\\jdk\\re"} + std::wstring(1, L'\0') + L"lease"}; // embedded NUL
+    for (const auto& bad : refused) {
+        INFO("refuses a name of " << bad.size() << " wide chars");
+        CHECK_FALSE(drive_relative_name(bad).has_value());
+    }
+}
+
 #ifdef _WIN32
 
 #include "local_dispatcher.hpp" // yuzu::agent::LocalDispatcher (a real CommandContext)
 #include "test_helpers.hpp" // yuzu::test::ScopeExit
+#include "win_junction_test_support.hpp" // yuzu::test::create_junction / JunctionCleanup
 
 #include <win_reg_handle.hpp>
 #include <yuzu/plugin.h>
@@ -1179,7 +1211,7 @@ TEST_CASE("runtimes win: RealRegOps reads planted dotnet values and a Release DW
 
 TEST_CASE("runtimes win: RealRegOps::read_file_bounded reads a plain file and refuses what it must not open",
           "[runtimes][jvm][windows]") {
-    // The real CreateFileW path, once. engaged-and-empty = no such file; nullopt = not read.
+    // The real open path (NtCreateFile relative to the drive root), once. engaged-and-empty = no such file; nullopt = not read.
     namespace fs = std::filesystem;
     const yuzu::test::TempDir tmp{"yuzu_test_runtimes_release_"};
     const fs::path& dir = tmp.path;
@@ -1221,6 +1253,59 @@ TEST_CASE("runtimes win: RealRegOps::read_file_bounded reads a plain file and re
     // A missing ancestor is a missing file, not a refusal.
     CHECK(ops.read_file_bounded((dir / "nodir" / "release").wstring(), kCap) ==
           std::optional<std::string>{std::string{}});
+}
+
+TEST_CASE("runtimes win: read_file_bounded follows no reparse point below the drive root",
+          "[runtimes][jvm][windows]") {
+    // Junctions are built without a privilege (FSCTL_SET_REPARSE_POINT), so these always run.
+    // nullopt = refused; engaged-and-empty would mean "absent", which a refused link must never read as.
+    namespace fs = std::filesystem;
+    const yuzu::test::TempDir tmp{"yuzu_test_runtimes_norepar_"};
+    const fs::path& dir = tmp.path;
+    std::error_code ec;
+    const std::string other_body = "JAVA_VERSION=\"8.0.1\"\n";
+    const std::string plain_body = "JAVA_VERSION=\"21.0.1\"\n";
+    fs::create_directories(dir / "other", ec);
+    { std::ofstream(dir / "other" / "release", std::ios::binary) << other_body; }
+    fs::create_directories(dir / "a" / "b", ec);
+    { std::ofstream(dir / "a" / "b" / "release", std::ios::binary) << plain_body; }
+
+    const rwin::RealRegOps ops;
+    constexpr std::size_t kCap = 64 * 1024;
+
+    // A plain nested tree still reads.
+    CHECK(ops.read_file_bounded((dir / "a" / "b" / "release").wstring(), kCap) ==
+          std::optional<std::string>{plain_body});
+
+    // A junction ANCESTOR to a directory holding a different `release` is refused, not read.
+    const fs::path via = dir / "via";
+    REQUIRE(yuzu::test::create_junction(via, dir / "other"));
+    const yuzu::test::JunctionCleanup via_cleanup{via};
+    CHECK_FALSE(ops.read_file_bounded((via / "release").wstring(), kCap).has_value());
+
+    // A junction LEAF (the `release` name itself is a link) is refused.
+    const fs::path home = dir / "home";
+    fs::create_directories(home, ec);
+    const fs::path leaf = home / "release";
+    REQUIRE(yuzu::test::create_junction(leaf, dir / "other"));
+    const yuzu::test::JunctionCleanup leaf_cleanup{leaf};
+    CHECK_FALSE(ops.read_file_bounded(leaf.wstring(), kCap).has_value());
+
+    // A junction ancestor whose target no longer exists is refused, never "absent".
+    const fs::path gone_target = dir / "gone";
+    fs::create_directories(gone_target, ec);
+    const fs::path dangling = dir / "dangling";
+    REQUIRE(yuzu::test::create_junction(dangling, gone_target));
+    const yuzu::test::JunctionCleanup dangling_cleanup{dangling};
+    fs::remove(gone_target, ec);
+    CHECK_FALSE(ops.read_file_bounded((dangling / "release").wstring(), kCap).has_value());
+
+    // A genuinely missing file in a real tree is still absent (engaged and empty).
+    CHECK(ops.read_file_bounded((dir / "a" / "b" / "nope").wstring(), kCap) ==
+          std::optional<std::string>{std::string{}});
+    // A name the NT open would spell differently from CreateFileW is refused, not read as absent.
+    CHECK_FALSE(ops.read_file_bounded((dir.wstring() + L"\\a\\.\\b\\release"), kCap).has_value());
+    CHECK_FALSE(ops.read_file_bounded((dir.wstring() + L"\\a \\b\\release"), kCap).has_value());
 }
 
 #endif // _WIN32

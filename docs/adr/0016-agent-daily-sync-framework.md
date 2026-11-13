@@ -1384,9 +1384,11 @@ the fallback.
 | `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
 | `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle with an openable `Contents` and no `release` file under `Contents/Home`, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
 
-The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
-literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
-takes ten tokens. The `list` action has its own columns.
+The rpm `list_inventory` query format (`kRpmInvQueryFormat`) has ten columns, the two free-text
+tags last: `%{VENDOR}` then `%{PACKAGER}`. The pinned argv literal in
+`docs/agent-spawn-sink-manifest.md` carries the same format. `parse_rpm_inv_line` takes at least
+nine tokens: the publisher is `VENDOR` when set, else `PACKAGER`, each read as the text before any
+tab it contains. The `list` action has its own columns.
 
 **The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
 `kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
@@ -1767,3 +1769,9 @@ Two recorded limits of the writer: component records are still normalised inside
 (idempotent, and unreachable until a producer exists; the component change plans them pre-normalised and
 drops that call), and the agent tests' server oracle is a test-local copy of the server recipe (the agent
 tests cannot link the store), so the server's golden vectors stay the cross-pin and both change together.
+
+## Routed-concern invariants
+
+Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Agent daily-sync framework + installed-software inventory (ADR-0016) — agent pushes per-source state daily over `ReportInventory` (hash-skip); sources: #1 `installed_software` (blob v3, a section per source: `installed_apps.list_inventory` — `list` rows are never hashed; `pkg_inventory.*`, `windows_optional_features.list`, `msi_packages.list_inventory`, `runtimes.*`, `middleware.ibm_mq`, `hardware.drivers_inventory`), #2 `app_perf`, #3 `device_ci` (serial/UUID/MAC = GDPR personal data → behavioural-PII tier). CRITICAL: (1) `inventory_state.last_seen`/`first_seen` = SERVER receipt time, never agent `collected_at` (#1685); (2) a new sync source is a new `plugin_data` map KEY, NOT a proto field (no `agent_pb`/`gateway_pb` regen); (3) Windows registry STRING reads use `Reg*W` via `win_str.hpp`, never `Reg*A` (#1662/#1682); (4) the v3 section hash is hashed byte-for-byte on agent (`agents/core/src/installed_software_v3.cpp`, the only writer) + server (`software_inventory_store.cpp`): 16 slots, slot 14 (uninstall_string) RESERVED (#5186), slot 13 (install_location) an agent-side allowlist (§8: kept under a machine root, else blanked), source = facet, publisher never empty — a one-sided change breaks hash agreement for good; the writer follows the `v3:` held-facet rule and commits on ack (a status-only ack ERASES the facet's acked set); a degraded answer is a status-only section, never rows; collector workers drain before plugin shutdown.

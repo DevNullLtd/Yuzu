@@ -100,6 +100,14 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # The one set_known_plugins(...) line in server.cpp bounds the yuzu_fleet_plugin_init_failed
+      # label; no unit test builds ServerImpl, so dropping it leaves every test green.
+      - name: Plugin init failed wiring gate
+        run: python3 -I tests/test_plugin_init_failed_wiring_lexical.py
+
+      - name: Plugin init failed wiring gate self-test
+        run: python3 -I tests/test_plugin_init_failed_wiring_lexical_selftest.py
+
       # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
       # no source or manual claims an absent command_id proves a step was never sent.
       - name: Workflow execute docs gate (#2146)
@@ -248,6 +256,14 @@ jobs:
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
 
+      # OpenAPI authoring: a dev-side author adding an operation to rest_api_v1.cpp meets the C++
+      # completeness tests one kind of mistake per full Linux build (no operationId, then the
+      # checksum pin, then an untyped success response outside kUntyped). This lexical twin reports
+      # all of them at once, plus the 15,000-byte literal segment ceiling, with no build. Stdlib
+      # only; also registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: OpenAPI operation authoring (operationId, pin, typed responses)
+        run: python3 -I tests/test_openapi_operation_authoring.py
+
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.
       - name: Changelog promote --append
@@ -279,7 +295,26 @@ jobs:
       # check-release-artifacts.sh and build-agent-bundle.sh. Mutation-tests
       # itself. Stdlib only.
       - name: Agent-only release lint
+        env:
+          # The runner image ships pwsh and the system PyYAML: require them so
+          # the behavioural server-DLL refusal test cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
         run: python3 -I tests/test_release_agent_only.py
+
+      # Agent-bundle release verification (#7529): build-agent-bundle.sh
+      # verifies SHA256SUMS' cosign signature (exact identity per signing era)
+      # before use and matches each file to its own line. Offline: stub gh and
+      # cosign, asserts cosign's argv; mutation-tests itself. Stdlib only.
+      - name: Agent bundle release verification
+        run: python3 -I tests/test_build_agent_bundle_verify.py
+
+      # The `server` feature option (ADR-0035 ladder step 3): lexical pins on
+      # meson.options and meson.build's guard, with a mutation self-test. The
+      # behavioural half (a real configure for Windows/macOS/Linux targets)
+      # skips here, where meson is not installed, and runs in `meson test
+      # --suite docs`.
+      - name: Server feature option lint
+        run: python3 -I tests/test_server_feature_option.py
 
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,

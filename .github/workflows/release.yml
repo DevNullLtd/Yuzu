@@ -98,9 +98,12 @@ jobs:
             echo "::error::release.yml must run from a release tag, not ${GITHUB_REF_TYPE:-<unset>} '${tag}' (dispatch with --ref vX.Y.Z). Refusing (#5282)."
             exit 1
           fi
-          re='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)[0-9]+)?$'
+          # 1-4 digits per field: scripts/build-agent-bundle.sh (the post-release
+          # agent-bundle job) refuses wider fields, so a tag it would reject must
+          # not be allowed to publish a release first (#7529).
+          re='^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)[0-9]{1,4})?$'
           if [[ ! "$tag" =~ $re ]]; then
-            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N). Refusing (#5282)."
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N, 1-4 digits per number). Refusing (#5282)."
             exit 1
           fi
           out="$(mktemp)"; err="$(mktemp)"; rc=0
@@ -731,11 +734,13 @@ jobs:
         shell: pwsh
         run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
-      # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
-      # persist on the self-hosted Windows runner between jobs. The
-      # original cache/restore@v5 calls were already restore-only —
-      # local persistence delivers the same restore semantics without
-      # any GHA round-trip. Issue #569.
+      # ccache (~\AppData\Local\ccache) persists on the self-hosted
+      # Windows runner between jobs (the original cache/restore@v5 calls
+      # were already restore-only — local persistence delivers the same
+      # restore semantics without any GHA round-trip, issue #569).
+      # vcpkg_installed/ does NOT persist for this job: the default
+      # clean: true checkout runs git clean -ffdx, so every release run
+      # installs its own agent-only tree.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -761,14 +766,18 @@ jobs:
 
       - name: Install vcpkg packages
         run: |
+          # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature
+          # (libpq, xmlsec, drogon) and no `tests` (-Dbuild_tests=false).
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
             --triplet x64-windows `
-            --x-manifest-root="${{ github.workspace }}"
+            --x-manifest-root="${{ github.workspace }}" `
+            --x-no-default-features
 
       # Agent only (ADR-0035): the server is supported on Linux only, so the
       # Windows release builds and ships the agent and its plugins, never
-      # yuzu-server.exe. Pinned by tests/test_release_agent_only.py. Ladder
-      # step 3 renames the switch to the `server` feature option.
+      # yuzu-server.exe. -Dserver=disabled is explicit here (this job starts
+      # from a clean checkout, so no stored option can reach an older
+      # branch). Pinned by tests/test_release_agent_only.py.
       - name: Configure (Meson release)
         env:
           CC: ccache cl
@@ -779,7 +788,7 @@ jobs:
             -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
             -Dbuild_tests=false `
-            -Dbuild_server=false
+            -Dserver=disabled
 
       - name: Build
         run: meson compile -C build-windows -j $env:YUZU_BUILD_JOBS
@@ -862,11 +871,10 @@ jobs:
           Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
-          # every DLL vcpkg installed, so until ADR-0035 ladder step 3 drops
-          # the server ports from the Windows vcpkg install, the agent archive
-          # still carries server-only DLLs (libpq, drogon, trantor, xmlsec). They
-          # are unused by the agent; pruning them by hand here, with no RC to
-          # prove the list, was judged riskier than one more release with them.
+          # every DLL vcpkg installed; since ADR-0035 step 3 the install above
+          # is agent-only, so the server-only DLLs (libpq and its libecpg/
+          # libpgtypes siblings, drogon, trantor, jsoncpp, xmlsec) are not
+          # installed; the verify step below refuses the archive if one is.
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
@@ -898,6 +906,15 @@ jobs:
           $agent = Join-Path $bin "yuzu-agent.exe"
           if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }
           if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error "yuzu-server.exe found in the agent archive"; exit 1 }
+          # ADR-0035 step 3: the install is agent-only, so a server-only DLL in the archive means the
+          # vcpkg profile regressed. The patterns cover the nine DLLs that a full x64-windows vcpkg
+          # tree has and an agent-only one lacks (measured on a real tree): drogon, jsoncpp,
+          # libecpg, libecpg_compat, libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor.
+          # UNVERIFIED on a release: this check ran in the ADR-0035 step-3 Windows rehearsal (not a
+          # release) and has not yet run on a real release tag; until then it is lexically pinned and
+          # rehearsed, not operationally proven.
+          $serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "libecpg*.dll", "libpgtypes*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll" | ForEach-Object { $_.Name })
+          if ($serverDlls.Count -gt 0) { Write-Error "server-only DLLs in the agent archive: $($serverDlls -join ', ')"; exit 1 }
           $built = @(Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse).Count
           $packed = @(Get-ChildItem -Path (Join-Path $top.FullName "plugins") -Filter "*.dll").Count
           if ($built -lt 1 -or $packed -ne $built) { Write-Error "plugin DLLs: built $built, in the archive $packed"; exit 1 }
@@ -997,10 +1014,12 @@ jobs:
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
       # Known limitation: `path: .` scans the whole workspace (the vcpkg
-      # ports tree and build trees too), so this SBOM lists components the
-      # agent archive does not ship or load (thousands of entries, the
-      # server's dependencies such as libpq among them). The release notes
-      # and release-verification.md say so.
+      # ports tree and build trees too), so this SBOM can list components the
+      # agent archive does not ship or load. Since ADR-0035 step 3 the vcpkg
+      # install on this runner is agent-only, so the server's dependencies
+      # (libpq, drogon, xmlsec) are no longer installed here; whether Syft
+      # still reports them from the ports tree is unverified until a release
+      # SBOM is inspected. The release notes and release-verification.md say so.
       - name: Generate Windows SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1086,9 +1105,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
-          # ADR-0006) runs autoreconf during its build and the hosted macOS
-          # image doesn't ship autotools.
+          # autoconf/automake/libtool: installed back when vcpkg's libpq port
+          # (Postgres substrate, ADR-0006) ran autoreconf on this leg. This
+          # install is agent-only since ADR-0035 step 3 (no libpq), so they
+          # may no longer be needed; kept until a macOS run proves the leg
+          # builds without them (the hosted image doesn't ship autotools).
           #
           # cmake deliberately excluded from this brew line, pinned via pipx
           # below instead. 2026-07-16: brew's floating `cmake` drifted to
@@ -1169,9 +1190,11 @@ jobs:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-macos
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Agent-only vcpkg profile (ADR-0035 step 3), no tests.
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
-            --x-manifest-root=${{ github.workspace }}
+            --x-manifest-root=${{ github.workspace }} \
+            --x-no-default-features
 
       - name: Configure (Meson release + LTO)
         env:
@@ -1190,14 +1213,14 @@ jobs:
           # is unchanged.
           # Agent only (ADR-0035): the server is supported on Linux only, so the
           # macOS release never builds or ships yuzu-server. Pinned by
-          # tests/test_release_agent_only.py; ladder step 3 renames the switch
-          # to the `server` feature option.
+          # tests/test_release_agent_only.py. -Dserver=disabled is explicit
+          # (clean checkout, nothing stored).
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=false \
-            -Dbuild_server=false \
+            -Dserver=disabled \
             -Db_lto=true \
             -Dbackend_max_links=1
 
@@ -1388,8 +1411,9 @@ jobs:
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
       # Same known limitation as the Windows SBOM: `path: .` covers the
-      # whole workspace, so it lists components the agent archive does not
-      # ship, the server's dependencies such as libpq among them.
+      # whole workspace, so it can list components the agent archive does not
+      # ship. The vcpkg install is agent-only (ADR-0035 step 3), so the
+      # server's dependencies are not installed on this runner either.
       - name: Generate macOS SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -1445,9 +1469,15 @@ jobs:
   # Runs on the self-hosted Linux runner (native dockerd, systemd-managed).
   # Both images build in parallel via matrix; buildx registry cache persists
   # across releases so repeat runs with unchanged vcpkg/rebar deps are fast.
+  # build-windows and build-macos are in the needs: so a failed agent
+  # packaging step (e.g. the Windows "Verify the agent runs from the packaged
+  # archive" refusal) stops the push before any :X.Y.Z image exists; without
+  # them the images were pushed while no GitHub Release was created (ADR-0035
+  # step 3, UP-12). Neither build job has an `if:`, so neither is skipped on
+  # any tag, and docker-publish has no `if:` that reads needs.*.
   docker-publish:
     name: "Publish ${{ matrix.image }} image"
-    needs: [release-guard, build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     permissions:
@@ -1689,17 +1719,20 @@ jobs:
   # Postgres 16 + pgvector + app role/db init (ADR-0006/0007/0008, #1318).
   # Mirrors docker-publish (login / metadata / SBOM / attestation / cosign)
   # with three differences:
-  #   1. No needs on build-linux/build-gateway — the image contains no Yuzu
-  #      build artifacts (it's postgres + pgvector + init SQL), so a core
-  #      build failure is irrelevant to it. It IS in the release job's
-  #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
-  #      so a release must not publish if this image failed to.
+  #   1. The image contains no Yuzu build artifacts (it's postgres + pgvector
+  #      + init SQL), so no build is an INPUT to it. It still waits for all
+  #      four builds (build-linux, build-gateway, build-windows, build-macos),
+  #      purely as a success gate: no :X.Y.Z image is pushed for a release
+  #      whose server or agent packaging fails (ADR-0035 step 3, UP-12; owner
+  #      decision 2026-11-12). It IS in the release job's needs: the composes
+  #      release-pin ghcr.io/.../yuzu-postgres:X.Y.Z, so a release must not
+  #      publish if this image failed to.
   #   2. amd64-only today: the QEMU arm64 leg was dropped (see the buildx
   #      step); the demo/viz rigs would need it back.
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
-    needs: [release-guard]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:
@@ -1874,7 +1907,9 @@ jobs:
   #      collides with docker-publish's cache.
   docker-publish-chisel:
     name: "Publish ${{ matrix.image }}-chisel image"
-    # Mirror docker-publish's needs (core builds must pass). The release job
+    # Mirror docker-publish's needs (core builds AND the Windows/macOS agent
+    # builds must pass, so no :X.Y.Z image is pushed for a release whose agent
+    # packaging fails; ADR-0035 step 3, UP-12). The release job
     # NEEDS this job (#5242): the three chisel images' SBOMs are release assets
     # and belong inside the signed SHA256SUMS, and while this job stayed out of
     # the release's needs they were attached only when it happened to finish
@@ -1885,7 +1920,7 @@ jobs:
     # Recovery: "Re-run failed jobs" on the NEWEST run for the tag (digests of
     # the succeeded legs are kept; each push re-checks the tag), never on an
     # older run (#5242); a fresh run is the fallback. See the release skill.
-    needs: [release-guard, build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
     # in-flight build instead of wedging the single self-hosted Linux runner
@@ -2152,10 +2187,10 @@ jobs:
 
   # ── Agent-bundle delivery image — published + SIGNED after the release ─
   # The 3-triplet agent bundle (yuzu-agent-bundle-chisel) repackages the
-  # release's OWN signed agent archives, so it can only be built once the
+  # release's OWN agent archives, so it can only be built once the
   # GitHub Release exists -> needs: [release]. It runs on a GitHub-hosted
-  # runner (no compilation, just download + repackage; gh/docker/buildx/cosign
-  # all preinstalled), reuses scripts/build-agent-bundle.sh as the single
+  # runner (no compilation, just download + repackage; gh/docker/buildx are
+  # preinstalled, cosign is installed by the job), reuses scripts/build-agent-bundle.sh as the single
   # source of truth, then signs + SBOMs + attests the pushed image exactly
   # like docker-publish. It is deliberately NOT in the release job's needs:
   # (it depends on release, not vice-versa), so it never gates the release.
@@ -2218,8 +2253,8 @@ jobs:
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
 
-      # Reuse the maintainer script (download release artifacts -> verify by
-      # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
+      # Reuse the maintainer script (download release artifacts -> verify
+      # SHA256SUMS' cosign signature, then each file against its own line -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
       # lets its `gh release download` authenticate against this just-published
       # release. linux/arm64 dropped — pass --push without --multiarch.
       - name: Build + push agent bundle (amd64)
@@ -2228,6 +2263,7 @@ jobs:
         run: |
           bash scripts/build-agent-bundle.sh \
             --version "${{ steps.ref.outputs.version }}" \
+            --signer-repo "${{ github.repository }}" \
             --push
 
       - name: Resolve pushed image digest
@@ -2409,6 +2445,9 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Sign SHA256SUMS (keyless)
+        env:
+          SIGN_REPOSITORY: ${{ github.repository }}
+          SIGN_REF: ${{ github.ref }}
         run: |
           cd artifacts
           # cosign v3.0+ rejects explicit --oidc-issuer when a signing
@@ -2426,6 +2465,16 @@ jobs:
           # every future release Scorecard-visible by default.
           cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.sigstore
           echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
+          # Verify what we just signed with the exact identity the published
+          # instructions (and scripts/build-agent-bundle.sh) will use, BEFORE
+          # the GitHub Release is created (#7529): a bundle a verifier would
+          # reject fails this job here, not after the release is public. (The
+          # images are already pushed and signed by now.)
+          cosign verify-blob --bundle SHA256SUMS.sigstore \
+            --certificate-identity "https://github.com/${SIGN_REPOSITORY}/.github/workflows/release.yml@${SIGN_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+          echo "Verified the SHA256SUMS signature with its exact release.yml identity"
 
       - name: Bundle SLSA attestations as .intoto.jsonl release assets
         env:
@@ -2575,13 +2624,9 @@ jobs:
           \`yuzu-windows-x64.zip\` and \`yuzu-macos-arm64.tar.gz\` and also
           held the server; update any script that downloads them by name.
 
-          Known limitations: the Windows archive still carries server-side
-          DLLs (\`libpq.dll\`, \`drogon.dll\`, \`trantor.dll\` and the
-          \`libxmlsec1\` DLLs), present but never loaded by the agent. The
-          Windows and macOS SBOMs are generated from the whole build
-          workspace, so they list thousands of components the archive does
-          not ship or load, the server's dependencies among them; a finding
-          in one of those does not apply to the agent.
+          Known limitation: the Windows and macOS SBOMs are generated from the whole build
+          workspace, so they can list components the archive does not ship
+          or load; a finding in one of those does not apply to the agent.
 
           ## Compose Wizard
 
@@ -2618,7 +2663,7 @@ jobs:
 
           \`\`\`bash
           cosign verify-blob --bundle SHA256SUMS.sigstore \\
-            --certificate-identity-regexp '.*' \\
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
             SHA256SUMS
           \`\`\`

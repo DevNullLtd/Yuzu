@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression net for agent-only Windows and macOS releases (ADR-0035 ladder step 2).
+"""Regression net for agent-only Windows and macOS releases (ADR-0035 ladder steps 2 and 3).
 
 The server is supported on Linux only. release.yml runs only on a tag, so a
 regression in its Windows or macOS job, or a disagreement between the archive
@@ -10,18 +10,23 @@ instead. Stdlib only; no network, no Windows, no macOS.
 What they pin:
 
 - The `build-windows` and `build-macos` jobs of release.yml each configure
-  with exactly one literal `-Dbuild_server=false`, name `build_server`
-  nowhere else, never set it `=true` and never run `meson configure` (the
-  conventions of step 1's ci.yml pin, scripts/ci/test_runner_health_check.py;
-  ladder step 3 renames the switch to the `server` feature option: change
-  both pins with it). Their non-comment lines name no `yuzu-server`,
+  with exactly one literal `-Dserver=disabled` (step 3's feature option),
+  never name the deprecated `build_server` in code, never set `server` to
+  anything else and never run `meson configure`. Their vcpkg install carries
+  `--x-no-default-features` and asks for no `server` feature, so the
+  server-only ports (libpq, xmlsec, drogon) are never installed and their
+  DLLs cannot reach the archive (the ci.yml/codeql/nightly twin of this pin
+  is scripts/ci/test_runner_health_check.py; change both together). Their
+  non-comment lines name no `yuzu-server`,
   `YuzuServerSetup`, `yuzu-server.iss` or `install-server-postgres.sh`,
   except the one exact line of the Windows archive check that FAILS on
   `yuzu-server.exe`.
 - build-windows has exactly one gating "Verify the agent runs from the
   packaged archive" step (no continue-on-error, a step timeout), after
   Package archive and before the installers, attestation and upload, and it
-  keeps each of its checks (VERIFY_MUST). build-macos signs and notarizes
+  keeps each of its checks (VERIFY_MUST), including the refusal of the server
+  ports' DLLs (libpq, libecpg, libpgtypes, drogon, trantor, jsoncpp, xmlsec: the nine DLLs
+  an agent-only tree lacks) in the archive. build-macos signs and notarizes
   `build-macos/agents/core/yuzu-agent` and checks the notarization verdict.
 - The release job's `gh release create` list attaches no `YuzuServerSetup`;
   scripts/check-release-artifacts.sh requires none and its FORBIDDEN_GLOBS
@@ -44,8 +49,12 @@ Each check is also run against a mutated copy of the sources and must fail
 there, so a check that stops matching anything cannot pass silently.
 """
 
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -73,6 +82,9 @@ VERIFY_MUST = (
     '-ArgumentList "--help"',
     'if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error',
     'if ($p.ExitCode -ne 0) { Write-Error',
+    # ADR-0035 step 3: the archive must hold none of the server ports' DLLs.
+    '$serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "libecpg*.dll", "libpgtypes*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll"',
+    'if ($serverDlls.Count -gt 0) { Write-Error',
 )
 OLD_NAME_RE = re.compile(r"(?<![a-z0-9-])(?:" + "|".join(map(re.escape, OLD_ARCHIVES)) + r")\b")
 
@@ -134,19 +146,29 @@ def problems(release: str, check: str, bundle: str) -> list:
         if len(setups) != 1:
             found.append(f"{job}: expected one `meson setup`, found {len(setups)}")
         for s in setups:
-            n = len(re.findall(r"-Dbuild_server=false(?![\w=-])", s))
+            n = len(re.findall(r"-Dserver=disabled(?![\w=-])", s))
             if n != 1:
-                found.append(f"{job}: its meson setup carries {n} `-Dbuild_server=false`, expected exactly 1")
-            if "${{" in s and re.search(r"\$\{\{[^}]*build_server", s):
-                found.append(f"{job}: build_server is set from an expression; it must be the literal false")
-        # The same conventions as step 1's ci.yml pin: the switch appears once
-        # in the job, never `=true`, and nothing reconfigures it later.
-        if body.count("build_server") != 1:
-            found.append(f"{job}: `build_server` must appear exactly once (in its meson setup)")
-        if re.search(r"build_server\s*=\s*true", body):
-            found.append(f"{job}: sets build_server=true")
+                found.append(f"{job}: its meson setup carries {n} `-Dserver=disabled`, expected exactly 1")
+        # The switch appears once in the job, only as `disabled`, never from an
+        # expression; the deprecated boolean is gone from code; nothing
+        # reconfigures the build dir later.
+        if len(re.findall(r"-Dserver=", body)) != 1:
+            found.append(f"{job}: `-Dserver=` must appear exactly once (in its meson setup, as disabled)")
+        if re.search(r"-Dserver=(?!disabled(?![\w=-]))", body):
+            found.append(f"{job}: sets -Dserver to something other than the literal disabled")
+        if "build_server" in body:
+            found.append(f"{job}: names the deprecated `build_server` in code; use -Dserver=disabled")
         if re.search(r"\bmeson\s+configure\b", body):
             found.append(f"{job}: runs `meson configure`, which could re-enable the server")
+        # The vcpkg install is the agent-only profile: no server ports.
+        installs = re.findall(r"vcpkg(?:\.exe)?\"? install\b.*?(?=\n\s*\n|\n\s*- name:|\Z)", body, re.S)
+        if len(installs) != 1:
+            found.append(f"{job}: expected one vcpkg install, found {len(installs)}")
+        for inst in installs:
+            if "--x-no-default-features" not in inst:
+                found.append(f"{job}: its vcpkg install lacks --x-no-default-features, so it installs the server ports")
+            if re.search(r"--x-feature=server\b", inst):
+                found.append(f"{job}: its vcpkg install asks for the server feature")
         scan = "\n".join(l for l in body.splitlines() if not ABSENCE_CHECK.match(l))
         for tok in SERVER_TOKENS:
             if tok in scan:
@@ -255,6 +277,22 @@ def problems(release: str, check: str, bundle: str) -> list:
     if platform_bases != stems:
         found.append(f"SBOM_BASES platform entries {sorted(platform_bases)} do not match the archives {sorted(stems)}")
 
+    # 4b. docker-publish waits for the agent builds, so a failed Windows/macOS
+    # packaging step cannot leave pushed images with no GitHub Release (UP-12).
+    for pub in ("docker-publish", "docker-publish-chisel", "docker-publish-postgres"):
+        try:
+            dp = job_block(release, pub)
+        except AssertionError as e:
+            found.append(str(e))
+            continue
+        m = re.search(r"^    needs:\s*\[([^\]]*)\]", dp, re.M)
+        dp_needs = {n.strip() for n in m.group(1).split(",")} if m else set()
+        for dep in ("build-linux", "build-gateway", "build-windows", "build-macos"):
+            if dep not in dp_needs:
+                found.append(f"{pub} does not need {dep} (needs: {sorted(dp_needs)})")
+        if re.search(r"^    if:", dp, re.M):
+            found.append(f"{pub} has a job-level if: (a skipped needed job would skip it silently)")
+
     # 5. The bundle script requests and prefers the current names.
     requested = literal(re.findall(rf"-p '({ARCHIVE_RE})'", bundle))
     current = {n for n in requested if not OLD_NAME_RE.search(n)}
@@ -290,9 +328,23 @@ class ReleaseAgentOnly(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         mutations = {
-            "windows server flag dropped": ("release", "-Dbuild_tests=false `\n            -Dbuild_server=false", "-Dbuild_tests=false"),
-            "macos server flag dropped": ("release", "            -Dbuild_server=false \\\n            -Db_lto=true", "            -Db_lto=true"),
-            "windows server flag doubled": ("release", "-Dbuild_server=false\n", "-Dbuild_server=false `\n            -Dbuild_server=false\n"),
+            "docker-publish stops waiting for windows": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]", "needs: [release-guard, build-linux, build-gateway, build-macos]"),
+            "docker-publish stops waiting for macos": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]", "needs: [release-guard, build-linux, build-gateway, build-windows]"),
+            "chisel stops waiting for windows": ("release", "needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]\n    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]\n    # Job-level", "needs: [release-guard, build-linux, build-gateway, build-macos]\n    runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]\n    # Job-level"),
+            "postgres stops waiting for windows": ("release", 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]', 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-macos]'),
+            "postgres stops waiting for linux": ("release", 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]', 'name: "Publish postgres image"\n    needs: [release-guard, build-gateway, build-windows, build-macos]'),
+            "postgres stops waiting for gateway": ("release", 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]', 'name: "Publish postgres image"\n    needs: [release-guard, build-linux, build-windows, build-macos]'),
+            "windows server flag dropped": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false"),
+            "macos server flag dropped": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Db_lto=true"),
+            "windows server flag doubled": ("release", "-Dserver=disabled\n", "-Dserver=disabled `\n            -Dserver=disabled\n"),
+            "windows server flag auto": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dserver=auto"),
+            "macos back to deprecated boolean": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Dbuild_server=false \\\n            -Db_lto=true"),
+            "windows deprecated boolean alongside": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dbuild_server=false `\n            -Dserver=disabled"),
+            "windows server from expression": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dserver=${{ inputs.server }}"),
+            # Step 3: the vcpkg install is agent-only (no server ports).
+            "windows vcpkg opt-out dropped": ("release", '--x-manifest-root="${{ github.workspace }}" `\n            --x-no-default-features\n', '--x-manifest-root="${{ github.workspace }}"\n'),
+            "macos vcpkg opt-out dropped": ("release", "--x-manifest-root=${{ github.workspace }} \\\n            --x-no-default-features\n", "--x-manifest-root=${{ github.workspace }}\n"),
+            "macos vcpkg server feature asked": ("release", "--x-manifest-root=${{ github.workspace }} \\\n            --x-no-default-features\n", "--x-manifest-root=${{ github.workspace }} \\\n            --x-no-default-features \\\n            --x-feature=server\n"),
             "windows server copy back": ("release", '          Copy-Item "build-windows/agents/core/yuzu-agent.exe"', '          Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"\n          Copy-Item "build-windows/agents/core/yuzu-agent.exe"'),
             "macos server copy back": ("release", "          cp build-macos/agents/core/yuzu-agent \"${STAGING}/bin/\"", "          cp build-macos/server/core/yuzu-server \"${STAGING}/bin/\"\n          cp build-macos/agents/core/yuzu-agent \"${STAGING}/bin/\""),
             "server installer back": ("release", '"deploy\\packaging\\windows\\yuzu-agent.iss"', '"deploy\\packaging\\windows\\yuzu-server.iss"'),
@@ -309,15 +361,23 @@ class ReleaseAgentOnly(unittest.TestCase):
             "server installer required again": ("check", '  "YuzuAgentSetup-*.exe"\n', '  "YuzuAgentSetup-*.exe"\n  "YuzuServerSetup-*.exe"\n'),
             "bundle new name typo": ("bundle", "-p 'yuzu-agent-windows-x64.zip'", "-p 'yuzu-agent-windows-x86.zip'"),
             # Step-1 conventions (C-1): an override or a reconfigure is caught.
-            "windows =true appended": ("release", "-Dbuild_tests=false `\n            -Dbuild_server=false", "-Dbuild_tests=false `\n            -Dbuild_server=false `\n            -Dbuild_server=true"),
-            "macos =true appended": ("release", "            -Dbuild_server=false \\\n            -Db_lto=true", "            -Dbuild_server=false \\\n            -Dbuild_server=true \\\n            -Db_lto=true"),
-            "windows meson configure": ("release", "      - name: Build\n        run: meson compile -C build-windows", "      - name: Reconfigure\n        run: meson configure build-windows -Dbuild_server=true\n\n      - name: Build\n        run: meson compile -C build-windows"),
+            "windows =enabled appended": ("release", "-Dbuild_tests=false `\n            -Dserver=disabled", "-Dbuild_tests=false `\n            -Dserver=disabled `\n            -Dserver=enabled"),
+            "macos =enabled appended": ("release", "            -Dserver=disabled \\\n            -Db_lto=true", "            -Dserver=disabled \\\n            -Dserver=enabled \\\n            -Db_lto=true"),
+            "windows meson configure": ("release", "      - name: Build\n        run: meson compile -C build-windows", "      - name: Reconfigure\n        run: meson configure build-windows -Dbuild_tests=true\n\n      - name: Build\n        run: meson compile -C build-windows"),
             # The packaged-archive check (qe-1).
             "verify step removed": ("release", "      - name: Verify the agent runs from the packaged archive", "      - name: Something else"),
             "verify exit check dropped": ("release", "          if ($p.ExitCode -ne 0) { Write-Error", "          if ($false) { Write-Error"),
             "verify PATH restriction dropped": ("release", '          $env:PATH = "$env:SystemRoot\\System32;$env:SystemRoot"\n', ""),
             "verify agent-present check dropped": ("release", '          if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }\n', ""),
             "verify server check inverted": ("release", 'if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error', 'if (-not (Test-Path (Join-Path $bin "yuzu-server.exe"))) { Write-Error'),
+            "verify server-DLL refusal dropped": ("release", "          if ($serverDlls.Count -gt 0) { Write-Error", "          if ($false) { Write-Error"),
+            "verify server-DLL list loses libpq": ("release", '"libpq*.dll", ', ""),
+            "verify server-DLL scan drops -Recurse": ("release", "Get-ChildItem -Path $top.FullName -Recurse -File -Include", "Get-ChildItem -Path $top.FullName -File -Include"),
+            "verify server-DLL list loses libecpg": ("release", '"libecpg*.dll", ', ""),
+            "verify server-DLL list loses libpgtypes": ("release", '"libpgtypes*.dll", ', ""),
+            "verify server-DLL list loses trantor": ("release", '"trantor*.dll", ', ""),
+            "verify server-DLL list loses jsoncpp": ("release", '"jsoncpp*.dll", ', ""),
+            "verify server-DLL list loses xmlsec": ("release", ', "*xmlsec*.dll"', ""),
             "verify plugin count dropped": ("release", "          if ($built -lt 1 -or $packed -ne $built) { Write-Error", "          if ($false) { Write-Error"),
             "verify made non-gating": ("release", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n        continue-on-error: true\n"),
             "verify made conditional": ("release", "      - name: Verify the agent runs from the packaged archive\n        shell: pwsh\n", "      - name: Verify the agent runs from the packaged archive\n        if: ${{ false }}\n        shell: pwsh\n"),
@@ -343,6 +403,129 @@ class ReleaseAgentOnly(unittest.TestCase):
                 srcs[which] = srcs[which].replace(old, new, 1)
                 self.assertNotEqual(problems(srcs["release"], srcs["check"], srcs["bundle"]), [],
                                     f"{name!r} was not caught")
+
+
+try:
+    import yaml
+except ImportError:  # without PyYAML the behavioural test skips (docs-lint requires it: YUZU_REQUIRE_PWSH_TEST)
+    yaml = None
+
+
+def server_dll_refusal(release_text: str) -> str:
+    """The server-DLL refusal of the Verify step, taken from release.yml with a
+    YAML parser (nothing is retyped here).
+
+    The step's `run:` body also expands the zip, needs a built tree and runs
+    yuzu-agent.exe, none of which exist on a test box. The refusal is the two
+    statements that read only `$top.FullName`: the `$serverDlls = ...` line and
+    the `if ($serverDlls.Count ...)` line right after it. Those two lines are cut
+    out by their anchors (a missing anchor fails loudly), and the caller supplies
+    `$top` as a fixture root, which is the one variable they read."""
+    doc = yaml.safe_load(release_text)
+    steps = doc["jobs"]["build-windows"]["steps"]
+    body = [s["run"] for s in steps if s.get("name") == VERIFY_STEP]
+    if len(body) != 1:
+        raise AssertionError(f"expected exactly one {VERIFY_STEP!r} step, found {len(body)}")
+    lines = body[0].splitlines()
+    first = [i for i, l in enumerate(lines) if l.startswith("$serverDlls =")]
+    if len(first) != 1 or not lines[first[0] + 1].startswith("if ($serverDlls.Count"):
+        raise AssertionError("server-DLL refusal anchors not found in the Verify step")
+    return "\n".join(lines[first[0]:first[0] + 2])
+
+
+def run_refusal(pwsh: str, release_text: str, files):
+    """Run the refusal under pwsh against a fixture tree holding `files`
+    (relative paths); returns (exit code, combined output)."""
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_srvdll_") as tmp:
+        top = Path(tmp) / "yuzu-agent"
+        top.mkdir()
+        for rel in files:
+            f = top / rel
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"")
+        script = Path(tmp) / "refusal.ps1"
+        # As GitHub Actions wraps a pwsh step: stop on error, run as a file.
+        script.write_text("$ErrorActionPreference = 'stop'\n"
+                          f"$top = [pscustomobject]@{{ FullName = '{top}' }}\n"
+                          + server_dll_refusal(release_text) + "\n", encoding="utf-8")
+        r = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(script)],
+                           capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+
+
+def find_pwsh():
+    """A pwsh on PATH that actually runs, else None."""
+    exe = shutil.which("pwsh")
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, "-NoProfile", "-NonInteractive", "-Command", "'ok'"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return exe if r.returncode == 0 and "ok" in r.stdout else None
+
+
+# Probed ONCE: the skip decorator, the prerequisite check and setUp all read this
+# value, so a pwsh that fails its first call cannot skip the class while the
+# required-mode check separately finds it working (G8-UP-1).
+_PWSH = find_pwsh()
+
+# Lowercase names are enough: pwsh `-Include` is case-INSENSITIVE on every OS
+# (verified on Linux pwsh), so mixed case would not test the step any harder.
+REFUSAL_CASES = (
+    ("clean", ("bin/yuzu-agent.exe", "bin/zlib1.dll", "plugins/x/x.dll"), []),
+    ("top-level libpq", ("bin/yuzu-agent.exe", "bin/libpq.dll"), ["libpq.dll"]),
+    ("nested xmlsec", ("bin/yuzu-agent.exe", "plugins/x/libxmlsec1-openssl.dll"),
+     ["libxmlsec1-openssl.dll"]),
+    ("ecpg and pgtypes", ("bin/libecpg.dll", "bin/libpgtypes.dll"),
+     ["libecpg.dll", "libpgtypes.dll"]),
+    ("drogon, trantor and jsoncpp", ("bin/yuzu-agent.exe", "bin/drogon.dll", "plugins/x/trantor.dll", "bin/jsoncpp.dll"),
+     ["drogon.dll", "trantor.dll", "jsoncpp.dll"]),
+)
+
+
+# YUZU_REQUIRE_PWSH_TEST=1 (set by docs-lint.yml, whose ubuntu-24.04 runner
+# ships PowerShell and the system PyYAML) turns a missing prerequisite into a
+# failure, so the behavioural check cannot go silently green in CI.
+_REQUIRE_PWSH = os.environ.get("YUZU_REQUIRE_PWSH_TEST") == "1"
+
+
+class _PrereqCheck(unittest.TestCase):
+    def test_behavioural_prerequisites_present_when_required(self):
+        if not _REQUIRE_PWSH:
+            self.skipTest("YUZU_REQUIRE_PWSH_TEST is not set")
+        self.assertIsNotNone(yaml, "YUZU_REQUIRE_PWSH_TEST=1 but PyYAML is not importable")
+        self.assertTrue(_PWSH, "YUZU_REQUIRE_PWSH_TEST=1 but no working pwsh on PATH")
+
+
+@unittest.skipUnless(yaml is not None, "PyYAML not installed")
+@unittest.skipUnless(_PWSH, "no working pwsh on PATH")
+class ServerDllRefusalBehaviour(unittest.TestCase):
+    """Runs the real refusal from release.yml (ADR-0035 step 3, QE-2)."""
+
+    def setUp(self):
+        self.pwsh = _PWSH
+        self.release = RELEASE.read_text(encoding="utf-8")
+
+    def check_cases(self, release_text):
+        bad = []
+        for name, files, named in REFUSAL_CASES:
+            code, out = run_refusal(self.pwsh, release_text, files)
+            if named:
+                if code == 0 or not all(n in out for n in named):
+                    bad.append(f"{name}: exit {code}, output {out!r}")
+            elif code != 0:
+                bad.append(f"{name}: exit {code}, output {out!r}")
+        return bad
+
+    def test_refusal_behaviour(self):
+        self.assertEqual(self.check_cases(self.release), [])
+
+    def test_dropping_a_pattern_is_caught(self):
+        mutant = self.release.replace('"libecpg*.dll", ', "", 1)
+        self.assertNotEqual(mutant, self.release, "mutation anchor not found")
+        self.assertNotEqual(self.check_cases(mutant), [], "dropping libecpg* was not caught")
 
 
 if __name__ == "__main__":

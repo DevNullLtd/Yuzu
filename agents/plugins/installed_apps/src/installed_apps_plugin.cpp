@@ -473,9 +473,9 @@ InvCollection get_inventory_linux() {
         // `rpm -K` verification. The publisher is the declared VENDOR, falling
         // back to PACKAGER (a person) when VENDOR is unset; the publisher slot
         // carries the one chosen, and the `list` action reports its own columns.
-        collect({path, "-qa", "--queryformat",
-                "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t%{PACKAGER}\t"
-                "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\n"},
+        // The two free-text tags are last so a tab inside one truncates the
+        // publisher and never drops the row.
+        collect({path, "-qa", "--queryformat", std::string{inv::kRpmInvQueryFormat}},
                 inv::parse_rpm_inv_line);
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});
               !path.empty()) {
