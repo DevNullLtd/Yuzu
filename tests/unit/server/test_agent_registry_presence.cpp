@@ -403,9 +403,24 @@ TEST_CASE("HA WS-5: has_remote_presence — direct single-lock membership check"
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     (void)registry.register_agent(make_agent_info("local-agent", "linux", "local-host"));
+    // #5685 hp-1: "locally known" means locally DELIVERABLE. A bare registration (empty
+    // gateway_node, no stream) is not, so give this agent the placement a CONNECTED handled
+    // on this replica would have published.
+    REQUIRE(registry.set_gateway_route(
+        "local-agent", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
 
     SECTION("every id in the list is locally known: false (no widening)") {
         CHECK_FALSE(registry.has_remote_presence({"local-agent"}));
+    }
+
+    SECTION("a local session with no delivery path (empty gateway_node, no stream) widens "
+            "(#5685 hp-1: send_to_all would skip it)") {
+        (void)registry.register_agent(make_agent_info("shadowed", "linux", "shadow-host"));
+        CHECK(registry.lacks_local_delivery_path("shadowed"));
+        CHECK_FALSE(registry.lacks_local_delivery_path("local-agent"));
+        CHECK_FALSE(registry.lacks_local_delivery_path("never-registered"));
+        CHECK(registry.has_remote_presence({"local-agent", "shadowed"}));
     }
 
     SECTION("a candidate list containing an id NOT in the local registry: true") {

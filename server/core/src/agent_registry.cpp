@@ -825,6 +825,17 @@ bool AgentRegistry::send_via_directory(const std::string& agent_id, const Classi
     // the ONLY check this method makes before queuing.
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
         return false;
+    // #5685 hp-1: this path now also serves an agent this replica holds a session
+    // for that cannot deliver (`lacks_local_delivery_path`). `send_to`'s send-time
+    // per-OS kill-switch enforcement (#5294) would have run for it, so run it here
+    // against the session's OS. A genuinely session-less id has no local OS to
+    // check; its OS gate is the dispatch-time one.
+    {
+        std::lock_guard lock(mu_);
+        if (auto it = agents_.find(agent_id);
+            it != agents_.end() && cmd.kill_switched_os().contains(it->second->os))
+            return false;
+    }
     std::lock_guard glock(gw_pending_mu_);
     gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
     return true;
@@ -1643,11 +1654,39 @@ std::size_t AgentRegistry::local_agent_count() const {
 }
 
 bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) const {
-    std::lock_guard lock(mu_);
-    for (const auto& id : ids)
-        if (!agents_.contains(id))
+    std::vector<std::shared_ptr<AgentSession>> local;
+    {
+        std::lock_guard lock(mu_);
+        local.reserve(ids.size());
+        for (const auto& id : ids) {
+            auto it = agents_.find(id);
+            if (it == agents_.end())
+                return true;
+            local.push_back(it->second);
+        }
+    }
+    // #5685 hp-1: a local session with no delivery path is not "reachable
+    // locally" — `send_to_all` skips it, so the caller must take the per-id
+    // walk, whose directory consult can still reach it.
+    for (const auto& s : local) {
+        std::lock_guard slock(s->stream_mu);
+        if (s->gateway_node.empty() && s->stream == nullptr)
             return true;
+    }
     return false;
+}
+
+bool AgentRegistry::lacks_local_delivery_path(const std::string& agent_id) const {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end())
+            return false;
+        session = it->second;
+    }
+    std::lock_guard slock(session->stream_mu);
+    return session->gateway_node.empty() && session->stream == nullptr;
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {

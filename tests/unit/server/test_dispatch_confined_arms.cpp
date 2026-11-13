@@ -29,6 +29,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1240,6 +1241,130 @@ TEST_CASE("wire_and_dispatch_confined: a local-miss agent with a ROUTABLE direct
     CHECK(pending[0].agent_id == "dev-remote");
     REQUIRE(pending[0].cluster_id.has_value());
     CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+// HA WS-5 #5685 hp-1: a local session that has NO delivery path here (empty `gateway_node`, no
+// Subscribe stream) is what a replica holds for an agent whose CONNECTED a different replica
+// handled — `send_to` returns false for it. That session must not shadow the directory.
+TEST_CASE("wire_and_dispatch_confined: a local session with no delivery path (empty gateway_node, "
+          "no stream) falls through to a ROUTABLE directory row (#5685 hp-1)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    // Registered here (this replica did the ProxyRegister) but its CONNECTED was handled by
+    // another replica, so gateway_node stays empty and no stream is attached.
+    (void)registry.register_agent(make_wiring_test_info("dev-shadowed"));
+    REQUIRE(registry.lacks_local_delivery_path("dev-shadowed"));
+
+    auto fresh = store.register_fresh("dev-shadowed", "sess-shadowed-1");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->won);
+    auto announced =
+        store.announce_connected("dev-shadowed", "sess-shadowed-1", "cluster-b", "node-b", 90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-shadow"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-shadow", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-shadowed"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 1);
+    CHECK_FALSE(outcome.route_unreadable);
+    CHECK(outcome.not_sent.empty());
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1); // exact send set: one queue entry, no duplicate
+    CHECK(pending[0].agent_id == "dev-shadowed");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+TEST_CASE("wire_and_dispatch_confined: a local session with no delivery path and NO directory "
+          "row is still a definite no-route (#5685 hp-1: no outcome that succeeded changes)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-nopath"));
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-nopath"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-nopath", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-nopath"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 0);
+    CHECK_FALSE(outcome.route_unreadable);
+    CHECK(outcome.not_sent == std::vector<std::string>{"dev-nopath"});
+    CHECK(registry.drain_gateway_pending().empty());
+}
+
+// An unfiltered fleet-wide dispatch takes `send_to_all`, which skips a session with no delivery
+// path. The fast-path gate must therefore not treat such a session as "local, reachable".
+TEST_CASE("wire_and_dispatch_confined: a Broadcast reaches a shadowed local session through the "
+          "directory and does not double-send a deliverable one (#5685 hp-1)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-ok"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-ok", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+    (void)registry.register_agent(make_wiring_test_info("dev-shadowed"));
+
+    auto fresh = store.register_fresh("dev-shadowed", "sess-shadowed-2");
+    REQUIRE(fresh.has_value());
+    auto announced =
+        store.announce_connected("dev-shadowed", "sess-shadowed-2", "cluster-b", "node-b", 90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-bcast"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-bcast", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/true, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 2);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 2); // exact send set: one entry each
+    std::map<std::string, std::optional<std::string>> by_agent;
+    for (auto& pc : pending)
+        by_agent[pc.agent_id] = pc.cluster_id;
+    REQUIRE(by_agent.size() == 2);
+    CHECK_FALSE(by_agent.at("dev-ok").has_value()); // local gateway_node path
+    REQUIRE(by_agent.at("dev-shadowed").has_value());
+    CHECK(*by_agent.at("dev-shadowed") == "cluster-b"); // directory path
 }
 
 // A command for the echo plugin to an agent that only has a directory row (no local session) is

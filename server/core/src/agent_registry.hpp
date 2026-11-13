@@ -856,8 +856,10 @@ public:
     int send_to_all(const ClassifiedCommand& cmd);
 
     // WS-4 4.2b Task C: fallback-ONLY queue for an agent this replica has NO
-    // local session for at all (the precondition every caller must have
-    // already established — this method does not itself check `agents_`).
+    // local session for at all — or (#5685 hp-1) one whose local session
+    // `lacks_local_delivery_path` (the precondition every caller must have
+    // already established — this method does not itself check `agents_`,
+    // except to apply the #5294 per-OS kill switch to a local session's OS).
     // The caller (`GatewayRouteFallback`, dispatch_route_fallback.hpp) has
     // already resolved `cluster_id` from a BATCHED GatewayRouteStore
     // directory read. Mirrors `send_to`'s existing gateway_node branch: the
@@ -865,10 +867,10 @@ public:
     // just keyed off a directory-resolved cluster rather than a live
     // session's advertised `gateway_node`. Returns false only on a
     // malformed dispatch tag (the defensive check); queuing itself cannot
-    // fail. NEVER call this for an agent that DOES have a local session —
-    // `send_to` is the sole path for that (this method has no capability
-    // advertisement to check, because there is no session to have
-    // advertised one).
+    // fail. Returns false too when the #5294 kill switch withholds the local
+    // session's OS. NEVER call this for an agent whose local session CAN
+    // deliver — `send_to` is the sole path for that (this method has no
+    // capability advertisement to check).
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
                             const std::string& cluster_id);
 
@@ -980,7 +982,25 @@ public:
     // since genuinely registered locally, this correctly reports "no longer
     // remote" and the fast path (which walks the CURRENT registry) reaches
     // it anyway.
+    //
+    // #5685 hp-1: ALSO true when an id has a local session that
+    // `lacks_local_delivery_path` — `send_to_all` skips such a session, so the
+    // unfiltered fast path would silently drop an agent the directory can reach.
     [[nodiscard]] bool has_remote_presence(const std::vector<std::string>& ids) const;
+
+    /// HA WS-5 #5685 hp-1: true iff this replica holds a session for `agent_id`
+    /// that `send_to` cannot deliver on: an EMPTY `gateway_node` AND no
+    /// Subscribe stream. That is the state a non-owning replica's CONNECTED
+    /// leaves behind (the CONNECTED was handled elsewhere, so the local
+    /// session never learns its placement), and it shadowed the directory
+    /// fallback, which used to consult the store only on a TOTAL local miss.
+    /// It is exactly the state in which `send_to` returns false, so routing
+    /// such an id to the directory can change no outcome that used to succeed:
+    /// a direct agent has a stream, a gateway agent has a `gateway_node`. False
+    /// for an unknown id (that is a plain local miss, handled by the caller).
+    /// Takes `mu_` only to copy the session pointer, then `stream_mu`, never
+    /// both at once (the order `send_to` itself uses).
+    [[nodiscard]] bool lacks_local_delivery_path(const std::string& agent_id) const;
 
     // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
     // that all_ids()/evaluate_scope() merge in for ids absent from the local
