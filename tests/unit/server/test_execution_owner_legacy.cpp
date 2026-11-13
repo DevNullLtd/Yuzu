@@ -353,7 +353,7 @@ TEST_CASE("owner legacy: a degraded tracker is a 503 for a service-scoped list, 
     r.exec_sql("ALTER TABLE execution_tracker.executions_hidden_5557 RENAME TO executions");
 }
 
-// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list.
+// #5557: a corrupted service-scoped ENGINE credential gets no unrestricted list.
 TEST_CASE("owner legacy: a service-scoped engine row is refused 403 on GET /api/executions, "
           "RBAC on",
           "[pg][execution][owner_rig][owner_legacy][5557]") {

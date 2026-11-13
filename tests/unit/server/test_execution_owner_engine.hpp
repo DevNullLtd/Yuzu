@@ -1,7 +1,7 @@
 #pragma once
 
 // test_execution_owner_engine.hpp -- #5557: engine credentials on the shared execution-owner rig,
-// for the service-scoped unrestricted-authority refusal tests (D-E/D-L).
+// for the service-scoped unrestricted-authority refusal tests on the list gates.
 //
 // Minting refuses a service-scoped engine token, so the only way to reach the gates with one is
 // a CORRUPTED row: mint a valid engine token, then set its stored `scope_service` by direct SQL
@@ -116,7 +116,7 @@ struct EngineListResult {
     std::vector<std::string> ids;
 };
 
-/// The D-E cases for ONE execution list surface, RBAC on or off. `list(token)` is the surface's
+/// The corrupted-engine cases for ONE execution list surface, RBAC on or off. `list(token)` is the surface's
 /// list route as `token`. The LEGIT engine runs first as the control (RBAC on: 200 and every
 /// seeded id; RBAC off: the engine-is-RBAC-only refusal as today), so a 403 for a corrupted row
 /// proves the entry refusal and not a broken rig. A refusal is told from the ordinary deny by

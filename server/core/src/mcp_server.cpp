@@ -14713,8 +14713,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // OWN dispatches (`dispatched_by` pushed into the SQL WHERE,
             // ExecutionQuery::dispatched_by): cheap, provably safe (never
             // another operator's execution), and consistent with the
-            // dispatcher-ownership precedent elsewhere. #5557 (D-2 option A): a
-            // SERVICE-SCOPED session is the exception. It has no owner key, so it
+            // dispatcher-ownership precedent elsewhere. #5557: a SERVICE-SCOPED
+            // session is the exception (owner decision). It has no owner key, so it
             // takes the engaged fleet-read scope through the checked query (the
             // REST list twin's admission), never the owner-only filter.
             if (tool_name == "list_executions") {
@@ -14752,7 +14752,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
-                // #5557 (D-2 option A): a service-scoped session's owner key is EMPTY, and an
+                // #5557: a service-scoped session's owner key is EMPTY, and an
                 // empty `eq.dispatched_by` means "no filter" -- clearing the key here would
                 // widen a confined caller to the whole list. So the two confined classes take
                 // different, EXPLICIT paths (the raw-username guard above guarantees a non-empty

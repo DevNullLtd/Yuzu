@@ -1121,7 +1121,7 @@ TEST_CASE("require_fleet_read — engine principal with an explicit global RBAC 
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 6c-1. A service-scoped session never receives unrestricted fleet-read authority
-//       (#5557 D-E). Minting refuses a service-scoped engine token, so the only way to
+//       (#5557). Minting refuses a service-scoped engine token, so the only way to
 //       reach the gate with one is a corrupted row: this rig mints a VALID engine token,
 //       then sets its stored `scope_service` by direct SQL (DML on the shared clone).
 //       The refusal is the FIRST statement of the gate's engine branch, so the grant
@@ -1288,7 +1288,7 @@ TEST_CASE("require_fleet_read: a clean engine without the grant keeps the ordina
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 6c-2. The same refusal on the list-read gate (#5557 D-L): require_list_read's engine branch
+// 6c-2. The same refusal on the list-read gate (#5557): require_list_read's engine branch
 //       also admitted a service-scoped (corrupted) engine session unfiltered. Same rig, same
 //       shared responder; the audit action is the gate's own, `auth.permission_required`.
 // ═══════════════════════════════════════════════════════════════════════════

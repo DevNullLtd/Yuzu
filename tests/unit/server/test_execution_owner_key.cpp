@@ -5,7 +5,9 @@
  * admission may compare against `Execution::dispatched_by`; a service-scoped session's
  * `username` is its MINTING account, so its key must be empty. These tests pin the derivation
  * per session class and the type-level properties that keep a bare string out of the compare.
- * No call site is converted by this change; the behaviour tests arrive with the conversions.
+ * The behaviour tests for the call sites that use the key sit beside their routes
+ * (test_execution_owner_{rest_v1,legacy,dashboard}.cpp, test_mcp_server.cpp,
+ * test_execution_mutation_owner_key.cpp).
  */
 
 #include "execution_scope_rules.hpp"

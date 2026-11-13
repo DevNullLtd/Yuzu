@@ -472,7 +472,7 @@ TEST_CASE("owner rest v1: GET /api/v1/events attach, replay and live events for 
     CHECK(transitions == std::vector<std::string>{"a1", "a2", "b1", "z1", "z1"});
 }
 
-// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list.
+// #5557: a corrupted service-scoped ENGINE credential gets no unrestricted list.
 TEST_CASE("owner REST v1: a service-scoped engine row is refused 403 on GET /api/v1/executions, "
           "RBAC on",
           "[pg][execution][owner_rig][owner_rest][5557]") {

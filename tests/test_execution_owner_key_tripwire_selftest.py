@@ -4,8 +4,8 @@
 A tripwire that has never been seen to fail proves nothing. This runs the tripwire's checks against
 mutated copies of the real server tree (held in memory, nothing on disk is touched) and asserts each
 mutation is caught by the check meant to catch it: a bare `dispatched_by` compare in a handler (also
-reversed, `!=`, `.compare(`, split across lines), the Astra bypass `ExecutionScope s{std::in_place};
-s->owner = session->username;`, a dropped or literal scope argument on the checked tracker reads, a
+reversed, `!=`, `.compare(`, split across lines), the `ExecutionScope s{std::in_place};
+s->owner = session->username;` bypass, a dropped or literal scope argument on the checked tracker reads, a
 string-typed `execution_visible(...)`, a string overload, a mutation request that lost `.owner`, a
 raw-username guard replaced by a check on the key, a public string constructor on the key, the entry
 refusal deleted from each list gate, a second caller of `require_list_read_unchecked`, a second
@@ -108,7 +108,7 @@ def main() -> int:
     # ---- CHECK 2: scope construction ---------------------------------------------------------
     anchor_rest = "                scope_arg = confined_list_scope(owner, gate.scope);\n"
     for what, snippet in (
-            ("Astra's in_place bypass (declaration and owner write)",
+            ("the in_place bypass (declaration and owner write)",
              "yuzu::server::ExecutionScope s{std::in_place}; s->owner = session->username;"),
             ("a hand-initialised scope", "yuzu::server::ExecutionScope s{std::in_place};"),
             ("an owner write from the session", "scope_arg->owner = session->username;"),

@@ -1315,7 +1315,7 @@ struct McpTestServer {
     std::function<bool(const std::string& securable, const std::string& op)>
         perm_override_for_test{};
 
-    /// #5557 (D-M): TEST-ONLY real-session seam. When `real_session_auth_for_test` is set, the
+    /// #5557: TEST-ONLY real-session seam. When `real_session_auth_for_test` is set, the
     /// fixture's authentication hook is that resolver wrapped in the PRODUCTION admission
     /// (`mcp::make_admission_auth_fn`, the same composition server.cpp registers), so a tierless
     /// token or a cookie session is refused 403 before any tool runs and `mock_username`,
@@ -1663,7 +1663,7 @@ private:
             return audit_succeeds_;
         };
 
-        // #5557 (D-M): the real-session seam. The resolver is wrapped in the PRODUCTION admission
+        // #5557: the real-session seam. The resolver is wrapped in the PRODUCTION admission
         // (the one composition server.cpp registers for every MCP verb), with the fixture's own
         // audit recorder as the admission audit sink, so a refused credential leaves its
         // `mcp.session.reject` row in `audit_log` exactly as production would write it.
@@ -53330,13 +53330,12 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
     }
 }
 
-// ── #5557 (D-M): the test-only real-session seam, proved against TODAY's behaviour ──────────────
+// ── #5557: the test-only real-session seam ─────────────────────────────────────────────────────
 //
 // `ExecutionOwnerRig::wire_mcp` makes ONE real AuthRoutes the session source for MCP
 // authentication (wrapped in the production admission), permission, fleet-read and list-read.
-// These cases assert no fix. The admission case is a permanent control (tierless and cookie
-// credentials never reach a tool); the [owner_rig_current] case pins the minter-keyed leak so the
-// MCP conversion commit (#5557, commit 8) flips exactly one block.
+// The admission case is a permanent control (tierless and cookie credentials never reach a
+// tool); the cases after it assert the exact execution ids each credential class sees.
 namespace {
 
 std::vector<std::string> mcp_list_execution_ids(const std::unique_ptr<httplib::Response>& res) {
@@ -53454,7 +53453,7 @@ std::vector<std::string> mcp_status_visible_ids(McpTestServer& ts, const OwnerRi
 } // namespace
 
 // The exact id sets the five confined/unconfined caller classes see, shared by the list and the
-// status cases. `bob_owner` is what MCP's owner-only list (D-2 option A) shows a non-service
+// status cases. `bob_owner` is what MCP's owner-only list shows a non-service
 // confined caller; status keeps the owner-or-visible-agent rule for him.
 TEST_CASE("MCP execution tools: list_executions serves exact sets through the real session",
           "[pg][mcp][execution][owner_rig][owner_key][5557]") {
@@ -53542,7 +53541,7 @@ TEST_CASE("MCP execution tools: list_executions serves exact sets through the re
         CHECK(mcp_list_execution_ids(svc) == r.service_a_ids());
     }
 
-    SECTION("non-service callers keep today's behaviour (D-2 option A)") {
+    SECTION("non-service callers keep the owner-only list") {
         // Confined non-service bob: owner-only. NONE of carol's a1 executions on MCP.
         auto bob = list_as(r.creds.mcp_bob);
         REQUIRE(bob);
@@ -53835,7 +53834,7 @@ TEST_CASE("MCP execution tools: past a permit-all permission check a service-sco
     CHECK(after->status == before->status);
 }
 
-// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list_executions.
+// #5557: a corrupted service-scoped ENGINE credential gets no unrestricted list_executions.
 // Through the real-session seam, so the production admission and the real fleet-read gate decide.
 namespace {
 

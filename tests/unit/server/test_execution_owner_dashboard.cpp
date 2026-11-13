@@ -340,7 +340,7 @@ static int denied_as_403(const Resp& got) {
     return got.status == 200 && has(got.body, "data-denied=\"true\"") ? 403 : got.status;
 }
 
-// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list.
+// #5557: a corrupted service-scoped ENGINE credential gets no unrestricted list.
 TEST_CASE("owner dashboard: a service-scoped engine row is refused 403 on /fragments/executions, "
           "RBAC on",
           "[pg][execution][owner_rig][owner_dashboard][5557]") {

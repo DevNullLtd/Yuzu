@@ -520,7 +520,10 @@ public:
     /// global-grant, permission-group or subtree read: `read_failed`) is
     /// `GateFailure::Degraded` (503) too. Only a genuine
     /// `ListReadDecision::DenyAll` (real "no grant") lands on
-    /// `GateFailure::Forbidden` (403).
+    /// `GateFailure::Forbidden` (403), as does the engine-entry refusal of a
+    /// service-scoped engine session (also 403, no `.permission`); an admit that
+    /// would have been unrestricted for a service-scoped session is
+    /// `GateFailure::InvariantViolated` (500, not retryable).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
     /// NOT additionally gate the same `(securable_type, operation)` on

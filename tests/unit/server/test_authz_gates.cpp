@@ -1620,7 +1620,7 @@ TEST_CASE("ceiling read: the acquire budget is the 250 ms authz budget and not t
 
 // ═══════════════════════════════════════════════════════════════════════════
 // authz::service_scope_authority_ok: the ONE predicate behind the unrestricted-authority
-// refusal shared by require_fleet_read and require_list_read (#5557 D-E / D-L). Pure: no store.
+// refusal shared by require_fleet_read and require_list_read (#5557). Pure: no store.
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("service_scope_authority_ok: a service-scoped session may never hold unrestricted "
