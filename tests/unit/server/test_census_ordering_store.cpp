@@ -1563,10 +1563,17 @@ TEST_CASE("census ordering: a pending event that disagrees with a verdict insert
                            ".guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION " + kSchema +
                            ".yuzu_test_hold_w()");
 
+    // UP-1 is a census-SQL schedule. With the agent step on, X queues on W's uncommitted agent row
+    // (its Ensure parks on W's transaction) and folds only after W commits, so the second fold is
+    // unreachable; the step is off here, like the other v4 cases, so X reaches its census upsert
+    // while W's census row is still invisible. The step-on behaviour is covered by the agent-step
+    // cases.
+    AgentStepOff step_off(store);
+
     // Declaration order is the safety argument: the result slots first (the threads write them),
     // then the owner, then the lock holder, so on a failure the holder (and its advisory locks) is
-    // destroyed first, the parked writers finish, and only then are they joined.
-    AgentStepLockWait step_wait(store); // X's step waits on W's uncommitted agent row
+    // destroyed first, the parked writers finish, and only then are they joined. The step guard
+    // outlives all of them.
     EventInsertResult x_res;
     EventInsertResult w_res;
     WriterThreads writers(store, nullptr);
