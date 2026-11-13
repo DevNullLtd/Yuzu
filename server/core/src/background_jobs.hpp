@@ -47,7 +47,7 @@
 /// typed-source purge, and the MUST-run-per-replica / shared-PG-writing passes found by the sweep
 /// (cert reloader, catalogue rollup, provisional-MFA cleanup, OTA watchdog, MCP
 /// projector, MCP bridge sweep + session gc, store-worker delivery pools, the
-/// HA WS-8 Postgres reachability probe). This
+/// HA WS-8 Postgres reachability probe, the collation-version recheck). This
 /// proves named⇒classified for those sites. It does NOT yet prove pass⇒named for
 /// every dispatch site — a consteval sweep visiting ALL of them is a tracked
 /// follow-up (#4094) — so completeness rests on THIS array plus the recorded
@@ -94,7 +94,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (51 passes). Verified against the source sweep
+/// The exhaustive inventory (53 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
@@ -104,7 +104,8 @@ struct BackgroundJobDecl {
 /// `inventory_store.purge_typed_sources`, the SAM.4 addition of
 /// `software_normalization_job.run_tick`, the #2146 addition of
 /// `workflow_engine.refresh_table_size_metrics`, and the SAM-14 addition of
-/// `software_inventory_store.run_retention_prune_changes`); keep the count
+/// `software_inventory_store.run_retention_prune_changes`, and the collation-version
+/// recheck `pg_collation_recheck.tick`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -357,6 +358,14 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "dedicated connection) feeding THIS replica's /readyz pg_reachable row; MUST run per-replica "
      "— each replica measures its OWN path to Postgres; never leader-gate (a follower would then "
      "report stale/unready and be evicted from the LB)"},
+    {"pg_collation_recheck.tick", "PgCollationRecheck::thread_", BackgroundJobClass::ReplicaSafe,
+     "per-replica read-only recheck (hourly when settled; every minute while a mismatch stands, no "
+     "verdict is conclusive yet or the latest check was unreadable) of pg_database.datcollversion "
+     "against pg_database_collation_actual_version() (one short bounded catalog read on a pooled "
+     "connection; writes nothing to the database); each replica exports its OWN "
+     "yuzu_pg_collation_version_mismatch gauge, so it MUST run per-replica and is never "
+     "leader-gated (WS-4: do not reclassify it to a leader-only job, a follower's gauge would then "
+     "go stale); no shared state, and a failed read leaves the gauge as it was"},
 });
 
 /// Index of `pass` in kBackgroundJobs, or -1 if absent. consteval so a site
