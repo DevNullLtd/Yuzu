@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,6 +55,7 @@ class GitCase(unittest.TestCase):
         self.env = {
             **os.environ,
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "TZ": "UTC",
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
@@ -616,16 +618,16 @@ class BaseSelection(GitCase):
         a, b, c, d = ("1" * 40, "2" * 40, "3" * 40, "4" * 40)
         reflog = f"{a}\tcommit: mine\x0b{c}\tpull: forged\n{b}\tpull: Fast-forward\n{d}\tclone: from x\n"
         repo = FakeRepo(runs={"symbolic-ref": "refs/heads/dev\n", "rev-parse": "origin/dev\n", "reflog": reflog})
-        self.assertEqual(WN.last_pull_base(repo), d)
+        self.assertEqual(WN.last_pull_base(repo)[0], d)
         junk = f"not-a-sha\tpull: x\n{b}\tpull: Fast-forward\n{d}\tclone: from x\n"
         repo.runs["reflog"] = junk
-        self.assertEqual(WN.last_pull_base(repo), d)
+        self.assertEqual(WN.last_pull_base(repo)[0], d)
 
     def test_merge_entries_match_only_this_branchs_upstream(self):
         a, b, c = ("1" * 40, "2" * 40, "3" * 40)
         repo = FakeRepo(runs={"symbolic-ref": "refs/heads/dev\n", "rev-parse": "origin/dev\n",
                               "reflog": f"{a}\tmerge origin/other: Fast-forward\n{b}\tmerge origin/dev: Fast-forward\n{c}\tclone: x\n"})
-        self.assertEqual(WN.last_pull_base(repo), c)
+        self.assertEqual(WN.last_pull_base(repo)[0], c)
         repo.runs["rev-parse"] = ""  # no upstream configured: a bare merge is not a pull
         with self.assertRaises(WN.GitError):
             WN.last_pull_base(repo)
@@ -636,8 +638,19 @@ class DateValidation(GitCase):
         self.assertEqual(WN.date_cutoff("2026-11-01"), "2026-11-01 00:00:00")
         self.assertEqual(WN.date_cutoff("2026-11-01 12:30"), "2026-11-01 12:30")
         self.assertEqual(WN.date_cutoff("2026-11-01T12:30:15"), "2026-11-01T12:30:15")
-        self.assertEqual(WN.date_cutoff("yesterday"), "yesterday")
-        self.assertEqual(WN.date_cutoff("3 days ago"), "3 days ago")
+        now = datetime(2026, 11, 13, 16, 0, 0)
+        self.assertEqual(WN.date_cutoff("yesterday", now), "2026-11-12 16:00:00")
+        self.assertEqual(WN.date_cutoff("3 days ago", now), "2026-11-10 16:00:00")
+        self.assertEqual(WN.date_cutoff("2 hours ago", now), "2026-11-13 14:00:00")
+        self.assertEqual(WN.date_cutoff("90 minutes ago", now), "2026-11-13 14:30:00")
+        self.assertEqual(WN.date_cutoff("30 seconds ago", now), "2026-11-13 15:59:30")
+        self.assertEqual(WN.date_cutoff("2 weeks ago", now), "2026-10-30 16:00:00")
+        self.assertEqual(WN.date_cutoff("1 month ago", datetime(2026, 3, 31, 9, 0, 0)), "2026-02-28 09:00:00")
+        self.assertEqual(WN.date_cutoff("13 months ago", now), "2025-10-13 16:00:00")
+        self.assertEqual(WN.date_cutoff("1 year ago", datetime(2024, 2, 29, 9, 0, 0)), "2023-02-28 09:00:00")
+        for far in ("9999 years ago", "1000 years ago", "9999 months ago", "57 years ago"):
+            with self.assertRaises(WN.GitError, msg=far):
+                WN.date_cutoff(far, now)
 
     def test_a_bare_date_does_not_depend_on_the_time_of_day(self):
         repo = self.init()
@@ -654,7 +667,8 @@ class DateValidation(GitCase):
 
     def test_calendar_impossible_and_junk_dates_are_refused(self):
         for bad in ("2026-02-30", "2026-00-10", "2026-11-00", "2026-04-31", "2026-11-01 25:99", "2026-13-45",
-                    "2026-11-01 junk", "junk 2026-11-01", "2026-11-01\n", "99999 years ago", "2 wekks ago"):
+                    "2026-11-01 junk", "junk 2026-11-01", "2026-11-01\n", "yesterday\n", "99999 years ago", "2 wekks ago",
+                    "\u0665 days ago", "2 Days ago", "2  days ago", "-1 days ago"):
             with self.assertRaises(WN.GitError, msg=repr(bad)):
                 WN.date_cutoff(bad)
 
@@ -863,7 +877,7 @@ class Hostile(GitCase):
     def test_a_carriage_return_in_a_fragment_and_a_subject_reaches_clean(self):
         repo = self.init()
         old = self.seed(repo)
-        self.put(repo, "changelog.d/2-cr.added.md", "- **Entry\rEVIL.**\n")
+        self.put(repo, "changelog.d/2-cr.added.md", "- **Entry\x08EVIL.**\n")
         self.put(repo, "deploy/docker/Dockerfile.x", "FROM x\n")
         self.commit(repo, "build(deps): bump a\rb")
         out = self.ok(repo, "--since", old)
@@ -897,6 +911,294 @@ class Hostile(GitCase):
         res = subprocess.run([sys.executable, str(SCRIPT), "--repo", "/nonexistent/dir"], env=self.env,
                              capture_output=True, text=True)
         self.assertNotIn("not found on PATH", res.stderr)
+
+
+def promote(repo, version="1.3.0"):
+    subprocess.run(
+        [sys.executable, str(ASSEMBLE), "promote", version, "--date", "2026-10-30",
+         "--changelog", str(repo / "CHANGELOG.md"), "--fragments-dir", str(repo / "changelog.d")],
+        check=True, capture_output=True, text=True)
+
+
+class PullArguments(BaseSelection):
+    def reflog_repo(self, *lines, remote="origin", merge="refs/heads/dev", upstream="origin/dev"):
+        shas = ["%040x" % (i + 1) for i in range(len(lines))]
+        reflog = "".join(f"{sha}\t{subject}\n" for sha, subject in zip(shas, lines))
+
+        class R(FakeRepo):
+            def _run(self, *args, **kw):
+                out = {"symbolic-ref": "refs/heads/dev\n", "rev-parse": upstream + "\n", "reflog": reflog}.get(args[0], "")
+                if args[0] == "config":
+                    out = {"branch.dev.remote": remote, "branch.dev.merge": merge}.get(args[1], "") + "\n"
+                return subprocess.CompletedProcess(args, 0, out, "")
+        return R(), shas
+
+    def base_for(self, subject, **kw):
+        repo, shas = self.reflog_repo(subject, "clone: from x", **kw)
+        try:
+            return WN.last_pull_base(repo)[0] == shas[1]
+        except WN.GitError:
+            return None
+
+    def test_which_pull_subjects_count(self):
+        counts = ["pull: Fast-forward", "pull -q: Fast-forward", "pull --rebase (finish): returning to refs/heads/dev",
+                  "pull -q origin dev: Fast-forward", "pull origin dev: Merge made", "pull --ff-only origin: Fast-forward",
+                  "pull -q --rebase origin dev (finish): x", "pull origin refs/heads/dev: Fast-forward",
+                  "merge origin/dev: Fast-forward"]
+        refuses = ["pull -q origin fix/foo: Fast-forward", "pull fork dev: Fast-forward", "pull origin dev extra: x",
+                   "pull --rebase origin fix/foo (finish): x", "merge origin/dev-hotfix: Fast-forward",
+                   "merge origin/dev2: Fast-forward", "merge origin/devtools: Fast-forward", "merge origin/dev~1: x",
+                   "merge origin/other: x", "merge feature: x", "pullover: x", "commit (merge): resolve"]
+        for subject in counts:
+            self.assertTrue(self.base_for(subject), subject)
+        for subject in refuses:
+            self.assertIsNone(self.base_for(subject), subject)
+
+    def test_without_an_upstream_a_pull_must_name_the_branch_itself(self):
+        kw = dict(remote="", merge="", upstream="")
+        self.assertTrue(self.base_for("pull origin dev: Fast-forward", **kw))
+        self.assertTrue(self.base_for("pull: Fast-forward", **kw))
+        self.assertIsNone(self.base_for("pull origin fix/foo: Fast-forward", **kw))
+        self.assertIsNone(self.base_for("merge origin/dev: Fast-forward", **kw))  # no upstream: not a pull
+
+    def test_a_pull_of_another_branch_does_not_replace_the_pull_of_this_one(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q")
+        self.git(upstream, "checkout", "-q", "-b", "fix/foo")
+        self.push_upstream(upstream, "3-foo.added.md", "- **Foo branch.**\n")
+        self.git(upstream, "checkout", "-q", "dev")
+        self.git(local, "pull", "-q", "origin", "fix/foo")
+        out = self.ok(local)
+        self.assertIn("Pull A", out)
+        self.assertIn("Foo branch", out)
+
+    def test_merging_a_branch_that_extends_the_upstream_name_is_not_a_pull(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q")
+        self.git(upstream, "checkout", "-q", "-b", "dev2")
+        self.push_upstream(upstream, "3-d.added.md", "- **On dev2.**\n")
+        self.git(upstream, "checkout", "-q", "dev")
+        self.git(local, "fetch", "-q")
+        self.git(local, "merge", "-q", "--no-edit", "origin/dev2")
+        out = self.ok(local)
+        self.assertIn("Pull A", out)
+        self.assertIn("On dev2", out)
+
+    def test_the_default_run_says_which_reflog_entry_it_used(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q")
+        self.assertIn("Via  reflog entry: pull -q: Fast-forward", self.ok(local))
+        self.assertNotIn("Via ", self.ok(local, "--since", "HEAD~1"))
+
+    def test_resetting_below_the_pull_is_an_error_not_an_empty_report(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q")
+        self.git(local, "reset", "-q", "--hard", "HEAD~1")
+        res = self.run_script(local)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("nothing to compare", res.stderr)
+
+    def test_a_pull_stopped_by_a_conflict_starts_at_the_pull_before_it(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-first.added.md", "- **Clean pull.**\n")
+        self.git(local, "pull", "-q")
+        self.put(upstream, "x.txt", "base\n")
+        self.commit(upstream, "shared")
+        self.git(local, "pull", "-q")
+        self.put(local, "x.txt", "local\n")
+        self.commit(local, "local edit")
+        self.put(upstream, "x.txt", "upstream\n")
+        self.put(upstream, "changelog.d/3-c.added.md", "- **Through the conflict.**\n")
+        self.commit(upstream, "upstream edit")
+        self.assertNotEqual(self.try_git(local, "pull", "--rebase").returncode, 0)
+        self.put(local, "x.txt", "resolved\n")
+        self.git(local, "add", "x.txt")
+        self.env["GIT_EDITOR"] = "true"
+        self.git(local, "rebase", "--continue")
+        out = self.ok(local)
+        self.assertIn("Through the conflict", out)  # never lost
+        # The pull that stopped on a conflict is not recognised, so the base is the pull before it.
+        self.assertIn("Via  reflog entry: pull -q: Fast-forward", out)
+        self.assertIn("3 commits", out)  # upstream "shared" is in the range: it started earlier, not later
+
+
+class PromotedFragments(GitCase):
+    def promoted(self, name, body, **kw):
+        repo = self.init()
+        self.seed(repo)
+        old = self.commit(repo, "base", date="2026-10-20T12:00:00+0000") if False else self.git(repo, "rev-parse", "HEAD")
+        self.put(repo, f"changelog.d/{name}", body)
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        return repo, old
+
+    def test_a_pinned_exact_line_must_be_added_by_the_range(self):
+        repo = self.init()
+        self.seed(repo)
+        self.put(repo, "CHANGELOG.md", CHANGELOG.replace("- **Older.**", "- **Fix.**"))
+        old = self.commit(repo, "changelog already has the exact line")
+        self.put(repo, "changelog.d/2-fix.fixed.md", "- **Fix.**\n")
+        self.commit(repo, "add")
+        (repo / "changelog.d/2-fix.fixed.md").unlink()
+        self.commit(repo, "withdraw")
+        self.assertIn("No changelog fragments were added", self.ok(repo, "--since", old))
+
+    def test_a_multi_line_security_entry_is_shown_whole_after_promotion(self):
+        repo, old = self.promoted("2-s.security.md", "- **Sec fix.** first line\n  second line of the step\n")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("second line of the step", out)
+        self.assertEqual(out.count("Sec fix"), 1)
+
+    def test_an_indented_crlf_and_lone_cr_fragments_survive_promotion(self):
+        repo = self.init()
+        self.seed(repo)
+        old = self.git(repo, "rev-parse", "HEAD")
+        self.put(repo, "changelog.d/2-i.added.md", "  - **Indented first line.**\n")
+        self.put(repo, "changelog.d/3-c.fixed.md", "- **Crlf entry.**\r\n  continued\r\n")
+        self.put(repo, "changelog.d/4-r.changed.md", "- **Cr one.**\r- **Cr two.**\r")
+        self.commit(repo, "odd line endings")
+        pending = self.ok(repo, "--since", old)
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        for text in ("Indented first line", "Crlf entry", "Cr one", "Cr two"):
+            self.assertIn(text, pending, text)
+            self.assertIn(text, out, text)
+        self.assertNotIn("\r", out)
+        self.assertNotIn("?", out.split("Changelog entries added")[1])  # no stray control marks
+        self.assertIn("Changelog entries added (4)", out)
+
+    def test_promotion_listing_survives_hostile_git_config(self):
+        repo, old = self.promoted("2-p.added.md", "- **Promoted under config.**\n")
+        cfg = self.dir / "hostile.gitconfig"
+        cfg.write_text("[color]\n\tui = always\n[diff]\n\texternal = /bin/false\n\trenames = false\n"
+                       "[log]\n\tshowSignature = true\n[core]\n\tpager = false\n", encoding="utf-8")
+        res = self.run_script(repo, "--since", old, env={**self.env, "GIT_CONFIG_GLOBAL": str(cfg)})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Promoted under config", res.stdout)
+
+    def test_works_from_a_subdirectory(self):
+        repo, old = self.promoted("2-p.added.md", "- **Promoted, from a subdirectory.**\n")
+        (repo / "sub").mkdir()
+        self.assertIn("Promoted, from a subdirectory", self.ok(repo / "sub", "--since", old))
+
+    def test_a_fragment_renamed_in_the_range_and_then_promoted_is_not_new(self):
+        repo = self.init()
+        self.seed(repo)
+        old = self.git(repo, "rev-parse", "HEAD")
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/9-renamed.added.md")
+        self.commit(repo, "rename")
+        promote(repo)
+        self.commit(repo, "release")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+
+class Robustness(GitCase):
+    def test_blobs_handles_missing_entries_in_the_middle(self):
+        repo = self.init()
+        self.seed(repo)
+        sha = self.git(repo, "rev-parse", "HEAD")
+        r = WN.Repo(repo)
+        got = r.blobs([f"{sha}:meson.build", f"{sha}:nope.txt", f"{sha}:changelog.d/README.md"])
+        self.assertEqual(got[f"{sha}:nope.txt"], None)
+        self.assertEqual(got[f"{sha}:changelog.d/README.md"], "readme\n")
+        self.assertIn("project('yuzu'", got[f"{sha}:meson.build"])
+        self.assertIsNone(r.show(sha, "nope.txt"))
+        self.assertEqual(r.blobs([]), {})
+
+    def test_an_unexpected_cat_file_reply_is_an_error(self):
+        class R(FakeRepo):
+            def _run(self, *args, **kw):
+                return subprocess.CompletedProcess(args, 0, b"abc ambiguous\n", b"")
+        with self.assertRaises(WN.GitError):
+            R().blobs(["abc:x"])
+
+    def test_show_reports_a_real_read_failure(self):
+        with self.assertRaises(WN.GitError):  # not a repository: git fails for a reason other than an absent path
+            WN.Repo(self.dir).show("HEAD", "meson.build")
+
+    def test_sha_grammar(self):
+        for good in ("a" * 40, "0" * 64):
+            self.assertTrue(WN.SHA_RE.fullmatch(good), good)
+        for bad in ("A" * 40, "a" * 39, "a" * 41, "a" * 63, "a" * 65, "g" * 40, "a" * 40 + "\n", ""):
+            self.assertFalse(WN.SHA_RE.fullmatch(bad), repr(bad))
+
+    def test_the_error_text_on_stderr_is_cleaned(self):
+        repo = self.init()
+        self.seed(repo)
+        saved = WN.build_report
+
+        def boom(*a, **k):
+            raise WN.GitError("bad \x1b[2J \x9b \u202e text")
+        WN.build_report = boom
+        import contextlib
+        import io
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                rc = WN.main(["--repo", str(repo)])
+        finally:
+            WN.build_report = saved
+        self.assertEqual(rc, 2)
+        self.assertEqual(err.getvalue(), "whats-new: bad ?[2J ? ? text\n")
+
+    @unittest.skipUnless(os.name == "posix", "needs a shell redirect")
+    def test_a_closed_stdout_is_not_a_traceback(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "next")
+        res = subprocess.run(f'"{sys.executable}" "{SCRIPT}" --repo "{repo}" --since {old} >&-', shell=True,
+                             env=self.env, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_clean_every_boundary(self):
+        inside = [0x00, 0x08, 0x0b, 0x0c, 0x0e, 0x1f, 0x7f, 0x80, 0x9f, 0xad, 0x34f, 0x61c, 0x180e, 0x200b, 0x200f,
+                  0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064, 0x2066, 0x2069, 0xfeff, 0xfff9, 0xfffb,
+                  0xe0000, 0xe0001, 0xe007f]
+        outside = [0x09, 0x0a, 0x20, 0x7e, 0xa0, 0xa1, 0x34e, 0x350, 0x61b, 0x61d, 0x180d, 0x180f, 0x200a, 0x2010,
+                   0x2027, 0x202f, 0x205f, 0x2065, 0x206a, 0xfefe, 0xff00, 0xfff8, 0xfffc, 0xdffff, 0xe0080,
+                   0x41, 0xe9, 0x4e2d]
+        for cp in inside:
+            self.assertEqual(WN.clean(f"a{chr(cp)}b"), "a?b", hex(cp))
+        for cp in outside:
+            self.assertEqual(WN.clean(f"a{chr(cp)}b"), f"a{chr(cp)}b", hex(cp))
+
+    def test_vertical_tab_style_separators_do_not_split_text(self):
+        self.assertEqual(WN.lines_of("a\x0bb\x0cc\u2028d\x85e"), ["a\x0bb\x0cc\u2028d\x85e"])
+        self.assertEqual(WN.bullets("- one\x0b- two\n- three"), ["- one\x0b- two", "- three"])
+
+    def test_long_changed_and_fixed_entries_are_still_cut(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-c.changed.md", "- **Changed.** " + "c" * 300 + "\n")
+        self.put(repo, "changelog.d/3-f.fixed.md", "- **Fixed.** " + "f" * 300 + "\n")
+        self.put(repo, "changelog.d/4-b.fixed.md", "- **BREAKING:** " + "k" * 300 + "\n")
+        self.commit(repo, "long entries")
+        out = self.ok(repo, "--since", old)
+        self.assertNotIn("c" * 300, out)
+        self.assertNotIn("f" * 300, out)
+        self.assertIn("k" * 300, out)  # the breaking marker is matched in any case
+
+
+class RelativeDatesEndToEnd(GitCase):
+    def test_relative_dates_resolve_against_commit_dates(self):
+        repo = self.init()
+        self.seed(repo)
+        now = datetime.now()
+        self.put(repo, "changelog.d/2-old.added.md", "- **Long ago.**\n")
+        self.commit(repo, "old", date=(now.replace(year=now.year - 2)).strftime("%Y-%m-%dT%H:%M:%S+0000"))
+        self.put(repo, "changelog.d/3-new.added.md", "- **Recent.**\n")
+        self.commit(repo, "recent", date=now.strftime("%Y-%m-%dT%H:%M:%S+0000"))
+        out = self.ok(repo, "--since", "1 year ago")
+        self.assertIn("Recent", out)
+        self.assertNotIn("Long ago", out)
 
 
 if __name__ == "__main__":
