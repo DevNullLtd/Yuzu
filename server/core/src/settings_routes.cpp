@@ -7033,6 +7033,12 @@ void SettingsRoutes::register_routes(
             set_toast(kMsg, "error");
             refuse_text(kMsg);
         };
+        // No group store wired: answer the fixed store-unavailable refusal before any use of it
+        // and before any audit row (nothing can be created, so nothing is attempted).
+        if (!mgmt_group_store_) {
+            store_fault();
+            return;
+        }
         ManagementGroup g;
         g.name = name;
         g.parent_id = parent_id;

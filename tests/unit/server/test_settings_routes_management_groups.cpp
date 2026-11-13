@@ -537,3 +537,57 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
     }
     CHECK(h.group_names().empty());
 }
+
+TEST_CASE("Settings group create: a missing group store refuses with the fixed text, a toast "
+          "and no audit row",
+          "[settings][management-groups][mgmt-audit-first]") {
+    // No Postgres needed: the route is registered with a null group store.
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    auth::AutoApproveEngine auto_approve{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    yuzu::server::test::TestRouteSink sink;
+    std::vector<AuditRow> calls;
+
+    auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "admin";
+        s.role = auth::Role::admin;
+        return s;
+    };
+    auto admin_fn = [](const httplib::Request&, httplib::Response&) { return true; };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) { return true; };
+    auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
+                       const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    auto audit_read_fn = [&calls](const httplib::Request&, const std::string& action,
+                                  const std::string& result, const std::string& target_type,
+                                  const std::string& target_id,
+                                  const std::string& detail) -> bool {
+        calls.push_back({action, result, target_type, target_id, detail, true});
+        return true;
+    };
+    SettingsRoutes routes;
+    routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr, auto_approve,
+                           /*api_token_store=*/nullptr, /*mgmt_group_store=*/nullptr,
+                           /*tag_store=*/nullptr,
+                           /*update_registry=*/nullptr, /*runtime_config_store=*/nullptr,
+                           /*audit_store=*/nullptr,
+                           /*gateway_enabled=*/false, []() -> std::size_t { return 0; },
+                           []() -> std::string { return "[]"; }, oidc_mu, oidc_provider,
+                           /*metrics_registry=*/nullptr, /*step_up_fn=*/{}, audit_read_fn);
+
+    auto res = sink.Post("/api/settings/management-groups", "name=NoStore&membership_type=static",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
+                         "try again</span>") != std::string::npos);
+    const auto toast = res->get_header_value("HX-Trigger");
+    CHECK(toast.find("showToast") != std::string::npos);
+    CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
+    CHECK(calls.empty());
+}
