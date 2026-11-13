@@ -102,7 +102,8 @@ void AuthRoutes::refuse_service_scoped_unrestricted(const httplib::Request& req,
                                                     authz::UnrestrictedRefusalSite site) {
     // Shared by both list gates; each caller still refuses the request itself (fail CLOSED).
     // Fixed audit text: the scope value is never echoed. Not retryable, so no retry hint. The
-    // postcondition site also covers an admit with no session to check; the audit detail is fixed.
+    // postcondition site also covers an admit with no session to check; the audit text is the
+    // same for that case.
     const bool entry = site == authz::UnrestrictedRefusalSite::kEngineEntry;
     const bool fleet = gate == authz::UnrestrictedRefusalGate::kFleetRead;
     if (auto* m = auth_mgr_.metrics_registry()) {
