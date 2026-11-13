@@ -3684,18 +3684,23 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
 
 ## Behaviour change: protective actions exempt from plugin enablement
 
-**What changed.** Five `plugin.action` pairs are now *protective*: the quarantine plugin's
+**What changed.** Nine `plugin.action` pairs are now *protective*: the quarantine plugin's
 `quarantine.quarantine`, `quarantine.unquarantine`, `quarantine.status` and `quarantine.whitelist`,
-and the Guardian rule push `__guard__.push_rules`. No plugin-enablement gate refuses them any more:
+the firewall plugin's four containment actions `firewall.quarantine`, `firewall.release`,
+`firewall.quarantine_status` and `firewall.quarantine_allow`, and the Guardian rule push
+`__guard__.push_rules`. No plugin-enablement gate refuses them any more:
 not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-presence read), not
-the plugin-presence filter, and not a degraded plugin-config store. The set is closed. The four
-quarantine actions are **newly** exempt; before this change only the containment gate exempted
-them. Decision record: the 2026-10-12 update in [ADR-3005](../adr/3005-plugin-config-store.md).
+the plugin-presence filter, and not a degraded plugin-config store. The set is closed: the other
+firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The four quarantine actions are
+**newly** exempt; before this change only the containment gate exempted them. The firewall four joined
+the set with the firewall containment actions; the containment gate's own exemption still names the
+quarantine plugin only. Decision record: the 2026-10-12 update in [ADR-3005](../adr/3005-plugin-config-store.md).
 
 A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
-inert**: it no longer stops dispatch. A plugin-level `quarantine` / `__guard__` row never stops the
+inert**: it no longer stops dispatch. A plugin-level `quarantine` / `firewall` / `__guard__` row never stops the
 plugin's protective actions either, and still gates any non-protective action the plugin declares
-(none today: `quarantine` declares only the four, and `__guard__` dispatches only `push_rules`). A
+(`quarantine` declares only its four and `__guard__` dispatches only `push_rules`; a plugin-level
+`firewall` row still gates `firewall.state` and `firewall.rules`). A
 `PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
 detail and logs a warning. If you stopped Guardian rule delivery by switching
 `__guard__.push_rules` off, that stop **ends when you upgrade**: rules deploy on the next Baseline

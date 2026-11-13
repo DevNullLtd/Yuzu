@@ -28,9 +28,12 @@ stack on a local host and has not been run by its author on every OS.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
+import re
+import signal
 import subprocess
 import sys
 import time
@@ -111,8 +114,44 @@ def dispatch(client: Client, agent_id: str, action: str, params: dict) -> dict:
     return client.poll_response(cid) if cid else {}
 
 
-def status_text(client: Client, agent_id: str) -> str:
-    return json.dumps(dispatch(client, agent_id, "quarantine_status", {})).lower()
+_STATUS_ROW = re.compile(r"\bstatus\|([a-z_]+)")
+
+
+def status_token(client: Client, agent_id: str) -> str:
+    """The `status|<token>` row of one `quarantine_status` answer, exactly: `active`, `inactive`,
+    `active_unproven`, `partial`, `degraded`. Empty when no agent answered (an empty response envelope, an
+    error) -- never a guess from a substring ("inactive" contains "active")."""
+    m = _STATUS_ROW.search(json.dumps(dispatch(client, agent_id, "quarantine_status", {})).lower())
+    return m.group(1) if m else ""
+
+
+@contextlib.contextmanager
+def _signals(handler, sigs):
+    """Install `handler` for `sigs` for the span, then put the previous handlers back (the tests call
+    main() in-process, so nothing may stay ignored after it returns)."""
+    old = {sig: signal.signal(sig, handler) for sig in sigs}
+    try:
+        yield
+    finally:
+        for sig, prev in old.items():
+            signal.signal(sig, prev)
+
+
+def release_and_confirm(client: Client, agent_id: str) -> bool:
+    """Dispatch `firewall.release` and require an explicit `inactive` answer. Any error, or no answer, is
+    NOT a confirmation. Signals are ignored for the span: a second Ctrl-C must not skip the release."""
+    with _signals(signal.SIG_IGN, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
+        try:
+            dispatch(client, agent_id, "release", {})
+            time.sleep(2)
+            return status_token(client, agent_id) == "inactive"
+        except Exception as e:  # noqa: BLE001 - an unconfirmed release is exit 3, whatever stopped it
+            print(f"release call failed: {e}", file=sys.stderr)
+            return False
+
+
+def _raise_on_signal(signum, _frame):
+    raise KeyboardInterrupt(f"signal {signum}")
 
 
 def parse_args(argv):
@@ -149,28 +188,28 @@ def main(argv=None) -> int:
                 print("precondition failed: no agent registered", file=sys.stderr)
                 return EXIT_PRECONDITION
             agent_id = agents[0].get("agent_id") or agents[0].get("id", "")
-        before = status_text(client, agent_id)
-        if not before or before == "{}":
+        before = status_token(client, agent_id)
+        if not before:
             print("precondition failed: firewall.quarantine_status got no agent answer (plugin or grant missing?)", file=sys.stderr)
             return EXIT_PRECONDITION
         print("probe ok: firewall.quarantine_status answered")
         if not args.apply_containment:
             print("probe-only: nothing was changed (--apply-containment runs the live ceremony)")
             return EXIT_OK
+        # From here a containment may be on the host: a signal raises into the try below, whose
+        # release runs for ANY failure or signal.
         ok = False
         err = None
-        try:
-            dispatch(client, agent_id, "quarantine", {"exceptions": args.exceptions})
-            time.sleep(2)
-            ok = "active" in status_text(client, agent_id)
-            print(f"contained: {ok}")
-        except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure or signal
-            err = e
+        with _signals(_raise_on_signal, (signal.SIGTERM, signal.SIGHUP)):
+            try:
+                dispatch(client, agent_id, "quarantine", {"exceptions": args.exceptions})
+                time.sleep(2)
+                ok = status_token(client, agent_id) == "active"
+                print(f"contained: {ok}")
+            except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure or signal
+                err = e
         # ALWAYS release, then re-raise whatever stopped the containment step.
-        dispatch(client, agent_id, "release", {})
-        time.sleep(2)
-        after = status_text(client, agent_id)
-        released = "inactive" in after or "active" not in after
+        released = release_and_confirm(client, agent_id)
         print(f"released: {released}")
         if not released:
             print("RELEASE NOT CONFIRMED: clear the firewall by hand", file=sys.stderr)

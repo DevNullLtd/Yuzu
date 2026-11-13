@@ -2419,7 +2419,7 @@ struct IptablesListing {
     /// present but not first does not govern: dockerd re-inserts its own FORWARD jump
     /// at position 1 on restart, ahead of our DROP.
     std::array<std::string, 3> first_target{};
-    /// Our generation chains that hold a terminal `-A <chain> -j DROP` rule. A jump to a
+    /// Our generation chains whose LAST rule is `-A <chain> -j DROP`. A jump to a
     /// chain that is referenced but EMPTY (the jump delete failed under xtables lock
     /// contention while the flush succeeded) blocks nothing, so a jump alone is not
     /// enforcement.
@@ -2453,10 +2453,14 @@ struct IptablesListing {
                 out.jumps.emplace_back(std::string{f[1]}, std::string{f[3]});
         }
         // The terminal DROP of one of OUR generation chains (`-A yuzu-fwq-N -j DROP`;
-        // the allow rules in front of it carry more fields).
-        if (f.size() == 4 && f[0] == "-A" && f[2] == "-j" && f[3] == "DROP" &&
-            ipt_chain_gen(f[1]))
-            out.dropping.emplace_back(std::string{f[1]});
+        // the allow rules in front of it carry more fields). `-S` lists a chain's rules
+        // in order, so every later rule of the chain withdraws the claim: a DROP that
+        // something was appended after is not terminal.
+        if (f.size() >= 2 && f[0] == "-A" && ipt_chain_gen(f[1])) {
+            std::erase(out.dropping, std::string{f[1]});
+            if (f.size() == 4 && f[2] == "-j" && f[3] == "DROP")
+                out.dropping.emplace_back(std::string{f[1]});
+        }
         // The first rule of each built-in chain, whatever it is: `-S` lists a chain's
         // rules in order, so the first `-A <builtin>` line is the one that governs.
         if (f.size() >= 2 && f[0] == "-A") {

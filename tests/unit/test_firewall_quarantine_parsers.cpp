@@ -5364,6 +5364,9 @@ TEST_CASE("iptables: a jump to a chain with no terminal DROP is not enforcing (e
     CHECK(no_fwd.first_is_ours_and_denies(0));
     CHECK(no_fwd.first_is_ours_and_denies(1));
     CHECK_FALSE(no_fwd.first_is_ours_and_denies(2));
+    // The DROP must be the chain's last rule: a rule appended after it makes it non-terminal.
+    CHECK_FALSE(parse_iptables_listing(jumps + "-A yuzu-fwq-1 -j DROP\n-A yuzu-fwq-1 -j ACCEPT\n")
+                    .first_is_ours_and_denies(0));
     // A DROP in someone else's chain, or an ACCEPT-only chain of ours, does not count.
     CHECK_FALSE(parse_iptables_listing(jumps + "-A OTHER -j DROP\n-A yuzu-fwq-1 -j ACCEPT\n")
                     .first_is_ours_and_denies(0));

@@ -4243,7 +4243,7 @@ test('Firewall containment regression guards (privilege model step 6)',
   _python3_test,
   args: [files('test_firewall_containment_ceremony.py')],
   suite: 'agent',
-  timeout: 60,
+  timeout: 30,
 )
 
 # virtualization `wsl`: static lexical gate over the Windows shell's wiring -- the one

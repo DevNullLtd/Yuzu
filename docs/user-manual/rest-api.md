@@ -2290,7 +2290,7 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
-> protective action (the quarantine plugin's four actions and `__guard__.push_rules`); see
+> protective action (the quarantine plugin's four actions, the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
 > `reason` is a top-level key on the error object, not part of the A4
