@@ -30,6 +30,7 @@
 
 #include <libpq-fe.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -62,6 +63,10 @@ struct AuditRow {
     std::string target_id;
     std::string detail;
     bool stored{true}; // false: the hook refused the write (a failure-injection switch)
+    // Who the row names: the re-resolving hook models production (the CURRENT session, empty once
+    // it is gone), the session-bound writer stamps the session it is handed.
+    std::string principal;
+    bool bound{false}; // true: written through the session-bound writer
 };
 
 struct MgmtGroupsHarness {
@@ -86,6 +91,10 @@ struct MgmtGroupsHarness {
     // 403 into the response, as the production callbacks do.
     bool session_gone_after_attempt{false};
     bool perm_revoked_after_attempt{false};
+    /// Runs ONCE, the first time the session is resolved after an `attempted` row is stored: the
+    /// deterministic injection point for a change that lands between the route's pre-check and
+    /// its insert (e.g. deleting the parent group).
+    std::function<void()> after_attempted_hook{};
 
     /// Rows the hook actually stored, in order.
     std::vector<AuditRow> stored() const {
@@ -116,6 +125,11 @@ struct MgmtGroupsHarness {
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
+            if (after_attempted_hook && attempted_stored()) {
+                auto hook = std::move(after_attempted_hook);
+                after_attempted_hook = nullptr;
+                hook();
+            }
             if (session_gone_after_attempt && attempted_stored()) {
                 res.status = 401;
                 return std::nullopt;
@@ -144,9 +158,21 @@ struct MgmtGroupsHarness {
                                     const std::string& detail) -> bool {
             const bool attempted = result == "attempted";
             const bool ok = attempted ? attempt_audit_ok : outcome_audit_ok;
-            calls.push_back({action, result, target_type, target_id, detail, ok});
+            const bool alive = !(session_gone_after_attempt && attempted_stored());
+            calls.push_back({action, result, target_type, target_id, detail, ok,
+                             alive ? "admin" : "", /*bound=*/false});
             return ok;
         };
+        // The session-bound writer, as `AuthRoutes::audit_as_session_fn()` is wired in production.
+        routes.set_audit_as_session_fn(
+            [this](const httplib::Request&, const auth::Session& session, const std::string&,
+                   const std::string& action, const std::string& result,
+                   const std::string& target_type, const std::string& target_id,
+                   const std::string& detail) -> bool {
+                calls.push_back({action, result, target_type, target_id, detail, true,
+                                 session.username, /*bound=*/true});
+                return true;
+            });
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve,
                                /*api_token_store=*/nullptr, &mgmt_group_store,
@@ -662,4 +688,66 @@ TEST_CASE("Settings group create: an over-long or unclean name or parent id is r
         CHECK(h.calls.empty());
         CHECK(h.group_names().empty());
     }
+}
+
+TEST_CASE("Settings group create: a parent deleted between the check and the insert refuses with "
+          "attempted then failure/validation_refused and creates no group",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    ManagementGroup parent;
+    parent.name = "Vanishing Parent";
+    parent.membership_type = "static";
+    const auto parent_id = h.mgmt_group_store.create_group(parent);
+    REQUIRE(parent_id.has_value());
+    bool deleted = false;
+    h.after_attempted_hook = [&]() {
+        deleted = h.mgmt_group_store.delete_group(*parent_id).has_value();
+    };
+
+    auto res = h.create("Orphaned Child", *parent_id);
+    REQUIRE(res);
+    REQUIRE(deleted);
+    CHECK(res->status == 200);
+    CHECK(res->body == "<span class=\"feedback-error\">parent group not found</span>");
+
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].target_id.empty());
+    CHECK(rows[1].detail == "validation_refused");
+    CHECK(h.group_names().empty());
+}
+
+TEST_CASE("Settings group create: the session_revoked and permission_revoked failure rows name the "
+          "principal of the attempted row",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+
+    SECTION("session revoked") {
+        h.session_gone_after_attempt = true;
+        auto res = h.create("Revoked Session");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].principal == "admin");
+        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].bound); // a re-resolved row would name nobody here
+        CHECK(rows[1].principal == "admin");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(rows[1].target_id == rows[0].target_id);
+    }
+    SECTION("permission revoked") {
+        h.perm_revoked_after_attempt = true;
+        auto res = h.create("Revoked Perm");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "permission_revoked");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(rows[1].principal == "admin");
+    }
+    CHECK(h.group_names().empty());
 }

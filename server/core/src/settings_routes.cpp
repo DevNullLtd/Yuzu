@@ -7068,6 +7068,21 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (session)
             g.created_by = session->username;
+        // The two `*_revoked` failure rows below are written after the session may be gone, when
+        // the re-resolving `audit_read_fn_` would stamp an empty principal: they are stamped from
+        // the session resolved here, before the `attempted` row (the one that row names), as the
+        // MFA disable does. Without a session writer wired (tests) they use `audit_read_fn_`.
+        const AuditReadFn revoked_audit = [&]() -> AuditReadFn {
+            if (!session || !audit_as_session_fn_)
+                return audit_read_fn_;
+            return [writer = audit_as_session_fn_, who = *session,
+                    role = auth::role_to_string(auth::effective_role(*session))](
+                       const httplib::Request& r, const std::string& action,
+                       const std::string& result, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail_text) {
+                return writer(r, who, role, action, result, target_type, target_id, detail_text);
+            };
+        }();
 
         if (!detail::audit_attempted(audit_read_fn_, req, res, "management_group.create",
                                      "ManagementGroup", "", g.name)) {
@@ -7081,7 +7096,7 @@ void SettingsRoutes::register_routes(
         // session invalidated or a grant revoked during the wait creates nothing.
         const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
         if (!fresh_session) {
-            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "management_group.create",
+            (void)detail::emit_behavioral_audit(revoked_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 "session_revoked");
             if (res.status < 400) { // auth_fn_ writes its own 401; cover one that did not
@@ -7092,7 +7107,7 @@ void SettingsRoutes::register_routes(
             return;
         }
         if (!perm_fn_(req, res, "ManagementGroup", "Write")) { // writes its own 403
-            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "management_group.create",
+            (void)detail::emit_behavioral_audit(revoked_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 "permission_revoked");
             return;
@@ -7103,11 +7118,11 @@ void SettingsRoutes::register_routes(
         if (!result) {
             // The attempted row is stored, so it gets an outcome with a FIXED token, never the
             // store text (which can carry database error output).
-            const bool conflict = result.error() == "a group with that name already exists";
-            const bool fault = !conflict && mgmt_group_error_is_store_fault(result.error());
-            (void)detail::emit_behavioral_audit(
-                audit_read_fn_, req, res, "management_group.create", "failure", "ManagementGroup",
-                "", conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
+            const auto token = create_failure_token(result.error());
+            const bool fault = token == "store_error";
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                std::string(token));
             if (fault) {
                 // The cause is logged (sanitised), never shown on the page or audited.
                 spdlog::error("management_group.create store fault: {}",

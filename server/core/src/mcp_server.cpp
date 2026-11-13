@@ -8554,6 +8554,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     detail_text);
             };
 
+            // The two `*_revoked` failure rows are written after the session may be gone, when the
+            // re-resolving `audit_fn` would stamp an empty principal. They go through the
+            // session-bound writer (`ToolDeps::audit_as_session_fn`, the one REST binds its
+            // session-bound rows to) with the session this call resolved BEFORE the `attempted`
+            // row, so they name the same principal as that row. With no session writer wired
+            // (tests) they use mg_audit. Any exception from the writer is caught like mg_audit's.
+            auto mg_audit_pre_wait = [&](const char* action, const char* result_status,
+                                         const std::string& target_id,
+                                         const std::string& detail_text) -> bool {
+                if (!tool_deps_.audit_as_session_fn)
+                    return mg_audit(action, result_status, target_id, detail_text);
+                try {
+                    return tool_deps_.audit_as_session_fn(
+                        req, *session, auth::role_to_string(auth::effective_role(*session)),
+                        action, result_status, "ManagementGroup", target_id, detail_text);
+                } catch (...) {
+                    spdlog::warn("audit_as_session_fn threw on management-group row action={} "
+                                 "target={}",
+                                 action, audit_token(target_id));
+                    return false;
+                }
+            };
+
             // The ONE attempted-row-or-refuse step of the audit-first management-group writes
             // (#7074, ADR-0033 section 9 "no audit row, no mutation"): create_management_group
             // and add_management_group_member both use it, the twin of detail::audit_attempted on
@@ -13790,7 +13813,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
                 const auto fresh = auth_fn(req, res);
                 if (!fresh || fresh->username != session->username) {
-                    (void)mg_audit("management_group.create", "failure", "", "session_revoked");
+                    (void)mg_audit_pre_wait("management_group.create", "failure", "",
+                                            "session_revoked");
                     if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                         res.status = 401;
                         res.set_content(a4_error(kPermissionDenied, "authentication required",
@@ -13800,19 +13824,19 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write")) {
-                    (void)mg_audit("management_group.create", "failure", "", "permission_revoked");
+                    (void)mg_audit_pre_wait("management_group.create", "failure", "",
+                                            "permission_revoked");
                     return;
                 }
 
                 auto result = mgmt_store->create_group(g);
                 if (!result) {
                     // The attempted row is stored, so it gets an outcome with a FIXED token.
-                    const bool conflict = result.error() == "a group with that name already exists";
-                    const bool fault = !conflict && classify_mgmt_group_error(result.error()).code ==
-                                                        kInternalError;
-                    const bool audit_ok = mg_audit(
-                        "management_group.create", "failure", "",
-                        conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
+                    const auto token = create_failure_token(result.error());
+                    const bool conflict = token == "name_conflict";
+                    const bool fault = token == "store_error";
+                    const bool audit_ok = mg_audit("management_group.create", "failure", "",
+                                                   std::string(token));
                     mcp_audit("failure", conflict ? "name_conflict"
                                                   : (fault ? "store_error" : result.error()));
                     if (fault) {
@@ -14206,7 +14230,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
                 const auto fresh = auth_fn(req, res);
                 if (!fresh || fresh->username != session->username) {
-                    (void)mg_audit("management_group.add_member", "failure", group_id, "session_revoked");
+                    (void)mg_audit_pre_wait("management_group.add_member", "failure", group_id,
+                                            "session_revoked");
                     if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                         res.status = 401;
                         res.set_content(a4_error(kPermissionDenied, "authentication required",
@@ -14216,8 +14241,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write")) {
-                    (void)mg_audit("management_group.add_member", "failure", group_id,
-                                   "permission_revoked");
+                    (void)mg_audit_pre_wait("management_group.add_member", "failure", group_id,
+                                            "permission_revoked");
                     return;
                 }
                 auto result = mgmt_store->add_member(group_id, agent_id);

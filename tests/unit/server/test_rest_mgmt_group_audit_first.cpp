@@ -19,6 +19,7 @@
  */
 
 #include "management_group_store.hpp"
+#include "mgmt_group_error.hpp"
 #include "rest_api_v1.hpp"
 #include "test_auth_db_pg_helper.hpp" // AuthDbPg: a real AuthDB for the agent-known flag
 #include "test_mgmt_group_pg_helper.hpp"
@@ -69,6 +70,13 @@ struct AuditFirstHarness {
         std::string target_type;
         std::string target_id;
         std::string detail;
+        /// Who the row names. The re-resolving `audit_fn` models production (the principal comes
+        /// from the request's CURRENT session, so it is empty once the session is gone); the
+        /// session-bound writer stamps the session handed to it.
+        std::string principal;
+        /// True when the row went through the session-bound writer
+        /// (`RestApiV1::set_audit_as_session_fn`) rather than the re-resolving `audit_fn`.
+        bool bound = false;
     };
     /// Rows the sink STORED, in order (a row the sink refused is not here).
     std::vector<AuditRow> audits;
@@ -153,9 +161,26 @@ struct AuditFirstHarness {
                                const std::string& target_id, const std::string& detail) -> bool {
             if (fail_audit.contains(action + "|" + result))
                 return false;
-            audits.push_back({action, result, target_type, target_id, detail});
+            // Production re-resolves the session from the request at write time: once it is
+            // gone the row names nobody.
+            const bool session_alive = !(session_gone_after_attempted && attempted_stored());
+            audits.push_back({action, result, target_type, target_id, detail,
+                              session_alive ? "tester" : "", /*bound=*/false});
             return true;
         };
+        // The session-bound writer, as `AuthRoutes::audit_as_session_fn()` is wired in
+        // production: the row names the session it is handed, whatever the request resolves to.
+        api.set_audit_as_session_fn(
+            [this](const httplib::Request&, const auth::Session& session, const std::string&,
+                   const std::string& action, const std::string& result,
+                   const std::string& target_type, const std::string& target_id,
+                   const std::string& detail) -> bool {
+                if (fail_audit.contains(action + "|" + result))
+                    return false;
+                audits.push_back(
+                    {action, result, target_type, target_id, detail, session.username, true});
+                return true;
+            });
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
@@ -1207,5 +1232,168 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an over-long agent id
         REQUIRE(res);
         CHECK(res->status == 404);
         CHECK(h.audits.empty());
+    }
+}
+
+// ── F3 (Gate 7): one name-conflict predicate, a checked parent read, validation_refused ──────────
+
+TEST_CASE("create_failure_token: the fixed audit token for each class of create failure",
+          "[mgmt-audit-first][mgmt_group_error]") {
+    CHECK(create_failure_token(kMgmtGroupNameConflict) == "name_conflict");
+    CHECK(create_failure_token("a group with that name already exists") == "name_conflict");
+    // Only the exact text is a conflict: the same words inside a longer message are not.
+    CHECK(create_failure_token("a group with that name already exists (x)") ==
+          "validation_refused");
+    for (const char* fault : {"database not open", "pool acquire timed out",
+                              "failed to create group: ERROR: boom",
+                              "failed to resolve ancestor chain (store degraded)"})
+        CHECK(create_failure_token(fault) == "store_error");
+    for (const char* refusal : {"parent group not found", "maximum hierarchy depth (5) exceeded",
+                                "group name cannot be empty", "group cannot be its own parent", ""})
+        CHECK(create_failure_token(refusal) == "validation_refused");
+}
+
+TEST_CASE("the store's duplicate-name answer is exactly kMgmtGroupNameConflict",
+          "[pg][mgmt_group][mgmt-audit-first][mgmt_group_error]") {
+    AuditFirstHarness h;
+    ManagementGroup g;
+    g.name = "twice";
+    g.membership_type = "static";
+    REQUIRE(h.mgmt_bundle->create_group(g).has_value());
+    auto again = h.mgmt_bundle->create_group(g);
+    REQUIRE_FALSE(again.has_value());
+    // A rewording in management_group_store.cpp would turn name_conflict into validation_refused
+    // on all three create surfaces: this pins the constant to the store's literal.
+    CHECK(again.error() == kMgmtGroupNameConflict);
+    CHECK(create_failure_token(again.error()) == "name_conflict");
+}
+
+TEST_CASE("validate_new_group: a parent read that FAILED is a store fault, not parent group not "
+          "found; a confirmed-absent parent still is",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    ManagementGroup child;
+    child.name = "child-of-unknown";
+    child.parent_id = "deadbeef0000";
+    child.membership_type = "static";
+
+    SECTION("a confirmed-absent parent") {
+        auto v = h.mgmt_bundle->validate_new_group(child);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error() == "parent group not found");
+        CHECK_FALSE(mgmt_group_error_is_store_fault(v.error()));
+        auto res = h.create(R"({"name":"child-of-unknown","parent_id":"deadbeef0000"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("parent group not found") != std::string::npos);
+    }
+    SECTION("an unreadable group table") {
+        drop_mgmt_table(h, "management_group_store.management_groups");
+        auto v = h.mgmt_bundle->validate_new_group(child);
+        REQUIRE_FALSE(v.has_value());
+        CHECK(v.error() == "failed to resolve ancestor chain (store degraded)");
+        CHECK(mgmt_group_error_is_store_fault(v.error()));
+
+        auto res = h.create(R"({"name":"child-of-unknown","parent_id":"deadbeef0000"})");
+        REQUIRE(res);
+        CHECK(res->status == 503); // a store fault, never a 400 "parent group not found"
+        CHECK(res->body.find("parent group not found") == std::string::npos);
+        CHECK(h.audits.empty()); // refused before any row
+    }
+}
+
+TEST_CASE("POST /management-groups: a parent deleted between the check and the insert is a 400 "
+          "with attempted then failure/validation_refused and no group",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string parent = make_group(h, "vanishing-parent");
+    const auto groups_before = h.group_count();
+    // Deterministic race: the parent exists at the route's pre-check; it is deleted while the
+    // `attempted` row is stored, so create_group's own validation refuses.
+    bool deleted = false;
+    h.after_attempted_hook = [&]() { deleted = h.mgmt_bundle->delete_group(parent).has_value(); };
+
+    auto res = h.create(nlohmann::json{{"name", "orphaned-child"}, {"parent_id", parent}}.dump());
+    REQUIRE(res);
+    REQUIRE(deleted);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("parent group not found") != std::string::npos);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == kCreate);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == kCreate);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id.empty());
+    CHECK(h.audits[1].detail == "validation_refused");
+    CHECK_FALSE(h.group_exists("orphaned-child"));
+    CHECK(h.group_count() == groups_before - 1); // only the parent's deletion changed the count
+}
+
+// ── UP-2 (Gate 7): the `*_revoked` failure rows name the principal the attempted row names ──────
+
+TEST_CASE("POST /management-groups: the session_revoked and permission_revoked failure rows name "
+          "the principal of the attempted row",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+
+    SECTION("session revoked while the attempted row was stored") {
+        h.session_gone_after_attempted = true;
+        auto res = h.create(R"({"name":"revoked-session"})");
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[0].principal == "tester");
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].detail == "session_revoked");
+        CHECK(h.audits[1].bound); // not re-resolved: a re-resolved row would name nobody here
+        CHECK(h.audits[1].principal == "tester");
+        CHECK(h.audits[1].principal == h.audits[0].principal);
+        CHECK(h.audits[1].target_id == h.audits[0].target_id);
+    }
+    SECTION("permission revoked while the attempted row was stored") {
+        h.perm_revoked_after_attempted = true;
+        auto res = h.create(R"({"name":"revoked-perm"})");
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].principal == "tester");
+        CHECK(h.audits[1].principal == h.audits[0].principal);
+    }
+    CHECK_FALSE(h.group_exists("revoked-session"));
+    CHECK_FALSE(h.group_exists("revoked-perm"));
+}
+
+TEST_CASE("POST and DELETE members: the session_revoked failure row names the principal of the "
+          "attempted row",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "revoked-members");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    h.session_gone_after_attempted = true;
+
+    SECTION("add member") {
+        auto res = h.add_member(gid, R"({"agent_id":"agent-2"})");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kAdd);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(rows[1].target_id == gid);
+        CHECK(h.member_count(gid) == 1);
+    }
+    SECTION("remove member") {
+        auto res = h.remove_member(gid, "agent-1");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kRemove);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(h.member_count(gid) == 1);
     }
 }

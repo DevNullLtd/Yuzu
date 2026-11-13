@@ -2,10 +2,12 @@
 
 /// @file mgmt_group_error.hpp
 /// The one answer to "is this ManagementGroupStore error message a store fault?", shared by the
-/// REST create and assign-role routes (rest_api_v1.cpp) and the four MCP management-group write
-/// tools (mcp_server.cpp: create, update, add member, assign role) so those two cannot drift. The
-/// other REST group routes (update, delete, add and remove member) map store errors on their
-/// own and are NOT routed through it.
+/// REST create and assign-role routes (rest_api_v1.cpp), the Settings create form
+/// (settings_routes.cpp) and the four MCP management-group write tools (mcp_server.cpp: create,
+/// update, add member, assign role), so those three cannot drift. The other REST group routes
+/// (update, delete, add and remove member) map store errors on their own and are NOT routed
+/// through it. The create audit token (`create_failure_token`, below) is shared by the same three
+/// create surfaces.
 ///
 /// The store returns `std::expected<..., std::string>`. A fault of the store itself (not open, no
 /// pool connection, a failed query) carries one of the FIXED messages below, always at the START
@@ -48,6 +50,25 @@ namespace yuzu::server {
         if (msg.starts_with(p))
             return true;
     return false;
+}
+
+/// The text `ManagementGroupStore::create_group` returns for a duplicate group name. A named
+/// constant is not seen by the literal scan above, so the store's literal and this constant are
+/// pinned equal by a test (`[mgmt-audit-first]`, test_rest_mgmt_group_audit_first.cpp); the
+/// scan's own list names the same text as a validation message.
+inline constexpr std::string_view kMgmtGroupNameConflict = "a group with that name already exists";
+
+/// The FIXED audit token for a failed group create: `name_conflict` (a duplicate name),
+/// `store_error` (a store fault) or `validation_refused` (any other store answer, e.g. a parent
+/// that vanished after the pre-check). Never the store's own text, which can carry database
+/// output. The REST create route, the MCP `create_management_group` tool and the Settings create
+/// form all use this one function.
+[[nodiscard]] constexpr std::string_view create_failure_token(std::string_view err) noexcept {
+    if (err == kMgmtGroupNameConflict)
+        return "name_conflict";
+    if (mgmt_group_error_is_store_fault(err))
+        return "store_error";
+    return "validation_refused";
 }
 
 } // namespace yuzu::server

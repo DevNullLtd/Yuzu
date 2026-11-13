@@ -85,7 +85,7 @@ public:
     // ── Group CRUD (deny-or-benign display class — may stay plain, EXCEPT
     // get_group: see get_group_checked below) ────────────────────────────
     /// The refusals `create_group` makes BEFORE it writes (store not open, empty
-    /// name, self-parent, parent not found, degraded ancestor read, depth cap),
+    /// name, self-parent, parent not found, degraded parent or ancestor read, depth cap),
     /// with the exact error text `create_group` returns for each. Success means
     /// "would pass those checks now"; nothing is written. `create_group` calls
     /// this itself (one copy of the logic), so a caller that pre-checks and then
