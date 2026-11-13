@@ -2805,14 +2805,14 @@ invocation 362 s to 375 s where the log carries per-line timestamps.
 priority order, which reproduces two observed baseline walls to within 3 s, gives
 269 s to 279 s with the shards at about 100 s and `gateway ct` at 130 s to 160 s,
 and 290 s to 302 s with the shards at 130 s; the invocation only gets longer than
-today if each shard runs past about 190 s. This takes the `gateway ct` half of
-the rung Push 2b named, at the shards' 120 rather than its own duration: ct is no
+today if each shard runs past about 190 s. This takes the `gateway ct` half of the
+rung Push 2b named, at the shards' 120 rather than its own duration: ct is no
 longer the 37 s entry Push 2b measured but 124 s to 136 s under the concurrent
-halves, so it needs to start with the shards. Local runs, all four entries at once:
-92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average of 20
-to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no priority); a
-priority for it is the next rung. The non-pg half should fall from about 480 s to
-about 390 s to 400 s, which leaves the pg half the longer one.
+halves, so it needs to start with the shards. Local runs, all four entries at
+once: 92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average
+of 20 to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no
+priority); a priority for it is the next rung. The non-pg half should fall from
+about 480 s to about 390 s to 400 s, which leaves the pg half the longer one.
 *Measurement and rule* are Push 2b's (two same-SHA samples, attempt-specific
 logs), judged on the cheap-suites invocation wall and the non-pg half's wall:
 (a) the invocation median improves by 10% or more; (b) no entry of 5 s or more

@@ -72,10 +72,10 @@ WEIGHT_HINTS: per-module wall time in seconds, as a shard runs it (cover
   one report per module; a plain `rebar3 eunit` runs WITH cover and would
   give skewed weights), read `_build/test/eunit/TEST-*.xml`, and list the
   modules over 2s (the wrapper prints each shard's module list and weight
-  total). The
-  earlier table came from the Windows MSVC leg WITH cover; on Linux it no
-  longer balanced the shards (about 250s against 200s on CI), and cover's
-  meck overhead (below) inflates some modules far more than others.
+  total). The earlier table came from the Windows MSVC leg WITH cover; on
+  Linux it no longer balanced the shards (about 250s against 200s on CI),
+  and cover's meck overhead (below) inflates some modules far more than
+  others.
 
 COVER: a shard runs with the test profile's `cover_enabled` forced to false
   (gateway/eunit_shard.config.script); a plain `rebar3 eunit --dir ...` keeps
