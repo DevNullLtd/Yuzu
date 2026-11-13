@@ -2226,9 +2226,15 @@ public:
                           "gauge");
         metrics_.describe(pg::kCollationCheckCounter,
                           "Total PostgreSQL collation version checks by result (ok, mismatch, "
-                          "not_applicable, unreadable); a check that could not run counts as "
-                          "unreadable",
+                          "not_applicable, unreadable); unreadable means the facts could not be "
+                          "read or the operating system reported no version",
                           "counter");
+        metrics_.describe(pg::kCollationLastCompletedGauge,
+                          "Unix time in seconds of the latest PostgreSQL collation version check "
+                          "that completed with any verdict (unreadable included); absent until the "
+                          "first check; a stale value means the recheck loop has stopped completing "
+                          "checks",
+                          "gauge");
         // Pre-seeded so every result reads 0, not absent, before it first happens
         // (docs/observability-conventions.md): the closed set is pg::all_collation_verdicts().
         pg::seed_collation_metrics(metrics_);
@@ -5439,6 +5445,11 @@ public:
                 // database's recorded collation version with the operating system's. Never stops
                 // the server (logs, exports yuzu_pg_collation_version_mismatch), so an operator can
                 // start it to fix the database; a failed check does not either. It gates nothing.
+                // Like every query this constructor runs before the listener binds, it has no
+                // client-side deadline against a backend that is frozen while its connection keeps
+                // acknowledging data (the 5 s bounds are the pool acquire and server-side
+                // statements; see pg_collation_recheck.hpp "LIFETIME"): a start against such a
+                // database waits here until the orchestrator gives up.
                 // The repeat (pg_collation_recheck_) is started in run(), seeded with the state
                 // this call leaves in collation_state_. See pg/pg_collation_check.hpp.
                 if (pg_probe_ok)
@@ -9522,7 +9533,7 @@ public:
                     pg_collation_recheck_ = std::make_unique<PgCollationRecheck>(
                         [this] { return pg::check_collation_version(*pg_pool_); }, &metrics_,
                         kCollationRecheckInterval, collation_state_,
-                        kCollationMismatchRecheckInterval);
+                        kCollationUnsettledRecheckInterval);
                     pg_collation_recheck_->start();
                 }
             }
@@ -11123,7 +11134,7 @@ public:
             // The collation recheck is told to stop here too, without a join: a check in flight can
             // take about 15 s (up to about 35 s on a network that drops packets, see the join
             // below) and signalled now it overlaps the drain and the web server stop instead of
-            // being added after them. Its join stays where it was, before pg_pool_ is reset.
+            // being added after them. Its join is the LAST step before pg_pool_ is reset.
             if (pg_collation_recheck_)
                 pg_collation_recheck_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
@@ -11257,18 +11268,6 @@ public:
         // exchange inside libpq that is in progress when stop() arrives.
         if (pg_reachability_probe_)
             pg_reachability_probe_->stop();
-
-        // Join the collation recheck. It borrows pg_pool_, which is reset far below, so it is
-        // joined here. request_stop() was called at the start of the drain above, so the check in
-        // flight has been running alongside the drain and the web server stop; the join waits only
-        // for what is left of it. The check is bounded: about 15 s (the 5 s acquire and two 5 s
-        // statements, pg_collation_check.hpp), and up to about 35 s if the network drops packets (a
-        // new connection adds the pool's 10 s connect timeout and a silent connection is given up
-        // on by tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce;
-        // pg_pool.hpp). stop() is idempotent; the member is also declared after pg_pool_ so its
-        // destructor (which stops it too) runs first.
-        if (pg_collation_recheck_)
-            pg_collation_recheck_->stop();
 
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
@@ -12452,6 +12451,24 @@ public:
         // workers before any reset), not a reordering within this function.
         if (gateway_service_)
             gateway_service_->set_known_gateway_clusters(nullptr);
+        // Join the collation recheck. It borrows pg_pool_, so it is joined immediately before the
+        // reset, and deliberately LAST: the join can wait out a check in flight, and a wait here
+        // must not be able to hold up the leader-lease release, the audit cleanup or the offload
+        // flush above (an orchestrator kill during the wait would skip them). request_stop() was
+        // called at the start of the drain, so the check has been running alongside the drain and
+        // the rest of teardown; the join waits only for what is left of it. With the pool defaults
+        // that is bounded by about 15 s (the 5 s acquire and two 5 s statements,
+        // pg_collation_check.hpp), up to about 35 s if the network drops packets (a new connection
+        // adds the pool's 10 s connect timeout and a silent connection is given up on by
+        // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce; pg_pool.hpp).
+        // It is NOT bounded against a backend that is frozen while its connection keeps
+        // acknowledging data, a host-name lookup that hangs, or a connection string that sets
+        // tcp_user_timeout to 0: libpq has no client-side query deadline here, so such a wait ends
+        // only when the orchestrator kills the process, after everything above has run. stop() is
+        // idempotent; the member is also declared after pg_pool_ so its destructor (which stops it
+        // too) runs first.
+        if (pg_collation_recheck_)
+            pg_collation_recheck_->stop();
         gw_mgmt_pool_.reset();
         pg_pool_.reset();
 

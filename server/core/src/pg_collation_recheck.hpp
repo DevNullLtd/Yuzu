@@ -29,14 +29,19 @@
 ///
 /// LIFETIME (ServerImpl). `start()` runs in `run()`, after the constructor-time check and past
 /// every fail-closed return. `ServerImpl::stop()` calls `request_stop()` EARLY, at the start of
-/// the shutdown drain, and `stop()` (signal and join) later, before the PostgreSQL pool the check
-/// function borrows is reset. The split exists because the join can wait out the check in flight,
-/// which is bounded but not short: about 15 seconds (the acquire and each of the two statements
-/// are bounded at 5 seconds in `pg_collation_check.hpp`), and up to about 35 seconds if the
-/// network drops packets (a new connection adds the pool's 10 second connect timeout, and a
+/// the shutdown drain, and `stop()` (signal and join) LATE, immediately before the PostgreSQL pool
+/// the check function borrows is reset, after the leader lease is released and the audit and
+/// offload flushes have run (a wait there must not be able to skip them). The split exists because
+/// the join can wait out the check in flight. With the pool defaults that wait is about 15 seconds
+/// (the acquire and each of the two statements are bounded at 5 seconds in
+/// `pg_collation_check.hpp`; a saturated pool fails the acquire sooner), and up to about 35 seconds
+/// if the network drops packets (a new connection adds the pool's 10 second connect timeout, and a
 /// silent connection is given up on by `tcp_user_timeout_ms`, 10 seconds by default, which
-/// `statement_timeout` cannot enforce; `pg_pool.hpp`). Signalled early, that check runs while the
-/// rest of teardown runs, so the final join waits only for whatever is left of it by then. The
+/// `statement_timeout` cannot enforce; `pg_pool.hpp`). It is NOT bounded against a backend that is
+/// frozen while its connection keeps acknowledging data, a host-name lookup that hangs, or a
+/// connection string that sets `tcp_user_timeout` to 0: libpq has no client-side query deadline
+/// here. Signalled early, a check in flight runs while the rest of teardown runs, so the final
+/// join waits only for whatever is left of it by then. The
 /// check itself is not interrupted: `request_stop()` makes the loop exit after it and makes the
 /// tick drop its report. A check that has already passed `tick()`'s stop test may still start in
 /// the instant before the check function is called; its report is then dropped, and the join
@@ -65,10 +70,9 @@ inline constexpr std::chrono::seconds kCollationRecheckInterval{3600};
 /// Mismatch (after a repair the gauge must not outlast it by up to an hour), or there is no
 /// conclusive verdict yet (the start-time check was unreadable), or the latest check was
 /// unreadable. One cheap read a minute (the same bounded transaction as the hourly one) is the
-/// price, paid only while unsettled. The name says Mismatch for history; the rule is
-/// `PgCollationRecheck::next_wait`.
-inline constexpr std::chrono::seconds kCollationMismatchRecheckInterval{60};
-static_assert(kCollationMismatchRecheckInterval < kCollationRecheckInterval,
+/// price, paid only while unsettled. The rule is `PgCollationRecheck::next_wait`.
+inline constexpr std::chrono::seconds kCollationUnsettledRecheckInterval{60};
+static_assert(kCollationUnsettledRecheckInterval < kCollationRecheckInterval,
               "the unsettled cadence must be the faster one");
 static_assert(kCollationRecheckInterval == std::chrono::seconds{3600},
               "the hourly recheck interval is part of the documented behaviour (server-admin.md, "
@@ -81,12 +85,12 @@ public:
 
     /// `metrics` may be null and must outlive this object. `initial` is the state left by the
     /// constructor-time report. While the state is unsettled (last conclusive verdict Mismatch or
-    /// none yet, or the latest check unreadable) the loop waits `mismatch_interval` instead of
+    /// none yet, or the latest check unreadable) the loop waits `unsettled_interval` instead of
     /// `interval` when that is shorter.
     PgCollationRecheck(CheckFn check, yuzu::MetricsRegistry* metrics,
                        std::chrono::milliseconds interval, pg::CollationState initial = {},
-                       std::chrono::milliseconds mismatch_interval =
-                           kCollationMismatchRecheckInterval);
+                       std::chrono::milliseconds unsettled_interval =
+                           kCollationUnsettledRecheckInterval);
     ~PgCollationRecheck();
     PgCollationRecheck(const PgCollationRecheck&) = delete;
     PgCollationRecheck& operator=(const PgCollationRecheck&) = delete;
@@ -124,7 +128,7 @@ private:
     const CheckFn check_;
     yuzu::MetricsRegistry* const metrics_;
     const std::chrono::milliseconds interval_;
-    const std::chrono::milliseconds mismatch_interval_;
+    const std::chrono::milliseconds unsettled_interval_;
 
     std::atomic<bool> stop_{false};
     std::atomic<std::uint64_t> ticks_{0};

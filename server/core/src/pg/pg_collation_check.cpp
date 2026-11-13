@@ -10,6 +10,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <exception>
 #include <string>
 #include <vector>
@@ -58,7 +59,7 @@ std::string unreadable_failure_text(const std::string& failure, bool facts_read,
     if (facts_read)
         return "commit failed";
     if (!pool_error.empty())
-        return pool_error;
+        return "the pool's last error (may be from an earlier attempt): " + pool_error;
     return "could not run the collation version query";
 }
 
@@ -134,10 +135,18 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
             out.failure = "the operating system reported no collation version for this database";
     } catch (const std::exception& e) {
         out.verdict = CollationVerdict::Unreadable;
-        out.failure = e.what();
+        // The text is best effort: assigning it can itself throw (out of memory), and this function
+        // is noexcept, so the verdict above is the part that must survive.
+        try {
+            out.failure = e.what();
+        } catch (...) {
+        }
     } catch (...) {
         out.verdict = CollationVerdict::Unreadable;
-        out.failure = "unknown exception";
+        try {
+            out.failure = "unknown exception";
+        } catch (...) {
+        }
     }
     return out;
 }
@@ -165,7 +174,7 @@ CollationStep next_collation_state(const CollationState& prev, CollationVerdict 
         if (prev.last == CollationLast::Mismatch)
             step.log = LogAction::InfoMismatchNoLongerApplies;
         else if (prev.last != CollationLast::NotApplicable)
-            step.log = LogAction::DebugNotApplicable;
+            step.log = LogAction::InfoNotApplicable;
         break;
     case CollationVerdict::Unreadable:
         step.next = {prev.last, true};
@@ -182,9 +191,14 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
     try {
         const CollationStep step = next_collation_state(state, report.verdict);
         state = step.next;
-        if (metrics)
+        if (metrics) {
             metrics->counter(kCollationCheckCounter, {{"result", to_string(report.verdict)}})
                 .increment();
+            metrics->gauge(kCollationLastCompletedGauge)
+                .set(static_cast<double>(std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count()));
+        }
         if (metrics) {
             switch (step.gauge) {
             case GaugeAction::Leave:
@@ -225,12 +239,13 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
             break;
         case LogAction::InfoCleared:
             spdlog::info("[PG] database '{}' collation version {} now matches the operating "
-                         "system's again; the earlier mismatch is cleared",
+                         "system's again; the earlier mismatch is cleared (this compares "
+                         "versions only; it does not show that the indexes were rebuilt)",
                          db, ::yuzu::log_key_token(report.recorded));
             break;
         case LogAction::ErrorMismatch:
             spdlog::error(
-                "[PG] database '{}' was created with collation version {} but the operating "
+                "[PG] database '{}' records collation version {} but the operating "
                 "system now reports {}. Indexes on text columns may be ordered under the old "
                 "rules, and an ordered read of a text key (a keyset page walk) can skip or repeat "
                 "rows. Remedy, in this order: connect to that database; reindex it (REINDEX "
@@ -254,9 +269,9 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
                          "there is nothing to compare",
                          db);
             break;
-        case LogAction::DebugNotApplicable:
-            spdlog::debug(
-                "[PG] database collation version check not applicable (no recorded version)");
+        case LogAction::InfoNotApplicable:
+            spdlog::info("[PG] database collation version check not applicable (no recorded version, or "
+                         "PostgreSQL before 15); the gauge stays absent");
             break;
         }
     } catch (...) {

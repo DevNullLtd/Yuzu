@@ -24,6 +24,7 @@
 #include <libpq-fe.h>
 
 #include <initializer_list>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -127,12 +128,13 @@ TEST_CASE("collation state machine: every (previous state, verdict) pair", "[pg_
                 CHECK(step.next == st(CollationLast::NotApplicable));
                 CHECK(step.gauge == GaugeAction::Remove);
                 // A repeat is silent; a Mismatch that becomes NotApplicable (the series is removed
-                // without ever reading 0) is announced at INFO; any other entry is debug-level.
+                // without ever reading 0) is announced at INFO; any other entry says once, at INFO, that the check
+                // does not apply.
                 CHECK(step.log == (prev.last == CollationLast::NotApplicable
                                        ? LogAction::None
                                        : prev.last == CollationLast::Mismatch
                                              ? LogAction::InfoMismatchNoLongerApplies
-                                             : LogAction::DebugNotApplicable));
+                                             : LogAction::InfoNotApplicable));
                 break;
             case CollationVerdict::Unreadable:
                 // Never flips the gauge, remembers the last conclusive finding, and warns once
@@ -258,6 +260,70 @@ TEST_CASE("collation report logs on a transition only", "[pg_collation][state][l
     CHECK(count("[error]") == 1);                         // the mismatch, once
     CHECK(count("[warning]") == 1);                       // the unreadable spell, once
     CHECK(count("the earlier mismatch is cleared") == 1); // the fix, once
+    // The clearing line says it compares versions only (a REFRESH alone also clears it).
+    CHECK(count("it does not show that the indexes were rebuilt") == 1);
+}
+
+TEST_CASE("collation report: entering not-applicable says so once at INFO", "[pg_collation][log]") {
+    yuzu::test::LogCapture cap(spdlog::level::info);
+    CollationState state;
+    for (int i = 0; i < 3; ++i)
+        report_collation_check(report(CollationVerdict::NotApplicable), nullptr, state);
+    cap.stop();
+    const std::string logs = cap.text();
+    std::size_t n = 0;
+    for (auto at = logs.find("check not applicable"); at != std::string::npos;
+         at = logs.find("check not applicable", at + 1))
+        ++n;
+    CHECK(n == 1);
+    CHECK(logs.find("[info]") != std::string::npos);
+}
+
+TEST_CASE("collation report: the last-completed time is set by every verdict and absent before "
+          "the first",
+          "[pg_collation][metrics]") {
+    yuzu::MetricsRegistry m;
+    const auto has_series = [&] {
+        return ("\n" + m.serialize()).find(std::string("\n") + kCollationLastCompletedGauge + " ") !=
+               std::string::npos;
+    };
+    CollationState state;
+    CHECK_FALSE(has_series()); // nothing has completed yet
+    const double before = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    for (const auto v : {CollationVerdict::Unreadable, CollationVerdict::Ok,
+                         CollationVerdict::Mismatch, CollationVerdict::NotApplicable}) {
+        m.gauge(kCollationLastCompletedGauge).set(0.0); // would stay 0 if the verdict did not stamp it
+        report_collation_check(report(v, "a", v == CollationVerdict::Mismatch ? "b" : "a"), &m,
+                               state);
+        const double stamped = m.gauge(kCollationLastCompletedGauge).value();
+        INFO("verdict " << to_string(v));
+        CHECK(stamped >= before);
+        CHECK(stamped <= before + 60.0);
+    }
+    CHECK(has_series()); // and a not-applicable verdict does not remove it
+}
+
+TEST_CASE("collation report: Mismatch, not applicable, Mismatch again re-creates the gauge series",
+          "[pg_collation][metrics]") {
+    yuzu::MetricsRegistry m;
+    CollationState state;
+    const auto sample = [&] {
+        return ("\n" + m.serialize()).find(std::string("\n") + kCollationMismatchGauge + " ") !=
+               std::string::npos;
+    };
+    report_collation_check(report(CollationVerdict::Mismatch, "a", "b"), &m, state);
+    REQUIRE(sample());
+    CHECK(m.gauge(kCollationMismatchGauge).value() == 1.0);
+    report_collation_check(report(CollationVerdict::NotApplicable), &m, state);
+    // gauge() creates the series, so look at the exposition text only
+    CHECK_FALSE(("\n" + m.serialize()).find(std::string("\n") + kCollationMismatchGauge + " ") !=
+                std::string::npos);
+    report_collation_check(report(CollationVerdict::Mismatch, "a", "b"), &m, state);
+    CHECK(sample());
+    CHECK(m.gauge(kCollationMismatchGauge).value() == 1.0);
 }
 
 TEST_CASE("collation report: a mismatch that stops applying logs one INFO line and removes "
@@ -333,8 +399,10 @@ TEST_CASE("unreadable failure text: a failed COMMIT is not blamed on the pool", 
     // earlier pool error must not be echoed as its cause.
     CHECK(unreadable_failure_text("", true, "connection refused earlier") == "commit failed");
     CHECK(unreadable_failure_text("", true, "") == "commit failed");
-    // Facts not read: the pool's own error (the acquire failed), else a fixed text.
-    CHECK(unreadable_failure_text("", false, "pool acquire timeout") == "pool acquire timeout");
+    // Facts not read: the pool's own error (the acquire or BEGIN failed), marked as possibly from an
+    // earlier attempt because the pool keeps only its latest error; else a fixed text.
+    CHECK(unreadable_failure_text("", false, "pool acquire timeout") ==
+          "the pool's last error (may be from an earlier attempt): pool acquire timeout");
     CHECK(unreadable_failure_text("", false, "") ==
           "could not run the collation version query");
 }
@@ -395,7 +463,11 @@ TEST_CASE("collation report: a mismatch logs one error naming the database, both
     CHECK(logs.find("REINDEX DATABASE CONCURRENTLY \"yuzu_prod\"") != std::string::npos);
     CHECK(logs.find("ALTER DATABASE \"yuzu_prod\" REFRESH COLLATION VERSION") != std::string::npos);
     CHECK(logs.find("REFRESH COLLATION VERSION") != std::string::npos);
+    // The docs quote these strings, so they are pinned here.
+    CHECK(logs.find("records collation version 2.36 but the operating system now reports 2.39") !=
+          std::string::npos);
     CHECK(logs.find("[warning]") != std::string::npos); // the Unreadable report
+    CHECK(logs.find("could not check the database collation version") != std::string::npos);
     CHECK(logs.find("the probe failed") != std::string::npos);
 }
 

@@ -12,9 +12,9 @@ namespace yuzu::server {
 PgCollationRecheck::PgCollationRecheck(CheckFn check, yuzu::MetricsRegistry* metrics,
                                        std::chrono::milliseconds interval,
                                        pg::CollationState initial,
-                                       std::chrono::milliseconds mismatch_interval)
+                                       std::chrono::milliseconds unsettled_interval)
     : check_(std::move(check)), metrics_(metrics), interval_(interval),
-      mismatch_interval_(mismatch_interval), state_(initial) {}
+      unsettled_interval_(unsettled_interval), state_(initial) {}
 
 PgCollationRecheck::~PgCollationRecheck() {
     stop();
@@ -33,7 +33,11 @@ void PgCollationRecheck::tick() noexcept {
         report = check_();
     } catch (...) {
         report.verdict = pg::CollationVerdict::Unreadable;
-        report.failure = "the collation check threw";
+        // Best effort: assigning the text can throw (out of memory) and this function is noexcept.
+        try {
+            report.failure = "the collation check threw";
+        } catch (...) {
+        }
     }
     // A check cut short by stop() is not reported: the server is going down.
     if (stop_.load(std::memory_order_acquire))
@@ -51,8 +55,8 @@ void PgCollationRecheck::start() {
     std::lock_guard<std::mutex> lk(mu_);
     if (started_ || stop_.load(std::memory_order_acquire))
         return;
+    thread_ = std::thread([this] { run_loop(); }); // may throw (thread exhaustion): started_ stays false
     started_ = true;
-    thread_ = std::thread([this] { run_loop(); });
 }
 
 void PgCollationRecheck::request_stop() noexcept {
@@ -83,7 +87,7 @@ std::chrono::milliseconds PgCollationRecheck::next_wait() const {
         unsettled = state_.last == pg::CollationLast::Mismatch ||
                     state_.last == pg::CollationLast::None || state_.unreadable;
     }
-    return unsettled ? std::min(interval_, mismatch_interval_) : interval_;
+    return unsettled ? std::min(interval_, unsettled_interval_) : interval_;
 }
 
 void PgCollationRecheck::run_loop() {

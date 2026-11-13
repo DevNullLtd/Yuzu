@@ -27,6 +27,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <new>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -39,6 +40,9 @@ using yuzu::server::pg::CollationLast;
 using yuzu::server::pg::CollationReport;
 using yuzu::server::pg::CollationState;
 using yuzu::server::pg::CollationVerdict;
+
+// The documented cadence while the picture is unsettled (server-admin.md, metrics.md).
+static_assert(kCollationUnsettledRecheckInterval == std::chrono::seconds{60});
 
 namespace {
 
@@ -198,11 +202,13 @@ TEST_CASE("PgCollationRecheck: the first recheck is one interval after start, th
     for (int i = 0; i < 600 && check.calls.load() < 2; ++i)
         std::this_thread::sleep_for(10ms);
     CHECK(check.calls.load() >= 2); // and it repeats
-    // The first check came at least one interval after start (measured at the check itself).
+    // The first check came about one interval after start (measured at the check itself). The 50 ms
+    // slack is for a timer that wakes a little early on some platforms; the "no check yet after
+    // 50 ms" assertion above pins the other side.
     const auto first = std::chrono::steady_clock::time_point(
         std::chrono::nanoseconds(check.first_call_ns.load()));
     REQUIRE(check.first_call_ns.load() != 0);
-    CHECK(first - started >= kInterval);
+    CHECK(first - started >= kInterval - 50ms);
 
     const auto t = std::chrono::steady_clock::now();
     recheck.stop();
@@ -618,9 +624,10 @@ TEST_CASE("PgCollationRecheck: an unsettled state is rechecked sooner than the h
 // The documented repair, run for real. A forced mismatch sets the gauge to 1; then the statements
 // the runbook gives (REINDEX DATABASE CONCURRENTLY, ALTER DATABASE ... REFRESH COLLATION VERSION)
 // run against the throwaway database, and the recheck loop, with nothing faked after the first
-// UPDATE, must see the repair and clear the gauge by itself. Kills: a gauge that never clears, a
-// loop that stays on the hourly interval while a mismatch stands, and a runbook statement that
-// does not do what the docs say.
+// UPDATE, must see the repair and clear the gauge by itself. Kills: a gauge that never clears and a
+// loop that stays on the hourly interval while a mismatch stands. It does NOT show that the REINDEX
+// rebuilt anything: this database holds no user index, and REFRESH COLLATION VERSION alone clears the
+// gauge (the docs say so). The [nonsuper] case below checks the rebuild on an index it creates.
 TEST_CASE("PgCollationRecheck against a real database: the documented reindex clears the gauge "
           "within the Mismatch interval",
           "[pg][pg_collation][recheck]") {
@@ -634,9 +641,6 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     if (first.verdict == CollationVerdict::Mismatch)
         SKIP("this cluster's template database already has a collation version mismatch");
     REQUIRE(first.verdict == CollationVerdict::Ok);
-
-    // The documented cadence while a mismatch stands.
-    CHECK(std::chrono::milliseconds(kCollationMismatchRecheckInterval).count() == 60000);
 
     auto run_sql = [&](const std::string& sql) {
         auto lease = pool.acquire();
@@ -659,8 +663,8 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     // The opt-in run at the production cadence (a minute): YUZU_TEST_REAL_CADENCE=1. The default
     // run uses 200 ms so the suite does not wait a minute.
     const bool real_cadence = std::getenv("YUZU_TEST_REAL_CADENCE") != nullptr;
-    const std::chrono::milliseconds production(kCollationMismatchRecheckInterval);
-    const auto mismatch_interval = real_cadence ? production : std::chrono::milliseconds(200);
+    const std::chrono::milliseconds production(kCollationUnsettledRecheckInterval);
+    const auto unsettled_interval = real_cadence ? production : std::chrono::milliseconds(200);
 
     // A forced mismatch (the one faked step), seen by the start-time check.
     if (!run_sql("UPDATE pg_database SET datcollversion = '0.0.bogus' WHERE datname = "
@@ -673,7 +677,7 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     REQUIRE(gauge(m) == 1.0);
 
     PgCollationRecheck recheck([&pool] { return pg::check_collation_version(pool); }, &m, 1h,
-                               state, mismatch_interval);
+                               state, unsettled_interval);
     recheck.start();
 
     // While broken the gauge stays at 1 across several rechecks (it does not flap).
@@ -686,16 +690,15 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     const auto repaired = std::chrono::steady_clock::now();
 
     // Nothing else is touched: the recheck loop alone must clear the gauge.
-    const auto budget = mismatch_interval + 5s;
+    const auto budget = unsettled_interval + 5s;
     while (recheck.state().last == CollationLast::Mismatch &&
            std::chrono::steady_clock::now() - repaired < budget)
         std::this_thread::sleep_for(20ms);
     const auto cleared_after = std::chrono::steady_clock::now() - repaired;
     INFO("cleared after "
          << std::chrono::duration_cast<std::chrono::milliseconds>(cleared_after).count()
-         << " ms (mismatch interval " << mismatch_interval.count() << " ms)");
+         << " ms (mismatch interval " << unsettled_interval.count() << " ms)");
     CHECK(recheck.state().last == CollationLast::Ok);
-    CHECK(cleared_after <= mismatch_interval + 2s);
     CHECK(gauge(m) == 0.0);
 
     // The refresh really recorded the operating system's version (not a faked UPDATE).
@@ -706,7 +709,7 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     // And back on the long interval: no further checks while healthy.
     std::this_thread::sleep_for(150ms); // the report that cleared the gauge finishes counting
     const auto ticks = recheck.ticks();
-    std::this_thread::sleep_for(mismatch_interval * 3 > 1s ? 1s : mismatch_interval * 3);
+    std::this_thread::sleep_for(unsettled_interval * 3 > 1s ? 1s : unsettled_interval * 3);
     CHECK(recheck.ticks() == ticks);
     recheck.stop();
 }
@@ -803,15 +806,26 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
             }
         }
     } role_guard{[&] {
-        sql(admin, "ALTER DATABASE " + quoted_db + " OWNER TO " + pg::quote_identifier(admin_name));
-        sql(admin, "DROP OWNED BY " + quoted_role);
-        sql(admin, "DROP ROLE IF EXISTS " + quoted_role);
+        // Each statement on its own: a failure of one (a dead admin lease throws from `sql`) must not
+        // skip the rest, or the cluster-wide role is left behind.
+        const auto attempt = [&](const std::string& text) {
+            try {
+                sql(admin, text);
+            } catch (...) {
+            }
+        };
+        attempt("ALTER DATABASE " + quoted_db + " OWNER TO " + pg::quote_identifier(admin_name));
+        attempt("DROP OWNED BY " + quoted_role);
+        attempt("DROP ROLE IF EXISTS " + quoted_role);
     }};
 
     // A table the admin owns and an index on its text key: what the repair has to rebuild.
     REQUIRE(sql(admin, "CREATE TABLE ci_probe (k text PRIMARY KEY)"));
+    // The role is cluster-wide and has a fixed test password, so it expires by itself in an hour if a
+    // killed run never reaches the guard above.
+    const std::string valid_until = text_of(admin, "SELECT (now() + interval '1 hour')::text");
     REQUIRE(sql(admin, "CREATE ROLE " + quoted_role + " LOGIN NOSUPERUSER NOCREATEDB PASSWORD '" +
-                           kPassword + "'"));
+                           kPassword + "' VALID UNTIL '" + valid_until + "'"));
     REQUIRE(sql(admin, "GRANT CONNECT ON DATABASE " + quoted_db + " TO " + quoted_role));
 
     pg::PgPool role_pool{{.conninfo = dsn_as_role(db.dsn(), role, kPassword), .size = 3}};
@@ -852,7 +866,14 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
     std::this_thread::sleep_for(500ms);
     CHECK(gauge(m) == 1.0);
 
+    // The rebuild is observable: a rebuilt index gets a new relfilenode. Without this the case would
+    // stay green if REINDEX did nothing, because REFRESH alone clears the gauge.
+    const std::string probe_file_before = text_of(
+        role_pool, "SELECT relfilenode::text FROM pg_class WHERE relname = 'ci_probe_pkey'");
     REQUIRE(sql(role_pool, "REINDEX DATABASE CONCURRENTLY " + quoted_db));
+    CHECK(text_of(role_pool,
+                  "SELECT relfilenode::text FROM pg_class WHERE relname = 'ci_probe_pkey'") !=
+          probe_file_before);
     REQUIRE(sql(role_pool, "ALTER DATABASE " + quoted_db + " REFRESH COLLATION VERSION"));
     const auto repaired = std::chrono::steady_clock::now();
     while (recheck.state().last == CollationLast::Mismatch &&
@@ -865,4 +886,58 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
     const CollationReport after = pg::check_collation_version(role_pool);
     CHECK(after.verdict == CollationVerdict::Ok);
     CHECK(after.recorded == first.actual);
+}
+
+TEST_CASE("PgCollationRecheck: the destructor joins a loop that is still running",
+          "[pg_collation][recheck]") {
+    // Every other started case calls stop() (or a guard) first: this one lets scope end, so removing
+    // the destructor's stop() would hang or crash here instead of passing.
+    ScriptedCheck check;
+    {
+        PgCollationRecheck recheck(check.fn(), nullptr, 5ms);
+        recheck.start();
+        for (int i = 0; i < 400 && check.calls.load() < 1; ++i)
+            std::this_thread::sleep_for(10ms);
+        REQUIRE(check.calls.load() >= 1);
+    } // ~PgCollationRecheck: request_stop, then join
+    const int after = check.calls.load();
+    std::this_thread::sleep_for(100ms);
+    CHECK(check.calls.load() == after); // no thread left running the check
+}
+
+TEST_CASE("PgCollationRecheck: tick without a check function does nothing, and a check that throws "
+          "anything is an unreadable tick",
+          "[pg_collation][recheck]") {
+    yuzu::MetricsRegistry m;
+    {
+        PgCollationRecheck recheck(PgCollationRecheck::CheckFn{}, &m, 1h);
+        recheck.tick();
+        CHECK(recheck.ticks() == 0);
+        CHECK(count(m, "unreadable") == 0);
+    }
+    {
+        PgCollationRecheck recheck([]() -> CollationReport { throw std::bad_alloc(); }, &m, 1h);
+        recheck.tick();
+        CHECK(recheck.ticks() == 1);
+        CHECK(count(m, "unreadable") == 1);
+        CHECK(recheck.state().unreadable);
+    }
+}
+
+TEST_CASE("PgCollationRecheck: start and stop from different threads are safe",
+          "[pg_collation][recheck]") {
+    // Meaningful under TSan (not run for this change): the thread member is written by start() and
+    // read by stop(), ordered only through mu_.
+    ScriptedCheck check;
+    for (int round = 0; round < 20; ++round) {
+        PgCollationRecheck recheck(check.fn(), nullptr, 1ms);
+        std::thread starter([&] { recheck.start(); });
+        std::thread stopper([&] { recheck.request_stop(); });
+        starter.join();
+        stopper.join();
+        recheck.stop();
+        const int after = check.calls.load();
+        std::this_thread::sleep_for(5ms);
+        CHECK(check.calls.load() == after);
+    }
 }

@@ -104,7 +104,9 @@ struct CollationFacts {
 /// Why a check that did not produce a verdict failed, for the log. Pure. `failure` is the text
 /// captured inside the transaction; `facts_read` is true when the callback finished reading the
 /// facts (so a failure with `failure` empty can only be the COMMIT); `pool_error` is the pool's
-/// last error. A failed COMMIT says so rather than echoing an unrelated earlier pool error.
+/// last error. A failed COMMIT says so rather than echoing an unrelated earlier pool error. When
+/// the transaction never ran (acquire or BEGIN failed) the pool error is shown but marked as
+/// possibly from an earlier attempt, because the pool keeps only its latest error.
 [[nodiscard]] std::string unreadable_failure_text(const std::string& failure, bool facts_read,
                                                   const std::string& pool_error);
 
@@ -135,7 +137,7 @@ enum class LogAction {
     ErrorMismatch,       ///< entering Mismatch
     InfoCleared,         ///< Mismatch to Ok
     WarnUnreadable,      ///< entering an Unreadable spell
-    DebugNotApplicable,  ///< entering NotApplicable
+    InfoNotApplicable,   ///< entering NotApplicable (once; the gauge series is absent)
     InfoMismatchNoLongerApplies,  ///< Mismatch to NotApplicable (the gauge series is removed)
 };
 
@@ -163,8 +165,15 @@ inline constexpr const char* kCollationCheckStatementTimeout = "5s";
 /// set of four.
 inline constexpr const char* kCollationMismatchGauge = "yuzu_pg_collation_version_mismatch";
 inline constexpr const char* kCollationCheckCounter = "yuzu_pg_collation_check_total";
+/// Unix time, in seconds, of the latest check that COMPLETED with any verdict (Unreadable included).
+/// Absent until the first report, never removed. A stale value means the recheck loop has stopped
+/// completing checks (a check stuck mid-query, a wedged thread), which the mismatch gauge and the
+/// counter cannot show.
+inline constexpr const char* kCollationLastCompletedGauge =
+    "yuzu_pg_collation_check_last_completed_timestamp_seconds";
 
-/// Applies one check's report: updates `state`, counts the check, drives the gauge and logs, all
+/// Applies one check's report: updates `state`, counts the check, stamps the last-completed time,
+/// drives the gauge and logs, all
 /// as decided by `next_collation_state`. On a Mismatch entry one ERROR names the database, both
 /// versions and the remedy. The gauge is absent (not zero) until a conclusive verdict sets it, and
 /// is removed again on NotApplicable. `metrics` may be null. Never throws. Not thread-safe:

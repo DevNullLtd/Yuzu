@@ -49,6 +49,15 @@ Invariants:
      before the join `pg_collation_recheck_->stop();`: the check in flight is told to stop at the
      start of teardown, so it overlaps the rest of it instead of being added after it.
 
+  11. The recheck construction is guarded by exactly
+     `if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {` (both
+     conditions present and negated): an inverted or half-dropped guard compiles, passes every
+     unit test and either never starts the recheck or starts one stop() will not join.
+  12. The three series' HELP text and the counter's closed result set are wired: `pg::seed_collation_metrics(metrics_);`
+     appears exactly once, before the constructor-time report, and `metrics_.describe(` is called
+     once for each of the mismatch gauge, the check counter and the last-completed gauge. A dropped
+     seed makes the first failure after a restart invisible to `increase()`.
+
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
 the preprocessor-dead branches of `#if 0` / `#if 1 ... #else` (nested, with `#elif`) are removed,
@@ -101,8 +110,15 @@ MSG_MAKE_BEFORE_CHECK = ("the PgCollationRecheck is constructed before the const
                          "report_collation_check call")
 MSG_MAKE_NO_STATE = "the PgCollationRecheck is not seeded with collation_state_"
 MSG_NO_START = "run() no longer starts the PgCollationRecheck after constructing it"
-MSG_UNLOCKED = ("the PgCollationRecheck is not constructed under lifecycle_mu_ with a "
-                "stop_requested_ check")
+START_GUARD = "if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {"
+MSG_UNLOCKED = ("the PgCollationRecheck is not constructed under lifecycle_mu_ with exactly the "
+                "guard `" + START_GUARD + "` (both conditions, both negated)")
+SEED = "pg::seed_collation_metrics(metrics_);"
+DESCRIBED = ("pg::kCollationMismatchGauge", "pg::kCollationCheckCounter",
+             "pg::kCollationLastCompletedGauge")
+MSG_SEED = ("server.cpp must call `" + SEED + "` exactly once, before the constructor-time "
+            "report_collation_check call")
+MSG_DESCRIBE = "server.cpp must call metrics_.describe(...) once for each of the three collation series"
 MSG_STOP_COUNT = "expected exactly one `{}` in server.cpp, found {{n}}".format(STOP)
 MSG_STOP_NOT_IN_STOP = "the PgCollationRecheck is not stopped inside stop()'s own body"
 MSG_STOP_AFTER_POOL = "stop() resets pg_pool_ before it stops the PgCollationRecheck"
@@ -297,7 +313,7 @@ def recheck_problems(t, report_pos):
         if "collation_state_" not in t[pos:end]:
             out.append(MSG_MAKE_NO_STATE)
         window = t[max(0, pos - 300):pos]
-        if "lifecycle_mu_" not in window or "stop_requested_" not in window:
+        if "lifecycle_mu_" not in window or START_GUARD not in window:
             out.append(MSG_UNLOCKED)
         start = t.find(START, pos)
         if start < 0 or not (run[0] < start < run[1]):
@@ -340,6 +356,13 @@ def problems(src):
         out.append(MSG_STARTUP_FAILED)
     if "collation_state_" not in t[pos:end]:
         out.append(MSG_NO_STATE)
+    seeds = [m.start() for m in re.finditer(re.escape(SEED), t)]
+    if len(seeds) != 1 or seeds[0] > pos:
+        out.append(MSG_SEED)
+    for name in DESCRIBED:
+        if len(re.findall(r"metrics_\.describe\(\s*" + re.escape(name) + r"\s*,", t)) != 1:
+            out.append(MSG_DESCRIBE)
+            break
     return out + recheck_problems(t, pos)
 
 
@@ -489,6 +512,28 @@ class PgCollationCheckWiring(unittest.TestCase):
         k = rest.index(POOL_DECL)
         m = rest[:k] + RECHECK_DECL + "\n    " + rest[k:]
         self.assertEqual(problems(m), [MSG_DECL_ORDER])
+
+    def test_start_guard_with_the_stop_condition_not_negated(self):
+        m = self.src.replace("!stop_requested_.load(std::memory_order_acquire)) {\n                    pg_collation_recheck_",
+                             "stop_requested_.load(std::memory_order_acquire)) {\n                    pg_collation_recheck_", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_UNLOCKED])
+
+    def test_start_guard_without_the_teardown_condition(self):
+        m = self.src.replace("if (!teardown_complete_ && !stop_requested_.load(", "if (!stop_requested_.load(", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_UNLOCKED])
+
+    def test_metrics_seed_deleted(self):
+        m = self.src.replace(SEED, "(void)0;", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_SEED])
+
+    def test_a_collation_series_not_described(self):
+        m = self.src.replace("metrics_.describe(pg::kCollationLastCompletedGauge,",
+                             "metrics_.describe(\"yuzu_other\",", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_DESCRIBE])
 
     def test_recheck_not_under_the_lifecycle_lock(self):
         i = self.src.index(MAKE)
