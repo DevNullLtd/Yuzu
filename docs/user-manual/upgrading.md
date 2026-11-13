@@ -3742,7 +3742,7 @@ Also be aware of:
   action.
 ## Behaviour change: Guardian full_sync agent log lines and in-place `rule:` rows (#4415)
 
-Three changes are live on every agent on upgrade, on both detection paths. The skip of healthy,
+Four changes are live on every agent on upgrade, on both detection paths. The skip of healthy,
 unchanged rules that motivated them runs only on the Spark path, which production does not enable
 (`prefer_spark` is off); see the [Spark flip gate](../spark-flip-gate.md) AC-18.
 
@@ -3753,6 +3753,14 @@ unchanged rules that motivated them runs only on the Spark path, which productio
 - **New line on every full push.** `Guardian: full_sync preserved N rule(s) (skipped re-arm) ids=[...] more=M`
   is logged by every agent on every full push that reaches the end of its rule loop. Use it as the
   full-push marker instead. Legacy-path agents always log `preserved 0`.
+- **Second new line on every applied full push (#5719).** `Guardian: full_sync rebuilt N rule(s) (rebuild attempted): path=legacy first_attach=0 content_changed=0 key_busy=0 ...`
+  is logged beside the preserved line, on the same condition, and gives the arm path and a count per
+  reason a carried rule was rebuilt instead of skipped. After a count above zero, every group
+  except `first_attach` and `content_changed` is followed by `ids=[...]` naming the rules; a group
+  with a zero count has no list. Legacy-path agents (every production agent today) always log
+  `path=legacy ... rebuilt 0`, and that does not mean nothing was rebuilt: on that path every
+  carried rule that has a legacy guard is still stopped and re-armed on each full push. The new line matches none of the
+  patterns the full_sync blackout diagnostic reads. The tokens are explained in [Reading the rebuild line](guaranteed-state.md#reading-the-rebuild-line-5719).
 - **Rows updated in place.** The agent's stored `rule:` rows are no longer cleared and reinserted
   on a full push: only the rows for rules the push omits are deleted, and a row whose bytes are
   unchanged is not rewritten. A crash after the omitted rows are removed and before the carried
