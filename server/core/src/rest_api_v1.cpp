@@ -5143,11 +5143,11 @@ void RestApiV1::register_routes(
                       return;
                   }
                   // Does the server hold an enrolment record for this id? A read, made after the
-                  // group-exists answer and before the `attempted` row. It only FLAGS the id, on the
-                  // success audit row; it is never returned (a response field would reveal enrolment
-                  // status to a caller whose scope hides the device). An unknown id is accepted (an
-                  // operator may stage a membership ahead of the device) and no lookup outcome refuses
-                  // the add. Unreadable is recorded as neither known nor unknown.
+                  // group-exists answer and before the `attempted` row. It only FLAGS the id, on
+                  // the success audit row; it is never returned (a response field would reveal
+                  // enrolment status to a caller whose scope hides the device). An unknown id is
+                  // accepted (an operator may stage a membership ahead of the device) and no lookup
+                  // outcome refuses the add. Unreadable is recorded as neither known nor unknown.
                   const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
                   // The session the `attempted` row names, resolved before it (see the create
                   // route): the `*_revoked` failure rows below are stamped from it.
