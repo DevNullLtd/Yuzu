@@ -319,6 +319,7 @@
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "legacy_sqlite_probe.hpp"
+#include "delivery_pool_metrics.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
@@ -2835,17 +2836,13 @@ public:
                           "Number of obs_types currently routed to alerts", "gauge");
         // #3261 governance hardening (Gate 8 consistency-auditor) - the same
         // parity gap DexAlertRouter's family above had before its own
-        // describe() calls were added: without this, these six counters
+        // describe() calls were added: without this, these counters
         // emit no HELP/TYPE line and stay entirely absent until first
         // incremented.
         metrics_.describe("yuzu_server_webhook_delivery_success_total",
                           "Webhook deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_webhook_delivery_failed_total",
                           "Webhook deliveries that failed (connection error, non-2xx, exception)",
-                          "counter");
-        metrics_.describe("yuzu_server_webhook_delivery_dropped_total",
-                          "Webhook deliveries dropped because the delivery worker pool's queue "
-                          "was full or the store was quiescing",
                           "counter");
         // ADR-0057 (gov Gate 3 sre): these three joined the family above but
         // were missing describe()/pre-seed, the same HC-1-class parity gap
@@ -2870,15 +2867,14 @@ public:
                           "Offload-target deliveries that failed (connection error, non-2xx, "
                           "exception, or a tampered non-http(s) URL)",
                           "counter");
-        metrics_.describe("yuzu_server_offload_delivery_dropped_total",
-                          "Offload-target deliveries dropped because the delivery worker pool's "
-                          "queue was full or the store was quiescing",
-                          "counter");
-        // Pre-seed all six to 0 (adversarial-review round 2, Kimi+Codex
+        // The two drop counters (closed `reason` set) and the delivery pool gauges are described
+        // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
+        yuzu::server::register_delivery_pool_metrics(metrics_);
+        // Pre-seed each of these to 0 (adversarial-review round 2, Kimi+Codex
         // both independently confirmed) - describe() alone only writes
         // HELP/TYPE metadata (MetricsRegistry::describe()), it does not
         // create a series; counter(name) with no labels does. Each of
-        // these six is a no-label counter, so it has exactly one known
+        // these is a no-label counter, so it has exactly one known
         // "label combination" - itself - and the same bounded-label
         // pre-seed rule applies (docs/observability-conventions.md
         // "Bounded-label counters are pre-seeded to 0 at startup"),
@@ -2892,17 +2888,15 @@ public:
         // alerting can't distinguish "not wired" from "no deliveries yet".
         for (const char* name : {"yuzu_server_webhook_delivery_success_total",
                                  "yuzu_server_webhook_delivery_failed_total",
-                                 "yuzu_server_webhook_delivery_dropped_total",
                                  "yuzu_server_webhook_delivery_secret_unavailable_total",
                                  "yuzu_server_webhook_fire_event_degraded_total",
                                  "yuzu_server_webhook_delivery_log_failed_total",
                                  "yuzu_server_offload_delivery_success_total",
-                                 "yuzu_server_offload_delivery_failed_total",
-                                 "yuzu_server_offload_delivery_dropped_total"}) {
+                                 "yuzu_server_offload_delivery_failed_total"}) {
             metrics_.counter(name);
         }
         // ADR-0059 (OffloadTargetStore Postgres migration) — two new counters
-        // this migration adds, same pre-seed rule as the six above.
+        // this migration adds, same pre-seed rule as the counters above.
         metrics_.describe("yuzu_server_offload_delivery_credential_unavailable_total",
                           "Offload-target deliveries skipped because the target's credential "
                           "failed to decrypt (ADR-0010 fail-closed - never fired unsigned)",
@@ -9853,6 +9847,21 @@ public:
                 // The OIDC egress resolver pool, from the same tick.
                 metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
                     .set(static_cast<double>(::yuzu::server::oidc::oidc_resolver_in_flight()));
+                // Webhook and offload delivery pool backlog, from the same tick. A store that is
+                // not open reads 0 (never a stale value).
+                {
+                    const bool webhook_open = webhook_store_ && webhook_store_->is_open();
+                    yuzu::server::publish_delivery_pool(
+                        metrics_, "webhook", webhook_open,
+                        webhook_open ? webhook_store_->delivery_pool_pending() : 0,
+                        webhook_open ? webhook_store_->delivery_pool_capacity() : 0);
+                    const bool offload_open =
+                        offload_target_store_ && offload_target_store_->is_open();
+                    yuzu::server::publish_delivery_pool(
+                        metrics_, "offload", offload_open,
+                        offload_open ? offload_target_store_->delivery_pool_pending() : 0,
+                        offload_open ? offload_target_store_->delivery_pool_capacity() : 0);
+                }
                 // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
                 // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
                 // connection), noexcept (a failed sample keeps the previous gauge values).
@@ -20259,7 +20268,7 @@ private:
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : *eps) {
+            for (const auto& e : eps->rows) {
                 InventoryDeviceRow r;
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
@@ -20278,8 +20287,8 @@ private:
             }
             // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
             // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
-            // limit-clamp contract, not "zero rows" — (symmetric with the full
-            // offline_endpoint_store_ materialize above), joined by agent_id via the pure
+            // limit-clamp contract, not "zero rows" — (symmetric with the capped
+            // offline roster read above, #5712), joined by agent_id via the pure
             // attach_device_ci (inventory_ci_join.cpp). `out` is the
             // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
             // FleetReadGate scope, downstream of this join; attach_device_ci only ever
@@ -20353,11 +20362,11 @@ private:
             return result;
         };
         // One device's identity row for the Hardware CI record — checks the live
-        // registry first (online, authoritative hostname/OS), else falls back to a
-        // linear scan of the same 30-day offline_endpoint_store_ roster the list
-        // uses. FOLLOW-UP: no point read exists on OfflineEndpointStore yet
-        // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
-        // page (opened far less often than the list re-renders).
+        // registry first (online, authoritative hostname/OS), else falls back to the
+        // offline_endpoint_store_ POINT READ (`find_within`, a primary-key lookup over the
+        // same 30-day window the list uses). #5712: it replaced a linear scan of the capped
+        // roster, which read an enrolled offline device past `kQueryRowCap` as "not found";
+        // the point read is exact at any fleet size, and a miss is a confirmed absence.
         auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
             -> std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> {
             if (auto sess = registry_.get_session(agent_id)) {
@@ -20378,11 +20387,11 @@ private:
             }
             if (!offline_endpoint_store_)
                 return std::optional<InventoryDeviceRow>{};
-            const auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            const auto ep = offline_endpoint_store_->find_within(agent_id, kHardwareRosterWindow);
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
+            return offline_identity_row(ep, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
         // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
@@ -20437,9 +20446,13 @@ private:
             if (!offline_endpoint_store_)
                 return out;
             // #5531 exception: display-only; a failed read leaves hostnames
-            // unresolved and the page falls back to the agent_id.
-            for (auto& e : offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
-                               .value_or(std::vector<OfflineEndpoint>{}))
+            // unresolved and the page falls back to the agent_id. #5712: the same holds past
+            // `kQueryRowCap` — a truncated roster is read as served, so a host outside the
+            // newest cap shows its agent_id. Deliberately silent: this map decorates names
+            // and decides nothing (documented in the user manual).
+            auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                              .value_or(OfflineRoster{});
+            for (auto& e : roster.rows)
                 out.emplace(std::move(e.agent_id), std::move(e.hostname));
             return out;
         };
@@ -20778,8 +20791,6 @@ private:
         // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
         // sibling pages receive. `build_hw_roster` is UNFILTERED: the route narrows
         // it by the gate's scope.
-        static_assert(static_cast<int>(home::kRosterReadCap) == OfflineEndpointStore::kQueryRowCap,
-                      "The Dashboard labels a roster read as a lower bound at the store's row cap");
         dashboard_summary_routes_ = std::make_unique<home::DashboardSummaryRoutes>();
         dashboard_summary_routes_->register_routes(
             *web_server_,

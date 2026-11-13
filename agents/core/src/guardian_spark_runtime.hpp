@@ -81,6 +81,7 @@
 
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/spark.hpp> // SparkSpec, SparkEvent, SparkType, ServiceRunState
+#include <yuzu/agent/guardian_rebuild_tally.hpp> // GuardianRebuildReason (#5719)
 
 #include "guardian_emit_seq.hpp"    // GuardianEmitSeqSource (UP-14)
 #include "guardian_io_executor.hpp" // GuardianIoExecutor, IoClass (#2233 item 3)
@@ -435,7 +436,29 @@ public:
     /// when attach_rule re-observes it. A kept rule whose key is faulted (reported, or found so
     /// by the backend health check) or dead is detached as well, so a key shared by several rules
     /// is torn down and re-armed rather than rejoined by each of them.
-    void detach_rules_except(const std::set<std::string, std::less<>>& keep);
+    /// #5719: the kept rules this call detaches because their key's faulted bit was set (reported
+    /// by the mechanism, or found Faulted, Dead or unreadable by the backend health sweep it runs
+    /// first), one entry per such rule (a key shared by several kept rules yields one entry per
+    /// sibling), each with `why` = the cause recorded for the key (PerKey::unhealthy_why, else
+    /// KeyFaulted). Rules omitted from `keep` are NOT listed (they are not "kept"), and a healthy
+    /// kept rule is not listed. Built under the same registry_mu_ hold as the detach (not
+    /// pre-reserved); detach_all() discards it. It exists because, after this call, the
+    /// kept rule's own attach sees EITHER KeyBusy (an io-class key whose disarm claim is still
+    /// queued) OR FirstAttach (an inline type, or a disarm that already completed), never the
+    /// key's cause: the return value is the only place the cause survives. A caller on the engine
+    /// apply thread should prefer it over the reason attach_rule reports for these rules, but
+    /// only for an attach that targets the entry's `key` (see ForcedRebuild).
+    /// `key` is the spark key the rule was mapped to when the teardown inspected it (the key
+    /// whose fault `why` records). A caller applying `why` to the rule's NEXT attach must do so
+    /// only when that attach targets the same key: a rule kept on a faulted key and retargeted
+    /// to another key in the same push is a first attach of the new key, not a rebuild for the
+    /// old key's cause.
+    struct ForcedRebuild {
+        std::string rule_id;
+        GuardianRebuildReason why{GuardianRebuildReason::None};
+        std::string key;
+    };
+    [[nodiscard]] std::vector<ForcedRebuild> detach_rules_except(const std::set<std::string, std::less<>>& keep);
 
     /// The queued-handler body: resolve `ev.key` to its rules and run one
     /// evaluate_key(Event) pass. Safe to call on a detached thread post-shutdown
@@ -845,6 +868,49 @@ public:
     [[nodiscard]] std::uint64_t claim_drain_failures() const noexcept {
         return claim_drain_failures_.load(std::memory_order_relaxed);
     }
+    /// #5719 item 4: times probe_key_health's backend-health query threw. Effect: that attach
+    /// found the key's health unknown, so it did NOT skip: the rule was rebuilt (torn down and
+    /// re-armed) although it may have been healthy and unchanged, and it is tallied as
+    /// health_unknown on the full_sync rebuild line. Read by tests only: no log, heartbeat or
+    /// export reads it, so a swallowed failure is counted here but not visible to an operator.
+    /// probe_key_health is called only from attach_core, which the engine reaches only on the
+    /// Spark path (prefer_spark_ true), so this stays zero while prefer_spark_ is false.
+    /// Lock-free relaxed read.
+    [[nodiscard]] std::uint64_t health_probe_failures() const noexcept {
+        return health_probe_failures_.load(std::memory_order_relaxed);
+    }
+    /// #5719 item 4: times sweep_key_health could not take its snapshot of the armed keys (an
+    /// allocation failure). Effect: the sweep was skipped for that ONE call and nothing else
+    /// changed. From the convergence scheduler's poll backstop (revalidate_subscriptions, which
+    /// the engine starts only while prefer_spark_ is true) it means a Dead key was not reported on
+    /// that tick; from a full_sync's scoped detach (detach_rules_except runs the sweep whenever
+    /// the push carries a rule) it means the kept rules' faulted bits were not refreshed from the
+    /// backend for that push, so a key that was already deaf was not torn down by it. A later
+    /// full_sync or poll tick repairs it. Unlike health_probe_failures, the scoped-detach call
+    /// site IS reached with prefer_spark_ false (the runtime is wired regardless of it), but no
+    /// key is armed on the Spark path then, so the snapshot is of an empty registry and
+    /// allocates nothing: the counter is zero in practice. Read by tests only (no log, heartbeat
+    /// or export). Lock-free relaxed read.
+    [[nodiscard]] std::uint64_t sweep_snapshot_failures() const noexcept {
+        return sweep_snapshot_failures_.load(std::memory_order_relaxed);
+    }
+    /// #5719 item 4: times sweep_key_health's backend-health query threw for one key, counted once
+    /// per throwing key per sweep (the sweep still visits the other keys). Effect: that key was
+    /// treated as unhealthy by the scoped detach (so its rules were torn down and re-armed for
+    /// that push) or ignored by the poll backstop (it was not reported dead on that tick), for
+    /// that one sweep. The sweep runs in production full_syncs that carry rules, but over an
+    /// empty key registry while prefer_spark_ is false, so there is no query to throw and the
+    /// counter is zero for that reason. Read by tests only (no log, heartbeat or export).
+    /// Lock-free relaxed read.
+    [[nodiscard]] std::uint64_t sweep_health_query_failures() const noexcept {
+        return sweep_health_query_failures_.load(std::memory_order_relaxed);
+    }
+    /// TEST-ONLY (#5719): make the next sweep_key_health snapshot throw bad_alloc inside its try
+    /// (consumed once, after the registry_mu_ lock_guard and before the reserve). Distinct from fail_next_snapshot_for_test (baseline
+    /// staging). No production caller.
+    void fail_next_sweep_snapshot_for_test() noexcept {
+        fail_next_sweep_snapshot_.store(true, std::memory_order_relaxed);
+    }
     /// Test seam: claims currently queued on `key` (0 when the key has no entry).
     [[nodiscard]] std::size_t claim_queue_depth_for_test(const std::string& key) const;
     /// Test seam (R5.7): {detach_epoch_, gen_counter_} snapshot, registry_mu_
@@ -927,6 +993,15 @@ public:
     /// Dispatching-window race deterministically. Set before triggering the
     /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
     void set_dispatch_entry_hook_for_test(std::function<void()> hook);
+    /// #5719 test seam: fires at most once, in attach_rule(NonWaiting), after attach_core()
+    /// returned Pending and before that function re-inspects its claim (an attach that returns
+    /// Armed, Failed or Reobserved earlier leaves it set). The hook runs with
+    /// registry_mu_ RELEASED (the one acquisition the re-inspection needs is dropped and retaken
+    /// around it, so an empty hook costs production nothing). A hook that waits for the claim to
+    /// settle makes the re-inspection deterministically take its Armed return, the "completion
+    /// preceded resumption" case that no timing-free test could otherwise force. Set before the
+    /// attach; consumed (moved out) under registry_mu_.
+    void set_attach_resume_hook_for_test(std::function<void()> hook);
     /// R5.2 drain fault seam (C2/K5): a point is consumed once, the next time execution
     /// reaches its call site; it is not tied to one entry point. Points 1, 2, 4, 5, 8 and
     /// 12 are in on_arm_complete. Points 3, 6 and 7 are in publish_arm_verdicts_locked,
@@ -1293,6 +1368,18 @@ private:
         /// reuse_existing_locked and detach_rules_except. A key torn down and re-armed gets a
         /// fresh PerKey that starts clear: the skip decision does not rely on the bit alone.
         bool faulted{false};
+        /// #5719: why `faulted` was recorded; None while the key is healthy (registry_mu_-guarded).
+        /// Written at exactly the three `faulted` write sites: on_subscription_faulted (the event
+        /// edge, authoritative: KeyFaulted when set, None when cleared), and sweep_key_health and
+        /// the attach_core probe repair (only while None: the FIRST cause wins; the sweep maps
+        /// Faulted to KeyFaulted, Dead to KeyDead and an unreadable answer to HealthUnknown, the
+        /// probe repair writes KeyFaulted). Read by reuse_existing_locked and
+        /// detach_rules_except. Written only under registry_mu_ (never mtx_), from those three
+        /// sites. One of them, on_subscription_faulted, runs on the SparkEngine consumer thread
+        /// (SparkEngine::consumer_loop, through on_event); the sweep runs on the engine apply
+        /// thread (detach_rules_except) or the convergence scheduler's priority lane, and the
+        /// probe repair on the thread that is attaching.
+        GuardianRebuildReason unhealthy_why{GuardianRebuildReason::None};
     };
 
     /// rung 9c R5.2: the per-key claim/queue state machine (replaces #2233 item 3's
@@ -1533,6 +1620,9 @@ private:
         /// #4415: set only by the reuse_existing_locked() skip (state Armed or Reobserved);
         /// the retained-wedge re-observation paths leave it false.
         bool skipped{false};
+        /// #5719: why attach_core did NOT skip (None on a skip, a Failed result and the
+        /// retained-wedge re-observation that runs before reuse_existing_locked).
+        GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
     };
 
 public:
@@ -1744,6 +1834,9 @@ public:
         /// #4415: true iff reuse_existing_locked() skipped this push (a healthy, unchanged
         /// committed rule, or an identical live arm already in flight); no teardown, no new claim.
         bool skipped{false};
+        /// #5719: why this attach was not skipped (None on a skip, a failure and a wedge
+        /// re-observation); see GuardianRebuildReason and reuse_existing_locked.
+        GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
     };
 
     /// rung 9c PR-5c round 2 (#4221, UP-1 residual): the non-waiting attach_rule()
@@ -2023,7 +2116,10 @@ private:
     /// copy keys_[key]'s subscription id, releases it, then asks the backend (the engine's own
     /// state, the authority a lost Faulted event cannot corrupt). nullopt when there is nothing
     /// committed to probe (stopping, no such rule or key, a claim on the key) or the backend
-    /// threw; the caller then does not skip. Must not be called with registry_mu_ held.
+    /// threw; the caller then does not skip. #5719: reuse_existing_locked reads a nullopt probe on
+    /// the committed path as HealthUnknown (a first attach and a claimed key never reach that term:
+    /// they are decided by the claims and no-committed-entry steps first). Must not be called with
+    /// registry_mu_ held.
     [[nodiscard]] std::optional<KeyHealthProbe>
     probe_key_health(const std::string& key, const std::string& rule_id);
 
@@ -2038,15 +2134,40 @@ private:
     /// #4415: the skip decision, called from attach_core() under registry_mu_ and before
     /// anything is mutated. Returns Armed (a healthy committed rule whose pushed content is
     /// identical: the existing generation, no receipt) or Reobserved (a live in-flight or
-    /// queued same-rule claim whose content is identical: that claim), else nullopt and the
-    /// caller rebuilds as before. A skip is a claim that the rule is healthy, so a rule that is
-    /// in an Unknown episode, whose key the mechanism reported faulted (the recorded bit, or
-    /// `probe` not Healthy or taken against another subscription), whose key still has any claim
-    /// other than this rule's own identical live arm (the Reobserved case), whose baseline
-    /// differs, or that has a retained wedge never reaches it (the wedge has its own
-    /// Reobserved path in attach_core). `probe` is required for the Armed skip: a null one
+    /// queued same-rule claim whose content is identical: that claim), else the reason it did
+    /// not skip (#5719) and the caller rebuilds as before. A skip is a claim that the rule is
+    /// healthy, so a rule that is in an Unknown episode, whose key the mechanism reported faulted
+    /// (the recorded bit, or `probe` not Healthy or taken against another subscription), whose
+    /// key still has any claim other than this rule's own identical live arm (the Reobserved
+    /// case), whose baseline differs, or that has a retained wedge never reaches it (the wedge has
+    /// its own Reobserved path in attach_core). `probe` is required for the Armed skip: a null one
     /// means health is unknown, which is not healthy. Reads only; may not throw.
-    [[nodiscard]] std::optional<AttachCoreResult>
+    ///
+    /// #5719 reason semantics. The error is the FIRST rebuild condition that holds, evaluated in
+    /// the order below, which is the precedence documented in guardian_rebuild_tally.hpp. It is
+    /// the code's order, not the declaration order of GuardianRebuildReason (the health terms in
+    /// step 3 are tested in a different sequence from the enum):
+    ///   1. the key has any claim: this rule's own live arm with identical content is the
+    ///      Reobserved success; this rule's own live arm with other content, spec or ownership is
+    ///      ContentChanged; any other claim (another rule's arm, a disarm, a parked or retained
+    ///      head) is KeyBusy;
+    ///   2. no committed rules_ entry for the rule or keys_ entry for the key, or a committed
+    ///      rule whose live arm is mapped to a different key (a retarget onto a key another rule
+    ///      holds; decided before the health and content terms): FirstAttach;
+    ///   3. committed path, health before content: the recorded faulted bit (PerKey::unhealthy_why, KeyFaulted
+    ///      when none was recorded), an absent probe (HealthUnknown), a probe of another
+    ///      subscription (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy
+    ///      probe (KeyFaulted), an Unknown evaluation episode (UnknownEpisode);
+    ///   4. content: a changed content id (ContentChanged), then FileHashEquals' empty
+    ///      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
+    ///   5. defensive invariants (inactive generation, spec mismatch, an index that does not own
+    ///      the generation although it maps the rule to this key, or has no mapping for it):
+    ///      Other, unreachable through the public API.
+    /// Health outranks content only on the committed path (steps 3 and 4); step 1 comes first, so
+    /// a changed-content rule that still has its own arm in flight is ContentChanged even when
+    /// the key is unhealthy. The reason only labels conditions that already rebuilt; it never
+    /// decides skip versus rebuild. It is never None.
+    [[nodiscard]] std::expected<AttachCoreResult, GuardianRebuildReason>
     reuse_existing_locked(const std::string& key, const std::string& rule_id,
                           const SparkSpec& spec, const RuleGeneration& pushed,
                           const std::optional<KeyHealthProbe>& probe) const noexcept;
@@ -2729,6 +2850,7 @@ private:
     std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
     std::atomic<bool> fail_next_unstaged_sweep_{false}; ///< TEST-ONLY sweep-throw seam
+    std::atomic<bool> fail_next_sweep_snapshot_{false}; ///< TEST-ONLY, see fail_next_sweep_snapshot_for_test()
     std::atomic<bool> fail_next_inherit_copy_{false};     ///< TEST-ONLY attach_core copy seam
     /// TEST-ONLY: see unstaged_sweep_stopping_for_test().
     std::atomic<int> unstaged_sweep_stopping_for_test_{-1};
@@ -2978,12 +3100,16 @@ private:
     std::atomic<std::uint64_t> disarm_retained_{0};       ///< R5.2: disarm claims retained after an admission refusal
     std::atomic<std::uint64_t> claims_dropped_at_stop_{0}; ///< R5.2: queued claims dropped by begin_stop / Stopped
     std::atomic<std::uint64_t> claim_drain_failures_{0};  ///< R5.2: on_arm_complete firewall fired
+    std::atomic<std::uint64_t> health_probe_failures_{0};        ///< #5719: probe_key_health catch
+    std::atomic<std::uint64_t> sweep_snapshot_failures_{0};      ///< #5719: sweep_key_health snapshot catch
+    std::atomic<std::uint64_t> sweep_health_query_failures_{0};  ///< #5719: sweep_key_health per-key catch
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
     std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (a retained owner tombstone; see detach_sweep_left_residue())
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
+    std::function<void()> attach_resume_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<std::uint64_t> tombstones_released_by_reaper_{0}; ///< #5322: runtime-only, incremented by reap_stranded_claims_locked

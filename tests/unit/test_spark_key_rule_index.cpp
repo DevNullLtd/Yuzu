@@ -161,6 +161,41 @@ TEST_CASE("SparkKeyRuleIndex: remove_rule stays unconditional on generation", "[
 
 // owns() (#5322 WP0) is the read-only ownership test erase_rule() applies: (key, rule,
 // generation) must all match the recorded mapping.
+TEST_CASE("SparkKeyRuleIndex: mapped_to_other_key is true only for a mapped rule on another key",
+          "[spark][index][owns][5719]") {
+    SparkKeyRuleIndex idx;
+
+    SECTION("unknown rule and empty index are not mapped elsewhere") {
+        REQUIRE_FALSE(idx.mapped_to_other_key("service|5:sshd", "never-added"));
+        idx.add("service|5:sshd", "rule-a", /*generation=*/1);
+        REQUIRE_FALSE(idx.mapped_to_other_key("service|5:sshd", "never-added"));
+    }
+
+    SECTION("a rule mapped to exactly the key is not mapped elsewhere, whatever its generation") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/3);
+        REQUIRE_FALSE(idx.mapped_to_other_key("service|5:sshd", "rule-a"));
+    }
+
+    SECTION("a rule mapped to a different key is") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/3);
+        REQUIRE(idx.mapped_to_other_key("service|5:nginx", "rule-a"));
+        REQUIRE(idx.mapped_to_other_key("", "rule-a"));
+    }
+
+    SECTION("a key move follows the rule") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/1);
+        idx.add("service|5:nginx", "rule-a", /*generation=*/2);
+        REQUIRE(idx.mapped_to_other_key("service|5:sshd", "rule-a"));
+        REQUIRE_FALSE(idx.mapped_to_other_key("service|5:nginx", "rule-a"));
+    }
+
+    SECTION("an erased rule is no longer mapped anywhere") {
+        idx.add("service|5:sshd", "rule-a", /*generation=*/1);
+        (void)idx.erase_rule("rule-a", /*generation=*/1);
+        REQUIRE_FALSE(idx.mapped_to_other_key("service|5:nginx", "rule-a"));
+    }
+}
+
 TEST_CASE("SparkKeyRuleIndex: owns is true only for the exact (key, rule, generation)",
           "[spark][index][owns]") {
     SparkKeyRuleIndex idx;

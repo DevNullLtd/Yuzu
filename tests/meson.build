@@ -1898,6 +1898,7 @@ if build_server
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
       'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
+      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, scanned from server.cpp at test run time
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -3471,6 +3472,17 @@ test('agent-only release lint',
   args: [files('test_release_agent_only.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Agent-bundle release verification (#7529): build-agent-bundle.sh must verify
+# SHA256SUMS' cosign signature (exact identity per signing era) before use and
+# match each file to its OWN line. Runs `--verify-only` against stub gh/cosign,
+# asserts cosign's argv, and mutation-tests itself on a scratch copy of the script.
+test('agent bundle release verification',
+  _python3_test,
+  args: [files('test_build_agent_bundle_verify.py')],
+  suite: 'docs',
+  timeout: 300,
 )
 
 # The `server` feature option (ADR-0035 ladder step 3): auto turns the server
