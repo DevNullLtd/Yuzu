@@ -384,7 +384,7 @@ REST sibling `GET /api/v1/events` is deliberately not denied to a service-scoped
 token (it is confined by the fleet-read gate and needs an `execution_id`; since
 #5557 it admits the token only once an agent in its service scope has a status
 row for that execution, so a service-scoped credential's execution visibility is
-limited to its service scope (limits: see below); this applies from the release
+limited to its service scope (limits: see "Limits that stand" below); this applies from the release
 that contains #5557, and before that release it showed a service-scoped token its
 minter's executions); the asymmetry is
 recorded in
@@ -892,7 +892,7 @@ same finding and was closed as its duplicate), and `GET /api/v1/execution-statis
 - An open `GET /api/v1/events` or `GET /sse/executions/{id}` stream keeps the scope it attached with, and revoking the token, retagging an agent out of the service or switching RBAC enforcement off does not close it (pre-existing for every confined caller; tracked as a follow-up).
 - Event ids are per-execution counters put raw on the wire, so a confined or service-scoped subscriber of an execution it is admitted to can infer how many events were withheld from it (roughly two per status update of an agent outside its scope) from id gaps, the sanitized terminal frame's id and, on `GET /api/v1/events`, the replay-gap `missing_to`; no event content or per-agent attribution is disclosed, so the fleet-count withholding protects values, not counts, and an opaque resumable cursor is tracked as a follow-up.
 - The rule is applied per replica, so a rolling upgrade shows the old behaviour from a replica not yet upgraded.
-- The two postcondition refusals of the list gates (the non-retryable `500` arms) are not reachable at runtime without a test hook and are covered by the pure predicate test and the lexical check, not end to end.
+- There are two postcondition arms of the list gates (the non-retryable `500` arms, one per gate; the `require_list_read` arm also refuses an admit that carried no session) plus the local fail-closed of MCP `list_executions`. All three are unreachable at runtime without a test hook except the MCP one, which has a runtime test through an injected fleet-read seam; the two gate arms are covered by the pure predicate test and the lexical check, not end to end.
 - The three MCP `execution_owner_key(*session)` conversions (`cancel_execution`, `record_execution_rerun`, `summarize_working_set`) sit behind the service-scope default-deny, which refuses a service-scoped session before the handler runs, and are guarded only by the tripwire self-test: for every other session the key equals the username, so no behavioural test can observe a revert.
 - The MCP stream bridge (`McpStreamBridge`) relays execution progress counts to the session that armed it without the scope projection the REST and dashboard event streams apply. A service-scoped session is refused at the `Execution:Execute` check of the only tool that arms it (`execute_instruction`), so the gap concerns principals that hold global `Execute` with only scoped `Read`; it is recorded in the executions-history ladder (Recorded gap (b)) and tracked as a follow-up.
 

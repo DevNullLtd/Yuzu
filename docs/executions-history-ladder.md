@@ -550,8 +550,9 @@ and the collapsed responses list at 50; the drawer's default view is unchanged a
 
 ### Audit policy
 
-`execution.live_subscribe` audits on first connect per session-per-execution
-(deduped). SSE auto-reconnect inside the dedup window does NOT re-audit.
+`execution.live_subscribe` audits every successful subscribe, with no per-session-per-execution
+dedup (tracked as #700), so an SSE auto-reconnect writes another row; a not-found subscribe is
+audited as `denied`.
 The forensic-grade audit on read remains on
 `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
