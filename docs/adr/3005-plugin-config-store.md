@@ -181,7 +181,7 @@ The other firewall actions (`state`, `rules`) stay ordinary, so a plugin-level `
 row is labelled `protective_exempt=true` yet still gates them. Authorization is unchanged (the
 catalogue rows keep their permission and approval gates). The containment-gate exemption
 (`is_quarantine_control_plugin`) is deliberately unchanged: it keeps naming the quarantine plugin
-only until the server's live containment path moves to the firewall plugin (#7437), so a firewall
+only until the server's live containment path moves to the firewall plugin (#7437, which re-keys that exemption), so a firewall
 containment is reachable for release only while the quarantine store can be read.
 
 ### Update (2026-10-03, #5294) — per-OS kill-switch rows

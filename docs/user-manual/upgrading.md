@@ -3745,7 +3745,7 @@ Also be aware of:
   dispatch because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
   plugin registry **accepted the frame**; it is never proof of isolation. A
   device whose agent lacks the plugin answers its own "plugin not found", and
-  `YuzuQuarantineEndpointUnconfirmed` can fire for it. Verify containment with `quarantine.status` (or
+  `YuzuQuarantineEndpointUnconfirmed` can fire for a quarantine-plugin containment of it (no alert covers a firewall containment yet). Verify containment with `quarantine.status` (or
   `firewall.quarantine_status` for a firewall containment), and upgrade agents before you rely on
   quarantine.
 - **Integrations.** The kill-switch `GET` and `PUT` responses are unchanged: `enabled=false` for a

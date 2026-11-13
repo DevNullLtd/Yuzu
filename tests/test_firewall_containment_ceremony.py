@@ -100,6 +100,11 @@ class Status(unittest.TestCase):
         real = {"responses": [{"agent_id": "a", "status": 0, "output": "verify|control=ok\nstatus|active|probe\nnote|x"}]}
         self.assertEqual(self.tok(real), "active")
 
+    def test_a_failed_row_is_not_an_answer(self):
+        failed = {"responses": [{"agent_id": "a", "status": 1, "output": "status|inactive",
+                                 "error_detail": "plugin crashed"}]}
+        self.assertEqual(self.tok(failed), "")
+
     def test_disagreeing_rows_are_not_an_answer(self):
         two = {"responses": [{"agent_id": "a", "status": 0, "output": "status|inactive\nstatus|active"}]}
         self.assertEqual(self.tok(two), "")
@@ -114,7 +119,10 @@ class Reachable(unittest.TestCase):
         self.assertTrue(self.ok("http://localhost:8080"))
         self.assertTrue(self.ok("http://[::1]:8080"))
         self.assertTrue(self.ok("http://192.0.2.7:8080", "127.0.0.1,192.0.2.7:8080"))
+        self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.7"))              # any port, outbound, both protocols
         self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.0/24/tcp/out"))
+        self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.0/24:8080"))      # the prefix may carry the port
+        self.assertTrue(self.ok("https://192.0.2.7", "192.0.2.7:443/tcp"))           # scheme default port
         self.assertTrue(self.ok("http://[2001:db8::7]:8080", "[2001:db8::7]:8080"))
         self.assertTrue(self.ok("http://[2001:db8::7]:8080", "2001:db8::/32"))
 
@@ -122,6 +130,19 @@ class Reachable(unittest.TestCase):
         self.assertFalse(self.ok("http://192.0.2.8:8080", "192.0.2.7"))
         self.assertFalse(self.ok("http://dash.example:8080", "dash.example"))  # DNS is blocked while contained
         self.assertFalse(self.ok("http://192.0.2.7:8080", "garbage,,"))
+
+    def test_an_entry_that_does_not_let_the_release_through_is_refused(self):
+        dash = "https://10.0.0.5:8443"
+        for entry in ("10.0.0.5:22", "10.0.0.5/udp", "10.0.0.5/in", "10.0.0.5/out/in", "10.0.0.0/8/in",
+                      "10.0.0.5:8443/udp", "10.0.0.5:8444", "0.0.0.0/0", "10.0.0.5/8/16", "10.0.0.5/x"):
+            with self.subTest(entry=entry):
+                self.assertFalse(self.ok(dash, entry))
+        for entry in ("10.0.0.5:8443", "10.0.0.5:8443/tcp/out", "10.0.0.0/8", "10.0.0.0/8:8443/tcp"):
+            with self.subTest(entry=entry):
+                self.assertTrue(self.ok(dash, entry))
+
+    def test_an_unparseable_dashboard_is_refused_not_raised(self):
+        self.assertFalse(self.ok("https://[::1", "127.0.0.1"))
 
 
 @unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
@@ -228,6 +249,14 @@ class Flow(unittest.TestCase):
         rc, calls = self.run_main(script(), extra=["--probe-target", "198.18.0.9:443"])
         self.assertEqual(rc, fc.EXIT_FAIL)       # a requested probe that did not verify is a failure ...
         self.assertIn("release", calls)          # ... and the release still runs
+
+    def test_a_limit_too_short_for_the_release_confirmation_is_refused(self):
+        rc, calls = self.run_main({}, extra=["--ttl-seconds", "60"])
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
+        self.assertEqual(calls, [])
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                               "quarantine": [{}], "release": [{}]}, extra=["--ttl-seconds", str(fc.MIN_TTL_S)])
+        self.assertEqual(rc, fc.EXIT_OK)
 
     def test_a_dashboard_the_contained_host_could_not_reach_is_refused(self):
         rc, calls = self.run_main({}, dashboard="http://192.0.2.7:8080")

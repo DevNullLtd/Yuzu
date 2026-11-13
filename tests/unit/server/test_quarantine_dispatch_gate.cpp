@@ -42,7 +42,7 @@
 
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_scope_ladder.hpp"
-#include "yuzu/protective_actions.hpp"
+#include <yuzu/protective_actions.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 

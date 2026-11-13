@@ -255,8 +255,8 @@ inline constexpr std::size_t kListRowCap = 5000;
 
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
-/// but never gating the protective actions; a plugin-level row for a plugin that
-/// also declares ordinary actions, `firewall`, still gates those), plus `, reason="<text>"` when the operator gave
+/// but never gating the protective actions; a plugin-level `firewall` row still
+/// gates that plugin's ordinary actions), plus `, reason="<text>"` when the operator gave
 /// one. The reason survives on the live row only until the next flip, so without
 /// it here the audit trail cannot answer "why was this switched off". It is
 /// already validated (<= 512 bytes, no control characters but tab) by

@@ -22,8 +22,9 @@ the allow set (loopback plus the agent's control channel). It refuses to run whe
 is detected (SSH_CONNECTION / SSH_CLIENT / SSH_TTY) unless --i-have-console-access is given, and
 never runs without --apply-containment. The SSH check reads environment variables that `sudo` and a
 long-lived tmux/screen session can drop, so --i-have-console-access is the real control. The dashboard
-must be this host (loopback) or listed in --exceptions, or the release could not reach it. Run it on a
-local box with a keyboard and a screen.
+must be this host (loopback) or covered by an outbound TCP --exceptions entry for its port, or the release
+could not reach it. --ttl-seconds is 0 (none) or at least 240, so the limit outlasts the release
+confirmation. Run it on a local box with a keyboard and a screen.
 
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
 3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
@@ -59,6 +60,7 @@ SSH_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 POLL_S = 20
 POLL_APPLY_S = 90
 RELEASE_READS = 4
+MIN_TTL_S = 240  # the release dispatch (90 s) plus the status re-reads (4 x ~22 s) must fit inside the limit
 
 
 class Client:
@@ -137,7 +139,8 @@ def status_token(client: Client, agent_id: str) -> str:
     answer = dispatch(client, agent_id, "quarantine_status", {})
     tokens = set()
     for r in answer.get("responses") or []:
-        if not isinstance(r, dict) or r.get("agent_id") != agent_id or not isinstance(r.get("output"), str):
+        if (not isinstance(r, dict) or r.get("agent_id") != agent_id or r.get("status") not in (0, None)
+                or not isinstance(r.get("output"), str)):
             continue
         for line in r["output"].splitlines():
             m = _STATUS_ROW.fullmatch(line.strip().lower())
@@ -173,11 +176,65 @@ def release_and_confirm(client: Client, agent_id: str) -> bool:
         return False
 
 
+def _entry_covers(entry: str, addr, port: int) -> bool:
+    """Does one allow-set entry (the plugin grammar `addr[/prefix][:port][/tcp|udp][/in|out]`, defaults:
+    both protocols, outbound, any port) let an outbound TCP connection to addr:port through?"""
+    segs = entry.strip().split("/")
+    s0, port_text = segs[0], None
+    if s0.startswith("["):
+        close = s0.find("]")
+        if close < 0:
+            return False
+        ip, rest = s0[1:close], s0[close + 1:]
+        if rest:
+            if not rest.startswith(":"):
+                return False
+            port_text = rest[1:]
+    elif s0.count(":") >= 2:
+        ip = s0
+    elif s0.count(":") == 1:
+        ip, port_text = s0.split(":")
+    else:
+        ip = s0
+    prefix, proto, direction = None, "both", "out"
+    for i, seg in enumerate(segs[1:], 1):
+        if not seg:
+            return False
+        if seg[0].isdigit():
+            if i != 1:
+                return False
+            prefix, _, more = seg.partition(":")
+            if more:
+                if port_text is not None:
+                    return False
+                port_text = more
+        elif seg in ("tcp", "udp"):
+            proto = seg
+        elif seg in ("in", "out"):
+            direction = seg
+        else:
+            return False
+    if direction != "out" or proto == "udp":
+        return False
+    if port_text is not None and (not port_text.isdigit() or int(port_text) != port):
+        return False
+    if prefix is not None and (not prefix.isdigit() or int(prefix) == 0):
+        return False  # a /0 would not be a containment at all
+    try:
+        return addr in ipaddress.ip_network(f"{ip}/{prefix}" if prefix is not None else ip, strict=False)
+    except ValueError:
+        return False
+
+
 def dashboard_reachable_while_contained(dashboard: str, exceptions: str) -> bool:
     """The release is dispatched through the dashboard from this host: it must be this host (loopback) or
-    an IP literal the allow set covers, or the contained host could not reach it (DNS is blocked too, so a
-    hostname never counts). Entries follow the plugin grammar `ip[:port][/prefix][/tcp|udp][/in|out]`."""
-    host = (urllib.parse.urlparse(dashboard).hostname or "").lower()
+    an IP literal an OUTBOUND TCP allow-set entry covers for the dashboard's port, or the contained host
+    could not reach it (DNS is blocked too, so a hostname never counts)."""
+    try:
+        parsed = urllib.parse.urlparse(dashboard)
+        host, port = (parsed.hostname or "").lower(), parsed.port
+    except ValueError:
+        return False
     if host == "localhost":
         return True
     try:
@@ -186,21 +243,8 @@ def dashboard_reachable_while_contained(dashboard: str, exceptions: str) -> bool
         return False
     if addr.is_loopback:
         return True
-    for entry in re.split(r"[,\s]+", exceptions):
-        parts = entry.strip().split("/")
-        ip = parts[0]
-        if ip.startswith("["):
-            ip = ip[1:].split("]")[0]
-        elif ip.count(":") == 1:
-            ip = ip.split(":")[0]
-        prefix = parts[1] if len(parts) > 1 and parts[1].isdigit() else None
-        try:
-            net = ipaddress.ip_network(f"{ip}/{prefix}" if prefix else ip, strict=False)
-        except ValueError:
-            continue
-        if addr in net:
-            return True
-    return False
+    port = port or (443 if parsed.scheme == "https" else 80)
+    return any(_entry_covers(e, addr, port) for e in re.split(r"[,\s]+", exceptions) if e.strip())
 
 
 def parse_args(argv):
@@ -224,8 +268,12 @@ def main(argv=None) -> int:
     if why:
         print(f"refused: {why}", file=sys.stderr)
         return EXIT_PRECONDITION
+    if args.apply_containment and 0 < args.ttl_seconds < MIN_TTL_S:
+        print(f"refused: --ttl-seconds below {MIN_TTL_S} could end the containment before the release "
+              "confirmation finishes (use 0 for none)", file=sys.stderr)
+        return EXIT_PRECONDITION
     if args.apply_containment and not dashboard_reachable_while_contained(args.dashboard, args.exceptions):
-        print("refused: the dashboard host is neither loopback nor in --exceptions, so the release could not "
+        print("refused: the dashboard is neither loopback nor an IP covered by an outbound TCP --exceptions entry for its port, so the release could not "
               "reach it while contained", file=sys.stderr)
         return EXIT_PRECONDITION
     rc, last = install_check()
