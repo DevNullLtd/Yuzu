@@ -98,9 +98,10 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
           "[pg][software_inventory][rollup]") {
     // HA WS-8 (RD-1): stop() calls request_stop() when draining begins so an hourly
     // recompute cannot START inside the drain grace and then run its full statement
-    // budget after it. A 1s interval slept in 100 ms steps makes the loop re-arm after 1 s
+    // budget after it. A 2 s interval slept in 100 ms steps makes the loop re-arm after 2 s
     // (production's 5 s step would make that 5 s), so without request_stop() a second
-    // recompute would run inside the 3 s window below.
+    // recompute would run inside the 4 s window below. The 2 s re-arm is also the margin a
+    // stalled test thread has between seeing the first recompute and calling request_stop().
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -114,7 +115,7 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
                    .value();
     };
 
-    SoftwareCatalogRollup rollup{store, std::chrono::seconds{1}, &metrics,
+    SoftwareCatalogRollup rollup{store, std::chrono::seconds{2}, &metrics,
                                  std::chrono::milliseconds{100}};
     rollup.start();
     for (int i = 0; i < 100 && recomputes() < 1; ++i) // the immediate first recompute
@@ -122,7 +123,7 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
     REQUIRE(recomputes() == 1);
 
     rollup.request_stop();                                // must not block
-    std::this_thread::sleep_for(std::chrono::seconds{3}); // 3x the 1 s re-arm
+    std::this_thread::sleep_for(std::chrono::seconds{4}); // 2x the 2 s re-arm
     CHECK(recomputes() == 1);                             // no new recompute started
 
     const auto t = std::chrono::steady_clock::now();
