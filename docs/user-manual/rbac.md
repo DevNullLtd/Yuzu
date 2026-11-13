@@ -285,7 +285,9 @@ Recommended order for a fresh install:
 > owner disjunct (a principal's own dispatches) is suppressed for it, because its
 > session username is the account that minted it. Since #5557 the same holds on
 > every other execution read surface: a service-scoped token sees an execution only
-> once an agent in its service scope has a status row for it, whoever dispatched it.
+> once an agent in its service scope has a status row for it, whoever dispatched it;
+> the rows it sees name the dispatching operator (`dispatched_by`), which can be an
+> account other than the one that minted the token.
 > **Exception to
 > the degraded-store sentence above:** a degrade on the Executions panel is NOT a
 > `503` the operator sees. The fragment's own failure notes (tracker or status
