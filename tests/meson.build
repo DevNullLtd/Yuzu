@@ -4948,6 +4948,15 @@ test('rbac cross-schema query-owner seam',
   timeout: 30,
 )
 
+# #7223: the durable-session account gate wiring (the soft-delete literal, the owner's session
+# generation bump, the mode ternary, the gate position and the cache epoch guard) keeps its shape.
+test('session account gate wiring (#7223)',
+  _python3_test,
+  args: [files('test_session_account_gate_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # #4665 lockstep: the #4606-pinned format_arm_committed_line shape
 # (tests/unit/fixtures/spark/arm_committed_line.json) still parses through the #3990
 # driver's own T2_RE, and the driver's evidence regexes still refuse a forged rule-id/Spark-key
