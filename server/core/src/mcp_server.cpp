@@ -14764,7 +14764,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 const ExecutionOwnerKey owner = execution_owner_key(*session);
                 const bool service_scoped = gate.scope.has_value() && owner.empty();
                 if (gate.scope && !service_scoped)
-                    eq.dispatched_by = session->username; // == the key for this class
+                    // Non-empty: the raw username was guarded above.
+                    eq.dispatched_by = owner_only_filter(owner);
                 // An unrestricted (default) VisibleSet pushes down nothing.
                 const auto query_scope = confined_list_scope(
                     owner, service_scoped ? gate.scope : authz::VisibleSet{});

@@ -12,6 +12,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <concepts>
 #include <initializer_list>
 #include <string>
 #include <type_traits>
@@ -145,20 +146,30 @@ authz::VisibleSet agents(std::initializer_list<const char*> ids) {
 
 } // namespace
 
-// The typed overloads sit beside the string ones until every call site takes the key. They must
-// not make a plain string argument ambiguous or a key argument unusable.
-static_assert(std::is_same_v<decltype(execution_visible(
-                                 std::declval<const Execution&>(),
-                                 std::declval<const std::vector<AgentExecStatus>&>(),
-                                 std::declval<const authz::VisibleSet&>(),
-                                 std::declval<const ExecutionOwnerKey&>())),
-                             bool>);
-static_assert(std::is_same_v<decltype(execution_visible(
-                                 std::declval<const Execution&>(),
-                                 std::declval<const std::vector<AgentExecStatus>&>(),
-                                 std::declval<const authz::VisibleSet&>(),
-                                 std::declval<const std::string&>())),
-                             bool>);
+// A plain string argument must not compile against the visibility/admission predicates: the
+// typed key is the only overload (#5557), so the minting account cannot be passed by habit.
+template <class Owner>
+concept VisibleWith = requires(const Execution& e, const std::vector<AgentExecStatus>& st,
+                               const authz::VisibleSet& sc, const Owner& o) {
+    { execution_visible(e, st, sc, o) } -> std::same_as<bool>;
+};
+template <class Owner>
+concept AdmitsWith = requires(const Execution& e, const std::vector<AgentExecStatus>& st,
+                              const authz::VisibleSet& sc, const Owner& o) {
+    { admit_confined_mutation(e, st, sc, o) } -> std::same_as<bool>;
+};
+static_assert(VisibleWith<ExecutionOwnerKey> && AdmitsWith<ExecutionOwnerKey>);
+static_assert(!VisibleWith<std::string> && !AdmitsWith<std::string>);
+static_assert(!VisibleWith<const char*> && !AdmitsWith<const char*>);
+
+TEST_CASE("owner_only_filter: carries the key's principal, empty for the empty key",
+          "[execution][owner_key][5557]") {
+    CHECK(owner_only_filter(execution_owner_key(make_session("bob"))) == "bob");
+    // A service-scoped session's key is empty: the filter is then ExecutionQuery's "no filter"
+    // sentinel, which is why the one consumer routes that class through confined_list_scope.
+    CHECK(owner_only_filter(execution_owner_key(service_scoped("mina", "A"))).empty());
+    CHECK(owner_only_filter(ExecutionOwnerKey{}).empty());
+}
 
 TEST_CASE("confined_list_scope: unrestricted scope is nullopt whatever the key is",
           "[execution][owner_key][5557]") {

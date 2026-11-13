@@ -119,8 +119,9 @@ struct ExecutionListScope {
     std::string owner;
     std::vector<std::string> visible_agents;
 };
-/// `nullopt` = unrestricted (TOP, no pushdown) — every existing caller of
-/// `query_executions`/`query_executions_checked`'s default keeps this.
+/// `nullopt` = unrestricted (TOP, no pushdown). `query_executions` keeps it;
+/// `query_executions_checked` takes the scope as a REQUIRED argument (#5557), so an omitted
+/// scope is a compile error.
 using ExecutionScope = std::optional<ExecutionListScope>;
 
 struct ExecutionSummary {
@@ -390,8 +391,7 @@ public:
     /// `ExecutionQuery::dispatched_by`'s doc comment above rejects (one
     /// statement, planner-optimizable to a semi-join).
     std::optional<std::vector<Execution>>
-    query_executions_checked(const ExecutionQuery& q = {},
-                             const ExecutionScope& scope = std::nullopt) const;
+    query_executions_checked(const ExecutionQuery& q, const ExecutionScope& scope) const;
     std::optional<Execution> get_execution(const std::string& id) const;
     /// #3789: degrade-distinguishable twin of `get_execution`. That method
     /// collapses "row absent" and "read degraded" to the same `nullopt`

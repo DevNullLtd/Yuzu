@@ -57,6 +57,7 @@ private:
     explicit ExecutionOwnerKey(std::string key) : key_(std::move(key)) {}
     friend ExecutionOwnerKey execution_owner_key(const auth::Session&);
     friend ExecutionScope confined_list_scope(const ExecutionOwnerKey&, const authz::VisibleSet&);
+    friend std::string owner_only_filter(const ExecutionOwnerKey&);
 
     std::string key_;
 };
@@ -98,12 +99,23 @@ private:
     return out;
 }
 
+/// The value for `ExecutionQuery::dispatched_by` that narrows a LIST to rows `owner` dispatched
+/// (an exact-match FILTER, not an admission predicate; compare `ExecutionListScope`). The empty
+/// string is `ExecutionQuery`'s own sentinel for "no filter", so an EMPTY key yields NO
+/// narrowing: call this only for a caller whose key is known non-empty (a confined non-service
+/// session whose raw username was already checked) and route a service-scoped (empty-key)
+/// session through `confined_list_scope` instead, never through this.
+[[nodiscard]] inline std::string owner_only_filter(const ExecutionOwnerKey& owner) {
+    return owner.key_;
+}
+
 /// Is `exec` visible to a caller whose fleet-read scope is `scope`? Mirrors
 /// the #1634 `rest_api_v1.cpp` detail-route logic (`owns_execution ||
 /// has_visible_agent`, full scan, no early exit — avoids a scan-length
-/// existence oracle). `username` empty never satisfies the ownership
+/// existence oracle). An empty `owner` key never satisfies the ownership
 /// disjunct (an unauthenticated/unresolved-session comparison against an
-/// empty `dispatched_by` must not silently admit).
+/// empty `dispatched_by` must not silently admit; a service-scoped session's
+/// key is empty, #5557).
 ///
 /// Also the correct predicate for a CHILD execution in
 /// `/api/executions/{id}/children` (Sol/gpt-5.6-sol adversarial review,
@@ -111,28 +123,8 @@ private:
 /// PARENT execution that has already passed its own check does not by
 /// itself authorize enumerating separate child execution records — each
 /// child must pass this same predicate independently.
-[[nodiscard]] inline bool execution_visible(const Execution& exec,
-                                            const std::vector<AgentExecStatus>& statuses,
-                                            const authz::VisibleSet& scope,
-                                            const std::string& username) {
-    if (!scope)
-        return true;
-    // Full scan, no early exit — matches the doc comment above. An early
-    // `return true` on the first in-scope row makes the loop length
-    // (and thus wall-clock time) a function of WHERE in `statuses` the
-    // first visible agent falls, a residual timing side-channel on the
-    // admit path (cpp-expert, #3789 Gate 3).
-    bool visible = !username.empty() && exec.dispatched_by == username;
-    for (const auto& a : statuses)
-        visible = authz::in_scope(scope, a.agent_id) || visible;
-    return visible;
-}
-
-/// `execution_visible` keyed on an `ExecutionOwnerKey` instead of a raw username: the ownership
-/// disjunct is `owner.owns(exec)`, so a service-scoped session's minting account can never reach
-/// the compare. Same full-scan, no-early-exit shape as the string overload above. The key never
-/// constrains an UNRESTRICTED scope: `!scope` is visible whatever the key is. The string overload
-/// is removed once every call site takes the key.
+/// The key never constrains an UNRESTRICTED scope: `!scope` is visible whatever the key is.
+/// Full scan, no early exit, as above.
 [[nodiscard]] inline bool execution_visible(const Execution& exec,
                                             const std::vector<AgentExecStatus>& statuses,
                                             const authz::VisibleSet& scope,
@@ -208,27 +200,9 @@ confined_projection(const std::vector<AgentExecStatus>& statuses, const authz::V
 /// parent cohort and cancel halts pending dispatches, so a partially
 /// visible execution must not let a confined caller affect an
 /// out-of-scope agent.
-[[nodiscard]] inline bool admit_confined_mutation(const Execution& exec,
-                                                  const std::vector<AgentExecStatus>& statuses,
-                                                  const authz::VisibleSet& scope,
-                                                  const std::string& username) {
-    const bool owns = !username.empty() && exec.dispatched_by == username;
-    if (statuses.empty())
-        return owns;
-    if (static_cast<int>(statuses.size()) != exec.agents_targeted)
-        return false;
-    // Full scan, no early exit — same rationale as `execution_visible`
-    // above (cpp-expert NICE, folded in for consistency, #3789 Gate 3).
-    bool all_in_scope = true;
-    for (const auto& a : statuses)
-        all_in_scope = authz::in_scope(scope, a.agent_id) && all_in_scope;
-    return all_in_scope;
-}
-
-/// `admit_confined_mutation` keyed on an `ExecutionOwnerKey`: the zero-status-row dispatcher
-/// window admits `owner.owns(exec)` only, and an empty key (a service-scoped session) never
-/// satisfies it. Rule and full-scan shape identical to the string overload above, which is
-/// removed once every call site takes the key.
+///
+/// Keyed on an `ExecutionOwnerKey`: the zero-status-row dispatcher window admits
+/// `owner.owns(exec)` only, and an empty key (a service-scoped session) never satisfies it.
 [[nodiscard]] inline bool admit_confined_mutation(const Execution& exec,
                                                   const std::vector<AgentExecStatus>& statuses,
                                                   const authz::VisibleSet& scope,
