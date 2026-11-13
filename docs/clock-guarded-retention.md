@@ -732,7 +732,7 @@ diagnostic read, `submit()`'s approved-ticket sweep, and
   step's transaction, also over a shorter session-level timeout, in a one-off check on a throwaway PG16 by the
   implementer; it is not a repo test, and the repo tests pin only that the statement carries the prefix). It touches every unsettled approved or
   rejected scheduled ticket, including old rejected ones (rejected tickets never expire and are never swept).
-  The deny direction: a legitimate approved-but-unfired ticket that the step marks used just gets a fresh ask. See the bullet "The approvals v2 step is data only (#6096)" in `docs/user-manual/upgrading.md`.
+  The deny direction: a legitimate approved-but-unfired ticket at upgrade time just gets a fresh ask. See the upgrade note in `docs/user-manual/upgrading.md`.
 - **Parts 1, 2 and 4 DECLINED for the approved-ticket and the pending path; part 3 is not declined
   (next bullet)** (there is no per-replica clock reading to probe, persist or dedupe, and running the
   sweep on every replica is safe, so the SINGLE-WRITER caveat does not apply to it). With

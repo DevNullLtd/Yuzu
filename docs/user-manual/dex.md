@@ -167,8 +167,8 @@ The tab has these sections:
   summing to at most 100.
 - **Model** - the per-device event cap (1 to 1000, default 5), the regression start and full ratios
   (1 to 1000, start below full, defaults 1.0 and 3.0) and the interval confidence level (0.5 to
-  0.999, default 0.95; global only). Setting one stores a version 2 document (see *Score policy
-  versions* at the end of this section).
+  0.999, default 0.95; global only). Do not change a model parameter during a rolling upgrade or
+  rollback (see *Rolling upgrades* at the end of this section).
 - **Application overrides** - up to 200 per-application overrides keyed by the exact image name
   (case is ignored). An override replaces only the fields it sets; a blank field inherits the global
   value. Tick *Remove this override* and save to delete a row; a blank row at the end adds one.
@@ -204,9 +204,8 @@ nothing is overwritten, and a Reload button fetches the current policy; reloadin
 edits on screen. A change reaches every server typically within 5 seconds. Tier names and image
 names are HTML-escaped wherever they are shown.
 
-**Score policy versions.** The Scoring tab writes the same document as the REST route; a stored
-document of a version above the one the server supports is scored under the shipped defaults with an
-`unsupported_version` fault. See [Upgrading](upgrading.md#behaviour-change-the-dex-score-policy-document-gains-model-parameters-and-version-2).
+**Rolling upgrades.** Do not save or reset the policy during a rolling upgrade or rollback of the
+server; see [Upgrading](upgrading.md#behaviour-change-the-dex-scoring-tab-edits-the-score-policy-from-the-dashboard).
 
 ### Catalogue
 

@@ -643,7 +643,7 @@ on an existing server (see the InstructionStore note in [`upgrading.md`](upgradi
 unaffected. Editing the definition (dashboard YAML editor or `PUT /api/instructions/{id}`) to declare the two
 new columns is optional and cosmetic.
 
-**Check your consumers.** Search your scripts, SIEM parsers and saved exports for
+**Before upgrading, check whether this affects you.** Search your scripts, SIEM parsers and saved exports for
 consumers of `installed_apps`/`crossplatform.software.inventory` output and change any fixed five-field
 pattern to `app|name|version|publisher|install_date[|install_location|bundle_id]`.
 
@@ -955,7 +955,8 @@ What changes on **every** deployment, including single-server:
   `--cert-san`) deleted their old inventory rows, including revoked ones, so a
   revoked default leaf was accepted again and dropped from the CRL. Revoked rows
   are now kept, and the database now refuses to delete them (migration v4
-  trigger). **This does not restore a revocation already lost that way:** the
+  trigger) — during a rolling upgrade an older server's default-cert purge fails
+  with "failed to purge prior default-cert inventory rows" instead. **This does not restore a revocation already lost that way:** the
   purged serial is no longer in the inventory, so revoking it again returns
   `404`. This only affects you if you revoked a default server certificate (for
   example because its key may have leaked) **and** the default certificates were
@@ -973,9 +974,21 @@ What changes on **every** deployment, including single-server:
   because it keeps the issuing key the leaked certificate chains to. A re-root
   re-enrolls the whole fleet.
 
-Single-server remains the only supported topology.
+Single-server remains the only supported topology. If you nevertheless run two
+server versions against one database during an upgrade, a publish from the
+**older** binary does not take the lock and can still publish a CRL that omits a
+revocation the newer binary just recorded; the newer binary's freshness pass
+republishes to cover it (and can do so on every tick for as long as the older
+binary keeps publishing).
 
-The CRL freshness pass runs only on the elected leader; a leader whose CA directory lacks the CA key cannot publish or refresh the CRL.
+**Rollback** to the previous release is safe: an older binary boots against the
+v4 schema and ignores the new column. It will not self-heal a missed CRL (rolling
+forward again republishes once), and its default-cert inventory purge fails
+while any revoked default leaf exists (logged, harmless) because the trigger stays
+in place — which is the point: it cannot un-revoke anything. Multi-replica PKI also still
+needs WS-6 slices 6.2 (enrollment) and 6.3 (CA key and KEK custody): today the
+freshness pass runs only on the elected leader, and a leader whose CA directory
+lacks the CA key can never publish.
 
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
@@ -1139,7 +1152,7 @@ that holds it).
 - **`YuzuLeaderFlapping` (warning).** Six or more acquisitions in 30 minutes across
   a **multi-replica** deployment: a network or Postgres failover flap, or a
   handover loop. Compare with `YuzuServerPostgresUnreachable` and
-  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A planned restart of an
+  `yuzu_server_leader_lost_total{cause="liveness_failed"}`. A rolling upgrade of an
   N-replica deployment legitimately adds up to N acquisitions; the threshold
   leaves room for four replicas. **It usually does not detect a single
   replica in a restart loop**: the counter is synced at scrape time, so a boot whose
@@ -1262,6 +1275,13 @@ no-backfill, since this store never existed before 3.3).
   per-device concurrency enforcement for the outbox path is a follow-up, not
   an oversight.
 
+**Rollback note:** a `pending` outbox row committed by a 3.3-or-later binary
+is invisible to a pre-3.3 binary, which has no outbox reader. Rolling back
+mid-flight leaves that occurrence undelivered until you roll forward again —
+a narrow window, and no data corruption (the row stays durable in Postgres
+and delivers as soon as a 3.3-or-later binary is running and holds
+leadership).
+
 ### vNEXT — manual policy remediation is now claimed durably, cross-replica (HA WS-3 3.4; breaking for automation asserting `agents == len(agent_ids)`)
 
 `POST /api/policies/{id}/remediate` now arbitrates its per-target claim
@@ -1272,7 +1292,12 @@ replicas racing a remediate call for the same policy/agent can no longer both
 dispatch a fix. (This is the guarantee for when the safe-to-scale gate lifts, ADR-2002 §7c; exactly one server replica is supported today.)
 
 **Scope of the guarantee.** This holds between replicas running the **same
-schema version**; a supported deployment runs every replica on this build (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)).
+schema version**. A rolling upgrade across the migration boundary can
+transiently run an old binary that predates the durable claim alongside a new
+one; that mixed-version window is covered today only by the safe-to-scale gate
+(`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a
+durable cluster-capability admission gate (#6528). The exposure is one-directional: a row written by an old
+binary carries claim-generation `0`, a value a new binary never mints.
 Separately, this is effectively-once, not exactly-once (consistent with
 ADR-2002): a replica that pauses for longer than `fixing_stale_seconds`
 between winning a claim and actually sending a command over gRPC — the fix,
@@ -1435,7 +1460,7 @@ across both.
 
 **Who this affects.** A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)), where this migration runs over empty tables and cannot fail. The note applies only to a development or UAT database whose `scim_store` schema was built before this migration and that holds SCIM data (the server has run with `--scim-enable` at some point, even if it is not set now), where two or more `scim_resources` rows share the same non-empty `external_id`, most likely from an IdP connector bug, a manual data-fix gone wrong, or a resource re-provisioned under a new SCIM `id` without the old row ever being cleaned up.
 
-**To check a database for duplicates before the migration runs, use this query:**
+**Before upgrading, run this against your existing database to check:**
 
 ```sql
 SELECT external_id, COUNT(*) FROM scim_store.scim_resources
@@ -1444,7 +1469,7 @@ GROUP BY external_id
 HAVING COUNT(*) > 1;
 ```
 
-**If it returns any rows,** the migration fails and the server will not boot until you resolve the duplicates first: deactivate or delete the stale/incorrect row(s) for each `external_id` this query surfaces (keep whichever row is the IdP's actual current resource), then re-run the query until it returns nothing. If it returns no rows, this note does not affect you and the migration applies silently on boot.
+**If it returns any rows,** the upgrade will fail to boot until you resolve the duplicates first — deactivate or delete the stale/incorrect row(s) for each `external_id` this query surfaces (keep whichever row is the IdP's actual current resource), then re-run the query until it returns nothing. If it returns no rows, this note does not affect you and the migration applies silently on next boot.
 
 ### vNEXT — pre-auth request-body caps now apply to (almost) every route, not just `/mcp/` (#2407) (breaking)
 
@@ -1480,7 +1505,7 @@ go-cohort includes a device outside the role's `Execution:Execute` scope will no
 that device (visible as `skipped` in the deployment's device list) instead of executing on it.
 A role with a global `Execution:Execute` grant sees no change.
 
-**Check for any role combining a scoped `Execution:Execute` grant with
+**Before upgrading, check for any role combining a scoped `Execution:Execute` grant with
 `SoftwareDeployment:Execute`** — that combination is the only one affected. If none of your
 deployment-triggering roles hold a scoped (rather than global) `Execution:Execute` grant, this
 note does not affect you.
@@ -1724,6 +1749,19 @@ schedule id, not through the MCP recall, so the origin check never sees it and a
 outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
 there is nothing to do.
 
+**Rolling BACK across this release re-opens the check, and rolling forward does not close it
+again — but as of this same release, it does not stay open either.** The back-fill runs once, as a
+schema migration. An older server started against an already-migrated database does not re-run it
+and does not refuse to start; approvals it mints while you are rolled back record no minting
+surface at all (the column is never set). Rolling forward will not revisit those rows, because the
+migration has already run — but the MCP mint in this same release always declares its own surface
+(see the "MCP mint now declares its own surface" entry below), so a row with no recorded surface is
+no longer the value that grants: it is refused at recall exactly like a declared foreign surface,
+not exempted. There is no window in which a rollback-minted ticket is redeemable once you are back
+on a current server. Treat a roll-back as a window during which such tickets simply won't work
+later — mint fresh ones after rolling forward rather than relying on anything minted during the
+roll-back.
+
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade
 labels them with a sentinel that fails closed — so an approval granted before the upgrade is refused
@@ -1815,7 +1853,7 @@ update, so an existing `mcp.`-prefixed definition cannot be edited there if its 
 declares `metadata.id` (one that omits it still saves, since the validator only checks a
 declared id).
 
-**What to do.** Check for affected content. Query the instruction database
+**What to do.** Before upgrading, check for affected content. Query the instruction database
 directly rather than the REST list route: `GET /api/v1/definitions` caps its result at 100
 definitions, and the shipped content alone exceeds that, so an API-based check can report a
 false all-clear. Use a case-sensitive glob-style match — Postgres `LIKE` is case-sensitive by
@@ -1829,10 +1867,10 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT id FROM instruction_store.instruction_definitions WHERE id ~ '^mcp\.';"
 ```
 
-Any id listed keeps executing and can still be edited through
+Any id listed keeps executing after the upgrade and can still be edited through
 `PUT /api/instructions/{id}`, but re-importing an export of it will fail, and so will saving it
 from the dashboard's YAML editor (that path validates the id on every save, not only on
-create). Rename those definitions: create a replacement under a different id
+create). Rename those definitions before upgrading — create a replacement under a different id
 and delete the original.
 
 ### vNEXT: the `guardian.` instruction-definition id prefix is reserved (#6062) (breaking)
@@ -1867,7 +1905,7 @@ same validation on every save, create or update: an existing `guardian.`-prefixe
 cannot be edited there if its document declares `metadata.id` (a document that omits it still
 saves). Re-importing an export of such a definition also fails.
 
-**What to do.** Look for affected ids. Query the instruction database directly
+**What to do.** Before upgrading, look for affected ids. Query the instruction database directly
 rather than the REST list route: `GET /api/v1/definitions` caps its result at 100 definitions
 and the shipped content alone exceeds that, so an API-based check can report a false all-clear.
 The query is read-only and case-sensitive, matching the reservation:
@@ -1940,7 +1978,7 @@ and the threshold of 3 are tentative and have not been tuned against fleet data.
   address it connects to (for example `http://localhost:8080`; `https://localhost:8443` when the server terminates TLS itself, where an `http://` origin is refused). Direct access needs a local sign-in:
   a deployment that offers only OIDC or SAML sign-in redirects to the public URL, so for those only
   restarting with the flag works.
-- The check cannot be disabled: the remedies are the flag or an API token.
+- The check cannot be disabled: the remedies are the flag, an API token or rolling back.
 - An `Origin: null` request cannot be fixed by configuration: the reserved token `null` is refused as
   an entry, and `Referer` is not consulted once `Origin` is present.
 
@@ -2455,18 +2493,20 @@ schema change ever applied to `api_tokens` since it shipped — every
 authenticated request validates a Bearer token against this table, so it is
 one of the hottest tables on the server.
 
-**Not breaking, but worth knowing about the migration.** `ALTER TABLE
+**Not breaking, but worth knowing before a rolling upgrade.** `ALTER TABLE
 ... ADD COLUMN ... DEFAULT ''` takes Postgres's briefest possible form (a
 metadata-only "fast default" on PG 11+, not a table rewrite) but is still an
 `ACCESS EXCLUSIVE` DDL statement: it must wait for every transaction
 currently touching `api_tokens` to finish before it can run, and every new
-transaction on the table queues behind it in turn while it waits. A
-request still open on the table can hold such a transaction open. This is bounded and loud, not silent: the pool's
+transaction on the table queues behind it in turn while it waits. During a
+rolling upgrade, an outgoing replica's still-open request handling can hold
+such a transaction open. This is bounded and loud, not silent: the pool's
 `lock_timeout` (10s, `pg_pool.hpp`) cancels the migration's `ALTER` if it
 queues that long, and `ApiTokenStore` construction fails closed exactly as
 it does for any other migration failure — the new binary refuses to start
 with a clear log line rather than serving degraded or hanging the table. If
-you see this, retry once traffic on the table quiesces; it is not a data
+you see this on a rolling upgrade, retry once traffic quiesces (a load
+balancer draining the outgoing replica is usually enough); it is not a data
 integrity concern either way.
 
 ### vNEXT — a device quarantined while offline now re-contains itself automatically on reconnect (#3425) (breaking)
@@ -3978,7 +4018,9 @@ The server emits an audit event on every branch:
 > leaves the person's account (and, after an early refusal, their tokens and
 > sessions) live and raises a critical analytics event: an operator has to
 > act. No alert rule ships for these series yet (tracked in
-> #5673). A server with an authentication
+> #5673). A replica
+> running a build without this rule does not enforce it, so drain old
+> replicas during a rolling upgrade. A server with an authentication
 > database but no RBAC store refuses to start.
 
 ### Changing and resetting passwords
@@ -6136,7 +6178,7 @@ A **revocation source** tells the server which certificate authority to check ce
 
 **Audit.** Every read and change is audited (`crypto.revocation_source.*`; see the [audit log](audit-log.md)). A change writes an `attempted` row first and is refused with a `503` if that row cannot be stored. The URLs you register, with the address classes you confirmed, are recorded in the audit detail (so an audit row can carry an internal host name; limit who can read the audit log accordingly).
 
-**Startup.** The `revocation_source_store` schema is created at start and is fail-closed: if the server cannot create or open it, it logs `[PG] Refusing to start: revocation-source store migration/open failed ...` and exits with status `1` (the database role needs `CREATE` on the database), and `/readyz` lists it as a gating check.
+**Startup and rollback.** The `revocation_source_store` schema is created at start and is fail-closed: if the server cannot create or open it, it logs `[PG] Refusing to start: revocation-source store migration/open failed ...` and exits with status `1` (the database role needs `CREATE` on the database), and `/readyz` lists it as a gating check. Rolling back to an older server leaves the schema in place and unused; see [Upgrading](upgrading.md).
 
 **Backup and erasure.** The registrations live in the `revocation_source_store` schema of the PostgreSQL database and are covered by the whole-database dump. They hold operator-supplied configuration (`created_by` is the registering administrator's username); there is no per-subject data.
 

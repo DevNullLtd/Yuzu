@@ -1394,8 +1394,10 @@ If you do use the lever, follow the security note in
 (shortest possible window, approval, restricted network, enrol administrators first, restart every
 replica, review the window's `auth.login` and `mfa.enroll.verified` rows afterwards).
 
-**Per replica.** Counters are per replica; aggregate across replicas when you alert. Every replica runs this build
-(see "Deployment contract (hard cutover)" in [Upgrading](../user-manual/upgrading.md)).
+**During a rolling upgrade.** Counters are per replica. An un-upgraded replica still reports a Shape 1
+fault as `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` (and at sign-in also
+`yuzu_auth_read_degrade_total{route="login"}`) with a `store_unavailable` audit detail. Alert on both signals
+until every replica runs the same build.
 
 ## Enrolling a non-admin approver
 

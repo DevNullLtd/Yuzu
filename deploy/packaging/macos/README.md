@@ -321,9 +321,11 @@ root-owned, non-symlinked, and not group/world writable. A missing data working
 directory is created root-owned; an existing one is never changed.
 
 The first line of `package-files.list` names the package version that wrote it.
-When the next install sees that this version differs from the Installer receipt,
-it re-derives ownership instead of trusting the manifest: the receipt's plugins,
-plus each listed plugin whose bytes still match its recorded hash.
+A package without a manifest (any release from before this one), installed over
+a newer one, leaves that manifest behind. The next install sees that its version
+differs from the Installer receipt. It then re-derives ownership: the receipt's
+plugins, plus each listed plugin whose bytes still match its recorded hash. So
+rolling back a fleet and forward again does not refuse every later upgrade.
 
 For an authorized silent uninstall, run:
 
@@ -424,9 +426,8 @@ Other points for an MDM rollout:
   unconfigured first install succeeds with the agent not started. Check the
   outcome with `sudo launchctl print system/com.yuzu.agent` (or your MDM's
   script runner) rather than the install status alone.
-- **Packages from before this installer.** They replace the service definition
-  with their own default. Installing one over a current agent is not a supported
-  path.
+- **Rollback.** Installing a package from before this installer replaces the
+  service definition with its own default, so re-apply the settings afterwards.
 
 Without step 2, the package installs the agent but does not start it. A later
 script can add the settings to the installed plist and run

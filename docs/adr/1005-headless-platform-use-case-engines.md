@@ -1009,9 +1009,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        the OpenAPI document is readable as the `yuzu://openapi` resource; and
        the generic runtime-config write refuses `dex_score_policy`.
      - Wire reference: `docs/user-manual/rest-api.md`, "GET / PUT / DELETE
-       /api/v1/dex/score-policy"; the version 2 behaviour (an unsupported
-       version scores under the shipped defaults with an `unsupported_version`
-       fault) is in `docs/user-manual/upgrading.md`; audit rows:
+       /api/v1/dex/score-policy"; the version 2 rolling-upgrade rule is in
+       `docs/user-manual/upgrading.md`; audit rows:
        `docs/user-manual/audit-log.md` (unchanged by this entry).
      - Recorded by the change author; ADR-owner acceptance pending.
 

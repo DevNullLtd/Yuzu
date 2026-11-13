@@ -352,7 +352,12 @@ use-after-free guard any shutdown refactor must preserve.
 > targets (the fix was actually dispatched to them), not attempted targets.
 >
 > **Scope of the guarantee.** The claim prevents two replicas from independently *claiming* the
-> same `(policy, agent)` target only when both are running the **same schema version**; a supported deployment runs every replica on this build (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Separately, the guarantee is
+> same `(policy, agent)` target only when both are running the **same schema version**. During a
+> rolling upgrade across the migration boundary, an old binary that predates the durable claim can
+> transiently run alongside a new one; that mixed-version window is covered today only by the safe-to-scale gate
+> (`docs/ha-delivery-matrix.md`, which is procedural and not lifted), pending a durable
+> cluster-capability admission gate (#6528). The exposure is one-directional — a row written by an old binary carries claim-generation
+> `0`, a value a new binary never mints for its own claims. Separately, the guarantee is
 > effectively-once, not exactly-once (consistent with ADR-2002): a replica that pauses for longer
 > than `fixing_stale_seconds` between winning the claim and actually sending a command over gRPC —
 > the fix, or the subsequent post-fix verify — can still deliver that one send after a sibling has

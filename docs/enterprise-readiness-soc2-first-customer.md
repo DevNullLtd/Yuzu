@@ -406,9 +406,10 @@ call the MCP tool surface without the tier ceiling or the supervised-tier approv
 gate; per-tool authorization (RBAC, or the legacy role check when enforcement was
 off) still applied to every call. The fix is not retroactive: for any audit period
 covered by builds that predate this change, MCP calls made by a tierless principal
-were not subject to the tier or approval controls. The check is enforced by each
-replica, and this build has no rolling or mixed-build window (see "Deployment
-contract (hard cutover)" in `docs/user-manual/upgrading.md`).
+were not subject to the tier or approval controls. The check is enforced per
+replica, so a replica not yet upgraded during a rolling upgrade, or one rolled back,
+admits tierless callers again; see `docs/user-manual/upgrading.md` for the
+rolling-upgrade and rollback windows.
 Questionnaire wording: every tierless request that reaches admission on an upgraded
 replica is refused (`403`) and counted on `yuzu_mcp_admission_refused_total`. An
 audit row (`mcp.session.reject`, `reason=tier_required`) is written for the first
@@ -423,7 +424,8 @@ Stream liveness is principal-level: the class is checked when the stream attache
 Further residuals: a class switch strands the old-class sessions against the
 per-principal cap (fixed at 8, no flag) for up to the 30-minute idle TTL (longer while
 a stream stays attached, because the stream's per-tick liveness check keeps the
-session alive) with no administrator reap path.
+session alive) with no administrator reap path; and during a rolling upgrade the gap stays open on any replica not yet
+upgraded.
 Audit evidence: the `mcp.session.*` rows are written set-and-proceed (a failure to
 persist one is logged at warning level and the denial is still answered; `tier_required`
 rows are rate-limited per principal, and the refused counter is complete) and they are queryable through
@@ -612,7 +614,7 @@ that keeps the fleet from losing its last administrator through an ordinary
 operation, **not** proof that anyone can sign in (a counted administrator may have no
 usable credential or step-up factor), and **not** an HA claim. Limits an assessor
 should know: administrators who sign in only through SSO are not counted until #5182;
-an earlier binary run against this database does not enforce the guard;
+a rolling upgrade or a rollback runs without the guard on the binaries that lack it;
 direct SQL against the database is outside the rule; the SCIM Group role recompute has
 documented known limits and no alert rule ships for it yet (tracked in #5673; the
 interim SIEM keys are in `docs/user-manual/scim-provisioning.md`, "Pilot playbook").
@@ -714,7 +716,7 @@ step-up endpoint (verify `amr` before enabling; see
 
 *Second residual, CC8.1 (maker-checker on scheduled runs), closed by #6096:* every approval stamp,
 submission time included, is now database time, and a scheduled ticket is marked used when its
-occurrence is queued, so one approval runs at most one occurrence regardless of server clocks. Further small
+occurrence is queued, so one approval runs at most one occurrence regardless of server clocks, once every replica runs the fixed binary. Further small
 residuals (database-clock steps expiring approved tickets, a stale `approved`
 status on lists until the next sweep, no approval or schedule alert rules) are tracked in #6097 and
 #6098. Operator-facing detail: `docs/user-manual/instructions.md`, "Who can
@@ -1106,7 +1108,7 @@ so a runner missing the gateway toolchain fails instead of passing without the g
 - Forward pointer: track 2g (ADR-1005 Decision 16, `docs/agentic-first-principle.md` A5) delivers a near-fully self-describing MCP tool/resource surface — typed schemas, truthful safety annotations, a handshake orientation blob, and OpenAPI/scope-DSL specs discoverable via `resources/list` rather than tool-by-tool, with one narrow tracked residual (streamed-final fallback envelope, #2990 — `retry_after_ms` closed 2026-08 by #3344). Cite this in the security whitepaper / CAIQ responses as evidence of a machine-verifiable, not merely documented, agentic contract — a differentiator against peers whose AI integrations (if any) are undocumented or prose-only; disclose the residuals rather than overclaiming completeness to a technical reviewer.
 - Forward pointer: the plugin README standard (`docs/plugin-readme-standard.md`) makes each agent plugin self-describing as data — its per-OS mechanism, the privilege it runs at with a measured date, its securable/operation/risk tier, output columns and where the rows land — served at `GET /api/v1/discover/plugin-docs` and the `yuzu://plugin-docs` resource. Cite it as the per-plugin answer to "what does the agent collect, at what privilege" (the `Sensitivity is plugin-dependent` rows above point here for the plugins that have adopted it); state the coverage honestly — two pilots today, the remaining plugins in the retrospective sweep, held by a README-existence ratchet in the `docs` test suite.
 - Known-limitations disclosure (#3481, gov Gate 6 enterprise-readiness, 2026-08-24): two tracked, filed, non-blocking `ProductPackStore` residuals worth surfacing in a technical security/reliability review rather than presenting only as public GH issues — #3523 (two concurrent installs of an identical product-pack bundle can cross-couple a `Policy` to an unrelated pack's `Fragment`; no attacker required, an automation/GitOps race is sufficient) and #3524 (a large duplicate-item-id bundle drives an unbounded, synchronous compensation pass over sibling-store locks — a `ProductPack:Write`-privileged-caller resource-exhaustion question a CAIQ-style review would reasonably ask). Both are data-integrity/availability class, not credential/RCE; neither derived BLOCKING under this repo's severity schema.
-- Known-limitations disclosure (#4966): the last-Administrator guard is a recovery rule, not proof of sign-in and not an HA claim; SSO-only administrators are not counted until #5182, direct SQL is outside it, an earlier binary run against this database does not enforce it, and the SCIM Group role recompute has documented limits with no shipped alert rules (tracked in #5673). State these alongside the control in the questionnaire/whitepaper rather than presenting the guard as absolute.
+- Known-limitations disclosure (#4966): the last-Administrator guard is a recovery rule, not proof of sign-in and not an HA claim; SSO-only administrators are not counted until #5182, direct SQL is outside it, a rolling upgrade or rollback drops it, and the SCIM Group role recompute has documented limits with no shipped alert rules (tracked in #5673). State these alongside the control in the questionnaire/whitepaper rather than presenting the guard as absolute.
 - Known-limitations disclosure (#5692): state these alongside the OIDC SSO control in a questionnaire.
   - Signing keys are fetched afresh for every sign-in and not cached, so a key the IdP has retired or revoked stops verifying at the next sign-in (#1901 UP-19); the cost is one JWKS request per sign-in and no sign-in while the JWKS endpoint is down; an IdP that rate-limits `jwks_uri` (429/5xx) fails that sign-in with no retry, and under `--auth-mode=sso-only` an outage locks out every operator without an armed break-glass account. A token naming a `kid` the key set lacks is refused; a token with no `kid` is checked against each usable signing key in turn (at most the first 16, in the order published). An RSA signing key whose modulus is under 2048 bits, or whose public exponent is below 3, even or over 32 bits, is skipped when the key set is parsed, so such a key cannot verify a token and an IdP that signs with one cannot sign anyone in; under `--auth-mode=sso-only` that locks out every operator without an armed break-glass account, and the skip is recorded in the server log only (no metric, no audit row; the failed sign-in itself is the generic `auth.oidc_login_failed` row). These checks are defence in depth against an IdP publishing a weak or degenerate key; they do not defend a tampered or hostile JWKS, whose publisher can serve a key of their own that passes them, and no setting lowers them. JWKS fetches are not single-flight (a burst makes N parallel fetches; #1900, #5983).
   - A discovery failure at `/auth/oidc/start` is logged only: no audit row and no counter (#5704). A callback's discovery or JWKS failure shares the generic failure row and counter.
