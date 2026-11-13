@@ -611,7 +611,8 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
 bool AuthManager::wipe_user_sessions_then_drop_cache(const std::string& username) {
     const bool persisted = wipe_user_sessions_durable(username);
     // No lock is held across the durable wipe above; mu_ is taken only for the erase and the
-    // epoch bump.
+    // epoch bump. The drop runs after a failed wipe too, but it only closes the straddle when the
+    // wipe persisted: after a failure the row survives and a later cold read can re-cache it.
     std::unique_lock lock(mu_);
     drop_cached_user_sessions_locked(username);
     return persisted;
@@ -2364,7 +2365,9 @@ bool AuthManager::reactivate_user(const std::string& username) {
     {
         // Drop again now the wipe has persisted: a validation that began after the local erase
         // above can have read the then-present row and cached the pre-change session. (Not on
-        // the failure path: the account stays inactive there and the account gate refuses.)
+        // the failure path: for a deactivated account the account stays inactive there and the
+        // gate refuses. An already-active account whose wipe fails keeps a gap-cached session
+        // until the next generation poll: bounded, and no worse than before.)
         std::unique_lock lock(mu_);
         drop_cached_user_sessions_locked(username);
     }
@@ -2641,7 +2644,10 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
             between_local_erase_and_wipe_hook_for_test_();
         // Fail closed on a durable-wipe error: a demoted user's higher-role session must not
         // survive a lost durable delete (see the helper). The role IS changed by now. The cache is
-        // dropped again after the wipe (success or not) for a validation that straddled it.
+        // dropped again after the wipe for a validation that straddled it. That closes the gap
+        // only when the wipe persisted: after a FAILED wipe the row survives, so a later cold
+        // read can re-cache the stale-role session (the existing "role stale after a failed
+        // wipe" case, not addressed here).
         if (!wipe_user_sessions_then_drop_cache(username)) {
             spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
                           "(the role IS changed)",

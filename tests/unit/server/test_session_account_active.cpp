@@ -1017,12 +1017,31 @@ TEST_CASE("cache epoch: a revoke on the SAME replica drops a validation held acr
     }
 }
 
+namespace {
+
+// Clears the between-erase-and-wipe hook on scope exit, so a throwing REQUIRE cannot leave a
+// lambda (which captures locals of the test) installed on the manager.
+class GapHookGuard {
+public:
+    GapHookGuard(AuthManager& mgr, std::function<void()> hook) : mgr_(mgr) {
+        mgr_.set_between_local_erase_and_wipe_hook_for_test(std::move(hook));
+    }
+    ~GapHookGuard() { mgr_.set_between_local_erase_and_wipe_hook_for_test(nullptr); }
+    GapHookGuard(const GapHookGuard&) = delete;
+    GapHookGuard& operator=(const GapHookGuard&) = delete;
+
+private:
+    AuthManager& mgr_;
+};
+
+} // namespace
+
 TEST_CASE("cache epoch: a validation inside the gap between a role change's local erase and its "
           "durable wipe does not leave the pre-change session cached (T-R12)",
           "[auth][session_store][account_active][cache_epoch][pg]") {
     // The validation runs after the local erase and before the wipe, so it reads the still
-    // present row, passes the account gate (the account is active) and caches the pre-change
-    // session. Only the second drop after the wipe removes it. No poll runs afterwards.
+    // present row, passes the account gate (the account is active) and, without the second drop
+    // after the wipe, would leave the pre-change session cached. No poll runs afterwards.
     AcctFx f;
     auto& a = f.add();
     f.seed_world("alice");
@@ -1030,15 +1049,14 @@ TEST_CASE("cache epoch: a validation inside the gap between a role change's loca
     REQUIRE_FALSE(token.empty());
 
     bool gap_validation_served = false;
-    a.set_between_local_erase_and_wipe_hook_for_test(
-        [&] { gap_validation_served = a.validate_session(token).has_value(); });
+    GapHookGuard hook(a, [&] { gap_validation_served = a.validate_session(token).has_value(); });
     REQUIRE(a.update_role_checked("alice", Role::admin) ==
             yuzu::server::auth::UpdateRoleOutcome::Updated);
-    a.set_between_local_erase_and_wipe_hook_for_test(nullptr);
 
-    REQUIRE(gap_validation_served); // the validation did cache the pre-change session ...
+    // The gap validation was served. That alone does not prove it cached anything; the mutation
+    // that removes the post-wipe drop is what proves the straddle (this test then fails).
+    REQUIRE(gap_validation_served);
     CHECK(f.durable_sessions_of("alice") == 0);
-    // ... and the wipe must have removed it from the cache too.
     CHECK_FALSE(a.validate_session(token).has_value());
 }
 
@@ -1046,7 +1064,7 @@ TEST_CASE("cache epoch: a validation inside the gap between a reactivation's loc
           "durable wipe does not leave the pre-change session cached (T-R13)",
           "[auth][session_store][account_active][cache_epoch][reactivation][pg]") {
     // The already-active shape (T-R10): the account passes the gate inside the gap, so the
-    // gap validation is served and cached. Reactivation then wipes, and the cache must not keep it.
+    // gap validation is served. Reactivation then wipes, and the cache must not keep the session.
     AcctFx f;
     auto& a = f.add();
     f.seed_world("alice");
@@ -1054,10 +1072,8 @@ TEST_CASE("cache epoch: a validation inside the gap between a reactivation's loc
     REQUIRE_FALSE(token.empty());
 
     bool gap_validation_served = false;
-    a.set_between_local_erase_and_wipe_hook_for_test(
-        [&] { gap_validation_served = a.validate_session(token).has_value(); });
-    (void)a.reactivate_user("alice");
-    a.set_between_local_erase_and_wipe_hook_for_test(nullptr);
+    GapHookGuard hook(a, [&] { gap_validation_served = a.validate_session(token).has_value(); });
+    REQUIRE(a.reactivate_user("alice"));
 
     REQUIRE(gap_validation_served);
     CHECK(f.durable_sessions_of("alice") == 0);
@@ -1076,13 +1092,32 @@ TEST_CASE("cache epoch: the same role-change gap with no AuthDB (config-file use
     REQUIRE_FALSE(token.empty());
 
     bool gap_validation_served = false;
-    a.set_between_local_erase_and_wipe_hook_for_test(
-        [&] { gap_validation_served = a.validate_session(token).has_value(); });
+    GapHookGuard hook(a, [&] { gap_validation_served = a.validate_session(token).has_value(); });
     REQUIRE(a.update_role_checked("cfguser", Role::admin) ==
             yuzu::server::auth::UpdateRoleOutcome::Updated);
-    a.set_between_local_erase_and_wipe_hook_for_test(nullptr);
 
     REQUIRE(gap_validation_served);
     CHECK(f.durable_sessions_of("cfguser") == 0);
     CHECK_FALSE(a.validate_session(token).has_value());
+}
+
+TEST_CASE("update_role_checked answers UpdatedSessionWipeFailed when the durable wipe does not "
+          "persist, and the role IS changed (T-R14)",
+          "[auth][session_store][account_active][pg]") {
+    // Outcome only: after a failed wipe the surviving row is the existing "role stale after a
+    // failed wipe" case, so the cache contents are deliberately not asserted here.
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+    REQUIRE_FALSE(a.create_local_session_for_test("alice", Role::user, false).empty());
+
+    yuzu::test::SessionWipeFault wipe_fault{f.db.pool()};
+    wipe_fault.arm();
+    CHECK(a.update_role_checked("alice", Role::admin) ==
+          yuzu::server::auth::UpdateRoleOutcome::UpdatedSessionWipeFailed);
+    wipe_fault.repair();
+
+    const auto role = f.db->get_user("alice");
+    REQUIRE(role.has_value());
+    CHECK(role->role == Role::admin); // the role IS changed
 }
