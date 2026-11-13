@@ -32,6 +32,14 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 (`--native-file meson/native/*.ini` / `--cross-file meson/cross/*.ini` select compilers / cross targets.)
 The script runs `vcpkg install` then `meson setup` automatically.
 
+### Following `dev`: what changed since your last pull
+Unreleased changes are only collated into `CHANGELOG.md` at release. After `git pull`, run:
+```bash
+python3 scripts/whats-new.py                   # since ORIG_HEAD, the commit before the last pull
+python3 scripts/whats-new.py --since "2 weeks ago"   # or a tag, branch or commit
+```
+It lists version bumps first (project version, plugin ABI, vcpkg baseline and dependencies, gateway packages), the surfaces that need a rebuild (a vcpkg change means re-running the setup script above), Dependabot bumps, then the `changelog.d/` fragments added in the range. `reset` and `rebase` overwrite `ORIG_HEAD`; pass `--since` then. Details: `changelog.d/README.md`.
+
 ### Manual configure
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=.

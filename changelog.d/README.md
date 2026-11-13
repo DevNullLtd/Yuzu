@@ -53,6 +53,27 @@ filename.
    agent would notice the change, write one.
 4. Lint locally before pushing: `python3 scripts/assemble-changelog.py --check`
 
+## Reading unreleased changes (following `dev`)
+
+Fragments are only collated into `CHANGELOG.md` at release. To see what a
+`git pull` of `dev` just brought, run this straight after the pull:
+
+```bash
+python3 scripts/whats-new.py                    # since ORIG_HEAD, i.e. before the last pull/merge
+python3 scripts/whats-new.py --since v0.15.0    # since a tag, branch or commit
+python3 scripts/whats-new.py --since "2 weeks ago"
+python3 scripts/whats-new.py --full             # whole bullets, not just their first line
+```
+
+It prints version bumps first (project version, plugin ABI, vcpkg baseline and
+dependency constraints, gateway packages), then the rebuild-relevant surfaces
+touched, Dependabot bumps (`build(deps)`/`chore(deps)` commits: Docker images
+listed, CI/tooling counted unless `--full`), then the fragments added in the range grouped by section (security,
+removed, deprecated, changed, added, fixed). It is read-only. `ORIG_HEAD` is
+overwritten by `reset` and `rebase`; pass `--since` if that happened. Changes
+that skipped a fragment (rule 3) do not appear; `git log --first-parent` lists
+every merged PR.
+
 ## For AI coding agents
 
 If you are an agent (Claude Code, etc.) preparing a change in this repo: when
