@@ -13929,6 +13929,8 @@ void RestApiV1::register_routes(
             mreq.what = ExecutionMutation::kCancel;
             mreq.execution_id = req.matches[1].str();
             mreq.username = session->username;
+            // #5557: admission key; `username` stays the real audit identity.
+            mreq.owner = execution_owner_key(*session);
             mreq.scope = gate.scope;
             mreq.audit_context = "surface=rest-v1 cid=" + cid;
             const auto outcome = apply_execution_mutation(
@@ -14028,6 +14030,7 @@ void RestApiV1::register_routes(
             if (!session)
                 return; // auth_fn wrote the 401.
             mreq.username = session->username;
+            mreq.owner = execution_owner_key(*session); // #5557: see the cancel arm
             const auto outcome = apply_execution_mutation(
                 execution_mutation_ports, mreq,
                 [&](const std::string& action, const std::string& result,

@@ -27939,6 +27939,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kCancel;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.audit_context = "surface=mcp";
                 const auto outcome = apply_execution_mutation(
@@ -28035,6 +28037,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kRerun;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.failed_only = *failed_only;
                 mreq.audit_context = "surface=mcp";

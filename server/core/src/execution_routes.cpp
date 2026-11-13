@@ -519,6 +519,10 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps.resolve_session_fn(req);
         auto user = session ? session->username : "unknown";
         const std::string username = session ? session->username : std::string{};
+        // #5557: admission compares the OWNERSHIP key, never `username` (the real principal, kept
+        // for the guard, `user` and the audit rows).
+        const ExecutionOwnerKey owner_key =
+            session ? execution_owner_key(*session) : ExecutionOwnerKey{};
 
         if (gate.scope) {
             // #3789: an empty username under an engaged scope means
@@ -561,7 +565,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             }
             const bool admitted = exec_opt.has_value() &&
                                  admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
-                                                        username);
+                                                        owner_key);
             if (!admitted) {
                 // #3789: uniform deny shape — nonexistent, zero-visible,
                 // partial, and incomplete-target-ledger all collapse to
@@ -618,6 +622,10 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps.resolve_session_fn(req);
         auto user = session ? session->username : "unknown";
         const std::string username = session ? session->username : std::string{};
+        // #5557: admission compares the OWNERSHIP key, never `username` (the real principal, kept
+        // for the guard, `user` and the audit rows).
+        const ExecutionOwnerKey owner_key =
+            session ? execution_owner_key(*session) : ExecutionOwnerKey{};
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
         if (!exec_r) {
@@ -663,7 +671,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             }
             const bool admitted = exec_opt.has_value() &&
                                  admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
-                                                        username);
+                                                        owner_key);
             if (!admitted) {
                 (void)deps.audit_fn(req, "execution.cancel", "denied", "execution", id,
                                     "not found or outside caller's fleet-read scope cid=" + cid);

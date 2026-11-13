@@ -47086,6 +47086,32 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: a confined caller need
     }
 }
 
+TEST_CASE("MCP cancel_execution / record_execution_rerun: the zero-row window admits the "
+          "dispatcher's own owner key only, and the effect names the real principal",
+          "[mcp][execution][mutation][confinement][security][owner_key][5557]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        for (const char* dispatcher : {"test-user", "alice"}) {
+            McpExecFake fs;
+            fs.exec = mcp_exec(dispatcher, 1); // no status rows yet
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                           const std::string&, const std::string&)
+                -> yuzu::server::authz::FleetReadGate {
+                return {true, mcp_exec_scope({"a"})};
+            };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            const bool own = std::string(dispatcher) == "test-user";
+            INFO(tool << " dispatcher=" << dispatcher);
+            CHECK(fs.effects() == (own ? 1 : 0));
+            if (own)
+                CHECK(fs.effect_user == "test-user");
+        }
+    }
+}
+
 TEST_CASE("MCP cancel_execution / record_execution_rerun: an empty principal is refused, never "
           "run as 'unknown'",
           "[mcp][execution][mutation][security][2146]") {
