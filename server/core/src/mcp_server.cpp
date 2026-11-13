@@ -8558,8 +8558,11 @@ McpServer::HandlerFn McpServer::build_handler(
             // re-resolving `audit_fn` would stamp an empty principal. They go through the
             // session-bound writer (`ToolDeps::audit_as_session_fn`, the one REST binds its
             // session-bound rows to) with the session this call resolved BEFORE the `attempted`
-            // row, so they name the same principal as that row. With no session writer wired
-            // (tests) they use mg_audit. Any exception from the writer is caught like mg_audit's.
+            // row, so they name the same principal as that row. server.cpp binds the writer only
+            // where the runtime-config store is open (the DEX score policy tools' deps, whose
+            // tripwire pins that wiring); with none wired (that deployment, tests) they use
+            // mg_audit, whose row re-resolves the session. Any exception from the writer is
+            // caught like mg_audit's.
             auto mg_audit_pre_wait = [&](const char* action, const char* result_status,
                                          const std::string& target_id,
                                          const std::string& detail_text) -> bool {

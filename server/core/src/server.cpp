@@ -23489,11 +23489,6 @@ private:
                     };
             }
             tool_deps.crypto_access_fn = crypto_access_cb;
-            // The session-bound audit writer, wired whether or not the runtime-config store (the
-            // DEX score policy tools, below) is: create_management_group and
-            // add_management_group_member stamp their `session_revoked` / `permission_revoked`
-            // failure rows from the session they resolved before their `attempted` row.
-            tool_deps.audit_as_session_fn = auth_routes_->audit_as_session_fn();
             // #6087: get/set/reset_dex_score_policy. The read closure is the REST GET's
             // reader; the apply closure is a pure forward of apply_dex_score_policy, the one
             // audit-first write path REST PUT/DELETE also call, with the per-request audit
@@ -23506,6 +23501,7 @@ private:
                 // from it, as the REST PUT/DELETE do (audit_as_session_fn, #6065 PR-Q).
                 tool_deps.session_fn = [this](const httplib::Request& req)
                     -> std::optional<auth::Session> { return auth_routes_->resolve_session(req); };
+                tool_deps.audit_as_session_fn = auth_routes_->audit_as_session_fn();
                 tool_deps.dex_score_policy_read_fn = dex_score_policy_deps->read_stored;
                 tool_deps.dex_score_policy_apply_fn =
                     [deps = *dex_score_policy_deps](
