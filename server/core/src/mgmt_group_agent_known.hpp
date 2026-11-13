@@ -1,8 +1,8 @@
 #pragma once
 
 /// @file mgmt_group_agent_known.hpp
-/// "Does the server hold an enrolment record for this agent id?", for the add-member surfaces: the REST
-/// route POST /api/v1/management-groups/{id}/members (rest_api_v1.cpp) and the MCP tool
+/// "Does the server hold an enrolment record for this agent id?", for the add-member surfaces: the
+/// REST route POST /api/v1/management-groups/{id}/members (rest_api_v1.cpp) and the MCP tool
 /// add_management_group_member (mcp_server.cpp). Both call `lookup_agent_known` and record the
 /// same `agent_known` audit suffix, so the two cannot drift (#7074, #6967).
 ///

@@ -14220,11 +14220,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Does the server hold an enrolment record for this id? A read, made after the group-exists
-                // answer and before the `attempted` row. It only FLAGS the id, on the success audit
-                // row; it is never returned. An unknown id is accepted and no lookup outcome
-                // refuses the add. Unreadable is recorded as neither known nor unknown (the REST
-                // twin does the same).
+                // Does the server hold an enrolment record for this id? A read, made after the
+                // group-exists answer and before the `attempted` row. It only FLAGS the id, on the
+                // success audit row; it is never returned. An unknown id is accepted and no lookup
+                // outcome refuses the add. Unreadable is recorded as neither known nor unknown (the
+                // REST twin does the same).
                 const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
                 if (!mcp_audit_attempted_or_refuse("management_group.add_member", group_id,
                                                    agent_id,
