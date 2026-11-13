@@ -171,6 +171,19 @@ reconcile). Refusing a kill-switch write for a protective pair is deferred until
 enablement catalogue replaces the kill-switch write surface; until then a stored row is
 informational only.
 
+### Update (2026-11-13) — the firewall plugin's four containment actions are protective
+
+`firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and
+`firewall.quarantine_allow` join the protective set on the owner's decision, as a second CLOSED
+four-action predicate (`is_firewall_control_plugin`) behind the same single `is_protective_action`:
+`firewall.release` is the way out of a firewall containment, so no enablement gate may refuse it.
+The other firewall actions (`state`, `rules`) stay ordinary, so a plugin-level `firewall` kill-switch
+row is labelled `protective_exempt=true` yet still gates them. Authorization is unchanged (the
+catalogue rows keep their permission and approval gates). The containment-gate exemption
+(`is_quarantine_control_plugin`) is deliberately unchanged: it keeps naming the quarantine plugin
+only until the server's live containment path moves to the firewall plugin (#7437), so a firewall
+containment is reachable for release only while the quarantine store can be read.
+
 ### Update (2026-10-03, #5294) — per-OS kill-switch rows
 
 A kill switch can now be narrowed to one agent OS, so a new OS leg can ship off where the plugin

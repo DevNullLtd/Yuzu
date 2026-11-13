@@ -8,6 +8,7 @@ fake of the dispatch seam: the status token is read exactly (inactive is not act
 is never a confirmation, and the release runs, and is confirmed or exits 3, on every failure path.
 """
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -57,9 +58,12 @@ class Guards(unittest.TestCase):
                             "--apply-containment"], capture_output=True, text=True, env=env, timeout=60)
         self.assertEqual(r.returncode, fc.EXIT_PRECONDITION)
         self.assertIn("refused", r.stderr)
+        if platform.system() in ("Linux", "Darwin"):  # elsewhere the POSIX-only refusal comes first
+            self.assertIn("SSH", r.stderr)
 
     def test_failed_install_check_exits_2_before_any_dispatch(self):
-        # The dashboard is a closed port: had the script gone on to log in, the exit would be 1.
+        # install_check is the only thing mocked: had the script gone on past it, it would have tried to
+        # reach the dashboard and exited 1, never 2.
         with mock.patch.object(fc, "install_check", return_value=(1, "account missing")), \
                 mock.patch.object(fc, "refusal", return_value=None):
             self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9"]), fc.EXIT_PRECONDITION)
@@ -92,20 +96,24 @@ class Flow(unittest.TestCase):
     """main() against a recording fake of the dispatch seam. `script` maps an action to the list of replies
     (or exceptions) it answers with, in order."""
 
-    def run_main(self, script, apply=True):
+    def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None):
         calls = []
+        self.params = {}
 
-        def fake(_client, _agent, action, _params):
+        def fake(_client, _agent, action, params):
             calls.append(action)
+            self.params[action] = params
             r = script[action].pop(0)
             if isinstance(r, BaseException):
                 raise r
             return r(calls) if callable(r) else r
 
-        argv = ["--dashboard", "http://unused", "--agent-id", "a"] + (["--apply-containment"] if apply else [])
+        argv = ["--dashboard", dashboard] + (["--agent-id", "a"] if agent else []) + \
+               (["--apply-containment"] if apply else []) + list(extra)
         with mock.patch.object(fc, "refusal", return_value=None), \
                 mock.patch.object(fc, "install_check", return_value=(0, "")), \
-                mock.patch.object(fc, "Client"), mock.patch.object(fc.time, "sleep"), \
+                mock.patch.object(fc, "Client", return_value=client or mock.MagicMock()), \
+                mock.patch.object(fc.time, "sleep"), \
                 mock.patch.object(fc, "dispatch", side_effect=fake):
             return fc.main(argv), calls
 
@@ -154,6 +162,49 @@ class Flow(unittest.TestCase):
                                            "quarantine": [boom], "release": [{}]})
                 self.assertEqual(rc, fc.EXIT_FAIL)
                 self.assertIn("release", calls)
+
+    def test_the_apply_carries_the_dead_man_limit_and_the_probe_target(self):
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                               "quarantine": [{}], "release": [{}]}, extra=["--probe-target", "198.18.0.9:443"])
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(self.params["quarantine"],
+                         {"exceptions": "127.0.0.1", "ttl_seconds": 300, "probe_target": "198.18.0.9:443"})
+        self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                       "quarantine": [{}], "release": [{}]}, extra=["--ttl-seconds", "0"])
+        self.assertEqual(self.params["quarantine"], {"exceptions": "127.0.0.1"})
+
+    def test_an_unproven_containment_passes_only_without_a_probe_target(self):
+        script = lambda: {"quarantine_status": [row("inactive"), row("active_unproven"), row("inactive")],
+                          "quarantine": [{}], "release": [{}]}
+        rc, calls = self.run_main(script())
+        self.assertEqual(rc, fc.EXIT_OK)
+        rc, calls = self.run_main(script(), extra=["--probe-target", "198.18.0.9:443"])
+        self.assertEqual(rc, fc.EXIT_FAIL)       # a requested probe that did not verify is a failure ...
+        self.assertIn("release", calls)          # ... and the release still runs
+
+    def test_a_dashboard_the_contained_host_could_not_reach_is_refused(self):
+        rc, calls = self.run_main({}, dashboard="http://192.0.2.7:8080")
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
+        self.assertEqual(calls, [])
+        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                   "quarantine": [{}], "release": [{}]}, dashboard="http://192.0.2.7:8080",
+                                  extra=["--exceptions", "127.0.0.1,192.0.2.7:8080"])
+        self.assertEqual(rc, fc.EXIT_OK)
+        rc, _ = self.run_main({"quarantine_status": [row("inactive")]}, apply=False,
+                              dashboard="http://192.0.2.7:8080")
+        self.assertEqual(rc, fc.EXIT_OK)         # a probe-only run changes nothing, so any dashboard is fine
+
+    def test_no_registered_agent_and_a_failed_login_exit_before_any_dispatch(self):
+        client = mock.MagicMock()
+        client.get_json.return_value = {"agents": []}
+        rc, calls = self.run_main({}, agent=False, client=client)
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
+        self.assertEqual(calls, [])
+        client = mock.MagicMock()
+        client.login.side_effect = OSError("refused")
+        rc, calls = self.run_main({}, client=client)
+        self.assertEqual(rc, fc.EXIT_FAIL)
+        self.assertEqual(calls, [])
 
     def test_an_already_contained_host_is_refused_before_any_change(self):
         for token in ("active", "partial", "degraded"):

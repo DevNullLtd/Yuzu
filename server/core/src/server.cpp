@@ -18601,10 +18601,13 @@ private:
         // reconnected. Same shared dispatch lambda as every other
         // background engine. The shared protective predicate
         // (yuzu::protective::is_protective_action, built on
-        // is_quarantine_control_plugin and is_firewall_control_plugin) lets the quarantine plugin's own
-        // actions through every gate unmodified: the #881 containment gate, the
+        // is_quarantine_control_plugin and is_firewall_control_plugin) lets
+        // the quarantine plugin's own actions (and the firewall plugin's four
+        // containment actions) through every enablement gate unmodified: the
         // per-plugin/action kill switch (incl. a degraded store), the per-OS
-        // withhold and its presence read, and the plugin-presence filter.
+        // withhold and its presence read, and the plugin-presence filter. The
+        // #881 containment gate's own exemption names the quarantine plugin's
+        // four only (the firewall four follow in #7437).
         // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{

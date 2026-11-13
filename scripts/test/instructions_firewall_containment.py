@@ -11,21 +11,26 @@ plugin", step 6). This script is that regression:
      and require an agent answer, so a missing plugin or grant shows up without changing a rule.
   3. CONTAINMENT (only with --apply-containment): refuse (exit 2) when the host already reads
      anything but `inactive` (the release would lift a containment this run did not apply); dispatch
-     `firewall.quarantine`, require the status to read `active`, then ALWAYS dispatch
+     `firewall.quarantine` (with a `ttl_seconds` dead-man limit), require the status to read
+     `active` (`active_unproven` is accepted, with a note, when no --probe-target was given: the plugin
+     only calls a containment proven when it could probe a non-loopback target before and after), then ALWAYS dispatch
      `firewall.release` (also on any failure; SIGINT/SIGTERM/SIGHUP are noted and the release still
      runs) and require the status to read `inactive` again.
 
 DO NOT RUN THE CONTAINMENT STEP ON A REMOTE / SSH-ONLY HOST. It briefly blocks all traffic except
 the allow set (loopback plus the agent's control channel). It refuses to run when an SSH session
 is detected (SSH_CONNECTION / SSH_CLIENT / SSH_TTY) unless --i-have-console-access is given, and
-never runs without --apply-containment. Run it on a local box with a keyboard and a screen.
+never runs without --apply-containment. The SSH check reads environment variables that `sudo` and a
+long-lived tmux/screen session can drop, so --i-have-console-access is the real control. The dashboard
+must be this host (loopback) or listed in --exceptions, or the release could not reach it. Run it on a
+local box with a keyboard and a screen.
 
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
 3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
 
 The status is read from the exact `status|<token>` row of the agent's reply. The flow is covered
 against a recording fake (tests/test_firewall_containment_ceremony.py); the live apply/release round
-trip needs a UAT stack on a local host and has not been run on every OS.
+trip needs a UAT stack on a local host and has not been run live on any OS yet.
 """
 from __future__ import annotations
 
@@ -151,13 +156,26 @@ def release_and_confirm(client: Client, agent_id: str) -> bool:
         return False
 
 
+def dashboard_reachable_while_contained(dashboard: str, exceptions: str) -> bool:
+    """The release is dispatched through the dashboard from this host: it must be this host or an allowed
+    entry, or the contained host could not reach it."""
+    host = (urllib.parse.urlparse(dashboard).hostname or "").lower()
+    if host in ("localhost", "::1") or host.startswith("127."):
+        return True
+    allowed = {e.strip().rsplit(":", 1)[0].strip("[]").lower() for e in re.split(r"[,\s]+", exceptions) if e.strip()}
+    return host in allowed
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--dashboard", required=True)
     p.add_argument("--user", default="admin")
-    p.add_argument("--password", default="")
+    p.add_argument("--password", default=os.environ.get("YUZU_PASSWORD", ""),
+                   help="dashboard password (default: $YUZU_PASSWORD; an argv value is visible in the process list)")
     p.add_argument("--agent-id", default="")
     p.add_argument("--exceptions", default="127.0.0.1", help="allow-set entries for the containment step")
+    p.add_argument("--probe-target", default="", help="ip:port the plugin probes before/after the apply; without it the status reads active_unproven")
+    p.add_argument("--ttl-seconds", type=int, default=300, help="dead-man time limit on the containment (0 = none; the plugin's minimum is 60)")
     p.add_argument("--apply-containment", action="store_true", help="really contain and release (guarded)")
     p.add_argument("--i-have-console-access", action="store_true", help="allow --apply-containment from an SSH session")
     return p.parse_args(argv)
@@ -168,6 +186,10 @@ def main(argv=None) -> int:
     why = refusal(args)
     if why:
         print(f"refused: {why}", file=sys.stderr)
+        return EXIT_PRECONDITION
+    if args.apply_containment and not dashboard_reachable_while_contained(args.dashboard, args.exceptions):
+        print("refused: the dashboard host is neither loopback nor in --exceptions, so the release could not "
+              "reach it while contained", file=sys.stderr)
         return EXIT_PRECONDITION
     rc, last = install_check()
     if rc != 0:
@@ -206,9 +228,17 @@ def main(argv=None) -> int:
         err = None
         with _signals(lambda signum, _frame: got.append(signum), (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
             try:
-                dispatch(client, agent_id, "quarantine", {"exceptions": args.exceptions})
+                params = {"exceptions": args.exceptions}
+                if args.ttl_seconds > 0:
+                    params["ttl_seconds"] = args.ttl_seconds
+                if args.probe_target:
+                    params["probe_target"] = args.probe_target
+                dispatch(client, agent_id, "quarantine", params)
                 time.sleep(2)
-                ok = status_token(client, agent_id) == "active"
+                token = status_token(client, agent_id)
+                ok = token == "active" or (token == "active_unproven" and not args.probe_target)
+                if token == "active_unproven" and ok:
+                    print("note: contained but unproven (no --probe-target); pass one to require a verified containment")
                 print(f"contained: {ok}")
             except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure
                 err = e

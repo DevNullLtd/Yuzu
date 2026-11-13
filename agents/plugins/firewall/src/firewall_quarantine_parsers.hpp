@@ -2428,7 +2428,10 @@ struct IptablesListing {
         return builtin < first_target.size() && ipt_chain_gen(first_target[builtin]).has_value();
     }
     /// The first rule of the built-in chain jumps to one of our chains AND that chain
-    /// still holds the terminal DROP: the only state that denies anything.
+    /// still ends in the DROP: the only state that denies anything we can read. It does not
+    /// prove that nothing ahead of the DROP accepts: a root-written ACCEPT inserted before
+    /// it, or a conditional first rule, still reads enforcing (the pf leg documents the same
+    /// limit for a `pass quick` ahead of its anchor).
     [[nodiscard]] bool first_is_ours_and_denies(std::size_t builtin) const {
         return first_is_ours(builtin) &&
                std::find(dropping.begin(), dropping.end(), first_target[builtin]) != dropping.end();
