@@ -686,6 +686,8 @@ MUST route every event through `execution_event_scope.hpp`'s
 the bus directly without this call leaks agent-transition and progress events to an out-of-scope
 subscriber.
 
+**Limit (b): withheld-event counts are inferable.** Bus ids are per-execution counters (one per event, for all agents) sent raw, so a confined subscriber can infer how many events were withheld from gaps in the ids, the sanitized terminal frame's id and the replay-gap `missing_to`; no content or attribution leaks. A dense per-connection id would break `Last-Event-ID` resume; an opaque resumable cursor is tracked as a follow-up.
+
 Both call sites are pinned by source-tripwire tests
 (`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
 **A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
