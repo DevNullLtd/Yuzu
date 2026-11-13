@@ -147,7 +147,7 @@ jobs:
       # epoch guard and increment). Also registered in tests/meson.build for local
       # `meson test --suite docs` parity.
       - name: Session account gate wiring (#7223)
-        run: python3 tests/test_session_account_gate_wiring.py
+        run: python3 -I tests/test_session_account_gate_wiring.py
 
       # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
       # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
