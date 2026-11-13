@@ -399,7 +399,9 @@ any replica that misses its cache, including this one after a restart, will
 rebuild those sessions from them. Retry the revoke once the database is
 healthy. A session whose local account is inactive or deleted is refused at
 validation regardless, so a surviving row of a deactivated account does not
-serve (see `docs/auth-architecture.md`, "Account state at session validation").
+serve once each replica's generation poll has run (about one second on a healthy
+poll, at most about 30 seconds while a replica's poll fails; see
+`docs/auth-architecture.md`, "Account state at session validation").
 
 API tokens are a separate credential class. The admin `?username=` call does
 **not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
@@ -682,7 +684,7 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
     GROUP BY 1;"
 ```
 
-These rows are refused at validation (see `docs/auth-architecture.md`, "Account state at session validation") and the reaper removes them at expiry, or you can remove them at once with `DELETE /api/v1/sessions?username=<name>`. The query matches local sessions of accounts that still have an `auth.users` row; a hard-deleted account has none. Run it, and end those sessions, before returning to an earlier build, which does not refuse them (see `docs/user-manual/upgrading.md`, "Rollback").
+These rows are refused at validation once each replica's generation poll has run (about one second on a healthy poll, at most about 30 seconds while a replica's poll fails; see `docs/auth-architecture.md`, "Account state at session validation") and the reaper removes them at expiry, or you can remove them at once with `DELETE /api/v1/sessions?username=<name>`. The query matches local sessions of accounts that still have an `auth.users` row; a hard-deleted account has none. Returning to an earlier build is not supported, and an earlier build does not refuse these rows; if it happens regardless, run the query and end those sessions first (see `docs/user-manual/upgrading.md`, "Rollback").
 
 ## Emergency MFA disable (break-glass)
 
