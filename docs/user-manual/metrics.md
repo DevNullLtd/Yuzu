@@ -694,8 +694,9 @@ deprovision-time tripwire can each attribute.
 ### Durable session-store metrics (HA WS-1/1a, ADR-2002 §4)
 
 Operator sessions are durable Postgres rows (`SessionStore`), authored and
-adjudicated against the DB clock (Postgres `now()`, #3715). All four families are
-pre-seeded to 0 at boot so `increase()` alerting is meaningful.
+adjudicated against the DB clock (Postgres `now()`, #3715). The session-store families
+(`store_degrade`, `account_inactive`, `unknown_source`, `reap`, `reap_clock_anomaly` and
+`local_clock_backward`) are pre-seeded to 0 at boot so `increase()` alerting is meaningful.
 
 | Metric | Type | Meaning |
 |---|---|---|

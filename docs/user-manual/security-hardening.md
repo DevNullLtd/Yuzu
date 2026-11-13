@@ -472,6 +472,9 @@ Five classes that used to appear on this list no longer belong on it:
     the check.
   - The refusal writes no audit row. The evidence is the deactivation's audit
     row plus the aggregate counter `yuzu_auth_session_account_inactive_total`.
+  - A deactivation can now fail with `503`, leaving the account active, when
+    its session write-generation write cannot complete (see
+    [Auth database recovery](../ops-runbooks/auth-db-recovery.md#scim--dashboard-deprovision-returns-500-sessions_db_error)).
 
   Details: `docs/auth-architecture.md`, "Account state at session validation".
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
