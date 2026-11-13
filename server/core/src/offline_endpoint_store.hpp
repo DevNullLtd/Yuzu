@@ -226,8 +226,9 @@ public:
                 std::string_view session_id = {});
 
     /// Caps on one published plugin list (an agent reports its own list, so bound it before it is
-    /// persisted): at most this many names, each at most this many bytes. Extra or over-long
-    /// names are dropped; an empty result publishes nothing.
+    /// persisted): at most this many names, each non-empty and at most this many bytes. A list
+    /// outside them is NOT stored in part (a missing name would read as absent): it publishes
+    /// nothing and the agent reads as unknown.
     static constexpr std::size_t kMaxPublishedPlugins = 256;
     static constexpr std::size_t kMaxPluginNameBytes = 64;
 

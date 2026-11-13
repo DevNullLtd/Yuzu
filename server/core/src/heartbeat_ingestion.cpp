@@ -26,6 +26,15 @@ namespace {
 /// replica holds no session for. The heartbeat upserting this row has just run, so a row older
 /// than this belongs to an agent that has gone quiet and whose platform this path should not vouch for.
 constexpr std::chrono::hours kPresenceOsFallbackWindow{1};
+
+/// After a failed `publish_plugins` a session does not try again for this long.
+constexpr std::int64_t kPublishPluginsRetryBackoffMs = 60'000;
+
+std::int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 } // namespace
 
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
@@ -74,7 +83,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
             agent_version = sess->agent_version;
             arch = sess->arch;
             if (!sess->presence_plugins_published.load(std::memory_order_relaxed) &&
-                !sess->plugin_names.empty()) {
+                !sess->plugin_names.empty() &&
+                steady_now_ms() >=
+                    sess->presence_plugins_retry_after_ms.load(std::memory_order_relaxed)) {
                 plugin_names = sess->plugin_names;
                 published_sess = std::move(sess);
             }
@@ -106,9 +117,18 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // The list goes to its own row (it is written once per session, never on the hot row) and
         // only for the session that reported it. The flag is set after a SUCCESSFUL write only, so
         // a failure retries on the next heartbeat.
+        // Only for the CURRENT session: a late heartbeat for an older session must not store the
+        // new session's list under the old id (and mark it published, so it is never republished).
+        // A failed write backs off (no per-heartbeat database round trip while the store is
+        // unhealthy or the list is unpublishable); a mismatch costs nothing and tries again.
         if (upserted && published_sess && !session_id.empty() &&
-            offline_store_->publish_plugins(agent_id_str, session_id, plugin_names))
-            published_sess->presence_plugins_published.store(true, std::memory_order_relaxed);
+            registry_.session_is(agent_id_str, session_id)) {
+            if (offline_store_->publish_plugins(agent_id_str, session_id, plugin_names))
+                published_sess->presence_plugins_published.store(true, std::memory_order_relaxed);
+            else
+                published_sess->presence_plugins_retry_after_ms.store(
+                    steady_now_ms() + kPublishPluginsRetryBackoffMs, std::memory_order_relaxed);
+        }
         if (presence_batch) {
             if (upserted) {
                 presence_batch->store_failed = false;

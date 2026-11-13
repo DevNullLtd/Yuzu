@@ -555,22 +555,82 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
         r2.configure_presence_plugin_reader(
             [&](std::chrono::seconds, std::string_view)
                 -> std::expected<std::vector<std::string>, PresenceReadError> {
-                ++calls;
-                while (!release.load())
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                // Only the FIRST read may block: a second one (single-flight broken) returns at
+                // once, so the assertions below FAIL instead of the test hanging.
+                if (++calls == 1)
+                    while (!release.load())
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 return std::vector<std::string>{"yuzu_test_pm_lacks"};
             });
         std::thread refresher([&] { (void)r2.ids_missing_plugin("echo", "sql"); });
-        while (calls.load() == 0)
+        const auto started = std::chrono::steady_clock::now();
+        while (calls.load() == 0 && std::chrono::steady_clock::now() - started <
+                                        std::chrono::seconds(10))
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        REQUIRE(calls.load() == 1);
         // While the one refresh is in flight, other callers neither wait for it nor start a
-        // second read: with no stale entry they fail open, and live_presence() is not blocked.
+        // second read: with no stale entry they fail open, and live presence is not blocked.
         CHECK(r2.ids_missing_plugin("echo", "sql").empty());
-        CHECK(r2.all_ids().size() >= 0);
+        CHECK(r2.all_ids().size() == 3); // the three presence rows: not blocked by the read
+        CHECK(calls.load() == 1);
         release = true;
         refresher.join();
         CHECK(calls.load() == 1);
+        CHECK(r2.ids_missing_plugin("echo", "sql") ==
+              std::unordered_set<std::string>{"yuzu_test_pm_lacks"}); // the refresh landed
     }
+
+    SECTION("a single replica never pays the read: presence holds nothing beyond local sessions") {
+        std::atomic<int> calls{0};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                ++calls;
+                return std::vector<std::string>{"x"};
+            });
+        // This replica holds a session for every one of the three presence rows.
+        for (const char* id : {"yuzu_test_pm_lacks", "yuzu_test_pm_has", "yuzu_test_pm_unknown"})
+            (void)r2.register_agent(make_agent_info(id, "linux", "h"));
+        r2.expire_presence_cache_for_test();
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+        CHECK(calls.load() == 0);
+        // A fourth presence row this replica holds no session for: the read is now worth it.
+        REQUIRE(store.upsert("yuzu_test_pm_remote", "h", "linux", 1, 0, "1", "x", "s9"));
+        r2.expire_presence_cache_for_test();
+        CHECK(r2.ids_missing_plugin("echo", "sql") == std::unordered_set<std::string>{"x"});
+        CHECK(calls.load() == 1);
+    }
+}
+
+// A held `stream_mu` means a send to that session is in flight: it must read as HAVING a path and
+// the dispatch gate must not block behind it.
+TEST_CASE("no-delivery-path predicates never block behind a held stream_mu",
+          "[server][dispatch][ha]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_agent_info("yuzu_test_trylock", "linux", "h"));
+    REQUIRE(registry.lacks_local_delivery_path("yuzu_test_trylock")); // no path while unlocked
+    auto sess = registry.get_session("yuzu_test_trylock");
+    REQUIRE(sess != nullptr);
+
+    std::atomic<bool> locked{false};
+    std::atomic<bool> done{false};
+    std::thread holder([&] {
+        std::lock_guard lock(sess->stream_mu);
+        locked = true;
+        while (!done.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    });
+    while (!locked.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Returns immediately (never blocks) and reports "has a path" while the lock is held.
+    CHECK_FALSE(registry.lacks_local_delivery_path("yuzu_test_trylock"));
+    CHECK_FALSE(registry.needs_directory_consult("yuzu_test_trylock"));
+    CHECK_FALSE(registry.has_remote_presence({"yuzu_test_trylock"}));
+    done = true;
+    holder.join();
+    CHECK(registry.lacks_local_delivery_path("yuzu_test_trylock")); // back to no path
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

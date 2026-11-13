@@ -1386,16 +1386,34 @@ TEST_CASE("OfflineEndpointStore plugin lists (session-keyed and served only for 
         CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"}); // unchanged
     }
 
-    SECTION("a list is capped at kMaxPublishedPlugins names") {
+    SECTION("a list the caps would cut is NOT stored in part: the agent reads as unknown") {
+        // A name left out of a stored partial list would read as ABSENT, and a replica would answer
+        // plugin_not_found for a plugin the agent has. So an over-cap or invalid list publishes
+        // nothing at all.
         std::vector<std::string> many;
         for (std::size_t n = 0; n < OfflineEndpointStore::kMaxPublishedPlugins + 40; ++n)
             many.push_back("p" + std::to_string(n));
         REQUIRE(store.upsert("yuzu_test_pv_many", "h", "linux", 1, 0, "1", "x", "s6"));
+        const auto listed = [&](std::string_view plugin) {
+            const auto ids = without(plugin);
+            return std::ranges::find(ids, "yuzu_test_pv_many") != ids.end();
+        };
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_many", "s6", many));
+        CHECK_FALSE(listed("p299")); // a stored partial list would LIST the agent here
+        CHECK_FALSE(listed("p0"));
+
+        // Exactly at the cap is stored whole: p255 present, p256 (never in the list) absent.
+        many.resize(OfflineEndpointStore::kMaxPublishedPlugins);
         REQUIRE(store.publish_plugins("yuzu_test_pv_many", "s6", many));
-        const auto kept = without("p0");     // inside the cap: present
-        const auto dropped = without("p299"); // past it: dropped, so it reads as absent
-        CHECK(std::ranges::find(kept, "yuzu_test_pv_many") == kept.end());
-        CHECK(std::ranges::find(dropped, "yuzu_test_pv_many") != dropped.end());
+        CHECK_FALSE(listed("p255"));
+        CHECK(listed("p256"));
+
+        // One bad name among good ones: nothing is stored (the cap-sized list above stays).
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_many", "s6", {"os_info", "", "echo"}));
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_many", "s6",
+                                          {"os_info", std::string(65, 'x')}));
+        CHECK_FALSE(listed("p255")); // unchanged
+        CHECK(listed("echo"));       // still the cap-sized list, which has no echo
     }
 
     SECTION("deleting the endpoint (decommission, retention) cascades to its list") {

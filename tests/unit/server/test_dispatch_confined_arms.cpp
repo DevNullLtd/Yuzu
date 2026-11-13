@@ -29,6 +29,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <map>
 #include <optional>
 #include <string>
@@ -1388,7 +1389,7 @@ TEST_CASE("a direct agent with a live stream is NOT treated as having no deliver
     (void)registry.register_agent(make_wiring_test_info("dev-direct"));
     auto sess = registry.get_session("dev-direct");
     REQUIRE(sess != nullptr);
-    char stream_stand_in = 0; // never dereferenced: these predicates only null-check the pointer
+    alignas(std::max_align_t) char stream_stand_in = 0; // never dereferenced: only null-checked
     {
         std::lock_guard lock(sess->stream_mu);
         sess->stream = reinterpret_cast<decltype(sess->stream)>(&stream_stand_in);

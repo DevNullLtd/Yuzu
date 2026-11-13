@@ -945,7 +945,11 @@ groups:
       # threshold needs fleet data (the #913 lesson above). NOT covered by
       # YuzuGatewayRouteWriteFailed: presence-store failures
       # (yuzu_server_agent_presence_store_failed_total{op="upsert"}) have no
-      # rule, and a presence upsert gives up at 250 ms against 500 ms for the
+      # rule (nor do the plugin-capability ops, query_without_plugin and
+      # publish_plugins: a failure there fails the plugin withhold OPEN, and a
+      # sustained reason="truncated" on query_without_plugin means more than
+      # 100000 live agents lack the plugin and the cross-replica withhold is off
+      # for it), and a presence upsert gives up at 250 ms against 500 ms for the
       # route-directory ops, so milder pool saturation or a presence-only
       # db_error degrades batches without moving that rule. YuzuPgPoolSaturated
       # and YuzuPgAcquireWaitHigh are the covering pool-level signals. A

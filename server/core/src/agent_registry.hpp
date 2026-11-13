@@ -461,7 +461,7 @@ struct PluginMeta {
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
 // comment) and the atomics last_activity_epoch_ms and
-// presence_plugins_published (written by HeartbeatIngestion). `session_id` is ALSO
+// presence_plugins_published and presence_plugins_retry_after_ms (written by HeartbeatIngestion). `session_id` is ALSO
 // rewritten in place after publication, by AgentRegistry::map_session under
 // AgentRegistry::mu_ (an exception to the identity-field rule above): read
 // it only through session_is()/session_id_of(), never through a
@@ -527,6 +527,9 @@ struct AgentSession {
     /// (a successful `OfflineEndpointStore::upsert` that carried them), so later heartbeats skip
     /// re-sending a list that only changes at re-registration (a new session starts false).
     std::atomic<bool> presence_plugins_published{false};
+    /// steady_clock ms before which a failed publish is not retried (a backoff, so an unhealthy
+    /// store or an unpublishable list costs no database round trip per heartbeat).
+    std::atomic<std::int64_t> presence_plugins_retry_after_ms{0};
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
     // Atomic to avoid acquiring the registry mutex on every stream Read.
@@ -1007,8 +1010,10 @@ public:
     /// such an id to the directory can change no outcome that used to succeed:
     /// a direct agent has a stream, a gateway agent has a `gateway_node`. False
     /// for an unknown id (that is a plain local miss, handled by the caller).
-    /// Takes `mu_` only to copy the session pointer, then `stream_mu`, never
-    /// both at once (the order `send_to` itself uses).
+    /// Takes `mu_` only to copy the session pointer, then only TRY-locks
+    /// `stream_mu` (never both at once): a held `stream_mu` means a send to the
+    /// session is in flight, so it is reported as HAVING a path. A stalled
+    /// stream write therefore cannot stall a caller of this.
     [[nodiscard]] bool lacks_local_delivery_path(const std::string& agent_id) const;
 
     /// What `GatewayRouteFallback::prepare` asks per candidate, in ONE registry lookup: true when
@@ -1321,6 +1326,9 @@ private:
         MissingPluginIds ids;
     };
     static constexpr std::size_t kMissingPluginCacheMax = 64;
+    /// A refresh in flight lets other callers serve the previous entry only while it is this
+    /// recent; an older one fails open instead.
+    static constexpr std::chrono::seconds kMaxStaleServe{30};
     mutable std::mutex missing_plugin_mu_;
     PluginMissingReadFn presence_missing_plugin_reader_;
     std::chrono::seconds missing_plugin_ttl_{};
@@ -1339,6 +1347,12 @@ private:
     /// Cached cross-replica "live ids lacking `plugin`" read; null when no reader is wired or the
     /// read degraded (callers fail open). Takes only `missing_plugin_mu_`, never across the read.
     MissingPluginIds missing_plugin_from_presence(std::string_view plugin) const;
+
+    /// Row count of the cached live-presence set (refreshing it like `live_presence()` does, but
+    /// without copying it out); 0 when presence is not wired, nullopt on a degraded read.
+    std::optional<std::size_t> presence_row_count() const;
+    /// Refreshes `presence_cache_` when stale. Caller holds `presence_cache_mu_`.
+    void refresh_presence_cache_locked() const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl
     // considers. `LocalOnly` skips the live_presence() call AND the

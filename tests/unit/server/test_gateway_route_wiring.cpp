@@ -3004,6 +3004,8 @@ TEST_CASE("WS-5 BatchHeartbeat: a session the local map and the directory attrib
     CHECK(listed_unknown(resp) == std::vector<std::string>{sid}); // listed so the gateway replays
     CHECK(owner.desync("session_lookup", "agent_mismatch") == 1);
     CHECK(owner.desync("session_lookup", "ambiguous_session") == 0);
+    // Listed for replay, but not ALSO counted as a session the cluster has no record of.
+    CHECK(owner.desync("renew_leases", "unknown_session") == 0);
     // The harm was attribution: neither agent's row is touched by the refused heartbeat.
     const auto row = owner.store.lookup_route("yuzu_test_6339_row");
     REQUIRE(row.has_value());

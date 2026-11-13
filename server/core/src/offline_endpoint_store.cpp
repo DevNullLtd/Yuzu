@@ -364,26 +364,27 @@ bool OfflineEndpointStore::publish_plugins(std::string_view agent_id, std::strin
                                            const std::vector<std::string>& plugin_names) {
     if (!open_ || agent_id.empty() || session_id.empty() || plugin_names.empty())
         return false;
+    // Validate BEFORE taking a pool lease, and publish only a COMPLETE list. An agent reports its
+    // own list, so bound it; but a list that had to be cut (too many names, an empty or over-long
+    // name) is NOT stored in part, because a name left out would read as ABSENT and a replica
+    // would then answer plugin_not_found for a plugin the agent has. No list means unknown, which
+    // fails open. Names are quoted by the shared builder, so any text is inert.
+    if (plugin_names.size() > kMaxPublishedPlugins)
+        return false;
+    std::vector<std::string_view> names;
+    names.reserve(plugin_names.size());
+    for (const auto& n : plugin_names) {
+        if (n.empty() || n.size() > kMaxPluginNameBytes)
+            return false;
+        names.emplace_back(n);
+    }
     auto lease = pool_.try_acquire_for(kUpsertAcquireTimeout);
     if (!lease) {
         record_presence_store_failure(metrics_, "publish_plugins", /*had_lease=*/false);
         return false;
     }
-    // Bounded and quoted: an agent reports its own list, so cap the count and the element size
-    // before it reaches the database, and let the shared builder quote every element (a name of
-    // `NULL`, a brace or a quote is then stored as plain text, never parsed as array syntax).
-    std::vector<std::string_view> names;
-    names.reserve(std::min(plugin_names.size(), kMaxPublishedPlugins));
-    for (const auto& n : plugin_names) {
-        if (names.size() >= kMaxPublishedPlugins)
-            break;
-        if (!n.empty() && n.size() <= kMaxPluginNameBytes)
-            names.emplace_back(n);
-    }
-    if (names.empty())
-        return false;
     // The FK needs the endpoints row, which the heartbeat's upsert wrote just before; a missing
-    // row (a delete racing this call) makes the INSERT fail and the caller retries next heartbeat.
+    // row (a delete racing this call) makes the INSERT fail and the caller backs off and retries.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO endpoint_state.endpoint_plugins (agent_id, session_id, plugin_names) "
@@ -649,11 +650,19 @@ void OfflineEndpointStore::set_metrics(yuzu::MetricsRegistry* m) {
     m->counter(kRosterTruncatedMetric); // pre-seed at 0 so the series exists before the first cap hit
     // The per-device point read's two failure series, pre-seeded so the first failure is an
     // increase from 0 that increase() sees, not a series born at 1 (docs/observability-conventions.md,
-    // bounded-label counters). The other `op` values of this family are not seeded here: that is the
-    // existing shape of the family and is not widened by this change.
+    // bounded-label counters). The older `op` values of this family are not seeded here: that is the
+    // existing shape of the family. The plugin-capability ops (#5685 follow-up) are seeded, since a
+    // sustained `truncated` on `query_without_plugin` is the only sign the cross-replica withhold
+    // has switched itself off.
     for (const char* reason : {"store_unavailable", "db_error"})
         m->counter("yuzu_server_agent_presence_store_failed_total",
                    {{"op", "find_within"}, {"reason", reason}});
+    for (const char* op : {"query_without_plugin", "publish_plugins"})
+        for (const char* reason : {"store_unavailable", "db_error"})
+            m->counter("yuzu_server_agent_presence_store_failed_total",
+                       {{"op", op}, {"reason", reason}});
+    m->counter("yuzu_server_agent_presence_store_failed_total",
+               {{"op", "query_without_plugin"}, {"reason", "truncated"}});
 }
 
 std::expected<FleetStateCounts, PresenceReadError>

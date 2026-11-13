@@ -373,8 +373,10 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "row (the unique session index refused the fallback insert); the placement is "
             "unpublished and the same alert covers it. "
             "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
-            "because the directory read degraded and this replica holds no matching local "
-            "session (the agent recovers by reconnecting). HA WS-5 lookups: "
+            "because the directory read degraded, whatever session this replica holds locally "
+            "(a gateway with the NOTIFY-ACK change resends it and it is accepted once the "
+            "directory reads; an older gateway leaves the agent undispatchable until it "
+            "reconnects). HA WS-5 lookups: "
             "op=\"session_lookup\" outcome=\"ambiguous_session\" means one presented "
             "session_id matched more than one directory row (never trusted; expected zero), "
             "and outcome=\"unknown_session\" under op=\"renew_leases\" or "
@@ -1534,6 +1536,12 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 // Cannot tell (directory degraded) or refused (ambiguous):
                 // NOT unknown. Listing it would make the gateway re-register
                 // a healthy session — a fleet-wide storm on a Postgres blip.
+            } else if (resolution.agent_mismatch.contains(sid)) {
+                // #6339: refused, and listed so the gateway replays ProxyRegister, but NOT an
+                // unknown session (already counted as session_lookup/agent_mismatch), so it goes
+                // to the replay set and is left out of the renew_leases/unknown_session count.
+                if (sid.size() <= kMaxGatewaySessionIdLen)
+                    replay_ids.insert(sid);
             } else if (sid.size() > kMaxGatewaySessionIdLen) {
                 ++malformed_session_ids; // counted below; never echoed or logged in full
             } else {

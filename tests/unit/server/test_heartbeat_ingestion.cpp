@@ -519,9 +519,17 @@ TEST_CASE("HeartbeatIngestion: the owner publishes the plugin list once per sess
         return info;
     };
     (void)owner.register_agent(make_info({"os_info"}));
+    owner.map_session("sess-1", "yuzu_test_hb_plugins");
     auto sess = owner.get_session("yuzu_test_hb_plugins");
     REQUIRE(sess != nullptr);
     CHECK_FALSE(sess->presence_plugins_published.load());
+
+    // A heartbeat that resolved some OTHER session id must not publish this session's list under
+    // that id (and so must not mark it published): it costs nothing and is retried.
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-stale");
+    CHECK_FALSE(sess->presence_plugins_published.load());
+    CHECK(sess->presence_plugins_retry_after_ms.load() == 0); // not a failure: no backoff
+    CHECK(without("echo").empty());
 
     owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
     CHECK(sess->presence_plugins_published.load()); // set only after the write succeeded
@@ -540,6 +548,7 @@ TEST_CASE("HeartbeatIngestion: the owner publishes the plugin list once per sess
 
     // A re-registration is a NEW session object with a changed list: it republishes.
     (void)owner.register_agent(make_info({"os_info", "echo"}));
+    owner.map_session("sess-2", "yuzu_test_hb_plugins");
     auto sess2 = owner.get_session("yuzu_test_hb_plugins");
     REQUIRE(sess2 != nullptr);
     REQUIRE(sess2 != sess);
@@ -551,14 +560,22 @@ TEST_CASE("HeartbeatIngestion: the owner publishes the plugin list once per sess
 
     // A failed write leaves the flag clear so the next heartbeat retries it.
     (void)owner.register_agent(make_info({"os_info"}));
+    owner.map_session("sess-3", "yuzu_test_hb_plugins");
     auto sess3 = owner.get_session("yuzu_test_hb_plugins");
     REQUIRE(sess3 != nullptr);
     exec_sql_hb(db.dsn(),
                 "ALTER TABLE endpoint_state.endpoint_plugins RENAME TO endpoint_plugins_x");
     owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
     CHECK_FALSE(sess3->presence_plugins_published.load());
+    // A failed write backs off: the next heartbeat does not try again at once, even though the
+    // table is back (no database round trip per heartbeat while the store is unhealthy).
+    CHECK(sess3->presence_plugins_retry_after_ms.load() > 0);
     exec_sql_hb(db.dsn(),
                 "ALTER TABLE endpoint_state.endpoint_plugins_x RENAME TO endpoint_plugins");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
+    CHECK_FALSE(sess3->presence_plugins_published.load()); // still backing off
+    // Once the backoff has passed the next heartbeat publishes.
+    sess3->presence_plugins_retry_after_ms.store(1);
     owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
     CHECK(sess3->presence_plugins_published.load());
 }

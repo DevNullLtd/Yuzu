@@ -499,7 +499,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     //
     // COST, ACCEPTED: `ids_missing_plugin` is one locked O(fleet) pass over
     // `agents_` regardless of arm size, so a single-Ids dispatch to one
-    // device pays the same registry walk a fleet broadcast does. Same shape
+    // device pays the same registry walk a fleet broadcast does. It can also
+    // trigger the cached (3 s), single-flight cross-replica plugin read, but
+    // only when the durable presence holds rows beyond this replica's own
+    // sessions, so a single replica never pays that database read. Same shape
     // and same trade as `gate`'s own containment-store read immediately
     // above -- see `make_containment_gate`'s comment for the equivalent
     // "share the one read across arms rather than skip it for small

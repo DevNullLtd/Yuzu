@@ -2219,7 +2219,7 @@ degraded `lookup_route` is refused (`acknowledged=false`,
 `notify_stream_status/connected_unverified`), whatever this replica's local state says; the same WS-4
 4.4 F1 principle as the `ProxyRegister` decide path — never admit what nothing has verified. Since
 #5695 the gateway keeps a refused CONNECTED and sends it again (decorrelated jitter, first resend 1 to
-3 s after the refusal, at most 60 s apart, no time limit while it holds the session) and treats
+3 s after the refusal, at most 60 s apart for the first 15 minutes of refusals and then about 10 minutes apart, no time limit while it holds the session) and treats
 `connected_unverified` as transient, so a refusal means "placement is delayed until the directory
 reads again", not "lost until the agent reconnects". `yuzu_gw_upstream_notify_dropped_total` does NOT
 count it, so the server-side `connected_unverified` counter is the signal; a refused session stays
@@ -2335,7 +2335,9 @@ guardian heartbeat reconcile on a non-owning replica is NOT done: its push needs
 reports `no_session`, and #5685 stays open for it. (c) *#6339.* `resolve_sessions` refuses a session id whose
 local map and directory row name different agents (`session_lookup/agent_mismatch`) and lists it as unknown,
 so the gateway replays `ProxyRegister` and the register path decides who holds it (the agent that is not the
-row's holder is refused `held_by_other_agent`); the no-row `announce_connected` probe is not added.
+row's holder is refused `held_by_other_agent`); the no-row `announce_connected` probe is not added. This
+narrows the BatchHeartbeat and ProxyInventory attribution only: the tombstoned-victim CONNECTED window of
+the 2026-10-22 update is unchanged.
 (d) *Plugin-capability visibility (§7a presence, extended in place).* Migration v5 of `OfflineEndpointStore`
 adds a side table `endpoint_plugins(agent_id PK REFERENCES endpoints ON DELETE CASCADE, session_id,
 plugin_names text[])`, written once per session by the owning replica's heartbeat after its upsert. A side table,
@@ -2344,7 +2346,30 @@ session equalling the endpoint's current session, so a list from an older sessio
 one (it reads as unknown). `AgentRegistry::ids_missing_plugin` merges the live ids whose published list lacks
 the plugin (per-plugin result cached for the presence TTL, one refresher per plugin, no registry lock held
 across the database read). Local wins; an agent with no list, a degraded or truncated read, and every protective
-action fail open or stay exempt. Not measured: the query cost at fleet scale, and the one extra write per session.
+action fail open or stay exempt. The read is skipped altogether unless the durable presence holds more rows than
+this replica has sessions, so a single replica never pays it; a caller that arrives while a refresh is in flight
+is served a previous entry only if it is under 30 s old (else it fails open); a list the caps would cut (over 256
+names, an empty or over-64-byte name) is not stored in part, because a missing name would read as absent; the
+heartbeat publishes only for the registry's current session and backs off 60 s after a failed write. Limits, not
+closed: an agent that restarts with a changed plugin set can be judged by its OLD list on another replica until
+the first heartbeat of its new session (about one heartbeat plus the 3 s cache, a false `plugin_not_found` that
+self-heals); if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
+not republished until the agent re-registers, so visibility fails open; sustained `truncated` on
+`query_without_plugin` (above 100,000 live agents) switches the cross-replica withhold off with no alert; while
+every session lacks a delivery path (after a directory outage) an unfiltered broadcast takes the per-id path with
+one batched directory read per dispatch, and a no-path session whose directory row is stale can be reported
+queued although it never reaches the agent (the same shape as spike finding 10). Not measured: the query cost at
+fleet scale, and the one extra write per session.
+(e) *Slice 13.7 (#7062).* The server's gateway management channel sends a keepalive ping every 30 s with a 10 s
+timeout, also while idle, so a node that stops answering without closing the connection is found in about 40 s
+(from the code, the cowboy listener having no minimum ping interval, and a unit test through the `channel_via`
+seam; the final call into `grpc::CreateCustomChannel` is by inspection and detection is not measured against a
+real silent-drop fault). A forward that fails UNAVAILABLE is retried up to 3 times with the same command id, so a
+drop after the gateway accepted a command can send it again; the agent's dedup store makes that effectively-once.
+The decision recorded with it (the manual and #7062): one name in front of every gateway node (TCP pass-through,
+a certificate SAN for that name, the same management peer settings on each node) is the shape the spike
+exercised; a multi-address DNS name was not tried; an address-list syntax is deferred; the server has no second
+address or failover of its own. 13.7 is not claimed closed for the gate.
 The safe-to-scale gate is NOT lifted.
 
 **Update (2026-10-22, #5683): UNIQUE partial index on `agent_routes(session_id)`.** Migration v5 of
