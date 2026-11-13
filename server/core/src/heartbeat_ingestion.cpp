@@ -19,6 +19,14 @@
 
 namespace yuzu::server {
 
+namespace {
+/// #5685 hp-2: how recent a presence row must be to supply the snapshot `os` of an agent this
+/// replica holds no session for. The heartbeat upserting this row has just run, so a row older
+/// than this belongs to an agent that has gone quiet and whose platform this path should not vouch for.
+constexpr std::chrono::hours kPresenceOsFallbackWindow{1};
+} // namespace
+
+
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                                 std::string_view agent_id, std::string_view via,
                                 std::string_view resolved_session_id,
@@ -180,6 +188,18 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string os_from_session;
         if (auto sess = registry_.get_session(agent_id_str))
             os_from_session = sess->os;
+        // HA WS-5 #5685 hp-2: a replica that sees only this agent's NON-OWNER heartbeats holds
+        // no session for it, so the snapshot's `os` was blank. Fall back to the durable presence
+        // row (a primary-key read, never a roster scan). Local wins, and an empty answer or a
+        // failed read stays blank (unknown), which is what this path produced before: a
+        // blank `os` never invents a platform. Skipped while the batch's presence store is
+        // tripped (#5686) so a degraded store is not read once per snapshot heartbeat.
+        if (os_from_session.empty() && offline_store_ &&
+            !(presence_batch && presence_batch->store_failed)) {
+            if (auto ep = offline_store_->find_within(agent_id_str, kPresenceOsFallbackWindow);
+                ep && *ep)
+                os_from_session = (*ep)->os;
+        }
         std::string parse_err;
         auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(
             hb.fleet_snapshot_json(), agent_id_str, os_from_session, &parse_err);

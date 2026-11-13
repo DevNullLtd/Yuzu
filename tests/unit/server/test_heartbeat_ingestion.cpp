@@ -13,6 +13,7 @@
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
+#include "fleet_topology_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
 
@@ -30,6 +31,7 @@
 #include <chrono>
 #include <cstdint>
 #include <latch>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -409,6 +411,55 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence r
     // no longer matches, the resolved one does (and the clear is consumed).
     CHECK_FALSE(store.remove_if_session("yuzu_test_hb_nonowner", "sess-owner"));
     CHECK(store.remove_if_session("yuzu_test_hb_nonowner", "sess-resolved"));
+}
+
+// #5685 hp-2: a replica with no session for an agent (it sees only that agent's non-owner
+// heartbeats) used to push a fleet snapshot with a blank `os`.
+TEST_CASE("HeartbeatIngestion: a fleet snapshot with no local session takes its os from the "
+          "presence row; with no row it stays blank (#5685 hp-2)",
+          "[heartbeat_ingestion][ws5][pg][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+
+    nlohmann::json snap;
+    snap["schema"] = "fleet_snapshot.v1";
+    snap["ts"] = 1;
+    snap["hostname"] = "snap-host";
+    snap["local_ips"] = nlohmann::json::array();
+    snap["processes"] = nlohmann::json::array();
+    snap["connections"] = nlohmann::json::array();
+
+    // One topology store per case: it caches its first get() for 60 s.
+    const auto pushed_os = [&](const std::string& id) -> std::optional<std::string> {
+        yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
+            return std::vector<yuzu::server::RawAgentSnapshot>{};
+        }};
+        HeartbeatIngestion ingestion{registry, nullptr, &topo, &metrics, &store};
+        ::yuzu::agent::v1::HeartbeatRequest hb;
+        hb.set_fleet_snapshot_json(snap.dump());
+        ingestion.ingest(hb, id, "gateway", "sess-resolved");
+        auto t = topo.get(false);
+        REQUIRE(t != nullptr);
+        for (const auto& m : t->machines)
+            if (m.agent_id == id)
+                return m.os;
+        return std::nullopt;
+    };
+
+    // Seeded by the OWNING replica earlier; this replica holds no session.
+    REQUIRE(store.upsert("yuzu_test_hb_snap_os", "known-host", "linux", 1, 0, "1.0.0", "arm64",
+                         "sess-owner"));
+    CHECK(pushed_os("yuzu_test_hb_snap_os") == std::optional<std::string>{"linux"});
+
+    // No presence row and no session: unknown stays blank, never an invented platform.
+    CHECK(pushed_os("yuzu_test_hb_snap_noos") == std::optional<std::string>{""});
 }
 
 TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's id; blank "
