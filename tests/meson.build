@@ -3596,6 +3596,14 @@ test('changelog promote append',
   suite: 'docs',
   timeout: 60,
 )
+# scripts/whats-new.py: collated "what changed since my last pull" view (version bumps +
+# changelog.d fragments). Builds throwaway git repositories. Stdlib only.
+test('whats-new script',
+  _python3_test,
+  args: [files('test_whats_new.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 test('changelog order',
   _python3_test,
   args: [files('test_changelog_order.py')],

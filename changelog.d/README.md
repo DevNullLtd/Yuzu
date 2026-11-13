@@ -56,23 +56,45 @@ filename.
 ## Reading unreleased changes (following `dev`)
 
 Fragments are only collated into `CHANGELOG.md` at release. To see what a
-`git pull` of `dev` just brought, run this straight after the pull:
+`git pull` of `dev` just brought, run this after the pull:
 
 ```bash
-python3 scripts/whats-new.py                    # since ORIG_HEAD, i.e. before the last pull/merge
-python3 scripts/whats-new.py --since v0.15.0    # since a tag, branch or commit
-python3 scripts/whats-new.py --since "2 weeks ago"
-python3 scripts/whats-new.py --full             # whole bullets, not just their first line
+python3 scripts/whats-new.py                          # since your last pull
+python3 scripts/whats-new.py --since v0.15.0          # since a tag, branch or commit
+python3 scripts/whats-new.py --since "2 weeks ago"    # or YYYY-MM-DD
+python3 scripts/whats-new.py --full                   # whole bullets, every dependency bump
 ```
 
-It prints version bumps first (project version, plugin ABI, vcpkg baseline and
-dependency constraints, gateway packages), then the rebuild-relevant surfaces
-touched, Dependabot bumps (`build(deps)`/`chore(deps)` commits: Docker images
-listed, CI/tooling counted unless `--full`), then the fragments added in the range grouped by section (security,
-removed, deprecated, changed, added, fixed). It is read-only. `ORIG_HEAD` is
-overwritten by `reset` and `rebase`; pass `--since` if that happened. Changes
-that skipped a fragment (rule 3) do not appear; `git log --first-parent` lists
-every merged PR.
+It prints, in this order:
+
+- **Version bumps:** the project version, the plugin ABI, the vcpkg baseline
+  and dependency constraints (including per-feature ones), the gateway
+  packages, and the latest released `CHANGELOG.md` version.
+- **Rebuild / redeploy:** the surfaces the range touched that may need a
+  rebuild (vcpkg, `proto/`, `gateway/`, `sdk/`, deploy and compose files).
+- **Dependency bumps:** commits titled `build(deps):` or `chore(deps):`.
+  Dockerfile and compose bumps are listed; the rest (workflows, pip, npm) are
+  counted, and `--full` lists them.
+- **Changelog entries:** the fragments this range adds, grouped security,
+  removed, deprecated, changed, added, fixed. Each shows its first line, cut at
+  200 characters; security, removed and deprecated entries are never cut, and
+  neither is an entry starting `**Breaking`. A fragment replaced, renamed or
+  withdrawn inside the range is shown once in its final form, or not at all.
+
+"Your last pull" is read from the `HEAD` reflog: the newest `git pull` (or
+`git merge <remote>/<branch>` after a fetch) and the commit you were on before
+it. `checkout`, a local `merge` or `reset` cannot move it later, only earlier.
+A fresh clone has no pull in its reflog, and the reflog is local and expires,
+so pass `--since` then. After `git pull --rebase` the range starts at the
+common ancestor. `--since` with a date picks the newest commit older than it by
+commit date; only `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `yesterday` and `N
+days/weeks/months/years ago` are accepted, because git would read a typo as
+"now".
+
+The script only reads. Text from fragments and commit messages is printed with
+control characters replaced. Changes that skipped a fragment (rule 3) do not
+appear in the entries; `git log --first-parent --oneline <base>..HEAD` lists
+every merged PR, with `<base>` the commit the `Base` line prints.
 
 ## For AI coding agents
 
