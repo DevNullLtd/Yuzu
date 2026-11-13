@@ -686,8 +686,11 @@ TEST_CASE("AuthManager+SessionStore: a LOWER durable generation clears the repli
 // (local, oidc, saml), so the row is refused at validation: no session resolves, every gate
 // answers 401 and the audit class stays at the cookie presentation ("human"). That is the
 // stronger outcome: a stored engine-source row never reaches a gate in either class. The engine
-// branch of each gate is pinned by the synthesized-session tests (test_rbac_enforcement_read.cpp,
-// test_step_up_wiring.cpp). An ordinary human admin is still admitted by the legacy path (or,
+// branch of each gate is pinned by the synthesized-session tests in
+// test_engine_principal_integration.cpp (require_permission, require_scoped_permission,
+// require_list_read, require_fleet_read, make_audit_event) and the engine audit class by
+// test_auth_routes.cpp (the audit_as_session_fn case for an engine-source, human-kind
+// session). An ordinary human admin is still admitted by the legacy path (or,
 // for require_fleet_read, reaches the 503 arm of an unwired store) as the control.
 TEST_CASE("Gates: a restored (engine_token source, human kind) session is refused at validation",
           "[auth_session_store][pg][engine_principal]") {

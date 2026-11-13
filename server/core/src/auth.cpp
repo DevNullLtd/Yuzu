@@ -2203,8 +2203,8 @@ void AuthManager::evict_target_after_indeterminate_write(const std::string& user
     }
     if (!wipe_user_sessions_durable(username))
         spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
-                     "lifecycle write also failed; a durable session may survive until the "
-                     "operation is retried",
+                     "lifecycle write also failed; the durable session row may survive until "
+                     "the operation is retried",
                      username);
 }
 
@@ -2328,9 +2328,13 @@ bool AuthManager::reactivate_user(const std::string& username) {
 
     // Wipe-first: sessions that exist when an account is reactivated are removed, so a
     // session left behind by an earlier deactivation (whose own wipe may not have persisted)
-    // cannot become valid again. A sign-in that completes after the reactivation is a new
-    // sign-in. Local erase, then the durable wipe; if the wipe does not persist the account
-    // stays inactive and the caller retries (invalidate_user is idempotent).
+    // cannot become valid again. A sign-in whose credential check started after the
+    // reactivation is a new sign-in. One residual remains: a login whose first factor was
+    // verified before the deactivation can still mint after the reactivation (reactivation
+    // keeps the password), because the post-mint recheck compares only the role, the credential
+    // hash and the active state, and all three match. Local erase, then the durable wipe; if the
+    // wipe does not persist the account stays inactive and the caller retries (invalidate_user
+    // is idempotent).
     {
         std::unique_lock lock(mu_);
         drop_cached_user_sessions_locked(username);

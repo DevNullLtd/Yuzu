@@ -691,7 +691,8 @@ enum class RemoveUserOutcome : std::uint8_t {
                               ///< can complete it; an IdP retry of a SCIM request is NOT
                               ///< promised to (#5214)
     RemovedSessionWipeFailed, ///< the account IS deactivated (committed) but the durable session
-                              ///< wipe failed, so a live session may survive: a repeated
+                              ///< wipe failed, so the session row may survive (a local
+                              ///< session is refused at validation): a repeated
                               ///< `remove_user_checked` re-runs the wipe (the dashboard DELETE
                               ///< offers that); a SCIM retry is NOT promised to repeat it
                               ///< (#5214)

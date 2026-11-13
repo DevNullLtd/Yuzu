@@ -304,7 +304,8 @@ def main() -> int:
             print(f"  - {f}", file=sys.stderr)
         return 1
     print("OK: session account gate wiring intact (soft-delete literal, owner bump, mode ternary, "
-          "gate position, epoch guard and increment)")
+          "gate position, epoch guard and increment, every targeted erase through the epoch "
+          "helpers)")
     return 0
 
 

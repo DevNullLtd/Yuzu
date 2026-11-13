@@ -88,6 +88,7 @@ class HeldValidation {
 public:
     // Installs the hook on `mgr`. The holder must outlive every validation on `mgr`.
     void install(AuthManager& mgr) {
+        mgr_ = &mgr;
         mgr.set_validate_pre_cache_hook_for_test([this] {
             if (!in_held_thread())
                 return;
@@ -128,6 +129,11 @@ public:
         // terminate the process.
         if (worker_.joinable())
             (void)release_and_join();
+        // Then clear the manager's hook so the lambda's captured `this` cannot dangle if the
+        // manager outlives this holder. Not before the join: the held worker is executing inside
+        // that std::function, and reassigning it under a running call is undefined behaviour.
+        if (mgr_)
+            mgr_->set_validate_pre_cache_hook_for_test(nullptr);
     }
 
 private:
@@ -136,6 +142,7 @@ private:
         return v;
     }
 
+    AuthManager* mgr_ = nullptr;
     std::mutex mu_;
     std::condition_variable cv_;
     bool reached_ = false;
@@ -970,6 +977,9 @@ TEST_CASE("cache epoch: a revoke on the SAME replica drops a validation held acr
     // on its next poll, so without an epoch bump at the targeted erase the held validation would
     // put its session back and a cache hit would serve it. No poll runs between the release and
     // the final validate (the poll interval is 1 s and the steps below take milliseconds).
+    // On a very slow runner a 1 s poll can fire between the release and the final validate; it
+    // clears the cache and would mask a regression here (a false pass), but it can never cause a
+    // failure.
     AcctFx f;
     auto& a = f.add();
     f.seed_world("alice");
