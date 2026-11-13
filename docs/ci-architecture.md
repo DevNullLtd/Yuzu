@@ -697,6 +697,23 @@ runs that suite, "Test suites by leg" below), so the ratchet is enforced on the 
 `Linux gcc-15 debug` leg without depending on the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
 but it cannot touch `content/` or the baseline, which are classified as code.
 
+### Execution owner key tripwire and self-test (`docs` suite + `docs-lint.yml`, #5557)
+
+`tests/test_execution_owner_key_tripwire.py` is a best-effort lexical check, not a control-flow
+proof, that execution admission is keyed on the owner key and that neither list gate hands a
+service-scoped session unrestricted authority; its self-test
+(`tests/test_execution_owner_key_tripwire_selftest.py`) mutates the server sources in memory and
+proves each mutation is caught. The tripwire runs as a step of the `changelog-order` job (check
+name "CHANGELOG order", the required one). The self-test costs about half a minute of CPU, more on
+a hosted runner, so it is its own job, `execution-owner-key-selftest` (check name "Execution owner
+key tripwire self-test"), which keeps it out of the required check's five minute budget. That job
+is **advisory**: the workflow's own header names only "CHANGELOG order" as required, and the
+repository owner may add the job to branch protection. Both tests are also registered in
+`tests/meson.build` (suite `docs`), and the `linux` job of `ci.yml` lists `--suite docs`, so the
+self-test still gates on the required `Linux gcc-15 debug` leg without depending on the advisory
+job. A red self-test job means a frozen set no longer matches or a mutation went undetected; it is
+fixed by reviewing the edit, not by re-running the job.
+
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target

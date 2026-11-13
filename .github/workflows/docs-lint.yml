@@ -14,7 +14,9 @@ name: Docs Lint
 # PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
 # `cbom-schema` reaches one too, a hash-pinned jsonschema from PyPI.
 # `execution-owner-key-selftest` is split off for run time, not for a registry: its
-# half minute of CPU must not eat into the required check's budget.
+# half minute of CPU must not eat into the required check's budget. It is advisory (only
+# "CHANGELOG order" is required here, and the owner may add it to branch protection); the
+# same self-test also gates through the meson `docs` suite on the required Linux leg.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
