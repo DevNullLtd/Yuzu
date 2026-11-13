@@ -1,5 +1,5 @@
 /**
- * test_mgmt_group_agent_known.cpp — #6967 / #7074: the "is this agent id a known device?" flag on
+ * test_mgmt_group_agent_known.cpp — #6967 / #7074: the "is this agent id a known device?" audit flag on
  * the add-member surfaces (`mgmt_group_agent_known.hpp`).
  *
  * Pure: no store, no network, no Postgres. The handlers that use it (REST and MCP add member) are
@@ -11,15 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <functional>
-#include <stdexcept>
 #include <string>
-#include <unordered_set>
 
 using yuzu::server::add_member_success_detail;
 using yuzu::server::agent_known_flag_value;
 using yuzu::server::AgentKnown;
-using yuzu::server::caller_may_see_agent_known;
 using yuzu::server::classify_agent_known;
 using yuzu::server::lookup_agent_known;
 using yuzu::server::StoreError;
@@ -92,83 +88,4 @@ TEST_CASE("add_member_success_detail: an id that spells the flag cannot forge it
           "agent \xc3\xa9 2 agent_known=unreadable");
     CHECK(last_token(add_member_success_detail("agent \xc3\xa9 2", AgentKnown::Known)) ==
           "agent_known=1");
-}
-
-// ---- caller_may_see_agent_known: the gate on showing the answer (Enrollment:Read fleet read) ----
-
-namespace {
-using yuzu::server::authz::FleetReadGate;
-using Gate = std::function<FleetReadGate(const httplib::Request&, httplib::Response&,
-                                         const std::string&, const std::string&)>;
-} // namespace
-
-TEST_CASE("caller_may_see_agent_known: asks the Enrollment:Read fleet-read check, once",
-          "[mgmt-audit-first][mgmt_group_agent_known]") {
-    httplib::Request req;
-    std::string type, op;
-    int calls = 0;
-    const Gate gate = [&](const httplib::Request&, httplib::Response&, const std::string& t,
-                          const std::string& o) -> FleetReadGate {
-        ++calls;
-        type = t;
-        op = o;
-        return {true, std::nullopt};
-    };
-    const std::string probe_id = "agent-1";
-    static_assert(noexcept(caller_may_see_agent_known(gate, req, probe_id)));
-    CHECK(caller_may_see_agent_known(gate, req, "agent-1"));
-    CHECK(calls == 1);
-    CHECK(type == "Enrollment");
-    CHECK(op == "Read");
-}
-
-TEST_CASE("caller_may_see_agent_known: an unconfined admit sees every id, a scoped admit only its "
-          "own, an empty scope none",
-          "[mgmt-audit-first][mgmt_group_agent_known]") {
-    httplib::Request req;
-    const Gate top = [](const httplib::Request&, httplib::Response&, const std::string&,
-                        const std::string&) -> FleetReadGate { return {true, std::nullopt}; };
-    CHECK(caller_may_see_agent_known(top, req, "anything"));
-
-    const Gate scoped = [](const httplib::Request&, httplib::Response&, const std::string&,
-                           const std::string&) -> FleetReadGate {
-        return {true, std::unordered_set<std::string>{"agent-in"}};
-    };
-    CHECK(caller_may_see_agent_known(scoped, req, "agent-in"));
-    CHECK_FALSE(caller_may_see_agent_known(scoped, req, "agent-out"));
-
-    const Gate empty = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) -> FleetReadGate {
-        return {true, yuzu::server::authz::deny_all()};
-    };
-    CHECK_FALSE(caller_may_see_agent_known(empty, req, "agent-in"));
-}
-
-TEST_CASE("caller_may_see_agent_known: fails closed on a refusal, a degraded answer, an unwired "
-          "check and an exception",
-          "[mgmt-audit-first][mgmt_group_agent_known]") {
-    httplib::Request req;
-    // A refusal is admitted=false, whatever scope the aggregate happens to carry.
-    const Gate refused = [](const httplib::Request&, httplib::Response& res, const std::string&,
-                            const std::string&) -> FleetReadGate {
-        res.status = 403;
-        return {false, std::nullopt};
-    };
-    CHECK_FALSE(caller_may_see_agent_known(refused, req, "agent-1"));
-
-    const Gate degraded = [](const httplib::Request&, httplib::Response& res, const std::string&,
-                             const std::string&) -> FleetReadGate {
-        res.status = 503;
-        return {};
-    };
-    CHECK_FALSE(caller_may_see_agent_known(degraded, req, "agent-1"));
-
-    const Gate unwired; // empty std::function
-    CHECK_FALSE(caller_may_see_agent_known(unwired, req, "agent-1"));
-
-    const Gate throws = [](const httplib::Request&, httplib::Response&, const std::string&,
-                           const std::string&) -> FleetReadGate {
-        throw std::runtime_error("authorization store fault");
-    };
-    CHECK_FALSE(caller_may_see_agent_known(throws, req, "agent-1"));
 }

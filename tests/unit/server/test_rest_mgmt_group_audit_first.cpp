@@ -18,7 +18,6 @@
  * YUZU_TEST_POSTGRES_DSN is unset and FAILs when it is set but broken.
  */
 
-#include "authz_gates.hpp"
 #include "management_group_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_auth_db_pg_helper.hpp" // AuthDbPg: a real AuthDB for the agent-known flag
@@ -42,9 +41,7 @@
 #include <functional>
 #include <optional>
 #include <set>
-#include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -86,14 +83,6 @@ struct AuditFirstHarness {
     /// after the attempted row is stored): the deterministic injection point for a change that
     /// lands between the route's checks and its write, e.g. deleting the group.
     std::function<void()> after_attempted_hook{};
-    /// The fleet-read decision the route's Enrollment:Read check gets (the injected
-    /// `AuthRoutes::require_fleet_read`). Unset = admit with no confinement (TOP). A test that
-    /// refuses writes its own 401/403/503 into the response, as the real gate does.
-    std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
-                                       const std::string&, const std::string&)>
-        fleet_read_decision{};
-    /// "securable:operation" of every fleet-read check the routes made, in order.
-    std::vector<std::string> fleet_read_calls;
 
     [[nodiscard]] std::size_t audit_count(const std::string& action,
                                           const std::string& result) const {
@@ -128,7 +117,7 @@ struct AuditFirstHarness {
         return false;
     }
 
-    explicit AuditFirstHarness(bool with_auth_db = false, bool wire_fleet_read = true) {
+    explicit AuditFirstHarness(bool with_auth_db = false) {
         mgmt_bundle->set_metrics(&metrics);
         if (with_auth_db)
             auth_db_pg.emplace();
@@ -167,18 +156,6 @@ struct AuditFirstHarness {
             return true;
         };
 
-        RestApiV1::FleetReadFn fleet_read_fn;
-        if (wire_fleet_read) {
-            fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                   const std::string& type,
-                                   const std::string& op) -> authz::FleetReadGate {
-                fleet_read_calls.push_back(type + ":" + op);
-                if (fleet_read_decision)
-                    return fleet_read_decision(req, res, type, op);
-                return {true, std::nullopt}; // admitted, unconfined
-            };
-        }
-
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
                             /*mgmt_store=*/&*mgmt_bundle,
@@ -216,11 +193,7 @@ struct AuditFirstHarness {
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr,
                             /*auth_db=*/auth_db_pg ? auth_db_pg->get() : nullptr,
-                            /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr,
-                            /*exec_visible_fn=*/{},
-                            /*list_read_fn=*/{},
-                            /*fleet_read_fn=*/std::move(fleet_read_fn));
+                            /*directory_sync=*/nullptr);
     }
 
     auto create(const std::string& body) { return sink.Post("/api/v1/management-groups", body); }
@@ -262,6 +235,19 @@ void drop_mgmt_table(AuditFirstHarness& h, const char* qualified_table) {
     yuzu::server::pg::PgResult d{
         PQexec(conn.get(), (std::string("DROP TABLE ") + qualified_table + " CASCADE").c_str())};
     REQUIRE(d.ok());
+}
+
+} // namespace
+
+namespace {
+
+/// The add-member answer is exactly `{"added":true}`: no field says whether the agent id is an
+/// enrolled device (that is recorded on the success audit row only).
+void expect_added_only(const httplib::Response& res) {
+    CHECK(res.body.find("known") == std::string::npos);
+    const auto body = nlohmann::json::parse(res.body);
+    REQUIRE(body.contains("data"));
+    CHECK(body.at("data") == nlohmann::json{{"added", true}});
 }
 
 } // namespace
@@ -587,7 +573,7 @@ TEST_CASE("POST /management-groups/{id}/members: success writes attempted then s
     CHECK(h.audits[1].target_id == gid);
     // No AuthDB is wired here, so the lookup is unreadable (see the agent-known cases below).
     CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable");
-    CHECK(res->body.find("\"known\"") == std::string::npos); // omitted, never false
+    expect_added_only(*res); // the response never carries the agent-known flag
 }
 
 TEST_CASE("POST /management-groups/{id}/members: a lost outcome row keeps the 201 and marks the "
@@ -858,9 +844,10 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a session or grant go
 }
 
 // ---------------------------------------------------------------------------------------------
-// Add member reports whether the agent id is a known device (#6967, #7074): accept and flag.
-// "Known" = a row in the durable enrolment table (`AuthDB::pending_status`). The flag never
-// changes whether the add happens; an unreadable lookup is never reported as "unknown".
+// Add member records whether the agent id is a known device (#6967, #7074): accept and flag, in
+// the success audit row ONLY. "Known" = a row in the durable enrolment table
+// (`AuthDB::pending_status`). The flag never changes whether the add happens, is never returned in
+// the response, and an unreadable lookup is never recorded as "unknown".
 // ---------------------------------------------------------------------------------------------
 
 namespace {
@@ -889,15 +876,10 @@ nlohmann::json add_body(const std::string& agent_id) {
     return nlohmann::json{{"agent_id", agent_id}};
 }
 
-/// The `data` object of a 201 answer.
-nlohmann::json data_of(const httplib::Response& res) {
-    return nlohmann::json::parse(res.body).at("data");
-}
-
 } // namespace
 
-TEST_CASE("POST /management-groups/{id}/members: a known device (any enrolment status) reports "
-          "known:true and the success row ends with agent_known=1",
+TEST_CASE("POST /management-groups/{id}/members: a known device (any enrolment status) is "
+          "recorded as agent_known=1 and the response carries no known field",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
     AuditFirstHarness h(/*with_auth_db=*/true);
     const std::string gid = make_group(h, "known-ok");
@@ -911,10 +893,7 @@ TEST_CASE("POST /management-groups/{id}/members: a known device (any enrolment s
     REQUIRE(res);
     CHECK(res->status == 201);
     CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
-    const auto data = data_of(*res);
-    CHECK(data["added"] == true);
-    REQUIRE(data.contains("known"));
-    CHECK(data["known"] == true);
+    expect_added_only(*res);
     CHECK(h.member_count(gid) == 1);
 
     REQUIRE(h.audits.size() == 2);
@@ -924,8 +903,8 @@ TEST_CASE("POST /management-groups/{id}/members: a known device (any enrolment s
     CHECK(h.audits[1].detail == "agent-known agent_known=1");
 }
 
-TEST_CASE("POST /management-groups/{id}/members: an unknown device is still added, flagged "
-          "known:false and agent_known=0",
+TEST_CASE("POST /management-groups/{id}/members: an unknown device is still added, recorded as "
+          "agent_known=0, with no known field in the response",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
     AuditFirstHarness h(/*with_auth_db=*/true);
     const std::string gid = make_group(h, "unknown-ok");
@@ -934,10 +913,7 @@ TEST_CASE("POST /management-groups/{id}/members: an unknown device is still adde
     auto res = h.add_member(gid, add_body("agent-never-seen").dump());
     REQUIRE(res);
     CHECK(res->status == 201);
-    const auto data = data_of(*res);
-    CHECK(data["added"] == true);
-    REQUIRE(data.contains("known"));
-    CHECK(data["known"] == false);
+    expect_added_only(*res);
 
     // The member row exists: an unknown id is flagged, never refused.
     const auto members = h.mgmt_bundle->get_members(gid);
@@ -960,8 +936,10 @@ TEST_CASE("POST /management-groups/{id}/members: matching is exact, a case-only 
     auto res = h.add_member(gid, add_body("agent-abc").dump());
     REQUIRE(res);
     CHECK(res->status == 201);
-    CHECK(data_of(*res)["known"] == false);
+    expect_added_only(*res);
     CHECK(h.member_count(gid) == 1);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].detail == "agent-abc agent_known=0");
 }
 
 TEST_CASE("POST /management-groups/{id}/members: an id the enrolment store cannot hold (a comma, "
@@ -976,18 +954,17 @@ TEST_CASE("POST /management-groups/{id}/members: an id the enrolment store canno
     auto res = h.add_member(gid, add_body(id).dump());
     REQUIRE(res);
     CHECK(res->status == 201);
-    const auto data = data_of(*res);
-    REQUIRE(data.contains("known"));
-    CHECK(data["known"] == false);
+    expect_added_only(*res);
     CHECK(h.member_count(gid) == 1);
 
     REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].detail == id); // the attempted row keeps the bare raw id
     CHECK(h.audits[1].result == "success");
     CHECK(h.audits[1].detail == id + " agent_known=0");
 }
 
-TEST_CASE("POST /management-groups/{id}/members: no AuthDB wired omits known, records "
-          "agent_known=unreadable and still adds",
+TEST_CASE("POST /management-groups/{id}/members: no AuthDB wired records "
+          "agent_known=unreadable and still adds, with no known field in the response",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
     AuditFirstHarness h; // auth_db is null
     const std::string gid = make_group(h, "no-auth-db");
@@ -995,9 +972,7 @@ TEST_CASE("POST /management-groups/{id}/members: no AuthDB wired omits known, re
     auto res = h.add_member(gid, add_body("agent-1").dump());
     REQUIRE(res);
     CHECK(res->status == 201);
-    const auto data = data_of(*res);
-    CHECK(data["added"] == true);
-    CHECK_FALSE(data.contains("known")); // omitted, never false
+    expect_added_only(*res);
     CHECK(h.member_count(gid) == 1);
 
     REQUIRE(h.audits.size() == 2);
@@ -1005,8 +980,8 @@ TEST_CASE("POST /management-groups/{id}/members: no AuthDB wired omits known, re
     CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable");
 }
 
-TEST_CASE("POST /management-groups/{id}/members: a lookup store error omits known, records "
-          "agent_known=unreadable and still adds, never reporting unknown",
+TEST_CASE("POST /management-groups/{id}/members: a lookup store error records "
+          "agent_known=unreadable and still adds, never recording unknown",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
     AuditFirstHarness h(/*with_auth_db=*/true);
     const std::string gid = make_group(h, "lookup-error");
@@ -1022,9 +997,7 @@ TEST_CASE("POST /management-groups/{id}/members: a lookup store error omits know
     REQUIRE(res);
     CHECK(res->status == 201);
     CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
-    const auto data = data_of(*res);
-    CHECK(data["added"] == true);
-    CHECK_FALSE(data.contains("known"));
+    expect_added_only(*res);
     CHECK(res->body.find("auth.pending_agents") == std::string::npos); // no store text
     CHECK(h.member_count(gid) == 1);
 
@@ -1043,7 +1016,7 @@ TEST_CASE("POST /management-groups/{id}/members: the last token of the success d
     auto res = h.add_member(gid, add_body(id).dump());
     REQUIRE(res);
     CHECK(res->status == 201);
-    CHECK(data_of(*res)["known"] == false); // no such enrolment row
+    expect_added_only(*res);
 
     REQUIRE(h.audits.size() == 2);
     const auto& d = h.audits[1].detail;
@@ -1063,182 +1036,6 @@ TEST_CASE("POST /management-groups/{id}/members: the lookup never refuses, and a
     REQUIRE(res);
     CHECK(res->status == 503); // the audit-first refusal, not a lookup refusal
     CHECK(res->has_header("Sec-Audit-Failed"));
-    CHECK(res->body.find("\"known\"") == std::string::npos);
+    CHECK(res->body.find("known") == std::string::npos);
     CHECK(h.member_count(gid) == 0);
-}
-
-// ---------------------------------------------------------------------------------------------
-// `known` is shown only to a caller who may read enrolment status for that agent id: the same
-// fleet-read check (Enrollment:Read, admitted AND the id in scope) the pending-agents read makes.
-// Otherwise it is OMITTED, exactly as for an unreadable lookup, so the answer cannot tell an
-// enrolled id from an absent one. The add itself and the audit flag do not depend on the check.
-// ---------------------------------------------------------------------------------------------
-
-namespace {
-
-/// A fleet-read check that refuses, writing the status the real gate would.
-auto refuse_with(int status) {
-    return [status](const httplib::Request&, httplib::Response& res, const std::string&,
-                    const std::string&) -> authz::FleetReadGate {
-        res.status = status;
-        res.set_content(R"({"error":{"code":)" + std::to_string(status) + "}}", "application/json");
-        return {}; // admitted=false
-    };
-}
-
-/// A fleet-read check that admits, confined to exactly `ids` (present-empty = nothing visible).
-auto admit_scoped_to(std::set<std::string> ids) {
-    return [ids = std::move(ids)](const httplib::Request&, httplib::Response&, const std::string&,
-                                  const std::string&) -> authz::FleetReadGate {
-        return {true, std::unordered_set<std::string>(ids.begin(), ids.end())};
-    };
-}
-
-} // namespace
-
-TEST_CASE("POST /management-groups/{id}/members: known is asked of the Enrollment:Read fleet-read "
-          "check, and an admitted unconfined caller gets it",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h(/*with_auth_db=*/true);
-    const std::string gid = make_group(h, "gate-asked");
-    enrol(h, "agent-known", auth::PendingStatus::approved);
-
-    auto known = h.add_member(gid, add_body("agent-known").dump());
-    auto absent = h.add_member(gid, add_body("agent-never-seen").dump());
-    REQUIRE(known);
-    REQUIRE(absent);
-    CHECK(known->status == 201);
-    CHECK(absent->status == 201);
-    CHECK(data_of(*known)["known"] == true);
-    CHECK(data_of(*absent)["known"] == false);
-    // One check per answer, for exactly the enrolment-read pair and no other.
-    CHECK(h.fleet_read_calls == std::vector<std::string>{"Enrollment:Read", "Enrollment:Read"});
-}
-
-TEST_CASE("POST /management-groups/{id}/members: a caller who fails the fleet-read check gets no "
-          "known, for an enrolled id and for an absent one alike, and the add still succeeds",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h(/*with_auth_db=*/true);
-    const std::string gid = make_group(h, "gate-refused");
-    enrol(h, "agent-known", auth::PendingStatus::approved);
-
-    const int refusal = GENERATE(401, 403, 503); // unauthenticated, forbidden, degraded
-    INFO("fleet-read refusal status " << refusal);
-    h.fleet_read_decision = refuse_with(refusal);
-
-    auto known = h.add_member(gid, add_body("agent-known").dump());
-    auto absent = h.add_member(gid, add_body("agent-never-seen").dump());
-    REQUIRE(known);
-    REQUIRE(absent);
-    // The gate's own refusal never becomes the route's answer: the add answers as it always does.
-    CHECK(known->status == 201);
-    CHECK(absent->status == 201);
-    CHECK_FALSE(known->has_header("Sec-Audit-Failed"));
-    CHECK(known->body.find("\"known\"") == std::string::npos);
-    CHECK(absent->body.find("\"known\"") == std::string::npos);
-    // Indistinguishable: both bodies are the same object.
-    CHECK(data_of(*known) == data_of(*absent));
-    CHECK(data_of(*known) == nlohmann::json{{"added", true}});
-    CHECK(h.member_count(gid) == 2);
-
-    // The success rows still carry the real flag: an audit row is not a response.
-    REQUIRE(h.audits.size() == 4);
-    CHECK(h.audits[1].result == "success");
-    CHECK(h.audits[1].detail == "agent-known agent_known=1");
-    CHECK(h.audits[3].result == "success");
-    CHECK(h.audits[3].detail == "agent-never-seen agent_known=0");
-}
-
-TEST_CASE("POST /management-groups/{id}/members: a confined caller is told known only for an id "
-          "inside its scope",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h(/*with_auth_db=*/true);
-    const std::string gid = make_group(h, "gate-scoped");
-    enrol(h, "agent-in-scope", auth::PendingStatus::approved);
-    enrol(h, "agent-hidden", auth::PendingStatus::approved);
-    h.fleet_read_decision = admit_scoped_to({"agent-in-scope"});
-
-    auto in_scope = h.add_member(gid, add_body("agent-in-scope").dump());
-    auto hidden = h.add_member(gid, add_body("agent-hidden").dump());
-    auto absent = h.add_member(gid, add_body("agent-never-seen").dump());
-    REQUIRE(in_scope);
-    REQUIRE(hidden);
-    REQUIRE(absent);
-    CHECK(in_scope->status == 201);
-    CHECK(hidden->status == 201);
-    CHECK(absent->status == 201);
-    CHECK(data_of(*in_scope)["known"] == true);
-    // An enrolled device the caller's scope hides reads exactly like an id that is not enrolled.
-    CHECK(hidden->body.find("\"known\"") == std::string::npos);
-    CHECK(absent->body.find("\"known\"") == std::string::npos);
-    CHECK(data_of(*hidden) == data_of(*absent));
-
-    REQUIRE(h.audits.size() == 6);
-    CHECK(h.audits[3].detail == "agent-hidden agent_known=1"); // the audit row is not scoped
-    CHECK(h.audits[5].detail == "agent-never-seen agent_known=0");
-}
-
-TEST_CASE("POST /management-groups/{id}/members: an admitted caller with nothing in scope gets no "
-          "known",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h(/*with_auth_db=*/true);
-    const std::string gid = make_group(h, "gate-empty-scope");
-    enrol(h, "agent-known", auth::PendingStatus::approved);
-    h.fleet_read_decision = admit_scoped_to({}); // present-empty: deny-all, never unconfined
-
-    auto res = h.add_member(gid, add_body("agent-known").dump());
-    REQUIRE(res);
-    CHECK(res->status == 201);
-    CHECK(res->body.find("\"known\"") == std::string::npos);
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[1].detail == "agent-known agent_known=1");
-}
-
-TEST_CASE("POST /management-groups/{id}/members: an unwired fleet-read check omits known (fail "
-          "closed) and the add and the audit flag are unchanged",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h(/*with_auth_db=*/true, /*wire_fleet_read=*/false);
-    const std::string gid = make_group(h, "gate-unwired");
-    enrol(h, "agent-known", auth::PendingStatus::approved);
-
-    auto res = h.add_member(gid, add_body("agent-known").dump());
-    REQUIRE(res);
-    CHECK(res->status == 201);
-    CHECK(res->body.find("\"known\"") == std::string::npos);
-    CHECK(h.member_count(gid) == 1);
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[1].detail == "agent-known agent_known=1");
-}
-
-TEST_CASE("POST /management-groups/{id}/members: a fleet-read check that throws omits known and "
-          "does not fail the add",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h(/*with_auth_db=*/true);
-    const std::string gid = make_group(h, "gate-throws");
-    enrol(h, "agent-known", auth::PendingStatus::approved);
-    h.fleet_read_decision = [](const httplib::Request&, httplib::Response&, const std::string&,
-                               const std::string&) -> authz::FleetReadGate {
-        throw std::runtime_error("authorization store fault");
-    };
-
-    auto res = h.add_member(gid, add_body("agent-known").dump());
-    REQUIRE(res);
-    CHECK(res->status == 201);
-    CHECK(res->body.find("\"known\"") == std::string::npos);
-    CHECK(res->body.find("authorization store fault") == std::string::npos);
-    CHECK(h.member_count(gid) == 1);
-}
-
-TEST_CASE("POST /management-groups/{id}/members: an unreadable lookup still omits known for a "
-          "caller who passes the fleet-read check",
-          "[pg][rest][mgmt_group][mgmt-audit-first]") {
-    AuditFirstHarness h; // no AuthDB: the lookup is unreadable; the fleet-read check admits
-    const std::string gid = make_group(h, "gate-ok-lookup-unreadable");
-
-    auto res = h.add_member(gid, add_body("agent-1").dump());
-    REQUIRE(res);
-    CHECK(res->status == 201);
-    CHECK(res->body.find("\"known\"") == std::string::npos);
-    REQUIRE(h.audits.size() == 2);
-    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable");
 }
