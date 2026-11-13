@@ -319,6 +319,7 @@
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "legacy_sqlite_probe.hpp"
+#include "delivery_pool_metrics.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
@@ -2835,17 +2836,13 @@ public:
                           "Number of obs_types currently routed to alerts", "gauge");
         // #3261 governance hardening (Gate 8 consistency-auditor) - the same
         // parity gap DexAlertRouter's family above had before its own
-        // describe() calls were added: without this, these six counters
+        // describe() calls were added: without this, these counters
         // emit no HELP/TYPE line and stay entirely absent until first
         // incremented.
         metrics_.describe("yuzu_server_webhook_delivery_success_total",
                           "Webhook deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_webhook_delivery_failed_total",
                           "Webhook deliveries that failed (connection error, non-2xx, exception)",
-                          "counter");
-        metrics_.describe("yuzu_server_webhook_delivery_dropped_total",
-                          "Webhook deliveries dropped because the delivery worker pool's queue "
-                          "was full or the store was quiescing",
                           "counter");
         // ADR-0057 (gov Gate 3 sre): these three joined the family above but
         // were missing describe()/pre-seed, the same HC-1-class parity gap
@@ -2870,15 +2867,14 @@ public:
                           "Offload-target deliveries that failed (connection error, non-2xx, "
                           "exception, or a tampered non-http(s) URL)",
                           "counter");
-        metrics_.describe("yuzu_server_offload_delivery_dropped_total",
-                          "Offload-target deliveries dropped because the delivery worker pool's "
-                          "queue was full or the store was quiescing",
-                          "counter");
-        // Pre-seed all six to 0 (adversarial-review round 2, Kimi+Codex
+        // The two drop counters (closed `reason` set) and the delivery pool gauges are described
+        // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
+        yuzu::server::register_delivery_pool_metrics(metrics_);
+        // Pre-seed each of these to 0 (adversarial-review round 2, Kimi+Codex
         // both independently confirmed) - describe() alone only writes
         // HELP/TYPE metadata (MetricsRegistry::describe()), it does not
         // create a series; counter(name) with no labels does. Each of
-        // these six is a no-label counter, so it has exactly one known
+        // these is a no-label counter, so it has exactly one known
         // "label combination" - itself - and the same bounded-label
         // pre-seed rule applies (docs/observability-conventions.md
         // "Bounded-label counters are pre-seeded to 0 at startup"),
@@ -2892,17 +2888,15 @@ public:
         // alerting can't distinguish "not wired" from "no deliveries yet".
         for (const char* name : {"yuzu_server_webhook_delivery_success_total",
                                  "yuzu_server_webhook_delivery_failed_total",
-                                 "yuzu_server_webhook_delivery_dropped_total",
                                  "yuzu_server_webhook_delivery_secret_unavailable_total",
                                  "yuzu_server_webhook_fire_event_degraded_total",
                                  "yuzu_server_webhook_delivery_log_failed_total",
                                  "yuzu_server_offload_delivery_success_total",
-                                 "yuzu_server_offload_delivery_failed_total",
-                                 "yuzu_server_offload_delivery_dropped_total"}) {
+                                 "yuzu_server_offload_delivery_failed_total"}) {
             metrics_.counter(name);
         }
         // ADR-0059 (OffloadTargetStore Postgres migration) — two new counters
-        // this migration adds, same pre-seed rule as the six above.
+        // this migration adds, same pre-seed rule as the counters above.
         metrics_.describe("yuzu_server_offload_delivery_credential_unavailable_total",
                           "Offload-target deliveries skipped because the target's credential "
                           "failed to decrypt (ADR-0010 fail-closed - never fired unsigned)",
@@ -9853,6 +9847,21 @@ public:
                 // The OIDC egress resolver pool, from the same tick.
                 metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
                     .set(static_cast<double>(::yuzu::server::oidc::oidc_resolver_in_flight()));
+                // Webhook and offload delivery pool backlog, from the same tick. A store that is
+                // not open reads 0 (never a stale value).
+                {
+                    const bool webhook_open = webhook_store_ && webhook_store_->is_open();
+                    yuzu::server::publish_delivery_pool(
+                        metrics_, "webhook", webhook_open,
+                        webhook_open ? webhook_store_->delivery_pool_pending() : 0,
+                        webhook_open ? webhook_store_->delivery_pool_capacity() : 0);
+                    const bool offload_open =
+                        offload_target_store_ && offload_target_store_->is_open();
+                    yuzu::server::publish_delivery_pool(
+                        metrics_, "offload", offload_open,
+                        offload_open ? offload_target_store_->delivery_pool_pending() : 0,
+                        offload_open ? offload_target_store_->delivery_pool_capacity() : 0);
+                }
                 // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
                 // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
                 // connection), noexcept (a failed sample keeps the previous gauge values).
