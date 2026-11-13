@@ -926,13 +926,15 @@ TEST_CASE("PgCollationRecheck: tick without a check function does nothing, and a
 
 TEST_CASE("PgCollationRecheck: start and stop from different threads are safe",
           "[pg_collation][recheck]") {
-    // Meaningful under TSan (not run for this change): the thread member is written by start() and
-    // read by stop(), ordered only through mu_.
+    // Meaningful only under TSan (not run for this change): without it this proves that the three
+    // calls interleaved on two threads neither hang nor leave a loop running; it cannot fail on a
+    // missing lock. The thread member is written by start() and read by stop(), ordered only
+    // through mu_.
     ScriptedCheck check;
     for (int round = 0; round < 20; ++round) {
         PgCollationRecheck recheck(check.fn(), nullptr, 1ms);
         std::thread starter([&] { recheck.start(); });
-        std::thread stopper([&] { recheck.request_stop(); });
+        std::thread stopper([&] { recheck.stop(); });
         starter.join();
         stopper.join();
         recheck.stop();

@@ -271,7 +271,7 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
             break;
         case LogAction::InfoNotApplicable:
             spdlog::info("[PG] database collation version check not applicable (no recorded version, or "
-                         "PostgreSQL before 15); the gauge stays absent");
+                         "PostgreSQL before 15); the mismatch gauge has no series");
             break;
         }
     } catch (...) {

@@ -49,6 +49,10 @@ Invariants:
      before the join `pg_collation_recheck_->stop();`: the check in flight is told to stop at the
      start of teardown, so it overlaps the rest of it instead of being added after it.
 
+  13. The join `pg_collation_recheck_->stop();` comes AFTER `leader_elector_->resign();`,
+     `audit_store_->stop_cleanup();` and `offload_target_store_->flush_all();` in stop(): the join
+     can wait out a check stuck against a frozen backend, and a kill during that wait must not skip
+     the lease release or the flushes (it is the last step before the pool is reset).
   11. The recheck construction is guarded by exactly
      `if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {` (both
      conditions present and negated): an inverted or half-dropped guard compiles, passes every
@@ -130,6 +134,11 @@ MSG_REQ_NOT_LOCKED = ("the early request_stop is not after stop()'s `lifecycle_m
 MSG_REQ_AFTER_JOIN = ("the early request_stop is after the join `pg_collation_recheck_->stop();` "
                       "(then it is not early)")
 MSG_REQ_AFTER_WEB = "the early request_stop is after `web_server_->stop();` (then it is not early)"
+BEFORE_JOIN = ("leader_elector_->resign();", "audit_store_->stop_cleanup();",
+               "offload_target_store_->flush_all();")
+MSG_JOIN_LATE = ("the PgCollationRecheck join must come after the leader resign, the audit cleanup "
+                 "and the offload flush in stop(): a join that waits on a wedged check must not be "
+                 "able to skip them")
 MSG_DECL_ORDER = ("the pg_collation_recheck_ member is not declared after the pg_pool_ member it "
                   "borrows")
 
@@ -329,6 +338,12 @@ def recheck_problems(t, report_pos):
             if 0 <= reset < stop[1] and reset < stops[0]:
                 out.append(MSG_STOP_AFTER_POOL)
     out += request_stop_problems(t, stop, stops)
+    if len(stops) == 1 and stop[0] < stops[0] < stop[1]:
+        for step in BEFORE_JOIN:
+            at = t.find(step, stop[0], stop[1])
+            if at < 0 or at > stops[0]:
+                out.append(MSG_JOIN_LATE)
+                break
     pool = t.find(POOL_DECL)
     decl = t.find(RECHECK_DECL)
     if pool < 0 or decl < 0 or decl < pool:
@@ -512,6 +527,24 @@ class PgCollationCheckWiring(unittest.TestCase):
         k = rest.index(POOL_DECL)
         m = rest[:k] + RECHECK_DECL + "\n    " + rest[k:]
         self.assertEqual(problems(m), [MSG_DECL_ORDER])
+
+    def test_join_moved_before_the_leader_resign(self):
+        i = self.src.index(STOP)
+        j = i + len(STOP)
+        rest = self.src[:i] + "(void)0;" + self.src[j:]
+        k = rest.index("leader_elector_->resign();")
+        m = rest[:k] + STOP + "\n            " + rest[k:]
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_JOIN_LATE])
+
+    def test_join_moved_before_the_offload_flush(self):
+        i = self.src.index(STOP)
+        j = i + len(STOP)
+        rest = self.src[:i] + "(void)0;" + self.src[j:]
+        k = rest.index("offload_target_store_->flush_all();")
+        m = rest[:k] + STOP + "\n            " + rest[k:]
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_JOIN_LATE])
 
     def test_start_guard_with_the_stop_condition_not_negated(self):
         m = self.src.replace("!stop_requested_.load(std::memory_order_acquire)) {\n                    pg_collation_recheck_",

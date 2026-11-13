@@ -12464,7 +12464,8 @@ public:
         // It is NOT bounded against a backend that is frozen while its connection keeps
         // acknowledging data, a host-name lookup that hangs, or a connection string that sets
         // tcp_user_timeout to 0: libpq has no client-side query deadline here, so such a wait ends
-        // only when the orchestrator kills the process, after everything above has run. stop() is
+        // only when the orchestrator kills the process (or a second termination signal hard-exits
+        // it), after everything above has run, before the pools are reset. stop() is
         // idempotent; the member is also declared after pg_pool_ so its destructor (which stops it
         // too) runs first.
         if (pg_collation_recheck_)

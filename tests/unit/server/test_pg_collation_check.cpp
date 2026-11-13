@@ -293,6 +293,9 @@ TEST_CASE("collation report: the last-completed time is set by every verdict and
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch())
             .count());
+    // The first report creates the series by itself (no gauge() call has touched it before).
+    report_collation_check(report(CollationVerdict::Unreadable), &m, state);
+    CHECK(has_series());
     for (const auto v : {CollationVerdict::Unreadable, CollationVerdict::Ok,
                          CollationVerdict::Mismatch, CollationVerdict::NotApplicable}) {
         m.gauge(kCollationLastCompletedGauge).set(0.0); // would stay 0 if the verdict did not stamp it
