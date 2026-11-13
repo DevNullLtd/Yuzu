@@ -80,7 +80,10 @@ struct ExecutionQuery {
     std::string definition_id;
     std::string status;
     /// #1634: restricts to executions dispatched by this exact principal.
-    /// Empty (the default) is unrestricted. Used by MCP `list_executions`
+    /// Empty (the default) is unrestricted. The value is the ExecutionOwnerKey-derived key
+    /// (`owner_only_filter`, `execution_scope_rules.hpp`), never a raw session `username`:
+    /// a service-scoped session's key is EMPTY, which here would mean "no filter", so such a
+    /// session is admitted through `ExecutionListScope` instead. Used by MCP `list_executions`
     /// for a management-group-confined caller — executions carry no single
     /// `agent_id` to filter by (they fan out to many), so "own dispatches
     /// only" is the cheap, provably-safe confinement until a real per-row
@@ -114,7 +117,10 @@ struct ExecutionQuery {
 /// `visible_agents` empty means "visible to nobody" (every row excluded),
 /// matching `response_store.cpp`'s `append_scope_clause` engaged-empty
 /// convention. This is a plain data type with no authz dependency — the
-/// route layer derives it from `authz::VisibleSet`/the session username.
+/// route layer derives it with `confined_list_scope` (`execution_scope_rules.hpp`) from
+/// `authz::VisibleSet` and the session's `ExecutionOwnerKey`: `owner` is that key, EMPTY
+/// for a service-scoped session (whose `username` is its minting account), so such a
+/// session is admitted only through `visible_agents`.
 struct ExecutionListScope {
     std::string owner;
     std::vector<std::string> visible_agents;
