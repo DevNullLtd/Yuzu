@@ -4618,19 +4618,24 @@ groups:
         # missing scrape is likewise silent here, so keep your own `up == 0` alert on the
         # server job. The check repeats every minute while it is 1, so after the database is
         # fixed the next check sets the gauge to 0 and this clears without a restart.
-        # With N replicas one database mismatch raises N alerts (each replica exports its own
-        # gauge and checks on its own schedule, up to an hour apart at drift onset); group the
-        # notifications by alertname and job so one repair is one page.
+        # The mismatch is ONE shared pg_database fact, so the alert collapses replicas with
+        # `max by (job)` (docs/observability-conventions.md: alerts over a row shared by every
+        # replica take `max by (job)`): any replica's gauge at 1 fires one alert for the job, and
+        # it carries no instance label. The gauge itself stays per replica (each replica checks
+        # on its own schedule, up to an hour apart at drift onset), so which replicas have
+        # already seen the mismatch is answered by querying the gauge per instance. By contrast
+        # YuzuPgCollationCheckBlind and YuzuPgCollationCheckStale below are genuinely
+        # per-replica conditions and stay per instance.
         # After a restart during an unreadable spell the gauge is absent until the first
-        # recheck, so a standing alert can resolve and fire again a minute or two later
-        # (reasoned, not measured).
+        # recheck, so on a single-replica job a standing alert can resolve and fire again a
+        # minute or two later (reasoned, not measured).
         expr: |
-          yuzu_pg_collation_version_mismatch == 1
+          max by (job) (yuzu_pg_collation_version_mismatch) == 1
         for: 1m
         labels:
           severity: warning
         annotations:
-          summary: "Yuzu server {{ $labels.instance }}: the PostgreSQL collation version differs from the operating system's"
+          summary: "Yuzu server job {{ $labels.job }}: the PostgreSQL collation version differs from the operating system's"
           description: >-
             The database's recorded collation version is not the version the operating
             system of the PostgreSQL server reports, so text-keyed indexes may be ordered
@@ -4638,9 +4643,12 @@ groups:
             can then skip or repeat rows without any error. The server does not stop or change
             anything because of this signal: it keeps serving, and the gauge and the log line
             are the whole report.
-            Each replica exports its own gauge, so with N replicas one database mismatch
-            raises N of these alerts, which one repair clears together within about a minute;
-            group the notifications by alertname and job.
+            The mismatch is one shared database fact, so this is one alert for the Yuzu server
+            job {{ $labels.job }}: any replica's gauge at 1 fires it, and it clears when every
+            replica's gauge is 0 or absent (within about a minute of the repair). The gauges are
+            per replica and replicas check on their own schedule, up to an hour apart at drift
+            onset, so which replicas have already seen the mismatch is answered by querying
+            yuzu_pg_collation_version_mismatch per instance.
             The server log has one "[PG] database ... collation version" error line naming
             the database and both versions. Remedy, in this order, as a change under your own
             process with a verified backup first: connect to the affected
@@ -4706,8 +4714,10 @@ groups:
         # than 3 resets of yuzu_server_uptime_seconds in 3 hours and one continuous series per
         # instance, and a loop faster than the metrics sweep can keep it silent; see its comment).
         # The 10m window, the threshold of 5 and the 5m hold are claims reasoned from the
-        # cadence, not measured values. With N replicas one database problem raises N alerts
-        # (each replica exports its own counter): group the notifications by alertname and job.
+        # cadence, not measured values. This is a genuinely per-replica condition (each replica
+        # exports its own counter and fails on its own), so it stays per instance; with N
+        # replicas one database problem raises N alerts: group the notifications by alertname
+        # and job.
         expr: |
           sum by (job, instance) (increase(yuzu_pg_collation_check_total{result="unreadable"}[10m])) >= 5
         for: 5m
@@ -4768,7 +4778,8 @@ groups:
         # the host is suspended, so a suspend can also fire it (both reasoned): check the
         # replica's uptime and clock before treating it as a hang. The 7200 s and the 10m hold
         # are reasoned from the cadence, not measured; promtool covers the arithmetic only.
-        # With N replicas one database problem raises N alerts: group by alertname and job.
+        # A genuinely per-replica condition, so it stays per instance; with N replicas one
+        # database problem raises N alerts: group by alertname and job.
         expr: |
           time() - max by (job, instance) (yuzu_pg_collation_check_last_completed_timestamp_seconds) > 7200
         for: 10m

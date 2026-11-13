@@ -8961,13 +8961,13 @@ tests:
       - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
         eval_time: 15m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
         eval_time: 30m
         exp_samples: []
 
-  # CASE -- a start-up collation mismatch (gauge 1) fires after the 1m hold and names the instance.
+  # CASE -- a start-up collation mismatch (gauge 1) fires after the 1m hold; the alert is per job, so it carries no instance label.
   # Red if the comparison were `== 0` or the rule read a different metric name.
   - interval: 1m
     name: pg collation version - a mismatch recorded at start fires
@@ -8981,24 +8981,84 @@ tests:
       - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="pending"}'
         eval_time: 0m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="pending", job="yuzu", severity="warning"}'
             value: 1
       # Firing after the 1m hold, not the earlier 5m one: red if the hold is lengthened again.
       - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
         eval_time: 1m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
         eval_time: 2m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
       - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
         eval_time: 10m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE -- the mismatch is ONE shared database fact, so the alert collapses replicas with
+  # `max by (job)`: two replicas s1 and s2 of one job both at 1 raise exactly ONE alert for the job
+  # (labels alertname, job, severity; no instance). Red if the rule went back to one alert per
+  # instance (two samples) or lost the `by (job)` collapse.
+  - interval: 1m
+    name: pg collation version - two replicas both at 1 raise one alert for the job
+    input_series:
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x30"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s2"}'
+        values: "1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- only one of two replicas has seen the mismatch yet (replicas check on their own
+  # schedule, up to an hour apart at drift onset): s1 at 1, s2 at 1 only later. The alert is ONE
+  # for the job from the moment any replica is at 1, and stays ONE once both are.
+  - interval: 1m
+    name: pg collation version - only one replica at 1 raises one alert for the job
+    input_series:
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "1x30"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s2"}'
+        values: "0x15 1x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- the gauge is 0 on one replica and 1 on the other from the start: it still fires (max
+  # over the job is 1), once. Red if the rule used `min`, `avg` or a sum compared with the replica
+  # count. Then the 1 replica is fixed and reads 0: the alert clears.
+  - interval: 1m
+    name: pg collation version - 0 on one replica and 1 on the other still fires, then clears
+    input_series:
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s1"}'
+        values: "0x30"
+      - series: 'yuzu_pg_collation_version_mismatch{job="yuzu",instance="s2"}'
+        values: "1x15 0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPgCollationVersionMismatch", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
 
   # CASE -- a matching database (gauge 0) and a replica that learned nothing (series absent) stay quiet.
   - interval: 1m
