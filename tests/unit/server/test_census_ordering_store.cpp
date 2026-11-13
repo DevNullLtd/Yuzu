@@ -3718,6 +3718,76 @@ TEST_CASE("census ordering: a lower epoch is refused while the clock is fresh, r
     CHECK(order_text(db.dsn(), "a") == "4|1|5|1|0|1|0|2|0|1");
 }
 
+TEST_CASE("census ordering: the pair clock is fresh up to an hour old and five minutes ahead and "
+          "stale beyond either edge",
+          "[pg][guaranteed_state_store][db][census][ordering][pair][stale]") {
+    // The edges of `YUZU_AGENT_ORDER_FRESH_`: fresh = recorded, not older than one hour, not more
+    // than five minutes in the database's future. A same-epoch LOWER sequence is a straggler (a
+    // counter, the clock untouched) while the clock is fresh and a recovery (a counter, the clock
+    // refreshed) once it is not, so one event reads the rule off the counters. An unpaired event
+    // reads the same rule as `unpaired_held` against a fresh clock.
+    // The clock is placed relative to the database's time by the statement that sets it, so the
+    // only drift is the milliseconds until DECIDE starts (time only moves forward). That decides
+    // the "at the edge" rows without any flake: a clock exactly one hour old is past it by the time
+    // DECIDE reads it (stale), and one exactly five minutes ahead is inside it by then (fresh). The
+    // two "just" rows that drift the wrong way keep a 5 s margin so a loaded box does not flip them.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("e0", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    int n = 0;
+    // Put the live pair at 5/10 with the clock `offset_s` seconds from the database's now and zero
+    // counters, then deliver one event and return the order row.
+    const auto probe = [&](std::int64_t offset_s, bool paired) {
+        exec_sql(db.dsn(),
+                 std::string("UPDATE ") + kSchema +
+                     ".guardian_agent_order SET epoch = 5, emit_seq_hwm = 10, retired_epoch = NULL, "
+                     "epoch_recv_ns = (floor(extract(epoch FROM statement_timestamp()) * "
+                     "1000000000))::bigint + " +
+                     std::to_string(offset_s) +
+                     "::bigint * 1000000000, unpaired_events = 0, unpaired_held = 0, "
+                     "pair_regressions = 0, pair_stragglers = 0, pair_recoveries = 0, "
+                     "pair_duplicates = 0, retired_events = 0 WHERE agent_id = 'a'");
+        ++n;
+        auto e = ev("p" + std::to_string(n), "r1", "a", kDrifted, kBase + 1000 + 100 * n);
+        if (paired)
+            e = with_pair(std::move(e), 5, 9);
+        REQUIRE(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+        return order_text(db.dsn(), "a");
+    };
+    const std::string straggler = "5|10|-|0|0|0|1|0|0|0";
+    const std::string recovery = "5|9|-|0|0|0|0|1|0|0";
+    const std::string held = "5|10|-|1|1|0|0|0|0|0";
+    const std::string not_held = "5|10|-|1|0|0|0|0|0|0";
+    struct Edge {
+        const char* what;
+        std::int64_t offset_s;
+        bool fresh;
+    };
+    const Edge edges[] = {
+        {"just inside the hour (5 s short of it)", -3595, true},
+        {"exactly an hour old", -3600, false},
+        {"just outside the hour (1 s past it)", -3601, false},
+        {"two hours old", -7200, false},
+        {"the receive time is now", 0, true},
+        {"just inside the slack (5 s short of it)", 295, true},
+        {"exactly the slack ahead", 300, true},
+        {"just outside the slack (5 s past it)", 305, false},
+        {"three hours ahead", 10800, false},
+    };
+    for (const Edge& edge : edges) {
+        CAPTURE(edge.what, edge.offset_s);
+        CHECK(probe(edge.offset_s, true) == (edge.fresh ? straggler : recovery));
+        CHECK(probe(edge.offset_s, false) == (edge.fresh ? held : not_held));
+    }
+    CHECK(paired_rows_without_order(db.dsn()) == "0");
+}
+
 TEST_CASE("census ordering: a failed census write still leaves the pair clock having seen the event",
           "[pg][guaranteed_state_store][db][census][ordering][pair]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
@@ -3956,12 +4026,17 @@ TEST_CASE("census ordering: a held or cancelled agent step costs the step and ne
     // overrides a pool value, so a shorter pool value would no longer be the one under test. Without
     // the agent_step savepoint the whole ingest aborts and the event is stored nowhere; with it the
     // event is stored pending and acked, and a redelivery repairs it.
+    //
+    // The pool's statement timeout stays at its generous 30 s in both variants, so the schema
+    // setup and every setup statement are immune to a loaded box. The 400 ms variant shortens the
+    // timeout for ONE statement: a trigger on the Ensure INSERT does `SET LOCAL statement_timeout`,
+    // which the next statement (DECIDE) arms and the step's ROLLBACK TO SAVEPOINT reverts.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     const bool statement_cancel = GENERATE(false, true);
     CAPTURE(statement_cancel);
     PgPool pool{{.conninfo = db.dsn(),
                  .size = 4,
-                 .statement_timeout_ms = statement_cancel ? 400 : 30000,
+                 .statement_timeout_ms = 30000,
                  .lock_timeout_ms = 10000}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
@@ -3973,13 +4048,29 @@ TEST_CASE("census ordering: a held or cancelled agent step costs the step and ne
     const auto failures_before = store.census_proj_failures_total();
     const std::string verdict_before = census(db.dsn(), "a", "r1");
     const auto e2 = with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11);
+    if (statement_cancel) {
+        // BEFORE INSERT fires for an Ensure that DO NOTHINGs on the existing row ('a' has one).
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_decide_timeout() RETURNS trigger LANGUAGE plpgsql AS "
+                               "$$ BEGIN PERFORM set_config('statement_timeout', '400ms', true); "
+                               "RETURN NEW; END $$");
+        exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_decide_timeout BEFORE INSERT ON ") +
+                               kSchema + ".guardian_agent_order FOR EACH ROW EXECUTE FUNCTION " +
+                               kSchema + ".yuzu_test_decide_timeout()");
+    }
 
     {
         HeldSession holder(db.dsn());
         REQUIRE(holder.run("BEGIN"));
         REQUIRE(holder.run(std::string("SELECT 1 FROM ") + kSchema +
                            ".guardian_agent_order WHERE agent_id = 'a' FOR UPDATE"));
+        yuzu::test::LogCapture cap(spdlog::level::err);
         const auto r = store.insert_event_classified(e2);
+        cap.stop();
+        // Pin which bound ended the wait, so a variant that silently took the other path fails.
+        // Postgres words them "canceling statement due to statement timeout" and "... lock timeout".
+        CHECK(cap.text().find(statement_cancel ? "statement timeout" : "lock timeout") !=
+              std::string::npos);
         CHECK(r.outcome == EventInsertOutcome::Inserted); // acked, not an error
         CHECK(store.event_count() == 2);                   // the event is stored, not lost
         CHECK(pending_for(db.dsn(), "a") == "1");
@@ -3990,6 +4081,10 @@ TEST_CASE("census ordering: a held or cancelled agent step costs the step and ne
     CHECK(order_text(db.dsn(), "a") == "5|10|-|0|0|0|0|0|0|0"); // the failed step wrote nothing
 
     // The holder is gone: the same store takes the next event, and a redelivery repairs e2.
+    if (statement_cancel)
+        exec_sql(db.dsn(),
+                 std::string("DROP TRIGGER yuzu_test_decide_timeout ON ") + kSchema +
+                     ".guardian_agent_order"); // the repair must not run under 400 ms
     CHECK(store.insert_event_classified(e2).outcome == EventInsertOutcome::Redelivered);
     CHECK(pending_for(db.dsn(), "a") == "0");
     CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
@@ -4199,6 +4294,91 @@ TEST_CASE("census ordering: an abandoned agent step is an ingest error, is count
         CHECK(projected("first_delivery", "failed") == 0);
         CHECK(store.census_proj_failures_total() == failures_before);
         CHECK(store.event_count() == 1);
+    }
+}
+
+TEST_CASE("census ordering: a failing Ensure alone is a failed step, stored pending and counted "
+          "failed, never abandoned and never a lost event",
+          "[pg][guaranteed_state_store][db][census][ordering][pair]") {
+    // Every other failed-step case breaks DECIDE or races the row away. Here ONLY the Ensure INSERT
+    // raises (a BEFORE INSERT trigger; it fires even when the row exists and Ensure would DO
+    // NOTHING), and DECIDE (an UPDATE) is healthy. Ensure runs inside SAVEPOINT agent_step, so the
+    // step rolls back to it and the transaction holding the event survives: the single path stores
+    // the event pending and skips the census write, the batch path aborts and rolls back.
+    YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    const auto projected = [&](const char* source, const char* outcome) {
+        return metrics
+            .counter("yuzu_server_guardian_census_projection_total",
+                     {{"source", source}, {"outcome", outcome}})
+            .value();
+    };
+    const auto e2 = with_pair(ev("e2", "r1", "a", kDrifted, kBase + 200), 5, 11);
+    const std::string order_before = order_text(db.dsn(), "a");
+    const std::string verdict_before = census(db.dsn(), "a", "r1");
+    const std::string order_table = std::string(kSchema) + ".guardian_agent_order";
+    exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                           ".yuzu_test_ensure_fail() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                           "BEGIN RAISE EXCEPTION 'forced ensure failure' USING ERRCODE = "
+                           "'XX000'; END $$");
+    exec_sql(db.dsn(), "CREATE TRIGGER yuzu_test_ensure_fail BEFORE INSERT ON " + order_table +
+                           " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                           ".yuzu_test_ensure_fail()");
+    const auto failures_before = store.census_proj_failures_total();
+    const auto errors_before = store.events_ingest_errors_total();
+
+    SECTION("a first delivery is acked, stored pending and counted failed") {
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        const auto r = store.insert_event_classified(e2);
+        cap.stop();
+        CHECK(r.outcome == EventInsertOutcome::Inserted); // acked, not an error
+        CHECK(store.event_count() == 2);                   // the event is stored, not lost
+        CHECK(pending_for(db.dsn(), "a") == "1");
+        CHECK(census(db.dsn(), "a", "r1") == verdict_before); // the census write was skipped
+        CHECK(order_text(db.dsn(), "a") == order_before);     // the step wrote nothing
+        CHECK(store.census_proj_failures_total() == failures_before + 1);
+        CHECK(store.events_ingest_errors_total() == errors_before);
+        CHECK(projected("first_delivery", "failed") == 1);
+        CHECK(projected("first_delivery", "abandoned") == 0);
+        // The cause is the Ensure statement, not a DECIDE that ran in an aborted transaction.
+        CHECK(cap.text().find("agent order step failed") != std::string::npos);
+        CHECK(cap.text().find("ensure failed") != std::string::npos);
+        CHECK(cap.text().find("forced ensure failure") != std::string::npos);
+        CHECK(cap.text().find("decide failed") == std::string::npos);
+        CHECK(pool.in_use() == 0);
+
+        // The cause is gone: a redelivery repairs the pending event and the step runs normally.
+        exec_sql(db.dsn(), "DROP TRIGGER yuzu_test_ensure_fail ON " + order_table);
+        CHECK(store.insert_event_classified(e2).outcome == EventInsertOutcome::Redelivered);
+        CHECK(pending_for(db.dsn(), "a") == "0");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e3", "r1", "a", kCompliant, kBase + 300), 5, 12))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(order_text(db.dsn(), "a") == "5|12|-|0|0|0|0|0|0|0");
+    }
+    SECTION("a batch row aborts the batch and leaves nothing behind") {
+        const auto n = store.insert_events({e2});
+        REQUIRE_FALSE(n.has_value());
+        CHECK(n.error().find("agent order step failed") != std::string::npos);
+        CHECK(n.error().find("batch rolled back") != std::string::npos);
+        CHECK(projected("batch", "failed") == 1);
+        CHECK(projected("batch", "abandoned") == 0);
+        CHECK(store.census_proj_failures_total() == failures_before + 1);
+        CHECK(store.event_count() == 1); // the batch went down whole
+        CHECK(order_text(db.dsn(), "a") == order_before);
+        CHECK(census(db.dsn(), "a", "r1") == verdict_before);
+        CHECK(pool.in_use() == 0);
     }
 }
 
@@ -4897,16 +5077,45 @@ TEST_CASE("census ordering: unordered_agents lists the agents whose latest unpai
 }
 
 TEST_CASE("census ordering: unordered_agents counts a never-paired agent whose pair clock is NULL "
-          "and orders ids by bytes",
+          "and orders ids by bytes, whatever the cluster or column collation",
           "[pg][guaranteed_state_store][db][census][ordering][order-read][pair]") {
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
+    // false: the cluster's own default collation, which is the byte order on a C-locale cluster and
+    // proves nothing there. true: the order table's agent_id column is given a non-byte collation, so
+    // an ORDER BY that dropped COLLATE "C" would sort by it, and the case fails on ANY cluster.
+    const bool column_collation = GENERATE(false, true);
+    CAPTURE(column_collation);
+    if (column_collation) {
+        std::string collation;
+        for (const char* candidate : {"und-x-icu", "en-US-x-icu", "en_US.utf8"}) {
+            const std::string quoted = std::string("\"") + candidate + "\"";
+            const std::string probe = "SELECT 'a' COLLATE " + quoted + " < 'B' COLLATE " + quoted;
+            if (!sqlstate_of(db.dsn(), probe).empty())
+                continue; // no such collation on this cluster
+            if (query_scalar(db.dsn(), probe) == "t") {
+                collation = quoted; // sorts 'a' before 'B': byte order does not
+                break;
+            }
+        }
+        if (collation.empty())
+            SKIP("no non-byte collation (ICU or en_US) is available on this cluster");
+        exec_sql(db.dsn(), std::string("ALTER TABLE ") + kSchema +
+                               ".guardian_agent_order ALTER COLUMN agent_id TYPE text COLLATE " +
+                               collation);
+    }
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
-    // Byte order puts 'B' (0x42) before '_' (0x5f) before 'a' (0x61); a locale collation does not.
+    // Ids whose byte order differs from en_US/ICU collation order: 'B' (0x42) before '_' (0x5f)
+    // before 'a' (0x61), upper case before lower case ("Zed" < "apple"), punctuation ahead of
+    // letters or not, "~" (0x7e) after every letter, and multi-byte UTF-8 (0xC3.., 0xE6..) after
+    // every ASCII id although a locale files "é" next to "e" and ignores punctuation entirely.
+    const std::vector<std::string> agents{
+        "a-low", "_x", "B-up", "Zed", "apple", "~tilde", "9-nine", "a.b", "aB",
+        "\xC3\xA9-agent", "\xE6\x97\xA5\xE6\x9C\xAC-agent", "z\xC3\xBC"};
     int n = 0;
-    for (const char* agent : {"a-low", "_x", "B-up"}) {
+    for (const std::string& agent : agents) {
         ++n;
         REQUIRE(store
                     .insert_event_classified(
@@ -4915,11 +5124,21 @@ TEST_CASE("census ordering: unordered_agents counts a never-paired agent whose p
     }
     // Every one of them has a NULL epoch_recv_ns: only COALESCE keeps the comparison from being NULL.
     REQUIRE(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
-                                       ".guardian_agent_order WHERE epoch_recv_ns IS NULL") == "3");
+                                       ".guardian_agent_order WHERE epoch_recv_ns IS NULL") ==
+            std::to_string(agents.size()));
+    std::vector<std::string> expected = agents;
+    std::sort(expected.begin(), expected.end()); // std::string compares bytes, like COLLATE "C"
     const auto r = store.unordered_agents(std::nullopt);
     REQUIRE(r.has_value());
-    CHECK(r->count == 3);
-    CHECK(r->ids == std::vector<std::string>{"B-up", "_x", "a-low"});
+    CHECK(r->count == static_cast<std::int64_t>(agents.size()));
+    CHECK(r->ids == expected);
+    // The head of the byte order spelled out, so a mistake in the expected order built above
+    // cannot hide a wrong answer.
+    REQUIRE(r->ids.size() >= 4);
+    CHECK(r->ids[0] == "9-nine");
+    CHECK(r->ids[1] == "B-up");
+    CHECK(r->ids[2] == "Zed");
+    CHECK(r->ids[3] == "_x");
 }
 
 TEST_CASE("census ordering: unordered_agents caps the id list at 50 and never the count",
