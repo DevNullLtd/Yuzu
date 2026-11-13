@@ -4533,6 +4533,9 @@ groups:
   # These alerts carry `for:` windows and are for paging/escalation — they fire
   # AFTER the LB has already reacted, not before. The pool metrics come from
   # the pool's Observer feed; the reachability metrics from the probe.
+  # The three YuzuPgCollation* alerts are the exception: they are not load-balancer or
+  # readiness related (the collation check never changes /readyz), they read the
+  # collation-check series.
   - name: yuzu-postgres
     rules:
       - alert: YuzuServerPostgresUnreachable
@@ -4615,6 +4618,12 @@ groups:
         # missing scrape is likewise silent here, so keep your own `up == 0` alert on the
         # server job. The check repeats every minute while it is 1, so after the database is
         # fixed the next check sets the gauge to 0 and this clears without a restart.
+        # With N replicas one database mismatch raises N alerts (each replica exports its own
+        # gauge and checks on its own schedule, up to an hour apart at drift onset); group the
+        # notifications by alertname and job so one repair is one page.
+        # After a restart during an unreadable spell the gauge is absent until the first
+        # recheck, so a standing alert can resolve and fire again a minute or two later
+        # (reasoned, not measured).
         expr: |
           yuzu_pg_collation_version_mismatch == 1
         for: 1m
@@ -4626,26 +4635,31 @@ groups:
             The database's recorded collation version is not the version the operating
             system of the PostgreSQL server reports, so text-keyed indexes may be ordered
             under the old rules. Ordered reads of a text key, such as a keyset page walk,
-            can then skip or repeat rows without any error. The server does not stop or refuse
+            can then skip or repeat rows without any error. The server does not stop or change
             anything because of this signal: it keeps serving, and the gauge and the log line
             are the whole report.
-            Each replica exports its own gauge.
+            Each replica exports its own gauge, so with N replicas one database mismatch
+            raises N of these alerts, which one repair clears together within about a minute;
+            group the notifications by alertname and job.
             The server log has one "[PG] database ... collation version" error line naming
-            the database and both versions. Remedy, in this order: connect to the affected
+            the database and both versions. Remedy, in this order, as a change under your own
+            process with a verified backup first: connect to the affected
             database; reindex it (REINDEX DATABASE CONCURRENTLY "<name>" on a server that
             is serving traffic, or REINDEX DATABASE "<name>" with the Yuzu servers
             stopped); only when the reindex has finished for every index, run ALTER DATABASE
             "<name>" REFRESH COLLATION VERSION (it records the version and rebuilds nothing,
-            so it clears this alert whether or not the reindex worked). The server rechecks
-            every minute while the mismatch stands, so this clears within about a minute and
-            without a restart. If the reindex fails on a duplicate key, stop the servers and
-            resolve the duplicates by hand first (see the runbook). A database
-            created with the C collation has no collation version and is not affected. This rule needs a
-            successful scrape and a check that can run: a server that is down or an
-            unreachable /metrics silences it, and an absent series means the check could not
-            run, not that the database is healthy, so keep your own `up == 0` alert; the
-            alert YuzuPgCollationCheckBlind covers a check that cannot run. Runbook:
-            docs/user-manual/server-admin.md, "PostgreSQL collation version".
+            so it clears this alert whether or not the reindex worked; the check compares
+            version strings only, so the reindex is what makes the result certain). The server
+            rechecks every minute while the mismatch stands, so this clears within about a
+            minute and without a restart. If the reindex fails on a duplicate key, stop the
+            servers and resolve the duplicates by hand first (see the runbook). A database
+            created with the C collation has no collation version and is not affected. This
+            rule needs a successful scrape and a check that can run: a server that is down or
+            an unreachable /metrics silences it, and an absent series means the check could not
+            run or does not apply, not that the database is healthy, so keep your own
+            `up == 0` alert; the alert YuzuPgCollationCheckBlind covers a check that cannot
+            run. Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
       - alert: YuzuPgCollationCheckBlind
         # The companion of YuzuPgCollationVersionMismatch: that rule reads the gauge, and the
@@ -4654,24 +4668,43 @@ groups:
         # keep failing: at least five "unreadable" results in ten minutes, held for five.
         # Why ten minutes and not the hours the hourly cadence would suggest: the first failed
         # check puts the replica on the one-minute cadence (so do a standing Mismatch and no
-        # conclusive verdict), so a check that cannot run fails about once a minute, and a
-        # window of hours would stay true for hours after a short outage. Five failures in
-        # ten minutes assume a check cycle under about two minutes (the one-minute cadence
-        # above); at a slower cadence five failures do not fit in the window. Measured with
-        # promtool at one failure a minute: exactly five failures go pending and do not fire
-        # (the window ages the first one out before the 5m hold ends), and six fire. A failover
-        # blip of a few checks never reaches it, and the alert resolves about ten minutes after
-        # the checks run again. The first failure after a settled hour waits for the hourly tick, so the
-        # alert fires about five minutes after that plus the hold, not from the outage start.
+        # conclusive verdict), so a check that cannot run fails about once a minute (a check is
+        # a 60 s wait plus its own duration, 61 to 75 s), and a window of hours would stay true
+        # for hours after a short outage. Five failures in ten minutes assume a check cycle under
+        # about two minutes; at a slower cadence five failures do not fit in the window.
+        # MEASURED with promtool v3.13.1 (Prometheus 3 left-open range selectors) at exactly one
+        # failure a minute: five failures go pending and never fire (the window ages the first
+        # one out before the 5m hold ends), six fire for one evaluation. REASONED, not
+        # measured: on Prometheus 2.x (closed ranges) five failures would fire; with a
+        # continuous outage the alert fires about ten minutes after the first counted failure at
+        # any scrape interval up to about two minutes, on 2.x or 3.x; and it clears about SIX
+        # minutes after the last failed check (the window keeps at least five events until the
+        # fifth from last ages out; the rule has no keep_firing_for). Whether a burst of
+        # exactly five or six failures that then stops fires depends on the Prometheus version,
+        # the scrape interval and the check duration: do not rely on it; read it as about five to
+        # six failures. A failover blip of a few checks never reaches it. The first failure after a
+        # settled hour waits for the hourly tick, so the alert fires about ten minutes after that
+        # failure, not from the outage start. The shipped docker-compose.yml pins Prometheus
+        # v3.2.1.
         # Why it keys on the "unreadable" counter and NOT on the absence of "ok" increases:
         # the start-time check runs in the constructor, before the first scrape, so the "ok"
         # series is first scraped already at 1 and shows no increase until the first recheck
         # that concludes: an "ok"-based rule would see no successful check, and false-fire,
-        # after each restart. The counter is pre-seeded to 0 for every result, so a recheck
-        # failure after a healthy start is counted; a failure of the start-time check itself
-        # is not counted by a fresh series, but it leaves no conclusive verdict, so the
-        # rechecks that follow run every minute and a check that cannot read from boot fires
-        # about ten to fifteen minutes after boot.
+        # after each restart. The counter is created at 0 for every result BEFORE the
+        # start-time check, and the start-time check IS counted, but a series first scraped
+        # already at 1 gives increase() no earlier sample, so this rule cannot see that one
+        # failure; a recheck failure after a healthy start is counted and seen. A check that
+        # cannot read from boot fires about ten to fifteen minutes after boot (reasoned) because
+        # the rechecks that follow run every minute.
+        # KNOWN LIMITS (reasoned): (1) a check stuck mid-query adds no increments, leaves the
+        # gauge as it was and logs nothing, so this rule and the mismatch rule stay silent;
+        # YuzuPgCollationCheckStale covers it after about two hours plus its hold. (2) a replica
+        # that restarts more often than once a minute while the check keeps failing never
+        # rechecks and its counter is born at 1 after each start, so increase() sees nothing
+        # and no counter-based alert from this feature fires: the alert YuzuServerRestartLoop is
+        # the one for a replica that restarts repeatedly, with its own limits (it needs more
+        # than 3 resets of yuzu_server_uptime_seconds in 3 hours and one continuous series per
+        # instance, and a loop faster than the metrics sweep can keep it silent; see its comment).
         # The 10m window, the threshold of 5 and the 5m hold are claims reasoned from the
         # cadence, not measured values.
         expr: |
@@ -4682,16 +4715,21 @@ groups:
         annotations:
           summary: "Yuzu server {{ $labels.instance }}: the PostgreSQL collation check has been unable to run"
           description: >-
-            The collation check has failed at least five times in ten minutes and kept failing
-            for about five minutes or more (it runs every minute once it starts failing; at
-            that cadence this takes six failures), so yuzu_pg_collation_version_mismatch is stale and
-            says nothing about the database: a mismatch could be present and unreported.
-            One cause is a database that records a collation version while the PostgreSQL
-            host reports none (for example after a base image change under an existing data
-            volume); the documented reindex followed by ALTER DATABASE ... REFRESH COLLATION
-            VERSION is the way out, and what REFRESH does on a host that reports no version
-            has not been verified. If the check cannot read from boot, this fires about ten
-            to fifteen minutes after boot (the failed start-time check is not counted).
+            The collation check has failed repeatedly: at least five times in ten minutes and
+            still failing after about five minutes (it runs every minute once it starts failing;
+            at that cadence this takes about five to six failures, which depends on the
+            Prometheus version and the scrape interval; do not rely on the exact count), so
+            yuzu_pg_collation_version_mismatch is stale and says nothing about the database: a
+            mismatch could be present and unreported.
+            Causes: PostgreSQL is down or unreachable, the pool is saturated (a lease cannot be had
+            in time), a catalog read is not allowed, or the database records a collation version
+            while the PostgreSQL host reports none (for example after a base image change under
+            an existing data volume). In that last case the check is permanently unreadable
+            and this alert does not clear: ALTER DATABASE ... REFRESH COLLATION VERSION fails
+            with "invalid collation version change" (measured on PostgreSQL 18.4 only, on a
+            C-locale database with a forced recorded value that has the same facts), so the
+            reindex-then-refresh way out does not apply; see the exits in the runbook. Meanwhile
+            silence this alert for that instance, with an expiry, rather than fleet-wide.
             Look for the "[PG] could not check the database collation version" WARN line in
             the server log. Check that PostgreSQL is reachable from this replica, and that
             pg_database_collation_actual_version() returns a value for the database.
@@ -4699,8 +4737,49 @@ groups:
             to its first occurrence; it names the cause. To check by hand, run: SELECT
             datcollversion, pg_database_collation_actual_version(oid) FROM pg_database
             WHERE datname = current_database();
-            The rule clears about ten minutes after the checks run again. Runbook:
-            docs/user-manual/server-admin.md, "PostgreSQL collation version".
+            With a continuous outage this fires about ten minutes after the first counted
+            failure and clears about six minutes after the last failed check. A check that
+            cannot read from boot fires about ten to fifteen minutes after boot (the failure of
+            the start-time check itself is counted but cannot be seen by increase()).
+            Known limits: a check stuck mid-query is covered by YuzuPgCollationCheckStale, not
+            by this alert; a replica restarting more often than once a minute while the check
+            keeps failing is not seen by this alert (see YuzuServerRestartLoop and your own
+            `up == 0` rule). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
+            version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuPgCollationCheckStale
+        # The third collation alert: no check has COMPLETED (with any verdict, ok, mismatch,
+        # not_applicable or unreadable) for two hours. The server sets
+        # yuzu_pg_collation_check_last_completed_timestamp_seconds on every applied report, the
+        # start-time one included; it is absent only until the first report and never removed. The
+        # settled cadence is one hour, so 7200 s is two missed hourly checks, and the 10m hold
+        # rides out a scrape or recheck jitter; a check stuck mid-query is therefore seen after
+        # about two hours plus the hold. It covers what neither of the other two can: a stuck
+        # check adds no counter increments, leaves the mismatch gauge as it was and logs nothing.
+        # An absent series (a process that never finished its boot check, or a scrape gap) is
+        # silent here: keep your own `up == 0` rule. The value is a replica wall-clock time
+        # compared with Prometheus's time(), so a replica clock that is off by hours moves the
+        # threshold (reasoned). The 7200 s and the 10m hold are reasoned from the cadence, not
+        # measured; promtool covers the arithmetic only.
+        expr: |
+          time() - max by (job, instance) (yuzu_pg_collation_check_last_completed_timestamp_seconds) > 7200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: no PostgreSQL collation check has completed for two hours"
+          description: >-
+            The latest completed collation check on {{ $labels.instance }} is more than two
+            hours old; the settled cadence is one hour, so at least two checks were missed. The
+            recheck thread is hung (for example a check stuck mid-query) or the process is
+            wedged. While this fires, yuzu_pg_collation_version_mismatch and
+            yuzu_pg_collation_check_total say nothing about the database. Look at the server
+            log and the thread state of the process. An absent series (a process that never
+            finished its boot check, or a scrape gap) does not fire this alert: keep your
+            own `up == 0` rule. Runbook: docs/user-manual/server-admin.md, "PostgreSQL
+            collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
   # HA WS-11 (#4014, ADR-2002 §3/§6/§10/§11): the fenced LeaderElector, as each
   # replica reports it on its own /metrics. READ BEFORE EDITING OR COPYING:

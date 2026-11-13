@@ -110,6 +110,11 @@ RestartSec=5
 # below a few seconds (#4666 PR-4): the T_server dedicated async logger's exit-time worker
 # join has no self-armed watchdog, so a stalled log sink leaves it bounded ONLY by a second
 # SIGTERM or this deadline — see guardian_ingest.hpp's own header banner.
+# A FOURTH stage joins late in stop(), just before the PostgreSQL pool is reset: the
+# collation-version recheck, up to about 15s for a check in flight (about 35s on a network
+# that drops packets, no bound against a backend that never answers). On the documented
+# figures it fits (about 145s with the ~130s stacked waits) but does not clearly fit on top of
+# the ~190s thread-exhaustion fallback path; see docs/user-manual/upgrading.md.
 TimeoutStopSec=210
 
 # File-descriptor headroom. The default 1024 soft limit is comfortably

@@ -46,7 +46,7 @@ passes on `health_recompute_thread_` are folded into a single
 which is NOT, is enumerated separately). Passes on their own dedicated component
 threads (cert reloader, catalogue rollup, software-title normalisation, provisional-MFA
 cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
-WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
+WS-8 - the Postgres reachability probe, and the PostgreSQL collation-version recheck) each get their own entry too - the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
 an earlier revision missed eight of these; later additions (53 passes now, including the one-shot
 `inventory_store.purge_typed_sources` on `typed_purge_thread_` and the hourly
@@ -69,7 +69,7 @@ that header.
   and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, software-title normalisation (`software_normalization_job.run_tick`), provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
   `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
-  Postgres reachability probe).
+  Postgres reachability probe, the collation-version recheck).
 - That proves **named⇒classified** for those sites. It does **not** yet prove
   **pass⇒named** for every dispatch site — a `consteval`/CI sweep visiting *all* of
   them is a tracked follow-up (#4094) — so completeness rests on this table, the

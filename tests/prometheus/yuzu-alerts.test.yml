@@ -9182,3 +9182,129 @@ tests:
       - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing"}'
         eval_time: 200m
         exp_samples: []
+
+  # CASE -- documents a BLIND SPOT, not a feature: a replica that restarts more often than once a
+  # minute while its check keeps failing never rechecks, and its counter is born at 1 after each
+  # start (the start-time failure is counted, but the series is first scraped already at 1), so the
+  # series sits flat at 1 across every restart and increase() sees nothing. YuzuPgCollationCheckBlind
+  # stays silent at every point; YuzuServerRestartLoop and an `up == 0` rule are the cover. Red if
+  # the rule were ever changed so a flat counter fired, and a reminder that this case must be
+  # revisited if the rule changes.
+  - interval: 1m
+    name: pg collation check blind - a crash loop (counter flat at 1 across restarts) is a blind spot
+    input_series:
+      - series: 'yuzu_pg_collation_check_total{job="yuzu",instance="s1",result="unreadable"}'
+        values: "1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="pending"}'
+        eval_time: 60m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing"}'
+        eval_time: 110m
+        exp_samples: []
+
+  # CASE -- the "ok" result rises every minute while "unreadable" does not move (a non-zero value
+  # left from an earlier spell): quiet at every point. Red if the rule read the total or the "ok"
+  # series, or lost its result="unreadable" selector.
+  - interval: 1m
+    name: pg collation check blind - ok rising while unreadable stays flat does not fire
+    input_series:
+      - series: 'yuzu_pg_collation_check_total{job="yuzu",instance="s1",result="ok"}'
+        values: "1+1x120"
+      - series: 'yuzu_pg_collation_check_total{job="yuzu",instance="s1",result="unreadable"}'
+        values: "3x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="pending"}'
+        eval_time: 30m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing"}'
+        eval_time: 100m
+        exp_samples: []
+
+  # CASE -- two replicas: s1 fails six times a minute apart (failures at minutes 10 to 15) and s2
+  # does not. The alert fires for s1 only (at 19m, as in the six-failure case above) and never
+  # names s2. Red if the rule lost its `by (job, instance)` grouping and summed the fleet.
+  - interval: 1m
+    name: pg collation check blind - one failing instance fires for that instance only
+    input_series:
+      - series: 'yuzu_pg_collation_check_total{job="yuzu",instance="s1",result="unreadable"}'
+        values: "0x9 1+1x5 6x120"
+      - series: 'yuzu_pg_collation_check_total{job="yuzu",instance="s2",result="unreadable"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing"}'
+        eval_time: 19m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="pending"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationCheckBlind", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- YuzuPgCollationCheckStale: the last-completed timestamp stops advancing (a check stuck
+  # mid-query, the series stays at its last value 1000, a Unix time 1000 s after the epoch). The
+  # promtool clock starts at the epoch, so time() - 1000 passes 7200 at 8200 s (136m40s): the
+  # first true evaluation is at 137m, the 10m hold ends at 147m. Quiet at 130m (the timestamp is
+  # 6800 s old at 7800 s), pending at 140m, firing at 150m. Red if the threshold or the hold moved.
+  - interval: 1m
+    name: pg collation check stale - a timestamp that stops advancing fires after two hours and the hold
+    input_series:
+      - series: 'yuzu_pg_collation_check_last_completed_timestamp_seconds{job="yuzu",instance="s1"}'
+        values: "1000x200"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending"}'
+        eval_time: 130m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending"}'
+        eval_time: 140m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
+        eval_time: 140m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
+        eval_time: 150m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE -- a settled replica whose timestamp advances once an hour (the hourly cadence) never gets
+  # more than 3600 s stale, so YuzuPgCollationCheckStale stays quiet for the whole run. The values
+  # are the Unix time of each hourly check (3600, 7200, ... in seconds).
+  - interval: 1m
+    name: pg collation check stale - a timestamp that advances hourly stays quiet
+    input_series:
+      - series: 'yuzu_pg_collation_check_last_completed_timestamp_seconds{job="yuzu",instance="s1"}'
+        values: "0x59 3600x60 7200x60 10800x60 14400x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
+        eval_time: 100m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending"}'
+        eval_time: 200m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
+        eval_time: 290m
+        exp_samples: []
+
+  # CASE -- an absent series is silent: a process that never finished its boot check (or a scrape
+  # gap) is covered by the operator's own `up == 0` rule, not by this alert. An unrelated series is
+  # present so the test has data.
+  - interval: 1m
+    name: pg collation check stale - an absent series stays quiet
+    input_series:
+      - series: 'yuzu_server_uptime_seconds{job="yuzu",instance="s1"}'
+        values: "60+60x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale"}'
+        eval_time: 250m
+        exp_samples: []
