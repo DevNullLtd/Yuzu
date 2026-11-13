@@ -2150,7 +2150,8 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
         // file-wide "never hold mu_ across a DB call" discipline, which
         // recheck_role_after_credential_check's mu_-inside-row-lock acquisition relies on to
         // stay deadlock-free against the owner's `auth.users` row lock).
-        const auto res = rbac_store_->deactivate_account(username);
+        const auto res =
+            rbac_store_->deactivate_account(username, SessionGenerationMode::kNoSessionStore);
         using Kind = AccountDeactivationResult::Kind;
         if (res.kind == Kind::kLastAdministratorRefused)
             return RemoveUserOutcome::LastAdministratorRefused; // nothing changed: no cleanup

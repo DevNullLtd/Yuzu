@@ -809,7 +809,8 @@ RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
 // UPDATE. A recount folded into the write's statement (or issued before it) would count the
 // target itself.
 AccountDeactivationResult
-RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
+RbacAdminAuthorityOwner::deactivate_account(const std::string& username,
+                                            [[maybe_unused]] SessionGenerationMode session_mode) const {
     // A name `is_valid_username` rejects can never be a stored account (every writer validates),
     // so it is `kNotFound` BEFORE any statement runs: an embedded NUL would truncate at the libpq
     // parameter boundary and an over-long name is not a row. Same gate `provision_first_admin`
