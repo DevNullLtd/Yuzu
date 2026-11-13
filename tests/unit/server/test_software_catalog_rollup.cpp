@@ -48,6 +48,11 @@ yuzu::test::PgTestTemplate swinv_tpl{"swinv", [](const std::string& dsn) {
                                              throw std::runtime_error(
                                                  "swinv template: store failed to migrate");
                                      }};
+
+// The idle-wait step the worker re-checks its stop flag at, in place of production's 5 s
+// (kCatalogRollupStopPoll): a stop() on a parked worker joins within one step, so the cases
+// below no longer wait out 5 s per join. The joins and the cadence are otherwise production's.
+constexpr std::chrono::milliseconds kTestStopPoll{50};
 } // namespace
 
 TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][rollup]") {
@@ -62,7 +67,7 @@ TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][ro
     const auto interval = std::chrono::hours{1};
 
     SECTION("start → stop joins cleanly; double-stop is an idempotent no-op") {
-        SoftwareCatalogRollup rollup{store, interval};
+        SoftwareCatalogRollup rollup{store, interval, nullptr, kTestStopPoll};
         rollup.start();
         rollup.stop(); // signals + joins
         rollup.stop(); // must not double-join / crash
@@ -70,7 +75,7 @@ TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][ro
     }
 
     SECTION("start is idempotent; start-after-stop restarts") {
-        SoftwareCatalogRollup rollup{store, interval};
+        SoftwareCatalogRollup rollup{store, interval, nullptr, kTestStopPoll};
         rollup.start();
         rollup.start(); // already running → no-op (guarded by thread_.joinable())
         rollup.stop();
@@ -81,7 +86,7 @@ TEST_CASE("SoftwareCatalogRollup thread lifecycle", "[pg][software_inventory][ro
 
     SECTION("destructor stops + joins a running thread without an explicit stop") {
         {
-            SoftwareCatalogRollup rollup{store, interval};
+            SoftwareCatalogRollup rollup{store, interval, nullptr, kTestStopPoll};
             rollup.start();
         } // dtor → stop() → join
         SUCCEED("dtor joined the running thread");
@@ -93,8 +98,9 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
           "[pg][software_inventory][rollup]") {
     // HA WS-8 (RD-1): stop() calls request_stop() when draining begins so an hourly
     // recompute cannot START inside the drain grace and then run its full statement
-    // budget after it. A 1s interval makes the loop re-arm after one 5s sleep step,
-    // so without request_stop() a second recompute would run inside the window below.
+    // budget after it. A 1s interval slept in 100 ms steps makes the loop re-arm after 1 s
+    // (production's 5 s step would make that 5 s), so without request_stop() a second
+    // recompute would run inside the 3 s window below.
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -108,14 +114,15 @@ TEST_CASE("SoftwareCatalogRollup::request_stop — no NEW recompute starts, the 
                    .value();
     };
 
-    SoftwareCatalogRollup rollup{store, std::chrono::seconds{1}, &metrics};
+    SoftwareCatalogRollup rollup{store, std::chrono::seconds{1}, &metrics,
+                                 std::chrono::milliseconds{100}};
     rollup.start();
     for (int i = 0; i < 100 && recomputes() < 1; ++i) // the immediate first recompute
         std::this_thread::sleep_for(std::chrono::milliseconds{100});
     REQUIRE(recomputes() == 1);
 
     rollup.request_stop();                                // must not block
-    std::this_thread::sleep_for(std::chrono::seconds{7}); // > one 5s re-arm step
+    std::this_thread::sleep_for(std::chrono::seconds{3}); // 3x the 1 s re-arm
     CHECK(recomputes() == 1);                             // no new recompute started
 
     const auto t = std::chrono::steady_clock::now();
@@ -160,7 +167,7 @@ TEST_CASE("SoftwareCatalogRollup worker refreshes the components rollup and emit
     yuzu::MetricsRegistry metrics;
     constexpr const char* kStem = "yuzu_inventory_component_rollup";
     const std::string stamp = std::string(kStem) + "_last_success_timestamp";
-    SoftwareCatalogRollup rollup{store, std::chrono::hours{1}, &metrics};
+    SoftwareCatalogRollup rollup{store, std::chrono::hours{1}, &metrics, kTestStopPoll};
     rollup.start();
     // The worker publishes a finished tick only through this gauge (it has no completion hook or
     // CV), so the wait polls it. The 60 s is a deadlock guard, not a timing assumption: the test
