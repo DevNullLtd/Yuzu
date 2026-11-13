@@ -14762,13 +14762,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 //     nothing, `AND 1=0`), the same admission as the REST list twin;
                 //   - any other confined caller: the owner-only filter, exactly as before.
                 const ExecutionOwnerKey owner = execution_owner_key(*session);
-                const bool service_scoped = gate.scope.has_value() && owner.empty();
+                const bool service_scoped = !session->token_scope_service.empty();
                 if (gate.scope && !service_scoped)
                     // Non-empty: the raw username was guarded above.
                     eq.dispatched_by = owner_only_filter(owner);
                 // An unrestricted (default) VisibleSet pushes down nothing.
-                const auto query_scope = confined_list_scope(
-                    owner, service_scoped ? gate.scope : authz::VisibleSet{});
+                const authz::VisibleSet unrestricted;
+                const auto query_scope =
+                    confined_list_scope(owner, service_scoped ? gate.scope : unrestricted);
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 // #4030: reconciled onto the fragment's fuller field set —
                 // populate last_error_detail so the error preview below is

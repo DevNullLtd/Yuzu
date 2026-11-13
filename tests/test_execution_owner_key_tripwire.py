@@ -215,7 +215,7 @@ SCOPE_CALLS: dict[tuple[str, str, str, tuple[str, ...]], tuple[int, str]] = {
      (_CONF,)):
         (1, "MCP get_execution_children"),
     (_SRC + "mcp_server.cpp", "query_executions_checked", "query_scope",
-     ("confined_list_scope(owner,service_scoped?gate.scope:authz::VisibleSet{})",)):
+     ("confined_list_scope(owner,service_scoped?gate.scope:unrestricted)",)):
         (1, "MCP list_executions: the sanctioned scope form (service-scoped sessions engage the "
             "scope with an empty key; others pass the unrestricted default and use the owner-only "
             "filter pinned by CHECK 1)"),

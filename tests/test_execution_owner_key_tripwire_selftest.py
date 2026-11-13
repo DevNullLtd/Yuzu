@@ -168,7 +168,7 @@ def main() -> int:
             ("a braced empty scope", "execution_routes.cpp",
              "query_executions_checked(q, scope_arg)", "query_executions_checked(q, {})"),
             ("MCP list_executions moved off its sanctioned scope form", "mcp_server.cpp",
-             "const auto query_scope = confined_list_scope(\n                    owner, service_scoped ? gate.scope : authz::VisibleSet{});",
+             "const auto query_scope =\n                    confined_list_scope(owner, service_scoped ? gate.scope : unrestricted);",
              "const auto query_scope = confined_list_scope(owner, authz::VisibleSet{});"),
             ("the default scope restored on the declaration", "execution_tracker.hpp",
              "query_executions_checked(const ExecutionQuery& q, const ExecutionScope& scope) const;",
@@ -400,8 +400,8 @@ def main() -> int:
     # ---- a pure reformat of a frozen spelling must NOT trip -------------------------------------
     for what, rel, old, new in (
             ("a re-wrapped confined_list_scope initialiser", "mcp_server.cpp",
-             "const auto query_scope = confined_list_scope(\n                    owner, service_scoped ? gate.scope : authz::VisibleSet{});",
-             "const auto query_scope = confined_list_scope(owner, service_scoped ?\n  gate.scope\n : authz::VisibleSet{});"),
+             "const auto query_scope =\n                    confined_list_scope(owner, service_scoped ? gate.scope : unrestricted);",
+             "const auto query_scope = confined_list_scope(owner, service_scoped ?\n  gate.scope\n : unrestricted);"),
             ("an unbraced-to-braced attribution write", "mcp_server.cpp",
              "if (gate.scope && !service_scoped)\n                    // Non-empty: the raw username was guarded above.\n"
              "                    eq.dispatched_by = owner_only_filter(owner);",
