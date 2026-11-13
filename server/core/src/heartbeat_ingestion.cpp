@@ -117,8 +117,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // The list goes to its own row (it is written once per session, never on the hot row) and
         // only for the session that reported it. The flag is set after a SUCCESSFUL write only, so
         // a failure retries on the next heartbeat.
-        // Only for the CURRENT session: a late heartbeat for an older session must not store the
-        // new session's list under the old id (and mark it published, so it is never republished).
+        // Only for the CURRENT session: a late heartbeat for an older session does not store the
+        // new session's list under the old id (a re-registration in the same instant can still
+        // slip through; the new session then republishes at its next heartbeat and overwrites it).
         // A failed write backs off (no per-heartbeat database round trip while the store is
         // unhealthy or the list is unpublishable); a mismatch costs nothing and tries again.
         if (upserted && published_sess && !session_id.empty() &&

@@ -649,6 +649,12 @@ void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset)
         .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
 }
 
+void AgentRegistry::age_plugin_cache_for_test(std::chrono::seconds by) {
+    std::lock_guard lock(missing_plugin_mu_);
+    for (auto& [_, e] : missing_plugin_cache_)
+        e.at -= by;
+}
+
 void AgentRegistry::expire_presence_cache_for_test() {
     std::lock_guard lock(presence_cache_mu_);
     presence_cache_at_ -= kPresenceCacheTtl;
@@ -738,7 +744,9 @@ namespace {
 /// a send to this session is in flight, i.e. it HAS a path, and a stalled stream must not stall
 /// the dispatch gate that asks. `set_gateway_route` also holds it briefly while it publishes a
 /// placement; judging that session deliverable only routes it through `send_to` (the pre-hp-1
-/// behaviour), which is the safe direction.
+/// behaviour). That is the safe direction for security (the capability check runs in `send_to`),
+/// not for delivery: a directory-only session probed in that instant can be reported not-sent
+/// where the directory path would have queued it, and the next dispatch succeeds.
 /// `send_to` and `send_to_all` keep their own inline `gateway_node`/`stream` tests (they take
 /// `stream_mu` blocking and act on the result): a change to what counts as a delivery path must
 /// update them too.

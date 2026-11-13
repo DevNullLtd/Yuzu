@@ -403,6 +403,30 @@ bool OfflineEndpointStore::publish_plugins(std::string_view agent_id, std::strin
     return true;
 }
 
+bool OfflineEndpointStore::clear_plugins_of_other_sessions(std::string_view agent_id,
+                                                           std::string_view current_session_id) {
+    if (!open_ || agent_id.empty() || current_session_id.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kUpsertAcquireTimeout);
+    if (!lease) {
+        record_presence_store_failure(metrics_, "clear_plugins", /*had_lease=*/false);
+        return false;
+    }
+    // Best effort. Removes only lists reported by OTHER sessions, so the owner's own publish for
+    // the current session is never touched, whichever of the two lands first.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM endpoint_state.endpoint_plugins WHERE agent_id = $1 AND session_id <> $2",
+        std::vector<std::string>{std::string(agent_id), std::string(current_session_id)});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::debug("OfflineEndpointStore: clear_plugins failed for agent={}: {}", agent_id,
+                      PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "clear_plugins", /*had_lease=*/true);
+        return false;
+    }
+    return true;
+}
+
 std::expected<std::vector<std::string>, PresenceReadError>
 OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
                                                     std::string_view plugin) {
@@ -657,7 +681,7 @@ void OfflineEndpointStore::set_metrics(yuzu::MetricsRegistry* m) {
     for (const char* reason : {"store_unavailable", "db_error"})
         m->counter("yuzu_server_agent_presence_store_failed_total",
                    {{"op", "find_within"}, {"reason", reason}});
-    for (const char* op : {"query_without_plugin", "publish_plugins"})
+    for (const char* op : {"query_without_plugin", "publish_plugins", "clear_plugins"})
         for (const char* reason : {"store_unavailable", "db_error"})
             m->counter("yuzu_server_agent_presence_store_failed_total",
                        {{"op", op}, {"reason", reason}});

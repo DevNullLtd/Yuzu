@@ -2328,13 +2328,13 @@ batched directory read per dispatch, and a degraded read for it now sets `route_
 classification change, not a routing change). `send_via_directory` re-checks at send time: if the CONNECTED
 landed after the decision it hands the id to `send_to` (which stamps the local placement and applies the
 dispatch-tag capability check), and it applies the per-OS kill switch (#5294) to a local session's OS. The
-delivery-path read only TRY-locks `stream_mu`, so a stalled stream write cannot stall the dispatch gate.
+delivery-path read only TRY-locks `stream_mu`, so a stalled stream write cannot stall the dispatch gate. Follow-up, deliberately not done here (touching Erlang triggers the gateway rows): the header comment of `gateway/apps/yuzu_gw/src/yuzu_gw_upstream.erl` (about lines 169-173) still quotes the old log text and describes `connected_unverified` as conditional on a local session; update it with the next gateway-touching change.
 (b) *hp-2, snapshot half.* The fleet snapshot's `os` on a replica with no session comes from the presence row
 (a primary-key read, only when this heartbeat's presence write succeeded; local wins; blank stays blank). The
 guardian heartbeat reconcile on a non-owning replica is NOT done: its push needs a local session, so it still
 reports `no_session`, and #5685 stays open for it. (c) *#6339.* `resolve_sessions` refuses a session id whose
-local map and directory row name different agents (`session_lookup/agent_mismatch`) and lists it as unknown,
-so the gateway replays `ProxyRegister` and the register path decides who holds it (the agent that is not the
+local map and directory row name different agents (`session_lookup/agent_mismatch`) and lists it for replay (not
+counted as an unknown session), so the gateway replays `ProxyRegister` and the register path decides who holds it (the agent that is not the
 row's holder is refused `held_by_other_agent`); the no-row `announce_connected` probe is not added. This
 narrows the BatchHeartbeat and ProxyInventory attribution only: the tombstoned-victim CONNECTED window of
 the 2026-10-22 update is unchanged.
@@ -2347,13 +2347,22 @@ one (it reads as unknown). `AgentRegistry::ids_missing_plugin` merges the live i
 the plugin (per-plugin result cached for the presence TTL, one refresher per plugin, no registry lock held
 across the database read). Local wins; an agent with no list, a degraded or truncated read, and every protective
 action fail open or stay exempt. The read is skipped altogether unless the durable presence holds more rows than
-this replica has sessions, so a single replica never pays it; a caller that arrives while a refresh is in flight
+this replica has sessions, so a single replica never pays it (local sessions whose presence row has not landed,
+a tripped batch or a failed upsert, can offset real remote rows and switch the withhold off for that window: an
+under-withhold, not a wrong refusal); a caller that arrives while a refresh is in flight
 is served a previous entry only if it is under 30 s old (else it fails open); a list the caps would cut (over 256
 names, an empty or over-64-byte name) is not stored in part, because a missing name would read as absent; the
-heartbeat publishes only for the registry's current session and backs off 60 s after a failed write. Limits, not
-closed: an agent that restarts with a changed plugin set can be judged by its OLD list on another replica until
-the first heartbeat of its new session (about one heartbeat plus the 3 s cache, a false `plugin_not_found` that
-self-heals); if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
+heartbeat publishes only for the registry's current session and backs off 60 s after a failed write. An ARRIVAL mirror
+(`mirror_arrival_to_presence`, the counterpart of the departure mirror, fired where a stream is established:
+direct Subscribe start and gateway CONNECTED on any replica, never in Register) deletes plugin lists published by
+OTHER sessions of the agent (`clear_plugins_of_other_sessions`, best effort, 250 ms acquire, counted
+`op="clear_plugins"`), so a restarted agent with a changed plugin set reads as unknown rather than being judged by
+its previous session's list while the endpoint row still names that session. Limits, not closed: if that
+best-effort arrival write fails inside the window (a store failure at that instant) the agent can still be judged
+by its OLD list on another replica until the first heartbeat of its new session (about one heartbeat plus the 3 s
+cache, a false `plugin_not_found` that self-heals); a derived-HIGH residual of a partial failure that needs the
+project lead's risk acceptance before it is carried, and the unsupported second replica does not by itself cap it
+(no admission gate prevents one, #6528); if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
 not republished until the agent re-registers, so visibility fails open; sustained `truncated` on
 `query_without_plugin` (above 100,000 live agents) switches the cross-replica withhold off with no alert; while
 every session lacks a delivery path (after a directory outage) an unfiltered broadcast takes the per-id path with

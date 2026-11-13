@@ -1362,6 +1362,23 @@ TEST_CASE("OfflineEndpointStore plugin lists (session-keyed and served only for 
         CHECK(without("os_info") == Ids{"yuzu_test_pv_lacks"});
     }
 
+    SECTION("arrival clears lists of OTHER sessions only, so a restarted agent reads as unknown") {
+        // The endpoint row still names s2 (its session only advances at the NEW session's first
+        // heartbeat), so without the clear a replica would keep judging the agent by s2's list.
+        CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"});
+        CHECK(store.clear_plugins_of_other_sessions("yuzu_test_pv_lacks", "s2b"));
+        CHECK(without("echo").empty()); // unknown now: fails open
+        // The current session's own list is never touched, whichever side lands first.
+        REQUIRE(store.upsert("yuzu_test_pv_cur", "h", "linux", 1, 0, "1", "x", "s7"));
+        REQUIRE(store.publish_plugins("yuzu_test_pv_cur", "s7", {"os_info"}));
+        CHECK(store.clear_plugins_of_other_sessions("yuzu_test_pv_cur", "s7"));
+        const auto still = without("echo");
+        CHECK(std::ranges::find(still, "yuzu_test_pv_cur") != still.end());
+        // Blank ids do nothing.
+        CHECK_FALSE(store.clear_plugins_of_other_sessions("", "s7"));
+        CHECK_FALSE(store.clear_plugins_of_other_sessions("yuzu_test_pv_cur", ""));
+    }
+
     SECTION("a row older than the ttl is excluded") {
         exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
                            "'2 hours' WHERE agent_id = 'yuzu_test_pv_lacks'");

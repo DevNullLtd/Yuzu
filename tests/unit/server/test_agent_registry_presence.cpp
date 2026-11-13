@@ -22,9 +22,11 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <expected>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -563,6 +565,17 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
                 return std::vector<std::string>{"yuzu_test_pm_lacks"};
             });
         std::thread refresher([&] { (void)r2.ids_missing_plugin("echo", "sql"); });
+        // Releases the blocked read and joins on EVERY exit, including a failed REQUIRE: a joinable
+        // std::thread destroyed by the unwind would call std::terminate and abort the whole binary.
+        struct JoinGuard {
+            std::atomic<bool>& rel;
+            std::thread& t;
+            ~JoinGuard() {
+                rel = true;
+                if (t.joinable())
+                    t.join();
+            }
+        } join_guard{release, refresher};
         const auto started = std::chrono::steady_clock::now();
         while (calls.load() == 0 && std::chrono::steady_clock::now() - started <
                                         std::chrono::seconds(10))
@@ -574,10 +587,56 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
         CHECK(r2.all_ids().size() == 3); // the three presence rows: not blocked by the read
         CHECK(calls.load() == 1);
         release = true;
-        refresher.join();
+        refresher.join(); // the guard then finds it already joined
         CHECK(calls.load() == 1);
         CHECK(r2.ids_missing_plugin("echo", "sql") ==
               std::unordered_set<std::string>{"yuzu_test_pm_lacks"}); // the refresh landed
+    }
+
+    SECTION("a refresh in flight serves a RECENT stale entry but fails open past kMaxStaleServe") {
+        std::atomic<int> calls{0};
+        std::atomic<bool> block_next{false};
+        std::atomic<bool> entered{false};
+        std::atomic<bool> release{false};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                ++calls;
+                if (block_next.exchange(false)) {
+                    entered = true;
+                    while (!release.load())
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                return std::vector<std::string>{"stale-x"};
+            });
+        // With the entry `age` old and a refresh blocked in flight, what does a second caller get?
+        const auto during_refresh = [&](std::chrono::seconds age) {
+            r2.age_plugin_cache_for_test(age);
+            entered = false;
+            release = false;
+            block_next = true;
+            std::thread refresher([&] { (void)r2.ids_missing_plugin("echo", "sql"); });
+            struct JoinGuard {
+                std::atomic<bool>& rel;
+                std::thread& t;
+                ~JoinGuard() {
+                    rel = true;
+                    if (t.joinable())
+                        t.join();
+                }
+            } guard{release, refresher};
+            const auto started = std::chrono::steady_clock::now();
+            while (!entered.load() && std::chrono::steady_clock::now() - started <
+                                          std::chrono::seconds(10))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            REQUIRE(entered.load());
+            return r2.ids_missing_plugin("echo", "sql"); // served while the refresh is in flight
+        };
+        // Populate the entry.
+        REQUIRE(r2.ids_missing_plugin("echo", "sql") == std::unordered_set<std::string>{"stale-x"});
+        CHECK(during_refresh(std::chrono::seconds(4)) ==
+              std::unordered_set<std::string>{"stale-x"}); // past the 3 s TTL, under 30 s: served
+        CHECK(during_refresh(std::chrono::seconds(40)).empty()); // older than 30 s: fail open
     }
 
     SECTION("a single replica never pays the read: presence holds nothing beyond local sessions") {
@@ -624,13 +683,53 @@ TEST_CASE("no-delivery-path predicates never block behind a held stream_mu",
     });
     while (!locked.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    // Returns immediately (never blocks) and reports "has a path" while the lock is held.
-    CHECK_FALSE(registry.lacks_local_delivery_path("yuzu_test_trylock"));
-    CHECK_FALSE(registry.needs_directory_consult("yuzu_test_trylock"));
-    CHECK_FALSE(registry.has_remote_presence({"yuzu_test_trylock"}));
-    done = true;
+    // Returns immediately (never blocks) and reports "has a path" while the lock is held. Run in a
+    // task with a bounded wait: a blocking lock would otherwise hang the test instead of failing it.
+    auto probe = std::async(std::launch::async, [&] {
+        return std::array<bool, 3>{registry.lacks_local_delivery_path("yuzu_test_trylock"),
+                                   registry.needs_directory_consult("yuzu_test_trylock"),
+                                   registry.has_remote_presence({"yuzu_test_trylock"})};
+    });
+    const bool returned = probe.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+    done = true; // let the holder go either way, so a blocked probe can finish and join
     holder.join();
+    REQUIRE(returned);
+    CHECK(probe.get() == std::array<bool, 3>{false, false, false});
     CHECK(registry.lacks_local_delivery_path("yuzu_test_trylock")); // back to no path
+}
+
+// The interleaving that matters for the lock order (`stream_mu` then `gw_pending_mu_`): a command is
+// being sent through the directory while the session's CONNECTED publishes its placement. Whichever
+// wins, a command that was reported queued is queued exactly once, and never as a ghost entry.
+TEST_CASE("send_via_directory racing set_gateway_route queues each accepted command exactly once",
+          "[server][dispatch][ha]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    for (int round = 0; round < 200; ++round) {
+        const std::string id = "yuzu_test_race_" + std::to_string(round);
+        (void)registry.register_agent(make_agent_info(id, "linux", "h"));
+        auto cmd = yuzu::server::detail::ClassifiedCommandTestAccess::make([&] {
+            ::yuzu::agent::v1::CommandRequest c;
+            c.set_command_id("race-" + std::to_string(round));
+            c.set_plugin("os_info");
+            c.set_action("version");
+            c.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+            return c;
+        }());
+        std::atomic<bool> go{false};
+        std::thread connected([&] {
+            while (!go.load()) {}
+            (void)registry.set_gateway_route(
+                id, /*session_id=*/{}, "test-gateway",
+                {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        });
+        go = true;
+        const bool sent = registry.send_via_directory(id, cmd, "cluster-stale");
+        connected.join();
+        const auto pending = registry.drain_gateway_pending();
+        CHECK(pending.size() == (sent ? 1u : 0u)); // reported queued <=> exactly one entry
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

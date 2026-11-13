@@ -242,6 +242,16 @@ public:
     bool publish_plugins(std::string_view agent_id, std::string_view session_id,
                          const std::vector<std::string>& plugin_names);
 
+    /// The ARRIVAL mirror of `remove_if_session`: when `agent_id`'s stream for `current_session_id`
+    /// is established (direct Subscribe, gateway CONNECTED), deletes any plugin list published by
+    /// a DIFFERENT session. The endpoint row's session only advances at the new session's first
+    /// heartbeat, so until then a replica without the session would still judge the agent by its
+    /// previous session's list and could refuse a plugin the new build has (a false
+    /// `plugin_not_found`). Best effort (250 ms acquire, counted `op="clear_plugins"`): a failure
+    /// leaves the window open until that first heartbeat. Returns true when the statement ran.
+    bool clear_plugins_of_other_sessions(std::string_view agent_id,
+                                         std::string_view current_session_id);
+
     /// Ids of agents that are LIVE (the `query_live_ids` predicate) AND have a published plugin
     /// list, from their CURRENT session, that does NOT contain `plugin`. An agent with no list, or
     /// whose list came from an older session (a pre-v5 row, an agent with no inventory, a

@@ -813,6 +813,10 @@ public:
     /// — no caller in `server/core/src/**` references it.
     void expire_presence_cache_for_test();
 
+    /// Test hook: age every cached plugin-capability entry by `by`, so a test can place an entry
+    /// inside or beyond `kMaxStaleServe` without sleeping.
+    void age_plugin_cache_for_test(std::chrono::seconds by);
+
     /// W1.5 / #823: install the device-token store so `register_agent`
     /// revokes any device tokens bound to a previous incarnation of the
     /// same agent_id whenever a re-registration is detected. Optional —

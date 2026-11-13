@@ -3073,6 +3073,47 @@ TEST_CASE("WS-5 BatchHeartbeat: a non-owning replica threads the directory-resol
     CHECK(offline.remove_if_session(agent, sid));
 }
 
+// #5685 follow-up: the arrival mirror. The agent re-registered (new session) but the durable endpoint
+// row still names the previous session, whose published plugin list a replica without the session
+// would keep judging it by. The CONNECTED, handled on ANY replica, drops the previous lists.
+TEST_CASE("WS-5 NotifyStreamStatus: a CONNECTED on a non-owning replica drops the plugin list "
+          "an earlier session published",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    NonOwningReplica other(owner.auth_mgr, owner.store);
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    yuzu::server::HeartbeatIngestion ingestion{other.registry, nullptr, nullptr, &other.metrics,
+                                               &offline};
+    other.svc.set_heartbeat_ingestion(&ingestion);
+
+    const std::string agent = "yuzu_test_ws5_arrival";
+    const std::string new_session = owner.register_live(agent);
+    // Left by the agent's PREVIOUS session: the durable row and a published list lacking "echo".
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", "gw-session-previous"));
+    REQUIRE(offline.publish_plugins(agent, "gw-session-previous", {"os_info"}));
+    {
+        auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+        REQUIRE(r.has_value());
+        REQUIRE(std::ranges::find(*r, agent) != r->end()); // judged by the old list
+    }
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(agent);
+    notif.set_session_id(new_session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-a");
+    notif.set_gateway_node("node-a");
+    gw::StreamStatusAck ack;
+    REQUIRE(other.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+    REQUIRE(ack.acknowledged());
+
+    auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+    REQUIRE(r.has_value());
+    CHECK(std::ranges::find(*r, agent) == r->end()); // unknown now: fails open
+}
+
 TEST_CASE("WS-5 BatchHeartbeat: a session id carried by TWO directory rows is refused "
           "and counted and neither acked nor listed unknown",
           "[pg][gateway_route_wiring][ws5]") {

@@ -373,8 +373,8 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "row (the unique session index refused the fallback insert); the placement is "
             "unpublished and the same alert covers it. "
             "op=\"notify_stream_status\" outcome \"connected_unverified\" is a CONNECTED refused "
-            "because the directory read degraded, whatever session this replica holds locally "
-            "(a gateway with the NOTIFY-ACK change resends it and it is accepted once the "
+            "because the directory read degraded, regardless of any session this replica holds "
+            "locally (a gateway that includes #5695 resends it and it is accepted once the "
             "directory reads; an older gateway leaves the agent undispatchable until it "
             "reconnects). HA WS-5 lookups: "
             "op=\"session_lookup\" outcome=\"ambiguous_session\" means one presented "
@@ -455,7 +455,7 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                           {{"op", "proxy_register"}, {"outcome", "malformed_session_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "proxy_register"}, {"outcome", "session_held_by_other_agent"}});
-        // HA WS-5: CONNECTED refused on a degraded read with no matching local session.
+        // HA WS-5: CONNECTED refused on every degraded directory read (a locally held session does not change this).
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "connected_unverified"}});
         // #1197: BatchHeartbeat's over-length unknown session_id, same shape
@@ -2302,6 +2302,12 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
             response->set_acknowledged(false);
             return grpc::Status::OK;
         }
+        // HA WS-5 #5685 follow-up: the arrival mirror. This runs on whichever replica receives the
+        // CONNECTED (it need not own the session), and drops plugin lists other sessions of this
+        // agent published, so no replica judges the re-registered agent by its previous list.
+        mirror_arrival_to_presence(
+            heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,
+            agent_id, session_id);
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp). As of
         // 4.2b Task C the directory IS read for dispatch (fallback-only, on a
