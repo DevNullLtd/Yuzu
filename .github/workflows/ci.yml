@@ -1976,6 +1976,62 @@ jobs:
             exit 1
           fi
 
+      # MEASUREMENT BRANCH ONLY - DO NOT MERGE. Same-job A/B of the [pg] template
+      # clone strategy (YUZU_TEST_PG_CLONE_STRATEGY): four pg-only passes of the
+      # server-pg suite in ABBA order (default, file_copy, file_copy, default) on
+      # the same runner, build and SHA, each under the same slot gate as the pg
+      # half. Records each pass's wall time (slot wait excluded) and the summed
+      # per-entry durations. Never fails the job.
+      - name: "MEASURE: pg clone strategy A/B (do not merge)"
+        if: success() && matrix.pg_mode == 'full'
+        timeout-minutes: 60
+        env:
+          BUILDDIR: build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}
+          YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
+          YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
+          YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+        run: |
+          LOGS="$BUILDDIR/meson-logs"
+          out="$LOGS/measure-clone.tsv"
+          printf 'pass\tstrategy\trc\tslot_wait_s\twall_s\tserial_s\tentries\trunner\tsha\n' > "$out"
+          i=0
+          for s in default file_copy file_copy default; do
+            i=$((i+1))
+            base="testlog-measure-$i-$s"
+            rm -f "$LOGS/$base".*
+            if [[ "$s" == default ]]; then strat=""; else strat="$s"; fi
+            rc=0
+            start=$(date +%s.%N)
+            YUZU_TEST_PG_CLONE_STRATEGY="$strat" bash scripts/ci/with-test-slot.sh 3 -- \
+              bash -c 'echo "MEASURE_T0 $(date +%s.%N)"; meson test -C "$1" --no-rebuild --logbase "$2" --num-processes 4 --suite server-pg; r=$?; echo "MEASURE_T1 $(date +%s.%N)"; exit $r' _ "$BUILDDIR" "$base" \
+              > "$LOGS/$base.console" 2>&1 || rc=$?
+            tail -n 25 "$LOGS/$base.console"
+            python3 - "$LOGS/$base" "$start" "$i" "$s" "$rc" "$RUNNER_NAME" "$GITHUB_SHA" >> "$out" <<'PY'
+          import json, sys
+          base, start, i, s, rc, runner, sha = sys.argv[1:]
+          t0 = t1 = None
+          for line in open(base + ".console", errors="replace"):
+              if line.startswith("MEASURE_T0 "): t0 = float(line.split()[1])
+              if line.startswith("MEASURE_T1 "): t1 = float(line.split()[1])
+          serial = 0.0; n = 0
+          try:
+              for line in open(base + ".json"):
+                  line = line.strip()
+                  if line:
+                      serial += float(json.loads(line).get("duration", 0)); n += 1
+          except OSError:
+              pass
+          wait = (t0 - float(start)) if t0 else float("nan")
+          wall = (t1 - t0) if (t0 and t1) else float("nan")
+          print(f"{i}\t{s}\t{rc}\t{wait:.1f}\t{wall:.1f}\t{serial:.1f}\t{n}\t{runner}\t{sha}")
+          PY
+          done
+          cat "$out"
+          if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            { echo ""; echo "### MEASURE: pg clone strategy A/B"; echo '```'; cat "$out"; echo '```'; } >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          exit 0
+
       # Sizes the tmpfs PGDATA cap (#4884): host RAM and the
       # persistent cluster's on-disk size after a full pg run, printed to the
       # step log. Never fails the job. Remove once the cap is recorded in
