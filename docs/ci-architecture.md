@@ -34,7 +34,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
   `pg_mode: full`). **Since ADR-0035 ladder step 1**, the Windows and macOS legs
-  are agent-only (`-Dbuild_server=false`): they build and test no server code and
+  are agent-only (the `server` option is `auto`, off on any non-Linux target; step 1 passed `-Dbuild_server=false`): they build and test no server code and
   run no Postgres suite, so `pg_mode` exists on the Linux matrix only. (From the
   Windows test-phase split, #3443 on 2026-08-28, until then the Windows matrix
   carried the same `pg_mode` key: debug=full, release=smoke.)
@@ -337,8 +337,9 @@ dashboard: it crawls every route the shell nav links to (200, the `Content-Secur
 header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs four scenarios (stubbed where they write: those requests are answered in the browser,
-so nothing reaches the server). The gate first runs
+and runs six scenarios (five that each force their own precondition, with writes answered by a
+request stub in the browser so nothing reaches the server, and the DEX Apps tab: a live keyboard
+half plus a committed golden page served through a GET stub). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
@@ -428,6 +429,11 @@ the `release` job needs `docker-publish`, `docker-publish-postgres` and
 `docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
 `:latest`) first (the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
+An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
+`docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
+(`build-linux`, `build-gateway`, `build-windows`, `build-macos`; ADR-0035 step 3,
+a success gate, not an artifact dependency), so a failed build, including a failed
+agent packaging step, pushes no versioned image.
 `docker-publish-chisel` joined the release's needs in #5242, so the release
 waits for the chisel builds (minutes with a warm cache, much longer cold) and
 the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
@@ -1064,11 +1070,12 @@ pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip pat
 prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
 (server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
 identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
-allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+allocation (`--free-ports`). A start-up that loses one to another process before binding it is retried, up to 3 attempts, on an unambiguous bind failure only, and a retry is a `::warning::` annotation and a step-summary line (#7538). The Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
 the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
 `runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
 fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
-the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+the step "Upload gateway real-wire logs on failure" uploads its logs, including each retried
+attempt's `server.attemptN.log` / `gateway.attemptN.log` (`failure() &&` leads the
 condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
 (`mgmt_driver.log`) is among the uploaded `*.log` files.
 
@@ -1217,7 +1224,7 @@ telemetry start step exports the same values for already-running listeners.
 ### Windows test-phase concurrency gate
 
 **Update (ADR-0035 ladder step 1).** The Windows leg is now agent-only: it
-configures with `-Dbuild_server=false` into `build-windows-agent-{debug,release}`
+configures agent-only (step 1 passed `-Dbuild_server=false`; since step 3 it passes nothing and the `server` option's `auto` is off on Windows) into `build-windows-agent-{debug,release}`
 and has one test step, `Test (non-pg suites)`, selecting `--suite agent --suite
 platform --suite proto --suite echo --suite gateway`. The `Ensure Postgres`,
 `Resolve pg_mode + assert Postgres DSN`, `Test (pg shards, full)` and `Test (pg
@@ -2943,7 +2950,7 @@ false at the test-file level: nine entries pin OS-specific behaviour inside the
 test file or script itself, not behind a meson guard. Those nine carry the
 `platform` suite instead, which every leg runs (except where an entry is not
 registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
-with `-Dbuild_server=false`, so a `build_server`-gated entry runs on Linux only):
+agent-only (the `server` option is off for a non-Linux target), so a `build_server`-gated entry runs on Linux only):
 
 | Entry | Why it is OS-contract |
 |---|---|
@@ -2988,8 +2995,8 @@ as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
 (linux) and nightly.yml (asan / tsan / coverage).
 
 **Only Linux runs the server suites (ADR-0035 ladder step 1).** The Windows and
-macOS legs of `ci.yml` configure with `-Dbuild_server=false`, so they build no
-server code, register no server suite and need no Postgres; the Windows job no
+macOS legs of `ci.yml` configure agent-only (`server` option `auto`, off on any
+non-Linux target), so they build no server code, register no server suite and need no Postgres; the Windows job no
 longer runs `Ensure Postgres`. Wee Tam's per-agent PostgreSQL services stay
 provisioned until ladder step 4 deprovisions them, and
 `deploy/windows/Assert-Toolchain.ps1` still health-checks them in the Windows
@@ -3165,8 +3172,8 @@ value sets it itself.
 |---|---|---|---|
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other legs: clang-21 debug on a push; release legs on a `main` push or Tier 2b dispatch) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
-| macOS | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
+| Windows | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
+| macOS | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
 
 Until ADR-0035 ladder step 1, Windows debug (every PR and push) ran the full
 14 shards and Windows release (a `main` push or a Tier 2b dispatch) the smoke
@@ -3276,6 +3283,8 @@ sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`
 (per-triplet, outside workspace). macOS joined this model with the BigMags
 cutover; its former `actions/cache@v5` round-trip was removed.
+
+**Install profile (ADR-0035 ladder step 3).** The key deliberately has no install-profile term. Every Windows and macOS workflow now installs an agent-only profile with no `server` feature (`--x-no-default-features`, plus `--x-feature=tests` where tests build; `release.yml` omits `tests`), so the persistent self-hosted tree (each Wee Tam runner keeps its own `vcpkg_installed/x64-windows` in its workspace, under its own work root, and the CI, nightly and CodeQL Windows jobs it picks up reuse it) is never reconciled between a full and an agent-only shape in steady state (when main and dev carry different `VCPKG_COMMIT` values the sentinel key changes and the tree is wiped and rebuilt instead). Linux legs install the full manifest; the Linux agent images use the agent-only profile in their own containers. A workflow that mixes profiles on one tree pays an incremental vcpkg reconcile on each switch (`docs/build-guide.md` "Dependency features"); do not add a second profile on Wee Tam without updating that section and the pins in `scripts/ci/test_runner_health_check.py`.
 
 The script must run cleanly under MSYS2 bash on Windows. **Do NOT use
 `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under

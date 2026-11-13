@@ -11,6 +11,7 @@
  * on how a platform resolves "localhost", or on an IdP listening on a non-loopback address.
  */
 
+#include "bounded_resolver.hpp"
 #include "oidc_provider.hpp"
 #include "test_oidc_mock_idp.hpp"
 
@@ -22,18 +23,52 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <expected>
 #include <format>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+using namespace yuzu::server::oidc;
+
+// Shared by the MockIdp cases and the resolver cases at the end of the file, which compile in the
+// ThreadSanitizer build too.
+namespace {
+
+struct Nat64Net {
+    const char* label;
+    const char* prefix;       // text for parse_nat64_prefix
+    const char* probe_answer; // the AAAA answer for ipv4only.arpa (192.0.0.170 embedded)
+    const char* link_local;   // 169.254.169.254 embedded
+    const char* priv;         // 10.0.0.5 embedded
+    const char* pub;          // 8.8.8.8 embedded
+};
+
+const Nat64Net kPub64{"pub/64",
+                      "2a0e:b107:122:344::/64",
+                      "2a0e:b107:122:344:c0:0:aa00:0",
+                      "2a0e:b107:122:344:a9:fea9:fe00:0",
+                      "2a0e:b107:122:344:a:0:500:0",
+                      "2a0e:b107:122:344:8:808:800:0"};
+
+/// The discovery cache is process-wide: every case starts and ends with it empty.
+struct Nat64CacheReset {
+    Nat64CacheReset() { OidcProvider::clear_nat64_discovery_cache_for_test(); }
+    ~Nat64CacheReset() { OidcProvider::clear_nat64_discovery_cache_for_test(); }
+    Nat64CacheReset(const Nat64CacheReset&) = delete;
+    Nat64CacheReset& operator=(const Nat64CacheReset&) = delete;
+};
+
+} // namespace
 
 // A real httplib acceptor thread crashes the ThreadSanitizer build (#438); see the MockIdp banner.
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN
 
-using namespace yuzu::server::oidc;
 using yuzu::server::test::MockIdp;
 
 namespace {
@@ -158,7 +193,7 @@ TEST_CASE("OIDC egress: a real host name goes through the OS resolver - no test 
 TEST_CASE("OIDC egress: a host name the real OS resolver cannot resolve is its own fixed failure",
           "[oidc][oidc_egress]") {
     // RFC 6761: ".invalid" never resolves. This runs the real resolver (the seam is not set), so
-    // the failure return of resolve_host_addresses is covered on every platform, with or without
+    // the failure return of the OIDC name lookup is covered on every platform, with or without
     // a network. A lookup that times out inside the 1 s budget reads the same.
     MockIdp idp;
     auto doc = OidcProvider::fetch_discovery_document("http://yuzu-no-such-host.invalid:1", false,
@@ -432,15 +467,6 @@ TEST_CASE("OIDC egress: the provider warns once at construction about an issuer 
 
 namespace {
 
-struct Nat64Net {
-    const char* label;
-    const char* prefix;       // text for parse_nat64_prefix
-    const char* probe_answer; // the AAAA answer for ipv4only.arpa (192.0.0.170 embedded)
-    const char* link_local;   // 169.254.169.254 embedded
-    const char* priv;         // 10.0.0.5 embedded
-    const char* pub;          // 8.8.8.8 embedded
-};
-
 const Nat64Net kDoc64{"doc/64",
                       "2001:db8:122:344::/64",
                       "2001:db8:122:344:c0:0:aa00:0",
@@ -453,12 +479,6 @@ const Nat64Net kDoc96{"doc/96",
                       "2001:db8:122:344:5566:7788:a9fe:a9fe",
                       "2001:db8:122:344:5566:7788:a00:5",
                       "2001:db8:122:344:5566:7788:808:808"};
-const Nat64Net kPub64{"pub/64",
-                      "2a0e:b107:122:344::/64",
-                      "2a0e:b107:122:344:c0:0:aa00:0",
-                      "2a0e:b107:122:344:a9:fea9:fe00:0",
-                      "2a0e:b107:122:344:a:0:500:0",
-                      "2a0e:b107:122:344:8:808:800:0"};
 const Nat64Net kPub96{"pub/96",
                       "2a0e:b107:122:344:5566:7788::/96",
                       "2a0e:b107:122:344:5566:7788:c000:aa",
@@ -480,14 +500,6 @@ OidcProvider::ResolverForTest nat64_resolver(std::atomic<int>& probes,
         return target;
     };
 }
-
-/// The discovery cache is process-wide: every case starts and ends with it empty.
-struct Nat64CacheReset {
-    Nat64CacheReset() { OidcProvider::clear_nat64_discovery_cache_for_test(); }
-    ~Nat64CacheReset() { OidcProvider::clear_nat64_discovery_cache_for_test(); }
-    Nat64CacheReset(const Nat64CacheReset&) = delete;
-    Nat64CacheReset& operator=(const Nat64CacheReset&) = delete;
-};
 
 std::string warnings_of(const std::function<void()>& body) {
     yuzu::test::LogCapture cap(spdlog::level::warn);
@@ -1087,3 +1099,560 @@ TEST_CASE("OIDC egress: the token POST's pre-check - pinned where the connect is
 }
 
 #endif // !YUZU_OIDC_MOCK_IDP_TSAN
+
+// The resolver cases below use no MockIdp and no acceptor thread, so they sit outside the guard
+// above and also run in the ThreadSanitizer build, where the lookup workers are what is worth
+// checking.
+#ifndef _WIN32
+// ── Name lookups on the bounded resolver (POSIX) ─────────────────────────────────────────────
+//
+// `resolve_host_addresses_status` runs the lookup through net::bounded_resolve with a pool of the
+// OIDC path's own. These cases replace the lookup function and the pool BELOW set_resolver_for_test
+// (OidcProvider::set_bounded_lookup_for_test), so the adapter itself is exercised with no DNS.
+// Every lookup function handed to the seam owns its state through a shared_ptr: a lookup can
+// outlive the case that started it.
+
+namespace {
+
+namespace net = yuzu::server::net;
+
+/// Replaces the bounded lookup and pool for the life of the guard, then restores the defaults.
+/// A null pool means the production OIDC pool.
+struct BoundedLookupGuard {
+    BoundedLookupGuard(net::LookupFn lookup, std::shared_ptr<net::ResolverPool> pool) {
+        OidcProvider::set_bounded_lookup_for_test(std::move(lookup), std::move(pool));
+    }
+    ~BoundedLookupGuard() { OidcProvider::set_bounded_lookup_for_test({}, {}); }
+    BoundedLookupGuard(const BoundedLookupGuard&) = delete;
+    BoundedLookupGuard& operator=(const BoundedLookupGuard&) = delete;
+};
+
+/// A lookup blocks on this until released.
+struct LookupGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open{false};
+    std::atomic<int> entered{0};
+    void wait() {
+        std::unique_lock lk(mu);
+        cv.wait(lk, [&] { return open; });
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+};
+
+/// Opens the gate on scope exit, so a failing REQUIRE never leaves a lookup latched.
+struct GateOpener {
+    explicit GateOpener(std::shared_ptr<LookupGate> g) : gate(std::move(g)) {}
+    ~GateOpener() { gate->release(); }
+    GateOpener(const GateOpener&) = delete;
+    GateOpener& operator=(const GateOpener&) = delete;
+    std::shared_ptr<LookupGate> gate;
+};
+
+bool wait_for(const std::function<bool()>& pred) {
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > give_up)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return true;
+}
+
+net::ResolveResult resolve_result(net::ResolveStatus status, std::vector<std::string> addresses) {
+    return {status, std::move(addresses)};
+}
+
+constexpr const char* kUnresolved = "the host name did not resolve";
+// A refused lookup (full pool, no worker): nothing was learned about the name.
+constexpr const char* kBusyReason = "the host name lookup was not started";
+
+std::expected<std::vector<std::string>, std::string> vet_name(const std::string& host,
+                                                              int timeout_ms = 1000) {
+    return OidcProvider::vet_egress_target_for_test(host, false, false, timeout_ms, {}, false);
+}
+
+/// How the ipv4only.arpa probe lookup answers.
+enum ProbeMode : int { kProbeAnswer, kProbeTemporary, kProbeBusy, kProbeBlock, kProbeGarbage };
+
+/// State a scripted lookup shares with its workers. A host ending in "a.test" blocks on `gate`;
+/// ipv4only.arpa follows `probe_mode`; any other host counts in `others` and answers with
+/// `other_status` / `other_answer`.
+struct LookupState {
+    std::shared_ptr<LookupGate> gate = std::make_shared<LookupGate>();
+    std::atomic<int> probes{0};
+    std::atomic<int> probe_mode{kProbeAnswer};
+    std::atomic<int> others{0};
+    net::ResolveStatus other_status{net::ResolveStatus::kOk}; // set before the lookup is installed
+    std::string other_answer{"93.184.216.34"};
+};
+
+net::LookupFn make_lookup(std::shared_ptr<LookupState> st) {
+    return [st](const std::string& host) {
+        if (host == "ipv4only.arpa") {
+            st->probes.fetch_add(1);
+            switch (st->probe_mode.load()) {
+            case kProbeTemporary:
+                return resolve_result(net::ResolveStatus::kTemporary, {});
+            case kProbeBusy:
+                return resolve_result(net::ResolveStatus::kBusy, {});
+            case kProbeBlock:
+                st->gate->wait();
+                return resolve_result(net::ResolveStatus::kOk, {kPub64.probe_answer});
+            case kProbeGarbage:
+                return resolve_result(net::ResolveStatus::kOk, {"garbage", "::zz"});
+            default:
+                return resolve_result(net::ResolveStatus::kOk, {kPub64.probe_answer});
+            }
+        }
+        if (host.ends_with("a.test")) {
+            st->gate->entered.fetch_add(1);
+            st->gate->wait();
+            return resolve_result(net::ResolveStatus::kOk, {"93.184.216.34"});
+        }
+        st->others.fetch_add(1);
+        if (st->other_status != net::ResolveStatus::kOk)
+            return resolve_result(st->other_status, {});
+        return resolve_result(net::ResolveStatus::kOk, {st->other_answer});
+    };
+}
+
+/// Runs vet_name on a thread. The destructor opens the gate and joins, so a failing REQUIRE in
+/// the case neither terminates the process nor leaves the lookup latched. Declare it AFTER the
+/// state and guard it uses.
+struct VetThread {
+    VetThread(std::shared_ptr<LookupGate> g, std::string host, int timeout_ms)
+        : gate(std::move(g)), thread([this, host = std::move(host), timeout_ms] {
+              result = vet_name(host, timeout_ms);
+          }) {}
+    ~VetThread() { finish(); }
+    VetThread(const VetThread&) = delete;
+    VetThread& operator=(const VetThread&) = delete;
+    /// Opens the gate and joins; `result` is valid afterwards.
+    void finish() {
+        gate->release();
+        if (thread.joinable())
+            thread.join();
+    }
+    std::shared_ptr<LookupGate> gate;
+    std::expected<std::vector<std::string>, std::string> result;
+    std::thread thread; // last: starts after the other members exist
+};
+
+OidcConfig resolver_cfg(const std::string& issuer) {
+    OidcConfig cfg;
+    cfg.issuer = issuer;
+    cfg.client_id = "yuzu-test-client";
+    cfg.redirect_uri = "http://localhost:8443/auth/callback";
+    return cfg;
+}
+
+/// What start_auth_flow throws; empty when it did not throw.
+std::string auth_flow_error(OidcProvider& provider) {
+    try {
+        (void)provider.start_auth_flow();
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return {};
+}
+
+/// A public-space IPv6 literal that embeds the link-local metadata address under kPub64. It is
+/// classified with no name lookup, so only the NAT64 probe touches the pool.
+const std::string kLiteralTarget = kPub64.link_local;
+
+/// Learns kPub64 from an answered probe: the literal is then refused, and one probe was made.
+void learn_prefix(LookupState& st) {
+    const auto learned = vet_name(kLiteralTarget);
+    REQUIRE_FALSE(learned.has_value());
+    REQUIRE(learned.error() == OidcProvider::kEgressRefused);
+    REQUIRE(st.probes.load() == 1);
+}
+
+} // namespace
+
+TEST_CASE("OIDC resolver: a lookup answer round-trips to the bytes the vetting classifies, and "
+          "text that is not an address is skipped",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    SECTION("v4 and v6 text become the pinned addresses; a refused class is dropped") {
+        BoundedLookupGuard guard(
+            [](const std::string& host) {
+                if (host == "ipv4only.arpa")
+                    return resolve_result(net::ResolveStatus::kNotFound, {});
+                return resolve_result(net::ResolveStatus::kOk,
+                                      {"not-an-address", "10.0.0.5", "93.184.216.34", "zz:zz",
+                                       "2606:4700:4700::1111", "fe80::1", "999.1.1.1"});
+            },
+            pool);
+        const auto pins = vet_name("multi.test");
+        REQUIRE(pins.has_value());
+        CHECK(*pins == std::vector<std::string>{"93.184.216.34", "2606:4700:4700::1111"});
+    }
+    SECTION("an answer with nothing parseable is unresolved") {
+        BoundedLookupGuard guard(
+            [](const std::string&) {
+                return resolve_result(net::ResolveStatus::kOk, {"garbage", "::zz"});
+            },
+            pool);
+        const auto pins = vet_name("junk.test");
+        REQUIRE_FALSE(pins.has_value());
+        CHECK(pins.error() == kUnresolved);
+    }
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: every status but an answer is a fixed reason, and only a refused "
+          "lookup is told apart",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    for (const auto status : {net::ResolveStatus::kNotFound, net::ResolveStatus::kTemporary,
+                              net::ResolveStatus::kTimeout, net::ResolveStatus::kBusy}) {
+        CAPTURE(static_cast<int>(status));
+        BoundedLookupGuard guard(
+            [status](const std::string&) { return resolve_result(status, {}); }, pool);
+        const auto pins = vet_name("gone.test");
+        REQUIRE_FALSE(pins.has_value());
+        CHECK(pins.error() == (status == net::ResolveStatus::kBusy ? kBusyReason : kUnresolved));
+    }
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a lookup that never returns fails the fetch at the bound, its slot is "
+          "held until it returns, and the next lookup then works",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto gate = std::make_shared<LookupGate>();
+    GateOpener opener(gate); // after a failed REQUIRE the lookup is still released
+    BoundedLookupGuard guard(
+        [gate](const std::string& host) {
+            if (host == "slow.test") {
+                gate->entered.fetch_add(1);
+                gate->wait();
+            }
+            return resolve_result(net::ResolveStatus::kOk, {"93.184.216.34"});
+        },
+        pool);
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    const auto started = std::chrono::steady_clock::now();
+    const auto pins = vet_name("slow.test", 1000);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    cap.stop();
+
+    REQUIRE_FALSE(pins.has_value());
+    CHECK(pins.error() == kUnresolved);
+    // The caller waited the 1 s bound (not zero, as for a full pool) and stopped there.
+    CHECK(elapsed >= std::chrono::milliseconds(900));
+    CHECK(elapsed < std::chrono::milliseconds(5000));
+    REQUIRE(wait_for([&] { return gate->entered.load() == 1; }));
+    CHECK(pool->in_flight.load() == 1); // the late lookup still holds its slot
+    CHECK(cap.text().find("did not answer") != std::string::npos);
+
+    gate->release(); // the resolver finally returns: the result is discarded, the slot freed
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+
+    const auto next = vet_name("fast.test", 1000);
+    REQUIRE(next.has_value());
+    CHECK(*next == std::vector<std::string>{"93.184.216.34"});
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a full pool fails closed at once as not started, without waiting",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    VetThread holder(st->gate, "slow.a.test", 10000);
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    const auto started = std::chrono::steady_clock::now();
+    const auto pins = vet_name("other.test", 10000);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    cap.stop();
+
+    REQUIRE_FALSE(pins.has_value());
+    CHECK(pins.error() == kBusyReason);
+    CHECK(elapsed < std::chrono::milliseconds(2000)); // refused, not queued and not waited for
+    CHECK(st->others.load() == 0);                    // nothing was started
+    CHECK(cap.text().find("was not started: the lookup pool (1 slots) is full") !=
+          std::string::npos);
+
+    holder.finish();
+    REQUIRE(holder.result.has_value());
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+
+    // Recovery: with the slot free, the same lookup now succeeds.
+    const auto again = vet_name("other.test", 1000);
+    REQUIRE(again.has_value());
+    CHECK(st->others.load() == 1);
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: two issuers share one pool - a name under one fills it for the other",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(2);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    VetThread first(st->gate, "one.a.test", 10000);
+    VetThread second(st->gate, "two.a.test", 10000);
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 2; }));
+    CHECK(pool->in_flight.load() == 2);
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    const auto refused = vet_name("b.test");
+    cap.stop();
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == kBusyReason);
+    CHECK(st->others.load() == 0);
+    CHECK(cap.text().find("the lookup pool (2 slots) is full") != std::string::npos);
+
+    first.finish(); // one shared gate: this opens it for both
+    second.finish();
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    const auto served = vet_name("b.test");
+    REQUIRE(served.has_value());
+    CHECK(*served == std::vector<std::string>{"93.184.216.34"});
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: the default OIDC pool serves lookups and is separate from the process "
+          "pool",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    REQUIRE(wait_for([] { return oidc_resolver_in_flight() == 0; }));
+    const int process_before = net::process_resolver_in_flight();
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), nullptr); // null pool: the production default
+    auto older = std::make_unique<OidcProvider>(resolver_cfg("https://idp.test"));
+    VetThread holder(st->gate, "slow.a.test", 10000);
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+
+    CHECK(oidc_resolver_in_flight() == 1);
+    CHECK(net::process_resolver_in_flight() <= process_before); // the process pool is untouched
+
+    // The pool is process state, not provider state: a rebuilt provider sees the same slot held.
+    older.reset();
+    OidcProvider rebuilt(resolver_cfg("https://idp.test"));
+    CHECK(oidc_resolver_in_flight() == 1);
+
+    holder.finish();
+    REQUIRE(holder.result.has_value());
+    CHECK(wait_for([] { return oidc_resolver_in_flight() == 0; }));
+    OidcProvider::set_bounded_lookup_for_test({}, nullptr); // the hook can be cleared
+    CHECK(oidc_resolver_in_flight() == 0);
+}
+
+TEST_CASE("OIDC resolver: a failed or busy NAT64 probe changes nothing in the learned prefixes",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    // A global-space translated address: public unless the prefix is known.
+    st->other_answer = kPub64.link_local;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+
+    // Learn the prefix: the embedded link-local address is refused.
+    auto learned = vet_name("nat.test");
+    REQUIRE_FALSE(learned.has_value());
+    CHECK(learned.error() == OidcProvider::kEgressRefused);
+    CHECK(st->probes.load() == 1);
+
+    for (const int mode : {kProbeTemporary, kProbeBusy}) {
+        CAPTURE(mode);
+        st->probe_mode.store(mode);
+        OidcProvider::expire_nat64_discovery_cache_for_test(); // the next fetch probes again
+        const int before = st->probes.load();
+        const auto after = vet_name("nat.test");
+        CHECK(st->probes.load() == before + 1);
+        REQUIRE_FALSE(after.has_value()); // the learned prefix is still applied
+        CHECK(after.error() == OidcProvider::kEgressRefused);
+    }
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a probe refused by a full pool is not remembered - the next fetch "
+          "probes again and the learned prefixes still apply",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    learn_prefix(*st);
+    OidcProvider::expire_nat64_discovery_cache_for_test(); // the next fetch is due to probe
+    // The worker frees its slot just after waking the caller, so a cap-1 pool can still read 1.
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+
+    {
+        VetThread holder(st->gate, "slow.a.test", 10000);
+        REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        const auto busy = vet_name(kLiteralTarget);
+        cap.stop();
+        CHECK(st->probes.load() == 1); // the probe lookup was never started
+        REQUIRE_FALSE(busy.has_value());
+        CHECK(busy.error() == OidcProvider::kEgressRefused); // learned prefix still applied
+        CHECK(cap.text().find("the NAT64 prefix lookup (ipv4only.arpa) was not started") !=
+              std::string::npos);
+    } // the holder's gate opens here
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+
+    // No expiry call: a busy refusal armed no negative window, so the very next fetch probes.
+    const auto next = vet_name(kLiteralTarget);
+    CHECK(st->probes.load() == 2);
+    REQUIRE_FALSE(next.has_value());
+    CHECK(next.error() == OidcProvider::kEgressRefused);
+    // The answered probe is cached again.
+    CHECK_FALSE(vet_name(kLiteralTarget).has_value());
+    CHECK(st->probes.load() == 2);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a probe that times out is not repeated inside the window, and the "
+          "learned prefixes still apply",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    GateOpener opener(st->gate); // after a failed REQUIRE the blocked probe is still released
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    learn_prefix(*st);
+    OidcProvider::expire_nat64_discovery_cache_for_test();
+
+    st->probe_mode.store(kProbeBlock);
+    const auto timed_out = vet_name(kLiteralTarget, 1000); // the one inherent 1 s wait
+    CHECK(st->probes.load() == 2);
+    REQUIRE_FALSE(timed_out.has_value());
+    CHECK(timed_out.error() == OidcProvider::kEgressRefused);
+
+    // Known residual, owner-ruled: a probe that was started and failed arms the 1 minute window,
+    // so the next fetch does not probe again (unlike a refusal for a full pool).
+    const auto again = vet_name(kLiteralTarget, 1000);
+    CHECK(st->probes.load() == 2);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == OidcProvider::kEgressRefused);
+
+    st->gate->release();
+    st->probe_mode.store(kProbeAnswer);
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    OidcProvider::expire_nat64_discovery_cache_for_test();
+    CHECK_FALSE(vet_name(kLiteralTarget).has_value());
+    CHECK(st->probes.load() == 3); // the window is over: the probe runs again
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: a probe answered only with unparsable text learns nothing and the "
+          "fetch proceeds",
+          "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->probe_mode.store(kProbeGarbage);
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const auto pins = vet_name(kLiteralTarget);
+    CHECK(st->probes.load() == 1);
+    // No prefix was learned, so the literal is a plain public address: permitted, nothing to pin.
+    REQUIRE(pins.has_value());
+    CHECK(pins->empty());
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: discovery that failed on a real lookup failure is retried only after "
+          "its window, and Test Connection does not wait for the window",
+          "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
+    Nat64CacheReset cache;
+    constexpr int kWindowMs = 1500;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    st->other_status = net::ResolveStatus::kNotFound; // a lookup that does run finds nothing
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const std::string issuer = "https://idp.test";
+    OidcProvider provider(resolver_cfg(issuer));
+    provider.set_discovery_negative_cache_for_test(kWindowMs);
+
+    const auto first_attempt = std::chrono::steady_clock::now();
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(st->others.load() == 1); // the lookup ran and found nothing: the window is armed
+
+    if (std::chrono::steady_clock::now() <
+        first_attempt + std::chrono::milliseconds(kWindowMs / 2)) {
+        // Inside the window the failed attempt is not retried.
+        CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+        CHECK(st->others.load() == 1);
+        // Test Connection calls the static fetch, which has no window: it does look the name up.
+        const auto doc = OidcProvider::fetch_discovery_document(issuer, false, false, 1000);
+        CHECK_FALSE(doc.has_value());
+        CHECK(st->others.load() == 2);
+    } else {
+        WARN("the host stalled past half the window: the in-window checks were skipped");
+    }
+
+    // After the window a login attempt performs a lookup again.
+    const int seen = st->others.load();
+    const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (st->others.load() == seen && std::chrono::steady_clock::now() < give_up) {
+        CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    CHECK(st->others.load() == seen + 1);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+TEST_CASE("OIDC resolver: discovery refused for a full pool is not remembered - the next attempt "
+          "looks the name up without waiting for the window",
+          "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
+    Nat64CacheReset cache;
+    constexpr int kWindowMs = 5000; // never waited out
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    st->other_status = net::ResolveStatus::kNotFound;
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    OidcProvider provider(resolver_cfg("https://idp.test"));
+    provider.set_discovery_negative_cache_for_test(kWindowMs);
+
+    {
+        VetThread holder(st->gate, "slow.a.test", 10000);
+        REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+        CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+        CHECK(st->others.load() == 0); // refused by the full pool: no lookup was performed
+    }
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+
+    // The pool is free: the very next attempt performs a lookup (the refusal armed no window).
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(st->others.load() == 1);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
+#ifndef YUZU_OIDC_MOCK_IDP_TSAN // uses MockIdp, which the TSan configuration excludes
+TEST_CASE("OIDC resolver: an issuer mismatch arms the discovery window (characterisation)",
+          "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {
+    // Characterisation only: a failure that is an issuer mismatch (IdP-controlled text) arms the
+    // window. It does not guard the exact-match test on the pool-full refusal.
+    MockIdp idp;
+    idp.with([](MockIdp& m) { m.discovery_issuer = "the host name lookup was not started"; });
+    auto cfg = resolver_cfg(idp.base());
+    cfg.allow_private_networks = true; // the mock IdP listens on loopback
+    OidcProvider provider(cfg);
+    provider.set_discovery_negative_cache_for_test(5000); // never waited out
+
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(idp.discovery_calls.load() == 1);
+    // Inside the window the failed attempt is not retried: no further fetch reaches the IdP.
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(idp.discovery_calls.load() == 1);
+}
+#endif // !YUZU_OIDC_MOCK_IDP_TSAN
+#endif // !_WIN32

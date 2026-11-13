@@ -178,13 +178,15 @@ and SPDX formats. Use whichever your procurement or SCA tool consumes.
 
 **Known limitations of the platform SBOMs.** They are generated from the whole
 build workspace (the vcpkg ports tree and build trees included), not from the
-archive alone, so they list thousands of components the archive does not ship
-or load; the Windows and macOS agent SBOMs include the server's dependencies,
-such as `libpq`, `drogon` and `xmlsec`. A finding in a component the archive
-does not contain does not apply to it. Separately, the Windows agent archive
-still contains `libpq.dll`, `drogon.dll`, `trantor.dll` and the `libxmlsec1` DLLs, which the agent never loads, until a later
-release removes the server's dependencies from the Windows build (ADR-0035
-step 3).
+archive alone, so they can list components the archive does not ship or load.
+A finding in a component the archive does not contain does not apply to it.
+Since ADR-0035 step 3 the Windows and macOS builds install only the agent's
+dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`) are no
+longer installed on those build machines and the Windows agent archive carries
+none of their DLLs (the Windows release build's "Verify the agent runs from the packaged archive" step
+refuses an archive that does; it has not yet run on a real release tag). What a
+given release's SBOM lists beyond the archive is not asserted here: inspect the
+SBOM of the release you verify.
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
