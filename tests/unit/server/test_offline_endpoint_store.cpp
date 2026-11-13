@@ -1318,3 +1318,48 @@ TEST_CASE("OfflineEndpointStore query_stale_within: concurrent truncated reads e
     CHECK(metrics.counter("yuzu_server_agent_presence_roster_truncated_total").value() ==
           static_cast<double>(kThreads * kReadsEach));
 }
+
+// HA WS-5 #5685 follow-up (plugin-capability visibility, migration v5).
+TEST_CASE("OfflineEndpointStore plugin_names: published once, blank-preserved, and read back as "
+          "'live ids WITHOUT a plugin' with unknown excluded",
+          "[pg][offline][ha][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    const auto ttl = std::chrono::hours(1);
+
+    // has-echo, lacks-echo, never-reported (unknown), lacks-echo-but-departed.
+    REQUIRE(store.upsert("yuzu_test_pv_has", "h", "linux", 1, 0, "1", "x", "s1", {"echo", "os_info"}));
+    REQUIRE(store.upsert("yuzu_test_pv_lacks", "h", "linux", 1, 0, "1", "x", "s2", {"os_info"}));
+    REQUIRE(store.upsert("yuzu_test_pv_unknown", "h", "linux", 1, 0, "1", "x", "s3"));
+    REQUIRE(store.upsert("yuzu_test_pv_gone", "h", "linux", 1, 0, "1", "x", "s4", {"os_info"}));
+    REQUIRE(store.remove_if_session("yuzu_test_pv_gone", "s4")); // graceful disconnect
+
+    auto r = store.query_live_ids_without_plugin(ttl, "echo");
+    REQUIRE(r.has_value());
+    CHECK(*r == std::vector<std::string>{"yuzu_test_pv_lacks"}); // unknown and departed excluded
+
+    // A later heartbeat from a replica WITHOUT the session passes no list: the stored one stays.
+    REQUIRE(store.upsert("yuzu_test_pv_lacks", "", "", 2, 0, "", "", "s2"));
+    r = store.query_live_ids_without_plugin(ttl, "echo");
+    REQUIRE(r.has_value());
+    CHECK(*r == std::vector<std::string>{"yuzu_test_pv_lacks"});
+
+    // A re-registration with a new list replaces it.
+    REQUIRE(store.upsert("yuzu_test_pv_lacks", "", "", 3, 0, "", "", "s2", {"echo"}));
+    r = store.query_live_ids_without_plugin(ttl, "echo");
+    REQUIRE(r.has_value());
+    CHECK(r->empty());
+
+    // Names outside [A-Za-z0-9_.-] are dropped, never spliced into array syntax.
+    REQUIRE(store.upsert("yuzu_test_pv_inject", "h", "linux", 1, 0, "1", "x", "s5",
+                         {"echo\",\"x", "a}b", "os_info"}));
+    r = store.query_live_ids_without_plugin(ttl, "echo");
+    REQUIRE(r.has_value());
+    CHECK(*r == std::vector<std::string>{"yuzu_test_pv_inject"});
+    r = store.query_live_ids_without_plugin(ttl, "os_info");
+    REQUIRE(r.has_value());
+    CHECK(*r == std::vector<std::string>{"yuzu_test_pv_lacks"}); // its list is now just {echo}
+}

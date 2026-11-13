@@ -519,6 +519,11 @@ struct AgentSession {
     std::string gateway_stream_home_id;
     std::mutex stream_mu;
 
+    /// #5685 follow-up: set once this session's `plugin_names` reached the durable presence row
+    /// (a successful `OfflineEndpointStore::upsert` that carried them), so later heartbeats skip
+    /// re-sending a list that only changes at re-registration (a new session starts false).
+    std::atomic<bool> presence_plugins_published{false};
+
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
     // Atomic to avoid acquiring the registry mutex on every stream Read.
     std::atomic<int64_t> last_activity_epoch_ms{
@@ -1019,6 +1024,13 @@ public:
     /// `has_remote_presence`) or it self-deadlocks.
     using PresenceReadFn = std::function<
         std::expected<std::vector<PresenceIdentity>, PresenceReadError>(std::chrono::seconds)>;
+    /// Injectable "live ids whose recorded plugin list lacks `plugin`" read (the
+    /// `query_live_ids_without_plugin` seam). Bound by the store overload of `configure_presence`;
+    /// tests may feed a stub through `configure_presence_plugin_reader`.
+    using PluginMissingReadFn = std::function<
+        std::expected<std::vector<std::string>, PresenceReadError>(std::chrono::seconds,
+                                                                   std::string_view)>;
+    void configure_presence_plugin_reader(PluginMissingReadFn reader);
     /// Test-facing overload: assigns the reader AND the TTL it is called with.
     void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
 
@@ -1065,6 +1077,13 @@ public:
     // quarantine/Guardian dispatch; a device that genuinely lacks the plugin
     // answers "plugin not found" itself, which is observable, unlike a
     // server-side withhold.
+    //
+    // #5685 follow-up: ALSO merges ids with NO local session whose durable presence row records a
+    // plugin list lacking `plugin` (`OfflineEndpointStore::query_live_ids_without_plugin`), so a
+    // replica that does not own an agent's session still reports plugin_not_found for it. Local
+    // wins (a local session is judged by its own list, as in `ids_with_os`); an agent with no
+    // recorded list is unknown and fails open; a degraded read fails open too (the cached
+    // failure is served for `kPresenceCacheTtl`, the store counts it).
     std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin,
                                                        std::string_view action) const;
 
@@ -1280,6 +1299,18 @@ private:
         std::vector<PresenceIdentity>{}};
     mutable std::chrono::steady_clock::time_point presence_cache_at_{};
 
+    /// #5685 follow-up (plugin-capability visibility): the cross-replica "live ids whose recorded
+    /// plugin list lacks `plugin`" read, and its per-plugin cache (success OR failure, the same
+    /// `kPresenceCacheTtl` window as `presence_cache_`). Both under `presence_cache_mu_`; the
+    /// reader runs under it too, so it must not call back into the registry.
+    struct MissingPluginCacheEntry {
+        std::chrono::steady_clock::time_point at{};
+        std::expected<std::vector<std::string>, PresenceReadError> ids{std::vector<std::string>{}};
+    };
+    static constexpr std::size_t kMissingPluginCacheMax = 64;
+    PluginMissingReadFn presence_missing_plugin_reader_;
+    mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
+
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
     /// read (#4981 PR-1 Finding B). Always acquires `presence_cache_mu_` first, so
@@ -1288,6 +1319,11 @@ private:
     /// single-replica case pays one uncontended mutex acquisition plus the
     /// pointer check, and can never fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
+
+    /// Cached cross-replica "live ids lacking `plugin`" read; `nullopt` when no reader is wired
+    /// or the read degraded (callers fail open). Takes `presence_cache_mu_`.
+    std::optional<std::vector<std::string>> missing_plugin_from_presence(
+        std::string_view plugin) const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl
     // considers. `LocalOnly` skips the live_presence() call AND the

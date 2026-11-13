@@ -652,6 +652,8 @@ void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset)
 void AgentRegistry::expire_presence_cache_for_test() {
     std::lock_guard lock(presence_cache_mu_);
     presence_cache_at_ -= kPresenceCacheTtl;
+    for (auto& [_, e] : missing_plugin_cache_)
+        e.at -= kPresenceCacheTtl;
 }
 
 namespace {
@@ -1689,7 +1691,18 @@ bool AgentRegistry::lacks_local_delivery_path(const std::string& agent_id) const
     return session->gateway_node.empty() && session->stream == nullptr;
 }
 
+void AgentRegistry::configure_presence_plugin_reader(PluginMissingReadFn reader) {
+    std::lock_guard lock(presence_cache_mu_);
+    presence_missing_plugin_reader_ = std::move(reader);
+    missing_plugin_cache_.clear();
+}
+
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
+    configure_presence_plugin_reader(
+        store ? PluginMissingReadFn{[store](std::chrono::seconds t, std::string_view plugin) {
+                    return store->query_live_ids_without_plugin(t, plugin);
+                }}
+              : PluginMissingReadFn{});
     configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
                                    return store->query_live_ids(t);
                                }}
@@ -1704,6 +1717,7 @@ void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::secon
     presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
     presence_cache_at_ = {};
+    missing_plugin_cache_.clear();
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
@@ -1783,6 +1797,10 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     // inventory grounds (see the declaration); decided before taking mu_.
     if (yuzu::protective::is_protective_action(plugin, action))
         return missing;
+    // The cross-replica read runs OFF mu_ (same discipline as ids_with_os / all_ids).
+    std::vector<std::string> remote_missing;
+    if (auto remote = missing_plugin_from_presence(plugin))
+        remote_missing = std::move(*remote);
     std::lock_guard lock(mu_);
     for (const auto& [id, s] : agents_) {
         if (s->plugin_names.empty())
@@ -1790,7 +1808,32 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
         if (std::ranges::find(s->plugin_names, plugin) == s->plugin_names.end())
             missing.insert(id);
     }
+    for (auto& id : remote_missing)
+        if (!agents_.contains(id)) // local wins
+            missing.insert(std::move(id));
     return missing;
+}
+
+std::optional<std::vector<std::string>>
+AgentRegistry::missing_plugin_from_presence(std::string_view plugin) const {
+    std::lock_guard lock(presence_cache_mu_);
+    if (!presence_missing_plugin_reader_)
+        return std::nullopt;
+    const auto now = std::chrono::steady_clock::now();
+    const std::string key(plugin);
+    auto it = missing_plugin_cache_.find(key);
+    if (it == missing_plugin_cache_.end() || now - it->second.at >= kPresenceCacheTtl) {
+        if (it == missing_plugin_cache_.end() &&
+            missing_plugin_cache_.size() >= kMissingPluginCacheMax)
+            missing_plugin_cache_.clear(); // bounded: plugin names come from a closed catalogue
+        auto& e = missing_plugin_cache_[key];
+        e.ids = presence_missing_plugin_reader_(presence_ttl_, plugin);
+        e.at = now;
+        it = missing_plugin_cache_.find(key);
+    }
+    if (!it->second.ids)
+        return std::nullopt; // degraded read: fail open (unknown, not absent)
+    return *it->second.ids;
 }
 
 std::expected<std::unordered_set<std::string>, PresenceReadError>

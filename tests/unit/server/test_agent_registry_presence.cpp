@@ -26,6 +26,9 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <string_view>
+#include <unordered_set>
+#include <expected>
 
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
@@ -429,6 +432,59 @@ TEST_CASE("HA WS-5: has_remote_presence — direct single-lock membership check"
 
     SECTION("empty candidate list: false") {
         CHECK_FALSE(registry.has_remote_presence({}));
+    }
+}
+
+// #5685 follow-up: a replica holding NO session for an agent still reports the plugins that agent
+// lacks, from the durable presence row the owning replica's heartbeat wrote.
+TEST_CASE("HA WS-5: ids_missing_plugin merges the presence plugin list for ids with no local "
+          "session; local wins, unknown and degraded fail open",
+          "[pg][ha][presence][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry r2(bus, metrics); // the NON-owning replica
+    r2.configure_presence(&store, std::chrono::hours(1));
+
+    // Published by the owning replica: one lacks "echo", one has it, one never reported.
+    REQUIRE(store.upsert("yuzu_test_pm_lacks", "h", "linux", 1, 0, "1", "x", "s1", {"os_info"}));
+    REQUIRE(store.upsert("yuzu_test_pm_has", "h", "linux", 1, 0, "1", "x", "s2", {"echo"}));
+    REQUIRE(store.upsert("yuzu_test_pm_unknown", "h", "linux", 1, 0, "1", "x", "s3"));
+
+    SECTION("a remote agent whose recorded list lacks the plugin is reported missing") {
+        const auto missing = r2.ids_missing_plugin("echo", "sql");
+        CHECK(missing == std::unordered_set<std::string>{"yuzu_test_pm_lacks"});
+    }
+
+    SECTION("local wins: a local session with the plugin is not reported on the presence row's "
+            "word") {
+        auto info = make_agent_info("yuzu_test_pm_lacks", "linux", "h");
+        info.add_plugins()->set_name("echo"); // this replica's own session says it HAS echo
+        (void)r2.register_agent(info);
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+    }
+
+    SECTION("a protective action is never withheld on inventory grounds") {
+        CHECK(r2.ids_missing_plugin("quarantine", "quarantine").empty());
+    }
+
+    SECTION("a degraded presence read fails OPEN: nothing is withheld") {
+        r2.configure_presence_plugin_reader(
+            [](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                return std::unexpected(PresenceReadError::DbError);
+            });
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+    }
+
+    SECTION("unconfigured (single replica): byte-identical to local-only") {
+        AgentRegistry solo(bus, metrics);
+        CHECK(solo.ids_missing_plugin("echo", "sql").empty());
     }
 }
 

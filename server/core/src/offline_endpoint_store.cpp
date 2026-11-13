@@ -80,6 +80,12 @@ const std::vector<pg::PgMigration>& migrations() {
         // (anchor + bootstrap-settled + anomaly-facts rows) for the endpoint prune.
         {4, "CREATE TABLE IF NOT EXISTS retention_meta ("
             "key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        // HA WS-5 #5685 follow-up (plugin-capability visibility): the plugin names the owning
+        // replica's session reported at registration, so a replica holding no session for an
+        // agent can still tell a dispatch to a plugin the agent lacks (plugin_not_found).
+        // NULLABLE on purpose: NULL means "never reported" (unknown, fail open), exactly as an
+        // empty local plugin_names does; a pre-v5 row stays NULL until its agent re-registers.
+        {5, "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS plugin_names TEXT[];"},
     };
     return kMigrations;
 }
@@ -118,6 +124,26 @@ void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_v
                       {{"op", std::string(op)}, {"reason", reason}})
             .increment();
     }
+}
+
+/// A Postgres `text[]` literal for `names`, or "" (bound as NULL through NULLIF) when there is
+/// nothing to publish. Plugin names are plain identifiers; a name with any other character is
+/// DROPPED rather than escaped, so the literal needs no quoting and nothing an agent reports can
+/// inject array syntax. Dropping can only make a name look absent from the stored list, and a
+/// dropped name is a name no shipped plugin uses.
+std::string pg_text_array_literal(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& n : names) {
+        if (n.empty() || n.size() > 64 ||
+            !std::ranges::all_of(n, [](unsigned char c) {
+                return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
+            }))
+            continue;
+        out.append(out.empty() ? "{" : ",").append(n);
+    }
+    if (!out.empty())
+        out.push_back('}');
+    return out;
 }
 
 constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roster_truncated_total";
@@ -227,7 +253,8 @@ OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
 bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view hostname,
                                   std::string_view os, std::int64_t last_heartbeat_ms,
                                   std::int64_t agent_ts, std::string_view agent_version,
-                                  std::string_view arch, std::string_view session_id) {
+                                  std::string_view arch, std::string_view session_id,
+                                  const std::vector<std::string>& plugin_names) {
     if (!open_ || agent_id.empty())
         return false;
     // Bounded acquire (gov UP-1): on a saturated pool, give up fast rather than
@@ -266,8 +293,8 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         lease.get(),
         "INSERT INTO endpoint_state.endpoints "
         "(agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch, session_id, "
-        "last_seen_at) "
-        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
+        "last_seen_at, plugin_names) "
+        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now(), NULLIF($9, '')::text[]) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  hostname = CASE WHEN EXCLUDED.hostname = '' THEN endpoints.hostname "
         "                  ELSE EXCLUDED.hostname END, "
@@ -278,12 +305,13 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         "  arch = CASE WHEN EXCLUDED.arch = '' THEN endpoints.arch ELSE EXCLUDED.arch END, "
         "  session_id = CASE WHEN EXCLUDED.session_id = '' THEN endpoints.session_id "
         "                    ELSE EXCLUDED.session_id END, "
-        "  last_seen_at = EXCLUDED.last_seen_at "
+        "  last_seen_at = EXCLUDED.last_seen_at, "
+        "  plugin_names = COALESCE(EXCLUDED.plugin_names, endpoints.plugin_names) "
         "RETURNING agent_id",
         std::vector<std::string>{std::string(agent_id), std::string(hostname), std::string(os),
                                  std::to_string(last_heartbeat_ms), std::to_string(agent_ts),
                                  std::string(agent_version), std::string(arch),
-                                 std::string(session_id)});
+                                 std::string(session_id), pg_text_array_literal(plugin_names)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: upsert failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
@@ -343,6 +371,47 @@ OfflineEndpointStore::query_live_ids(std::chrono::seconds ttl) {
         p.arch = PQgetvalue(res.get(), i, 4);
         out.push_back(std::move(p));
     }
+    return out;
+}
+
+std::expected<std::vector<std::string>, PresenceReadError>
+OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
+                                                    std::string_view plugin) {
+    if (!open_)
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        record_presence_store_failure(metrics_, "query_without_plugin", /*had_lease=*/false);
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    }
+    // Same live predicate as query_live_ids (DB clock, non-blank session). `plugin_names IS NOT
+    // NULL` keeps "never reported" out: unknown is not absent. ANY() on a bound parameter, so
+    // the plugin name is never spliced into the SQL.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id FROM endpoint_state.endpoints "
+        "WHERE last_seen_at >= now() - ($1::bigint * interval '1 second') "
+        "  AND session_id <> '' AND plugin_names IS NOT NULL "
+        "  AND NOT ($2::text = ANY(plugin_names)) "
+        "ORDER BY last_seen_at DESC LIMIT $3::bigint",
+        std::vector<std::string>{std::to_string(ttl.count()), std::string(plugin),
+                                 std::to_string(kQueryRowCap + 1)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("OfflineEndpointStore: query_live_ids_without_plugin failed: {}",
+                      PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "query_without_plugin", /*had_lease=*/true);
+        return std::unexpected(PresenceReadError::DbError);
+    }
+    const int rows = PQntuples(res.get());
+    if (rows > kQueryRowCap) {
+        record_presence_store_failure(metrics_, "query_without_plugin", /*had_lease=*/true,
+                                      "truncated");
+        return std::unexpected(PresenceReadError::Truncated);
+    }
+    std::vector<std::string> out;
+    out.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
     return out;
 }
 

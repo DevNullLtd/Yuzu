@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <string>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -59,11 +61,21 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string os;
         std::string agent_version;
         std::string arch;
+        // #5685 follow-up: the session's plugin list is published to the presence row ONCE per
+        // session (it changes only at re-registration), so a replica without the session can still
+        // tell a plugin the agent lacks. Cleared only after a successful upsert (below).
+        std::vector<std::string> plugin_names;
+        std::shared_ptr<detail::AgentSession> published_sess;
         if (auto sess = registry_.get_session(agent_id_str)) {
             hostname = sess->hostname;
             os = sess->os;
             agent_version = sess->agent_version;
             arch = sess->arch;
+            if (!sess->presence_plugins_published.load(std::memory_order_relaxed) &&
+                !sess->plugin_names.empty()) {
+                plugin_names = sess->plugin_names;
+                published_sess = std::move(sess);
+            }
         }
         // HA WS-5: threaded through so a later graceful disconnect can
         // session-guard its presence clear (remove_if_session via presence_departure.hpp) — see
@@ -87,7 +99,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // columns) rather than blanking a value this store already learned.
         const bool upserted = offline_store_->upsert(agent_id_str, hostname, os, now_ms,
                                                      /*agent_ts=*/0, agent_version, arch,
-                                                     session_id);
+                                                     session_id, plugin_names);
+        if (upserted && published_sess)
+            published_sess->presence_plugins_published.store(true, std::memory_order_relaxed);
         if (presence_batch) {
             if (upserted) {
                 presence_batch->store_failed = false;

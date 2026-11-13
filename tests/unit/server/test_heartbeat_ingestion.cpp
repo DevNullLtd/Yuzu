@@ -462,6 +462,50 @@ TEST_CASE("HeartbeatIngestion: a fleet snapshot with no local session takes its 
     CHECK(pushed_os("yuzu_test_hb_snap_noos") == std::optional<std::string>{""});
 }
 
+// #5685 follow-up: the OWNING replica's heartbeat publishes the session's plugin list to the
+// presence row once; a replica with no session never writes (or clobbers) it.
+TEST_CASE("HeartbeatIngestion: the owning replica publishes the session's plugin list once; a "
+          "non-owner heartbeat preserves it",
+          "[heartbeat_ingestion][ws5][pg][ha][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry owner{bus, metrics};
+    AgentRegistry non_owner{bus, metrics};
+    HeartbeatIngestion owner_ing{owner, nullptr, nullptr, &metrics, &store};
+    HeartbeatIngestion other_ing{non_owner, nullptr, nullptr, &metrics, &store};
+
+    ::yuzu::agent::v1::AgentInfo info;
+    info.set_agent_id("yuzu_test_hb_plugins");
+    info.set_hostname("h");
+    info.mutable_platform()->set_os("linux");
+    info.add_plugins()->set_name("os_info");
+    (void)owner.register_agent(info);
+    const auto sess = owner.get_session("yuzu_test_hb_plugins");
+    REQUIRE(sess != nullptr);
+    CHECK_FALSE(sess->presence_plugins_published.load());
+
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
+    CHECK(sess->presence_plugins_published.load()); // set only after the upsert succeeded
+    auto r = store.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+    REQUIRE(r.has_value());
+    CHECK(*r == std::vector<std::string>{"yuzu_test_hb_plugins"});
+
+    // The non-owner's blank-identity heartbeat must not clobber the stored list.
+    other_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
+    r = store.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+    REQUIRE(r.has_value());
+    CHECK(*r == std::vector<std::string>{"yuzu_test_hb_plugins"});
+    r = store.query_live_ids_without_plugin(std::chrono::hours(1), "os_info");
+    REQUIRE(r.has_value());
+    CHECK(r->empty());
+}
+
 TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's id; blank "
           "falls back to it",
           "[heartbeat_ingestion][ws5][pg]") {
