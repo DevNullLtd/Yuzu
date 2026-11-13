@@ -321,8 +321,36 @@ def main() -> int:
                      "ExecutionMutationRequest mreq;\n                auto g2 = auth_->require_list_read_unchecked(req, res, \"X\", \"Read\");"),
               "CHECK 8")
     must_fail("the postcondition removed from the require_list_read wrapper", t.check_gates,
-              mutate(files, "auth_routes.cpp", r"!authz::service_scope_authority_ok\(\*gate\.session, gate\.scope\)",
+              mutate(files, "auth_routes.cpp",
+                     r"!\(gate\.session && authz::service_scope_authority_ok\(\*gate\.session, gate\.scope\)\)",
                      "false", regex=True), "CHECK 8")
+    # The postconditions are pinned FAIL CLOSED: each of these keeps the predicate and the responder
+    # textually present and still has to fail.
+    must_fail("the wrapper backstop reverted to fail OPEN on an admit with no session", t.check_gates,
+              mutate(files, "auth_routes.cpp",
+                     r"!\(gate\.session && authz::service_scope_authority_ok\(\*gate\.session, gate\.scope\)\)",
+                     "gate.session && !authz::service_scope_authority_ok(*gate.session, gate.scope)",
+                     regex=True), "CHECK 8")
+    must_fail("the wrapper postcondition made dead with `false &&`", t.check_gates,
+              mutate(files, "auth_routes.cpp", "if (gate.admitted &&\n        !(gate.session",
+                     "if (false && gate.admitted &&\n        !(gate.session"), "CHECK 8")
+    must_fail("the wrapper refusal no longer un-admits the gate", t.check_gates,
+              mutate(files, "auth_routes.cpp", "        gate.admitted = false;\n        gate.scope.reset();\n"
+                     "        const auth::Session no_session{};",
+                     "        gate.scope.reset();\n        const auth::Session no_session{};"), "CHECK 8")
+    must_fail("the wrapper refusal no longer drops the scope", t.check_gates,
+              mutate(files, "auth_routes.cpp", "        gate.admitted = false;\n        gate.scope.reset();\n"
+                     "        const auth::Session no_session{};",
+                     "        gate.admitted = false;\n        const auth::Session no_session{};"), "CHECK 8")
+    must_fail("admit_fleet_read refuses but falls through to mint the authority", t.check_gates,
+              mutate(files, "authz_gates.cpp", "        return std::unexpected(authz::GateFailure::InvariantViolated);\n", ""),
+              "CHECK 8")
+    must_fail("admit_fleet_read refusal returns the wrong failure", t.check_gates,
+              mutate(files, "authz_gates.cpp", "return std::unexpected(authz::GateFailure::InvariantViolated);",
+                     "return std::unexpected(authz::GateFailure::Forbidden);"), "CHECK 8")
+    must_fail("admit_fleet_read postcondition made dead with `false &&`", t.check_gates,
+              mutate(files, "authz_gates.cpp", "if (!authz::service_scope_authority_ok(session, scope)) {",
+                     "if (false && !authz::service_scope_authority_ok(session, scope)) {"), "CHECK 8")
     must_fail("a second definition of service_scope_authority_ok", t.check_gates,
               {**files, S + "dashboard_routes.cpp": files[S + "dashboard_routes.cpp"] +
                "\nnamespace yuzu::server::authz { inline bool service_scope_authority_ok(const auth::Session&, int) { return true; } }\n"},

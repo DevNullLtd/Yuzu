@@ -1573,12 +1573,14 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
     // Postcondition on EVERY admit, in one place so a branch added to the body later cannot miss
     // it: a service-scoped session is never admitted unrestricted (the same predicate and
     // responder as require_fleet_read). The engine branch refuses it earlier; this is the backstop.
+    // An admit that carries no session cannot be checked, so it is refused too (fail CLOSED).
     ListReadGate gate = require_list_read_unchecked(req, res, securable_type, operation);
-    if (gate.admitted && gate.session &&
-        !authz::service_scope_authority_ok(*gate.session, gate.scope)) {
+    if (gate.admitted &&
+        !(gate.session && authz::service_scope_authority_ok(*gate.session, gate.scope))) {
         gate.admitted = false;
         gate.scope.reset();
-        refuse_service_scoped_unrestricted(req, res, *gate.session,
+        const auth::Session no_session{};
+        refuse_service_scoped_unrestricted(req, res, gate.session ? *gate.session : no_session,
                                            securable_type + ":" + operation,
                                            authz::UnrestrictedRefusalGate::kListRead,
                                            authz::UnrestrictedRefusalSite::kPostcondition);

@@ -55,7 +55,9 @@ CHECK 8 (gates). In `AuthRoutes::require_fleet_read` and `AuthRoutes::require_li
   wrapper and the ONLY caller of `require_list_read_unchecked`, running the postcondition;
   `service_scope_authority_ok` and `refuse_service_scoped_unrestricted` are each DEFINED once under
   server/; `admit_fleet_read` is the only place a `ListAuthority` is constructed, and it runs the
-  postcondition first.
+  postcondition first. The postconditions are pinned FAIL-CLOSED: `admit_fleet_read` returns
+  `InvariantViolated` straight after its refusal, and the `require_list_read` wrapper refuses an admit
+  that carries no session, un-admits the gate and drops its scope.
 
 Every frozen entry must still match something (a stale entry fails), so the lists cannot rot.
 
@@ -1135,6 +1137,23 @@ def check_gates(files: dict[str, str]) -> list[str]:
             errs.append("CHECK 8: AuthRoutes::require_list_read must run the postcondition "
                         "(service_scope_authority_ok then refuse_service_scoped_unrestricted(... "
                         "kListRead, kPostcondition))")
+        # The FAIL-CLOSED shape: an admit with no session is itself refused (the session test sits
+        # INSIDE the negation), and the refusal un-admits the gate and drops its scope.
+        post = re.search(r"\bif\s*\(\s*gate\s*\.\s*admitted\s*&&\s*!\s*\(\s*gate\s*\.\s*session\s*&&\s*"
+                         r"(?:authz\s*::\s*)?service_scope_authority_ok\s*\(\s*\*\s*gate\s*\.\s*session\s*,\s*"
+                         r"gate\s*\.\s*scope\s*\)\s*\)\s*\)\s*\{", body)
+        if not post:
+            errs.append("CHECK 8: AuthRoutes::require_list_read must test `if (gate.admitted && !(gate.session "
+                        "&& service_scope_authority_ok(*gate.session, gate.scope)))` (an admit with no session "
+                        "is refused, never waved through)")
+        else:
+            block = body[post.end():_balanced(body, post.end() - 1, "{", "}")]
+            if not re.search(r"\bgate\s*\.\s*admitted\s*=\s*false\s*;", block) or \
+                    not re.search(r"\bgate\s*\.\s*scope\s*\.\s*reset\s*\(\s*\)\s*;", block) or \
+                    not re.search(r"refuse_service_scoped_unrestricted\s*\(", block):
+                errs.append("CHECK 8: the postcondition block of AuthRoutes::require_list_read must set "
+                            "`gate.admitted = false;`, call `gate.scope.reset();` and call "
+                            "refuse_service_scoped_unrestricted(...)")
 
     # ONE definition each of the predicate and the responder under server/.
     for name, qual in (("service_scope_authority_ok", None),
@@ -1174,6 +1193,21 @@ def check_gates(files: dict[str, str]) -> list[str]:
             errs.append("CHECK 8: AuthRoutes::admit_fleet_read must run the postcondition "
                         "(service_scope_authority_ok, refuse_service_scoped_unrestricted(... kFleetRead, "
                         "kPostcondition)) BEFORE it constructs the ListAuthority")
+        # The FAIL-CLOSED shape: the refusal is followed, inside the same block, by the
+        # InvariantViolated return (a refusal that falls through would still mint the authority).
+        post = re.search(r"\bif\s*\(\s*!\s*(?:authz\s*::\s*)?service_scope_authority_ok\s*\(\s*session\s*,\s*"
+                         r"scope\s*\)\s*\)\s*\{", body)
+        if not post:
+            errs.append("CHECK 8: AuthRoutes::admit_fleet_read must test `if (!service_scope_authority_ok("
+                        "session, scope))` before it constructs the ListAuthority")
+        else:
+            block = body[post.end():_balanced(body, post.end() - 1, "{", "}")]
+            if not re.search(r"refuse_service_scoped_unrestricted\s*\([^;]*kFleetRead[^;]*kPostcondition[^;]*\)\s*;"
+                             r"\s*return\s+std\s*::\s*unexpected\s*\(\s*(?:authz\s*::\s*)?GateFailure\s*::\s*"
+                             r"InvariantViolated\s*\)\s*;\s*$", block):
+                errs.append("CHECK 8: the postcondition block of AuthRoutes::admit_fleet_read must END with "
+                            "refuse_service_scoped_unrestricted(... kFleetRead, kPostcondition); "
+                            "return std::unexpected(GateFailure::InvariantViolated);")
     return errs
 
 
