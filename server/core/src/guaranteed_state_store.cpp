@@ -2139,10 +2139,10 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
     return control("RELEASE SAVEPOINT census_upsert") ? out : CensusOutcome::Abandoned;
 }
 
-// The step's own lock wait bound (milliseconds). Deliberately shorter than the pool's `lock_timeout`
-// (10 s): see the Timeouts paragraph on `agent_order_step`. Ensure and DECIDE both wait on the
-// agent's row, so both are bounded by it.
-constexpr int kAgentStepLockTimeoutMs = 1000;
+// The step's own lock wait bound is `GuaranteedStateStore::kAgentStepLockTimeoutMs` (1 s by
+// default, read per call from the instance so a test can raise it). It is an absolute
+// `SET LOCAL`, not a ceiling: a pool or DSN `lock_timeout` below it would be loosened for the
+// step. See the Timeouts paragraph on `agent_order_step`.
 
 enum class AgentStepOutcome {
     Decided,   // DECIDE returned exactly one row; the savepoint is released
@@ -2158,26 +2158,32 @@ enum class AgentStepOutcome {
 // statement, a second missing row) costs the step and never the transaction that holds the
 // event. Never called for a Repair: a Repair runs no step and leaves the order table untouched.
 //
-// Timeouts: the step bounds its own lock waits (`kAgentStepLockTimeoutMs`) and leaves the
-// statement timeout to the connection's pool option (30 s). The agent row is the one lock every
-// first delivery of an agent queues on, and a waiter holds a pool lease for the whole wait, so a
-// row held for the pool's 10 s `lock_timeout` (a long fold, a stalled commit, an operator session
-// idle in a transaction) would pin one lease per waiting delivery and starve every other store
-// that shares the pool. A waiter that gives up after the step's bound takes the F1 path below
-// (SQLSTATE 55P03, event stored pending), which is the same cost at a fraction of the lease time.
+// Timeouts: the step sets its own `lock_timeout` (`kAgentStepLockTimeoutMs`, 1 s by default) and
+// leaves the statement timeout to the connection's pool option (30 s by default). The bound applies
+// to EACH lock wait, and the step can wait more than once: Ensure, DECIDE, and the one re-run of
+// both after a concurrent delete of the agent's row. A pooled connection can therefore be held for
+// the sum of those waits, not for one bound. The agent row is the one lock every first delivery of
+// an agent queues on, and a waiter holds a pool lease for the whole wait, so a row held for the
+// pool's default 10 s `lock_timeout` (a long fold, a stalled commit, an operator session idle in a
+// transaction) would pin one lease per waiting delivery and starve every other store that shares
+// the pool. A waiter whose wait reaches the step's bound takes the failed-step path below (SQLSTATE
+// 55P03: the event is stored pending and the census write is skipped), the same cost at a fraction
+// of the lease time. The `SET LOCAL` value is absolute: it does not take the smaller of its own and
+// the connection's value, so a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the step.
 // The bound is set under the step's savepoint and restored before the success RELEASE: ROLLBACK TO
 // reverts a SET LOCAL, RELEASE does not, so without the restore the census upsert and the fold
-// that follow in the same transaction would run under the step's bound instead of the pool's.
-// `TO DEFAULT` returns the pool's startup-option value, not the server default. A pool whose
-// statement timeout is the lower of the two gets 57014 instead. All take the same path as any
-// other error here.
+// that follow in the same transaction would run under the step's bound instead of the
+// connection's own. `TO DEFAULT` restores the connection's session reset value: the pool's startup
+// option `-c lock_timeout` (10 s by default), or a `options=` value in the DSN, or else the
+// role, database or server setting. A statement timeout below a lock wait ends the statement with
+// 57014 instead. All of these take the same path as any other error here.
 //
 // `pair` is the validated wire pair (0/0 = unpaired). The decided mode is not read: stored and
 // counted, not compared.
 [[nodiscard]] AgentStepOutcome
 agent_order_step(PGconn* conn,
                  const std::function<void(AgentStepGap, const std::string&)>& gap_hook,
-                 const GuaranteedStateEventRow& row, const CensusPair& pair) {
+                 const GuaranteedStateEventRow& row, const CensusPair& pair, int lock_timeout_ms) {
     const auto control = [conn](const char* sql) {
         return pg::exec_params(conn, sql, std::vector<std::string>{}).status() ==
                PGRES_COMMAND_OK;
@@ -2185,7 +2191,7 @@ agent_order_step(PGconn* conn,
     if (!control("SAVEPOINT agent_step"))
         return AgentStepOutcome::Abandoned;
     // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
-    if (!control(("SET LOCAL lock_timeout = " + std::to_string(kAgentStepLockTimeoutMs)).c_str()))
+    if (!control(("SET LOCAL lock_timeout = " + std::to_string(lock_timeout_ms)).c_str()))
         return AgentStepOutcome::Abandoned;
 
     const std::vector<std::string> ensure_params{row.agent_id};
@@ -2417,7 +2423,8 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         // census write does, and the census write is skipped: it has no decided mode to follow.
         const AgentStepOutcome step =
             agent_step_enabled_.load(std::memory_order_relaxed)
-                ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair)
+                ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair,
+                                   agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
                 : AgentStepOutcome::Decided;
         // An abandoned step is counted as the census write's own Abandoned outcome is: it aborts
         // the transaction and is also an ingest error.
@@ -2560,7 +2567,8 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             // back the whole batch and the caller re-issues it.
             const AgentStepOutcome step =
                 agent_step_enabled_.load(std::memory_order_relaxed)
-                    ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair)
+                    ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair,
+                                   agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
                     : AgentStepOutcome::Decided;
             if (step == AgentStepOutcome::Abandoned) {
                 count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Abandoned);

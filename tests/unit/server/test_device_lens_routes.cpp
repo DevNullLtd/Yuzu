@@ -416,9 +416,12 @@ TEST_CASE("device lenses: Guardian lens renders the degraded placeholder when on
     auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
                        const std::string&, const std::string&) { return true; };
     std::vector<std::string> audited;
-    auto audit = [&audited](const httplib::Request&, const std::string& a, const std::string&,
-                            const std::string&, const std::string& tid, const std::string&) {
+    std::vector<std::string> audit_results;
+    auto audit = [&audited, &audit_results](const httplib::Request&, const std::string& a,
+                                            const std::string& result, const std::string&,
+                                            const std::string& tid, const std::string&) {
         audited.push_back(a + "|" + tid);
+        audit_results.push_back(result);
         return true;
     };
     auto guardian_api = make_local_guardian_api(&store, /*baseline_store=*/nullptr);
@@ -460,9 +463,13 @@ TEST_CASE("device lenses: Guardian lens renders the degraded placeholder when on
               .counter("yuzu_server_guardian_read_degrade_total",
                        {{"reason", "query_error"}, {"source", "guardian_census_device"}})
               .value() == degraded_before + 1);
-    // Both opens are audited: the audit records the access, not the read's outcome.
+    // Both opens are audited, and the row's result follows the read: success for the control,
+    // failure for the open whose order read failed.
     REQUIRE(audited.size() == 2);
     CHECK(audited[1] == "guardian.device.view|" + agent);
+    REQUIRE(audit_results.size() == 2);
+    CHECK(audit_results[0] == "success");
+    CHECK(audit_results[1] == "failure");
 }
 
 // ─────────────────────────────────────────────────────────────────────────

@@ -947,6 +947,22 @@ struct AgentStepOff {
     GuaranteedStateStore& store;
 };
 
+// Raises the agent step's own lock bound for one store (RAII, restored to the production default).
+// For the cases that park a delivery behind a held lock and require the delivery to WAIT AND
+// SUCCEED: their margin is the former 10 s, not the 1 s production bound. The cases that pin the
+// 1 s default, or the failed-step outcome at it, never use it.
+struct AgentStepLockWait {
+    explicit AgentStepLockWait(GuaranteedStateStore& s, int ms = 10000) : store(s) {
+        store.set_agent_step_lock_timeout_ms_for_test(ms);
+    }
+    AgentStepLockWait(const AgentStepLockWait&) = delete;
+    AgentStepLockWait& operator=(const AgentStepLockWait&) = delete;
+    ~AgentStepLockWait() {
+        store.set_agent_step_lock_timeout_ms_for_test(GuaranteedStateStore::kAgentStepLockTimeoutMs);
+    }
+    GuaranteedStateStore& store;
+};
+
 // Poll until `n` backends in this database wait on a lock of `wait_event` (any lock when empty).
 // This observes that a writer really parked, which a fixed sleep cannot.
 bool wait_for_lock_waiters(const std::string& dsn, int n, const std::string& wait_event = {}) {
@@ -1550,6 +1566,7 @@ TEST_CASE("census ordering: a pending event that disagrees with a verdict insert
     // Declaration order is the safety argument: the result slots first (the threads write them),
     // then the owner, then the lock holder, so on a failure the holder (and its advisory locks) is
     // destroyed first, the parked writers finish, and only then are they joined.
+    AgentStepLockWait step_wait(store); // X's step waits on W's uncommitted agent row
     EventInsertResult x_res;
     EventInsertResult w_res;
     WriterThreads writers(store, nullptr);
@@ -3097,6 +3114,7 @@ TEST_CASE("census ordering: delete_agent and a projection holding the pair's row
     }
 
     SECTION("delete_agent parked behind a raw row lock, then a new event for the same pair") {
+        AgentStepLockWait step_wait(store); // the delivery's Ensure queues behind the delete
         EventInsertResult ingest_res;
         bool deleted = false;
         WriterThreads writers(store, nullptr);
@@ -3793,6 +3811,7 @@ TEST_CASE("census ordering: an order row deleted and held uncommitted while DECI
                 .outcome == EventInsertOutcome::Inserted);
 
     AgentHookGuard guard(store);
+    AgentStepLockWait step_wait(store); // DECIDE waits on the uncommitted delete and must succeed
     EventInsertResult res;
     std::atomic<bool> deleted_ok{false};
     std::promise<void> deleted_p;
@@ -3896,6 +3915,7 @@ TEST_CASE("census ordering: a delete uncommitted before Ensure makes Ensure wait
                 .outcome == EventInsertOutcome::Inserted);
 
     AgentHookGuard guard(store);
+    AgentStepLockWait step_wait(store); // Ensure waits on the uncommitted delete and must succeed
     std::atomic<int> gap_hits{0};
     store.set_agent_step_gap_hook_for_test(
         [&](AgentStepGap, const std::string&) { gap_hits.fetch_add(1); });
@@ -3974,12 +3994,13 @@ TEST_CASE("census ordering: a held or cancelled agent step costs the step and ne
 TEST_CASE("census ordering: the agent step bounds its own lock wait at one second and the pool's "
           "lock timeout is back for the census write",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {
-    // The pool keeps its 10 s lock_timeout. The step sets a 1 s bound under its savepoint, so a
-    // delivery queued behind a held agent row fails fast into the F1 path instead of pinning a pool
-    // lease for 10 s, and the bound must not leak to the census upsert that follows in the same
-    // transaction.
+    // The pool's lock_timeout is 30 s here, far above the step's own 1 s bound, so a step that
+    // missed its SET LOCAL would take 30 s and fail the margin below. The step sets its bound under
+    // its savepoint, so a delivery queued behind a held agent row fails fast into the failed-step
+    // path instead of pinning a pool lease for the pool's value, and the bound must not leak to the
+    // census upsert that follows in the same transaction.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 10000}};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 30000}};
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
@@ -3990,7 +4011,7 @@ TEST_CASE("census ordering: the agent step bounds its own lock wait at one secon
     const auto failures_before = store.census_proj_failures_total();
     const std::string verdict_before = census(db.dsn(), "a", "r1");
 
-    SECTION("a held agent row ends the step at about one second, not ten") {
+    SECTION("a held agent row ends the step at about one second, not the pool's thirty") {
         HeldSession holder(db.dsn());
         REQUIRE(holder.run("BEGIN"));
         REQUIRE(holder.run(std::string("SELECT 1 FROM ") + kSchema +
@@ -4001,7 +4022,7 @@ TEST_CASE("census ordering: the agent step bounds its own lock wait at one secon
         const auto waited = std::chrono::steady_clock::now() - t0;
         CHECK(r.outcome == EventInsertOutcome::Inserted); // acked, event stored pending (F1)
         CHECK(waited >= std::chrono::milliseconds(900));  // it did wait for the bound
-        CHECK(waited < std::chrono::seconds(6));          // and not for the pool's 10 s
+        CHECK(waited < std::chrono::seconds(15));         // and not for the pool's 30 s
         CHECK(pending_for(db.dsn(), "a") == "1");
         CHECK(census(db.dsn(), "a", "r1") == verdict_before);
         CHECK(store.census_proj_failures_total() == failures_before + 1);
@@ -4009,8 +4030,8 @@ TEST_CASE("census ordering: the agent step bounds its own lock wait at one secon
     }
 
     SECTION("a census row held past one second is waited for under the pool's lock timeout") {
-        // The step succeeds at once (the agent row is free) and must give the pool's lock_timeout
-        // back before RELEASE. The census upsert then waits behind the held census row for 2 s,
+        // The step succeeds at once (the agent row is free) and must give the connection's own
+        // lock_timeout back before RELEASE. The census upsert then waits behind the held census row for 2 s,
         // which a leaked 1 s bound would turn into a 55P03, a pending event and a counted failure.
         EventInsertResult res;
         std::chrono::steady_clock::duration waited{};
@@ -4061,11 +4082,12 @@ TEST_CASE("census ordering: the agent step bounds its own lock wait at one secon
                     .outcome == EventInsertOutcome::Inserted);
         CHECK(pending_for(db.dsn(), "a") == "0");
         CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11"); // the census write ran
-        // Both order statements (Ensure and DECIDE) ran under 1 s; the census upsert under 10 s.
+        // Both order statements (Ensure and DECIDE) ran under 1 s; the census upsert under the
+        // pool's 30 s.
         CHECK(query_scalar(db.dsn(), "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT "
                                      "stage || '=' || val AS x FROM " +
                                          log + ") t") ==
-              "guardian_agent_order=1s,guardian_agent_rule_status=10s");
+              "guardian_agent_order=1s,guardian_agent_rule_status=30s");
         // The connection goes back to the pool with its own setting, not the step's.
         CHECK(pool.in_use() == 0);
     }
@@ -4190,6 +4212,7 @@ TEST_CASE("census ordering: two writers of one agent on two rules take the agent
                 .outcome == EventInsertOutcome::Inserted);
     const auto failures_before = store.census_proj_failures_total();
 
+    AgentStepLockWait step_wait(store); // B's step waits on A's agent row and must succeed
     EventInsertResult res_a;
     EventInsertResult res_b;
     BarrierHold hold;
@@ -4462,6 +4485,7 @@ TEST_CASE("census ordering: delete_agent and a first delivery of the same agent 
             "arrives") {
         insert_pending_event(store, db.dsn(), "p1", "r1", "A", kBase + 150);
         const auto failures_before = store.census_proj_failures_total();
+        AgentStepLockWait step_wait(store); // the delivery's step waits behind delete_agent
         EventInsertResult res;
         bool deleted = false;
         WriterThreads writers(store, nullptr);

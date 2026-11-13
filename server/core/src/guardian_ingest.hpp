@@ -104,7 +104,8 @@ struct WirePair {
 
 /// Counter of wire emit-order pairs the ingest boundary withheld, by `reason` (`half_set`,
 /// `out_of_range`). Not a refusal: the event is stored and its verdict decision is unaffected (the
-/// census row's stored pair becomes NULL/NULL), so this is separate from
+/// census row's stored pair becomes NULL/NULL only when that unpaired verdict is applied; a verdict
+/// the ordering key refuses keeps the row's old pair), so this is separate from
 /// `kGuardianEventsRejectedMetric`. Counted once per withheld pair: only when the store reports the
 /// event `Inserted`, so a redelivery of the same event does not count again. Pre-seeded
 /// (server.cpp) from `kGuardianPairRejectReasons` so each series reads 0, not absent. Never
@@ -148,7 +149,8 @@ void report_pair_reject(PairReject reject, const GuaranteedStateEventRow& row,
                         yuzu::MetricsRegistry* metrics);
 
 /// Gauge of agents "currently unordered": the latest accepted unpaired census-bearing event is
-/// later than the agent's pair clock (`GuaranteedStateStore::unordered_agents`). Fleet-wide, no
+/// later than the agent's pair clock (the sweep reads `GuaranteedStateStore::unordered_agent_count`,
+/// the count-only twin of `unordered_agents`). Fleet-wide, no
 /// labels (never by agent: the per-agent view is the `ordering` field of the per-device read).
 /// Described in server.cpp and deliberately NOT pre-seeded, like `..._census_pending_events`: a
 /// zero before the first answered read would read as "no unordered agents".

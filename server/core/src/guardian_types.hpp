@@ -111,9 +111,10 @@ struct GuaranteedStateEventRow {
     // The agent's emit-order pair (schema v5), set by the ingest boundary from the wire
     // `boot_epoch`/`emit_seq` ONLY when both are set and each is in [1, 2^62): both set or both
     // unset, never one. Unset = unpaired (NULL columns). The store writes them to the event row
-    // and to the census row (re-validated by `census_pair`, so a half pair is never stored), and
-    // the agent order step reads them; nothing compares them yet. Like the key inputs above they
-    // stay OUT of the duplicate identity.
+    // and to the census row (re-validated by `census_pair`, so a half pair is never stored). The
+    // agent order step reads them and counts how a comparator WOULD decide (the per-agent
+    // regression, straggler, recovery and retired-event counters); no verdict compares them yet.
+    // Like the key inputs above they stay OUT of the duplicate identity.
     std::optional<std::int64_t> boot_epoch;
     std::optional<std::int64_t> emit_seq;
 };

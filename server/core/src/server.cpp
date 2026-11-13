@@ -4375,7 +4375,9 @@ public:
             "for a reason other than the rule not existing. The failure of a single "
             "event does not discard it: it stays stored with pending census "
             "evidence, and the pair keeps its previous state "
-            "until a redelivery of that event repairs it or a later event for the pair arrives. A "
+            "until a redelivery of that event repairs the census row or a later event for the "
+            "pair arrives. A repair runs no order step, so an event whose first delivery failed "
+            "that step never reaches the agent's order clock. A "
             "repair that fails is counted here again. >0 means the census may be "
             "stale; the server log line 'census upsert failed' names the agent "
             "and rule (the order step logs 'agent order step failed' with the agent and event). "
@@ -4421,7 +4423,8 @@ public:
                           "withheld at ingest, by reason. half_set: exactly one of the two was "
                           "set. out_of_range: a set pair had a value of 2^62 or more. The event "
                           "is still stored, unpaired, and its verdict decision is unaffected (the "
-                          "census row's stored pair becomes NULL); this is not a refusal. "
+                          "census row's stored pair becomes NULL when that unpaired verdict is applied); "
+                          "this is not a refusal. "
                           "Counted once per withheld pair: a redelivery of the same event does "
                           "not count again. Resets on server restart.",
                           "counter");

@@ -322,6 +322,20 @@ public:
         agent_step_enabled_.store(enabled, std::memory_order_relaxed);
     }
 
+    /// The agent order step's own `lock_timeout`, in milliseconds. It bounds EACH lock wait in the
+    /// step (Ensure, DECIDE, and the one re-run after a concurrent delete), so a step can hold its
+    /// pooled connection for the sum of its waits. See the Timeouts paragraph on `agent_order_step`.
+    static constexpr int kAgentStepLockTimeoutMs = 1000;
+
+    /// Test seam: the `lock_timeout` the agent order step applies, in milliseconds (default
+    /// `kAgentStepLockTimeoutMs`). A test that parks a delivery behind a held lock and expects the
+    /// delivery to wait and succeed raises it so the margin does not depend on the production
+    /// bound. Production never sets it, so it is inert by default. Atomic, so a setter never races
+    /// an ingest on another thread.
+    void set_agent_step_lock_timeout_ms_for_test(int ms) noexcept {
+        agent_step_lock_timeout_ms_.store(ms, std::memory_order_relaxed);
+    }
+
     /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
     /// reaches the database step invokes it first and returns `std::unexpected` when it returns true,
     /// so a test can fail ONLY this read (the earlier reads on the same request keep working). The
@@ -707,6 +721,7 @@ private:
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
     std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
+    std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production

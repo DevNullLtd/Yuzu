@@ -7240,4 +7240,5 @@ TEST_CASE("REST gs: a failed order read is a 503, never a zero or a null orderin
     REQUIRE(dev);
     CHECK(dev->status == 503);
     CHECK(dev->body.find("\"ordering\"") == std::string::npos);
+    CHECK(nlohmann::json::parse(dev->body)["error"]["retry_after_ms"] == 5000);
 }
