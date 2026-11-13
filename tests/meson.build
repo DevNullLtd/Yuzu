@@ -3473,6 +3473,17 @@ test('agent-only release lint',
   timeout: 30,
 )
 
+# Agent-bundle release verification (#7529): build-agent-bundle.sh must verify
+# SHA256SUMS' cosign signature (exact identity per signing era) before use and
+# match each file to its OWN line. Runs `--verify-only` against stub gh/cosign,
+# asserts cosign's argv, and mutation-tests itself on a scratch copy of the script.
+test('agent bundle release verification',
+  _python3_test,
+  args: [files('test_build_agent_bundle_verify.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # The `server` feature option (ADR-0035 ladder step 3): auto turns the server
 # off on a non-Linux target, enabled there is an error, the deprecated
 # `build_server` boolean stays declared and honoured. Lexical pins with a

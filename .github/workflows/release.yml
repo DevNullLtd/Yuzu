@@ -98,9 +98,12 @@ jobs:
             echo "::error::release.yml must run from a release tag, not ${GITHUB_REF_TYPE:-<unset>} '${tag}' (dispatch with --ref vX.Y.Z). Refusing (#5282)."
             exit 1
           fi
-          re='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)[0-9]+)?$'
+          # 1-4 digits per field: scripts/build-agent-bundle.sh (the post-release
+          # agent-bundle job) refuses wider fields, so a tag it would reject must
+          # not be allowed to publish a release first (#7529).
+          re='^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)[0-9]{1,4})?$'
           if [[ ! "$tag" =~ $re ]]; then
-            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N). Refusing (#5282)."
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N, 1-4 digits per number). Refusing (#5282)."
             exit 1
           fi
           out="$(mktemp)"; err="$(mktemp)"; rc=0
@@ -2184,10 +2187,10 @@ jobs:
 
   # ── Agent-bundle delivery image — published + SIGNED after the release ─
   # The 3-triplet agent bundle (yuzu-agent-bundle-chisel) repackages the
-  # release's OWN signed agent archives, so it can only be built once the
+  # release's OWN agent archives, so it can only be built once the
   # GitHub Release exists -> needs: [release]. It runs on a GitHub-hosted
-  # runner (no compilation, just download + repackage; gh/docker/buildx/cosign
-  # all preinstalled), reuses scripts/build-agent-bundle.sh as the single
+  # runner (no compilation, just download + repackage; gh/docker/buildx are
+  # preinstalled, cosign is installed by the job), reuses scripts/build-agent-bundle.sh as the single
   # source of truth, then signs + SBOMs + attests the pushed image exactly
   # like docker-publish. It is deliberately NOT in the release job's needs:
   # (it depends on release, not vice-versa), so it never gates the release.
@@ -2250,8 +2253,8 @@ jobs:
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
 
-      # Reuse the maintainer script (download release artifacts -> verify by
-      # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
+      # Reuse the maintainer script (download release artifacts -> verify
+      # SHA256SUMS' cosign signature, then each file against its own line -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
       # lets its `gh release download` authenticate against this just-published
       # release. linux/arm64 dropped — pass --push without --multiarch.
       - name: Build + push agent bundle (amd64)
@@ -2260,6 +2263,7 @@ jobs:
         run: |
           bash scripts/build-agent-bundle.sh \
             --version "${{ steps.ref.outputs.version }}" \
+            --signer-repo "${{ github.repository }}" \
             --push
 
       - name: Resolve pushed image digest
@@ -2441,6 +2445,9 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Sign SHA256SUMS (keyless)
+        env:
+          SIGN_REPOSITORY: ${{ github.repository }}
+          SIGN_REF: ${{ github.ref }}
         run: |
           cd artifacts
           # cosign v3.0+ rejects explicit --oidc-issuer when a signing
@@ -2458,6 +2465,16 @@ jobs:
           # every future release Scorecard-visible by default.
           cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.sigstore
           echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
+          # Verify what we just signed with the exact identity the published
+          # instructions (and scripts/build-agent-bundle.sh) will use, BEFORE
+          # the GitHub Release is created (#7529): a bundle a verifier would
+          # reject fails this job here, not after the release is public. (The
+          # images are already pushed and signed by now.)
+          cosign verify-blob --bundle SHA256SUMS.sigstore \
+            --certificate-identity "https://github.com/${SIGN_REPOSITORY}/.github/workflows/release.yml@${SIGN_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+          echo "Verified the SHA256SUMS signature with its exact release.yml identity"
 
       - name: Bundle SLSA attestations as .intoto.jsonl release assets
         env:
@@ -2646,7 +2663,7 @@ jobs:
 
           \`\`\`bash
           cosign verify-blob --bundle SHA256SUMS.sigstore \\
-            --certificate-identity-regexp '.*' \\
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
             SHA256SUMS
           \`\`\`
