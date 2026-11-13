@@ -455,3 +455,20 @@ client receives a client error (400 or -32602) rather than a store failure. `san
 remains the rule for free text that should be kept: it replaces the byte and stores the rest. The
 only direct-bind exceptions, which call `PQexecParams` themselves and are not covered by the
 helper, are `pg/secret_codec.cpp` and `pg/pg_migration_runner.cpp`.
+
+## Update (2026-11-13) -- `RbacAdminAuthorityOwner` now takes the `session_meta` row, last, in `deactivate_account`
+
+The 2026-10-04 entry says `RbacAdminAuthorityOwner` "takes `principal_roles` before `auth.users` and
+never a session or audit lock". That is no longer true of the session half. When a `SessionStore` is
+wired, `deactivate_account` calls the session store's own one-copy helper
+`session_sql::bump_generation_in_txn` (`session_store_sql_helpers.hpp`) as the last statement of its
+transaction, so the account going inactive and the session write-generation bump commit together (a
+replica then clears its validate cache on its next generation poll whether or not the later session
+wipe succeeds). The owner therefore touches a third schema, `session_store`, but through that
+helper rather than a copy of its SQL, and it still takes no audit lock. The lock edge is the
+`auth.users` row, then the `session_store.session_meta` `write_generation` row, taken last, the same
+position `CredentialChangeOwner` takes it in. It is acyclic because no `session_store` transaction
+takes an account or RBAC lock, so nothing that holds `session_meta` waits on one after taking it.
+The wait on that row is bounded per lock by the lifecycle `lock_timeout` the owner installs; session
+create and revoke writers install no timeout of their own and run under the pool defaults.
+A failed bump aborts the deactivation (the account stays active, a store failure to the caller).

@@ -4010,7 +4010,10 @@ The server emits an audit event on every branch:
 > failed session wipe, or a `POST` with `active:false`
 > ([#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)). Each request keeps a pooled PostgreSQL connection while it waits
 > (default pool 16, `--postgres-pool-size`; a deactivation can wait up to four
-> times 2000 ms), so watch `yuzu_pg_pool_waiters`,
+> times 2000 ms for its RBAC and account locks, plus a fifth wait on the
+> fleet-shared session write-generation row, and answers `503` with the account
+> still active if a session writer holds that row past the 2000 ms lifecycle lock
+> timeout), so watch `yuzu_pg_pool_waiters`,
 > `yuzu_pg_acquire_wait_seconds` and
 > `yuzu_server_rbac_lifecycle_store_failure_total{op}`; the full capacity and
 > stuck-lock procedure is in `docs/user-manual/rbac.md`, "Last-Administrator
