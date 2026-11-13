@@ -309,9 +309,11 @@ observations stay until retention expiry, and widening that is still tracked in 
 log's `boot_epoch` and `emit_seq` columns stay with their events until they expire. The order row
 holds the agent's counters and pair clock only: it is device-level (keyed by `agent_id`), holds
 server receipt-time clock readings and counters, and holds no user content and no behavioural data.
-It is retained until the device is decommissioned, with no TTL and no prune. An agent that vanishes
-without a decommission therefore stays counted in the unordered-agents figure and can crowd the
-first-50 id list. A prune of this table would be a separate clock-guarded-retention decision, not a
+The `epoch` and `emit_seq_hwm` values are what the agent asserted (the server checks only their
+range and does not verify them otherwise), while the clock readings are server database time. The row
+is retained until the device is decommissioned, with no TTL and no prune. An agent that vanishes
+without a decommission can therefore stay counted in the unordered-agents figure (while its latest
+unpaired event is later than its pair clock) and can crowd the first-50 id list. A prune of this table would be a separate clock-guarded-retention decision, not a
 quiet addition.
 
 Known residual, accepted: a first delivery that inserts the agent's order row and has not committed is
@@ -328,11 +330,19 @@ session left idle in a transaction) makes the agent's other first deliveries wai
 connection lease for the whole wait, and the leases come from one shared `PgPool` (default 16
 connections, `--postgres-pool-size`) that serves every store, authentication and audit included,
 with a 500 ms acquire timeout for ingest. The step therefore bounds its own wait: it runs
-`SET LOCAL lock_timeout = 1000` after its savepoint and restores the pool's value before the
-savepoint is released (`kAgentStepLockTimeoutMs`), so a waiter gives up after 1 s instead of the
-pool's 10 s. A waiter that gives up takes the existing failure path: the event is stored with pending census
-evidence, its census write is skipped, and it is counted as a failed census projection. The census
-write and the fold keep the pool's `lock_timeout`. The owner accepted that trade: a waiter fails fast
+`SET LOCAL lock_timeout = 1000` after its savepoint and restores the connection's own value (its
+session reset value: the pool's startup option, 10 s by default, a DSN `options=` value, or the
+role, database or server setting) before the savepoint is released (`kAgentStepLockTimeoutMs`), so
+each lock wait in the step gives up after 1 s instead of the pool's default 10 s. The bound is
+absolute: a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the step. One step can wait
+more than once (Ensure, DECIDE and one re-run after a concurrent delete of the agent's row), so a
+pooled connection can be held for the sum of those waits. A waiter that gives up takes the existing
+failure path: the event is stored with pending census evidence, its census write is skipped, and it
+is counted as a failed census projection. Such an event is acked and nothing on the server redelivers it, and the
+reaper exempts pending rows (`NOT projection_pending`), so for a rule that never fires again on that
+agent it stays until a later verdict for that (agent, rule) retires it: the accepted pending-list
+class of #7147, now also reachable through an order-step wait of over 1 s. The census write and the
+fold keep the connection's own `lock_timeout`. The owner accepted that trade: a waiter fails fast
 into pending instead of holding a pooled connection for 10 s, and the cost is faster pending growth
 for the waiting rules. Different agents do not wait on one another through this row, but they share
 the pool, so one agent holding its row for long can occupy leases until the shared pool saturates. Measured on one
