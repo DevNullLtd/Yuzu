@@ -77,19 +77,27 @@ It prints, in this order:
   counted, and `--full` lists them.
 - **Changelog entries:** the fragments this range adds, grouped security,
   removed, deprecated, changed, added, fixed. Each shows its first line, cut at
-  200 characters; security, removed and deprecated entries are never cut, and
-  neither is an entry starting `**Breaking`. A fragment replaced, renamed or
-  withdrawn inside the range is shown once in its final form, or not at all.
+  200 characters. Security, removed and deprecated entries, and entries starting
+  `**Breaking`, are shown whole, continuation lines included; other entries show
+  their continuation lines only with `--full`. A fragment replaced, reworded or
+  withdrawn inside the range is shown once in its final form, or not at all, and
+  a fragment merely renamed from a path you already had is not new. A fragment a
+  release has since promoted is shown when its first line appears among the
+  lines the range added to `CHANGELOG.md`; one whose changelog line was edited by
+  hand after promotion is not matched and is left out.
 
-"Your last pull" is read from the `HEAD` reflog: the newest `git pull` (or
-`git merge <remote>/<branch>` after a fetch) and the commit you were on before
-it. `checkout`, a local `merge` or `reset` cannot move it later, only earlier.
-A fresh clone has no pull in its reflog, and the reflog is local and expires,
-so pass `--since` then. After `git pull --rebase` the range starts at the
-common ancestor. `--since` with a date picks the newest commit older than it by
-commit date; only `YYYY-MM-DD`, `YYYY-MM-DD HH:MM`, `yesterday` and `N
-days/weeks/months/years ago` are accepted, because git would read a typo as
-"now".
+"Your last pull" is read from the reflog of the branch you are on: the newest
+`git pull` (or `git merge <upstream>` after a fetch) and the commit the branch
+was on before it. A pull on another branch is in that branch's reflog, and
+`checkout`, a local `merge` or `reset` write no pull entry, so none of them can
+move the base later; a pull the script does not recognise (a `fetch` followed
+by `reset --hard`, say) only makes the range start earlier. A fresh clone, a new
+branch, a detached `HEAD` or an expired reflog has no pull to read, so pass
+`--since`. After `git pull --rebase` the range starts at the common ancestor.
+`--since` with a date picks the newest commit older than the start of that day
+by commit date. Accepted: an ISO date (`YYYY-MM-DD`, optionally with
+`HH:MM[:SS]`), `yesterday`, or `N <unit> ago`; anything else is refused, because
+git would read a typo as "now".
 
 The script only reads. Text from fragments and commit messages is printed with
 control characters replaced. Changes that skipped a fragment (rule 3) do not

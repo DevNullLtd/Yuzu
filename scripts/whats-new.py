@@ -18,13 +18,14 @@ collated before a release.
   python3 scripts/whats-new.py                 # since your last pull
   python3 scripts/whats-new.py --since v0.15.0 # since a tag, branch or commit
   python3 scripts/whats-new.py --since "2 weeks ago"   # ISO date or "N <unit> ago"
-  python3 scripts/whats-new.py --full          # whole bullets; every CI/tooling dep bump
+  python3 scripts/whats-new.py --full          # whole bullets; every non-image dep bump
 
-"Your last pull" is read from the HEAD reflog: the newest `pull` entry, or a
-`merge <remote>/<branch>` entry after a manual fetch, and the commit HEAD was on
-before it. Unlike ORIG_HEAD it is not overwritten by `checkout`, a local `merge`
-or `reset`; a later action can only make the range start earlier, never later. The
-reflog is local and expires, so a fresh clone has none: pass --since.
+"Your last pull" is read from the reflog of the branch you are on: the newest
+`pull` entry, or a `merge <upstream>` entry after a manual fetch, and the commit the
+branch was on before it. `checkout`, a local `merge` and `reset` write no pull
+entry, and a pull on another branch is in that branch's reflog, so none of them can
+move the base later; a pull this script does not recognise only makes the range start
+earlier. The reflog is local and expires: a fresh clone has none, so pass --since.
 
 Read-only: it runs `git` queries and writes nothing. All repository-sourced text
 is printed with control characters replaced. Stdlib only.
@@ -39,6 +40,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
 # Breaking / operator-visible first. The grammar below mirrors scripts/assemble-changelog.py
@@ -49,21 +51,24 @@ FRAGMENT_RE = re.compile(
 )
 FRAGMENT_DIR = "changelog.d"
 BRIEF_MAX = 200
-# Sections whose entries are never cut: dropping the tail of a breaking or security
-# entry drops the step the reader has to take.
+# Sections whose entries are shown whole: the tail of a breaking or security entry is the
+# step the reader has to take.
 NEVER_TRUNCATE = {"security", "removed", "deprecated"}
 DEPS_SUBJECT = r"^(build|chore)\(deps[^)]*\):"
-# git's date parser accepts any string (a typo silently becomes "now"), so only
-# unambiguous forms are passed to it.
+# git's date parser accepts any string (a typo silently becomes "now"), so only unambiguous
+# forms are passed to it, and an absolute date is checked against the calendar here.
 DATE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?"
-    r"|yesterday"
-    r"|\d+ (second|minute|hour|day|week|month|year)s? ago)$"
+    r"^(?P<day>\d{4}-\d{2}-\d{2})(?P<time>[ T]\d{2}:\d{2}(:\d{2})?)?$"
+    r"|^yesterday$"
+    r"|^\d{1,4} (?:second|minute|hour|day|week|month|year)s? ago$"
 )
+SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 # A reflog entry written by one step of a rebase, e.g. "pull --rebase origin dev (pick): msg".
 REBASE_STEP_RE = re.compile(r"^(pull|rebase)\b[^:]*\((start|pick|finish|continue|fixup|squash|reword|edit|drop|abort)\b")
-# Terminal control characters other than \n and \t (ESC, CR, BEL, C1 controls, DEL).
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+# Terminal control characters other than \n and \t (ESC, CR, BEL, C1 controls, DEL), and
+# characters that reorder or hide text (zero-width, bidi overrides and isolates, line and
+# paragraph separators, BOM).
+CONTROL_RE = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏ -‮⁦-⁩﻿]")
 
 
 class GitError(Exception):
@@ -75,18 +80,32 @@ def clean(text: str) -> str:
     return CONTROL_RE.sub("?", text)
 
 
+def lines_of(text: str) -> list[str]:
+    """Split on newline only. str.splitlines() also splits on \\v, \\f, \\x1c-\\x1e, \\x85 and
+    U+2028/9, which lets repository text forge a record boundary."""
+    return text.split("\n")
+
+
 class Repo:
     def __init__(self, root: Path):
         self.root = root
 
-    def _run(self, *args: str) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, stdin: str | None = None, binary: bool = False) -> subprocess.CompletedProcess:
+        # Bytes in, bytes out, decoded here: text mode would turn a lone CR into a newline before
+        # clean() could see it.
         try:
-            return subprocess.run(
-                ["git", "-c", "core.quotepath=off", *args],
-                cwd=self.root, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            )
+            proc = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=self.root, capture_output=True,
+                                  input=stdin.encode() if stdin is not None else None)
         except FileNotFoundError as exc:
+            if not self.root.is_dir():
+                raise GitError(f"{self.root} is not a directory") from exc
             raise GitError("git was not found on PATH") from exc
+        except OSError as exc:
+            raise GitError(f"could not run git in {self.root}: {exc.strerror or exc}") from exc
+        if not binary:
+            proc.stdout = proc.stdout.decode("utf-8", "replace")
+            proc.stderr = proc.stderr.decode("utf-8", "replace")
+        return proc
 
     def git(self, *args: str) -> str:
         proc = self._run(*args)
@@ -110,6 +129,27 @@ class Repo:
             return None
         raise GitError(f"could not read {path} at {ref[:10]}: {proc.stderr.strip()}")
 
+    def blobs(self, specs: list[str]) -> dict[str, str | None]:
+        """Contents of `<rev>:<path>` specs in one process; None for a missing one."""
+        if not specs:
+            return {}
+        proc = self._run("cat-file", "--batch", stdin="\n".join(specs) + "\n", binary=True)
+        if proc.returncode != 0:
+            raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git cat-file --batch failed")
+        out: dict[str, str | None] = {}
+        data, pos = proc.stdout, 0
+        for spec in specs:
+            end = data.index(b"\n", pos)
+            header = data[pos:end].decode("utf-8", "replace")
+            pos = end + 1
+            if header.endswith(" missing"):
+                out[spec] = None
+                continue
+            size = int(header.rsplit(" ", 1)[1])
+            out[spec] = data[pos:pos + size].decode("utf-8", "replace")
+            pos += size + 1
+        return out
+
     def resolves(self, rev: str) -> str | None:
         proc = self._run("rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
         return proc.stdout.strip() or None
@@ -122,31 +162,61 @@ class Repo:
 # --- choosing the base ---------------------------------------------------------
 
 def last_pull_base(repo: Repo) -> str:
-    """The commit HEAD was on before the newest pull/fetch-merge recorded in the reflog."""
-    remotes = [r for r in repo.git("remote").split() if r]
-    merge_re = re.compile(r"^merge (?:" + "|".join(re.escape(r) for r in remotes) + r")/") if remotes else None
+    """The commit the current branch was on before its newest pull (or merge of its upstream)."""
+    branch = repo._run("symbolic-ref", "-q", "HEAD").stdout.strip()
+    if not branch:
+        raise GitError("HEAD is detached, so there is no branch reflog to read; pass --since <ref|date>")
+    upstream = repo._run("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}").stdout.strip()
     entries = []
-    for line in repo.git("reflog", "show", "--format=%H%x09%gs", "HEAD").splitlines():
+    for line in lines_of(repo.git("reflog", "show", "--format=%H%x09%gs", branch)):
         sha, _, subject = line.partition("\t")
-        entries.append((sha, subject))
+        if SHA_RE.match(sha):
+            entries.append((sha, subject))
 
     def is_pull(subject: str) -> bool:
-        return subject.startswith("pull") or bool(merge_re and merge_re.match(subject))
+        return subject.startswith("pull") or bool(upstream and subject.startswith(f"merge {upstream}"))
 
     for i, (_, subject) in enumerate(entries):
         if is_pull(subject):
             j = i + 1
             if REBASE_STEP_RE.match(subject):
-                # `pull --rebase` writes a run of pull/rebase step entries; the base precedes all of them.
-                while j < len(entries) and REBASE_STEP_RE.match(entries[j][1]):
+                # `pull --rebase` writes a run of step entries ending at its "(start)"; the base
+                # precedes all of them. An earlier pull's "(finish)" ends the run.
+                while j < len(entries) and REBASE_STEP_RE.match(entries[j][1]) and "(finish)" not in entries[j][1]:
+                    started = "(start)" in entries[j][1]
                     j += 1
+                    if started:
+                        break
             if j < len(entries):
                 return entries[j][0]
             break
     raise GitError(
-        "no pull is recorded in this checkout's reflog (a fresh clone or worktree has none); "
-        "pass --since <ref|date>"
+        "no pull is recorded for this branch (a fresh clone, a new branch or an expired reflog has none); "
+        "pass --since <ref|date>, for example --since v0.15.0 or --since \"2 weeks ago\""
     )
+
+
+def date_cutoff(since: str) -> str:
+    """The argument for `git rev-list --before=` for a validated date expression."""
+    m = DATE_RE.fullmatch(since)
+    if not m:
+        raise GitError(
+            f"--since {since!r} is not a ref in this repository; for a date use YYYY-MM-DD, "
+            "\"YYYY-MM-DD HH:MM\", yesterday or \"N days ago\" (seconds, minutes, hours, days, weeks, months, years)"
+        )
+    if m.group("day"):
+        text = since.replace("T", " ")
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise GitError(f"--since {since!r} is not a real calendar date or time")
+        # git fills a missing time of day with the current clock time; a bare date means its start.
+        return since if m.group("time") else since + " 00:00:00"
+    return since
 
 
 def resolve_base(repo: Repo, since: str | None, head: str) -> tuple[str, str]:
@@ -154,21 +224,13 @@ def resolve_base(repo: Repo, since: str | None, head: str) -> tuple[str, str]:
     if since is None:
         old, how = last_pull_base(repo), "your last pull"
     else:
-        old = repo.resolves(since)
-        how = since
+        old, how = repo.resolves(since), since
         if not old:
-            if not DATE_RE.match(since):
-                raise GitError(
-                    f"--since {since!r} is not a ref in this repository; for a date use YYYY-MM-DD "
-                    f"or \"N days ago\" (days, weeks, months and so on)"
-                )
-            old = repo.git("rev-list", "-1", f"--before={since}", head).strip()
+            old = repo.git("rev-list", "-1", f"--before={date_cutoff(since)}", head).strip()
             if not old:
-                hint = " (this is a shallow clone: history before the cut-off is missing)" \
-                    if repo.git("rev-parse", "--is-shallow-repository").strip() == "true" else ""
-                raise GitError(f"no commit is older than {since!r}{hint}")
-    if old == head:
-        raise GitError(f"{how}: HEAD has not moved since then, so there is nothing to compare; pass --since to look further back")
+                shallow = repo.git("rev-parse", "--is-shallow-repository").strip() == "true"
+                raise GitError(f"no commit is older than {since!r}"
+                               + (" (this is a shallow clone: history before the cut-off is missing)" if shallow else ""))
     if not repo.ok("merge-base", "--is-ancestor", old, head):
         if since is not None:
             raise GitError(f"{old[:10]} ({since}) is not an ancestor of HEAD; pick a ref on this branch's history")
@@ -177,6 +239,9 @@ def resolve_base(repo: Repo, since: str | None, head: str) -> tuple[str, str]:
         if not base:
             raise GitError("the commit before your last pull shares no history with HEAD; pass --since")
         old, how = base, "your last pull (rebased onto it; range starts at the common ancestor)"
+    if old == head:
+        raise GitError(f"{how}: HEAD has not moved since then, so there is nothing to compare; "
+                       + ("use an earlier --since" if since is not None else "pass --since to look further back"))
     return old, how
 
 
@@ -260,9 +325,10 @@ def version_changes(repo: Repo, old: str, new: str) -> list[str]:
     for fn in EXTRACTORS:
         try:
             before, after = fn(repo, old), fn(repo, new)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             # Compared as a whole or not at all: half a comparison would print the whole file as added or removed.
-            lines.append(f"  ! {fn.__name__} not compared: {exc}")
+            reason = str(exc) if isinstance(exc, ValueError) else "nested too deeply"
+            lines.append(f"  ! {fn.__name__} not compared: {reason}")
             continue
         for key in sorted(set(before) | set(after)):
             b, a = before.get(key), after.get(key)
@@ -326,7 +392,7 @@ def dependency_bumps(repo: Repo, old: str, new: str) -> tuple[list[str], list[st
     images: list[str] = []
     other: list[str] = []
     for block in out.split("\x00")[1:]:
-        subject, *paths = block.splitlines()
+        subject, *paths = lines_of(block)
         if not re.match(DEPS_SUBJECT, subject):
             continue
         (images if any(_is_image_file(p) for p in paths) else other).append(subject)
@@ -347,7 +413,7 @@ def section_of(path: str) -> str:
 def bullets(body: str) -> list[str]:
     """Split a fragment body into its '- ' bullets (continuation lines kept)."""
     items: list[list[str]] = []
-    for line in body.splitlines():
+    for line in lines_of(body):
         if line.startswith("- "):
             items.append([line])
         elif items:
@@ -355,39 +421,54 @@ def bullets(body: str) -> list[str]:
     return ["\n".join(b).rstrip() for b in items]
 
 
-def _squash(text: str) -> str:
-    return " ".join(text.split())
-
-
 def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
     """{path: body} for the fragments this range adds.
 
-    A fragment counts when it exists at `new` and did not at `old` (the net diff, so renames,
-    rewordings and reverts inside the range cannot list one change twice or list a withdrawn
-    one), or when a release promoted it inside the range: it is gone at `new`, its last body
-    appears in `new`'s CHANGELOG.md, and it was added after `old`.
+    A fragment counts when it exists at `new` and did not at `old` (the net diff, so a rename,
+    rewording or revert inside the range cannot list one change twice or list a withdrawn one; a
+    fragment merely renamed from a path that existed at `old` is not an add), or when a release
+    promoted it inside the range: it was added after `old`, is gone at `new`, and its last body's
+    first line is a line this range added to CHANGELOG.md.
     """
-    net = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=A", "--name-only", old, new, "--", FRAGMENT_DIR + "/")
+    pathspec = FRAGMENT_DIR + "/"
+    net = [p for p in repo.names("diff", "-z", "-M", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
            if _fragment_path_ok(p)]
     found: dict[str, str] = {}
-    for path in net:
-        body = repo.show(new, path)
+    for spec, body in repo.blobs([f"{new}:{p}" for p in net]).items():
         if body is not None:
-            found[path] = body
+            found[spec.split(":", 1)[1]] = body
 
-    # -m so adds made inside merge commits (conflict resolutions, evil merges) are seen too.
-    ever = repo.names("log", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only", "--format=", f"{old}..{new}", "--", FRAGMENT_DIR + "/")
-    gone = [p for p in dict.fromkeys(ever) if _fragment_path_ok(p) and p not in found and repo.show(new, p) is None]
-    if gone:
-        changelog = _squash(repo.show(new, "CHANGELOG.md") or "")
-        for path in gone:
-            deleter = repo.git("log", "-1", "--no-renames", "--diff-filter=D", "--format=%H", f"{old}..{new}", "--", path).strip()
-            if not deleter:
-                continue
-            body = repo.show(deleter + "^", path)
-            first = bullets(body)[:1] if body else []
-            if first and _squash(first[0]) in changelog:
-                found[path] = body  # type: ignore[assignment]
+    # -m so adds made inside merge commits are seen too. A fragment that already existed at `old`
+    # can show up here (a merge diffs against its side parent), so each is checked against both ends.
+    ever = [p for p in dict.fromkeys(repo.names("log", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only",
+                                                "--format=", f"{old}..{new}", "--", pathspec))
+            if _fragment_path_ok(p) and p not in found]
+    if not ever:
+        return found
+    tree_old = set(lines_of(repo.git("ls-tree", "-r", "--name-only", old, "--", pathspec)))
+    tree_new = set(lines_of(repo.git("ls-tree", "-r", "--name-only", new, "--", pathspec)))
+    gone = [p for p in ever if p not in tree_old and p not in tree_new]
+    if not gone:
+        return found
+    changelog_added = {
+        line[1:].rstrip() for line in lines_of(repo.git("diff", "-U0", old, new, "--", "CHANGELOG.md"))
+        if line.startswith("+") and not line.startswith("+++")
+    }
+    # The newest deleting commit of each path, in one pass.
+    deleter: dict[str, str] = {}
+    for block in repo.git("log", "--no-renames", "--diff-filter=D", "--name-only", "--format=%x00%H",
+                          f"{old}..{new}", "--", pathspec).split("\x00")[1:]:
+        sha, *paths = lines_of(block)
+        for p in paths:
+            if p:
+                deleter.setdefault(p, sha)
+    specs = {p: f"{deleter[p]}^:{p}" for p in gone if p in deleter}
+    bodies = repo.blobs(list(specs.values()))
+    for path, spec in specs.items():
+        body = bodies.get(spec)
+        first = bullets(body)[:1] if body else []
+        if body and first and first[0].split("\n")[0].rstrip() in changelog_added:
+            found[path] = body
     return found
 
 
@@ -408,11 +489,14 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
                 continue
             seen.add((section, b))
             total += 1
-            first = b.splitlines()[0]
-            cut = not full and section not in NEVER_TRUNCATE and not first.startswith("- **Breaking")
-            by_section[section].append(
-                b if full else (first[: BRIEF_MAX - 3].rstrip() + "..." if cut and len(first) > BRIEF_MAX else first)
-            )
+            first = b.split("\n")[0]
+            if full or section in NEVER_TRUNCATE or first.startswith("- **Breaking"):
+                shown = b
+            elif len(first) > BRIEF_MAX:
+                shown = first[: BRIEF_MAX - 3].rstrip() + "..."
+            else:
+                shown = first
+            by_section[section].append(shown)
     lines: list[str] = []
     for section in SECTION_ORDER:
         if by_section[section]:
@@ -426,11 +510,10 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
     head = repo.git("rev-parse", "HEAD").strip()
     old, how = resolve_base(repo, since, head)
     count = repo.git("rev-list", "--count", f"{old}..{head}").strip()
-    files = repo.names("diff", "-z", "--name-only", old, head)
-    base_line = repo.git("log", "-1", "--format=%h %cs %s", old).strip()
+    files = repo.names("diff", "-z", "--no-renames", "--name-only", old, head)
     out = [
         f"Changes since {how}: {count} commits, {len(files)} files ({top_level_summary(files)})",
-        f"Base {base_line}",
+        f"Base {repo.git('log', '-1', '--format=%h %cs %s', old).strip()}",
         f"Head {repo.git('log', '-1', '--format=%h %cs %s', head).strip()}",
         "",
     ]
@@ -448,7 +531,8 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
 
     images, other = dependency_bumps(repo, old, head)
     if images or other:
-        out.append(f"Dependency bumps (build(deps)/chore(deps) commits): {len(images)} Docker image, {len(other)} other")
+        out.append(f"Dependency bumps (build(deps)/chore(deps) commits): {len(images)} Docker "
+                   f"image{'' if len(images) == 1 else 's'}, {len(other)} other")
         out.extend(f"  {s}" for s in images)
         if full:
             out.extend(f"  {s}" for s in other)
@@ -463,7 +547,7 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
         out.extend(lines)
     else:
         out.append("No changelog fragments were added in this range (refactors, CI and test-only changes may skip them;")
-        out.append("`git log --first-parent --oneline` lists every merged PR).")
+        out.append(f"`git log --first-parent --oneline {old[:10]}..HEAD` lists every merged PR).")
     if empty:
         out.append(f"! {len(empty)} fragment(s) had no '- ' bullet and are not summarised: {', '.join(empty)}")
     return out
@@ -488,6 +572,8 @@ def main(argv: list[str]) -> int:
     except GitError as exc:
         print(f"whats-new: {clean(str(exc))}", file=sys.stderr)
         return 2
+    if sys.stdout is None:  # started with stdout closed (`>&-`)
+        return 0
     try:
         print("\n".join(clean(line) for line in report).rstrip())
         sys.stdout.flush()

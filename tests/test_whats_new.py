@@ -97,6 +97,25 @@ class GitCase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         return res.stdout
 
+    def make_clone(self):
+        upstream = self.init("upstream")
+        self.seed(upstream)
+        local = self.dir / "local"
+        self.git(self.dir, "clone", "-q", str(upstream), str(local))
+        return upstream, local
+
+    def push_upstream(self, upstream, name, text):
+        self.put(upstream, f"changelog.d/{name}", text)
+        self.commit(upstream, f"upstream {name}")
+
+    def try_git(self, repo, *args):
+        return subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=" + os.devnull, *args],
+            cwd=repo, env=self.env, capture_output=True, text=True)
+
+    def short(self, repo, rev):
+        return self.git(repo, "rev-parse", rev)
+
     def seed(self, repo):
         self.put(repo, "meson.build", MESON_OLD)
         self.put(repo, "vcpkg.json", vcpkg("a" * 40, ["zlib", {"name": "abseil", "version>=": "20240116.1"}]))
@@ -294,17 +313,6 @@ class Fragments(GitCase):
 
 
 class Base(GitCase):
-    def make_clone(self):
-        upstream = self.init("upstream")
-        self.seed(upstream)
-        local = self.dir / "local"
-        self.git(self.dir, "clone", "-q", str(upstream), str(local))
-        return upstream, local
-
-    def push_upstream(self, upstream, name, text):
-        self.put(upstream, f"changelog.d/{name}", text)
-        self.commit(upstream, f"upstream {name}")
-
     def test_default_is_the_last_pull_and_survives_later_actions(self):
         upstream, local = self.make_clone()
         self.assertEqual(self.run_script(local).returncode, 2)  # a fresh clone has no pull yet
@@ -315,7 +323,7 @@ class Base(GitCase):
         self.assertIn("since your last pull: 2 commits", out)
         self.assertIn("First pulled", out)
         self.assertIn("Second pulled", out)
-        # Each of these overwrites ORIG_HEAD; none of them may hide the pull.
+        # None of these writes a pull entry, so none may move the base or hide the pull.
         self.git(local, "checkout", "-q", "-b", "feat")
         self.put(local, "changelog.d/9-own.added.md", "- **Own work.**\n")
         self.commit(local, "own")
@@ -500,6 +508,395 @@ class Output(GitCase):
             self.assertTrue(WN.DATE_RE.match(good), good)
         for bad in ("yesterdy", "2 wekks ago", "last tuesday", "--output=x", "", "2 weeks"):
             self.assertFalse(WN.DATE_RE.match(bad), bad)
+
+
+class FakeRepo(WN.Repo):
+    """A Repo whose git answers are canned: for the reflog parser and the extractors."""
+
+    def __init__(self, runs=None, files=None):
+        super().__init__(Path("."))
+        self.runs = runs or {}
+        self.files = files or {}
+
+    def _run(self, *args, **kw):
+        return subprocess.CompletedProcess(args, 0, self.runs.get(args[0], ""), "")
+
+    def show(self, ref, path):
+        return self.files.get((ref, path))
+
+
+class BaseSelection(GitCase):
+    def base_token(self, out):
+        return next(line for line in out.splitlines() if line.startswith("Base ")).split()[1]
+
+    def test_a_pull_on_another_branch_does_not_replace_this_branchs_pull(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q")
+        self.git(local, "checkout", "-q", "-b", "feat")
+        self.push_upstream(upstream, "3-b.added.md", "- **Pull B on feat.**\n")
+        self.git(local, "pull", "-q", "origin", "dev")
+        self.git(local, "checkout", "-q", "dev")
+        self.put(local, "x.txt", "local\n")
+        self.commit(local, "local commit on dev")
+        out = self.ok(local)
+        self.assertIn("Pull A", out)
+        self.assertNotIn("Pull B", out)  # feat's pull is not dev's
+
+    def test_merging_another_remote_branch_is_not_a_pull_of_this_one(self):
+        upstream, local = self.make_clone()
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q")
+        self.git(upstream, "checkout", "-q", "-b", "other")
+        self.push_upstream(upstream, "3-o.added.md", "- **Other branch.**\n")
+        self.git(upstream, "checkout", "-q", "dev")
+        self.git(local, "fetch", "-q")
+        self.git(local, "merge", "-q", "--no-edit", "origin/other")
+        out = self.ok(local)
+        self.assertIn("Pull A", out)
+        self.assertIn("Other branch", out)
+
+    def test_a_detached_head_is_refused(self):
+        upstream, local = self.make_clone()
+        self.git(local, "checkout", "-q", "--detach")
+        res = self.run_script(local)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("detached", res.stderr)
+
+    def test_two_pull_rebases_in_a_row_start_at_the_second(self):
+        upstream, local = self.make_clone()
+        self.put(local, "x.txt", "l1\n")
+        self.commit(local, "local 1")
+        self.push_upstream(upstream, "2-a.added.md", "- **Pull A.**\n")
+        self.git(local, "pull", "-q", "--rebase")
+        # No commit between the two pulls: their reflog step entries are adjacent.
+        self.push_upstream(upstream, "3-b.added.md", "- **Pull B.**\n")
+        self.git(local, "pull", "-q", "--rebase")
+        out = self.ok(local)
+        self.assertIn("Pull B", out)
+        self.assertNotIn("Pull A", out)
+
+    def test_rebase_pull_reports_its_base_and_counts(self):
+        upstream, local = self.make_clone()
+        before = self.short(upstream, "HEAD")
+        self.put(local, "x.txt", "local\n")
+        self.commit(local, "local commit")
+        self.push_upstream(upstream, "2-a.added.md", "- **Rebased pull.**\n")
+        self.git(local, "pull", "-q", "--rebase")
+        out = self.ok(local)
+        self.assertIn("2 commits", out)  # the pulled one and the rebased local one
+        self.assertTrue(before.startswith(self.base_token(out)), out)
+
+    def test_pull_rebase_with_a_conflict_then_continue(self):
+        upstream, local = self.make_clone()
+        self.put(upstream, "x.txt", "base\n")
+        self.commit(upstream, "shared file")
+        self.git(local, "pull", "-q")
+        self.put(local, "x.txt", "local\n")
+        self.commit(local, "local edit")
+        self.put(upstream, "x.txt", "upstream\n")
+        self.put(upstream, "changelog.d/2-a.added.md", "- **Pulled through a conflict.**\n")
+        self.commit(upstream, "upstream edit")
+        self.assertNotEqual(self.try_git(local, "pull", "--rebase").returncode, 0)
+        self.put(local, "x.txt", "resolved\n")
+        self.git(local, "add", "x.txt")
+        self.env["GIT_EDITOR"] = "true"
+        self.git(local, "rebase", "--continue")
+        self.assertIn("Pulled through a conflict", self.ok(local))
+
+    def test_no_pull_message_names_the_remedy(self):
+        upstream, local = self.make_clone()
+        res = self.run_script(local)
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("no pull is recorded for this branch", res.stderr)
+        self.assertIn('--since "2 weeks ago"', res.stderr)
+
+    def test_the_forged_reflog_line_is_not_a_record(self):
+        # A replayed commit subject can carry \v, which str.splitlines() treats as a line break.
+        a, b, c, d = ("1" * 40, "2" * 40, "3" * 40, "4" * 40)
+        reflog = f"{a}\tcommit: mine\x0b{c}\tpull: forged\n{b}\tpull: Fast-forward\n{d}\tclone: from x\n"
+        repo = FakeRepo(runs={"symbolic-ref": "refs/heads/dev\n", "rev-parse": "origin/dev\n", "reflog": reflog})
+        self.assertEqual(WN.last_pull_base(repo), d)
+        junk = f"not-a-sha\tpull: x\n{b}\tpull: Fast-forward\n{d}\tclone: from x\n"
+        repo.runs["reflog"] = junk
+        self.assertEqual(WN.last_pull_base(repo), d)
+
+    def test_merge_entries_match_only_this_branchs_upstream(self):
+        a, b, c = ("1" * 40, "2" * 40, "3" * 40)
+        repo = FakeRepo(runs={"symbolic-ref": "refs/heads/dev\n", "rev-parse": "origin/dev\n",
+                              "reflog": f"{a}\tmerge origin/other: Fast-forward\n{b}\tmerge origin/dev: Fast-forward\n{c}\tclone: x\n"})
+        self.assertEqual(WN.last_pull_base(repo), c)
+        repo.runs["rev-parse"] = ""  # no upstream configured: a bare merge is not a pull
+        with self.assertRaises(WN.GitError):
+            WN.last_pull_base(repo)
+
+
+class DateValidation(GitCase):
+    def test_a_bare_date_means_the_start_of_that_day(self):
+        self.assertEqual(WN.date_cutoff("2026-11-01"), "2026-11-01 00:00:00")
+        self.assertEqual(WN.date_cutoff("2026-11-01 12:30"), "2026-11-01 12:30")
+        self.assertEqual(WN.date_cutoff("2026-11-01T12:30:15"), "2026-11-01T12:30:15")
+        self.assertEqual(WN.date_cutoff("yesterday"), "yesterday")
+        self.assertEqual(WN.date_cutoff("3 days ago"), "3 days ago")
+
+    def test_a_bare_date_does_not_depend_on_the_time_of_day(self):
+        repo = self.init()
+        self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "before", date="2026-10-31T12:00:00+0000")
+        self.put(repo, "changelog.d/2-early.added.md", "- **Early on the day.**\n")
+        self.commit(repo, "early", date="2026-11-01T01:00:00+0000")
+        self.put(repo, "changelog.d/3-late.added.md", "- **Late on the day.**\n")
+        self.commit(repo, "late", date="2026-11-01T23:00:00+0000")
+        out = self.ok(repo, "--since", "2026-11-01")
+        self.assertIn("Early on the day", out)
+        self.assertIn("Late on the day", out)
+
+    def test_calendar_impossible_and_junk_dates_are_refused(self):
+        for bad in ("2026-02-30", "2026-00-10", "2026-11-00", "2026-04-31", "2026-11-01 25:99", "2026-13-45",
+                    "2026-11-01 junk", "junk 2026-11-01", "2026-11-01\n", "99999 years ago", "2 wekks ago"):
+            with self.assertRaises(WN.GitError, msg=repr(bad)):
+                WN.date_cutoff(bad)
+
+    def test_cli_refuses_an_impossible_date(self):
+        repo = self.init()
+        self.seed(repo)
+        res = self.run_script(repo, "--since", "2026-02-30")
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("not a real calendar date", res.stderr)
+
+
+class FragmentSelection(GitCase):
+    def test_a_pending_fragment_is_not_listed_when_a_release_lands_in_the_range(self):
+        repo = self.init()
+        self.seed(repo)
+        self.git(repo, "checkout", "-q", "-b", "side")
+        self.put(repo, "changelog.d/3-g.added.md", "- **Added on the side branch.**\n")
+        self.commit(repo, "side")
+        self.git(repo, "checkout", "-q", "dev")
+        self.put(repo, "changelog.d/2-f.added.md", "- **Already pulled, pending.**\n")
+        old = self.commit(repo, "pending fragment, already pulled")
+        self.git(repo, "merge", "-q", "--no-ff", "-m", "Merge side", "side")
+        subprocess.run(
+            [sys.executable, str(ASSEMBLE), "promote", "1.3.0", "--date", "2026-10-30",
+             "--changelog", str(repo / "CHANGELOG.md"), "--fragments-dir", str(repo / "changelog.d")],
+            check=True, capture_output=True, text=True)
+        self.commit(repo, "release 1.3.0")
+        out = self.ok(repo, "--since", old)
+        self.assertEqual(out.count("Added on the side branch"), 1)
+        self.assertNotIn("Already pulled, pending", out)
+
+    def test_a_withdrawn_fragment_is_not_matched_by_older_changelog_text(self):
+        repo = self.init()
+        self.seed(repo)
+        self.put(repo, "CHANGELOG.md", CHANGELOG.replace("- **Older.**", "- **Fix.** an older, unrelated entry"))
+        old = self.commit(repo, "changelog mentions Fix.")
+        self.put(repo, "changelog.d/2-fix.fixed.md", "- **Fix.**\n")
+        self.commit(repo, "add")
+        (repo / "changelog.d/2-fix.fixed.md").unlink()
+        self.commit(repo, "withdraw")
+        out = self.ok(repo, "--since", old)
+        self.assertNotIn("Fixed (", out)
+        self.assertIn("No changelog fragments were added", out)
+
+    def test_a_fragment_renamed_from_a_path_that_existed_is_not_new(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/2-renamed.changed.md")
+        self.commit(repo, "rename an already-pulled fragment")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+    def test_an_edited_existing_fragment_is_not_listed(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/1-old.added.md", "- **Already there, edited.**\n")
+        self.commit(repo, "edit")
+        self.assertNotIn("edited", self.ok(repo, "--since", old))
+
+    def test_identical_bullets_in_one_section_count_once(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Twice.**\n")
+        self.put(repo, "changelog.d/3-b.added.md", "- **Twice.**\n")
+        self.commit(repo, "same text")
+        out = self.ok(repo, "--since", old)
+        self.assertEqual(out.count("**Twice.**"), 1)
+        self.assertIn("Changelog entries added (1)", out)
+
+    def test_removed_deprecated_and_breaking_entries_are_shown_whole(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-r.removed.md", "- **Removed.** " + "r" * 300 + "\n  second line of removal\n")
+        self.put(repo, "changelog.d/3-d.deprecated.md", "- **Deprecated.** " + "d" * 300 + "\n")
+        self.put(repo, "changelog.d/4-b.changed.md", "- **Breaking: change.** first\n  migration step\n")
+        self.put(repo, "changelog.d/5-s.security.md", "- **Sec.**\n  continuation of the security entry\n")
+        self.commit(repo, "entries")
+        out = self.ok(repo, "--since", old)
+        for text in ("r" * 300, "second line of removal", "d" * 300, "migration step", "continuation of the security entry"):
+            self.assertIn(text, out)
+
+    def test_the_brief_cut_is_exactly_at_the_limit(self):
+        repo = self.init()
+        old = self.seed(repo)
+        at = "- **A.** " + "a" * (200 - len("- **A.** "))
+        over = "- **B.** " + "b" * (201 - len("- **B.** "))
+        self.put(repo, "changelog.d/2-at.added.md", at + "\n")
+        self.put(repo, "changelog.d/3-over.added.md", over + "\n")
+        self.commit(repo, "two lengths")
+        out = self.ok(repo, "--since", old)
+        self.assertIn(at + "\n", out + "\n")
+        self.assertNotIn(at + "...", out)
+        line = next(line for line in out.splitlines() if line.startswith("- **B.**"))
+        self.assertEqual((len(line), line.endswith("...")), (200, True))
+
+    def test_vertical_tab_does_not_split_a_bullet_or_a_subject(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-v.added.md", "- **First half.**\x0b- **looks like a second bullet**\n")
+        self.put(repo, "server/q.txt", "x\n")
+        self.commit(repo, "build(deps): bump x\x0bdeploy/docker/Dockerfile")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (1)", out)
+        self.assertIn("0 Docker images, 1 other", out)
+
+
+class Extractors(GitCase):
+    def test_vcpkg_shapes(self):
+        def read(text):
+            return WN.vcpkg(FakeRepo(files={("r", "vcpkg.json"): text}), "r")
+        for bad in ('{"dependencies": 3}', '{"dependencies": [3]}', '{"dependencies": [{"x": 1}]}',
+                    '{"features": [1]}', '{"overrides": [3]}', "[]", "{bad"):
+            with self.assertRaises(ValueError, msg=bad):
+                read(bad)
+        out = read(json.dumps({
+            "builtin-baseline": "a" * 40, "dependencies": ["zlib", {"name": "abseil", "version>=": "1"}],
+            "features": {"server": {"dependencies": ["zlib"]}, "agent": {"description": "no deps key"}},
+            "overrides": [{"name": "a", "version-semver": "1.2.3"}, {"name": "b", "version-date": "2026-01-01"}],
+        }))
+        self.assertEqual(out["vcpkg dependency zlib"], "(unconstrained), (unconstrained) [feature server]")
+        self.assertEqual(out["vcpkg override a"], "1.2.3")
+        self.assertEqual(out["vcpkg override b"], "2026-01-01")
+        self.assertEqual(out["vcpkg builtin-baseline"], "a" * 10)
+        self.assertNotIn("vcpkg dependency agent", out)
+
+    def test_rebar_lock_absent_at_one_end_reads_as_new(self):
+        repo = FakeRepo(files={("n", "gateway/rebar.lock"): LOCK % "2.19.0"})
+        lines = WN.version_changes(repo, "o", "n")
+        self.assertIn("  + gateway package cowboy: 2.19.0  (new)", lines)
+
+    def test_a_pathologically_nested_manifest_is_reported_not_a_traceback(self):
+        repo = FakeRepo(files={("n", "vcpkg.json"): "[" * 100000, ("o", "vcpkg.json"): "{}"})
+        lines = WN.version_changes(repo, "o", "n")
+        self.assertIn("  ! vcpkg not compared: nested too deeply", lines)
+
+    def test_image_file_variants(self):
+        for path, image in (("deploy/docker/Dockerfile", True), ("deploy/docker/Dockerfile.runner", True),
+                            ("deploy/docker/x.Dockerfile", True), ("deploy/docker/docker-compose.yml", True),
+                            ("deploy/docker/requirements.txt", False), ("other/Dockerfile", False)):
+            self.assertEqual(WN._is_image_file(path), image, path)
+
+    def test_a_commit_touching_an_image_and_another_file_is_an_image_bump(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "deploy/docker/Dockerfile.y", "FROM y\n")
+        self.put(repo, "server/z.txt", "z\n")
+        self.commit(repo, "build(deps): bump y")
+        self.assertIn("1 Docker image, 0 other", self.ok(repo, "--since", old))
+
+    def test_a_deps_looking_line_in_a_message_body_is_not_a_bump(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.git(repo, "add", "-A")
+        self.git(repo, "commit", "-q", "-m", "feat: ordinary", "-m", "build(deps): not a subject")
+        self.assertNotIn("Dependency bumps", self.ok(repo, "--since", old))
+
+
+class Surfaces(GitCase):
+    def test_a_file_moved_out_of_a_watched_directory_is_still_noted(self):
+        repo = self.init()
+        self.seed(repo)
+        self.put(repo, "proto/a.proto", "syntax = \"proto3\";\n")
+        old = self.commit(repo, "add proto")
+        (repo / "other").mkdir()
+        self.git(repo, "mv", "proto/a.proto", "other/a.proto")
+        self.commit(repo, "move it out")
+        self.assertIn("`proto/` changed", self.ok(repo, "--since", old))
+
+    def test_header_lines_and_root_files(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        head = self.commit(repo, "the head subject")
+        out = self.ok(repo, "--since", old).splitlines()
+        self.assertTrue(out[0].startswith("Changes since "), out[0])
+        self.assertIn("1 commits, 1 files ((root) 1)", out[0])
+        self.assertTrue(out[1].startswith("Base ") and out[1].endswith(" old"), out[1])
+        self.assertTrue(out[2].startswith("Head ") and out[2].endswith(" the head subject"), out[2])
+        self.assertTrue(head.startswith(out[2].split()[1]))
+
+    def test_an_annotated_tag_and_a_subdirectory(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "tag", "-a", "v1", "-m", "release", old)
+        self.put(repo, "sub/x.txt", "x\n")
+        self.commit(repo, "next")
+        self.assertIn("Changes since v1", self.ok(repo, "--since", "v1"))
+        self.assertIn("Changes since v1", self.ok(repo / "sub", "--since", "v1"))
+
+    def test_no_fragments_line_names_the_real_range(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "no fragment")
+        out = self.ok(repo, "--since", old)
+        self.assertIn(f"`git log --first-parent --oneline {old[:10]}..HEAD`", out)
+
+
+class Hostile(GitCase):
+    def test_clean_table(self):
+        for ch in ("\x00", "\x07", "\x0d", "\x1b", "\x7f", "\x9b", "\u202e", "\u200b", "\u2028", "\ufeff"):
+            self.assertEqual(WN.clean("a" + ch + "b"), "a?b", repr(ch))
+        self.assertEqual(WN.clean("a\tb\nc"), "a\tb\nc")
+        self.assertEqual(WN.clean("plain é text"), "plain é text")
+
+    def test_a_carriage_return_in_a_fragment_and_a_subject_reaches_clean(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-cr.added.md", "- **Entry\rEVIL.**\n")
+        self.put(repo, "deploy/docker/Dockerfile.x", "FROM x\n")
+        self.commit(repo, "build(deps): bump a\rb")
+        out = self.ok(repo, "--since", old)
+        self.assertNotIn("\r", out)
+        self.assertIn("Entry?EVIL", out)
+        self.assertIn("bump a?b", out)
+
+    def test_control_characters_in_an_argument_do_not_reach_stderr(self):
+        repo = self.init()
+        self.seed(repo)
+        res = self.run_script(repo, "--since", "\x1b[2Jzz")
+        self.assertEqual(res.returncode, 2)
+        self.assertNotIn("\x1b", res.stderr)
+
+    def test_non_ascii_text_survives_a_narrow_output_encoding(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-u.added.md", "- **Caf\u00e9 \u2192 th\u00e9.**\n")
+        self.commit(repo, "unicode")
+        res = self.run_script(repo, "--since", old, env={**self.env, "PYTHONIOENCODING": "ascii"})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn("Caf? ? th?", res.stdout)
+
+    def test_bad_repo_arguments_are_clean_errors(self):
+        for target in ("/nonexistent/dir", "/etc/passwd"):
+            res = subprocess.run([sys.executable, str(SCRIPT), "--repo", target], env=self.env,
+                                 capture_output=True, text=True)
+            self.assertEqual(res.returncode, 2, target)
+            self.assertNotIn("Traceback", res.stderr)
+        res = subprocess.run([sys.executable, str(SCRIPT), "--repo", "/nonexistent/dir"], env=self.env,
+                             capture_output=True, text=True)
+        self.assertNotIn("not found on PATH", res.stderr)
 
 
 if __name__ == "__main__":
