@@ -41,6 +41,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -67,12 +68,15 @@ DATE_RE = re.compile(
 SHA_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 # A reflog entry written by one step of a rebase, e.g. "pull --rebase origin dev (pick): msg".
 REBASE_STEP_RE = re.compile(r"^(pull|rebase)\b[^:]*\((start|pick|finish|continue|fixup|squash|reword|edit|drop|abort)\b")
-# Terminal control characters other than \n and \t (ESC, CR, BEL, C1 controls, DEL), and
-# characters that reorder or hide text (zero-width, bidi overrides and isolates, line and
-# paragraph separators, BOM).
-CONTROL_RE = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u00ad\u034f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2064"
-    "\u2066-\u2069\ufeff\ufff9-\ufffb\U000e0000-\U000e007f]"
+# Text that is not shown but can steer a terminal or hide text: control characters except \n and
+# \t, and everything Unicode files under format (Cf: zero-width, bidi overrides and isolates, soft
+# hyphen, word joiner, tag characters, BOM), surrogate, line and paragraph separator, plus a few
+# invisible code points Unicode files elsewhere (variation selectors, fillers, combining grapheme
+# joiner, object replacement).
+HIDDEN_CATEGORIES = {"Cc", "Cf", "Cs", "Zl", "Zp"}
+HIDDEN_EXTRA_RE = re.compile(
+    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u2800\u3164\ufe00-\ufe0f\uffa0\ufffc"
+    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
 )
 
 
@@ -81,8 +85,11 @@ class GitError(Exception):
 
 
 def clean(text: str) -> str:
-    """Replace terminal control characters in repository-sourced text."""
-    return CONTROL_RE.sub("?", text)
+    """Replace terminal control and hidden characters in repository-sourced text."""
+    return "".join(
+        "?" if ch not in "\n\t" and (unicodedata.category(ch) in HIDDEN_CATEGORIES or HIDDEN_EXTRA_RE.match(ch)) else ch
+        for ch in text
+    )
 
 
 def lines_of(text: str) -> list[str]:
@@ -102,7 +109,7 @@ class Repo:
             # Pinned so a user's git config cannot change what is parsed (colour codes, signature
             # lines in `log`, quoted paths) and git's messages are not translated (see show()).
             proc = subprocess.run(["git", "-c", "core.quotepath=off", "-c", "color.ui=false",
-                                   "-c", "log.showSignature=false", *args],
+                                   "-c", "log.showSignature=false", "-c", "i18n.logOutputEncoding=UTF-8", *args],
                                   cwd=self.root, capture_output=True, input=stdin.encode() if stdin is not None else None,
                                   env={**os.environ, "LC_ALL": "C", "LANGUAGE": "C"})
         except FileNotFoundError as exc:
@@ -173,7 +180,12 @@ class Repo:
 
 # --- choosing the base ---------------------------------------------------------
 
-STEP_MARK_RE = re.compile(r"\s*\((?:start|pick|finish|continue|fixup|squash|reword|edit|drop|abort)[^)]*\)\s*$")
+# `git pull` options whose value is a separate argument.
+PULL_VALUE_OPTIONS = {
+    "-s", "--strategy", "-X", "--strategy-option", "-o", "--server-option", "-j", "--jobs", "--depth", "--deepen",
+    "--cleanup", "--upload-pack", "--shallow-since", "--shallow-exclude", "--negotiation-tip", "--refmap",
+}
+STEP_MARK_RE = re.compile(r"\s+\((?:start|pick|finish|continue|fixup|squash|reword|edit|drop|abort)[^)]*\)\s*$")
 
 
 def last_pull_base(repo: Repo) -> tuple[str, str]:
@@ -198,17 +210,29 @@ def last_pull_base(repo: Repo) -> tuple[str, str]:
             entries.append((sha, subject))
 
     def is_pull(subject: str) -> bool:
-        if subject.startswith("merge "):
-            return bool(upstream) and subject[len("merge "):].split(":", 1)[0] == upstream
-        if not (subject == "pull" or subject.startswith(("pull ", "pull:"))):
+        head, _, message = subject.partition(": ")  # git writes "<action and arguments>: <message>"
+        if head.startswith("merge "):
+            # A merge of exactly the upstream, and one that took its content (`-s ours` does not).
+            return bool(upstream) and head[len("merge "):] == upstream and "'ours' strategy" not in message
+        if not (head == "pull" or head.startswith("pull ")):
             return False
-        head = STEP_MARK_RE.sub("", subject.split(":", 1)[0])
-        positional = [t for t in head.split()[1:] if not t.startswith("-")]
+        head = STEP_MARK_RE.sub("", head)
+        positional, skip, after_dashes = [], False, False
+        for token in head.split()[1:]:
+            if skip:
+                skip = False
+            elif after_dashes or not token.startswith("-"):
+                positional.append(token)
+            elif token == "--":
+                after_dashes = True
+            elif token in PULL_VALUE_OPTIONS:
+                skip = True  # the next token is this option's value, not a repository or branch
         if len(positional) > 2:
             return False
         if positional and remote and positional[0] != remote:
             return False
-        return len(positional) < 2 or positional[1].removeprefix("refs/heads/") == own
+        # A refspec `src:dst` merges `src`; `:dst` merges the remote's HEAD, which is not this branch.
+        return len(positional) < 2 or positional[1].split(":", 1)[0].removeprefix("refs/heads/") == own
 
     for i, (_, subject) in enumerate(entries):
         if is_pull(subject):
@@ -245,6 +269,12 @@ def _minus_months(moment: datetime, months: int) -> datetime:
     raise GitError("that date is not representable")  # unreachable
 
 
+def _back(now: datetime, delta: timedelta) -> datetime:
+    """`now` minus an elapsed duration: absolute time, so a daylight-saving change inside the span
+    counts as the hour it is (naive wall-clock subtraction would be an hour out)."""
+    return (now.astimezone() - delta).astimezone().replace(tzinfo=None)
+
+
 def date_cutoff(since: str, now: datetime | None = None) -> str:
     """The argument for `git rev-list --before=` for a validated date expression.
 
@@ -259,6 +289,8 @@ def date_cutoff(since: str, now: datetime | None = None) -> str:
             "days, weeks, months or years)"
         )
     if m.group("day"):
+        if not 1970 <= int(m.group("day")[:4]) <= 2099:
+            raise GitError(f"--since {since!r}: git dates the history between 1970 and 2099")
         text = since.replace("T", " ")
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
@@ -272,16 +304,13 @@ def date_cutoff(since: str, now: datetime | None = None) -> str:
         return since if m.group("time") else since + " 00:00:00"
     now = now or datetime.now()
     if m.group("yesterday"):
-        moment = now - timedelta(days=1)
+        moment = _back(now, timedelta(days=1))
     else:
         n, unit = int(m.group("n")), m.group("unit")
         if unit in ("month", "year"):
-            moment = _minus_months(now, n * (12 if unit == "year" else 1))
+            moment = _minus_months(now, n * (12 if unit == "year" else 1))  # calendar arithmetic, as git does
         else:
-            try:
-                moment = now - timedelta(**{unit + "s": n})
-            except OverflowError as exc:
-                raise GitError(f"--since {since!r} is out of range") from exc
+            moment = _back(now, timedelta(**{unit + "s": n}))
     if moment.year < 1970:
         raise GitError(f"--since {since!r} is before 1970, earlier than any commit")
     return moment.strftime("%Y-%m-%d %H:%M:%S")
@@ -497,12 +526,13 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
 
     A fragment counts when it exists at `new` and did not at `old` (the net diff, so a rename,
     rewording or revert inside the range cannot list one change twice or list a withdrawn one; a
-    fragment merely renamed from a path that existed at `old` is not an add), or when a release
+    fragment renamed UNCHANGED from a path that existed at `old` is not an add: `-M100%`, because a
+    lower similarity threshold would also hide a new fragment that resembles a deleted one), or when a release
     promoted it inside the range: it was added after `old`, is gone at `new`, and its last body's
     first line is a line this range added to CHANGELOG.md.
     """
     pathspec = FRAGMENT_DIR + "/"
-    net = [p for p in repo.names("diff", "-z", "-M", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
+    net = [p for p in repo.names("diff", "-z", "-M100%", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
            if _fragment_path_ok(p)]
     found: dict[str, str] = {}
     for spec, body in repo.blobs([f"{new}:{p}" for p in net]).items():
@@ -511,7 +541,7 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
 
     # -m so adds made inside merge commits are seen too. A fragment that already existed at `old`
     # can show up here (a merge diffs against its side parent), so each is checked against both ends.
-    ever = [p for p in dict.fromkeys(repo.names("log", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only",
+    ever = [p for p in dict.fromkeys(repo.names("log", "-m", "-z", "-M100%", "--diff-filter=A", "--name-only",
                                                 "--format=", f"{old}..{new}", "--", pathspec))
             if _fragment_path_ok(p) and p not in found]
     if not ever:
@@ -522,7 +552,7 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
     if not gone:
         return found
     changelog_added = {
-        line[1:].rstrip() for line in lines_of(repo.git("diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", old, new, "--", "CHANGELOG.md"))
+        line[1:].rstrip() for line in lines_of(repo.git("diff", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", old, new, "--", "CHANGELOG.md"))
         if line.startswith("+") and not line.startswith("+++")
     }
     # The newest deleting commit of each path, in one pass.
@@ -533,19 +563,13 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
         for p in paths:
             if p:
                 deleter.setdefault(p, sha)
-    # A fragment renamed inside the range and then promoted is not new if its text was already
-    # there under the old name.
-    had = {
-        (bullets(b)[:1] or [""])[0].split("\n")[0].rstrip()
-        for b in repo.blobs([f"{old}:{p}" for p in tree_old if _fragment_path_ok(p)]).values() if b
-    }
     specs = {p: f"{deleter[p]}^:{p}" for p in gone if p in deleter}
     bodies = repo.blobs(list(specs.values()))
     for path, spec in specs.items():
         body = bodies.get(spec)
         first = bullets(body)[:1] if body else []
         line = first[0].split("\n")[0].rstrip() if first else ""
-        if body and line in changelog_added and line not in had:
+        if line and line in changelog_added:
             found[path] = body
     return found
 

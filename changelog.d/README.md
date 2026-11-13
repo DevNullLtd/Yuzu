@@ -81,8 +81,8 @@ It prints, in this order:
   `**Breaking` (in any case), are shown whole, continuation lines included;
   other entries show their continuation lines only with `--full`. A fragment
   replaced, reworded or withdrawn inside the range is shown once in its final
-  form, or not at all, and a fragment merely renamed from a path you already had
-  is not new. A fragment a release has since promoted is shown when its first
+  form, or not at all, and a fragment renamed unchanged from a path you already
+  had is not new (one renamed and edited is listed). A fragment a release has since promoted is shown when its first
   line is one of the lines the range added to `CHANGELOG.md`; one whose
   changelog line was edited by hand after promotion is not matched and is left
   out. Fragments are read the way `promote` reads them (line endings
@@ -90,8 +90,9 @@ It prints, in this order:
 
 "Your last pull" is read from the reflog of the branch you are on: the newest
 `git pull` that names no source or names that branch's upstream (or, when the
-branch has no upstream, the branch itself), or `git merge <upstream>` after a
-fetch, and the commit the branch was on before it. The `Via` line prints the
+branch has no upstream, the branch itself; `dev:dev` counts as `dev`, `:x` does
+not), or `git merge <upstream>` after a fetch (not `-s ours`), and the commit the
+branch was on before it. The `Via` line prints the
 reflog entry used. A pull on another branch is in that branch's reflog, and
 `checkout`, a local `merge`, `reset`, `git pull <other branch>` and a merge of a
 different branch (`origin/dev-hotfix` is not `origin/dev`) are not counted, so
@@ -104,8 +105,8 @@ range starts at the common ancestor.
 
 `--since` with a date picks the newest commit made at or before that moment, by
 commit date, in local time. A bare `YYYY-MM-DD` means 00:00 that day;
-`YYYY-MM-DD HH:MM[:SS]` (or with a `T`) is that moment; `yesterday` and `N <unit>
-ago` count back from now. `N` is one to four digits, the unit is lowercase
+`YYYY-MM-DD HH:MM[:SS]` (or with a `T`) is that moment, in the years 1970 to 2099;
+`yesterday` and `N <unit> ago` count back from now (a day is 24 hours). `N` is one to four digits, the unit is lowercase
 (`second`, `minute`, `hour`, `day`, `week`, `month`, `year`, singular or plural)
 and a month or year is a calendar month or year. Anything else is refused,
 because git would read a typo as "now".

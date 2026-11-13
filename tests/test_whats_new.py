@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -56,6 +56,8 @@ class GitCase(unittest.TestCase):
             **os.environ,
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "TZ": "UTC",
+            # Never discover a repository above the temp directory (TMPDIR may sit inside one).
+            "GIT_CEILING_DIRECTORIES": str(Path(self.tmp.name).parent),
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
@@ -633,7 +635,29 @@ class BaseSelection(GitCase):
             WN.last_pull_base(repo)
 
 
-class DateValidation(GitCase):
+class UtcClock:
+    """Run a test with the process clock in UTC, so date arithmetic does not depend on the machine."""
+
+    def setUp(self):
+        super().setUp()
+        import time
+        self._tz = os.environ.get("TZ")
+        os.environ["TZ"] = "UTC"
+        if hasattr(time, "tzset"):
+            time.tzset()
+
+    def tearDown(self):
+        import time
+        if self._tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self._tz
+        if hasattr(time, "tzset"):
+            time.tzset()
+        super().tearDown()
+
+
+class DateValidation(UtcClock, GitCase):
     def test_a_bare_date_means_the_start_of_that_day(self):
         self.assertEqual(WN.date_cutoff("2026-11-01"), "2026-11-01 00:00:00")
         self.assertEqual(WN.date_cutoff("2026-11-01 12:30"), "2026-11-01 12:30")
@@ -920,7 +944,7 @@ def promote(repo, version="1.3.0"):
         check=True, capture_output=True, text=True)
 
 
-class PullArguments(BaseSelection):
+class PullArguments(GitCase):
     def reflog_repo(self, *lines, remote="origin", merge="refs/heads/dev", upstream="origin/dev"):
         shas = ["%040x" % (i + 1) for i in range(len(lines))]
         reflog = "".join(f"{sha}\t{subject}\n" for sha, subject in zip(shas, lines))
@@ -1159,12 +1183,13 @@ class Robustness(GitCase):
         self.assertNotIn("Traceback", res.stderr)
 
     def test_clean_every_boundary(self):
-        inside = [0x00, 0x08, 0x0b, 0x0c, 0x0e, 0x1f, 0x7f, 0x80, 0x9f, 0xad, 0x34f, 0x61c, 0x180e, 0x200b, 0x200f,
-                  0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064, 0x2066, 0x2069, 0xfeff, 0xfff9, 0xfffb,
-                  0xe0000, 0xe0001, 0xe007f]
-        outside = [0x09, 0x0a, 0x20, 0x7e, 0xa0, 0xa1, 0x34e, 0x350, 0x61b, 0x61d, 0x180d, 0x180f, 0x200a, 0x2010,
-                   0x2027, 0x202f, 0x205f, 0x2065, 0x206a, 0xfefe, 0xff00, 0xfff8, 0xfffc, 0xdffff, 0xe0080,
-                   0x41, 0xe9, 0x4e2d]
+        inside = [0x00, 0x08, 0x0b, 0x0c, 0x0e, 0x1f, 0x7f, 0x80, 0x9f, 0xad, 0x34f, 0x61c, 0x115f, 0x1160, 0x17b4,
+                  0x17b5, 0x180b, 0x180d, 0x180e, 0x200b, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064,
+                  0x2066, 0x2069, 0x206a, 0x2800, 0x3164, 0xd800, 0xfe00, 0xfe0f, 0xfeff, 0xffa0,
+                  0xfff9, 0xfffb, 0xfffc, 0xe0000, 0xe0001, 0xe007f, 0xe0100, 0xe01ef]
+        outside = [0x09, 0x0a, 0x20, 0x7e, 0xa0, 0xa1, 0x34e, 0x350, 0x61b, 0x61d, 0x180f, 0x200a, 0x2010, 0x2027,
+                   0x202f, 0x205f, 0x2065, 0x27ff, 0x2801, 0x3163, 0x3165, 0xfdff, 0xfe10, 0xfefe, 0xff00, 0xff9f,
+                   0xfff8, 0xfffd, 0xdffff, 0xe0080, 0xe00ff, 0xe01f0, 0x41, 0xe9, 0x4e2d]
         for cp in inside:
             self.assertEqual(WN.clean(f"a{chr(cp)}b"), "a?b", hex(cp))
         for cp in outside:
@@ -1191,14 +1216,205 @@ class RelativeDatesEndToEnd(GitCase):
     def test_relative_dates_resolve_against_commit_dates(self):
         repo = self.init()
         self.seed(repo)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         self.put(repo, "changelog.d/2-old.added.md", "- **Long ago.**\n")
-        self.commit(repo, "old", date=(now.replace(year=now.year - 2)).strftime("%Y-%m-%dT%H:%M:%S+0000"))
+        self.commit(repo, "old", date=(now - timedelta(days=800)).strftime("%Y-%m-%dT%H:%M:%S+0000"))
         self.put(repo, "changelog.d/3-new.added.md", "- **Recent.**\n")
         self.commit(repo, "recent", date=now.strftime("%Y-%m-%dT%H:%M:%S+0000"))
         out = self.ok(repo, "--since", "1 year ago")
         self.assertIn("Recent", out)
         self.assertNotIn("Long ago", out)
+
+
+class RoundFourPulls(PullArguments):
+    def test_pull_subjects_that_must_not_count_and_must(self):
+        refuses = ["pull origin :zz: Fast-forward", "pull origin 'fix(finish)': x", "pull origin fix(start): x",
+                   "merge origin/dev: Merge made by the 'ours' strategy.", "merge dev: x", "merge origin: x",
+                   "merge /dev: x", "pull -s ours origin fix/foo: x", "pull -X theirs origin fix/foo: x",
+                   "pull --depth 5 origin fix/foo: x", "pull -- origin fix/foo: x"]
+        counts = ["pull -X theirs: Fast-forward", "pull -s ort: Fast-forward", "pull --depth 5: x", "pull -j 2: x",
+                  "pull -o x: x", "pull --upload-pack x: x", "pull --cleanup m: x", "pull -X theirs origin dev: x",
+                  "pull --rebase -X theirs (finish): x", "pull origin dev:dev: Fast-forward",
+                  "pull origin dev:other: Fast-forward", "pull -- origin dev: x", "pull --strategy ours origin dev: x"]
+        for subject in counts:
+            self.assertTrue(self.base_for(subject), subject)
+        for subject in refuses:
+            self.assertIsNone(self.base_for(subject), subject)
+
+    def test_a_local_branch_with_a_different_name_than_its_upstream(self):
+        upstream, local = self.make_clone()
+        self.git(local, "checkout", "-q", "-b", "work", "origin/dev")
+        self.push_upstream(upstream, "2-a.added.md", "- **Pulled into work.**\n")
+        self.git(local, "pull", "-q")
+        self.push_upstream(upstream, "3-b.added.md", "- **Second, by name.**\n")
+        self.git(local, "pull", "-q", "origin", "dev")
+        out = self.ok(local)
+        self.assertIn("Second, by name", out)
+        self.assertNotIn("Pulled into work", out)
+
+    def test_an_annotated_tag_at_head_is_nothing_to_compare(self):
+        repo = self.init()
+        self.seed(repo)
+        self.git(repo, "tag", "-a", "v9", "-m", "tag at head")
+        res = self.run_script(repo, "--since", "v9")
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("nothing to compare", res.stderr)
+
+    def test_the_fallback_base_equal_to_head_is_an_error(self):
+        class R(WN.Repo):
+            def ok(self, *a):
+                return False  # not an ancestor
+
+            def git(self, *a):
+                return "HEADSHA\n"  # the merge-base is HEAD
+
+        saved = WN.last_pull_base
+        WN.last_pull_base = lambda repo: ("OLDSHA", "pull: x")
+        try:
+            with self.assertRaises(WN.GitError) as ctx:
+                WN.resolve_base(R(Path(".")), None, "HEADSHA")
+        finally:
+            WN.last_pull_base = saved
+        self.assertIn("nothing to compare", str(ctx.exception))
+
+
+class RoundFourFragments(GitCase):
+    def test_a_new_fragment_that_resembles_a_deleted_one_is_still_new(self):
+        repo = self.init()
+        self.seed(repo)
+        body = "- **Templated entry.** line one\n  line two of the template\n  line three of the template\n"
+        self.put(repo, "changelog.d/2-old.fixed.md", body)
+        old = self.commit(repo, "a fragment")
+        (repo / "changelog.d/2-old.fixed.md").unlink()
+        self.put(repo, "changelog.d/3-new.fixed.md", body.replace("Templated entry.", "A different entry."))
+        self.commit(repo, "delete one, add a close relative")
+        self.assertIn("A different entry", self.ok(repo, "--since", old))
+
+    def test_a_promoted_new_fragment_may_share_a_first_line_with_an_old_one(self):
+        repo = self.init()
+        self.seed(repo)
+        self.put(repo, "changelog.d/2-gen.fixed.md", "- **Fixed.**\n")
+        old = self.commit(repo, "generic fragment, pending")
+        self.put(repo, "changelog.d/3-gen.fixed.md", "- **Fixed.**\n  but this one is new and longer\n")
+        self.commit(repo, "another with the same first line")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old, "--full")
+        self.assertIn("Changelog entries added (1)", out)
+        self.assertIn("but this one is new and longer", out)
+
+    def test_an_unchanged_rename_is_not_new_but_an_edited_one_is(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/2-moved.added.md")
+        self.commit(repo, "move unchanged")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+    def test_a_nul_in_a_promoted_fragment_does_not_hide_it(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-nul.added.md", "- **Has a NUL.** x\x00y\n")
+        self.commit(repo, "fragment with a NUL")
+        promote(repo)
+        self.commit(repo, "release")
+        self.assertIn("Has a NUL", self.ok(repo, "--since", old))
+
+    def test_a_deleted_fragment_with_no_bullet_makes_no_warning(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-junk.fixed.md", "no bullet here\n")
+        self.commit(repo, "junk")
+        (repo / "changelog.d/2-junk.fixed.md").unlink()
+        self.commit(repo, "removed by hand")
+        promote(repo)
+        self.commit(repo, "release")
+        self.assertNotIn("no '- ' bullet", self.ok(repo, "--since", old))
+
+    def test_a_non_ascii_dockerfile_path_is_still_an_image_bump(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "deploy/docker/Dockerfile.caf\u00e9", "FROM x\n")
+        self.commit(repo, "build(deps): bump x")
+        self.assertIn("1 Docker image, 0 other", self.ok(repo, "--since", old))
+
+    def test_a_non_utf8_commit_subject_is_replaced_not_a_traceback(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.git(repo, "add", "-A")
+        subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q",
+                        "-F", "-"], cwd=repo, env=self.env, input="build(deps): bump caf\xe9\n".encode("latin-1"),
+                       check=True, capture_output=True)
+        res = self.run_script(repo, "--since", old)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_a_broken_pipe_is_quiet(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "next")
+        r, w = os.pipe()
+        os.close(r)
+        try:
+            res = subprocess.run([sys.executable, str(SCRIPT), "--repo", str(repo), "--since", old], env=self.env,
+                                 stdout=w, stderr=subprocess.PIPE, text=True)
+        finally:
+            os.close(w)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+
+    def test_a_failed_cat_file_is_an_error(self):
+        class R(FakeRepo):
+            def _run(self, *args, **kw):
+                return subprocess.CompletedProcess(args, 1, b"", b"fatal: broken")
+        with self.assertRaises(WN.GitError):
+            R().blobs(["abc:x"])
+
+
+class RoundFourDates(UtcClock, GitCase):
+    def test_month_end_leap_and_boundary_arithmetic(self):
+        self.assertEqual(WN.date_cutoff("1 month ago", datetime(2026, 5, 31, 9, 0, 0)), "2026-04-30 09:00:00")
+        self.assertEqual(WN.date_cutoff("1 month ago", datetime(2026, 3, 30, 9, 0, 0)), "2026-02-28 09:00:00")
+        self.assertEqual(WN.date_cutoff("1 month ago", datetime(2026, 1, 31, 9, 0, 0)), "2025-12-31 09:00:00")
+        self.assertEqual(WN.date_cutoff("1 year ago", datetime(2028, 2, 29, 9, 0, 0)), "2027-02-28 09:00:00")
+        self.assertEqual(WN.date_cutoff("4 years ago", datetime(2028, 2, 29, 9, 0, 0)), "2024-02-29 09:00:00")
+        self.assertEqual(WN.date_cutoff("1000 days ago", datetime(2026, 11, 13, 16, 0, 0)), "2024-02-17 16:00:00")
+        self.assertEqual(WN.date_cutoff("56 years ago", datetime(2026, 11, 13, 16, 0, 0)), "1970-11-13 16:00:00")
+        with self.assertRaises(WN.GitError):
+            WN.date_cutoff("57 years ago", datetime(2026, 11, 13, 16, 0, 0))
+        with self.assertRaises(WN.GitError):
+            WN.date_cutoff("9999 weeks ago", datetime(2026, 11, 13, 16, 0, 0))
+        for bad in (" days ago", "12345 days ago", "days ago"):
+            with self.assertRaises(WN.GitError, msg=bad):
+                WN.date_cutoff(bad)
+
+    def test_absolute_years_outside_1970_to_2099_are_refused(self):
+        for bad in ("2100-01-01", "9999-12-31", "1969-12-31", "0001-01-01"):
+            with self.assertRaises(WN.GitError, msg=bad):
+                WN.date_cutoff(bad)
+        self.assertEqual(WN.date_cutoff("2099-12-31"), "2099-12-31 00:00:00")
+        self.assertEqual(WN.date_cutoff("1970-01-01"), "1970-01-01 00:00:00")
+
+
+class RoundFourDst(GitCase):
+    @unittest.skipUnless(hasattr(__import__("time"), "tzset"), "needs time.tzset")
+    def test_a_duration_across_a_daylight_saving_change_is_absolute(self):
+        import time
+        old_tz = os.environ.get("TZ")
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        try:
+            # 2026-03-08 10:00 EDT is 9 real hours after 2026-03-08 01:00 EST... clocks jumped 02:00 -> 03:00.
+            self.assertEqual(WN.date_cutoff("10 hours ago", datetime(2026, 3, 8, 10, 0, 0)), "2026-03-07 23:00:00")
+            # A day is 24 hours, as git counts it: 10:00 EDT on the 8th is 09:00 EST on the 7th.
+            self.assertEqual(WN.date_cutoff("1 day ago", datetime(2026, 3, 8, 10, 0, 0)), "2026-03-07 09:00:00")
+        finally:
+            if old_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old_tz
+            time.tzset()
 
 
 if __name__ == "__main__":
