@@ -1113,7 +1113,10 @@ static const ToolDef kTools[] = {
     {"create_management_group",
      "Create a new management group (hierarchical device grouping used for access scoping). "
      "Mirrors POST /api/v1/management-groups. Requires ManagementGroup:Write — approval-gated "
-     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing.",
+     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing. "
+     "Audit-first: an intent audit row is stored before the group is created; if it cannot be "
+     "stored the call is refused with an internal error (retryable) and nothing is created. "
+     "audit_persisted:false in a success means only the closing outcome row was lost.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Group display name"},)j"
      R"j("description":{"type":"string","maxLength":1024,"description":"Optional description"},)j"
@@ -13706,16 +13709,74 @@ McpServer::HandlerFn McpServer::build_handler(
                 g.scope_expression = param_str(args, "scope_expression");
                 g.created_by = session->username;
 
+                // Audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the
+                // REST twin is POST /api/v1/management-groups. The store's own fault text
+                // (libpq output) is never returned or audited: a fixed answer and token only.
+                const auto store_fault = [&]() {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                };
+                // The checks create_group runs before its insert, decided here so a refusal
+                // burns no `attempted` row (and writes no management_group.create row).
+                if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+                    if (classify_mgmt_group_error(valid.error()).code == kInternalError) {
+                        mcp_audit("failure", "store_error");
+                        store_fault();
+                        return;
+                    }
+                    mcp_audit("failure", valid.error());
+                    res.set_content(a4_error(kInvalidParams, valid.error()), "application/json");
+                    return;
+                }
+                if (!audit_fn(req, "management_group.create", "attempted", "ManagementGroup", "",
+                              name)) {
+                    mcp_audit("failure", "audit unavailable; group not created");
+                    res.set_content(a4_error(kInternalError,
+                                             "audit log unavailable; the change was not made",
+                                             "retry once the audit log is available",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // The attempted row can wait on the audit pool: authenticate and authorise
+                // again, so a credential revoked or a grant removed meanwhile creates nothing.
+                // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
+                const auto fresh = auth_fn(req, res);
+                if (!fresh || fresh->username != session->username) {
+                    (void)audit_fn(req, "management_group.create", "failure", "ManagementGroup", "",
+                                   "session_revoked");
+                    if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                        res.status = 401;
+                        res.set_content(R"({"error":"unauthorized"})", "application/json");
+                    }
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write")) {
+                    (void)audit_fn(req, "management_group.create", "failure", "ManagementGroup", "",
+                                   "permission_revoked");
+                    return;
+                }
+
                 auto result = mgmt_store->create_group(g);
                 if (!result) {
-                    const auto info = classify_mgmt_group_error(result.error());
-                    const bool audit_ok = audit_fn(req, "management_group.create", "failure",
-                                                   "ManagementGroup", name, result.error());
-                    res.set_content(
-                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
-                                 {}, audit_ok),
-                        "application/json");
-                    mcp_audit("failure", result.error());
+                    // The attempted row is stored, so it gets an outcome with a FIXED token.
+                    const bool conflict = result.error() == "a group with that name already exists";
+                    const bool fault = !conflict && classify_mgmt_group_error(result.error()).code ==
+                                                        kInternalError;
+                    const bool audit_ok = audit_fn(
+                        req, "management_group.create", "failure", "ManagementGroup", "",
+                        conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
+                    mcp_audit("failure", conflict ? "name_conflict"
+                                                  : (fault ? "store_error" : result.error()));
+                    if (fault) {
+                        store_fault();
+                        return;
+                    }
+                    // A name conflict or a validation literal: closed text, safe to echo.
+                    res.set_content(a4_error(kInvalidParams, result.error(), {}, -1, {}, audit_ok),
+                                    "application/json");
                     return;
                 }
                 const bool audit_ok = audit_fn(req, "management_group.create", "success",

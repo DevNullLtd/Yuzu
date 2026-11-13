@@ -28951,6 +28951,426 @@ TEST_CASE("MCP create_management_group: a non-string description/parent_id is "
     CHECK(store.list_groups().empty());
 }
 
+// ── #7074: create_management_group is audit-first (ADR-0033 section 9) ──────
+// The tool stores an `attempted` management_group.create row BEFORE it creates the group and
+// refuses (kInternalError + retry hint) when that row cannot be stored. Refusals decided without
+// a write (tier, permission, arguments, `validate_new_group`) write no management_group.create
+// row. Authority is decided again after the attempted row. A store fault never echoes the
+// store's text. REST twin: test_rest_mgmt_group_audit_first.cpp.
+
+namespace {
+
+std::string mg_create_body(const nlohmann::json& arguments, int id = 1) {
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"id", id},
+                          {"method", "tools/call"},
+                          {"params", {{"name", "create_management_group"}, {"arguments", arguments}}}}
+        .dump();
+}
+
+/// The "management_group.create|<result>" rows the tool wrote, in order (the generic
+/// mcp.create_management_group row is a different action and is not counted).
+std::vector<std::string> mg_create_rows(const McpTestServer& ts) {
+    std::vector<std::string> rows;
+    for (const auto& r : ts.audit_log)
+        if (r.starts_with("management_group.create|"))
+            rows.push_back(r);
+    return rows;
+}
+
+/// The detail / target_id of the n-th management_group.create row.
+std::string mg_create_row_field(const McpTestServer& ts, const std::vector<std::string>& column,
+                                std::size_t n) {
+    std::size_t seen = 0;
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+        if (ts.audit_log[i].starts_with("management_group.create|") && seen++ == n)
+            return column.at(i);
+    return "<missing>";
+}
+
+} // namespace
+
+TEST_CASE("MCP create_management_group: an unstorable attempted row refuses the create and "
+          "nothing is created",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.audit_fail_action_result_ = "management_group.create|attempted";
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "audit-down"}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "audit log unavailable; the change was not made");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    CHECK_FALSE(body.contains("result"));
+
+    CHECK(store.list_groups().empty());
+    // Only the refused attempt: no outcome row of either kind.
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted"});
+}
+
+TEST_CASE("MCP create_management_group: refusals decided without a write burn no "
+          "management_group.create row",
+          "[mcp][management_group][mgmt-audit-first]") {
+    // None of these reach the store, so none needs one: the argument checks, the tier and the
+    // permission all answer before the attempted row (and the null-store gate sits before it).
+    SECTION("tier denied") {
+        McpTestServer ts;
+        ts.start("readonly");
+        auto res = ts.call(mg_create_body({{"name", "x"}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kTierDenied);
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("permission denied") {
+        McpTestServer ts;
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write");
+        };
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", "x"}}));
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("empty name") {
+        McpTestServer ts;
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", ""}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("oversize name") {
+        McpTestServer ts;
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", std::string(kMgmtGroupNameMaxLen + 1, 'n')}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("wrong argument type") {
+        McpTestServer ts;
+        ts.start();
+        for (const char* field : {"description", "parent_id", "membership_type", "scope_expression"}) {
+            INFO("field: " << field);
+            auto res = ts.call(mg_create_body({{"name", "x"}, {field, 42}}));
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        CHECK(mg_create_rows(ts).empty());
+    }
+    SECTION("store unavailable") {
+        McpTestServer ts; // mgmt_store_for_test left null
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", "x"}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        CHECK(mg_create_rows(ts).empty());
+    }
+}
+
+TEST_CASE("MCP create_management_group: a validate_new_group refusal is a client error and "
+          "burns no management_group.create row",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+
+    SECTION("unknown parent") {
+        auto res = ts.call(mg_create_body({{"name", "orphan"}, {"parent_id", "no-such-group"}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "parent group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(mg_create_rows(ts).empty());
+        CHECK(store.list_groups().empty());
+    }
+
+    SECTION("hierarchy depth") {
+        // Grow a chain through the store until the store itself refuses, then ask the tool for
+        // one more level below the deepest group.
+        std::string deepest;
+        for (int i = 0; i < 10; ++i) {
+            yuzu::server::ManagementGroup g;
+            g.name = "depth-" + std::to_string(i);
+            g.parent_id = deepest;
+            g.membership_type = "static";
+            g.created_by = "tester";
+            auto made = store.create_group(g);
+            if (!made)
+                break;
+            deepest = *made;
+        }
+        REQUIRE_FALSE(deepest.empty());
+        const auto before = store.list_groups().size();
+        auto res = ts.call(mg_create_body({{"name", "too-deep"}, {"parent_id", deepest}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "maximum hierarchy depth (5) exceeded");
+        CHECK(mg_create_rows(ts).empty());
+        CHECK(store.list_groups().size() == before);
+    }
+}
+
+TEST_CASE("MCP create_management_group: a duplicate name writes attempted then failure "
+          "(name_conflict) and stays a client error",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup seed;
+    seed.name = "Taken Name";
+    seed.membership_type = "static";
+    seed.created_by = "tester";
+    REQUIRE(store.create_group(seed).has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "Taken Name"}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"] == "a group with that name already exists");
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                         "management_group.create|failure"});
+    CHECK(mg_create_row_field(ts, ts.audit_details, 0) == "Taken Name");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "name_conflict");
+    CHECK(mg_create_row_field(ts, ts.audit_target_ids, 0).empty());
+    CHECK(mg_create_row_field(ts, ts.audit_target_ids, 1).empty());
+    CHECK(store.list_groups().size() == 1);
+}
+
+TEST_CASE("MCP create_management_group: success writes attempted then success carrying the id",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "Audit First"}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    const auto id = payload["id"].get<std::string>();
+    REQUIRE_FALSE(id.empty());
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    REQUIRE(store.get_group(id).has_value());
+
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                         "management_group.create|success"});
+    // The intent row cannot name an id that does not exist yet; the success row does.
+    CHECK(mg_create_row_field(ts, ts.audit_target_ids, 0).empty());
+    CHECK(mg_create_row_field(ts, ts.audit_target_ids, 1) == id);
+    CHECK(mg_create_row_field(ts, ts.audit_details, 0) == "Audit First");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "Audit First");
+    CHECK(mg_create_row_field(ts, ts.audit_target_types, 0) == "ManagementGroup");
+}
+
+TEST_CASE("MCP create_management_group: a lost success row keeps the result and reports "
+          "audit_persisted:false",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.audit_fail_action_result_ = "management_group.create|success";
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "Outcome Lost"}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    const auto id = payload["id"].get<std::string>();
+    REQUIRE_FALSE(id.empty());
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(store.get_group(id).has_value()); // the group exists
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                         "management_group.create|success"});
+}
+
+TEST_CASE("MCP create_management_group: a store fault on create answers a fixed retryable "
+          "error, never the store's text",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(), "DROP TABLE management_group_store.management_groups CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "doomed"}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "Management group store unavailable");
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    // No database error text anywhere in the response or in any audit detail.
+    for (const char* leak : {"relation \"", "does not exist", "management_groups",
+                             "failed to create group", "ERROR"}) {
+        INFO("leak token: " << leak);
+        CHECK(res->body.find(leak) == std::string::npos);
+        for (const auto& d : ts.audit_details)
+            CHECK(d.find(leak) == std::string::npos);
+    }
+
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                         "management_group.create|failure"});
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "store_error");
+}
+
+TEST_CASE("MCP create_management_group: authority is decided again after the attempted row",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    const auto attempted_stored = [&ts]() {
+        for (const auto& r : ts.audit_log)
+            if (r == "management_group.create|attempted")
+                return true;
+        return false;
+    };
+
+    SECTION("grant revoked while the attempted row was being stored") {
+        ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write" && attempted_stored());
+        };
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", "revoked"}}));
+        REQUIRE(res);
+        CHECK(res->status == 403); // perm_fn writes its own refusal
+        CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                             "management_group.create|failure"});
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "permission_revoked");
+        CHECK(store.list_groups().empty());
+    }
+
+    SECTION("credential revoked while the attempted row was being stored") {
+        ts.audit_succeeds_for_action_ = [&ts](const std::string& action) {
+            if (action == "management_group.create")
+                ts.mock_auth_enabled = false; // the next auth_fn call answers 401
+            return true;
+        };
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", "revoked"}}));
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                             "management_group.create|failure"});
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked");
+        CHECK(store.list_groups().empty());
+    }
+}
+
+TEST_CASE("MCP create_management_group: a supervised call approved and then refused for audit "
+          "reasons counts as a burned approval",
+          "[mcp][pg][management_group][mgmt-audit-first][approval][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.audit_fail_action_result_ = "management_group.create|attempted";
+    ts.start("supervised");
+
+    const auto burned = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_burned_total",
+                     {{"tool", "create_management_group"}, {"reason", "handler_reject"}})
+            .value();
+    };
+    CHECK(burned() == 0.0);
+
+    auto mint = ts.call(mg_create_body({{"name", "needs-approval"}}, 1));
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    CHECK(burned() == 0.0); // minting spends nothing
+
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    auto res = ts.call(mg_create_body({{"name", "needs-approval"}, {"approval_id", approval_id}}, 2));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "audit log unavailable; the change was not made");
+    CHECK(burned() == 1.0); // the one-time approval was consumed before the refusal
+    CHECK(store.list_groups().empty());
+}
+
 TEST_CASE("MCP get_management_group: happy path returns metadata + members",
           "[mcp][pg][management_group]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
