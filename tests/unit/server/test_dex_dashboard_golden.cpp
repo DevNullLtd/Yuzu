@@ -2057,7 +2057,7 @@ TEST_CASE("DEX apps UI: agent-reported and customer-authored strings are escaped
     CHECK(contains(cell(words, "wide.exe", "", kColLastSeen), "unknown"));
     // the note sits after a space, never fused to the application link ("app1.exeversion not collected")
     CHECK(contains(cell(words, "app1.exe", "", kColApp),
-                   "</a> <span class=\"gp-mute\">version not collected</span>"));
+                   "</button> <span class=\"gp-mute\">version not collected</span>"));
 }
 
 TEST_CASE("DEX apps UI: the pre-rendered page stays under its size ceiling", "[dex][apps_ui]") {
@@ -2280,8 +2280,9 @@ TEST_CASE("DEX apps UI: tabs, chips and the application link are native buttons"
     CHECK(count_of(subnav, "<button type=\"button\"") == 10);
     CHECK(contains(subnav, "<button type=\"button\" class=\"on\" aria-current=\"page\" hx-get=\"/fragments/dex/apps?window=7d\""));
     CHECK(count_of(page, "aria-pressed=") == 8);
-    // The application link and the Scoring link are buttons that keep the raw name in the URL.
-    CHECK(contains(page, "<button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/app?name=app1.exe&window=7d\""));
+    // The application link and the Scoring link are buttons that keep the raw name in the URL (the `&` in the
+    // attribute is written `&amp;`, as in every other hx-get of the page).
+    CHECK(contains(page, "<button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/app?name=app1.exe&amp;window=7d\""));
     CHECK(contains(page, "<button type=\"button\" class=\"dx-lk\" hx-get=\"/fragments/dex/scoring?window=7d\""));
     // The shared stylesheet gives them a visible focus style.
     CHECK(contains(page, ".dx-lk:focus-visible"));
