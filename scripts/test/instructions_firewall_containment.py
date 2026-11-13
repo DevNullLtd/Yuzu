@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ipaddress
 import json
 import os
 import platform
@@ -56,6 +57,8 @@ INSTALL = REPO / "scripts" / "install-agent-user.sh"
 EXIT_OK, EXIT_FAIL, EXIT_PRECONDITION, EXIT_RELEASE_FAILED = 0, 1, 2, 3
 SSH_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 POLL_S = 20
+POLL_APPLY_S = 90
+RELEASE_READS = 4
 
 
 class Client:
@@ -118,18 +121,29 @@ def dispatch(client: Client, agent_id: str, action: str, params: dict) -> dict:
     sent = client.post_json("/api/command", {"plugin": "firewall", "action": action, "agent_ids": [agent_id],
                                              "params": {k: str(v) for k, v in params.items()}})
     cid = sent.get("command_id", "")
-    return client.poll_response(cid) if cid else {}
+    # an apply or release can take the plugin up to a minute plus its verify: wait for the answer
+    wait = POLL_APPLY_S if action in ("quarantine", "release", "quarantine_allow") else POLL_S
+    return client.poll_response(cid, timeout_s=wait) if cid else {}
 
 
-_STATUS_ROW = re.compile(r"\bstatus\|([a-z_]+)")
+_STATUS_ROW = re.compile(r"status\|([a-z_]+)(?:\|.*)?")
 
 
 def status_token(client: Client, agent_id: str) -> str:
-    """The `status|<token>` row of one `quarantine_status` answer, exactly: `active`, `inactive`,
-    `active_unproven`, `partial`, `degraded`. Empty when no agent answered (an empty response envelope, an
-    error) -- never a guess from a substring ("inactive" contains "active")."""
-    m = _STATUS_ROW.search(json.dumps(dispatch(client, agent_id, "quarantine_status", {})).lower())
-    return m.group(1) if m else ""
+    """The `status|<token>` row of this agent's `quarantine_status` output, exactly: `active`, `inactive`,
+    `active_unproven`, `partial`, `degraded`. Only a whole output LINE of a response row that names this
+    agent counts (a substring of an error string, or another agent's row, never does), and the rows must
+    agree. Empty when no agent answered -- never a guess ("inactive" contains "active")."""
+    answer = dispatch(client, agent_id, "quarantine_status", {})
+    tokens = set()
+    for r in answer.get("responses") or []:
+        if not isinstance(r, dict) or r.get("agent_id") != agent_id or not isinstance(r.get("output"), str):
+            continue
+        for line in r["output"].splitlines():
+            m = _STATUS_ROW.fullmatch(line.strip().lower())
+            if m:
+                tokens.add(m.group(1))
+    return tokens.pop() if len(tokens) == 1 else ""
 
 
 @contextlib.contextmanager
@@ -145,25 +159,48 @@ def _signals(handler, sigs):
 
 
 def release_and_confirm(client: Client, agent_id: str) -> bool:
-    """Dispatch `firewall.release` and require an explicit `inactive` answer. Any error, or no answer, is
-    NOT a confirmation (exit 3)."""
+    """Dispatch `firewall.release` and require an explicit `inactive` answer, re-reading the status a few
+    times (a slow apply can still be finishing). Any error, or no answer, is NOT a confirmation (exit 3)."""
     try:
         dispatch(client, agent_id, "release", {})
-        time.sleep(2)
-        return status_token(client, agent_id) == "inactive"
+        for _ in range(RELEASE_READS):
+            time.sleep(2)
+            if status_token(client, agent_id) == "inactive":
+                return True
+        return False
     except Exception as e:  # noqa: BLE001 - an unconfirmed release is exit 3, whatever stopped it
         print(f"release call failed: {e}", file=sys.stderr)
         return False
 
 
 def dashboard_reachable_while_contained(dashboard: str, exceptions: str) -> bool:
-    """The release is dispatched through the dashboard from this host: it must be this host or an allowed
-    entry, or the contained host could not reach it."""
+    """The release is dispatched through the dashboard from this host: it must be this host (loopback) or
+    an IP literal the allow set covers, or the contained host could not reach it (DNS is blocked too, so a
+    hostname never counts). Entries follow the plugin grammar `ip[:port][/prefix][/tcp|udp][/in|out]`."""
     host = (urllib.parse.urlparse(dashboard).hostname or "").lower()
-    if host in ("localhost", "::1") or host.startswith("127."):
+    if host == "localhost":
         return True
-    allowed = {e.strip().rsplit(":", 1)[0].strip("[]").lower() for e in re.split(r"[,\s]+", exceptions) if e.strip()}
-    return host in allowed
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    for entry in re.split(r"[,\s]+", exceptions):
+        parts = entry.strip().split("/")
+        ip = parts[0]
+        if ip.startswith("["):
+            ip = ip[1:].split("]")[0]
+        elif ip.count(":") == 1:
+            ip = ip.split(":")[0]
+        prefix = parts[1] if len(parts) > 1 and parts[1].isdigit() else None
+        try:
+            net = ipaddress.ip_network(f"{ip}/{prefix}" if prefix else ip, strict=False)
+        except ValueError:
+            continue
+        if addr in net:
+            return True
+    return False
 
 
 def parse_args(argv):

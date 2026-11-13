@@ -1,6 +1,7 @@
 /**
  * test_protective_action_dispatch_gate.cpp — protective actions (the
- * quarantine plugin's four actions plus `__guard__.push_rules`) are never
+ * quarantine plugin's four actions, the firewall plugin's four containment actions plus
+ * `__guard__.push_rules`) are never
  * refused by plugin enablement. Mirrors test_os_kill_switch_dispatch_gate.cpp:
  * every gate is bound with a real `AgentRegistry` and the exact send set
  * (`drain_gateway_pending`), with `echo.sql` as the control that is still

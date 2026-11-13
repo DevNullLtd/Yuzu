@@ -532,7 +532,7 @@ The `quarantine` agent plugin isolates compromised or suspicious devices by bloc
 The `firewall` plugin has its own containment actions (`quarantine`, `release`, `quarantine_status`,
 `quarantine_allow`). No kill switch, per-OS withhold or degraded plugin-config read refuses them, but
 the server's containment gate still names the `quarantine` plugin only: while the quarantine store has
-been unreadable for more than a minute it refuses every non-exempt dispatch to a contained device,
+been unreadable for more than a minute it refuses every non-exempt dispatch, whichever device it names,
 including those four, until the store answers again (see "Behaviour change: protective actions exempt
 from plugin enablement" in [Upgrading](upgrading.md)).
 

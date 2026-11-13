@@ -77,9 +77,9 @@ EMPTY = {"responses": [], "count": 0}
 
 
 class Status(unittest.TestCase):
-    def tok(self, reply):
+    def tok(self, reply, agent="a"):
         with mock.patch.object(fc, "dispatch", return_value=reply):
-            return fc.status_token(None, "a")
+            return fc.status_token(None, agent)
 
     def test_inactive_is_not_active(self):
         self.assertEqual(self.tok(row("inactive")), "inactive")
@@ -89,6 +89,39 @@ class Status(unittest.TestCase):
     def test_no_answer_is_empty_never_a_token(self):
         self.assertEqual(self.tok(EMPTY), "")
         self.assertEqual(self.tok({}), "")
+
+    def test_only_this_agents_whole_status_line_counts(self):
+        # an error string, another agent's row, a non-status line and a mid-line mention are not an answer
+        spoof = {"error": "x status|inactive", "responses": [
+            {"agent_id": "other", "status": 0, "output": "status|inactive"},
+            {"agent_id": "a", "status": 1, "output": "refused|x status|inactive"},
+            {"agent_id": "a", "status": 0, "output": "note|status|inactive"}]}
+        self.assertEqual(self.tok(spoof), "")
+        real = {"responses": [{"agent_id": "a", "status": 0, "output": "verify|control=ok\nstatus|active|probe\nnote|x"}]}
+        self.assertEqual(self.tok(real), "active")
+
+    def test_disagreeing_rows_are_not_an_answer(self):
+        two = {"responses": [{"agent_id": "a", "status": 0, "output": "status|inactive\nstatus|active"}]}
+        self.assertEqual(self.tok(two), "")
+
+
+class Reachable(unittest.TestCase):
+    def ok(self, dashboard, exceptions="127.0.0.1"):
+        return fc.dashboard_reachable_while_contained(dashboard, exceptions)
+
+    def test_loopback_and_covered_ip_literals_only(self):
+        self.assertTrue(self.ok("http://127.0.0.1:8080"))
+        self.assertTrue(self.ok("http://localhost:8080"))
+        self.assertTrue(self.ok("http://[::1]:8080"))
+        self.assertTrue(self.ok("http://192.0.2.7:8080", "127.0.0.1,192.0.2.7:8080"))
+        self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.0/24/tcp/out"))
+        self.assertTrue(self.ok("http://[2001:db8::7]:8080", "[2001:db8::7]:8080"))
+        self.assertTrue(self.ok("http://[2001:db8::7]:8080", "2001:db8::/32"))
+
+    def test_other_hosts_and_hostnames_are_refused(self):
+        self.assertFalse(self.ok("http://192.0.2.8:8080", "192.0.2.7"))
+        self.assertFalse(self.ok("http://dash.example:8080", "dash.example"))  # DNS is blocked while contained
+        self.assertFalse(self.ok("http://192.0.2.7:8080", "garbage,,"))
 
 
 @unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
@@ -141,7 +174,7 @@ class Flow(unittest.TestCase):
         self.assertIn("release", calls)
 
     def test_a_missing_release_answer_exits_3(self):
-        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), EMPTY],
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [EMPTY] * fc.RELEASE_READS,
                                "quarantine": [{}], "release": [{}]})
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
 
@@ -151,7 +184,21 @@ class Flow(unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
 
     def test_a_still_active_status_after_the_release_exits_3(self):
-        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("active")],
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS,
+                               "quarantine": [{}], "release": [{}]})
+        self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
+
+    def test_a_slow_release_is_confirmed_by_a_later_read(self):
+        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("partial"),
+                                                         row("inactive")],
+                                   "quarantine": [{}], "release": [{}]})
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(calls, ["quarantine_status", "quarantine", "quarantine_status", "release",
+                                 "quarantine_status", "quarantine_status"])
+
+    def test_a_spoofed_inactive_in_an_error_string_is_not_a_confirmed_release(self):
+        spoof = {"error": "x status|inactive", "responses": []}
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [spoof] * fc.RELEASE_READS,
                                "quarantine": [{}], "release": [{}]})
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
 

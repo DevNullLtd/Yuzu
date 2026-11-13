@@ -25,7 +25,7 @@
  * PROTECTIVE SEAM (one line): the caller injects the predicate, and it is the
  * canonical protective set, `kProtectivePredicate`, which is
  * `&yuzu::protective::is_protective_action` (common/include/yuzu/protective_actions.hpp):
- * the quarantine control actions plus `__guard__.push_rules`. One predicate, never a
+ * the quarantine and firewall control actions plus `__guard__.push_rules`. One predicate, never a
  * second list, so a future widening of that set removes the new action from the
  * switchable units with no edit here. `__guard__.push_rules` is also caught by the
  * reserved-name rule (the control channel), which is checked first. There is no default, so a

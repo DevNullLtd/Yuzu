@@ -3696,8 +3696,8 @@ firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The four qu
 added to the set later, so a kill-switch row you hold on one of them also stops stopping anything on
 upgrade. The containment gate's own exemption is a separate, narrower predicate and still names the
 quarantine plugin only: while the quarantine store cannot be read for longer than a minute, that gate
-refuses every non-exempt dispatch to a contained device, including the four firewall actions, until the
-store answers again (the follow-up that moves the containment gate onto the firewall plugin is #7437).
+refuses every non-exempt dispatch, whichever device it names, including the four firewall actions, until
+the store answers again (the follow-up that moves the containment gate onto the firewall plugin is #7437).
 Decision record: the 2026-10-12 and 2026-11-13 updates in
 [ADR-3005](../adr/3005-plugin-config-store.md).
 

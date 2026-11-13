@@ -2301,12 +2301,12 @@ TEST_CASE("MCP kill-switch tools advertise the protective-action caveat",
     // Both descriptions name the closed pair list and their own effect.
     check_mentions(getter["description"],
                    {"protective", "unquarantine", "whitelist", "__guard__.push_rules",
-                    "dispatch still proceeds"});
+                    "quarantine_allow", "dispatch still proceeds"});
     check_mentions(getter["inputSchema"]["properties"]["os"]["description"],
                    {"protective", "never gates"});
     check_mentions(setter["description"],
                    {"protective", "unquarantine", "whitelist", "__guard__.push_rules",
-                    "no dispatch effect"});
+                    "quarantine_allow", "no dispatch effect"});
     check_mentions(setter["inputSchema"]["properties"]["enabled"]["description"],
                    {"protective", "no dispatch effect"});
 }
