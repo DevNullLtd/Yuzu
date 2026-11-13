@@ -29918,6 +29918,56 @@ TEST_CASE("MCP add_management_group_member: a store fault on the insert answers 
     CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
 }
 
+TEST_CASE("MCP add_management_group_member: a group deleted between the check and the insert "
+          "answers group not found and records a group_not_found failure row",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    // Deterministic race: the group exists at the tool's exists check; the group is deleted while
+    // its `attempted` row is being stored, so the membership insert fails the foreign key.
+    bool deleted = false;
+    ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+        if (action == "management_group.add_member" && !deleted) {
+            deleted = true;
+            CHECK(f.store.delete_group(f.gid).has_value());
+        }
+        return true;
+    };
+
+    SECTION("the outcome row is stored") {
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        REQUIRE(deleted);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // no retry hint, as before
+        CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                          "management_group.add_member|failure"});
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "group_not_found");
+        CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
+        CHECK(mg_add_row_field(ts, ts.audit_target_types, 1) == "ManagementGroup");
+    }
+    SECTION("a lost outcome row keeps the answer") {
+        ts.audit_fail_action_result_ = "management_group.add_member|failure";
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        REQUIRE(deleted);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                          "management_group.add_member|failure"});
+    }
+}
+
 TEST_CASE("MCP add_management_group_member: authority is decided again after the attempted row",
           "[mcp][pg][management_group][mgmt-audit-first]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);

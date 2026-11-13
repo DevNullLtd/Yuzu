@@ -14185,8 +14185,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) {
                     const auto info = classify_mgmt_group_error(result.error());
                     // The group vanished between the check above and the insert (the membership
-                    // foreign key failed): not found, no failure row, no retry hint, as before.
+                    // foreign key failed): not found and no retry hint, as before, plus a
+                    // `failure` outcome row with a fixed token so the `attempted` row is never
+                    // left without one.
                     if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
+                        (void)audit_fn(req, "management_group.add_member", "failure",
+                                       "ManagementGroup", group_id, "group_not_found");
                         mcp_audit("denied", "group not found");
                         res.set_content(a4_error(kInvalidParams, "group not found"),
                                         "application/json");

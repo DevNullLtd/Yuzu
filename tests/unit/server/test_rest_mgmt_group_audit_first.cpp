@@ -73,6 +73,10 @@ struct AuditFirstHarness {
     /// permission is revoked (the second auth_fn / perm_fn call answers that way).
     bool session_gone_after_attempted = false;
     bool perm_revoked_after_attempted = false;
+    /// Runs ONCE, between the `attempted` row and the membership write (the first auth_fn call
+    /// after the attempted row is stored): the deterministic injection point for a change that
+    /// lands between the route's checks and its write, e.g. deleting the group.
+    std::function<void()> after_attempted_hook{};
 
     [[nodiscard]] std::size_t audit_count(const std::string& action,
                                           const std::string& result) const {
@@ -112,6 +116,11 @@ struct AuditFirstHarness {
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
+            if (after_attempted_hook && attempted_stored()) {
+                auto hook = std::move(after_attempted_hook);
+                after_attempted_hook = nullptr;
+                hook();
+            }
             if (session_gone_after_attempted && attempted_stored())
                 return std::nullopt; // writes no response of its own: the route covers the 401
             auth::Session s;
@@ -618,6 +627,43 @@ TEST_CASE("POST /management-groups/{id}/members: a session or grant gone after t
         CHECK(h.audits[1].detail == "permission_revoked");
     }
     CHECK(h.member_count(gid) == 0);
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a group deleted between the check and the "
+          "insert answers 404 and records a group_not_found failure row",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-vanishes");
+    // Deterministic race: the group exists at the route's exists check, the `attempted` row is
+    // stored, then the group is deleted before the membership insert (the first auth_fn call
+    // after the attempted row is the post-attempted re-check, which runs before the insert).
+    h.after_attempted_hook = [&h, &gid]() { CHECK(h.mgmt_bundle->delete_group(gid).has_value()); };
+
+    SECTION("the outcome row is stored") {
+        auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(res->body.find("group not found") != std::string::npos);
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+        CHECK(h.audit_count(kAdd, "success") == 0);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].action == kAdd);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].action == kAdd);
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].target_id == gid);
+        CHECK(h.audits[1].detail == "group_not_found"); // a fixed token, never the store's text
+    }
+    SECTION("a lost outcome row keeps the 404 and marks the response Sec-Audit-Failed") {
+        h.fail_audit.insert(std::string(kAdd) + "|failure");
+        auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(res->body.find("group not found") != std::string::npos);
+        CHECK(res->has_header("Sec-Audit-Failed"));
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "attempted");
+    }
 }
 
 TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an unstorable attempted row refuses "

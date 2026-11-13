@@ -5115,8 +5115,13 @@ void RestApiV1::register_routes(
                       return;
                   if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
                       // The group vanished between the check above and the insert (the
-                      // membership foreign key failed): 404, no failure row, no retry hint.
+                      // membership foreign key failed): 404 and no retry hint, as before, and
+                      // a `failure` outcome row with a fixed token so the `attempted` row is
+                      // never left without one.
                       if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
+                          (void)detail::emit_behavioral_audit(
+                              audit_fn, req, res, "management_group.add_member", "failure",
+                              "ManagementGroup", group_id, "group_not_found");
                           mgmt_group_not_found(res);
                           return;
                       }
