@@ -6,6 +6,7 @@
 #include "pg/pg_raii.hpp"
 #include "rbac_store_sql_helpers.hpp"
 #include "rbac_text.hpp"
+#include "session_store_sql_helpers.hpp" // session_sql::bump_generation_in_txn (deactivate_account, LAST)
 
 #include <yuzu/server/auth_db.hpp> // is_valid_username — provision_first_admin's own
                                     // pre-INSERT guard (rbac_admin_predicate.hpp already
@@ -810,7 +811,7 @@ RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
 // target itself.
 AccountDeactivationResult
 RbacAdminAuthorityOwner::deactivate_account(const std::string& username,
-                                            [[maybe_unused]] SessionGenerationMode session_mode) const {
+                                            SessionGenerationMode session_mode) const {
     // A name `is_valid_username` rejects can never be a stored account (every writer validates),
     // so it is `kNotFound` BEFORE any statement runs: an embedded NUL would truncate at the libpq
     // parameter boundary and an over-long name is not a row. Same gate `provision_first_admin`
@@ -882,6 +883,20 @@ RbacAdminAuthorityOwner::deactivate_account(const std::string& username,
                 refused = true;
                 return false;
             }
+        }
+
+        // 8. The session write-generation bump, the LAST statement. It commits together with the
+        // account going inactive, so every replica's validate cache is cleared by its next
+        // generation poll whether or not the caller's later durable session wipe succeeds. It
+        // takes the `session_store.session_meta` row, which every session create/revoke in the
+        // fleet shares and holds to COMMIT: nothing may wait after it (see the banner for the
+        // order), and its wait is bounded by the `lock_timeout` installed at step 0. Reached only
+        // when a row was deactivated and neither floor refused: a no-op or a refusal bumps nothing.
+        // A failure aborts the transaction (the account stays active, `kStoreFailure`).
+        if (session_mode == SessionGenerationMode::kBumpSessionGeneration &&
+            !session_sql::bump_generation_in_txn(c)) {
+            err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
+            return false;
         }
         removed = true;
         return true;

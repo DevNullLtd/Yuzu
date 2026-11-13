@@ -38,8 +38,15 @@
 /// `deactivate_account` always; `set_enforcement`'s ENABLE direction only), then
 /// one `auth.users` row (unassign, `deactivate_account` and `set_local_role`), then the
 /// `rbac_meta` write_generation row (the grant mutators only: `deactivate_account` and
-/// `set_local_role` change no `principal_roles` row and never bump it). A path that
-/// holds an `auth.users` row lock and then touches those would invert it.
+/// `set_local_role` change no `principal_roles` row and never bump it), then, for
+/// `deactivate_account` in `SessionGenerationMode::kBumpSessionGeneration` only, the
+/// `session_store.session_meta` `write_generation` row, LAST, bounded by the lifecycle
+/// `lock_timeout`, then COMMIT. A path that holds an `auth.users` row lock and then touches
+/// those would invert it. The `session_meta` row is the one lock every session create/revoke in
+/// the fleet shares, so nothing in the deactivation may wait after taking it. That edge is
+/// acyclic because no session writer takes an RBAC or account lock (session_store.cpp touches
+/// the `session_store` schema only) and `CredentialChangeOwner` takes `auth.users` before
+/// `session_meta` too.
 /// `provision_first_admin` is a DISJOINT lock path: it never touches the
 /// `rbac_enabled` row at all, and its `auth.users` interaction is a plain
 /// INSERT of a NEW row (there is nothing existing to lock; the table is, by
@@ -196,7 +203,11 @@ public:
     ///      sees this transaction's own write) recounts the authenticatable Administrator grants,
     ///      only when the target was a counted grant or held a grant at all; zero refuses;
     ///   7. COLUMN floor, BOTH regimes: a separate recount of the active local `role='admin'`
-    ///      accounts, only when the target was one; zero refuses.
+    ///      accounts, only when the target was one; zero refuses;
+    ///   8. in `SessionGenerationMode::kBumpSessionGeneration` only, as the LAST statement, the
+    ///      session write-generation bump (`session_sql::bump_generation_in_txn`), reached only
+    ///      when an account was deactivated. A failed bump aborts the transaction (the account
+    ///      stays active, `kStoreFailure`).
     /// A refusal rolls the whole transaction back (`kLastAdministratorRefused`, the account is
     /// still active). The floors are independent and a refusal from either aborts. Each rejects
     /// only a mutation that removes a member of ITS population and leaves it empty: a population
@@ -213,7 +224,8 @@ public:
     /// transaction; it lands on an account that is inactive once this commits, which
     /// `kAuthenticatableAdminGrantsFrom` does not count.
     /// `session_mode` is required (no default) and states whether a `SessionStore` is wired; see
-    /// `SessionGenerationMode`.
+    /// `SessionGenerationMode`. With `kNoSessionStore` the transaction touches no `session_store`
+    /// object.
     /// A `username` that `is_valid_username` rejects (empty, over 64 bytes, an embedded NUL or any
     /// other character outside `[A-Za-z0-9._-]`) can never be a stored account: it answers
     /// `kNotFound` before any statement runs, as do `set_local_role` and (as "not a member",
