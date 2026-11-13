@@ -1620,8 +1620,10 @@ TEST_CASE("census ordering: a pending event that disagrees with a verdict insert
 
 TEST_CASE("census ordering: two concurrent first deliveries to one pair match the serial result",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder]") {
-    // With no pending rows nothing but the census row serialises two first deliveries of one pair.
-    // Whatever the interleaving, the winner is the greater (key, ingest_seq) and the row is flagged
+    // With the agent step on (the default) the two first deliveries of one agent serialise on the
+    // agent's order row, so this case checks the serial-equivalent RESULT end to end and does not
+    // reach the census-upsert race itself; the census-level schedules run with the step off (see the
+    // five AgentStepOff cases). Whatever the interleaving, the winner is the greater (key, ingest_seq) and the row is flagged
     // exactly when the later arrival (higher ingest_seq) has the lower or the same key.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -4302,7 +4304,7 @@ TEST_CASE("census ordering: the batch path runs the agent step and aborts on a s
 TEST_CASE("census ordering: a second first delivery of one agent waits on the first's agent row and "
           "past the lock timeout is stored pending with nothing lost",
           "[pg][guaranteed_state_store][db][census][ordering][lockorder][pair]") {
-    // The REAL behaviour with the step enabled (the four v4 interleaving cases run with it off):
+    // The REAL behaviour with the step enabled (the five v4 interleaving cases run with it off):
     // writer A is parked inside its transaction holding the agent's order row; writer B, the same
     // agent and rule, cannot finish, takes the step's F1 path at its 1 s lock bound and is acked with
     // its event stored pending and the census untouched. A's release and a redelivery of B repair it.
