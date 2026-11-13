@@ -712,7 +712,8 @@
       "server/core/src/capability_decls/plugin_action_catalogue_c.hpp"
     ],
     "changelog": [
-      "changelog.d/2026-11-09-firewall-containment-actions.added.md"
+      "changelog.d/2026-11-09-firewall-containment-actions.added.md",
+      "changelog.d/7530-firewall-protective-set.changed.md"
     ],
     "definitions": [
       "content/definitions/firewall.yaml"
@@ -724,6 +725,7 @@
     ],
     "privilege_row": true,
     "tests": [
+      "tests/test_firewall_containment_ceremony.py",
       "tests/test_firewall_privilege_refusal_wiring_lexical.py",
       "tests/test_firewall_release_guard_wiring_lexical.py",
       "tests/unit/test_firewall_local_dispatcher.cpp",

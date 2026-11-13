@@ -410,7 +410,7 @@ rule|nftables|ip|filter|DOCKER-USER|handle|2
 - Plugin: `agents/plugins/firewall/src/firewall_parsers.hpp` · `agents/plugins/firewall/src/firewall_plugin.cpp` · `agents/plugins/firewall/src/firewall_quarantine_parsers.hpp`
 - Definitions: `content/definitions/firewall.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_c.hpp`
-- Tests: `tests/test_firewall_privilege_refusal_wiring_lexical.py` · `tests/test_firewall_release_guard_wiring_lexical.py` · `tests/unit/test_firewall_local_dispatcher.cpp` · `tests/unit/test_firewall_parsers.cpp` · `tests/unit/test_firewall_quarantine_live.cpp` · `tests/unit/test_firewall_quarantine_parsers.cpp`
+- Tests: `tests/test_firewall_containment_ceremony.py` · `tests/test_firewall_privilege_refusal_wiring_lexical.py` · `tests/test_firewall_release_guard_wiring_lexical.py` · `tests/unit/test_firewall_local_dispatcher.cpp` · `tests/unit/test_firewall_parsers.cpp` · `tests/unit/test_firewall_quarantine_live.cpp` · `tests/unit/test_firewall_quarantine_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/2026-11-09-firewall-containment-actions.added.md`
+- Changelog: `changelog.d/2026-11-09-firewall-containment-actions.added.md` · `changelog.d/7530-firewall-protective-set.changed.md`
 <!-- END GENERATED -->

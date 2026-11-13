@@ -945,6 +945,10 @@ TEST_CASE("command_v1: every firewall containment action is protective (never os
         INFO(action);
         Rig rig;
         rig.facts = {.legacy_open = true};
+        // Two of the four are Destructive / AdminOrApproval: an administrator naming a visible
+        // agent clears those gates so the request reaches the zero-reach classifier under test.
+        rig.session.role = auth::Role::admin;
+        rig.visible_agents = Ids{kA};
         ConfinedDispatchOutcome o;
         o.os_gate_unreadable = true;
         o.unknown_plugin_count = 1;

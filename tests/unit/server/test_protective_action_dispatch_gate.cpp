@@ -154,7 +154,12 @@ const std::vector<std::pair<std::string, std::string>> kProtectiveWire{
     {"quarantine", "quarantine"},
     {"quarantine", "unquarantine"},
     {"quarantine", "status"},
-    {"quarantine", "whitelist"}};
+    {"quarantine", "whitelist"},
+    // The firewall plugin's closed four-action containment set (#7530).
+    {"firewall", "quarantine"},
+    {"firewall", "release"},
+    {"firewall", "quarantine_status"},
+    {"firewall", "quarantine_allow"}};
 
 } // namespace
 
@@ -195,6 +200,16 @@ TEST_CASE("kill_switch_denial: control — echo.sql is still refused / still car
 
     CountingSwitch os_off{IdSet{"windows"}};
     CHECK(finalize(kEchoSql, os_off.fn()).kill_switched_os() == IdSet{"windows"});
+
+    // An ordinary firewall action is not exempt: the closed set stops at the four.
+    CountingSwitch fw_off{std::nullopt};
+    const auto fw = yuzu::server::detail::kill_switch_denial(protective_cap("firewall", "state"),
+                                                              fw_off.fn());
+    REQUIRE_FALSE(fw.has_value());
+    CHECK(*fw_off.calls == 1);
+    CountingSwitch fw_os_off{IdSet{"windows"}};
+    CHECK(finalize(protective_cap("firewall", "state"), fw_os_off.fn()).kill_switched_os() ==
+          IdSet{"windows"});
 }
 
 TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
@@ -359,8 +374,9 @@ TEST_CASE("the protective set is tied to the real catalogue rows and the push la
               (push == yuzu::server::SystemReservedPush::guardian_push_rules));
     }
 
-    // The real rows that carry a protective pair: exactly the quarantine
-    // plugin's four actions plus __guard__.push_rules.
+    // The real rows that carry a protective pair: the quarantine plugin's four
+    // actions, the firewall plugin's four containment actions plus
+    // __guard__.push_rules.
     std::set<std::string> protective;
     for (const auto rows : {capdecls::plugin_action_catalogue_c(),
                             capdecls::core_dispatch_capabilities()})
@@ -369,7 +385,9 @@ TEST_CASE("the protective set is tied to the real catalogue rows and the push la
                 protective.insert(std::string(cap.plugin) + "." + std::string(cap.action));
     CHECK(protective == std::set<std::string>{"quarantine.quarantine", "quarantine.unquarantine",
                                              "quarantine.status", "quarantine.whitelist",
-                                             "__guard__.push_rules"});
+                                             "firewall.quarantine", "firewall.release",
+                                             "firewall.quarantine_status",
+                                             "firewall.quarantine_allow", "__guard__.push_rules"});
 
     // The plugin-level label predicate is tied to the same rows: it must be true for
     // exactly the plugins that carry a protective row, so widening it to a plugin
@@ -396,7 +414,12 @@ TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate di
     CHECK(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "", "linux"}));
     // Everything else is an ordinary, effective row.
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "get_status", ""}));
-    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
+    // The firewall plugin owns four protective actions and declares ordinary ones too: a
+    // plugin-level row is labelled (it never stops the four) and an ordinary action-level
+    // row is not.
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "", ""}));
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "quarantine", "linux"}));
+    CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "state", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"echo", "sql", ""}));
 
     // The audit-evidence detail both write surfaces share (their only other

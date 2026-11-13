@@ -229,8 +229,10 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 /// action (`yuzu/protective_actions.hpp`): an action-level row for a protective
 /// pair, or a plugin-level row for a plugin that owns protective actions. Such
 /// a row never stops the protective actions and still gates any non-protective
-/// action the plugin declares (none today: `quarantine` declares exactly the
-/// four protective actions and `__guard__` dispatches only `push_rules`). The
+/// action the plugin declares (`quarantine` declares exactly its four protective
+/// actions and `__guard__` dispatches only `push_rules`; `firewall` declares four
+/// protective containment actions beside its ordinary ones, which a plugin-level
+/// row still gates). The
 /// write surfaces use it to label the audit evidence so a stored OFF row is
 /// never read as proof of a stop. One list: both predicates come from the
 /// shared header.
