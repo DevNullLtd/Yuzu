@@ -2005,9 +2005,9 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
 
     // Verify session. The durable directory is the cross-replica truth. The local
     // map is a fallback for a missing/tombstoned row, a lost-race session (which
-    // never owns a row under its own id) and a degraded read; a CONNECTED never
-    // takes it over a row that names a DIFFERENT session, and on a degraded read
-    // a CONNECTED needs this replica's own registry to hold the session too.
+    // never owns a row under its own id); a CONNECTED never takes it over a row
+    // that names a DIFFERENT session, and on a DEGRADED read a CONNECTED is always
+    // refused (no local fallback, #5685 (ii)). The map is never consulted then.
     const bool is_connected = request->event() == gw::StreamStatusNotification::CONNECTED;
     bool session_in_directory = false;
     bool directory_names_other_session = false;
@@ -2016,29 +2016,25 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         if (!row) {
             record_route_store_failure(metrics_, "session_lookup", row.error());
             if (is_connected) {
-                bool local_hint = false;
-                {
-                    std::lock_guard lock(sessions_mu_);
-                    auto it = gateway_sessions_.find(session_id);
-                    local_hint = it != gateway_sessions_.end() && it->second == agent_id;
+                // HA WS-5 (#5685 (ii), ADR-2002 7f Update 2026-11-13): a CONNECTED on a
+                // degraded directory read is ALWAYS refused. This replica's own session
+                // map is not evidence of the current placement once a second replica can
+                // supersede the session, and nothing exists to tell a one-replica
+                // deployment from a two-replica one, so there is deliberately no
+                // local-hint branch here. The gateway keeps a refused CONNECTED and sends
+                // it again (#5695), so the cost is a delay, not a loss. Do not
+                // reintroduce an acceptance for "the session this replica holds".
+                if (warn_slot_due("connected_unverified")) {
+                    spdlog::warn(
+                        "[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) "
+                        "refused — the directory read degraded; the gateway sends the notice "
+                        "again and it is accepted once the directory reads (logged at most "
+                        "once per 5s; see yuzu_server_gateway_route_desync_total)",
+                        onbehalf::sanitize_for_log(session_id, 64), ::yuzu::log_id_token(agent_id));
                 }
-                // Single replica: that local session was directory-verified at
-                // ProxyRegister, and set_gateway_route still rejects a superseded one.
-                if (!local_hint || !registry_.session_is(agent_id, session_id)) {
-                    if (warn_slot_due("connected_unverified")) {
-                        spdlog::warn(
-                            "[gateway] NotifyStreamStatus: CONNECTED for session {} (agent {}) "
-                            "refused — the directory read degraded and this replica holds no "
-                            "matching local session; the agent recovers by reconnecting (logged "
-                            "at most once per 5s; see yuzu_server_gateway_route_desync_total)",
-                            onbehalf::sanitize_for_log(session_id, 64),
-                            ::yuzu::log_id_token(agent_id));
-                    }
-                    record_directory_desync(metrics_, "notify_stream_status",
-                                            "connected_unverified");
-                    response->set_acknowledged(false);
-                    return grpc::Status::OK;
-                }
+                record_directory_desync(metrics_, "notify_stream_status", "connected_unverified");
+                response->set_acknowledged(false);
+                return grpc::Status::OK;
             }
         } else {
             const bool has_sid = row->has_value() && (*row)->session_id.has_value();

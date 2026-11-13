@@ -2157,11 +2157,9 @@ op `session_lookup`.
   the local-map fallback is permitted only when the row is absent/tombstoned or the session id is in
   `lost_race_sessions_`; a row carrying a DIFFERENT non-null `session_id` rejects the notification
   (`notify_stream_status/stale_connected_session`). On a DEGRADED `lookup_route`, CONNECTED is
-  accepted only when this replica holds the matching local session (`gateway_sessions_[session]` names
-  the agent AND the registry's current session for the agent is that session — local state the
-  directory verified at `ProxyRegister`, which is sound only for a single replica; see "Deferred, not
-  silent"); otherwise it is refused and counted
-  `notify_stream_status/connected_unverified`. DISCONNECTED proceeds on the local-map check when the
+  ALWAYS refused and counted `notify_stream_status/connected_unverified`, whatever this replica's
+  local state says (Update 2026-11-13, #5685 (ii): local state is not evidence of the current
+  placement once a second replica can supersede the session). DISCONNECTED proceeds on the local-map check when the
   directory read fails (it is a teardown, not an admission), and its presence-row delete (#5678: now
   a session clear; the row is kept for the roster) is gated on
   `removed_current_session || store_removed`. A CONNECTED on a replica with a directory row but no
@@ -2217,14 +2215,15 @@ the row's computed `routable` flag (lease freshness). A heartbeat IS the lease-r
 re-register storm. Tombstoned rows still never match.
 
 **Decision — degraded-read posture is per site, and is not uniformly fail-closed.** CONNECTED on a
-degraded `lookup_route` is accepted only when this replica holds the matching local session (single
-replica: that local state was directory-verified at `ProxyRegister`, and `set_gateway_route` still
-rejects a superseded session) and is refused otherwise (`acknowledged=false`,
-`notify_stream_status/connected_unverified`); the same WS-4 4.4 F1 principle as the `ProxyRegister`
-decide path — never admit what nothing has verified. The gateway does not retry a refused CONNECTED
-(it ignores `acknowledged=false`) and `yuzu_gw_upstream_notify_dropped_total` does NOT count it, so the
-server-side `connected_unverified` counter is the signal; a refused session stays registered but
-without dispatch placement until the agent reconnects. The degraded read itself is also counted under
+degraded `lookup_route` is refused (`acknowledged=false`,
+`notify_stream_status/connected_unverified`), whatever this replica's local state says; the same WS-4
+4.4 F1 principle as the `ProxyRegister` decide path — never admit what nothing has verified. Since
+#5695 the gateway keeps a refused CONNECTED and sends it again (decorrelated jitter, first resend 1 to
+3 s after the refusal, at most 60 s apart, no time limit while it holds the session) and treats
+`connected_unverified` as transient, so a refusal means "placement is delayed until the directory
+reads again", not "lost until the agent reconnects". `yuzu_gw_upstream_notify_dropped_total` does NOT
+count it, so the server-side `connected_unverified` counter is the signal; a refused session stays
+registered but without dispatch placement until a resend is accepted. The degraded read itself is also counted under
 `write_failed{op="session_lookup"}`. BatchHeartbeat and DISCONNECTED are deliberately fail-soft
 because refusing them would cause the storm or the teardown loss this design exists to prevent. A
 Postgres outage longer than the 90 s lease plus 180 s grace (270 s) tombstones the rows; recovery is
@@ -2279,13 +2278,37 @@ stream shadows the directory fallback in `GatewayRouteFallback::prepare`; reacha
 replica, which the gate forbids) and hp-2, both #5685. The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
 deferred: see the Update below. Also deferred: the local-only surfaces that still read only
 the local registry (`to_json_obj()`, `agent_count()`, the guardian heartbeat reconcile) on a replica
-that has not yet been hydrated; the degraded-read CONNECTED local acceptance, which is sound only
-for one replica (a supersede handled on another replica is invisible to this replica's
-`gateway_sessions_` and `session_is`, so on a degraded read this replica can re-publish its
-in-memory placement for the superseded session; the durable row is untouched because the write is
-session-guarded) and must be revisited with hp-1 before the gate lifts (#5685); TSan coverage of the new
+that has not yet been hydrated; the degraded-read CONNECTED local acceptance, closed by the
+Update (2026-11-13, #5685 (ii)) below, and hp-1/hp-2, which stay open on #5685; TSan coverage of the new
 paths (not landed with this change; #5278); and the WS-9 validation script (follow-on PR-B). The
 local-only surfaces and the WS-9 script are tracked in the WS-5 row of `docs/ha-delivery-matrix.md`.
+
+**Update (2026-11-13, #5685 (ii)): CONNECTED on a degraded directory read is always refused.** The
+local acceptance described above is removed. Rule: when the route store is wired and `lookup_route`
+fails, `NotifyStreamStatus` CONNECTED answers `acknowledged=false` and counts
+`notify_stream_status/connected_unverified` (plus the existing `write_failed{op="session_lookup"}`);
+there is no local-hint branch and no `session_is` conjunct, and a lost-race session is refused too.
+DISCONNECTED and BatchHeartbeat stay fail-soft, and a server with no route store is unchanged. No
+schema change. Why this and not a multi-replica indicator or a durable per-session generation
+(Fable-tier architect adjudication): the single-replica cost that motivated local acceptance went away
+with #5695 (the gateway resends the refused notice, so the price is a delay, not a loss); no replica
+registry or count exists to key an indicator on, and `LeaderElector::is_leader()` is a belief gate that
+is also true for the leader of a two-replica fleet; and a generation column cannot be read when the
+store is unreadable, so a migration buys nothing for the degraded case. Strict is also better on one
+replica: the old accept published in memory while `announce_connected` failed open on the same pool,
+leaving the durable row without placement and nothing to repair it, whereas refuse-and-resend lands
+both together. **Residuals, not closed:** (1) on one replica, an agent whose CONNECTED lands in a
+degraded window is undispatchable for the outage plus up to 60 s of resend backoff (the duration is
+from the documented backoff, not measured); `register_fresh` is fail-closed, so only sessions
+registered just before the outage, or a pool-acquire timeout (`kHotReadTimeout`, 500 ms), reach this
+branch. (2) A gateway older than #5695 never resends, so the placement is lost until the agent
+reconnects (version skew: upgrade every gateway before relying on this). (3) The fallback on a
+SUCCESSFUL read is unchanged: a row that is absent or tombstoned (the agent re-registered elsewhere
+and then disconnected) still lets a late CONNECTED for the old session republish this replica's
+in-memory placement. That is hp-1 (a stale local session is never reaped) and stays on #5685.
+(4) The read-then-supersede window remains; the durable write stays session-guarded. (5) The #4669
+compound window (the cluster-affinity check and the write both degrading) is unchanged. hp-1 and hp-2
+remain open, so this does not lift the safe-to-scale gate.
 
 **Update (2026-10-22, #5683): UNIQUE partial index on `agent_routes(session_id)`.** Migration v5 of
 `GatewayRouteStore` replaces the non-unique `agent_routes_session_id_idx` with
