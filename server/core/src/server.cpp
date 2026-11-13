@@ -20268,7 +20268,7 @@ private:
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            for (const auto& e : *eps) {
+            for (const auto& e : eps->rows) {
                 InventoryDeviceRow r;
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
@@ -20287,8 +20287,8 @@ private:
             }
             // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
             // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
-            // limit-clamp contract, not "zero rows" — (symmetric with the full
-            // offline_endpoint_store_ materialize above), joined by agent_id via the pure
+            // limit-clamp contract, not "zero rows" — (symmetric with the capped
+            // offline roster read above, #5712), joined by agent_id via the pure
             // attach_device_ci (inventory_ci_join.cpp). `out` is the
             // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
             // FleetReadGate scope, downstream of this join; attach_device_ci only ever
@@ -20362,11 +20362,11 @@ private:
             return result;
         };
         // One device's identity row for the Hardware CI record — checks the live
-        // registry first (online, authoritative hostname/OS), else falls back to a
-        // linear scan of the same 30-day offline_endpoint_store_ roster the list
-        // uses. FOLLOW-UP: no point read exists on OfflineEndpointStore yet
-        // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
-        // page (opened far less often than the list re-renders).
+        // registry first (online, authoritative hostname/OS), else falls back to the
+        // offline_endpoint_store_ POINT READ (`find_within`, a primary-key lookup over the
+        // same 30-day window the list uses). #5712: it replaced a linear scan of the capped
+        // roster, which read an enrolled offline device past `kQueryRowCap` as "not found";
+        // the point read is exact at any fleet size, and a miss is a confirmed absence.
         auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
             -> std::expected<std::optional<InventoryDeviceRow>, PresenceReadError> {
             if (auto sess = registry_.get_session(agent_id)) {
@@ -20387,11 +20387,11 @@ private:
             }
             if (!offline_endpoint_store_)
                 return std::optional<InventoryDeviceRow>{};
-            const auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            const auto ep = offline_endpoint_store_->find_within(agent_id, kHardwareRosterWindow);
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
-            return offline_identity_row(eps, agent_id, now_ms, inv_human_age);
+            return offline_identity_row(ep, now_ms, inv_human_age);
         };
         // The full per-device CI record composition — ONE closure shared verbatim
         // by the dashboard fragment, the REST twin and the MCP get_hardware_ci
@@ -20446,9 +20446,13 @@ private:
             if (!offline_endpoint_store_)
                 return out;
             // #5531 exception: display-only; a failed read leaves hostnames
-            // unresolved and the page falls back to the agent_id.
-            for (auto& e : offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
-                               .value_or(std::vector<OfflineEndpoint>{}))
+            // unresolved and the page falls back to the agent_id. #5712: the same holds past
+            // `kQueryRowCap` — a truncated roster is read as served, so a host outside the
+            // newest cap shows its agent_id. Deliberately silent: this map decorates names
+            // and decides nothing (documented in the user manual).
+            auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)
+                              .value_or(OfflineRoster{});
+            for (auto& e : roster.rows)
                 out.emplace(std::move(e.agent_id), std::move(e.hostname));
             return out;
         };
@@ -20787,8 +20791,6 @@ private:
         // existing typed read; the gates are the SAME fleet_read_fn / perm_fn the
         // sibling pages receive. `build_hw_roster` is UNFILTERED: the route narrows
         // it by the gate's scope.
-        static_assert(static_cast<int>(home::kRosterReadCap) == OfflineEndpointStore::kQueryRowCap,
-                      "The Dashboard labels a roster read as a lower bound at the store's row cap");
         dashboard_summary_routes_ = std::make_unique<home::DashboardSummaryRoutes>();
         dashboard_summary_routes_->register_routes(
             *web_server_,

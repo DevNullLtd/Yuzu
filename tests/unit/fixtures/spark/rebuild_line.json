@@ -1,0 +1,37 @@
+{
+  "_comment": "#5719 golden fixture for GuardianRebuildTally::format() (agents/core/include/yuzu/agent/guardian_rebuild_tally.hpp). Read by tests/unit/test_guardian_spark_reapply_skip_engine.cpp (via YUZU_TEST_FIXTURE_DIR). Each case lists the note() calls in order and the exact line format() must return. The line must match NONE of the fullsync_blackout_diag.py driver patterns (PRESERVED_RE, T0_RE, T0D_RE, T1_RE, T2_RE, ARM_LEGACY_RE); a one-sided edit to the formatter or this file is the drift this fixture exists to catch. Reason names are the guardian_rebuild_reason_token values. Each case also names the arm path the line reports (path=legacy|spark, the second field of the line); all_zero is the legacy-path (production) line, spark_all_zero the Spark-path line of a push that rebuilt nothing, populated the Spark-path line with every bucket filled.",
+  "cases": [
+    {
+      "name": "all_zero",
+      "path": "legacy",
+      "notes": [],
+      "expected_line": "Guardian: full_sync rebuilt 0 rule(s) (rebuild attempted): path=legacy first_attach=0 content_changed=0 key_busy=0 faulted_key=0 dead_key=0 health_unknown=0 subscription_replaced=0 unknown_episode=0 baseline_empty=0 baseline_differs=0 other=0 more=0"
+    },
+    {
+      "name": "spark_all_zero",
+      "path": "spark",
+      "notes": [],
+      "expected_line": "Guardian: full_sync rebuilt 0 rule(s) (rebuild attempted): path=spark first_attach=0 content_changed=0 key_busy=0 faulted_key=0 dead_key=0 health_unknown=0 subscription_replaced=0 unknown_episode=0 baseline_empty=0 baseline_differs=0 other=0 more=0"
+    },
+    {
+      "name": "populated",
+      "path": "spark",
+      "notes": [
+        {"rule_id": "r-first-1", "reason": "first_attach"},
+        {"rule_id": "r-first-2", "reason": "first_attach"},
+        {"rule_id": "r-changed", "reason": "content_changed"},
+        {"rule_id": "r-busy", "reason": "key_busy"},
+        {"rule_id": "r-faulted-1", "reason": "faulted_key"},
+        {"rule_id": "r-faulted-2", "reason": "faulted_key"},
+        {"rule_id": "r-dead", "reason": "dead_key"},
+        {"rule_id": "r-unknown-health", "reason": "health_unknown"},
+        {"rule_id": "r-replaced", "reason": "subscription_replaced"},
+        {"rule_id": "r-episode", "reason": "unknown_episode"},
+        {"rule_id": "r-empty-baseline", "reason": "baseline_empty"},
+        {"rule_id": "r-differs", "reason": "baseline_differs"},
+        {"rule_id": "r-other", "reason": "other"}
+      ],
+      "expected_line": "Guardian: full_sync rebuilt 13 rule(s) (rebuild attempted): path=spark first_attach=2 content_changed=1 key_busy=1 ids=[r-busy] faulted_key=2 ids=[r-faulted-1,r-faulted-2] dead_key=1 ids=[r-dead] health_unknown=1 ids=[r-unknown-health] subscription_replaced=1 ids=[r-replaced] unknown_episode=1 ids=[r-episode] baseline_empty=1 ids=[r-empty-baseline] baseline_differs=1 ids=[r-differs] other=1 ids=[r-other] more=0"
+    }
+  ]
+}

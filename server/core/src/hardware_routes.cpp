@@ -243,6 +243,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
         page.containment_ui = deps_.containment_ui;
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
@@ -286,7 +287,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
-                " omitted=" + std::to_string(omitted));
+                " omitted=" + std::to_string(omitted) +
+                (page.roster_truncated ? " roster_truncated=1" : ""));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
         send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only, all.tags_degraded));
@@ -691,6 +693,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
         if (deps_.dex_score_fn)
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
@@ -698,7 +701,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list (REST): devices=" + std::to_string(page.total_matching) +
-                " omitted=" + std::to_string(omitted));
+                " omitted=" + std::to_string(omitted) +
+                (page.roster_truncated ? " roster_truncated=1" : ""));
         if (!persisted) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
