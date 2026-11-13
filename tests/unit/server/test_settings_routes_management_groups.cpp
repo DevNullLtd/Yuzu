@@ -570,6 +570,7 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         CHECK(rows[1].result == "failure");
         CHECK(rows[1].target_id.empty());
         CHECK(rows[1].detail == "permission_revoked");
+        CHECK(rows[1].bound);
     }
     CHECK(h.group_names().empty());
 }
@@ -749,6 +750,7 @@ TEST_CASE("Settings group create: the session_revoked and permission_revoked fai
         const auto rows = h.create_rows();
         REQUIRE(rows.size() == 2);
         CHECK(rows[1].detail == "permission_revoked");
+        CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
         CHECK(rows[1].principal == "admin");
     }

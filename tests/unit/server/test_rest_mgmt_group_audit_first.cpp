@@ -503,6 +503,7 @@ TEST_CASE("POST /management-groups: a permission revoked after the attempted row
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].detail == "permission_revoked");
+    CHECK(h.audits[1].bound);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -682,6 +683,7 @@ TEST_CASE("POST /management-groups/{id}/members: a session or grant gone after t
         CHECK(h.audits[1].action == kAdd);
         CHECK(h.audits[1].result == "failure");
         CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].bound);
     }
     CHECK(h.member_count(gid) == 0);
 }
@@ -873,6 +875,7 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a session or grant go
         CHECK(h.audits[1].action == kRemove);
         CHECK(h.audits[1].result == "failure");
         CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].bound);
     }
     CHECK(h.member_count(gid) == 1);
 }
@@ -1360,6 +1363,7 @@ TEST_CASE("POST /management-groups: the session_revoked and permission_revoked f
         REQUIRE(res);
         REQUIRE(h.audits.size() == 2);
         CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].bound);
         CHECK(h.audits[1].principal == "tester");
         CHECK(h.audits[1].principal == h.audits[0].principal);
     }

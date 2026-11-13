@@ -29139,6 +29139,17 @@ TEST_CASE("MCP create_management_group: an over-long or unclean name or parent i
         }
         CHECK(mg_create_rows(ts).empty());
     }
+    SECTION("a 257 B name, the first byte over the bound, is refused by the length bound") {
+        auto res = ts.call(mg_create_body({{"name", std::string(257, 'n')}}));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] ==
+              "name<=256, description<=1024, parent_id<=256, scope_expression<=4096 bytes");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(mg_create_rows(ts).empty());
+    }
     SECTION("a 20-iteration retry loop of 3 KB names writes no row") {
         for (int i = 0; i < 20; ++i) {
             auto res = ts.call(mg_create_body({{"name", std::string(3 * 1024, 'r')}}, i + 1));
@@ -29644,6 +29655,43 @@ TEST_CASE("MCP create_management_group: the session_revoked and permission_revok
               mg_create_row_field(ts, ts.audit_principals, 0));
         CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == "test-user");
     }
+    CHECK(store.list_groups().empty());
+}
+
+TEST_CASE("MCP create_management_group: with no session-bound writer wired the session_revoked "
+          "row goes through the re-resolving writer",
+          "[mcp][pg][management_group][mgmt-audit-first][security]") {
+    // Pins the documented fallback of a deployment where server.cpp does not bind
+    // `audit_as_session_fn` (it is bound only inside the DEX score policy wiring guard, i.e.
+    // where the runtime-config store is open): the failure row is written by the writer that
+    // looks the session up again, so after the credential is revoked its principal is empty and
+    // the `attempted` row is the authority for who. The response and the state do not change.
+    // wire_mg_session_writer is deliberately NOT called.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    REQUIRE(!static_cast<bool>(ts.tool_deps_for_test.audit_as_session_fn));
+    ts.audit_succeeds_for_action_ = [&ts](const std::string& action) {
+        if (action == "management_group.create")
+            ts.mock_auth_enabled = false; // the next auth_fn call answers 401
+        return true;
+    };
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "revoked"}}));
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                         "management_group.create|failure"});
+    CHECK(mg_create_row_field(ts, ts.audit_details, 0) == "revoked");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked");
+    CHECK(mg_create_row_field(ts, ts.audit_target_ids, 1).empty());
+    CHECK(mg_create_row_field(ts, ts.audit_principals, 0) == "test-user");
+    CHECK(mg_create_row_field(ts, ts.audit_principals, 1).empty()); // re-resolved after revocation
     CHECK(store.list_groups().empty());
 }
 
@@ -30165,7 +30213,7 @@ TEST_CASE("MCP add_management_group_member: an over-long agent id is refused wit
     ts.mgmt_store_for_test = &f.store;
     ts.start();
 
-    SECTION("257 B, 3 KB and 3 MiB agent ids, repeated 20 times") {
+    SECTION("257 B and 3 KB agent ids repeated 20 times, then a 3 MiB agent id once") {
         for (int i = 0; i < 20; ++i) {
             for (const std::size_t n : {std::size_t{257}, std::size_t{3 * 1024}}) {
                 auto res = ts.call(mg_add_body(f.gid, std::string(n, 'a'), i + 1));
