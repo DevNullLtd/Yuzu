@@ -101,7 +101,8 @@ void AuthRoutes::refuse_service_scoped_unrestricted(const httplib::Request& req,
                                                     authz::UnrestrictedRefusalGate gate,
                                                     authz::UnrestrictedRefusalSite site) {
     // Shared by both list gates; each caller still refuses the request itself (fail CLOSED).
-    // Fixed audit text: the scope value is never echoed. Not retryable, so no retry hint.
+    // Fixed audit text: the scope value is never echoed. Not retryable, so no retry hint. The
+    // postcondition site also covers an admit with no session to check; the audit detail is fixed.
     const bool entry = site == authz::UnrestrictedRefusalSite::kEngineEntry;
     const bool fleet = gate == authz::UnrestrictedRefusalGate::kFleetRead;
     if (auto* m = auth_mgr_.metrics_registry()) {
@@ -114,7 +115,7 @@ void AuthRoutes::refuse_service_scoped_unrestricted(const httplib::Request& req,
                 "{}: refused service-scoped session principal={} for {} ({})",
                 fleet ? "fleet_read" : "list_read", ::yuzu::log_token(session.username), perm,
                 entry ? "corrupted scope_service on an engine credential"
-                      : "admit would have been unrestricted");
+                      : "admit would have been unrestricted, or carried no session");
     audit_log(req, fleet ? "auth.fleet_read_required" : "auth.permission_required",
               entry ? "denied" : "failure", "", "",
               entry ? "engine principal denied: corrupted scope_service on engine session"

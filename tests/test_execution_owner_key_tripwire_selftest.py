@@ -192,6 +192,12 @@ def main() -> int:
               mutate(files, "mcp_server.cpp", guard, ""), "CHECK 3")
     must_fail("the list_executions local fail-closed no longer returns", t.check_scope_args,
               mutate(files, "mcp_server.cpp", guard, guard.replace("return;\n", "\n")), "CHECK 3")
+    for what, repl in (("a value given to the unrestricted default", "const authz::VisibleSet unrestricted{{}};"),
+                       ("a parenthesised value given to the unrestricted default",
+                        "const authz::VisibleSet unrestricted(authz::VisibleSet{});"),
+                       ("the unrestricted default made non-const", "authz::VisibleSet unrestricted;")):
+        must_fail(what, t.check_scope_args,
+                  mutate(files, "mcp_server.cpp", "const authz::VisibleSet unrestricted;", repl), "CHECK 3")
     must_fail("the list_executions guard condition inverted", t.check_scope_args,
               mutate(files, "mcp_server.cpp", "if (service_scoped && !gate.scope) {",
                      "if (!service_scoped && !gate.scope) {"), "CHECK 3")

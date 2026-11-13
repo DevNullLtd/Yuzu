@@ -34,8 +34,8 @@ CHECK 3 (scope argument). Every call of `query_executions_checked(` / `get_child
   and a literal `std::nullopt` is allowed at three frozen sites only (the tracker's own unchecked
   wrappers and the home failed-execution read). The unchecked `query_executions(` callers are frozen
   too, and the declarations carry no `= ...` default. MCP `list_executions` also keeps its local
-  fail-closed (`if (service_scoped && !gate.scope)` returns an internal error before the read), a
-  lexical pin.
+  fail-closed (`if (service_scoped && !gate.scope)` returns an internal error before the read) and the
+  uninitialised `const authz::VisibleSet unrestricted;` it passes for every other caller (a lexical pin).
 CHECK 4 (visibility predicates). `execution_visible(` and `admit_confined_mutation(` are called with
   four arguments whose last is an owner key (a variable typed `ExecutionOwnerKey`, `req.owner`, or
   `execution_owner_key(...)`), and each is DECLARED exactly once with an `ExecutionOwnerKey`
@@ -802,14 +802,16 @@ def _decl_params(files: dict[str, str], name: str):
 _LIST_EXEC_CALL = re.compile(r"\bquery_executions_checked\s*\(\s*eq\s*,\s*query_scope\s*\)")
 _SERVICE_SCOPED_DECL = re.compile(
     r"\bconst\s+bool\s+service_scoped\s*=\s*!\s*session\s*->\s*token_scope_service\s*\.\s*empty\s*\(\s*\)\s*;")
+_UNRESTRICTED_DECL = re.compile(r"\bconst\s+authz::VisibleSet\s+unrestricted\s*;")
 _LOCAL_GUARD = re.compile(
     r"\bif\s*\(\s*service_scoped\s*&&\s*!\s*gate\s*\.\s*scope\s*\)\s*\{[^{}]*\bkInternalError\b[^{}]*\breturn\s*;\s*\}")
 
 
 def check_mcp_list_executions_guard(files: dict[str, str]) -> list[str]:
     """MCP `list_executions` keeps its LOCAL fail-closed for a service-scoped session admitted
-    without a scope. Lexical: it proves the guard text sits before the checked read in the tool's
-    own block, not that it runs."""
+    without a scope, and the `unrestricted` default it passes for every other caller stays an
+    uninitialised `const authz::VisibleSet`. Lexical: it proves the text sits before the checked
+    read in the tool's own block, not that it runs."""
     rel = _SRC + "mcp_server.cpp"
     sc = scan(files[rel]) if rel in files else None
     if sc is None:
@@ -826,6 +828,10 @@ def check_mcp_list_executions_guard(files: dict[str, str]) -> list[str]:
     if len(_SERVICE_SCOPED_DECL.findall(before)) != 1:
         errs.append("CHECK 3: MCP list_executions: `service_scoped` must be declared once as "
                     "`!session->token_scope_service.empty()`")
+    if len(_UNRESTRICTED_DECL.findall(before)) != 1 or re.search(r"\bunrestricted\s*[=({]", before):
+        errs.append("CHECK 3: MCP list_executions: `unrestricted` must be declared once as an "
+                    "uninitialised `const authz::VisibleSet unrestricted;` (an unrestricted default; "
+                    "giving it a value would hand a non-service-scoped caller a scope)")
     if len(_LOCAL_GUARD.findall(before)) != 1:
         errs.append("CHECK 3: MCP list_executions: the local fail-closed "
                     "`if (service_scoped && !gate.scope) { ... kInternalError ... return; }` is missing "
