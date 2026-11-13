@@ -2980,7 +2980,7 @@ TEST_CASE("WS-5 BatchHeartbeat: a NON-OWNING replica resolves a session known on
 // #6339 (UP-1): this replica's session map names agent Y for session S while the directory row
 // for S names agent X. The row alone used to win, attributing the heartbeat to X.
 TEST_CASE("WS-5 BatchHeartbeat: a session the local map and the directory attribute to DIFFERENT "
-          "agents is refused and listed for replay, never attributed (#6339)",
+          "agents is refused and listed for replay - never attributed (#6339)",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
     BatchHbFixture owner(db.dsn());
@@ -3004,6 +3004,11 @@ TEST_CASE("WS-5 BatchHeartbeat: a session the local map and the directory attrib
     CHECK(listed_unknown(resp) == std::vector<std::string>{sid}); // listed so the gateway replays
     CHECK(owner.desync("session_lookup", "agent_mismatch") == 1);
     CHECK(owner.desync("session_lookup", "ambiguous_session") == 0);
+    // The harm was attribution: neither agent's row is touched by the refused heartbeat.
+    const auto row = owner.store.lookup_route("yuzu_test_6339_row");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == std::optional<std::string>{sid});
 }
 
 TEST_CASE("WS-5 BatchHeartbeat: server-only restart reconcile lists the directory-known "
@@ -3316,7 +3321,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read with no local sess
 }
 
 TEST_CASE("WS-5 NotifyStreamStatus: a degraded directory read refuses CONNECTED for the "
-          "session this replica registered, leaves its placement alone, and accepts the resend "
+          "session this replica registered and leaves its placement alone then accepts the resend "
           "once the read recovers (#5685 (ii))",
           "[pg][gateway_route_wiring][ws5]") {
     YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
@@ -3642,6 +3647,24 @@ TEST_CASE("WS-5 ProxyInventory: a degraded read with a local hint still ingests 
         REQUIRE(owner.svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
         CHECK_FALSE(ack.received());
         CHECK(owner.desync("session_lookup", "ambiguous_session") == 1);
+    }
+
+    // #6339: the local map names one agent and the directory row another. The inventory must not
+    // be attributed to either, and the refusal is counted as the mismatch, not as an unknown id.
+    SECTION("local map and directory name different agents") {
+        const std::string sid = owner.register_live("yuzu_test_6339_inv_local");
+        const std::string sql = "UPDATE gateway_route_store.agent_routes SET agent_id = "
+                                "'yuzu_test_6339_inv_row' WHERE agent_id = "
+                                "'yuzu_test_6339_inv_local'";
+        raw_exec(db.dsn(), sql.c_str());
+
+        apb::InventoryReport rpt;
+        rpt.set_session_id(sid);
+        apb::InventoryAck ack;
+        REQUIRE(owner.svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+        CHECK_FALSE(ack.received());
+        CHECK(owner.desync("session_lookup", "agent_mismatch") == 1);
+        CHECK(owner.desync("proxy_inventory", "unknown_session") == 0);
     }
 }
 

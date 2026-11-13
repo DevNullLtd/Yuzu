@@ -69,8 +69,10 @@ namespace yuzu::server {
 /// not in that replica's own local live registry, local always winning on
 /// conflict). Deliberately excludes `session_id` and plugin capability: a
 /// merge caller has no session concept of its own (that's WS-4's fenced
-/// `GatewayRouteStore`), and plugin-capability cross-replica visibility
-/// (`ids_missing_plugin`) is out of this slice's scope — see WS-5's plan doc.
+/// `GatewayRouteStore`), and plugin capability is NOT carried here (a list per
+/// identity would make this fleet-sized cache enormous): cross-replica plugin
+/// visibility (`ids_missing_plugin`) reads the side table `endpoint_plugins`
+/// through `query_live_ids_without_plugin` instead (migration v5, #5685 follow-up).
 struct PresenceIdentity {
     std::string agent_id;
     std::string hostname;
@@ -218,22 +220,32 @@ public:
     /// heartbeat arrives — including a departed gateway agent that reconnects
     /// through a replica with a degraded session-directory lookup, for the
     /// duration of the degradation.
-    ///
-    /// `plugin_names` (v5, #5685 follow-up): the plugin names the agent's session reported at
-    /// registration. EMPTY means "not publishing this call" and preserves the stored list (never
-    /// writes an empty one), the same blank-preserve rule as the columns above, so only the
-    /// owning replica's session ever sets it. Names with characters outside `[A-Za-z0-9_.-]`, or
-    /// over 64 bytes, are dropped. Read by `query_live_ids_without_plugin`.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
                 std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
                 std::string_view agent_version = {}, std::string_view arch = {},
-                std::string_view session_id = {},
-                const std::vector<std::string>& plugin_names = {});
+                std::string_view session_id = {});
 
-    /// Ids of agents that are LIVE (the `query_live_ids` predicate) AND have a recorded plugin
-    /// list that does NOT contain `plugin`. An agent that never reported a list (NULL, a
-    /// pre-v5 row or an agent with no inventory) is absent from the result: unknown is not
-    /// absent, so the caller fails open for it. Typed failure like `query_live_ids`
+    /// Caps on one published plugin list (an agent reports its own list, so bound it before it is
+    /// persisted): at most this many names, each at most this many bytes. Extra or over-long
+    /// names are dropped; an empty result publishes nothing.
+    static constexpr std::size_t kMaxPublishedPlugins = 256;
+    static constexpr std::size_t kMaxPluginNameBytes = 64;
+
+    /// Records the plugin names the session `session_id` of `agent_id` reported at registration
+    /// (migration v5, `endpoint_plugins`, one row per agent, written ONCE per session by the
+    /// owning replica's heartbeat after its `upsert`). Names are capped and quoted (see the
+    /// caps above). Returns false when nothing was written (store not open, blank ids, an empty
+    /// list, a failed write: counted `op="publish_plugins"`); the caller retries on its next
+    /// heartbeat. A list is served by `query_live_ids_without_plugin` only while its session is the
+    /// endpoint's current one, so a newer session with no published list reads as unknown.
+    bool publish_plugins(std::string_view agent_id, std::string_view session_id,
+                         const std::vector<std::string>& plugin_names);
+
+    /// Ids of agents that are LIVE (the `query_live_ids` predicate) AND have a published plugin
+    /// list, from their CURRENT session, that does NOT contain `plugin`. An agent with no list, or
+    /// whose list came from an older session (a pre-v5 row, an agent with no inventory, a
+    /// re-registration whose owner has not heartbeated yet), is absent from the result: unknown is
+    /// not absent, so the caller fails open for it. Typed failure like `query_live_ids`
     /// (`Truncated` past `kQueryRowCap`); counted on
     /// `yuzu_server_agent_presence_store_failed_total{op="query_without_plugin"}`. Identity read
     /// only: it grants no authority.

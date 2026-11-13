@@ -463,9 +463,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
     yuzu::server::ConfinedDispatchSink raw_sink{
         [&registry, &cmd, route_fallback](const std::string& aid) {
-            // A local session ALWAYS wins (route_fallback->prepare() never
-            // even looks up an id with one) — this fallback fires ONLY for a
-            // candidate this replica has no local session for at all.
+            // A session that CAN deliver ALWAYS wins (route_fallback->prepare() never
+            // even looks up an id with one) — this fallback fires only for a candidate
+            // this replica has no local session for at all, or one it holds that has no
+            // delivery path (empty gateway_node and no stream, #5685 hp-1).
             if (auto cluster = route_fallback->cluster_for(aid))
                 return registry.send_via_directory(aid, cmd, *cluster);
             return registry.send_to(aid, cmd);

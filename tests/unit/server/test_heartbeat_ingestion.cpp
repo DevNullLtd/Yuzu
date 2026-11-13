@@ -16,6 +16,7 @@
 #include "fleet_topology_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
@@ -25,6 +26,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <atomic>
@@ -67,6 +69,13 @@ yuzu::test::PgTestTemplate offline_tpl{"offline", [](const std::string& dsn) {
     if (!store.is_open())
         throw std::runtime_error("offline template: store failed to migrate");
 }};
+
+void exec_sql_hb(const std::string& dsn, const char* sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
+}
 
 } // namespace
 
@@ -437,14 +446,15 @@ TEST_CASE("HeartbeatIngestion: a fleet snapshot with no local session takes its 
     snap["connections"] = nlohmann::json::array();
 
     // One topology store per case: it caches its first get() for 60 s.
-    const auto pushed_os = [&](const std::string& id) -> std::optional<std::string> {
+    const auto pushed_os = [&](const std::string& id, HeartbeatIngestion::PresenceBatch* batch =
+                                                          nullptr) -> std::optional<std::string> {
         yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
             return std::vector<yuzu::server::RawAgentSnapshot>{};
         }};
         HeartbeatIngestion ingestion{registry, nullptr, &topo, &metrics, &store};
         ::yuzu::agent::v1::HeartbeatRequest hb;
         hb.set_fleet_snapshot_json(snap.dump());
-        ingestion.ingest(hb, id, "gateway", "sess-resolved");
+        ingestion.ingest(hb, id, "gateway", "sess-resolved", batch);
         auto t = topo.get(false);
         REQUIRE(t != nullptr);
         for (const auto& m : t->machines)
@@ -458,14 +468,27 @@ TEST_CASE("HeartbeatIngestion: a fleet snapshot with no local session takes its 
                          "sess-owner"));
     CHECK(pushed_os("yuzu_test_hb_snap_os") == std::optional<std::string>{"linux"});
 
-    // No presence row and no session: unknown stays blank, never an invented platform.
+    // This heartbeat's own upsert wrote a blank-os row (the agent was never seen), so there is
+    // nothing to fall back to: unknown stays blank, never an invented platform. (The ingest
+    // upserts BEFORE the snapshot step, so a genuinely row-less read is not reachable here; a
+    // failed `find_within` takes the same blank path.)
     CHECK(pushed_os("yuzu_test_hb_snap_noos") == std::optional<std::string>{""});
+
+    // While the batch's presence store is tripped this heartbeat's write is skipped, and so is
+    // the fallback read: the row still says linux, but a degraded store is not read once per
+    // snapshot heartbeat, so the snapshot's os stays blank.
+    REQUIRE(store.upsert("yuzu_test_hb_snap_tripped", "known-host", "linux", 1, 0, "1", "x", "s"));
+    HeartbeatIngestion::PresenceBatch tripped;
+    tripped.store_failed = true;
+    tripped.next_probe = 1000; // the next entry is NOT the half-open probe
+    CHECK(pushed_os("yuzu_test_hb_snap_tripped", &tripped) == std::optional<std::string>{""});
+    CHECK(tripped.skipped == 1);
 }
 
-// #5685 follow-up: the OWNING replica's heartbeat publishes the session's plugin list to the
-// presence row once; a replica with no session never writes (or clobbers) it.
-TEST_CASE("HeartbeatIngestion: the owning replica publishes the session's plugin list once; a "
-          "non-owner heartbeat preserves it",
+// #5685 follow-up: the OWNING replica's heartbeat publishes the session's plugin list once per
+// session to its own row; a replica with no session never writes (or clobbers) it.
+TEST_CASE("HeartbeatIngestion: the owner publishes the plugin list once per session; a "
+          "non-owner heartbeat leaves it alone; a new session republishes",
           "[heartbeat_ingestion][ws5][pg][ha][plugin_visibility]") {
     YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -479,31 +502,65 @@ TEST_CASE("HeartbeatIngestion: the owning replica publishes the session's plugin
     AgentRegistry non_owner{bus, metrics};
     HeartbeatIngestion owner_ing{owner, nullptr, nullptr, &metrics, &store};
     HeartbeatIngestion other_ing{non_owner, nullptr, nullptr, &metrics, &store};
+    const auto without = [&](std::string_view plugin) {
+        auto r = store.query_live_ids_without_plugin(std::chrono::hours(1), plugin);
+        REQUIRE(r.has_value());
+        return *r;
+    };
+    using Ids = std::vector<std::string>;
 
-    ::yuzu::agent::v1::AgentInfo info;
-    info.set_agent_id("yuzu_test_hb_plugins");
-    info.set_hostname("h");
-    info.mutable_platform()->set_os("linux");
-    info.add_plugins()->set_name("os_info");
-    (void)owner.register_agent(info);
-    const auto sess = owner.get_session("yuzu_test_hb_plugins");
+    const auto make_info = [](const std::vector<std::string>& plugins) {
+        ::yuzu::agent::v1::AgentInfo info;
+        info.set_agent_id("yuzu_test_hb_plugins");
+        info.set_hostname("h");
+        info.mutable_platform()->set_os("linux");
+        for (const auto& p : plugins)
+            info.add_plugins()->set_name(p);
+        return info;
+    };
+    (void)owner.register_agent(make_info({"os_info"}));
+    auto sess = owner.get_session("yuzu_test_hb_plugins");
     REQUIRE(sess != nullptr);
     CHECK_FALSE(sess->presence_plugins_published.load());
 
     owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
-    CHECK(sess->presence_plugins_published.load()); // set only after the upsert succeeded
-    auto r = store.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
-    REQUIRE(r.has_value());
-    CHECK(*r == std::vector<std::string>{"yuzu_test_hb_plugins"});
+    CHECK(sess->presence_plugins_published.load()); // set only after the write succeeded
+    CHECK(without("echo") == Ids{"yuzu_test_hb_plugins"});
 
-    // The non-owner's blank-identity heartbeat must not clobber the stored list.
+    // A second owner heartbeat does not publish again: tamper with the stored list and see that
+    // the heartbeat leaves the tampered value alone.
+    exec_sql_hb(db.dsn(), "UPDATE endpoint_state.endpoint_plugins SET plugin_names = "
+                          "ARRAY['echo'] WHERE agent_id = 'yuzu_test_hb_plugins'");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
+    CHECK(without("echo").empty()); // still the tampered {echo}: not republished
+
+    // The non-owner's heartbeat (no session, no list) must not clobber it either.
     other_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
-    r = store.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
-    REQUIRE(r.has_value());
-    CHECK(*r == std::vector<std::string>{"yuzu_test_hb_plugins"});
-    r = store.query_live_ids_without_plugin(std::chrono::hours(1), "os_info");
-    REQUIRE(r.has_value());
-    CHECK(r->empty());
+    CHECK(without("echo").empty());
+
+    // A re-registration is a NEW session object with a changed list: it republishes.
+    (void)owner.register_agent(make_info({"os_info", "echo"}));
+    auto sess2 = owner.get_session("yuzu_test_hb_plugins");
+    REQUIRE(sess2 != nullptr);
+    REQUIRE(sess2 != sess);
+    CHECK_FALSE(sess2->presence_plugins_published.load());
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-2");
+    CHECK(sess2->presence_plugins_published.load());
+    CHECK(without("echo").empty());                         // the new list has echo
+    CHECK(without("other") == Ids{"yuzu_test_hb_plugins"}); // and nothing else
+
+    // A failed write leaves the flag clear so the next heartbeat retries it.
+    (void)owner.register_agent(make_info({"os_info"}));
+    auto sess3 = owner.get_session("yuzu_test_hb_plugins");
+    REQUIRE(sess3 != nullptr);
+    exec_sql_hb(db.dsn(),
+                "ALTER TABLE endpoint_state.endpoint_plugins RENAME TO endpoint_plugins_x");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
+    CHECK_FALSE(sess3->presence_plugins_published.load());
+    exec_sql_hb(db.dsn(),
+                "ALTER TABLE endpoint_state.endpoint_plugins_x RENAME TO endpoint_plugins");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
+    CHECK(sess3->presence_plugins_published.load());
 }
 
 TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's id; blank "

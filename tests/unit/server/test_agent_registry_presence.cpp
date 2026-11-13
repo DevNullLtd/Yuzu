@@ -22,13 +22,14 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <expected>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
-#include <expected>
 
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::EventBus;
@@ -436,9 +437,9 @@ TEST_CASE("HA WS-5: has_remote_presence — direct single-lock membership check"
 }
 
 // #5685 follow-up: a replica holding NO session for an agent still reports the plugins that agent
-// lacks, from the durable presence row the owning replica's heartbeat wrote.
-TEST_CASE("HA WS-5: ids_missing_plugin merges the presence plugin list for ids with no local "
-          "session; local wins, unknown and degraded fail open",
+// lacks, from the durable list the owning replica's heartbeat published.
+TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids with no local "
+          "session (local wins - unknown and degraded fail open - results are cached)",
           "[pg][ha][presence][plugin_visibility]") {
     YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -451,21 +452,27 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the presence plugin list for ids w
     AgentRegistry r2(bus, metrics); // the NON-owning replica
     r2.configure_presence(&store, std::chrono::hours(1));
 
-    // Published by the owning replica: one lacks "echo", one has it, one never reported.
-    REQUIRE(store.upsert("yuzu_test_pm_lacks", "h", "linux", 1, 0, "1", "x", "s1", {"os_info"}));
-    REQUIRE(store.upsert("yuzu_test_pm_has", "h", "linux", 1, 0, "1", "x", "s2", {"echo"}));
+    // Published by the owning replica: one lacks "echo", one has it, one never published.
+    REQUIRE(store.upsert("yuzu_test_pm_lacks", "h", "linux", 1, 0, "1", "x", "s1"));
+    REQUIRE(store.publish_plugins("yuzu_test_pm_lacks", "s1", {"os_info"}));
+    REQUIRE(store.upsert("yuzu_test_pm_has", "h", "linux", 1, 0, "1", "x", "s2"));
+    REQUIRE(store.publish_plugins("yuzu_test_pm_has", "s2", {"echo"}));
     REQUIRE(store.upsert("yuzu_test_pm_unknown", "h", "linux", 1, 0, "1", "x", "s3"));
 
-    SECTION("a remote agent whose recorded list lacks the plugin is reported missing") {
+    SECTION("a remote agent whose published list lacks the plugin is reported missing") {
         const auto missing = r2.ids_missing_plugin("echo", "sql");
         CHECK(missing == std::unordered_set<std::string>{"yuzu_test_pm_lacks"});
     }
 
-    SECTION("local wins: a local session with the plugin is not reported on the presence row's "
-            "word") {
+    SECTION("local wins: a local session with the plugin is not reported on the row's word") {
         auto info = make_agent_info("yuzu_test_pm_lacks", "linux", "h");
         info.add_plugins()->set_name("echo"); // this replica's own session says it HAS echo
         (void)r2.register_agent(info);
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+    }
+
+    SECTION("local wins: a local session with an EMPTY list is unknown, not absent") {
+        (void)r2.register_agent(make_agent_info("yuzu_test_pm_lacks", "linux", "h"));
         CHECK(r2.ids_missing_plugin("echo", "sql").empty());
     }
 
@@ -473,18 +480,96 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the presence plugin list for ids w
         CHECK(r2.ids_missing_plugin("quarantine", "quarantine").empty());
     }
 
-    SECTION("a degraded presence read fails OPEN: nothing is withheld") {
-        r2.configure_presence_plugin_reader(
-            [](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
-                return std::unexpected(PresenceReadError::DbError);
-            });
-        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
-    }
-
     SECTION("unconfigured (single replica): byte-identical to local-only") {
         AgentRegistry solo(bus, metrics);
         CHECK(solo.ids_missing_plugin("echo", "sql").empty());
+    }
+
+    SECTION("a degraded read fails OPEN and the failure is cached for the TTL") {
+        std::atomic<int> calls{0};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                ++calls;
+                return std::unexpected(PresenceReadError::DbError);
+            });
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+        CHECK(calls.load() == 1); // the failure is negative-cached, not retried per dispatch
+    }
+
+    SECTION("a throwing reader fails open and does not wedge the plugin") {
+        std::atomic<int> calls{0};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                if (++calls == 1)
+                    throw std::runtime_error("boom");
+                return std::vector<std::string>{"yuzu_test_pm_lacks"};
+            });
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty()); // the throw: fail open
+        r2.expire_presence_cache_for_test();
+        CHECK(r2.ids_missing_plugin("echo", "sql") ==
+              std::unordered_set<std::string>{"yuzu_test_pm_lacks"}); // next read works
+    }
+
+    SECTION("the result is cached per plugin for the TTL and re-read after it") {
+        std::atomic<int> calls{0};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view plugin)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                ++calls;
+                return std::vector<std::string>{"remote-" + std::string(plugin)};
+            });
+        CHECK(r2.ids_missing_plugin("echo", "sql") ==
+              std::unordered_set<std::string>{"remote-echo"});
+        CHECK(r2.ids_missing_plugin("echo", "sql").size() == 1);
+        CHECK(calls.load() == 1); // second call inside the TTL: no re-read
+        CHECK(r2.ids_missing_plugin("os_info", "list").size() == 1);
+        CHECK(calls.load() == 2); // a different plugin is its own entry
+        r2.expire_presence_cache_for_test();
+        CHECK(r2.ids_missing_plugin("echo", "sql").size() == 1);
+        CHECK(calls.load() == 3); // after the TTL: re-read
+    }
+
+    SECTION("the plugin cache is bounded: a flood of distinct names cannot grow it past the cap") {
+        std::atomic<int> calls{0};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                ++calls;
+                return std::vector<std::string>{};
+            });
+        const int distinct = 200;
+        for (int n = 0; n < distinct; ++n)
+            (void)r2.ids_missing_plugin("plug" + std::to_string(n), "act");
+        CHECK(calls.load() == distinct);
+        // Entries past the cap evicted earlier ones: the first name is read again.
+        (void)r2.ids_missing_plugin("plug0", "act");
+        CHECK(calls.load() == distinct + 1);
+    }
+
+    SECTION("concurrent dispatches for one plugin share a single refresh and none blocks") {
+        std::atomic<int> calls{0};
+        std::atomic<bool> release{false};
+        r2.configure_presence_plugin_reader(
+            [&](std::chrono::seconds, std::string_view)
+                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                ++calls;
+                while (!release.load())
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return std::vector<std::string>{"yuzu_test_pm_lacks"};
+            });
+        std::thread refresher([&] { (void)r2.ids_missing_plugin("echo", "sql"); });
+        while (calls.load() == 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        // While the one refresh is in flight, other callers neither wait for it nor start a
+        // second read: with no stale entry they fail open, and live_presence() is not blocked.
+        CHECK(r2.ids_missing_plugin("echo", "sql").empty());
+        CHECK(r2.all_ids().size() >= 0);
+        release = true;
+        refresher.join();
+        CHECK(calls.load() == 1);
     }
 }
 

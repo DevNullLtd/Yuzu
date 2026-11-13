@@ -2275,11 +2275,13 @@ honestly).
 
 **Deferred, not silent.** hp-1 (a local session with an empty `gateway_node` and no
 stream shadows the directory fallback in `GatewayRouteFallback::prepare`; reachable only with a second
-replica, which the gate forbids) and hp-2, both #5685. The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
+replica, which the gate forbids) and hp-2, both #5685 (hp-1's shadowing and hp-2's snapshot-`os` half
+are done: see the Update (2026-11-13, slice 3) below). The UNIQUE partial index on `agent_routes(session_id)` (#5683) is no longer
 deferred: see the Update below. Also deferred: the local-only surfaces that still read only
 the local registry (`to_json_obj()`, `agent_count()`, the guardian heartbeat reconcile) on a replica
 that has not yet been hydrated; the degraded-read CONNECTED local acceptance, closed by the
-Update (2026-11-13, #5685 (ii)) below, and hp-1/hp-2, which stay open on #5685; TSan coverage of the new
+Update (2026-11-13, #5685 (ii)) below, and the remaining half of hp-1/hp-2 (the stale-placement republish
+and the guardian heartbeat reconcile), which stay open on #5685; TSan coverage of the new
 paths (not landed with this change; #5278); and the WS-9 validation script (follow-on PR-B). The
 local-only surfaces and the WS-9 script are tracked in the WS-5 row of `docs/ha-delivery-matrix.md`.
 
@@ -2298,17 +2300,52 @@ store is unreadable, so a migration buys nothing for the degraded case. Strict i
 replica: the old accept published in memory while `announce_connected` failed open on the same pool,
 leaving the durable row without placement and nothing to repair it, whereas refuse-and-resend lands
 both together. **Residuals, not closed:** (1) on one replica, an agent whose CONNECTED lands in a
-degraded window is undispatchable for the outage plus up to 60 s of resend backoff (the duration is
-from the documented backoff, not measured); `register_fresh` is fail-closed, so only sessions
+degraded window is undispatchable for the outage plus up to 60 s of resend backoff, or up to 10 minutes
+once the refusal has lasted 15 minutes (the gateway's slow phase, `notify_unacked_slow_after_ms` and
+`notify_unacked_slow_max_ms` in `yuzu_gw_upstream.erl`; the durations are from the documented backoff, not
+measured); `register_fresh` is fail-closed, so only sessions
 registered just before the outage, or a pool-acquire timeout (`kHotReadTimeout`, 500 ms), reach this
 branch. (2) A gateway older than #5695 never resends, so the placement is lost until the agent
 reconnects (version skew: upgrade every gateway before relying on this). (3) The fallback on a
 SUCCESSFUL read is unchanged: a row that is absent or tombstoned (the agent re-registered elsewhere
 and then disconnected) still lets a late CONNECTED for the old session republish this replica's
-in-memory placement. That is hp-1 (a stale local session is never reaped) and stays on #5685.
+in-memory placement. That is the stale-placement republish (the open part of hp-1: a stale local
+session is never reaped) and stays on #5685.
 (4) The read-then-supersede window remains; the durable write stays session-guarded. (5) The #4669
-compound window (the cluster-affinity check and the write both degrading) is unchanged. hp-1 and hp-2
-remain open, so this does not lift the safe-to-scale gate.
+compound window (the cluster-affinity check and the write both degrading) is unchanged. The stale-placement
+republish and the guardian heartbeat reconcile stay open on #5685, so this does not lift the safe-to-scale
+gate.
+
+**Update (2026-11-13, slice 3): hp-1's shadowing, hp-2's snapshot half, #6339, plugin-capability visibility.**
+(a) *hp-1 shadowing.* A replica that handled an agent's `ProxyRegister` but not its CONNECTED holds a
+session with an empty `gateway_node` and no stream, for which `send_to` returns false; the directory fallback
+consulted the store only on a TOTAL local miss, so the agent stayed undispatchable although another replica
+held a routable row. `GatewayRouteFallback::prepare` (via `AgentRegistry::needs_directory_consult`) and
+`has_remote_presence` now treat exactly that state as a miss. It is the state in which `send_to` cannot
+deliver, so no outcome that succeeded changes; what does change on one replica is that such a session (a
+direct agent between Register and Subscribe, a gateway agent between ProxyRegister and CONNECTED) costs one
+batched directory read per dispatch, and a degraded read for it now sets `route_unreadable` (a
+classification change, not a routing change). `send_via_directory` re-checks at send time: if the CONNECTED
+landed after the decision it hands the id to `send_to` (which stamps the local placement and applies the
+dispatch-tag capability check), and it applies the per-OS kill switch (#5294) to a local session's OS. The
+delivery-path read only TRY-locks `stream_mu`, so a stalled stream write cannot stall the dispatch gate.
+(b) *hp-2, snapshot half.* The fleet snapshot's `os` on a replica with no session comes from the presence row
+(a primary-key read, only when this heartbeat's presence write succeeded; local wins; blank stays blank). The
+guardian heartbeat reconcile on a non-owning replica is NOT done: its push needs a local session, so it still
+reports `no_session`, and #5685 stays open for it. (c) *#6339.* `resolve_sessions` refuses a session id whose
+local map and directory row name different agents (`session_lookup/agent_mismatch`) and lists it as unknown,
+so the gateway replays `ProxyRegister` and the register path decides who holds it (the agent that is not the
+row's holder is refused `held_by_other_agent`); the no-row `announce_connected` probe is not added.
+(d) *Plugin-capability visibility (§7a presence, extended in place).* Migration v5 of `OfflineEndpointStore`
+adds a side table `endpoint_plugins(agent_id PK REFERENCES endpoints ON DELETE CASCADE, session_id,
+plugin_names text[])`, written once per session by the owning replica's heartbeat after its upsert. A side table,
+not a column on the hot row, because that row is rewritten on every heartbeat. A read joins on the list's
+session equalling the endpoint's current session, so a list from an older session is never served for a newer
+one (it reads as unknown). `AgentRegistry::ids_missing_plugin` merges the live ids whose published list lacks
+the plugin (per-plugin result cached for the presence TTL, one refresher per plugin, no registry lock held
+across the database read). Local wins; an agent with no list, a degraded or truncated read, and every protective
+action fail open or stay exempt. Not measured: the query cost at fleet scale, and the one extra write per session.
+The safe-to-scale gate is NOT lifted.
 
 **Update (2026-10-22, #5683): UNIQUE partial index on `agent_routes(session_id)`.** Migration v5 of
 `GatewayRouteStore` replaces the non-unique `agent_routes_session_id_idx` with

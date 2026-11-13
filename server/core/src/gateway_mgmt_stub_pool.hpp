@@ -199,14 +199,16 @@ public:
     /// This does NOT add a second address or any failover: the management
     /// address is still ONE name, and surviving a dead node still depends on
     /// that name resolving to a live one (a TCP-passthrough VIP with a
-    /// `/readyz` check, or multi-address DNS: docs/user-manual/gateway.md
-    /// "Management plane addressing"). It only makes a silent node fail like
+    /// `/readyz` check, or multi-address DNS: docs/user-manual/gateway.md,
+    /// the "Management address" bullet). It only makes a silent node fail like
     /// a closed one.
     ///
-    /// Safe against the gateway's own listener: cowboy_http2 has no minimum
-    /// ping interval (no `too_many_pings` GOAWAY), only a flood limit
-    /// (`enhance_your_calm`) orders of magnitude above one ping per 30 s, and
-    /// the agents already ping the same listener every 60 s.
+    /// Safe against the gateway's own management listener (:50063): cowboy_http2
+    /// has no minimum ping interval (no `too_many_pings` GOAWAY), only a flood
+    /// limit (`max_received_frame_rate`, `enhance_your_calm`) orders of
+    /// magnitude above one ping per 30 s, and it answers a PING synchronously
+    /// in the connection process (`yuzu_grpc_listener.erl`). Not measured: that
+    /// the PING ACK arrives within `kKeepaliveTimeoutMs` during a large fan-out.
     static constexpr int kKeepaliveTimeMs = 30000;
     static constexpr int kKeepaliveTimeoutMs = 10000;
 
@@ -221,10 +223,30 @@ public:
         return args;
     }
 
+    /// The creator `channel_via` calls; `grpc::CreateCustomChannel` in production. A seam so a
+    /// test can observe the arguments a channel is built with (a `grpc::Channel` exposes none).
+    using ChannelCreateFn = std::function<std::shared_ptr<grpc::Channel>(
+        const std::string& address, std::shared_ptr<grpc::ChannelCredentials>,
+        const grpc::ChannelArguments&)>;
+
+    /// Builds a channel with the keepalive arguments (`default_channel_arguments()`) through
+    /// `create`. The ONLY place the arguments are attached to a channel.
+    [[nodiscard]] static std::shared_ptr<grpc::Channel>
+    channel_via(const ChannelCreateFn& create, const std::string& address,
+                std::shared_ptr<grpc::ChannelCredentials> creds) {
+        return create(address, std::move(creds), default_channel_arguments());
+    }
+
     static std::shared_ptr<grpc::Channel>
     default_channel_factory(const std::string& address,
                             std::shared_ptr<grpc::ChannelCredentials> creds) {
-        return grpc::CreateCustomChannel(address, std::move(creds), default_channel_arguments());
+        // One line, checked by inspection: it passes the real creator to `channel_via`.
+        return channel_via(
+            [](const std::string& a, std::shared_ptr<grpc::ChannelCredentials> c,
+               const grpc::ChannelArguments& args) {
+                return grpc::CreateCustomChannel(a, std::move(c), args);
+            },
+            address, std::move(creds));
     }
 
     /// `default_address` is `Config::gateway_command_address` (may be

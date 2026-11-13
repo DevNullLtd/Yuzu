@@ -449,15 +449,19 @@ struct PluginMeta {
 // does not edit in place. Lock-free readers (scope evaluation, the DEX perf
 // provider) depend on this — NONE of them reads `gateway_node`,
 // `gateway_wire_capabilities`, or `gateway_stream_home_id` (verified: their
-// only readers are send_to/send_to_all and agent_registry.cpp's own
-// gateway_stream_home_id() accessor, all under `stream_mu`), which is
-// exactly why those three are NOT in this list. Post-publication writes are
+// readers are send_to/send_to_all, `has_remote_presence`,
+// `lacks_local_delivery_path`/`needs_directory_consult` (#5685 hp-1, via
+// `no_delivery_path`, which only TRY-locks `stream_mu`) and
+// agent_registry.cpp's own gateway_stream_home_id() accessor, all under
+// `stream_mu`), which is exactly why those three are NOT in this list.
+// Post-publication writes are
 // confined to stream/server_context/peer_cert_pem, gateway_node +
 // gateway_wire_capabilities + gateway_stream_home_id (all under stream_mu —
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// comment) and the atomics last_activity_epoch_ms and
+// presence_plugins_published (written by HeartbeatIngestion). `session_id` is ALSO
 // rewritten in place after publication, by AgentRegistry::map_session under
 // AgentRegistry::mu_ (an exception to the identity-field rule above): read
 // it only through session_is()/session_id_of(), never through a
@@ -1007,6 +1011,10 @@ public:
     /// both at once (the order `send_to` itself uses).
     [[nodiscard]] bool lacks_local_delivery_path(const std::string& agent_id) const;
 
+    /// What `GatewayRouteFallback::prepare` asks per candidate, in ONE registry lookup: true when
+    /// there is no local session at all, or the session `lacks_local_delivery_path`.
+    [[nodiscard]] bool needs_directory_consult(const std::string& agent_id) const;
+
     // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
     // that all_ids()/evaluate_scope() merge in for ids absent from the local
     // live registry. `ttl` bounds how stale a presence row may be and still
@@ -1030,7 +1038,8 @@ public:
     using PluginMissingReadFn = std::function<
         std::expected<std::vector<std::string>, PresenceReadError>(std::chrono::seconds,
                                                                    std::string_view)>;
-    void configure_presence_plugin_reader(PluginMissingReadFn reader);
+    void configure_presence_plugin_reader(PluginMissingReadFn reader,
+                                          std::chrono::seconds ttl = std::chrono::hours{1});
     /// Test-facing overload: assigns the reader AND the TTL it is called with.
     void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
 
@@ -1299,17 +1308,24 @@ private:
         std::vector<PresenceIdentity>{}};
     mutable std::chrono::steady_clock::time_point presence_cache_at_{};
 
-    /// #5685 follow-up (plugin-capability visibility): the cross-replica "live ids whose recorded
-    /// plugin list lacks `plugin`" read, and its per-plugin cache (success OR failure, the same
-    /// `kPresenceCacheTtl` window as `presence_cache_`). Both under `presence_cache_mu_`; the
-    /// reader runs under it too, so it must not call back into the registry.
+    /// #5685 follow-up (plugin-capability visibility): the cross-replica "live ids whose published
+    /// plugin list lacks `plugin`" read and its per-plugin cache (a success OR a failure, held for
+    /// `kPresenceCacheTtl`). A DEDICATED mutex, never `presence_cache_mu_`: the reader is a
+    /// Postgres query and runs with NO registry lock held (single-flight per plugin through
+    /// `missing_plugin_inflight_`), so it can never stall `live_presence()` or an unrelated
+    /// dispatch. A cached failure is a null pointer (callers fail open). The result is shared, not
+    /// copied, because it can be fleet-sized.
+    using MissingPluginIds = std::shared_ptr<const std::vector<std::string>>;
     struct MissingPluginCacheEntry {
         std::chrono::steady_clock::time_point at{};
-        std::expected<std::vector<std::string>, PresenceReadError> ids{std::vector<std::string>{}};
+        MissingPluginIds ids;
     };
     static constexpr std::size_t kMissingPluginCacheMax = 64;
+    mutable std::mutex missing_plugin_mu_;
     PluginMissingReadFn presence_missing_plugin_reader_;
+    std::chrono::seconds missing_plugin_ttl_{};
     mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
+    mutable std::unordered_set<std::string> missing_plugin_inflight_;
 
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
@@ -1320,10 +1336,9 @@ private:
     /// pointer check, and can never fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
 
-    /// Cached cross-replica "live ids lacking `plugin`" read; `nullopt` when no reader is wired
-    /// or the read degraded (callers fail open). Takes `presence_cache_mu_`.
-    std::optional<std::vector<std::string>> missing_plugin_from_presence(
-        std::string_view plugin) const;
+    /// Cached cross-replica "live ids lacking `plugin`" read; null when no reader is wired or the
+    /// read degraded (callers fail open). Takes only `missing_plugin_mu_`, never across the read.
+    MissingPluginIds missing_plugin_from_presence(std::string_view plugin) const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl
     // considers. `LocalOnly` skips the live_presence() call AND the

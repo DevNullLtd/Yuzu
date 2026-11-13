@@ -385,7 +385,7 @@ TEST_CASE("send_to / send_to_all: a per-OS OFF set is enforced at send time for 
 
 // #5685 hp-1: send_via_directory now also serves a local session with no delivery path, so the
 // send-time per-OS enforcement `send_to` applies must hold on it too.
-TEST_CASE("send_via_directory enforces the per-OS kill switch for a local session, and still "
+TEST_CASE("send_via_directory enforces the per-OS kill switch for a local session and still "
           "queues a session-less id (#5685 hp-1 / #5294)",
           "[server][dispatch][os_kill_switch][ha]") {
     EventBus bus;

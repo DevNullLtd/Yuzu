@@ -652,6 +652,7 @@ void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset)
 void AgentRegistry::expire_presence_cache_for_test() {
     std::lock_guard lock(presence_cache_mu_);
     presence_cache_at_ -= kPresenceCacheTtl;
+    std::lock_guard mlock(missing_plugin_mu_);
     for (auto& [_, e] : missing_plugin_cache_)
         e.at -= kPresenceCacheTtl;
 }
@@ -728,6 +729,22 @@ bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegist
     return true;
 }
 
+} // namespace
+
+namespace {
+/// True when `s` has no way to take a command on this replica: an empty gateway_node and no
+/// Subscribe stream. Read under `stream_mu`, the documented guard of both fields, but only
+/// TRY-locked: `send_to` holds `stream_mu` across a blocking stream Write, so a held lock means
+/// a send to this session is in flight, i.e. it HAS a path, and a stalled stream must not stall
+/// the dispatch gate that asks. `set_gateway_route` also holds it briefly while it publishes a
+/// placement; judging that session deliverable only routes it through `send_to` (the pre-hp-1
+/// behaviour), which is the safe direction.
+bool no_delivery_path(AgentSession& s) {
+    std::unique_lock lk(s.stream_mu, std::try_to_lock);
+    if (!lk.owns_lock())
+        return false;
+    return s.gateway_node.empty() && s.stream == nullptr;
+}
 } // namespace
 
 bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand& cmd) {
@@ -823,20 +840,29 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
 bool AgentRegistry::send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
                                        const std::string& cluster_id) {
     // Same defensive belt-and-braces check `send_to`/`send_to_all` apply —
-    // this path has no session to have already validated anything, so it is
-    // the ONLY check this method makes before queuing.
+    // a session-less id has no session to have already validated anything.
     if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
         return false;
-    // #5685 hp-1: this path now also serves an agent this replica holds a session
-    // for that cannot deliver (`lacks_local_delivery_path`). `send_to`'s send-time
-    // per-OS kill-switch enforcement (#5294) would have run for it, so run it here
-    // against the session's OS. A genuinely session-less id has no local OS to
-    // check; its OS gate is the dispatch-time one.
+    std::shared_ptr<AgentSession> session;
     {
         std::lock_guard lock(mu_);
-        if (auto it = agents_.find(agent_id);
-            it != agents_.end() && cmd.kill_switched_os().contains(it->second->os))
+        if (auto it = agents_.find(agent_id); it != agents_.end())
+            session = it->second;
+    }
+    if (session) {
+        // #5685 hp-1: this path also serves an agent this replica holds a session for that could
+        // not deliver when `prepare()` decided (`needs_directory_consult`). `send_to`'s send-time
+        // per-OS kill-switch enforcement (#5294) would have run for it, so run it here against
+        // the session's OS (an immutable identity field).
+        if (cmd.kill_switched_os().contains(session->os))
             return false;
+        // The decision is stale by now if its CONNECTED landed in between (the ordinary
+        // Register-to-CONNECTED gap): the session then has a gateway_node and advertised
+        // capabilities, so the capability check and cluster stamping live in `send_to`, which
+        // must be the one path for a session that can deliver. Skipping them here would send a
+        // dispatch-tagged command through a gateway that never advertised the tag.
+        if (!no_delivery_path(*session))
+            return send_to(agent_id, cmd);
     }
     std::lock_guard glock(gw_pending_mu_);
     gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
@@ -1670,11 +1696,9 @@ bool AgentRegistry::has_remote_presence(const std::vector<std::string>& ids) con
     // #5685 hp-1: a local session with no delivery path is not "reachable
     // locally" — `send_to_all` skips it, so the caller must take the per-id
     // walk, whose directory consult can still reach it.
-    for (const auto& s : local) {
-        std::lock_guard slock(s->stream_mu);
-        if (s->gateway_node.empty() && s->stream == nullptr)
+    for (const auto& s : local)
+        if (no_delivery_path(*s))
             return true;
-    }
     return false;
 }
 
@@ -1687,22 +1711,38 @@ bool AgentRegistry::lacks_local_delivery_path(const std::string& agent_id) const
             return false;
         session = it->second;
     }
-    std::lock_guard slock(session->stream_mu);
-    return session->gateway_node.empty() && session->stream == nullptr;
+    return no_delivery_path(*session);
 }
 
-void AgentRegistry::configure_presence_plugin_reader(PluginMissingReadFn reader) {
-    std::lock_guard lock(presence_cache_mu_);
+bool AgentRegistry::needs_directory_consult(const std::string& agent_id) const {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end())
+            return true; // no local session at all: the original fallback case
+        session = it->second;
+    }
+    return no_delivery_path(*session);
+}
+
+void AgentRegistry::configure_presence_plugin_reader(PluginMissingReadFn reader,
+                                                     std::chrono::seconds ttl) {
+    std::lock_guard lock(missing_plugin_mu_);
     presence_missing_plugin_reader_ = std::move(reader);
+    missing_plugin_ttl_ = ttl;
     missing_plugin_cache_.clear();
 }
 
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
+    // Borrowed, not owning: `store` is `ServerImpl::offline_endpoint_store_`, and `server.cpp`
+    // unwires it with configure_presence(nullptr) at stop, before the store is destroyed.
     configure_presence_plugin_reader(
         store ? PluginMissingReadFn{[store](std::chrono::seconds t, std::string_view plugin) {
                     return store->query_live_ids_without_plugin(t, plugin);
                 }}
-              : PluginMissingReadFn{});
+              : PluginMissingReadFn{},
+        ttl);
     configure_presence(store ? PresenceReadFn{[store](std::chrono::seconds t) {
                                    return store->query_live_ids(t);
                                }}
@@ -1717,7 +1757,6 @@ void AgentRegistry::configure_presence(PresenceReadFn reader, std::chrono::secon
     presence_reader_ = std::move(reader);
     presence_ttl_ = ttl;
     presence_cache_at_ = {};
-    missing_plugin_cache_.clear();
 }
 
 std::expected<std::vector<PresenceIdentity>, PresenceReadError> AgentRegistry::live_presence() const {
@@ -1797,43 +1836,66 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     // inventory grounds (see the declaration); decided before taking mu_.
     if (yuzu::protective::is_protective_action(plugin, action))
         return missing;
-    // The cross-replica read runs OFF mu_ (same discipline as ids_with_os / all_ids).
-    std::vector<std::string> remote_missing;
-    if (auto remote = missing_plugin_from_presence(plugin))
-        remote_missing = std::move(*remote);
-    std::lock_guard lock(mu_);
-    for (const auto& [id, s] : agents_) {
-        if (s->plugin_names.empty())
-            continue; // no reported inventory -- unknown, not absent; fail open
-        if (std::ranges::find(s->plugin_names, plugin) == s->plugin_names.end())
-            missing.insert(id);
+    // The cross-replica read runs OFF mu_ (same discipline as ids_with_os / all_ids) and shares
+    // its cached result, so nothing here copies the id list.
+    const MissingPluginIds remote = missing_plugin_from_presence(plugin);
+    std::vector<const std::string*> remote_only;
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& [id, s] : agents_) {
+            if (s->plugin_names.empty())
+                continue; // no reported inventory -- unknown, not absent; fail open
+            if (std::ranges::find(s->plugin_names, plugin) == s->plugin_names.end())
+                missing.insert(id);
+        }
+        if (remote) {
+            remote_only.reserve(remote->size());
+            for (const auto& id : *remote)
+                if (!agents_.contains(id)) // local wins
+                    remote_only.push_back(&id);
+        }
     }
-    for (auto& id : remote_missing)
-        if (!agents_.contains(id)) // local wins
-            missing.insert(std::move(id));
+    for (const auto* id : remote_only) // set inserts happen off mu_
+        missing.insert(*id);
     return missing;
 }
 
-std::optional<std::vector<std::string>>
+AgentRegistry::MissingPluginIds
 AgentRegistry::missing_plugin_from_presence(std::string_view plugin) const {
-    std::lock_guard lock(presence_cache_mu_);
-    if (!presence_missing_plugin_reader_)
-        return std::nullopt;
-    const auto now = std::chrono::steady_clock::now();
+    PluginMissingReadFn reader;
+    std::chrono::seconds ttl{};
     const std::string key(plugin);
-    auto it = missing_plugin_cache_.find(key);
-    if (it == missing_plugin_cache_.end() || now - it->second.at >= kPresenceCacheTtl) {
-        if (it == missing_plugin_cache_.end() &&
-            missing_plugin_cache_.size() >= kMissingPluginCacheMax)
-            missing_plugin_cache_.clear(); // bounded: plugin names come from a closed catalogue
-        auto& e = missing_plugin_cache_[key];
-        e.ids = presence_missing_plugin_reader_(presence_ttl_, plugin);
-        e.at = now;
-        it = missing_plugin_cache_.find(key);
+    {
+        std::lock_guard lock(missing_plugin_mu_);
+        if (!presence_missing_plugin_reader_)
+            return nullptr;
+        const auto now = std::chrono::steady_clock::now();
+        const auto it = missing_plugin_cache_.find(key);
+        if (it != missing_plugin_cache_.end() && now - it->second.at < kPresenceCacheTtl)
+            return it->second.ids; // fresh (a cached failure is a null pointer: fail open)
+        // One refresher per plugin: a concurrent caller serves the stale entry, or fails open when
+        // there is none, instead of queueing behind (or duplicating) the database read.
+        if (!missing_plugin_inflight_.insert(key).second)
+            return it != missing_plugin_cache_.end() ? it->second.ids : nullptr;
+        reader = presence_missing_plugin_reader_;
+        ttl = missing_plugin_ttl_;
     }
-    if (!it->second.ids)
-        return std::nullopt; // degraded read: fail open (unknown, not absent)
-    return *it->second.ids;
+    // The database read runs with NO registry lock held: it must never stall `live_presence()`
+    // or any dispatch that is not asking for this plugin.
+    MissingPluginIds ids;
+    try {
+        if (auto r = reader(ttl, plugin))
+            ids = std::make_shared<const std::vector<std::string>>(std::move(*r));
+    } catch (...) {
+        // A throwing reader is a failed read: fail open, never wedge the in-flight marker.
+    }
+    std::lock_guard lock(missing_plugin_mu_);
+    if (missing_plugin_cache_.size() >= kMissingPluginCacheMax &&
+        !missing_plugin_cache_.contains(key))
+        missing_plugin_cache_.clear(); // bounded: plugin names come from a closed catalogue
+    missing_plugin_cache_[key] = {std::chrono::steady_clock::now(), ids};
+    missing_plugin_inflight_.erase(key);
+    return ids;
 }
 
 std::expected<std::unordered_set<std::string>, PresenceReadError>

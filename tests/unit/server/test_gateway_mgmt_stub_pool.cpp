@@ -443,12 +443,29 @@ TEST_CASE("GatewayMgmtStubPool: the default management channel pings an idle cha
     CHECK(GatewayMgmtStubPool::kKeepaliveTimeMs >= 10000);
 }
 
-TEST_CASE("GatewayMgmtStubPool: the default channel factory builds a channel from the keepalive "
-          "arguments without dialling",
+TEST_CASE("GatewayMgmtStubPool: channel_via hands the keepalive arguments to the channel "
+          "creator and the default factory builds a channel",
           "[server][gateway_mgmt_stub_pool][ha]") {
-    // grpc::CreateCustomChannel is lazy-connecting like CreateChannel, so this
-    // proves the production factory is constructible with these arguments
-    // (a malformed arg would yield a null/lame channel on some gRPC builds).
+    // A grpc::Channel exposes no arguments, so the creator seam is what makes the wiring
+    // observable: whatever creator channel_via is given must receive exactly
+    // default_channel_arguments() (the ONLY place they are attached to a channel).
+    std::map<std::string, int> seen;
+    std::string seen_address;
+    auto spy = [&](const std::string& address, std::shared_ptr<grpc::ChannelCredentials>,
+                   const grpc::ChannelArguments& args) -> std::shared_ptr<grpc::Channel> {
+        seen_address = address;
+        seen = integer_args_of(args);
+        return nullptr;
+    };
+    (void)GatewayMgmtStubPool::channel_via(spy, "gw.example:50063",
+                                           grpc::InsecureChannelCredentials());
+    CHECK(seen_address == "gw.example:50063");
+    CHECK(seen == integer_args_of(GatewayMgmtStubPool::default_channel_arguments()));
+    CHECK(seen.size() == 4);
+
+    // The production factory is one line over channel_via with grpc::CreateCustomChannel
+    // (verified by inspection: grpc exposes no way to read a channel's arguments back).
+    // CreateCustomChannel is lazy-connecting, so this does not dial.
     auto ch = GatewayMgmtStubPool::default_channel_factory("127.0.0.1:0",
                                                            grpc::InsecureChannelCredentials());
     REQUIRE(ch != nullptr);

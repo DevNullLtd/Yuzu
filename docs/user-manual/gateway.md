@@ -858,7 +858,7 @@ and counts in `yuzu_server_gateway_route_desync_total` under the outcome named, 
 
 | Server WARN line (start) | Outcome | Event | Kind |
 |---|---|---|---|
-| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded; the gateway sends the notice again and it is accepted once the directory reads` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; every CONNECTED is refused while it cannot, and the gateway's resend (#5695) is accepted once it reads again |
+| `NotifyStreamStatus: CONNECTED for session ... (agent ...) refused — the directory read degraded; the gateway sends the notice again and it is accepted once the directory reads` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; every CONNECTED is refused while it cannot, and the gateway's resend (#5695) is accepted once it reads again |
 | `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
 | `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
 | `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
@@ -4397,7 +4397,9 @@ again after a backoff while it holds the session, so a `connected_unverified`
 rejection is put right once the directory reads again (see "When the server
 does not record a notification"). Until then the agent keeps heartbeating but
 is not dispatchable from that replica, for the outage plus up to 60 s (the
-gateway's resend backoff cap). An older gateway does not retry it: that
+gateway's resend backoff cap), or up to 10 minutes once the refusal has lasted
+15 minutes (the gateway's slow phase, "When the server does not record a
+notification"); both are derived from the documented backoff, not measured. An older gateway does not retry it: that
 server counter is then the only signal, and the agent cannot receive commands
 until it reconnects. When the read succeeds, the local fallback applies only if
 the directory row is absent or tombstoned, or the session is one this replica

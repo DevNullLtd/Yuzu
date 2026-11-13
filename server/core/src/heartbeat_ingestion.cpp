@@ -28,7 +28,6 @@ namespace {
 constexpr std::chrono::hours kPresenceOsFallbackWindow{1};
 } // namespace
 
-
 void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
                                 std::string_view agent_id, std::string_view via,
                                 std::string_view resolved_session_id,
@@ -53,6 +52,9 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // those live on the CommandResponse path, not here.
     // #5686: while the batch is tripped, skip this entry's upsert unless it is
     // a half-open probe (see PresenceBatch).
+    // True only when THIS heartbeat's presence write succeeded; the snapshot-os fallback below
+    // reads the same store and is skipped otherwise (a tripped batch, a skipped or failed write).
+    bool presence_ok = false;
     if (offline_store_ && presence_batch && presence_batch->store_failed &&
         ++presence_batch->skips_since_fail < presence_batch->next_probe) {
         ++presence_batch->skipped; // a later probe or the next batch refreshes this row
@@ -63,7 +65,7 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         std::string arch;
         // #5685 follow-up: the session's plugin list is published to the presence row ONCE per
         // session (it changes only at re-registration), so a replica without the session can still
-        // tell a plugin the agent lacks. Cleared only after a successful upsert (below).
+        // tell a plugin the agent lacks. Marked published only after a successful write (below).
         std::vector<std::string> plugin_names;
         std::shared_ptr<detail::AgentSession> published_sess;
         if (auto sess = registry_.get_session(agent_id_str)) {
@@ -99,8 +101,13 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // columns) rather than blanking a value this store already learned.
         const bool upserted = offline_store_->upsert(agent_id_str, hostname, os, now_ms,
                                                      /*agent_ts=*/0, agent_version, arch,
-                                                     session_id, plugin_names);
-        if (upserted && published_sess)
+                                                     session_id);
+        presence_ok = upserted;
+        // The list goes to its own row (it is written once per session, never on the hot row) and
+        // only for the session that reported it. The flag is set after a SUCCESSFUL write only, so
+        // a failure retries on the next heartbeat.
+        if (upserted && published_sess && !session_id.empty() &&
+            offline_store_->publish_plugins(agent_id_str, session_id, plugin_names))
             published_sess->presence_plugins_published.store(true, std::memory_order_relaxed);
         if (presence_batch) {
             if (upserted) {
@@ -208,8 +215,7 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
         // failed read stays blank (unknown), which is what this path produced before: a
         // blank `os` never invents a platform. Skipped while the batch's presence store is
         // tripped (#5686) so a degraded store is not read once per snapshot heartbeat.
-        if (os_from_session.empty() && offline_store_ &&
-            !(presence_batch && presence_batch->store_failed)) {
+        if (os_from_session.empty() && offline_store_ && presence_ok) {
             if (auto ep = offline_store_->find_within(agent_id_str, kPresenceOsFallbackWindow);
                 ep && *ep)
                 os_from_session = (*ep)->os;

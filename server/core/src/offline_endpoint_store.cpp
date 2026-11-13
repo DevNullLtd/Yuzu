@@ -1,5 +1,6 @@
 #include "offline_endpoint_store.hpp"
 
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -83,9 +84,16 @@ const std::vector<pg::PgMigration>& migrations() {
         // HA WS-5 #5685 follow-up (plugin-capability visibility): the plugin names the owning
         // replica's session reported at registration, so a replica holding no session for an
         // agent can still tell a dispatch to a plugin the agent lacks (plugin_not_found).
-        // NULLABLE on purpose: NULL means "never reported" (unknown, fail open), exactly as an
-        // empty local plugin_names does; a pre-v5 row stays NULL until its agent re-registers.
-        {5, "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS plugin_names TEXT[];"},
+        // A SIDE table, not a column on `endpoints`: that row is rewritten on every heartbeat
+        // and a ~1 KB array would ride along each time (write amplification, dead tuples), while
+        // this row is written once per session. `session_id` is the session that REPORTED the
+        // list; a read joins on it equalling the endpoint's CURRENT session_id, so a list from an
+        // older session is never served for a newer one (it reads as unknown, which fails
+        // open). ON DELETE CASCADE carries the decommission cascade and the retention prune.
+        {5, "CREATE TABLE IF NOT EXISTS endpoint_plugins ("
+            "  agent_id     TEXT PRIMARY KEY REFERENCES endpoints (agent_id) ON DELETE CASCADE,"
+            "  session_id   TEXT NOT NULL,"
+            "  plugin_names TEXT[] NOT NULL);"},
     };
     return kMigrations;
 }
@@ -124,26 +132,6 @@ void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_v
                       {{"op", std::string(op)}, {"reason", reason}})
             .increment();
     }
-}
-
-/// A Postgres `text[]` literal for `names`, or "" (bound as NULL through NULLIF) when there is
-/// nothing to publish. Plugin names are plain identifiers; a name with any other character is
-/// DROPPED rather than escaped, so the literal needs no quoting and nothing an agent reports can
-/// inject array syntax. Dropping can only make a name look absent from the stored list, and a
-/// dropped name is a name no shipped plugin uses.
-std::string pg_text_array_literal(const std::vector<std::string>& names) {
-    std::string out;
-    for (const auto& n : names) {
-        if (n.empty() || n.size() > 64 ||
-            !std::ranges::all_of(n, [](unsigned char c) {
-                return std::isalnum(c) != 0 || c == '_' || c == '-' || c == '.';
-            }))
-            continue;
-        out.append(out.empty() ? "{" : ",").append(n);
-    }
-    if (!out.empty())
-        out.push_back('}');
-    return out;
 }
 
 constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roster_truncated_total";
@@ -253,8 +241,7 @@ OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
 bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view hostname,
                                   std::string_view os, std::int64_t last_heartbeat_ms,
                                   std::int64_t agent_ts, std::string_view agent_version,
-                                  std::string_view arch, std::string_view session_id,
-                                  const std::vector<std::string>& plugin_names) {
+                                  std::string_view arch, std::string_view session_id) {
     if (!open_ || agent_id.empty())
         return false;
     // Bounded acquire (gov UP-1): on a saturated pool, give up fast rather than
@@ -293,8 +280,8 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         lease.get(),
         "INSERT INTO endpoint_state.endpoints "
         "(agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch, session_id, "
-        "last_seen_at, plugin_names) "
-        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now(), NULLIF($9, '')::text[]) "
+        "last_seen_at) "
+        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7, $8, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  hostname = CASE WHEN EXCLUDED.hostname = '' THEN endpoints.hostname "
         "                  ELSE EXCLUDED.hostname END, "
@@ -305,13 +292,12 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
         "  arch = CASE WHEN EXCLUDED.arch = '' THEN endpoints.arch ELSE EXCLUDED.arch END, "
         "  session_id = CASE WHEN EXCLUDED.session_id = '' THEN endpoints.session_id "
         "                    ELSE EXCLUDED.session_id END, "
-        "  last_seen_at = EXCLUDED.last_seen_at, "
-        "  plugin_names = COALESCE(EXCLUDED.plugin_names, endpoints.plugin_names) "
+        "  last_seen_at = EXCLUDED.last_seen_at "
         "RETURNING agent_id",
         std::vector<std::string>{std::string(agent_id), std::string(hostname), std::string(os),
                                  std::to_string(last_heartbeat_ms), std::to_string(agent_ts),
                                  std::string(agent_version), std::string(arch),
-                                 std::string(session_id), pg_text_array_literal(plugin_names)});
+                                 std::string(session_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: upsert failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
@@ -374,6 +360,48 @@ OfflineEndpointStore::query_live_ids(std::chrono::seconds ttl) {
     return out;
 }
 
+bool OfflineEndpointStore::publish_plugins(std::string_view agent_id, std::string_view session_id,
+                                           const std::vector<std::string>& plugin_names) {
+    if (!open_ || agent_id.empty() || session_id.empty() || plugin_names.empty())
+        return false;
+    auto lease = pool_.try_acquire_for(kUpsertAcquireTimeout);
+    if (!lease) {
+        record_presence_store_failure(metrics_, "publish_plugins", /*had_lease=*/false);
+        return false;
+    }
+    // Bounded and quoted: an agent reports its own list, so cap the count and the element size
+    // before it reaches the database, and let the shared builder quote every element (a name of
+    // `NULL`, a brace or a quote is then stored as plain text, never parsed as array syntax).
+    std::vector<std::string_view> names;
+    names.reserve(std::min(plugin_names.size(), kMaxPublishedPlugins));
+    for (const auto& n : plugin_names) {
+        if (names.size() >= kMaxPublishedPlugins)
+            break;
+        if (!n.empty() && n.size() <= kMaxPluginNameBytes)
+            names.emplace_back(n);
+    }
+    if (names.empty())
+        return false;
+    // The FK needs the endpoints row, which the heartbeat's upsert wrote just before; a missing
+    // row (a delete racing this call) makes the INSERT fail and the caller retries next heartbeat.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO endpoint_state.endpoint_plugins (agent_id, session_id, plugin_names) "
+        "VALUES ($1, $2, $3::text[]) "
+        "ON CONFLICT (agent_id) DO UPDATE SET session_id = EXCLUDED.session_id, "
+        "  plugin_names = EXCLUDED.plugin_names "
+        "RETURNING agent_id",
+        std::vector<std::string>{std::string(agent_id), std::string(session_id),
+                                 pg::to_text_array(names)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("OfflineEndpointStore: publish_plugins failed for agent={}: {}", agent_id,
+                      PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "publish_plugins", /*had_lease=*/true);
+        return false;
+    }
+    return true;
+}
+
 std::expected<std::vector<std::string>, PresenceReadError>
 OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
                                                     std::string_view plugin) {
@@ -384,16 +412,19 @@ OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
         record_presence_store_failure(metrics_, "query_without_plugin", /*had_lease=*/false);
         return std::unexpected(PresenceReadError::StoreUnavailable);
     }
-    // Same live predicate as query_live_ids (DB clock, non-blank session). `plugin_names IS NOT
-    // NULL` keeps "never reported" out: unknown is not absent. ANY() on a bound parameter, so
-    // the plugin name is never spliced into the SQL.
+    // Same live predicate as query_live_ids (DB clock, non-blank session). The JOIN requires the
+    // list's session to be the endpoint's CURRENT session, so a list reported by an older session
+    // is ignored (unknown, not absent: the caller fails open). An agent with no list has no
+    // endpoint_plugins row and never appears. The plugin is a bound parameter, never spliced.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT agent_id FROM endpoint_state.endpoints "
-        "WHERE last_seen_at >= now() - ($1::bigint * interval '1 second') "
-        "  AND session_id <> '' AND plugin_names IS NOT NULL "
-        "  AND NOT ($2::text = ANY(plugin_names)) "
-        "ORDER BY last_seen_at DESC LIMIT $3::bigint",
+        "SELECT e.agent_id FROM endpoint_state.endpoints e "
+        "JOIN endpoint_state.endpoint_plugins p "
+        "  ON p.agent_id = e.agent_id AND p.session_id = e.session_id "
+        "WHERE e.last_seen_at >= now() - ($1::bigint * interval '1 second') "
+        "  AND e.session_id <> '' "
+        "  AND NOT ($2::text = ANY(p.plugin_names)) "
+        "ORDER BY e.last_seen_at DESC LIMIT $3::bigint",
         std::vector<std::string>{std::to_string(ttl.count()), std::string(plugin),
                                  std::to_string(kQueryRowCap + 1)});
     if (res.status() != PGRES_TUPLES_OK) {
