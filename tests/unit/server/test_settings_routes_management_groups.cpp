@@ -311,8 +311,11 @@ TEST_CASE("Settings group create: an unstorable attempted row refuses with 503, 
     CHECK(h.stored().empty());
 }
 
-TEST_CASE("Settings group create: refusals decided without a write burn no audit row and echo "
-          "no raw markup",
+// What this proves: a refusal's text is a fixed literal, so the caller's raw name and parent id
+// are never echoed. It does NOT prove html_escape ran (no refusal text here contains markup for
+// it to escape), so a removed html_escape on the refusal span would not fail this test.
+TEST_CASE("Settings group create: refusals decided without a write burn no audit row and do not "
+          "echo the raw name or parent id",
           "[pg][settings][management-groups][mgmt-audit-first][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
     MgmtGroupsHarness h(db.dsn());
@@ -694,13 +697,13 @@ TEST_CASE("Settings group create: a parent deleted between the check and the ins
           "attempted then failure/validation_refused and creates no group",
           "[pg][settings][management-groups][mgmt-audit-first]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    bool deleted = false; // before `h`: the hook below captures it and `h` is destroyed first
     MgmtGroupsHarness h(db.dsn());
     ManagementGroup parent;
     parent.name = "Vanishing Parent";
     parent.membership_type = "static";
     const auto parent_id = h.mgmt_group_store.create_group(parent);
     REQUIRE(parent_id.has_value());
-    bool deleted = false;
     h.after_attempted_hook = [&]() {
         deleted = h.mgmt_group_store.delete_group(*parent_id).has_value();
     };

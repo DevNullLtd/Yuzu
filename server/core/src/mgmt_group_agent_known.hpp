@@ -58,8 +58,10 @@ classify_agent_known(const std::expected<std::optional<auth::PendingStatus>, Sto
     return r.error() == StoreError::InvalidInput ? AgentKnown::Unknown : AgentKnown::Unreadable;
 }
 
-/// The one lookup: a null `auth_db` (no store wired, or shutdown) is Unreadable, never a throw
-/// and never "unknown".
+/// The one lookup: a null `auth_db` (never wired) is Unreadable, never a throw and never
+/// "unknown". The pointer a handler holds is never nulled at shutdown: the lifetime contract is
+/// that the HTTP listener is joined (or the process `_Exit`s) before `auth_db_` is reset, so no
+/// handler can run against a destroyed store (server.cpp, `ServerImpl::stop()`).
 [[nodiscard]] inline AgentKnown lookup_agent_known(AuthDB* auth_db,
                                                    const std::string& agent_id) noexcept {
     if (auth_db == nullptr)

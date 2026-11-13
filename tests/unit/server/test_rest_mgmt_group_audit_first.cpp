@@ -1,5 +1,5 @@
 /**
- * test_rest_mgmt_group_audit_first.cpp — #7074: `POST /api/v1/management-groups` is audit-first
+ * test_rest_mgmt_group_audit_first.cpp: #7074: `POST /api/v1/management-groups` is audit-first
  * (ADR-0033 section 9, "no audit row, no mutation").
  *
  * The route stores an `attempted` row BEFORE it creates the group and refuses (503 +
@@ -82,10 +82,12 @@ struct AuditFirstHarness {
     std::vector<AuditRow> audits;
     /// "action|result" pairs the sink refuses (returns false for), to model an unavailable store.
     std::set<std::string> fail_audit;
-    /// Deny a (securable, operation) on the FIRST permission check only.
+    /// Deny a (securable, operation) when this returns false. perm_fn consults it on EVERY check,
+    /// so the denial also applies to the re-check made after the `attempted` row.
     std::function<bool(const std::string&, const std::string&)> perm_override{};
-    /// After an `attempted` row for management_group.create is stored: the session is gone / the
-    /// permission is revoked (the second auth_fn / perm_fn call answers that way).
+    /// After an `attempted` row of ANY management-group verb is stored (`attempted_stored()`
+    /// does not look at the action): the session is gone / the permission is revoked, that is,
+    /// every auth_fn / perm_fn call from then on answers that way.
     bool session_gone_after_attempted = false;
     bool perm_revoked_after_attempted = false;
     /// Runs ONCE, between the `attempted` row and the membership write (the first auth_fn call
@@ -1305,12 +1307,12 @@ TEST_CASE("validate_new_group: a parent read that FAILED is a store fault, not p
 TEST_CASE("POST /management-groups: a parent deleted between the check and the insert is a 400 "
           "with attempted then failure/validation_refused and no group",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    bool deleted = false; // before `h`: the hook below captures it and `h` is destroyed first
     AuditFirstHarness h;
     const std::string parent = make_group(h, "vanishing-parent");
     const auto groups_before = h.group_count();
     // Deterministic race: the parent exists at the route's pre-check; it is deleted while the
     // `attempted` row is stored, so create_group's own validation refuses.
-    bool deleted = false;
     h.after_attempted_hook = [&]() { deleted = h.mgmt_bundle->delete_group(parent).has_value(); };
 
     auto res = h.create(nlohmann::json{{"name", "orphaned-child"}, {"parent_id", parent}}.dump());

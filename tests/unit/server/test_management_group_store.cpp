@@ -886,11 +886,6 @@ TEST_CASE("ManagementGroupStore: cascade delete removes members and roles",
     CHECK(roles.empty());
 }
 
-// Degrade-distinguishable fail-closed path (ADR-0042). Deliberately NOT [pg]:
-// it needs NO database — a construct-invalid pool makes is_open() false, and
-// every confinement read must then report a degrade (nullopt / unexpected),
-// NEVER a silent empty. This is the load-bearing property RbacStore consumes as
-// DenyAll, so it must hold in every shard.
 // #7074 (C1): validate_new_group exposes the pre-insert refusals of create_group so a caller can refuse
 // BEFORE writing an audit row. create_group runs the same function, so each refusal text is identical.
 TEST_CASE("ManagementGroupStore: validate_new_group refusals match create_group text, write nothing",
@@ -1035,6 +1030,11 @@ TEST_CASE("ManagementGroupStore: validate_new_group and create_group refuse a cl
     CHECK(c.error() == "database not open");
 }
 
+// Degrade-distinguishable fail-closed path (ADR-0042). Deliberately NOT [pg]:
+// it needs NO database — a construct-invalid pool makes is_open() false, and
+// every confinement read must then report a degrade (nullopt / unexpected),
+// NEVER a silent empty. This is the load-bearing property RbacStore consumes as
+// DenyAll, so it must hold in every shard.
 TEST_CASE("ManagementGroupStore: confinement reads degrade-distinguishable when store not open",
           "[management_group][degrade]") {
     PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};

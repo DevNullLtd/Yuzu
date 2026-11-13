@@ -36,7 +36,7 @@
 #include "reserved_definition_id.hpp" // #3685: kMcpDefinitionPrefix, for the pre-seeded-ticket test
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
-#include "test_auth_db_pg_helper.hpp"   // AuthDbPg — a real AuthDB for the add-member agent-known flag
+#include "test_auth_db_pg_helper.hpp"   // AuthDbPg: a real AuthDB for the add-member agent-known flag
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
 #include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
@@ -28998,6 +28998,16 @@ std::vector<std::string> mg_create_rows(const McpTestServer& ts) {
     return rows;
 }
 
+/// True once `row` ("management_group.<verb>|attempted") has been stored. A free function, not a
+/// local lambda in the test: a callback held by `ts` that captured such a local would outlive it
+/// (locals are destroyed in reverse order, `ts` last of them), so these capture only `ts`.
+bool mg_attempted_stored(const McpTestServer& ts, const std::string& row) {
+    for (const auto& r : ts.audit_log)
+        if (r == row)
+            return true;
+    return false;
+}
+
 /// The detail / target_id of the n-th management_group.create row.
 std::string mg_create_row_field(const McpTestServer& ts, const std::vector<std::string>& column,
                                 std::size_t n) {
@@ -29386,16 +29396,11 @@ TEST_CASE("MCP create_management_group: authority is decided again after the att
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
-    const auto attempted_stored = [&ts]() {
-        for (const auto& r : ts.audit_log)
-            if (r == "management_group.create|attempted")
-                return true;
-        return false;
-    };
 
     SECTION("grant revoked while the attempted row was being stored") {
         ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
-            return !(securable == "ManagementGroup" && op == "Write" && attempted_stored());
+            return !(securable == "ManagementGroup" && op == "Write" &&
+                     mg_attempted_stored(ts, "management_group.create|attempted"));
         };
         ts.start();
         auto res = ts.call(mg_create_body({{"name", "revoked"}}));
@@ -29609,12 +29614,6 @@ TEST_CASE("MCP create_management_group: the session_revoked and permission_revok
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
     wire_mg_session_writer(ts);
-    const auto attempted_stored = [&ts]() {
-        for (const auto& r : ts.audit_log)
-            if (r == "management_group.create|attempted")
-                return true;
-        return false;
-    };
 
     SECTION("credential revoked while the attempted row was stored") {
         ts.audit_succeeds_for_action_ = [&ts](const std::string& action) {
@@ -29633,7 +29632,8 @@ TEST_CASE("MCP create_management_group: the session_revoked and permission_revok
     }
     SECTION("grant revoked while the attempted row was stored") {
         ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
-            return !(securable == "ManagementGroup" && op == "Write" && attempted_stored());
+            return !(securable == "ManagementGroup" && op == "Write" &&
+                     mg_attempted_stored(ts, "management_group.create|attempted"));
         };
         ts.start();
         auto res = ts.call(mg_create_body({{"name", "revoked"}}));
@@ -29792,7 +29792,7 @@ TEST_CASE("MCP get_management_group: an oversized group_id is rejected by the #4
 // the LEGACY fail-soft ManagementGroupStore::get_members(), collapsing a
 // member-table degrade into the same empty vector a genuinely-empty group
 // returns. It now calls get_members_checked() and answers a retryable error
-// instead — same shape as get_dex_device_score's #4855 degrade test above.
+// instead, same shape as get_dex_device_score's #4855 degrade test above.
 TEST_CASE("MCP get_management_group: a degraded member read fails closed with a retryable "
           "error, never an authoritative empty member list (#1762)",
           "[pg][mcp][management_group][degraded]") {
@@ -29837,7 +29837,7 @@ TEST_CASE("MCP get_management_group: a degraded member read fails closed with a 
 // Governance round-2 (G8-1, #1762): get_management_group used to call the
 // LEGACY fail-soft ManagementGroupStore::get_group(), whose nullopt collapses
 // a store-not-open / pool-acquire-timeout / query-error degrade with a
-// genuine "no such group" — so a degraded GROUP-ROW read (not just the member
+// genuine "no such group", so a degraded GROUP-ROW read (not just the member
 // read the round-1 test above covers) reported the SAME "group not found"
 // error as a genuinely nonexistent id. It now calls get_group_checked() and
 // answers the SAME retryable error the member-degrade case does; a genuine
@@ -30485,15 +30485,19 @@ TEST_CASE("MCP add_management_group_member: a group deleted between the check an
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
     MgAddFixture f(db.dsn());
 
+    // Declared before `ts`: the callback below captures them and `ts` is destroyed first. The
+    // callback runs on the HTTP worker, so it only RECORDS the delete result; the test asserts it
+    // on the main thread.
+    bool deleted = false;
+    bool delete_ok = false;
     McpTestServer ts;
     ts.mgmt_store_for_test = &f.store;
     // Deterministic race: the group exists at the tool's exists check; the group is deleted while
     // its `attempted` row is being stored, so the membership insert fails the foreign key.
-    bool deleted = false;
     ts.audit_succeeds_for_action_ = [&](const std::string& action) {
         if (action == "management_group.add_member" && !deleted) {
             deleted = true;
-            CHECK(f.store.delete_group(f.gid).has_value());
+            delete_ok = f.store.delete_group(f.gid).has_value();
         }
         return true;
     };
@@ -30503,6 +30507,7 @@ TEST_CASE("MCP add_management_group_member: a group deleted between the check an
         auto res = ts.call(mg_add_body(f.gid, "agent-1"));
         REQUIRE(res);
         REQUIRE(deleted);
+        CHECK(delete_ok);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == kInvalidParams);
@@ -30520,6 +30525,7 @@ TEST_CASE("MCP add_management_group_member: a group deleted between the check an
         auto res = ts.call(mg_add_body(f.gid, "agent-1"));
         REQUIRE(res);
         REQUIRE(deleted);
+        CHECK(delete_ok);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == kInvalidParams);
@@ -30654,16 +30660,11 @@ TEST_CASE("MCP add_management_group_member: authority is decided again after the
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &f.store;
-    const auto attempted_stored = [&ts]() {
-        for (const auto& r : ts.audit_log)
-            if (r == "management_group.add_member|attempted")
-                return true;
-        return false;
-    };
 
     SECTION("grant revoked while the attempted row was being stored") {
         ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
-            return !(securable == "ManagementGroup" && op == "Write" && attempted_stored());
+            return !(securable == "ManagementGroup" && op == "Write" &&
+                     mg_attempted_stored(ts, "management_group.add_member|attempted"));
         };
         ts.start();
         auto res = ts.call(mg_add_body(f.gid, "agent-1"));

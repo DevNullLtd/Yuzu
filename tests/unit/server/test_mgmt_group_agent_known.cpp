@@ -1,5 +1,5 @@
 /**
- * test_mgmt_group_agent_known.cpp — #6967 / #7074: the "is this agent id a known device?" audit flag on
+ * test_mgmt_group_agent_known.cpp: #6967 / #7074: the "is this agent id a known device?" audit flag on
  * the add-member surfaces (`mgmt_group_agent_known.hpp`).
  *
  * Pure: no store, no network, no Postgres. The handlers that use it (REST and MCP add member) are
