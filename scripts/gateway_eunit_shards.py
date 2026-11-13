@@ -67,9 +67,12 @@ WEIGHT_HINTS: per-module wall time in seconds, as a shard runs it (cover
   them, 234s of the 268s total); the other 88 average 0.4s, so the 1.0s
   default slightly over-weights them. A hint only steers balance -- a stale
   or missing entry can never drop or duplicate a module. Re-derive when the
-  shards drift apart: run the shards (or one `rebar3 eunit` over every
-  unit), read `_build/test/eunit/TEST-*.xml`, and list the modules over 2s
-  (the wrapper prints each shard's module list and weight total). The
+  shards drift apart: run the shards, or every unit in one run with
+  `python3 scripts/test_gateway.py gateway eunit --shard 1/1` (cover off,
+  one report per module; a plain `rebar3 eunit` runs WITH cover and would
+  give skewed weights), read `_build/test/eunit/TEST-*.xml`, and list the
+  modules over 2s (the wrapper prints each shard's module list and weight
+  total). The
   earlier table came from the Windows MSVC leg WITH cover; on Linux it no
   longer balanced the shards (about 250s against 200s on CI), and cover's
   meck overhead (below) inflates some modules far more than others.
