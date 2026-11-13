@@ -374,7 +374,10 @@ TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
     const std::string& source = stripped_source("execution_routes.cpp");
     const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     CHECK(list_route.find("query_executions_checked") != std::string::npos);
-    CHECK(list_route.find("ExecutionListScope") != std::string::npos);
+    // #5557: the engaged scope is built by the ONE owner-key constructor, never a hand-filled
+    // ExecutionListScope that could carry a service-scoped session's minting account.
+    CHECK(list_route.find("confined_list_scope(") != std::string::npos);
+    CHECK(list_route.find("ExecutionListScope") == std::string::npos);
     CHECK(list_route.find("get_agent_statuses_for_executions_checked") != std::string::npos);
     // Exact statement, not a bare "500" substring — a 5000ms retry_after_ms
     // literal in the same block would false-green a "500" find (#3789

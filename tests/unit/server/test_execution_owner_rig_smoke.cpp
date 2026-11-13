@@ -1,29 +1,19 @@
 /**
  * test_execution_owner_rig_smoke.cpp -- #5557: proves the shared real-gate rig
- * (test_execution_owner_scope_rig.hpp) works, against TODAY's behaviour.
+ * (test_execution_owner_scope_rig.hpp) works.
  *
- * Two jobs, and no more:
- *   1. The rig is what it claims: one real AuthRoutes feeds authentication, permission and
- *      fleet-read, the credentials resolve to the sessions and scopes the fixture documents, and
- *      the seeded fixture holds exactly the ids it should.
- *   2. The minter-keyed leak (#5557) IS observable through a production surface before any fix.
- *
- * Job 2 is deliberately an assert-current case. Its assertions are named so the commit that
- * closes each surface edits exactly one block: the cases tagged [owner_rig_current] FLIP in the
- * commit that converts the surface they drive (the legacy list here, MCP `list_executions` in
- * test_mcp_server.cpp). They assert no fix; they pin the starting point so a rig that cannot see
- * the leak cannot later "prove" it gone.
+ * The rig is what it claims: one real AuthRoutes feeds authentication, permission and
+ * fleet-read, the credentials resolve to the sessions and scopes the fixture documents, and the
+ * seeded fixture holds exactly the ids it should. It asserts no per-surface behaviour: the
+ * surface cases live in test_execution_owner_legacy.cpp, test_execution_owner_rest_v1.cpp and
+ * test_execution_owner_dashboard.cpp (and test_mcp_server.cpp for MCP).
  *
  * This file does not use, and does not depend on, any fleet-read or list-read gate refusal.
  */
 
-#include "execution_routes.hpp"
 #include "test_execution_owner_scope_rig.hpp"
-#include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-
-#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <string>
@@ -31,39 +21,6 @@
 
 using namespace yuzu::server;
 using yuzu::test::ExecutionOwnerRig;
-
-namespace {
-
-// The legacy GET /api/executions route, wired the way server.cpp wires it (real gate, real
-// session resolver, real tracker). Returns the executions array's ids, sorted.
-struct LegacyList {
-    int status{0};
-    std::vector<std::string> ids;
-};
-LegacyList legacy_list(ExecutionOwnerRig& r, const ExecutionOwnerRig::Headers& headers) {
-    yuzu::server::test::TestRouteSink sink;
-    execution::Deps d;
-    d.perm_fn = r.perm_fn();
-    d.fleet_read_fn = r.fleet_read_fn();
-    d.resolve_session_fn = r.resolve_session_fn();
-    d.audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                    const std::string&, const std::string&, const std::string&) { return true; };
-    d.emit_event_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
-                         const nlohmann::json&) {};
-    d.execution_tracker = &r.tracker;
-    execution::register_execution_routes(sink, std::move(d));
-    auto res = sink.dispatch("GET", "/api/executions", {}, "application/json", headers);
-    REQUIRE(res);
-    LegacyList out{res->status, {}};
-    if (res->status == 200) {
-        for (const auto& e : nlohmann::json::parse(res->body)["executions"])
-            out.ids.push_back(e["id"].get<std::string>());
-        std::sort(out.ids.begin(), out.ids.end());
-    }
-    return out;
-}
-
-} // namespace
 
 TEST_CASE("owner rig: one real session feeds authentication, permission and fleet-read",
           "[pg][execution][owner_rig][5557]") {
@@ -186,39 +143,4 @@ TEST_CASE("owner rig: child, starvation and cap fixtures seed on demand",
     CHECK(capped->truncated);
 
     CHECK(r.seed_starvation(60).size() == 60);
-}
-
-// ASSERT-CURRENT. FLIPS in the legacy-route conversion commit (#5557, commit 5): the two minter
-// rows below (minter_out, minter_pending) must disappear from a service-scoped list, leaving
-// service_a_ids(). The non-service controls must stay exactly as asserted.
-TEST_CASE("owner rig: legacy GET /api/executions still lists the minter's out-of-scope and "
-          "pending dispatches to a service-scoped token",
-          "[pg][execution][owner_rig][owner_rig_current][5557]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
-    ExecutionOwnerRig r{db.dsn()};
-
-    auto svc = legacy_list(r, ExecutionOwnerRig::bearer(r.creds.svc_a));
-    CHECK(svc.status == 200);
-    // The agent-evidence rows plus the minter's own dispatches (the leak): today's set.
-    CHECK(svc.ids == ExecutionOwnerRig::sorted({r.ids.in_a, r.ids.a2, r.ids.mixed, r.ids.run,
-                                                r.ids.minter_in_a, r.ids.minter_out,
-                                                r.ids.minter_pending}));
-    CHECK(std::find(svc.ids.begin(), svc.ids.end(), r.ids.minter_out) != svc.ids.end());
-    CHECK(std::find(svc.ids.begin(), svc.ids.end(), r.ids.minter_pending) != svc.ids.end());
-
-    // Controls that must NOT change: a non-service group-scoped bob keeps his agent-evidence rows
-    // (a1) plus his own dispatches; a global mina is unconfined.
-    auto bob = legacy_list(r, ExecutionOwnerRig::bearer(r.creds.bob));
-    CHECK(bob.status == 200);
-    CHECK(bob.ids == ExecutionOwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run,
-                                                r.ids.minter_in_a, r.ids.bob_out,
-                                                r.ids.bob_pending}));
-    auto mina = legacy_list(r, ExecutionOwnerRig::bearer(r.creds.mina));
-    CHECK(mina.status == 200);
-    CHECK(mina.ids == r.all_seeded_ids());
-
-    // dan has no Execution:Read: refused at the gate, no rows.
-    auto dan = legacy_list(r, ExecutionOwnerRig::bearer(r.creds.dan));
-    CHECK(dan.status == 403);
-    CHECK(dan.ids.empty());
 }

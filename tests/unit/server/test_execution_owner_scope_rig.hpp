@@ -34,6 +34,7 @@
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 #include "tag_store.hpp"
 #include "test_api_token_pg_helper.hpp"
@@ -45,6 +46,8 @@
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <chrono>
@@ -138,13 +141,14 @@ struct ExecutionOwnerRig {
     std::unique_ptr<server::oidc::OidcProvider> oidc_provider;
     std::unique_ptr<server::AuthRoutes> auth; // THE session source for every hook below
 
+    std::string dsn_;
     std::string bob_group;
     ExecutionOwnerIds ids;
     ExecutionOwnerCreds creds;
 
     explicit ExecutionOwnerRig(const std::string& dsn)
         : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, tracker{pool}, tags{pool},
-          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool}, dsn_{dsn} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
         REQUIRE(tracker.is_open());
@@ -327,6 +331,16 @@ struct ExecutionOwnerRig {
     static std::vector<std::string> sorted(std::vector<std::string> v) {
         std::sort(v.begin(), v.end());
         return v;
+    }
+
+    /// Run one statement over a fresh side connection (never the rig's pools), for fault injection
+    /// such as renaming the executions table to make the tracker's reads degrade.
+    void exec_sql(const std::string& sql) const {
+        server::pg::PgConn conn{PQconnectdb(dsn_.c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        server::pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
     }
 
     // ── seed ───────────────────────────────────────────────────────────────────

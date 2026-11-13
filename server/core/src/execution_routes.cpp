@@ -75,6 +75,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -90,10 +91,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
-            yuzu::server::ExecutionListScope s;
-            s.owner = username;
-            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-            scope_arg = std::move(s);
+            owner = execution_owner_key(*session);
+            scope_arg = confined_list_scope(owner, gate.scope);
         }
 
         auto execs_opt = deps.execution_tracker->query_executions_checked(q, scope_arg);
@@ -131,7 +130,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 auto it = statuses_opt->find(e.id);
                 const auto& statuses =
                     it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                if (!execution_visible(e, statuses, gate.scope, username))
+                if (!execution_visible(e, statuses, gate.scope, owner))
                     continue;
                 auto counts = confined_projection(statuses, gate.scope);
                 arr.push_back({{"id", e.id},
@@ -180,6 +179,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -199,6 +199,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            owner = execution_owner_key(*session);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -228,7 +229,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const bool visible =
-            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, owner);
         if (!exec_opt || !visible) {
             // #3789: audit ONLY when a confinement decision actually
             // happened (gate.scope engaged) — a suppressed
@@ -311,6 +312,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -330,6 +332,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            owner = execution_owner_key(*session);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -356,7 +359,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         const bool visible =
-            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, owner);
         if (!exec_opt || !visible) {
             // #3789: unknown-id and invisible now collapse to the SAME
             // 404 for EVERY caller — the legacy route previously
@@ -416,6 +419,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -435,6 +439,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            owner = execution_owner_key(*session);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -458,7 +463,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         const auto& statuses = *statuses_opt;
 
         const bool visible =
-            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, owner);
         if (!exec_opt || !visible) {
             // #3789: audit ONLY under an engaged scope — see the detail
             // route's identical rationale (compliance-officer F2).
@@ -731,6 +736,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
         yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
@@ -757,10 +763,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             // cap-before-scope defect where an invisible sibling could
             // displace this caller's own visible children out of the capped
             // window.
-            yuzu::server::ExecutionListScope s;
-            s.owner = username;
-            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-            scope_arg = std::move(s);
+            owner = execution_owner_key(*session);
+            scope_arg = confined_list_scope(owner, gate.scope);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -788,7 +792,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         const bool parent_visible =
             exec_opt.has_value() &&
-            execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
         if (!exec_opt || !parent_visible) {
             // #3789: audit ONLY under an engaged scope — see the detail
             // route's identical rationale (compliance-officer F2).
@@ -838,7 +842,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 auto it = child_statuses_opt->find(c.id);
                 const auto& c_statuses =
                     it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                if (!execution_visible(c, c_statuses, gate.scope, username))
+                if (!execution_visible(c, c_statuses, gate.scope, owner))
                     continue;
                 // #2146 A2-R1: shared builder (execution_model.hpp) - REST v1's
                 // new GET /api/v1/executions/{id}/children and MCP's new
