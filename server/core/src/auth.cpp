@@ -1547,6 +1547,11 @@ void AuthManager::expire_session_generation_poll_for_test() {
     last_session_gen_refresh_ms_ = steady_now_ms() - kSessionGenRefreshMs - 1;
 }
 
+void AuthManager::age_session_generation_refresh_for_test(std::chrono::milliseconds age) {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_successful_session_gen_refresh_ms_ -= age.count();
+}
+
 void AuthManager::set_validate_pre_cache_hook_for_test(std::function<void()> hook) {
     validate_pre_cache_hook_for_test_ = std::move(hook);
 }
@@ -1821,6 +1826,36 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         // rejected by step 3.
         session_copy = session_from_row(found->value().row, found->value().db_now_ms);
         from_store = true;
+
+        // Account gate: a session built from a store row is served only while its LOCAL
+        // account is active, so a session whose account is inactive or deleted is rejected on
+        // every replica, whether or not the deactivation's own session wipe persisted.
+        // Federated (oidc, saml) sessions are keyed on a principal that need not be an
+        // `auth.users` account (a ':' is not a valid account name), so only `local` sessions are
+        // gated. Skipped when no AuthDB is wired (test wiring only; production wires both
+        // stores). `user_exists` is active-only, own-schema,
+        // bounded-lease and tells an unreadable account store from an absent account: an
+        // unreadable store fails closed. Nothing is cached on either refusal.
+        if (auth_db_ && session_copy->auth_source == "local") {
+            const auto active = auth_db_->user_exists(session_copy->username);
+            if (!active) {
+                spdlog::warn("validate_session: account state for '{}' unreadable, refusing the "
+                             "session",
+                             ::yuzu::log_key_token(session_copy->username));
+                note_session_store_degrade("account_state");
+                return std::nullopt;
+            }
+            if (!*active) {
+                // Debug, not warn: a replayed cookie would log once per request; the counter
+                // is the signal.
+                spdlog::debug("validate_session: refusing a session whose account '{}' is not "
+                              "active",
+                              ::yuzu::log_key_token(session_copy->username));
+                if (metrics_)
+                    metrics_->counter("yuzu_auth_session_account_inactive_total").increment();
+                return std::nullopt;
+            }
+        }
     }
 
     // Adjudication uses the LOCAL MONOTONIC deadlines derived at populate (immune

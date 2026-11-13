@@ -891,6 +891,12 @@ public:
     /// anchor. Production code MUST NOT call this.
     void expire_session_generation_poll_for_test();
 
+    /// TEST-ONLY: age the last SUCCESSFUL session-generation refresh by `age`, so the
+    /// stale-serve bound (`kSessionGenStaleServeBoundMs`) can be crossed without waiting it
+    /// out. Does not touch the cached generation or the poll gate. Production code MUST NOT
+    /// call this.
+    void age_session_generation_refresh_for_test(std::chrono::milliseconds age);
+
     /// TEST-ONLY: installs a callback fired in `validate_session_durable` after the
     /// session to serve has been obtained (from the cache, or from the store on a
     /// miss) and before the tail's cache insert, with NO lock held. It lets a test
