@@ -29646,6 +29646,323 @@ TEST_CASE("MCP add_management_group_member: RBAC denial (ManagementGroup:Write) 
     REQUIRE(res->status == 403);
 }
 
+// ---------------------------------------------------------------------------------------------
+// #7074: add_management_group_member is audit-first (ADR-0033 section 9, "no audit row, no
+// mutation"). Twin: POST /api/v1/management-groups/{id}/members. It shares the one
+// attempted-row-or-refuse step with create_management_group. There is no MCP remove-member tool.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+std::string mg_add_body(const std::string& group_id, const std::string& agent_id, int id = 1) {
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"id", id},
+                          {"method", "tools/call"},
+                          {"params",
+                           {{"name", "add_management_group_member"},
+                            {"arguments", {{"group_id", group_id}, {"agent_id", agent_id}}}}}}
+        .dump();
+}
+
+/// The "management_group.add_member|<result>" rows the tool wrote, in order (the generic
+/// mcp.add_management_group_member row is a different action and is not counted).
+std::vector<std::string> mg_add_rows(const McpTestServer& ts) {
+    std::vector<std::string> rows;
+    for (const auto& r : ts.audit_log)
+        if (r.starts_with("management_group.add_member|"))
+            rows.push_back(r);
+    return rows;
+}
+
+/// The value of `column` on the n-th management_group.add_member row.
+std::string mg_add_row_field(const McpTestServer& ts, const std::vector<std::string>& column,
+                             std::size_t n) {
+    std::size_t seen = 0;
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i)
+        if (ts.audit_log[i].starts_with("management_group.add_member|") && seen++ == n)
+            return column.at(i);
+    return "<missing>";
+}
+
+/// A store with one group in it, for the add-member cases.
+struct MgAddFixture {
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::ManagementGroupStore store;
+    std::string gid;
+    explicit MgAddFixture(const std::string& dsn)
+        : pool({.conninfo = dsn, .size = 4}), store(pool) {
+        REQUIRE(pool.valid());
+        REQUIRE(store.is_open());
+        yuzu::server::ManagementGroup g;
+        g.name = "Add Member Target";
+        g.membership_type = "static";
+        g.created_by = "admin";
+        auto created = store.create_group(g);
+        REQUIRE(created.has_value());
+        gid = *created;
+    }
+};
+
+} // namespace
+
+TEST_CASE("MCP add_management_group_member: an unstorable attempted row refuses the add and "
+          "nothing is added",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.audit_fail_action_result_ = "management_group.add_member|attempted";
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"] == "audit log unavailable; the change was not made");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    CHECK_FALSE(body.contains("result"));
+
+    CHECK(f.store.get_members(f.gid).empty());
+    // Only the refused attempt: no outcome row of either kind.
+    CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted"});
+}
+
+TEST_CASE("MCP add_management_group_member: refusals decided without a write burn no attempted "
+          "row",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    SECTION("tier denied") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &f.store;
+        ts.start("readonly");
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kTierDenied);
+        CHECK(mg_add_rows(ts).empty());
+        CHECK(f.store.get_members(f.gid).empty());
+    }
+    SECTION("permission denied") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &f.store;
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write");
+        };
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(mg_add_rows(ts).empty());
+        CHECK(f.store.get_members(f.gid).empty());
+    }
+    SECTION("empty agent_id") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &f.store;
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, ""));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(mg_add_rows(ts).empty());
+    }
+    SECTION("a control byte in the agent_id keeps its existing denied row only") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &f.store;
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, std::string("agent") + '\t' + "1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|denied"});
+        CHECK(mg_add_row_field(ts, ts.audit_details, 0) == "invalid_agent_id");
+        CHECK(f.store.get_members(f.gid).empty());
+    }
+    SECTION("a group id naming no group is answered before any management_group row") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &f.store;
+        ts.start();
+        auto res = ts.call(mg_add_body("deadbeef0000", "agent-1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"] == "group not found");
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK(mg_add_rows(ts).empty());
+        CHECK(f.store.get_members("deadbeef0000").empty());
+    }
+    SECTION("an unreadable group read is a retryable store fault and no management_group row") {
+        {
+            auto lease = f.pool.acquire();
+            REQUIRE(lease);
+            pg::PgResult drop = pg::exec_params(
+                lease.get(), "DROP TABLE management_group_store.management_groups CASCADE",
+                std::vector<std::string>{});
+            REQUIRE(drop.status() == PGRES_COMMAND_OK);
+        }
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &f.store;
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+        CHECK(mg_add_rows(ts).empty());
+    }
+    SECTION("store unavailable") {
+        McpTestServer ts; // mgmt_store_for_test left null
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(mg_add_rows(ts).empty());
+    }
+}
+
+TEST_CASE("MCP add_management_group_member: success writes attempted then success carrying the "
+          "group id and the agent id",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["added"] == true);
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    REQUIRE(f.store.get_members(f.gid).size() == 1);
+
+    CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                      "management_group.add_member|success"});
+    for (std::size_t n = 0; n < 2; ++n) {
+        CHECK(mg_add_row_field(ts, ts.audit_target_ids, n) == f.gid);
+        CHECK(mg_add_row_field(ts, ts.audit_details, n) == "agent-1");
+        CHECK(mg_add_row_field(ts, ts.audit_target_types, n) == "ManagementGroup");
+    }
+}
+
+TEST_CASE("MCP add_management_group_member: a lost success row keeps the result and reports "
+          "audit_persisted:false",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.audit_fail_action_result_ = "management_group.add_member|success";
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["added"] == true);
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(f.store.get_members(f.gid).size() == 1); // the member was added
+    CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                      "management_group.add_member|success"});
+}
+
+TEST_CASE("MCP add_management_group_member: a store fault on the insert answers a fixed "
+          "retryable error and a store_error failure row, never the store's text",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    {
+        auto lease = f.pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(), "DROP TABLE management_group_store.management_group_members CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+    for (const char* leak : {"relation \"", "does not exist", "management_group_members",
+                             "failed", "ERROR"}) {
+        INFO("leak token: " << leak);
+        CHECK(res->body.find(leak) == std::string::npos);
+        for (const auto& d : ts.audit_details)
+            CHECK(d.find(leak) == std::string::npos);
+    }
+
+    CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                      "management_group.add_member|failure"});
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "store_error");
+    CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
+}
+
+TEST_CASE("MCP add_management_group_member: authority is decided again after the attempted row",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    const auto attempted_stored = [&ts]() {
+        for (const auto& r : ts.audit_log)
+            if (r == "management_group.add_member|attempted")
+                return true;
+        return false;
+    };
+
+    SECTION("grant revoked while the attempted row was being stored") {
+        ts.perm_override_for_test = [&](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write" && attempted_stored());
+        };
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        CHECK(res->status == 403); // perm_fn writes its own refusal
+        CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                          "management_group.add_member|failure"});
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "permission_revoked");
+        CHECK(f.store.get_members(f.gid).empty());
+    }
+
+    SECTION("credential revoked while the attempted row was being stored") {
+        ts.audit_succeeds_for_action_ = [&ts](const std::string& action) {
+            if (action == "management_group.add_member")
+                ts.mock_auth_enabled = false; // the next auth_fn call answers 401
+            return true;
+        };
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                          "management_group.add_member|failure"});
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked");
+        CHECK(f.store.get_members(f.gid).empty());
+    }
+}
+
 TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallback admits "
           "without UserManagement:Read (compound gate)",
           "[mcp][pg][management_group]") {

@@ -5031,11 +5031,39 @@ void RestApiV1::register_routes(
         res.set_content(detail::a4_error(res, "group not found"), "application/json");
     };
 
+    // The member writes are audit-first like create (ADR-0033 section 9, "no audit row, no
+    // mutation", #7074): perm, store, body and field checks, then (add only) the group-exists
+    // answer, all BEFORE any row; then the `attempted` row (503 + Sec-Audit-Failed when it cannot
+    // be stored); then the session and the permission decided AGAIN (the attempted row can wait
+    // on the audit pool), `session_revoked` / `permission_revoked` failure rows; then the
+    // mutation; then the outcome row. Failure rows carry FIXED detail tokens only. This is the
+    // post-attempted re-check, the member twin of the one in POST /api/v1/management-groups.
+    const auto mgmt_member_recheck = [auth_fn, perm_fn, audit_fn](
+                                         const httplib::Request& req, httplib::Response& res,
+                                         const char* action, const std::string& group_id) {
+        if (!auth_fn(req, res)) {
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, action, "failure",
+                                                "ManagementGroup", group_id, "session_revoked");
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return false;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, action, "failure",
+                                                "ManagementGroup", group_id, "permission_revoked");
+            return false;
+        }
+        return true;
+    };
+
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
               [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
-               mgmt_group_confirmed_absent, mgmt_group_not_found](const httplib::Request& req,
-                                                                  httplib::Response& res) {
+               mgmt_group_confirmed_absent, mgmt_group_not_found,
+               mgmt_member_recheck](const httplib::Request& req, httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -5066,29 +5094,53 @@ void RestApiV1::register_routes(
                                       "application/json");
                       return;
                   }
+                  // A well-formed id naming no group is a 404 BEFORE any row is written (a
+                  // refusal burns no `attempted` row); an unreadable group is a store fault,
+                  // never "absent".
+                  const auto exists = mgmt_store->get_group_checked(group_id);
+                  if (!exists) {
+                      spdlog::warn("management_group.add_member group read failure: {}",
+                                   exists.error());
+                      mgmt_write_failed(res);
+                      return;
+                  }
+                  if (!exists->has_value()) {
+                      mgmt_group_not_found(res);
+                      return;
+                  }
+                  if (!detail::audit_attempted(audit_fn, req, res, "management_group.add_member",
+                                               "ManagementGroup", group_id, agent_id))
+                      return;
+                  if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id))
+                      return;
                   if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
-                      // A well-formed id naming no group fails the membership foreign
-                      // key: answer 404 (no failure row, no retry hint), not a retryable 503.
+                      // The group vanished between the check above and the insert (the
+                      // membership foreign key failed): 404, no failure row, no retry hint.
                       if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
                           mgmt_group_not_found(res);
                           return;
                       }
                       spdlog::warn("management_group.add_member store failure: {}", added.error());
-                      audit_fn(req, "management_group.add_member", "failure", "ManagementGroup",
-                               group_id, "store_error");
+                      (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                          "management_group.add_member", "failure",
+                                                          "ManagementGroup", group_id,
+                                                          "store_error");
                       mgmt_write_failed(res);
                       return;
                   }
-                  audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
-                           group_id, agent_id);
+                  // The member is added: a lost outcome row keeps the 201 and marks the response
+                  // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+                  (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                      "management_group.add_member", "success",
+                                                      "ManagementGroup", group_id, agent_id);
                   res.status = 201;
                   res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
               });
 
     sink.Delete(
         R"(/api/v1/management-groups/([a-f0-9]+)/members/(.+))",
-        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed,
-         mgmt_text_ok](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
+         mgmt_member_recheck](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "ManagementGroup", "Write"))
                 return;
             if (!mgmt_store) {
@@ -5107,15 +5159,24 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
+            // Idempotent as before: removing an absent member (or from an absent group) is a
+            // success, so there is no group-exists answer here, only the audit-first order.
+            if (!detail::audit_attempted(audit_fn, req, res, "management_group.remove_member",
+                                         "ManagementGroup", group_id, agent_id))
+                return;
+            if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id))
+                return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
                 spdlog::warn("management_group.remove_member store failure: {}", removed.error());
-                audit_fn(req, "management_group.remove_member", "failure", "ManagementGroup",
-                         group_id, "store_error");
+                (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                    "management_group.remove_member", "failure",
+                                                    "ManagementGroup", group_id, "store_error");
                 mgmt_write_failed(res);
                 return;
             }
-            audit_fn(req, "management_group.remove_member", "success", "ManagementGroup", group_id,
-                     agent_id);
+            (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                "management_group.remove_member", "success",
+                                                "ManagementGroup", group_id, agent_id);
             res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
         });
 

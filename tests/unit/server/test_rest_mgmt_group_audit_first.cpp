@@ -9,6 +9,11 @@
  * (it can wait on the audit pool). A store fault on create answers 503 with a fixed message and
  * a `store_error` failure row; the store's database error text is never returned.
  *
+ * Add member (POST .../members) and remove member (DELETE .../members/{agent}) follow the same
+ * order: perm, store, body and field checks (and, for add, the group-exists 404) answer first and
+ * burn no row; then the `attempted` row; then the session and permission again; then the write;
+ * then the outcome row.
+ *
  * PG-gated: ManagementGroupStore is a Postgres store (ADR-0042), so every case SKIPs when
  * YUZU_TEST_POSTGRES_DSN is unset and FAILs when it is set but broken.
  */
@@ -41,6 +46,8 @@ using namespace yuzu::server;
 namespace {
 
 constexpr const char* kCreate = "management_group.create";
+constexpr const char* kAdd = "management_group.add_member";
+constexpr const char* kRemove = "management_group.remove_member";
 
 struct AuditFirstHarness {
     // Declared FIRST: the store borrows it via set_metrics(), so it must outlive the store.
@@ -83,7 +90,14 @@ struct AuditFirstHarness {
                 ++n;
         return n;
     }
-    [[nodiscard]] bool attempted_stored() const { return audit_count(kCreate, "attempted") > 0; }
+    /// An `attempted` row of ANY management-group verb has been stored (the re-check after the
+    /// attempted row is what the session / permission switches below model).
+    [[nodiscard]] bool attempted_stored() const {
+        for (const auto& a : audits)
+            if (a.result == "attempted")
+                return true;
+        return false;
+    }
 
     [[nodiscard]] std::size_t group_count() const { return mgmt_bundle->list_groups().size(); }
     [[nodiscard]] bool group_exists(const std::string& name) const {
@@ -166,6 +180,23 @@ struct AuditFirstHarness {
     }
 
     auto create(const std::string& body) { return sink.Post("/api/v1/management-groups", body); }
+    auto add_member(const std::string& gid, const std::string& body) {
+        return sink.Post("/api/v1/management-groups/" + gid + "/members", body);
+    }
+    auto remove_member(const std::string& gid, const std::string& agent_id) {
+        return sink.Delete("/api/v1/management-groups/" + gid + "/members/" + agent_id);
+    }
+    /// Every stored row of one verb, whatever its result.
+    [[nodiscard]] std::vector<AuditRow> rows_of(const std::string& action) const {
+        std::vector<AuditRow> out;
+        for (const auto& a : audits)
+            if (a.action == action)
+                out.push_back(a);
+        return out;
+    }
+    [[nodiscard]] std::size_t member_count(const std::string& gid) const {
+        return mgmt_bundle->get_members(gid).size();
+    }
 };
 
 std::string make_group(AuditFirstHarness& h, const std::string& name,
@@ -408,4 +439,337 @@ TEST_CASE("POST /management-groups: a permission revoked after the attempted row
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].detail == "permission_revoked");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Add member and remove member (#7074).
+// ---------------------------------------------------------------------------------------------
+
+TEST_CASE("POST /management-groups/{id}/members: an unstorable attempted row refuses the add "
+          "(503 + Sec-Audit-Failed) and nothing is added",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-audit-down");
+    h.fail_audit.insert(std::string(kAdd) + "|attempted");
+
+    auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_number());
+    CHECK(res->body.find("\"added\"") == std::string::npos);
+
+    CHECK(h.member_count(gid) == 0);
+    CHECK(h.rows_of(kAdd).empty()); // the refused attempt was not stored; no outcome row
+}
+
+TEST_CASE("POST /management-groups/{id}/members: refusals that need no write burn no attempted "
+          "row",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-no-row");
+
+    SECTION("a group id naming no group (confirmed absent) is a 404 and no row") {
+        auto res = h.add_member("deadbeef0000", R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        CHECK(res->body.find("group not found") != std::string::npos);
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    }
+    SECTION("a bad agent_id keeps its existing denied row and burns no attempted row") {
+        auto res = h.add_member(gid, std::string(R"({"agent_id":"a)") + "\\u0001" + R"(b"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.rows_of(kAdd).size() == 1);
+        CHECK(h.rows_of(kAdd)[0].result == "denied");
+        CHECK(h.rows_of(kAdd)[0].detail == "invalid_agent_id");
+        CHECK(h.audit_count(kAdd, "attempted") == 0);
+        CHECK(h.member_count(gid) == 0);
+    }
+    SECTION("a missing agent_id is a 400 and no row") {
+        auto res = h.add_member(gid, R"({"x":1})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("malformed JSON is a 400 and no row") {
+        auto res = h.add_member(gid, "{not json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("a caller without ManagementGroup:Write is a 403 and no row") {
+        h.perm_override = [](const std::string& type, const std::string& op) {
+            return !(type == "ManagementGroup" && op == "Write");
+        };
+        auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    SECTION("an unreadable group read is a retryable 503 and no row") {
+        drop_mgmt_table(h, "management_group_store.management_groups");
+        auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+    }
+
+    // None of the above burned an attempted or outcome row (the denied row is a refusal row).
+    CHECK(h.audit_count(kAdd, "attempted") == 0);
+    CHECK(h.audit_count(kAdd, "success") == 0);
+    CHECK(h.audit_count(kAdd, "failure") == 0);
+}
+
+TEST_CASE("POST /management-groups/{id}/members: success writes attempted then success with the "
+          "group id as target and the agent id as detail",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-ok");
+
+    auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->body.find("\"added\":true") != std::string::npos);
+    CHECK(h.member_count(gid) == 1);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == kAdd);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].target_type == "ManagementGroup");
+    CHECK(h.audits[0].target_id == gid);
+    CHECK(h.audits[0].detail == "agent-1");
+    CHECK(h.audits[1].action == kAdd);
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "agent-1");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a lost outcome row keeps the 201 and marks the "
+          "response Sec-Audit-Failed",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-outcome-lost");
+    h.fail_audit.insert(std::string(kAdd) + "|success");
+
+    auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    CHECK(h.member_count(gid) == 1);
+
+    // The attempted row stands alone: "started, outcome unknown".
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "attempted");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a store fault on the insert answers 503 with a "
+          "store_error failure row, never the database text",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-store-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_members");
+
+    auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_number());
+    CHECK(res->body.find("management group store unavailable") != std::string::npos);
+    for (const char* leak : {"management_group_members", "does not exist", "ERROR", "failed"})
+        CHECK(res->body.find(leak) == std::string::npos);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == kAdd);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == kAdd);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audit_count(kAdd, "success") == 0);
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a session or grant gone after the attempted row "
+          "adds nothing and writes a revoked failure row",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "add-revoked");
+
+    SECTION("session gone") {
+        h.session_gone_after_attempted = true;
+        auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].action == kAdd);
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].target_id == gid);
+        CHECK(h.audits[1].detail == "session_revoked");
+    }
+    SECTION("permission revoked") {
+        h.perm_revoked_after_attempted = true;
+        auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].action == kAdd);
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].detail == "permission_revoked");
+    }
+    CHECK(h.member_count(gid) == 0);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an unstorable attempted row refuses "
+          "the remove (503 + Sec-Audit-Failed) and the member is kept",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "remove-audit-down");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    h.fail_audit.insert(std::string(kRemove) + "|attempted");
+
+    auto res = h.remove_member(gid, "agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_number());
+    CHECK(res->body.find("\"removed\"") == std::string::npos);
+
+    CHECK(h.member_count(gid) == 1);
+    CHECK(h.rows_of(kRemove).empty());
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: refusals that need no write burn no "
+          "attempted row",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "remove-no-row");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+
+    SECTION("a bad agent_id keeps its existing denied row and burns no attempted row") {
+        auto res = h.remove_member(gid, std::string("agent") + '\x1b' + "1");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.rows_of(kRemove).size() == 1);
+        CHECK(h.rows_of(kRemove)[0].result == "denied");
+        CHECK(h.rows_of(kRemove)[0].detail == "invalid_agent_id");
+        CHECK(h.audit_count(kRemove, "attempted") == 0);
+        CHECK(h.member_count(gid) == 1);
+    }
+    SECTION("a caller without ManagementGroup:Write is a 403 and no row") {
+        h.perm_override = [](const std::string& type, const std::string& op) {
+            return !(type == "ManagementGroup" && op == "Write");
+        };
+        auto res = h.remove_member(gid, "agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.member_count(gid) == 1);
+    }
+
+    // None of the above burned an attempted or outcome row (the denied row is a refusal row).
+    CHECK(h.audit_count(kRemove, "attempted") == 0);
+    CHECK(h.audit_count(kRemove, "success") == 0);
+    CHECK(h.audit_count(kRemove, "failure") == 0);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: success writes attempted then success "
+          "with the group id as target and the agent id as detail",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "remove-ok");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+
+    auto res = h.remove_member(gid, "agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->body.find("\"removed\":true") != std::string::npos);
+    CHECK(h.member_count(gid) == 0);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == kRemove);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].target_type == "ManagementGroup");
+    CHECK(h.audits[0].target_id == gid);
+    CHECK(h.audits[0].detail == "agent-1");
+    CHECK(h.audits[1].action == kRemove);
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "agent-1");
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a lost outcome row keeps the success "
+          "and marks the response Sec-Audit-Failed",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "remove-outcome-lost");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    h.fail_audit.insert(std::string(kRemove) + "|success");
+
+    auto res = h.remove_member(gid, "agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    CHECK(h.member_count(gid) == 0);
+
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "attempted");
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a store fault answers 503 with a "
+          "store_error failure row, never the database text",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "remove-store-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_members");
+
+    auto res = h.remove_member(gid, "agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("management group store unavailable") != std::string::npos);
+    for (const char* leak : {"management_group_members", "does not exist", "ERROR", "failed"})
+        CHECK(res->body.find(leak) == std::string::npos);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == kRemove);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == kRemove);
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audit_count(kRemove, "success") == 0);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a session or grant gone after the "
+          "attempted row removes nothing and writes a revoked failure row",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "remove-revoked");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+
+    SECTION("session gone") {
+        h.session_gone_after_attempted = true;
+        auto res = h.remove_member(gid, "agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].action == kRemove);
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].target_id == gid);
+        CHECK(h.audits[1].detail == "session_revoked");
+    }
+    SECTION("permission revoked") {
+        h.perm_revoked_after_attempted = true;
+        auto res = h.remove_member(gid, "agent-1");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].action == kRemove);
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].detail == "permission_revoked");
+    }
+    CHECK(h.member_count(gid) == 1);
 }
