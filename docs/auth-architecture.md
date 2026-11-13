@@ -114,8 +114,8 @@ of the HA "safe-to-scale" gate. The design:
   idle evictions inside validation and the legacy in-memory reap do not move it. A
   validation captures the epoch before any store read and inserts its session at
   the tail only if it is unchanged (ADR-0012 section 4, rule 2). On a mismatch the
-  session is still returned to that one request, uncached. The mint insert is deliberately unguarded: the post-mint
-  recheck re-reads the role, the credential hash and the active state and erases
+  session is still returned to that one request, uncached. The mint insert is
+  deliberately unguarded: the post-mint recheck re-reads the role, the credential hash and the active state and erases
   this replica's entries when they changed. (3) `AuthManager::reactivate_user`
   erases the account's cached sessions and wipes its durable ones first (also for
   an account that is already active), and leaves the account inactive when that
@@ -136,11 +136,13 @@ of the HA "safe-to-scale" gate. The design:
   operation is outside the guarantee: the guarantee holds once every replica runs
   this build, and a deactivation committed by a replica on an earlier build bumps
   no generation. A session whose role is stale after a failed wipe on demotion is
-  a separate case and is not addressed here. A validation already in flight
-  across a reactivation, a role change or a password change on the SAME replica
-  can still cache the pre-change session until that replica's next generation poll
-  (the durable wipe bumps the generation), the same bound as every cross-replica
-  revocation. The refusal is bounded by the
+  a separate case and is not addressed here. A validation that starts, or is
+  already in flight, between the local erase and the durable wipe of a
+  reactivation or a role change on the SAME replica can still cache the
+  pre-change session until that replica's next generation poll (the durable wipe
+  bumps the generation), the same bound as every cross-replica revocation. A
+  password change deletes the sessions inside its own transaction before the
+  local erase, so it has no such window. The refusal is bounded by the
   generation poll: about one second on a healthy poll, at most about 30 seconds
   while a replica's poll fails (the stale-serve bound above). A refusal is logged
   at debug level and counted by `yuzu_auth_session_account_inactive_total`; the

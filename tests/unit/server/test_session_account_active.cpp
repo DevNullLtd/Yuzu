@@ -852,7 +852,8 @@ TEST_CASE("reactivation removes the sessions that existed, and a later sign-in w
     auto& c = f.add();
     CHECK_FALSE(c.validate_session(old_token).has_value());
 
-    // A sign-in that completes after the reactivation is a new sign-in.
+    // A sign-in that completes after the reactivation is a new sign-in (a login whose first factor
+    // was verified before the deactivation is a pre-existing residual; see reactivate_user).
     const auto fresh = a.create_local_session_for_test("alice", Role::user, false);
     REQUIRE_FALSE(fresh.empty());
     CHECK(b.validate_session(fresh).has_value());
@@ -892,7 +893,9 @@ TEST_CASE("reactivation with a validation in flight: that session is not served 
           "[auth][session_store][account_active][reactivation][cache_epoch][pg]") {
     // The "new sign-in" ruling, tested as a decision: a sign-in that finishes after the
     // reactivation is a new sign-in (reactivation keeps the password, so the caller holds a valid
-    // credential at that moment). Only sessions that EXISTED at reactivation are removed.
+    // credential at that moment). Only sessions that EXISTED at reactivation are removed. A login
+    // whose first factor was verified before the deactivation is a pre-existing residual (see the
+    // comment in reactivate_user).
     AcctFx f;
     auto& a = f.add();
     auto& b = f.add();
