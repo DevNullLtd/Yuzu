@@ -2304,10 +2304,21 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         }
         // HA WS-5 #5685 follow-up: the arrival mirror. This runs on whichever replica receives the
         // CONNECTED (it need not own the session), and drops plugin lists other sessions of this
-        // agent published, so no replica judges the re-registered agent by its previous list.
-        mirror_arrival_to_presence(
-            heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,
-            agent_id, session_id);
+        // agent published, so no replica judges the re-registered agent by its previous list. It
+        // runs BEFORE announce_connected, so a CONNECTED the durable write then refuses has still
+        // cleared them (fail-open only: the agent reads as unknown). It is skipped for a session
+        // recorded as having LOST its register_fresh epoch race: the durable row belongs to a
+        // NEWER session, and this session's id would make `session_id <> $2` delete THAT
+        // session's published list.
+        bool lost_race_session = false;
+        {
+            std::lock_guard lock(sessions_mu_);
+            lost_race_session = lost_race_sessions_.contains(session_id);
+        }
+        if (!lost_race_session)
+            mirror_arrival_to_presence(
+                heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr,
+                agent_id, session_id);
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp). As of
         // 4.2b Task C the directory IS read for dispatch (fallback-only, on a

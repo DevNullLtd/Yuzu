@@ -700,7 +700,10 @@ TEST_CASE("no-delivery-path predicates never block behind a held stream_mu",
 
 // The interleaving that matters for the lock order (`stream_mu` then `gw_pending_mu_`): a command is
 // being sent through the directory while the session's CONNECTED publishes its placement. Whichever
-// wins, a command that was reported queued is queued exactly once, and never as a ghost entry.
+// wins, a command that was reported queued is queued exactly once, and never as a ghost entry. This
+// is a crash/deadlock/TSan probe, NOT closure evidence for the capability-check bypass: a bypass
+// would still queue exactly one entry. The deterministic closure test is `send_via_directory sends
+// a session that gained a delivery path through send_to` (test_dispatch_confined_arms.cpp).
 TEST_CASE("send_via_directory racing set_gateway_route queues each accepted command exactly once",
           "[server][dispatch][ha]") {
     EventBus bus;
@@ -719,11 +722,19 @@ TEST_CASE("send_via_directory racing set_gateway_route queues each accepted comm
         }());
         std::atomic<bool> go{false};
         std::thread connected([&] {
-            while (!go.load()) {}
+            while (!go.load())
+                std::this_thread::yield();
             (void)registry.set_gateway_route(
                 id, /*session_id=*/{}, "test-gateway",
                 {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
         });
+        struct JoinGuard {
+            std::thread& t;
+            ~JoinGuard() {
+                if (t.joinable())
+                    t.join();
+            }
+        } join_guard{connected};
         go = true;
         const bool sent = registry.send_via_directory(id, cmd, "cluster-stale");
         connected.join();

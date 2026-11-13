@@ -3114,6 +3114,46 @@ TEST_CASE("WS-5 NotifyStreamStatus: a CONNECTED on a non-owning replica drops th
     CHECK(std::ranges::find(*r, agent) == r->end()); // unknown now: fails open
 }
 
+// A session that LOST its register_fresh epoch race belongs to an older connection; the durable row
+// names the winner. Its CONNECTED must not run the arrival mirror, or `session_id <> loser` would
+// delete the WINNER's published plugin list.
+TEST_CASE("WS-5 NotifyStreamStatus: the CONNECTED of a lost-race session leaves the winning "
+          "session's plugin list alone",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    yuzu::server::HeartbeatIngestion ingestion{owner.registry, nullptr, nullptr, &owner.metrics,
+                                               &offline};
+    owner.svc.set_heartbeat_ingestion(&ingestion);
+
+    const std::string agent = "yuzu_test_ws5_arrival_race";
+    (void)owner.register_live(agent);
+    auto row1 = owner.store.lookup_route(agent);
+    REQUIRE(row1.has_value());
+    REQUIRE(row1->has_value());
+    // A newer connection already won the epoch race.
+    raw_bump_epoch(db.dsn(), agent, (*row1)->connection_epoch + 1000, "gw-session-already-won");
+    const std::string losing_session = owner.register_live(agent);
+    // The winner's published list, which lacks "echo".
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", "gw-session-already-won"));
+    REQUIRE(offline.publish_plugins(agent, "gw-session-already-won", {"os_info"}));
+
+    gw::StreamStatusNotification notif;
+    notif.set_agent_id(agent);
+    notif.set_session_id(losing_session);
+    notif.set_event(gw::StreamStatusNotification::CONNECTED);
+    notif.set_cluster_id("cluster-loser");
+    notif.set_gateway_node("node-loser");
+    gw::StreamStatusAck ack;
+    REQUIRE(owner.svc.NotifyStreamStatus(/*context=*/nullptr, &notif, &ack).ok());
+
+    auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+    REQUIRE(r.has_value());
+    CHECK(std::ranges::find(*r, agent) != r->end()); // the winner's list is still served
+}
+
 TEST_CASE("WS-5 BatchHeartbeat: a session id carried by TWO directory rows is refused "
           "and counted and neither acked nor listed unknown",
           "[pg][gateway_route_wiring][ws5]") {

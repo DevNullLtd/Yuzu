@@ -1362,7 +1362,7 @@ TEST_CASE("OfflineEndpointStore plugin lists (session-keyed and served only for 
         CHECK(without("os_info") == Ids{"yuzu_test_pv_lacks"});
     }
 
-    SECTION("arrival clears lists of OTHER sessions only, so a restarted agent reads as unknown") {
+    SECTION("arrival clears lists of OTHER sessions only so a restarted agent reads as unknown") {
         // The endpoint row still names s2 (its session only advances at the NEW session's first
         // heartbeat), so without the clear a replica would keep judging the agent by s2's list.
         CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"});

@@ -2362,7 +2362,12 @@ best-effort arrival write fails inside the window (a store failure at that insta
 by its OLD list on another replica until the first heartbeat of its new session (about one heartbeat plus the 3 s
 cache, a false `plugin_not_found` that self-heals); a derived-HIGH residual of a partial failure that needs the
 project lead's risk acceptance before it is carried, and the unsupported second replica does not by itself cap it
-(no admission gate prevents one, #6528); if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
+(no admission gate prevents one, #6528). The mirror closes the window only from the point a stream is
+established: between a restart's Register and its Subscribe start (direct), or between ProxyRegister and the
+first accepted CONNECTED (a droppable cast, refused on a degraded directory read, and resent up to about 10
+minutes later), the old list is still served, and a mirror delete is visible on other replicas up to 3 s late
+because of the plugin-absence cache; the mirror is skipped for a lost-race session, and the direct Subscribe
+call site is pinned by a source-text gate, not by a behavioural test; if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
 not republished until the agent re-registers, so visibility fails open; sustained `truncated` on
 `query_without_plugin` (above 100,000 live agents) switches the cross-replica withhold off with no alert; while
 every session lacks a delivery path (after a directory outage) an unfiltered broadcast takes the per-id path with
