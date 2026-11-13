@@ -118,8 +118,8 @@ of the HA "safe-to-scale" gate. The design:
   deliberately unguarded: the post-mint recheck re-reads the role, the credential hash and the active state and erases
   this replica's entries when they changed. (3) `AuthManager::reactivate_user`
   erases the account's cached sessions and wipes its durable ones first (also for
-  an account that is already active), and leaves the account inactive when that
-  wipe does not persist. A sign-in that completes after the reactivation is not
+  an account that is already active), erases the cache a second time once that wipe
+  has persisted, and leaves the account inactive when the wipe does not persist. A sign-in that completes after the reactivation is not
   always a new sign-in: see the residual under "Deprovision and reactivation". The
   lock order for (1) is `rbac_enabled`, the grant rows, one `auth.users` row, then
   the `session_meta` row last; each lock wait is bounded by the lifecycle
@@ -138,13 +138,14 @@ of the HA "safe-to-scale" gate. The design:
   no generation. A session whose role is stale after a failed wipe on demotion is
   a separate case and is not addressed here. A reactivation or a role change
   erases the user's cached sessions, then removes the durable rows, then erases the
-  cache again and advances the cache epoch a second time. A validation that
-  started between the first erase and the durable wipe, whether it has already
-  cached the pre-change session or is still in flight, therefore cannot leave
-  that session cached on the originating replica; other replicas clear theirs at
-  their next generation poll. A password change deletes the sessions inside its
-  own transaction before the local erase, so it has no such window. The refusal is bounded by the
-  generation poll: about one second on a healthy poll, at most about 30 seconds
+  cache again and advances the cache epoch a second time (for a reactivation, once
+  the durable wipe has persisted: a failed wipe leaves the account inactive and the
+  gate refuses). A validation that started between the first erase and the durable
+  wipe, whether it has already cached the pre-change session or is still in flight,
+  therefore cannot leave that session cached on the originating replica; other
+  replicas clear theirs at their next generation poll. A password change deletes
+  the sessions inside its own transaction before the local erase, so it has no such
+  window. The refusal is bounded by the generation poll: about one second on a healthy poll, at most about 30 seconds
   while a replica's poll fails (the stale-serve bound above). A refusal is logged
   at debug level and counted by `yuzu_auth_session_account_inactive_total`; the
   count is not evidence of a failed wipe (a healthy deactivation can increment
