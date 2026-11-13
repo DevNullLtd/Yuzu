@@ -155,14 +155,31 @@ class Flow(unittest.TestCase):
                 self.assertEqual(rc, fc.EXIT_FAIL)
                 self.assertIn("release", calls)
 
-    def test_sigterm_while_containing_still_releases_and_the_handlers_are_restored(self):
-        before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT))
-        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive")],
-                                   "quarantine": [lambda _c: signal.raise_signal(signal.SIGTERM)],
-                                   "release": [{}]})
+    def test_an_already_contained_host_is_refused_before_any_change(self):
+        for token in ("active", "partial", "degraded"):
+            with self.subTest(token=token):
+                rc, calls = self.run_main({"quarantine_status": [row(token)]})
+                self.assertEqual(rc, fc.EXIT_PRECONDITION)
+                self.assertEqual(calls, ["quarantine_status"])
+
+    def test_a_signal_while_containing_still_releases_and_the_handlers_are_restored(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            with self.subTest(sig=sig.name):
+                before = tuple(signal.getsignal(x) for x in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT))
+                rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                           "quarantine": [lambda _c, sig=sig: signal.raise_signal(sig)],
+                                           "release": [{}]})
+                self.assertEqual(rc, fc.EXIT_FAIL)  # interrupted, but released and confirmed
+                self.assertEqual(calls[-2:], ["release", "quarantine_status"])
+                after = tuple(signal.getsignal(x) for x in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT))
+                self.assertEqual(after, before)
+
+    def test_a_signal_during_the_release_does_not_skip_the_confirmation(self):
+        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                   "quarantine": [{}],
+                                   "release": [lambda _c: signal.raise_signal(signal.SIGTERM)]})
         self.assertEqual(rc, fc.EXIT_FAIL)
-        self.assertIn("release", calls)
-        self.assertEqual((signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)), before)
+        self.assertEqual(calls[-2:], ["release", "quarantine_status"])
 
 
 if __name__ == "__main__":

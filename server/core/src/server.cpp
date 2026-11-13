@@ -18601,7 +18601,7 @@ private:
         // reconnected. Same shared dispatch lambda as every other
         // background engine. The shared protective predicate
         // (yuzu::protective::is_protective_action, built on
-        // is_quarantine_control_plugin) lets the quarantine plugin's own
+        // is_quarantine_control_plugin and is_firewall_control_plugin) lets the quarantine plugin's own
         // actions through every gate unmodified: the #881 containment gate, the
         // per-plugin/action kill switch (incl. a degraded store), the per-OS
         // withhold and its presence read, and the plugin-presence filter.

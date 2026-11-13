@@ -9,9 +9,11 @@ plugin", step 6). This script is that regression:
      grant are in place). Otherwise exit 2 and nothing is dispatched.
   2. PROBE (always): log in, find the agent, dispatch the read-only `firewall.quarantine_status`
      and require an agent answer, so a missing plugin or grant shows up without changing a rule.
-  3. CONTAINMENT (only with --apply-containment): dispatch `firewall.quarantine`, require the
-     status to read active, then ALWAYS dispatch `firewall.release` (also on any failure or signal)
-     and require the status to read inactive again.
+  3. CONTAINMENT (only with --apply-containment): refuse (exit 2) when the host already reads
+     anything but `inactive` (the release would lift a containment this run did not apply); dispatch
+     `firewall.quarantine`, require the status to read `active`, then ALWAYS dispatch
+     `firewall.release` (also on any failure; SIGINT/SIGTERM/SIGHUP are noted and the release still
+     runs) and require the status to read `inactive` again.
 
 DO NOT RUN THE CONTAINMENT STEP ON A REMOTE / SSH-ONLY HOST. It briefly blocks all traffic except
 the allow set (loopback plus the agent's control channel). It refuses to run when an SSH session
@@ -21,9 +23,9 @@ never runs without --apply-containment. Run it on a local box with a keyboard an
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
 3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
 
-The response parsing is deliberately loose (substring on the agent's reply rows): this script has
-been exercised for its guards and the probe path; the live apply/release round trip needs a UAT
-stack on a local host and has not been run by its author on every OS.
+The status is read from the exact `status|<token>` row of the agent's reply. The flow is covered
+against a recording fake (tests/test_firewall_containment_ceremony.py); the live apply/release round
+trip needs a UAT stack on a local host and has not been run on every OS.
 """
 from __future__ import annotations
 
@@ -139,19 +141,14 @@ def _signals(handler, sigs):
 
 def release_and_confirm(client: Client, agent_id: str) -> bool:
     """Dispatch `firewall.release` and require an explicit `inactive` answer. Any error, or no answer, is
-    NOT a confirmation. Signals are ignored for the span: a second Ctrl-C must not skip the release."""
-    with _signals(signal.SIG_IGN, (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
-        try:
-            dispatch(client, agent_id, "release", {})
-            time.sleep(2)
-            return status_token(client, agent_id) == "inactive"
-        except Exception as e:  # noqa: BLE001 - an unconfirmed release is exit 3, whatever stopped it
-            print(f"release call failed: {e}", file=sys.stderr)
-            return False
-
-
-def _raise_on_signal(signum, _frame):
-    raise KeyboardInterrupt(f"signal {signum}")
+    NOT a confirmation (exit 3)."""
+    try:
+        dispatch(client, agent_id, "release", {})
+        time.sleep(2)
+        return status_token(client, agent_id) == "inactive"
+    except Exception as e:  # noqa: BLE001 - an unconfirmed release is exit 3, whatever stopped it
+        print(f"release call failed: {e}", file=sys.stderr)
+        return False
 
 
 def parse_args(argv):
@@ -196,24 +193,34 @@ def main(argv=None) -> int:
         if not args.apply_containment:
             print("probe-only: nothing was changed (--apply-containment runs the live ceremony)")
             return EXIT_OK
-        # From here a containment may be on the host: a signal raises into the try below, whose
-        # release runs for ANY failure or signal.
+        if before != "inactive":
+            print(f"precondition failed: the host already reads status={before}; the ceremony would "
+                  "release a containment it did not apply. Release it by hand first.", file=sys.stderr)
+            return EXIT_PRECONDITION
+        # From here a containment may be on the host. SIGINT/SIGTERM/SIGHUP only NOTE the signal, for the
+        # whole span through the release: nothing can kill the process or skip the release in a gap, and
+        # the exit code reports the interruption once the release is confirmed. (The calls in the span are
+        # bounded by their own timeouts, so a signal waits at most one poll.)
+        got = []
         ok = False
         err = None
-        with _signals(_raise_on_signal, (signal.SIGTERM, signal.SIGHUP)):
+        with _signals(lambda signum, _frame: got.append(signum), (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)):
             try:
                 dispatch(client, agent_id, "quarantine", {"exceptions": args.exceptions})
                 time.sleep(2)
                 ok = status_token(client, agent_id) == "active"
                 print(f"contained: {ok}")
-            except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure or signal
+            except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure
                 err = e
-        # ALWAYS release, then re-raise whatever stopped the containment step.
-        released = release_and_confirm(client, agent_id)
+            # ALWAYS release, then re-raise whatever stopped the containment step.
+            released = release_and_confirm(client, agent_id)
         print(f"released: {released}")
         if not released:
             print("RELEASE NOT CONFIRMED: clear the firewall by hand", file=sys.stderr)
             return EXIT_RELEASE_FAILED
+        if got:
+            print(f"interrupted by signal {got[0]}; containment released", file=sys.stderr)
+            return EXIT_FAIL
         if err is not None:
             raise err
         return EXIT_OK if ok else EXIT_FAIL
