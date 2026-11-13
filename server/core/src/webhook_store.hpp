@@ -126,6 +126,12 @@ public:
     /// thread right up until it finishes (see the file header).
     bool quiesce(std::chrono::milliseconds timeout);
 
+    /// Deliveries queued plus running on the delivery pool, and the most that can be (queue bound
+    /// plus workers). Feed `yuzu_server_delivery_pool_pending` / `_capacity` (store="webhook").
+    /// A snapshot, safe from any thread.
+    [[nodiscard]] std::size_t delivery_pool_pending() const;
+    [[nodiscard]] std::size_t delivery_pool_capacity() const noexcept;
+
     /// Create a new webhook. `secret` may be empty (no signing secret —
     /// deliveries fire unsigned, `has_secret=false`); a non-empty secret is
     /// envelope-encrypted before it ever reaches Postgres. Returns the
