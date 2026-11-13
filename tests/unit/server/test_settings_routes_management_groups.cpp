@@ -19,6 +19,7 @@
 #include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -484,9 +485,15 @@ TEST_CASE("Settings group create: a store fault answers fixed text, writes failu
     // With no parent, validate_new_group reads nothing, so the fault surfaces in the insert.
     exec_sql(db.dsn(), "DROP TABLE management_group_store.management_groups CASCADE");
 
+    yuzu::test::LogCapture cap;
     auto res = h.create("Store Down");
+    cap.stop();
     REQUIRE(res);
     CHECK(res->status == 200);
+    // The cause is recorded in the server log (not on the page, the toast or the audit rows).
+    CHECK(cap.text().find("management_group.create store fault: failed to create group") !=
+          std::string::npos);
+    CHECK(cap.text().find("does not exist") != std::string::npos);
     CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
                          "try again</span>") != std::string::npos);
     for (const char* leak : {"relation \"", "does not exist", "management_groups", "ERROR",

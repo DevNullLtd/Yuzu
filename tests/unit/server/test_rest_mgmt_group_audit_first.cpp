@@ -25,6 +25,7 @@
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include "pg/pg_raii.hpp"
 
@@ -410,9 +411,15 @@ TEST_CASE("POST /management-groups: a store fault on create answers 503 with a f
     // No parent, so validate_new_group reads nothing and passes; the INSERT then fails.
     drop_mgmt_table(h, "management_group_store.management_groups");
 
+    yuzu::test::LogCapture cap;
     auto res = h.create(R"({"name":"store-fault"})");
+    cap.stop();
     REQUIRE(res);
     CHECK(res->status == 503);
+    // The cause is recorded in the server log (not in the response or the audit rows).
+    CHECK(cap.text().find("management_group.create store fault: failed to create group") !=
+          std::string::npos);
+    CHECK(cap.text().find("does not exist") != std::string::npos);
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["retry_after_ms"].is_number());
     CHECK(res->body.find("management group store unavailable") != std::string::npos);

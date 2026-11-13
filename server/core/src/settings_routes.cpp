@@ -7108,10 +7108,14 @@ void SettingsRoutes::register_routes(
             (void)detail::emit_behavioral_audit(
                 audit_read_fn_, req, res, "management_group.create", "failure", "ManagementGroup",
                 "", conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
-            if (fault)
+            if (fault) {
+                // The cause is logged (sanitised), never shown on the page or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
                 store_fault();
-            else
+            } else {
                 refuse_text(result.error()); // a name conflict or a validation literal: closed text
+            }
             return;
         }
         // The group exists: a lost outcome row keeps the success response, marks it

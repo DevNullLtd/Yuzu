@@ -4820,6 +4820,9 @@ void RestApiV1::register_routes(
                 audit_fn, req, res, "management_group.create", "failure", "ManagementGroup", "",
                 conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
             if (fault) {
+                // The cause is logged (sanitised), never returned to the caller or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
                 mgmt_write_failed(res);
                 return;
             }

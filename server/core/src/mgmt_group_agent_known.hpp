@@ -66,7 +66,7 @@ classify_agent_known(const std::expected<std::optional<auth::PendingStatus>, Sto
         return AgentKnown::Unreadable;
     try {
         return classify_agent_known(auth_db->pending_status(agent_id));
-    } catch (const std::exception&) {
+    } catch (...) { // noexcept: a non-std exception must not terminate the process
         return AgentKnown::Unreadable; // never refuse the add on a lookup fault
     }
 }
