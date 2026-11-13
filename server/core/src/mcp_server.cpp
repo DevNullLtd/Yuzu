@@ -14763,6 +14763,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 //   - any other confined caller: the owner-only filter, exactly as before.
                 const ExecutionOwnerKey owner = execution_owner_key(*session);
                 const bool service_scoped = !session->token_scope_service.empty();
+                // Fail closed locally: both gates already refuse to admit a service-scoped
+                // session unrestricted, and without a scope this would list the whole fleet.
+                if (service_scoped && !gate.scope) {
+                    spdlog::error("list_executions: service-scoped session admitted without a "
+                                  "scope; failing closed rather than risk an unrestricted list");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
                 if (gate.scope && !service_scoped)
                     // Non-empty: the raw username was guarded above.
                     eq.dispatched_by = owner_only_filter(owner);

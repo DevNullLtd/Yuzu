@@ -53868,3 +53868,27 @@ TEST_CASE("MCP list_executions: a service-scoped engine row is refused 403, RBAC
           "[pg][mcp][execution][owner_rig][5557]") {
     check_mcp_engine_refusal(/*rbac_on=*/false);
 }
+
+// #5557: the tool's own fail-closed. Both real gates refuse to admit a service-scoped session
+// unrestricted, so this injects the defect they guard against (an admit carrying no scope) and
+// asserts the tool still lists nothing for the service-scoped credential.
+TEST_CASE("MCP list_executions: a service-scoped session admitted without a scope lists nothing",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::nullopt}; // the defect: admitted, unrestricted
+    };
+    ts.start("readonly");
+
+    const auto res = mcp_list_executions_as(ts, r.creds.mcp_svc_a);
+    REQUIRE(res);
+    CHECK(mcp_is_error(res));
+    CHECK(mcp_error_message(res) == "service unavailable");
+    for (const auto& id : r.all_seeded_ids())
+        CHECK(res->body.find(id) == std::string::npos);
+}

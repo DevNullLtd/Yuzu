@@ -9,8 +9,8 @@ s->owner = session->username;` bypass, a dropped or literal scope argument on th
 string-typed `execution_visible(...)`, a string overload, a mutation request that lost `.owner`, a
 raw-username guard replaced by a check on the key, a public string constructor on the key, the entry
 refusal deleted from each list gate, a second caller of `require_list_read_unchecked`, a second
-definition of the shared predicate, responder or key factory, and a second `ListAuthority`
-construction. It also requires the unmutated tree to pass, a comment or string literal holding the
+definition of the shared predicate, responder or key factory, a second `ListAuthority`
+construction, and the MCP `list_executions` local fail-closed deleted or weakened. It also requires the unmutated tree to pass, a comment or string literal holding the
 same text NOT to trip, and every frozen entry to be load-bearing (a stale entry fails). Stdlib only.
 """
 from __future__ import annotations
@@ -180,6 +180,26 @@ def main() -> int:
              "deps.execution_tracker->query_executions({.limit = 1000})",
              "deps.execution_tracker->query_executions({.limit = 99999})")):
         must_fail(what, t.check_scope_args, mutate(files, rel, old, new), "CHECK 3")
+    # MCP list_executions' local fail-closed for a service-scoped session admitted without a scope.
+    guard = ("if (service_scoped && !gate.scope) {\n"
+             "                    spdlog::error(\"list_executions: service-scoped session admitted without a \"\n"
+             "                                  \"scope; failing closed rather than risk an unrestricted list\");\n"
+             "                    res.set_content(error_response(id, kInternalError, \"service unavailable\"),\n"
+             "                                    \"application/json\");\n"
+             "                    return;\n"
+             "                }\n                ")
+    must_fail("the list_executions local fail-closed deleted", t.check_scope_args,
+              mutate(files, "mcp_server.cpp", guard, ""), "CHECK 3")
+    must_fail("the list_executions local fail-closed no longer returns", t.check_scope_args,
+              mutate(files, "mcp_server.cpp", guard, guard.replace("return;\n", "\n")), "CHECK 3")
+    must_fail("the list_executions guard condition inverted", t.check_scope_args,
+              mutate(files, "mcp_server.cpp", "if (service_scoped && !gate.scope) {",
+                     "if (!service_scoped && !gate.scope) {"), "CHECK 3")
+    must_fail("the list_executions service_scoped flag no longer read from the session",
+              t.check_scope_args,
+              mutate(files, "mcp_server.cpp",
+                     "const bool service_scoped = !session->token_scope_service.empty();",
+                     "const bool service_scoped = false;"), "CHECK 3")
     # a scope variable whose source is not confined_list_scope(, and a wrapped argument
     must_fail("a scope variable assigned from a hand value before the call", t.check_scope_args,
               mutate(files, "rest_api_v1.cpp", "scope_arg = confined_list_scope(owner, gate.scope);",

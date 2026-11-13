@@ -33,7 +33,9 @@ CHECK 3 (scope argument). Every call of `query_executions_checked(` / `get_child
   forms (`confined_list_scope(owner, ...)` plus the owner-only filter assignment pinned by CHECK 1),
   and a literal `std::nullopt` is allowed at three frozen sites only (the tracker's own unchecked
   wrappers and the home failed-execution read). The unchecked `query_executions(` callers are frozen
-  too, and the declarations carry no `= ...` default.
+  too, and the declarations carry no `= ...` default. MCP `list_executions` also keeps its local
+  fail-closed (`if (service_scoped && !gate.scope)` returns an internal error before the read), a
+  lexical pin.
 CHECK 4 (visibility predicates). `execution_visible(` and `admit_confined_mutation(` are called with
   four arguments whose last is an owner key (a variable typed `ExecutionOwnerKey`, `req.owner`, or
   `execution_owner_key(...)`), and each is DECLARED exactly once with an `ExecutionOwnerKey`
@@ -797,8 +799,43 @@ def _decl_params(files: dict[str, str], name: str):
     return out
 
 
+_LIST_EXEC_CALL = re.compile(r"\bquery_executions_checked\s*\(\s*eq\s*,\s*query_scope\s*\)")
+_SERVICE_SCOPED_DECL = re.compile(
+    r"\bconst\s+bool\s+service_scoped\s*=\s*!\s*session\s*->\s*token_scope_service\s*\.\s*empty\s*\(\s*\)\s*;")
+_LOCAL_GUARD = re.compile(
+    r"\bif\s*\(\s*service_scoped\s*&&\s*!\s*gate\s*\.\s*scope\s*\)\s*\{[^{}]*\bkInternalError\b[^{}]*\breturn\s*;\s*\}")
+
+
+def check_mcp_list_executions_guard(files: dict[str, str]) -> list[str]:
+    """MCP `list_executions` keeps its LOCAL fail-closed for a service-scoped session admitted
+    without a scope. Lexical: it proves the guard text sits before the checked read in the tool's
+    own block, not that it runs."""
+    rel = _SRC + "mcp_server.cpp"
+    sc = scan(files[rel]) if rel in files else None
+    if sc is None:
+        return [f"CHECK 3: {rel} not found"]
+    calls = list(_LIST_EXEC_CALL.finditer(sc.masked))
+    if len(calls) != 1:
+        return [f"CHECK 3: MCP list_executions: expected one `query_executions_checked(eq, query_scope)`, "
+                f"found {len(calls)}"]
+    lo, hi = _handler_span(sc.masked, calls[0].start())
+    if _handler_id(sc, lo) != "list_executions":
+        return ["CHECK 3: MCP list_executions: the checked read is not inside the list_executions block"]
+    before = sc.masked[lo:calls[0].start()]
+    errs: list[str] = []
+    if len(_SERVICE_SCOPED_DECL.findall(before)) != 1:
+        errs.append("CHECK 3: MCP list_executions: `service_scoped` must be declared once as "
+                    "`!session->token_scope_service.empty()`")
+    if len(_LOCAL_GUARD.findall(before)) != 1:
+        errs.append("CHECK 3: MCP list_executions: the local fail-closed "
+                    "`if (service_scoped && !gate.scope) { ... kInternalError ... return; }` is missing "
+                    "before the checked read")
+    return errs
+
+
 def check_scope_args(files: dict[str, str]) -> list[str]:
     calls, errs, unchecked = scope_calls(files)
+    errs = errs + check_mcp_list_executions_guard(files)
     canon = collections.Counter((r, c, a, tuple(i)) for r, c, a, i in calls)
     errs = list(errs)
     errs += _stale_and_extra(canon, SCOPE_CALLS, "CHECK 3 (scope argument)",
