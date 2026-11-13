@@ -110,41 +110,12 @@ class Status(unittest.TestCase):
         self.assertEqual(self.tok(two), "")
 
 
-class Reachable(unittest.TestCase):
-    def ok(self, dashboard, exceptions="127.0.0.1"):
-        return fc.dashboard_reachable_while_contained(dashboard, exceptions)
-
-    def test_loopback_and_covered_ip_literals_only(self):
-        self.assertTrue(self.ok("http://127.0.0.1:8080"))
-        self.assertTrue(self.ok("http://localhost:8080"))
-        self.assertTrue(self.ok("http://[::1]:8080"))
-        self.assertTrue(self.ok("http://192.0.2.7:8080", "127.0.0.1,192.0.2.7:8080"))
-        self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.7"))              # any port, outbound, both protocols
-        self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.0/24/tcp/out"))
-        self.assertTrue(self.ok("http://192.0.2.7:8080", "192.0.2.0/24:8080"))      # the prefix may carry the port
-        self.assertTrue(self.ok("https://192.0.2.7", "192.0.2.7:443/tcp"))           # scheme default port
-        self.assertTrue(self.ok("http://[2001:db8::7]:8080", "[2001:db8::7]:8080"))
-        self.assertTrue(self.ok("http://[2001:db8::7]:8080", "2001:db8::/32"))
-
-    def test_other_hosts_and_hostnames_are_refused(self):
-        self.assertFalse(self.ok("http://192.0.2.8:8080", "192.0.2.7"))
-        self.assertFalse(self.ok("http://dash.example:8080", "dash.example"))  # DNS is blocked while contained
-        self.assertFalse(self.ok("http://192.0.2.7:8080", "garbage,,"))
-
-    def test_an_entry_that_does_not_let_the_release_through_is_refused(self):
-        dash = "https://10.0.0.5:8443"
-        for entry in ("10.0.0.5:22", "10.0.0.5/udp", "10.0.0.5/in", "10.0.0.5/out/in", "10.0.0.0/8/in",
-                      "10.0.0.5:8443/udp", "10.0.0.5:8444", "0.0.0.0/0", "10.0.0.5/8/16", "10.0.0.5/x",
-                      "10.0.0.5:\u00b2", "10.0.0.5/\u00b2", "10.0.0.5:\u0664\u0664\u0663", "[10.0.0.5]:8443",
-                      "10.0.0.5/tcp/tcp", "10.0.0.5/out/out", "10.0.0.5" + "/tcp" * 40):
-            with self.subTest(entry=entry):
-                self.assertFalse(self.ok(dash, entry))
-        for entry in ("10.0.0.5:8443", "10.0.0.5:8443/tcp/out", "10.0.0.0/8", "10.0.0.0/8:8443/tcp"):
-            with self.subTest(entry=entry):
-                self.assertTrue(self.ok(dash, entry))
-
-    def test_an_unparseable_dashboard_is_refused_not_raised(self):
-        self.assertFalse(self.ok("https://[::1", "127.0.0.1"))
+class Local(unittest.TestCase):
+    def test_only_a_loopback_dashboard_is_allowed(self):
+        for ok in ("http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"):
+            self.assertTrue(fc.dashboard_is_local(ok), ok)
+        for bad in ("http://192.0.2.7:8080", "http://dash.example:8080", "https://[::1", "", "127.0.0.1"):
+            self.assertFalse(fc.dashboard_is_local(bad), bad)
 
 
 @unittest.skipUnless(hasattr(signal, "SIGHUP"), "the ceremony is POSIX-only")
@@ -260,14 +231,10 @@ class Flow(unittest.TestCase):
                                "quarantine": [{}], "release": [{}]}, extra=["--ttl-seconds", str(fc.MIN_TTL_S)])
         self.assertEqual(rc, fc.EXIT_OK)
 
-    def test_a_dashboard_the_contained_host_could_not_reach_is_refused(self):
+    def test_a_non_loopback_dashboard_is_refused_for_the_apply_only(self):
         rc, calls = self.run_main({}, dashboard="http://192.0.2.7:8080")
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
-        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                                   "quarantine": [{}], "release": [{}]}, dashboard="http://192.0.2.7:8080",
-                                  extra=["--exceptions", "127.0.0.1,192.0.2.7:8080"])
-        self.assertEqual(rc, fc.EXIT_OK)
         rc, _ = self.run_main({"quarantine_status": [row("inactive")]}, apply=False,
                               dashboard="http://192.0.2.7:8080")
         self.assertEqual(rc, fc.EXIT_OK)         # a probe-only run changes nothing, so any dashboard is fine
