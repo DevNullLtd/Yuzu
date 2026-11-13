@@ -323,7 +323,7 @@ row (tracker #7532), the same class as the pending-list race of #7147. The decom
 has an order row again. That is accepted: the row holds counters and the pair clock only, and a later
 decommission deletes it.
 
-Lock wait and pool bound of the agent step (owner-accepted trade). Every census-bearing first
+Lock wait and pool bound of the agent step (owner decision, 2026-11-12). Every census-bearing first
 delivery of an agent queues on that agent's order row, so one transaction that holds the row
 (for example the census fold of another rule of the same agent, a stalled commit, or an operator
 session left idle in a transaction) makes the agent's other first deliveries wait. A waiter holds a
@@ -342,7 +342,8 @@ is counted as a failed census projection. Such an event is acked and nothing on 
 reaper exempts pending rows (`NOT projection_pending`), so for a rule that never fires again on that
 agent it stays until a later verdict for that (agent, rule) retires it: the accepted pending-list
 class of #7147, now also reachable through an order-step wait of over 1 s. The census write and the
-fold keep the connection's own `lock_timeout`. The owner accepted that trade: a waiter fails fast
+fold keep the connection's own `lock_timeout`. The owner chose this trade on 2026-11-12, with the
+cost of faster pending growth stated in the option, over recording the pool bound alone: a waiter fails fast
 into pending instead of holding a pooled connection for 10 s, and the cost is faster pending growth
 for the waiting rules. Different agents do not wait on one another through this row, but they share
 the pool, so one agent holding its row for long can occupy leases until the shared pool saturates. Measured on one
