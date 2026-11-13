@@ -13837,12 +13837,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!result) {
                     // The attempted row is stored, so it gets an outcome with a FIXED token.
                     const auto token = create_failure_token(result.error());
-                    const bool conflict = token == "name_conflict";
-                    const bool fault = token == "store_error";
+                    const bool conflict = token == kMgmtGroupTokenNameConflict;
+                    const bool fault = token == kMgmtGroupTokenStoreError;
                     const bool audit_ok = mg_audit("management_group.create", "failure", "",
                                                    std::string(token));
-                    mcp_audit("failure", conflict ? "name_conflict"
-                                                  : (fault ? "store_error" : result.error()));
+                    mcp_audit("failure", conflict ? std::string(kMgmtGroupTokenNameConflict)
+                                                  : (fault ? std::string(kMgmtGroupTokenStoreError)
+                                                           : result.error()));
                     if (fault) {
                         // The cause is logged, never returned to the caller or audited.
                         spdlog::error("management_group.create store fault: {}",

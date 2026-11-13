@@ -4822,7 +4822,7 @@ void RestApiV1::register_routes(
             // The attempted row is stored, so it gets an outcome. The detail is a fixed token,
             // never the store text (which can carry database error output).
             const auto token = create_failure_token(result.error());
-            const bool fault = token == "store_error";
+            const bool fault = token == kMgmtGroupTokenStoreError;
             (void)detail::emit_behavioral_audit(audit_fn, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 std::string(token));
