@@ -221,8 +221,8 @@ services:
   # auto-discover the install CA at /etc/yuzu/certs/default-ca.pem, or take
   # --ca-cert <path> / --server <host:port>. Install paths:
   #   Linux  — yuzu-agent_X.Y.Z_amd64.deb / .x86_64.rpm
-  #   Windows — YuzuAgentSetup-X.Y.Z.exe (Authenticode-signed)
-  #   macOS   — YuzuAgent-X.Y.Z-macos-arm64.pkg (notarized)
+  #   Windows — YuzuAgentSetup-X.Y.Z.exe (NOT Authenticode-signed today, #239)
+  #   macOS   — YuzuAgent-X.Y.Z-macos-arm64.pkg (NOT signed or notarized)
   # See docs/user-manual/agent-install.md.
 
 volumes:
