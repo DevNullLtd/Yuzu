@@ -30130,6 +30130,186 @@ TEST_CASE("MCP add_management_group_member: the last token of the success detail
     CHECK(mg_add_row_field(ts, ts.audit_details, 0) == id); // attempted: the bare raw id
 }
 
+// `known` is shown only to a caller who may read enrolment status for that agent id: the
+// Enrollment:Read fleet-read check, admitted AND the id in scope (the pending-agents read's rule).
+// Otherwise it is omitted, exactly as for an unreadable lookup; the add and the audit flag are
+// unchanged.
+TEST_CASE("MCP add_management_group_member: known is asked of the Enrollment:Read fleet-read "
+          "check, and an admitted unconfined caller gets it",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-known", yuzu::server::auth::PendingStatus::approved);
+
+    std::vector<std::string> asked;
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.fleet_read_fn_for_test = [&asked](const httplib::Request&, httplib::Response&,
+                                         const std::string& type, const std::string& op)
+        -> yuzu::server::authz::FleetReadGate {
+        asked.push_back(type + ":" + op);
+        return {true, std::nullopt};
+    };
+    ts.start();
+    auto known = ts.call(mg_add_body(f.gid, "agent-known"));
+    auto absent = ts.call(mg_add_body(f.gid, "agent-never-seen"));
+    REQUIRE(known);
+    REQUIRE(absent);
+    CHECK(mg_add_payload(*known)["known"] == true);
+    CHECK(mg_add_payload(*absent)["known"] == false);
+    CHECK(asked == std::vector<std::string>{"Enrollment:Read", "Enrollment:Read"});
+}
+
+TEST_CASE("MCP add_management_group_member: a caller who fails the fleet-read check gets no known, "
+          "for an enrolled id and an absent one alike, and the add still succeeds",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-known", yuzu::server::auth::PendingStatus::approved);
+
+    const int refusal = GENERATE(401, 403, 503); // unauthenticated, forbidden, degraded
+    INFO("fleet-read refusal status " << refusal);
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.fleet_read_fn_for_test = [refusal](const httplib::Request&, httplib::Response& res,
+                                          const std::string&, const std::string&)
+        -> yuzu::server::authz::FleetReadGate {
+        res.status = refusal; // the real gate writes its own error body; it must not reach the call
+        res.set_content(R"({"error":"gate"})", "application/json");
+        return {}; // admitted=false
+    };
+    ts.start();
+    auto known = ts.call(mg_add_body(f.gid, "agent-known"));
+    auto absent = ts.call(mg_add_body(f.gid, "agent-never-seen"));
+    REQUIRE(known);
+    REQUIRE(absent);
+    CHECK(known->status == 200);
+    CHECK(absent->status == 200);
+    const auto kp = mg_add_payload(*known);
+    const auto ap = mg_add_payload(*absent);
+    CHECK(kp == nlohmann::json{{"added", true}});
+    CHECK(kp == ap); // the two answers cannot be told apart
+    CHECK(f.store.get_members(f.gid).size() == 2);
+
+    // The success rows (attempted, success, attempted, success) still carry the real flag.
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-known agent_known=1");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 3) == "agent-never-seen agent_known=0");
+}
+
+TEST_CASE("MCP add_management_group_member: a confined caller is told known only for an id inside "
+          "its scope",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-in-scope", yuzu::server::auth::PendingStatus::approved);
+    mg_enrol(*auth_db, "agent-hidden", yuzu::server::auth::PendingStatus::approved);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-in-scope"}};
+    };
+    ts.start();
+    auto in_scope = ts.call(mg_add_body(f.gid, "agent-in-scope"));
+    auto hidden = ts.call(mg_add_body(f.gid, "agent-hidden"));
+    auto absent = ts.call(mg_add_body(f.gid, "agent-never-seen"));
+    REQUIRE(in_scope);
+    REQUIRE(hidden);
+    REQUIRE(absent);
+    CHECK(mg_add_payload(*in_scope)["known"] == true);
+    // An enrolled device the caller's scope hides reads exactly like an id that is not enrolled.
+    CHECK(mg_add_payload(*hidden) == nlohmann::json{{"added", true}});
+    CHECK(mg_add_payload(*hidden) == mg_add_payload(*absent));
+    CHECK(mg_add_row_field(ts, ts.audit_details, 3) == "agent-hidden agent_known=1");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 5) == "agent-never-seen agent_known=0");
+}
+
+TEST_CASE("MCP add_management_group_member: an admitted caller with nothing in scope gets no known",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-known", yuzu::server::auth::PendingStatus::approved);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()}; // present-empty: never unconfined
+    };
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-known"));
+    REQUIRE(res);
+    CHECK(mg_add_payload(*res) == nlohmann::json{{"added", true}});
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-known agent_known=1");
+}
+
+TEST_CASE("MCP add_management_group_member: an unwired fleet-read check omits known (fail closed) "
+          "and the add and the audit flag are unchanged",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-known", yuzu::server::auth::PendingStatus::approved);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.fleet_read_fn_for_test = {}; // genuinely empty, not the fixture's permissive default
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-known"));
+    REQUIRE(res);
+    CHECK(mg_add_payload(*res) == nlohmann::json{{"added", true}});
+    CHECK(f.store.get_members(f.gid).size() == 1);
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-known agent_known=1");
+}
+
+TEST_CASE("MCP add_management_group_member: a fleet-read check that throws omits known and does "
+          "not fail the add",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-known", yuzu::server::auth::PendingStatus::approved);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        throw std::runtime_error("authorization store fault");
+    };
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-known"));
+    REQUIRE(res);
+    CHECK(mg_add_payload(*res) == nlohmann::json{{"added", true}});
+    CHECK(res->body.find("authorization store fault") == std::string::npos);
+    CHECK(f.store.get_members(f.gid).size() == 1);
+}
+
+TEST_CASE("MCP add_management_group_member: an unreadable lookup still omits known for a caller "
+          "who passes the fleet-read check",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts; // no AuthDB: unreadable; the fixture's fleet-read check admits
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    CHECK(mg_add_payload(*res) == nlohmann::json{{"added", true}});
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-1 agent_known=unreadable");
+}
+
 TEST_CASE("MCP add_management_group_member: a group deleted between the check and the insert "
           "answers group not found and records a group_not_found failure row",
           "[mcp][pg][management_group][mgmt-audit-first]") {

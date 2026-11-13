@@ -1160,14 +1160,15 @@ static const ToolDef kTools[] = {
      "group is a no-op. Mirrors POST /api/v1/management-groups/{id}/members. Requires "
      "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
      "extends the member set, overwrites nothing. An agent id the server has not enrolled is "
-     "still added; the result's `known` says whether it is an enrolled device (omitted when that "
-     "could not be checked).",
+     "still added; the result's `known` says whether it is an enrolled device, and is omitted "
+     "when that could not be checked or when the caller may not read enrolment status for that "
+     "agent.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent to add as a static member"})j"
      R"j(},"required":["group_id","agent_id"]})j",
      R"j({"type":"object","properties":{"added":{"type":"boolean"},)j"
-     R"j("known":{"type":"boolean","description":"True when the agent id is an enrolled device, false when it is not; omitted when the enrolment lookup could not be made"}},)j"
+     R"j("known":{"type":"boolean","description":"True when the agent id is an enrolled device, false when it is not; omitted when the enrolment lookup could not be made or when the caller may not read enrolment status for that agent"}},)j"
      R"j("required":["added"]})j"},
 
     {"list_management_group_roles",
@@ -14223,7 +14224,12 @@ McpServer::HandlerFn McpServer::build_handler(
                              group_id, add_member_success_detail(agent_id, agent_known));
                 JObj payload;
                 payload.add("added", true);
-                if (agent_known != AgentKnown::Unreadable) // omitted, never false, when unreadable
+                // `known` is omitted, never false, when the lookup was unreadable, and also when the
+                // caller may not read enrolment status for this id (the same omission: the answer
+                // cannot tell an enrolled id from an absent one to a caller who fails the
+                // fleet-read check). The audit row above still carries the real flag.
+                if (agent_known != AgentKnown::Unreadable &&
+                    caller_may_see_agent_known(fleet_read_fn_, req, agent_id))
                     payload.add("known", agent_known == AgentKnown::Known);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
