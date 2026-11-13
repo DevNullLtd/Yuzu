@@ -58,44 +58,78 @@ PARTITION: greedy longest-processing-time. Each unit gets a weight
   the default weight and lands in exactly one shard. Within a shard the
   modules run in sorted name order.
 
-WEIGHT_HINTS: per-module wall time in seconds on the Windows MSVC leg (the
-  slowest leg), from the `[done in X s]` lines of run 39103378230 (head
-  5adc6e5f8). Modules at or above ~5s are listed; everything else is close
-  enough to the default that listing it buys nothing. A hint only steers
-  balance — a stale or missing entry can never drop or duplicate a module.
-  Re-derive from a fresh Windows log when the shards drift apart (the
-  wrapper prints each shard's module list and weight total).
+WEIGHT_HINTS: per-module wall time in seconds, as a shard runs it (cover
+  OFF, see COVER below), from the eunit_surefire reports (`TEST-<M>.xml`
+  `time`) of one sequential run of every unit on a 32-core Linux dev box
+  (OTP 28.5.0.1, 2026-11-13; with cover on, the same box's module sums for
+  the old two shards, 241s and 218s, were within ~10% of the 250s and 200s
+  the Linux CI leg measured). Modules at or above 2s are listed (33 of
+  them, 234s of the 268s total); the other 88 average 0.4s, so the 1.0s
+  default slightly over-weights them. A hint only steers balance -- a stale
+  or missing entry can never drop or duplicate a module. Re-derive when the
+  shards drift apart: run the shards (or one `rebar3 eunit` over every
+  unit), read `_build/test/eunit/TEST-*.xml`, and list the modules over 2s
+  (the wrapper prints each shard's module list and weight total). The
+  earlier table came from the Windows MSVC leg WITH cover; on Linux it no
+  longer balanced the shards (about 250s against 200s on CI), and cover's
+  meck overhead (below) inflates some modules far more than others.
+
+COVER: a shard runs with the test profile's `cover_enabled` forced to false
+  (gateway/eunit_shard.config.script); a plain `rebar3 eunit --dir ...` keeps
+  rebar.config's `{cover_enabled, true}`. With cover on, every `meck:new` /
+  `meck:unload` of a cover-compiled `src/` module (yuzu_grpc_client,
+  yuzu_gw_upstream, ...) goes through meck's cover preservation
+  (meck_proc / meck_cover): export the module's cover data to a
+  `<Mod>.<ospid>.coverdata` file in the cwd, cover-compile a renamed copy of
+  the original, and on unload cover-recompile the original from its beam and
+  import the data back -- so a `foreach` fixture that mocks src modules pays
+  that on every test. Measured on the whole suite: 459s with cover, 268s
+  without, the same 2807 tests passing (yuzu_gw_app_tests 53.8s -> 13.4s,
+  yuzu_gw_heartbeat_buffer_bound_tests 54.3s -> 20.7s,
+  yuzu_gw_heartbeat_binding_tests 43.0s -> 14.4s). Nothing reads a shard's
+  cover data (no CI step runs `rebar3 cover` or uploads
+  `_build_eunit_*/test/cover`), and no test reads cover state: turning it
+  off only stops instrumenting the code under test, which then runs faster. `gateway ct` keeps cover:
+  measured, it costs ct nothing (103.4s of cases without, 104.0s with).
 """
 import os
 import re
 
-# Seconds on Windows MSVC, run 39103378230 (5adc6e5f8), `[done in X s]`.
-# yuzu_grpc_client_channel_tests was still running when that run hit its
-# deadline, so its value is the macOS measurement (14.2s) scaled by the
-# ~2.1x Windows/macOS ratio of the other heavy modules.
+# Seconds per module with cover off, Linux, 2026-11-13 (see WEIGHT_HINTS above).
 WEIGHT_HINTS = {
-    "yuzu_gw_heartbeat_buffer_bound_tests": 64.3,
-    "yuzu_gw_heartbeat_binding_tests": 52.3,
-    "yuzu_gw_app_tests": 50.1,
-    "yuzu_gw_registration_replay_tests": 39.0,
-    "yuzu_grpc_client_channel_tests": 30.0,
-    "yuzu_gw_notify_ack_tests": 25.7,
-    "yuzu_gw_heartbeat_verdict_tests": 23.2,
-    "yuzu_gw_health_tests": 18.2,
-    "yuzu_grpc_listener_tests": 15.3,
-    "yuzu_gw_session_cap_tests": 15.0,
-    "yuzu_gw_notify_pending_tests": 13.3,
-    "yuzu_gw_log_text_sites_tests": 11.7,
-    "yuzu_gw_register_lifecycle_tests": 10.7,
-    "yuzu_gw_owner_restart_tests": 9.1,
-    "yuzu_gw_agent_registration_tests": 8.4,
-    "yuzu_gw_mgmt_pins_tests": 7.8,
-    "yuzu_gw_heartbeat_conn_rpc_tests": 6.6,
-    "yuzu_grpc_client_tests": 6.5,
-    "yuzu_gw_memory_shedder_tests": 6.3,
-    "yuzu_gw_circuit_breaker_tests": 5.8,
-    "yuzu_gw_register_bound_tests": 5.4,
-    "yuzu_gw_upstream_notify_result_tests": 5.0,
+    "yuzu_gw_notify_ack_tests": 26.3,
+    "yuzu_gw_heartbeat_buffer_bound_tests": 20.7,
+    "yuzu_gw_health_tests": 18.0,
+    "yuzu_gw_heartbeat_binding_tests": 14.4,
+    "yuzu_gw_registration_replay_tests": 14.3,
+    "yuzu_grpc_client_channel_tests": 14.1,
+    "yuzu_grpc_listener_tests": 13.6,
+    "yuzu_gw_app_tests": 13.4,
+    "yuzu_grpc_client_tests": 9.6,
+    "yuzu_gw_owner_restart_tests": 8.8,
+    "yuzu_gw_grpc_memory_bounds_tests": 8.4,
+    "yuzu_gw_heartbeat_verdict_tests": 7.5,
+    "yuzu_gw_mgmt_crl_watcher_tests": 6.8,
+    "yuzu_gw_notify_pending_tests": 5.4,
+    "yuzu_gw_session_cap_tests": 4.8,
+    "yuzu_gw_log_text_sites_tests": 3.8,
+    "yuzu_gw_register_lifecycle_tests": 3.4,
+    "yuzu_gw_mgmt_crl_hardening_tests": 3.4,
+    "yuzu_gw_runtime_metrics_tests": 3.2,
+    "yuzu_gw_circuit_breaker_nf_tests": 3.0,
+    "yuzu_gw_inventory_admission_tests": 3.0,
+    "yuzu_grpc_client_tls_tests": 3.0,
+    "yuzu_gw_circuit_breaker_tests": 2.9,
+    "yuzu_gw_agent_registration_tests": 2.6,
+    "yuzu_gw_mgmt_pins_tests": 2.5,
+    "yuzu_gw_heartbeat_conn_rpc_tests": 2.5,
+    "yuzu_gw_mgmt_crl_install_tests": 2.4,
+    "yuzu_gw_mgmt_edge_tests": 2.2,
+    "yuzu_gw_mgmt_crl_source_tests": 2.1,
+    "yuzu_gw_register_bound_tests": 2.1,
+    "yuzu_gw_replay_concurrency_tests": 2.1,
+    "yuzu_gw_planned_stop_tests": 2.0,
+    "yuzu_gw_health_concurrency_tests": 2.0,
 }
 DEFAULT_TEST_WEIGHT = 1.0    # an unlisted `*_tests` module
 DEFAULT_HELPER_WEIGHT = 0.0  # anything else: no test functions today
