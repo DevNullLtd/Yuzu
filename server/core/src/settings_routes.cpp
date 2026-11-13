@@ -43,6 +43,7 @@
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "mgmt_group_error.hpp"       // mgmt_group_error_is_store_fault (management-group create)
 #include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
@@ -6996,6 +6997,15 @@ void SettingsRoutes::register_routes(
 
     // -- Settings API: Management Groups (HTMX) --------------------------------
 
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the twins
+    // are POST /api/v1/management-groups and the MCP create_management_group tool. Every refusal
+    // that needs no write to decide (permission, empty name, `validate_new_group`) answers first
+    // and burns no row. The `attempted` row can wait on the audit pool, so the session and the
+    // permission are decided again after it. Failure rows carry FIXED detail tokens only, and
+    // no store text reaches the page: a store fault answers a fixed message, a validation
+    // refusal echoes its own closed text, HTML-escaped. The form swaps the response body into
+    // #mgmt-groups-section (htmx drops a 4xx/5xx body), so a refusal that must be seen carries
+    // an HX-Trigger toast too.
     sink.Post("/api/settings/management-groups", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!perm_fn_(req, res, "ManagementGroup", "Write"))
@@ -7008,29 +7018,91 @@ void SettingsRoutes::register_routes(
                             "text/html; charset=utf-8");
             return;
         }
+        const auto set_toast = [&res](const std::string& message, const char* level) {
+            res.set_header("HX-Trigger",
+                           nlohmann::json{{"showToast", {{"message", message}, {"level", level}}}}
+                               .dump());
+        };
+        const auto refuse_text = [&res](const std::string& text) {
+            res.set_content("<span class=\"feedback-error\">" + html_escape(text) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        // A fault of the store itself: fixed text, never the store's own (libpq) message.
+        const auto store_fault = [&]() {
+            static const std::string kMsg = "Management group store unavailable, try again";
+            set_toast(kMsg, "error");
+            refuse_text(kMsg);
+        };
         ManagementGroup g;
         g.name = name;
         g.parent_id = parent_id;
         g.membership_type = mtype.empty() ? "static" : mtype;
+
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row.
+        if (auto valid = mgmt_group_store_->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error()))
+                store_fault();
+            else
+                refuse_text(valid.error());
+            return;
+        }
+
         auto session = auth_fn_(req, res);
         if (session)
             g.created_by = session->username;
-        auto result = mgmt_group_store_->create_group(g);
-        if (!result) {
-            res.set_content("<span class=\"feedback-error\">" + result.error() + "</span>",
-                            "text/html; charset=utf-8");
+
+        if (!detail::audit_attempted(audit_read_fn_, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name)) {
+            // audit_attempted wrote the 503 A4 envelope + Sec-Audit-Failed; the form would show
+            // nothing for it, so add the toast.
+            set_toast("Audit log unavailable: the group was not created", "error");
             return;
         }
-        if (audit_store_) {
-            AuditEvent ae;
-            ae.principal = session ? session->username : "unknown";
-            ae.action = "management_group.create";
-            ae.target_type = "ManagementGroup";
-            ae.target_id = *result;
-            ae.detail = name;
-            ae.result = "success";
-            (void)audit_store_->log(ae);
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing.
+        const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
+        if (!fresh_session) {
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                "session_revoked");
+            if (res.status < 400) { // auth_fn_ writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return;
         }
+        if (!perm_fn_(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(audit_read_fn_, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                "permission_revoked");
+            return;
+        }
+        g.created_by = fresh_session->username;
+
+        auto result = mgmt_group_store_->create_group(g);
+        if (!result) {
+            // The attempted row is stored, so it gets an outcome with a FIXED token, never the
+            // store text (which can carry database error output).
+            const bool conflict = result.error() == "a group with that name already exists";
+            const bool fault = !conflict && mgmt_group_error_is_store_fault(result.error());
+            (void)detail::emit_behavioral_audit(
+                audit_read_fn_, req, res, "management_group.create", "failure", "ManagementGroup",
+                "", conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
+            if (fault)
+                store_fault();
+            else
+                refuse_text(result.error()); // a name conflict or a validation literal: closed text
+            return;
+        }
+        // The group exists: a lost outcome row keeps the success response, marks it
+        // `Sec-Audit-Failed` and says so in a toast (the `attempted` row stands as "started,
+        // outcome unknown"). Nothing is rolled back.
+        if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "management_group.create",
+                                           "success", "ManagementGroup", *result, g.name))
+            set_toast("Group created, but its audit record could not be stored", "warning");
         res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
     });
 
