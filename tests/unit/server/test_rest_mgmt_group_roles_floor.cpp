@@ -760,7 +760,7 @@ TEST_CASE("POST /management-groups/{id}/members: a clean agent_id is added and a
     CHECK(h.audits[1].action == "management_group.add_member");
     CHECK(h.audits[1].result == "success");
     CHECK(h.audits[1].target_id == gid);
-    CHECK(h.audits[1].detail == "agent-1");
+    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable"); // this harness wires no AuthDB
 }
 
 TEST_CASE("POST /management-groups/{id}/members: a store error answers 503 with a failure row, "

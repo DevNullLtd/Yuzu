@@ -20,6 +20,7 @@
 
 #include "management_group_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_auth_db_pg_helper.hpp" // AuthDbPg: a real AuthDB for the agent-known flag
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
@@ -31,9 +32,11 @@
 #include <yuzu/server/auth.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <cstddef>
 #include <functional>
 #include <optional>
@@ -53,6 +56,9 @@ struct AuditFirstHarness {
     // Declared FIRST: the store borrows it via set_metrics(), so it must outlive the store.
     yuzu::MetricsRegistry metrics;
     yuzu::test::ManagementGroupStorePg mgmt_bundle; // SKIPs without a PG DSN
+    /// A real AuthDB (its own database), wired as `auth_db` only when the harness is built with
+    /// `with_auth_db`; otherwise `auth_db` is null (the "no lookup source" case).
+    std::optional<yuzu::test::AuthDbPg> auth_db_pg;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
 
@@ -111,8 +117,10 @@ struct AuditFirstHarness {
         return false;
     }
 
-    AuditFirstHarness() {
+    explicit AuditFirstHarness(bool with_auth_db = false) {
         mgmt_bundle->set_metrics(&metrics);
+        if (with_auth_db)
+            auth_db_pg.emplace();
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -184,7 +192,7 @@ struct AuditFirstHarness {
                             /*response_scope_fn=*/{},
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr,
-                            /*auth_db=*/nullptr,
+                            /*auth_db=*/auth_db_pg ? auth_db_pg->get() : nullptr,
                             /*directory_sync=*/nullptr);
     }
 
@@ -546,11 +554,13 @@ TEST_CASE("POST /management-groups/{id}/members: success writes attempted then s
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[0].target_type == "ManagementGroup");
     CHECK(h.audits[0].target_id == gid);
-    CHECK(h.audits[0].detail == "agent-1");
+    CHECK(h.audits[0].detail == "agent-1"); // the attempted row keeps the bare raw id
     CHECK(h.audits[1].action == kAdd);
     CHECK(h.audits[1].result == "success");
     CHECK(h.audits[1].target_id == gid);
-    CHECK(h.audits[1].detail == "agent-1");
+    // No AuthDB is wired here, so the lookup is unreadable (see the agent-known cases below).
+    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable");
+    CHECK(res->body.find("\"known\"") == std::string::npos); // omitted, never false
 }
 
 TEST_CASE("POST /management-groups/{id}/members: a lost outcome row keeps the 201 and marks the "
@@ -818,4 +828,214 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a session or grant go
         CHECK(h.audits[1].detail == "permission_revoked");
     }
     CHECK(h.member_count(gid) == 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Add member reports whether the agent id is a known device (#6967, #7074): accept and flag.
+// "Known" = a row in the durable enrolment table (`AuthDB::pending_status`). The flag never
+// changes whether the add happens; an unreadable lookup is never reported as "unknown".
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+
+/// Put an enrolment row for `agent_id` in the harness's real AuthDB, in the given status.
+void enrol(AuditFirstHarness& h, const std::string& agent_id, auth::PendingStatus status) {
+    REQUIRE(h.auth_db_pg.has_value());
+    auth::PendingAgent a;
+    a.agent_id = agent_id;
+    a.hostname = "host-1";
+    a.os = "linux";
+    a.arch = "x64";
+    a.agent_version = "1.0.0";
+    a.requested_at = std::chrono::system_clock::now();
+    a.status = auth::PendingStatus::pending;
+    auto added = h.auth_db_pg->get()->add_pending(a);
+    REQUIRE(added.has_value());
+    REQUIRE(*added);
+    if (status == auth::PendingStatus::approved)
+        REQUIRE(h.auth_db_pg->get()->approve_pending(agent_id, "admin").has_value());
+    else if (status == auth::PendingStatus::denied)
+        REQUIRE(h.auth_db_pg->get()->deny_pending(agent_id, "admin").has_value());
+}
+
+nlohmann::json add_body(const std::string& agent_id) {
+    return nlohmann::json{{"agent_id", agent_id}};
+}
+
+/// The `data` object of a 201 answer.
+nlohmann::json data_of(const httplib::Response& res) {
+    return nlohmann::json::parse(res.body).at("data");
+}
+
+} // namespace
+
+TEST_CASE("POST /management-groups/{id}/members: a known device (any enrolment status) reports "
+          "known:true and the success row ends with agent_known=1",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "known-ok");
+
+    const auto status = GENERATE(auth::PendingStatus::pending, auth::PendingStatus::approved,
+                                 auth::PendingStatus::denied);
+    INFO("enrolment status " << static_cast<int>(status));
+    enrol(h, "agent-known", status);
+
+    auto res = h.add_member(gid, add_body("agent-known").dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    const auto data = data_of(*res);
+    CHECK(data["added"] == true);
+    REQUIRE(data.contains("known"));
+    CHECK(data["known"] == true);
+    CHECK(h.member_count(gid) == 1);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].detail == "agent-known"); // the attempted row keeps the bare raw id
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == "agent-known agent_known=1");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: an unknown device is still added, flagged "
+          "known:false and agent_known=0",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "unknown-ok");
+    enrol(h, "agent-known", auth::PendingStatus::approved); // a different id exists
+
+    auto res = h.add_member(gid, add_body("agent-never-seen").dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    const auto data = data_of(*res);
+    CHECK(data["added"] == true);
+    REQUIRE(data.contains("known"));
+    CHECK(data["known"] == false);
+
+    // The member row exists: an unknown id is flagged, never refused.
+    const auto members = h.mgmt_bundle->get_members(gid);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0].agent_id == "agent-never-seen");
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].detail == "agent-never-seen");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == "agent-never-seen agent_known=0");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: matching is exact, a case-only mismatch of a "
+          "known id is unknown and is not refused",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "case-only");
+    enrol(h, "Agent-ABC", auth::PendingStatus::approved);
+
+    auto res = h.add_member(gid, add_body("agent-abc").dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(data_of(*res)["known"] == false);
+    CHECK(h.member_count(gid) == 1);
+}
+
+TEST_CASE("POST /management-groups/{id}/members: an id the enrolment store cannot hold (a comma, "
+          "over 256 bytes) is unknown, not unreadable, and is still added",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "invalid-input");
+
+    const std::string id = GENERATE(std::string("web,01"), std::string(257, 'a'));
+    INFO("agent id length " << id.size());
+
+    auto res = h.add_member(gid, add_body(id).dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    const auto data = data_of(*res);
+    REQUIRE(data.contains("known"));
+    CHECK(data["known"] == false);
+    CHECK(h.member_count(gid) == 1);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == id + " agent_known=0");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: no AuthDB wired omits known, records "
+          "agent_known=unreadable and still adds",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h; // auth_db is null
+    const std::string gid = make_group(h, "no-auth-db");
+
+    auto res = h.add_member(gid, add_body("agent-1").dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    const auto data = data_of(*res);
+    CHECK(data["added"] == true);
+    CHECK_FALSE(data.contains("known")); // omitted, never false
+    CHECK(h.member_count(gid) == 1);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a lookup store error omits known, records "
+          "agent_known=unreadable and still adds, never reporting unknown",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "lookup-error");
+    enrol(h, "agent-1", auth::PendingStatus::approved); // would be known if the table were readable
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(conn.get(), "DROP TABLE auth.pending_agents CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    auto res = h.add_member(gid, add_body("agent-1").dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    const auto data = data_of(*res);
+    CHECK(data["added"] == true);
+    CHECK_FALSE(data.contains("known"));
+    CHECK(res->body.find("auth.pending_agents") == std::string::npos); // no store text
+    CHECK(h.member_count(gid) == 1);
+
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable");
+}
+
+TEST_CASE("POST /management-groups/{id}/members: the last token of the success detail is the "
+          "flag, even for an id that spells it",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "forged-suffix");
+    const std::string id = "x agent_known=1"; // a space and the flag text inside the raw id
+
+    auto res = h.add_member(gid, add_body(id).dump());
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(data_of(*res)["known"] == false); // no such enrolment row
+
+    REQUIRE(h.audits.size() == 2);
+    const auto& d = h.audits[1].detail;
+    CHECK(d == id + " agent_known=0");
+    CHECK(d.substr(d.rfind(' ') + 1) == "agent_known=0");
+    CHECK(h.audits[0].detail == id); // the attempted row stays the bare raw id
+}
+
+TEST_CASE("POST /management-groups/{id}/members: the lookup never refuses, and a failed attempted "
+          "row still refuses before any member is added",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h(/*with_auth_db=*/true);
+    const std::string gid = make_group(h, "lookup-no-refuse");
+    h.fail_audit.insert(std::string(kAdd) + "|attempted");
+
+    auto res = h.add_member(gid, add_body("agent-never-seen").dump());
+    REQUIRE(res);
+    CHECK(res->status == 503); // the audit-first refusal, not a lookup refusal
+    CHECK(res->has_header("Sec-Audit-Failed"));
+    CHECK(res->body.find("\"known\"") == std::string::npos);
+    CHECK(h.member_count(gid) == 0);
 }

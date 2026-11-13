@@ -36,6 +36,7 @@
 #include "reserved_definition_id.hpp" // #3685: kMcpDefinitionPrefix, for the pre-seeded-ticket test
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
+#include "test_auth_db_pg_helper.hpp"   // AuthDbPg — a real AuthDB for the add-member agent-known flag
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
 #include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
@@ -117,6 +118,7 @@
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp> // GENERATE: add-member agent-known cases
 #include <catch2/matchers/catch_matchers.hpp>        // REQUIRE_THROWS_WITH (#2383)
 #include <catch2/matchers/catch_matchers_exception.hpp> // MessageMatches (M.10b)
 #include <catch2/matchers/catch_matchers_string.hpp> // ContainsSubstring (#2383)
@@ -1449,6 +1451,9 @@ struct McpTestServer {
     /// preview_management_group_agent_count, which were already hardcoded to
     /// nullptr before this PR) on the "store unavailable" path.
     yuzu::server::ManagementGroupStore* mgmt_store_for_test{nullptr};
+    /// Optionally wire a real AuthDB as build_handler's `auth_db` (add_management_group_member
+    /// reads `pending_status` for its `known` flag). Default nullptr: no lookup source.
+    yuzu::server::AuthDB* auth_db_for_test{nullptr};
     /// B4: optionally wire a lockout-clear callback so unlock_account can be
     /// exercised end-to-end. Default unset (empty std::function) keeps every
     /// pre-existing test on the "lockout subsystem unavailable" path, mirroring
@@ -2035,7 +2040,7 @@ private:
             // what this call actually needs; nullptr is the pre-existing default.
             /*engine_principal_store=*/nullptr,
             /*access_review_store=*/nullptr,
-            /*auth_db=*/nullptr,
+            /*auth_db=*/auth_db_for_test,
             /*directory_sync=*/directory_sync_for_test,
             /*caller_fn=*/caller_fn_for_test,
             // 2f PR 3b: the POST handler leases from the SAME budget as GET.
@@ -29847,15 +29852,17 @@ TEST_CASE("MCP add_management_group_member: success writes attempted then succes
     auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(payload["added"] == true);
     CHECK_FALSE(payload.contains("audit_persisted"));
+    CHECK_FALSE(payload.contains("known")); // no AuthDB wired: unreadable, omitted, never false
     REQUIRE(f.store.get_members(f.gid).size() == 1);
 
     CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
                                                       "management_group.add_member|success"});
     for (std::size_t n = 0; n < 2; ++n) {
         CHECK(mg_add_row_field(ts, ts.audit_target_ids, n) == f.gid);
-        CHECK(mg_add_row_field(ts, ts.audit_details, n) == "agent-1");
         CHECK(mg_add_row_field(ts, ts.audit_target_types, n) == "ManagementGroup");
     }
+    CHECK(mg_add_row_field(ts, ts.audit_details, 0) == "agent-1"); // attempted: the bare raw id
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-1 agent_known=unreadable");
 }
 
 TEST_CASE("MCP add_management_group_member: a lost success row keeps the result and reports "
@@ -29916,6 +29923,211 @@ TEST_CASE("MCP add_management_group_member: a store fault on the insert answers 
                                                       "management_group.add_member|failure"});
     CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "store_error");
     CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
+}
+
+// Add member reports whether the agent id is a known device (#6967, #7074): accept and flag.
+// "Known" = a row in the durable enrolment table (`AuthDB::pending_status`). The flag never
+// changes whether the add happens; an unreadable lookup is never reported as "unknown".
+namespace {
+
+/// Put an enrolment row for `agent_id` in a real AuthDB, in the given status.
+void mg_enrol(yuzu::server::AuthDB& db, const std::string& agent_id,
+              yuzu::server::auth::PendingStatus status) {
+    yuzu::server::auth::PendingAgent a;
+    a.agent_id = agent_id;
+    a.hostname = "host-1";
+    a.os = "linux";
+    a.arch = "x64";
+    a.agent_version = "1.0.0";
+    a.requested_at = std::chrono::system_clock::now();
+    a.status = yuzu::server::auth::PendingStatus::pending;
+    auto added = db.add_pending(a);
+    REQUIRE(added.has_value());
+    REQUIRE(*added);
+    if (status == yuzu::server::auth::PendingStatus::approved)
+        REQUIRE(db.approve_pending(agent_id, "admin").has_value());
+    else if (status == yuzu::server::auth::PendingStatus::denied)
+        REQUIRE(db.deny_pending(agent_id, "admin").has_value());
+}
+
+/// The tool-result payload of a successful add_management_group_member call.
+nlohmann::json mg_add_payload(const httplib::Response& res) {
+    auto body = nlohmann::json::parse(res.body);
+    REQUIRE(body.contains("result"));
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+}
+
+} // namespace
+
+TEST_CASE("MCP add_management_group_member: a known device (any enrolment status) reports "
+          "known:true and the success row ends with agent_known=1",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+
+    const auto status = GENERATE(yuzu::server::auth::PendingStatus::pending,
+                                 yuzu::server::auth::PendingStatus::approved,
+                                 yuzu::server::auth::PendingStatus::denied);
+    INFO("enrolment status " << static_cast<int>(status));
+    mg_enrol(*auth_db, "agent-known", status);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-known"));
+    REQUIRE(res);
+    const auto payload = mg_add_payload(*res);
+    CHECK(payload["added"] == true);
+    REQUIRE(payload.contains("known"));
+    CHECK(payload["known"] == true);
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    CHECK(f.store.get_members(f.gid).size() == 1);
+
+    CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                      "management_group.add_member|success"});
+    CHECK(mg_add_row_field(ts, ts.audit_details, 0) == "agent-known"); // bare raw id
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-known agent_known=1");
+}
+
+TEST_CASE("MCP add_management_group_member: an unknown device is still added, flagged "
+          "known:false and agent_known=0",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-known", yuzu::server::auth::PendingStatus::approved);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-never-seen"));
+    REQUIRE(res);
+    const auto payload = mg_add_payload(*res);
+    CHECK(payload["added"] == true);
+    REQUIRE(payload.contains("known"));
+    CHECK(payload["known"] == false);
+
+    const auto members = f.store.get_members(f.gid);
+    REQUIRE(members.size() == 1); // flagged, never refused
+    CHECK(members[0].agent_id == "agent-never-seen");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-never-seen agent_known=0");
+}
+
+TEST_CASE("MCP add_management_group_member: matching is exact, a case-only mismatch of a known "
+          "id is unknown and is not refused",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "Agent-ABC", yuzu::server::auth::PendingStatus::approved);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-abc"));
+    REQUIRE(res);
+    CHECK(mg_add_payload(*res)["known"] == false);
+    CHECK(f.store.get_members(f.gid).size() == 1);
+}
+
+TEST_CASE("MCP add_management_group_member: an id the enrolment store refuses as input (a comma) "
+          "is unknown, not unreadable, and is still added",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+
+    // The MCP tool caps an id at 256 bytes itself, so an over-length id never reaches the lookup
+    // here (the REST twin covers 257 bytes). A comma is refused by the store as input; a 256-byte
+    // id is held by it and simply absent. Both are "unknown", and both are added.
+    const std::string id = GENERATE(std::string("web,01"), std::string(256, 'a'));
+    INFO("agent id length " << id.size());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, id));
+    REQUIRE(res);
+    const auto payload = mg_add_payload(*res);
+    CHECK(payload["added"] == true);
+    REQUIRE(payload.contains("known"));
+    CHECK(payload["known"] == false);
+    CHECK(f.store.get_members(f.gid).size() == 1);
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == id + " agent_known=0");
+}
+
+TEST_CASE("MCP add_management_group_member: no AuthDB wired omits known, records "
+          "agent_known=unreadable and still adds",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    McpTestServer ts; // auth_db_for_test stays null
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    const auto payload = mg_add_payload(*res);
+    CHECK(payload["added"] == true);
+    CHECK_FALSE(payload.contains("known")); // omitted, never false
+    CHECK(f.store.get_members(f.gid).size() == 1);
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-1 agent_known=unreadable");
+}
+
+TEST_CASE("MCP add_management_group_member: a lookup store error omits known, records "
+          "agent_known=unreadable and still adds, never reporting unknown",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    mg_enrol(*auth_db, "agent-1", yuzu::server::auth::PendingStatus::approved);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{PQexec(conn.get(), "DROP TABLE auth.pending_agents CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    const auto payload = mg_add_payload(*res);
+    CHECK(payload["added"] == true);
+    CHECK_FALSE(payload.contains("known"));
+    CHECK_FALSE(payload.contains("audit_persisted"));
+    CHECK(res->body.find("auth.pending_agents") == std::string::npos); // no store text
+    CHECK(f.store.get_members(f.gid).size() == 1);
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "agent-1 agent_known=unreadable");
+}
+
+TEST_CASE("MCP add_management_group_member: the last token of the success detail is the flag, "
+          "even for an id that spells it",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    yuzu::test::AuthDbPg auth_db;
+    const std::string id = "x agent_known=1"; // a space and the flag text inside the raw id
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.auth_db_for_test = auth_db.get();
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, id));
+    REQUIRE(res);
+    CHECK(mg_add_payload(*res)["known"] == false); // no such enrolment row
+
+    const auto d = mg_add_row_field(ts, ts.audit_details, 1);
+    CHECK(d == id + " agent_known=0");
+    CHECK(d.substr(d.rfind(' ') + 1) == "agent_known=0");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 0) == id); // attempted: the bare raw id
 }
 
 TEST_CASE("MCP add_management_group_member: a group deleted between the check and the insert "

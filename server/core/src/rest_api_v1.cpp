@@ -19,6 +19,7 @@
 #include "mgmt_group_owner_gate.hpp" // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp" // A2: is_rbac_administrator / is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp" // A2: kRbacAssignableRoles / is_rbac_assignable_role — closed 7-role set
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `known` flag, REST and MCP
 #include "mgmt_group_error.hpp" // mgmt_group_error_is_store_fault: one classifier for REST and MCP
 #include "rbac_text.hpp" // rbac_text_is_clean - the one clean-text predicate for RBAC identifiers
 #include "rbac_enforcement_read.hpp" // GET /api/v1/rbac/enforcement: the builder shared with MCP get_rbac_enforcement
@@ -5062,8 +5063,8 @@ void RestApiV1::register_routes(
     // Members
     sink.Post(R"(/api/v1/management-groups/([a-f0-9]+)/members)",
               [perm_fn, audit_fn, mgmt_store, mgmt_write_failed, mgmt_text_ok,
-               mgmt_group_confirmed_absent, mgmt_group_not_found,
-               mgmt_member_recheck](const httplib::Request& req, httplib::Response& res) {
+               mgmt_group_confirmed_absent, mgmt_group_not_found, mgmt_member_recheck,
+               auth_db](const httplib::Request& req, httplib::Response& res) {
                   if (!perm_fn(req, res, "ManagementGroup", "Write"))
                       return;
                   if (!mgmt_store) {
@@ -5108,6 +5109,11 @@ void RestApiV1::register_routes(
                       mgmt_group_not_found(res);
                       return;
                   }
+                  // Is this a device the server has enrolled? A read, made after the group-exists
+                  // answer and before the `attempted` row. It only FLAGS the id: an unknown id is
+                  // accepted (an operator may stage a membership ahead of the device) and no lookup
+                  // outcome refuses the add. Unreadable is reported as neither known nor unknown.
+                  const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
                   if (!detail::audit_attempted(audit_fn, req, res, "management_group.add_member",
                                                "ManagementGroup", group_id, agent_id))
                       return;
@@ -5135,11 +5141,17 @@ void RestApiV1::register_routes(
                   }
                   // The member is added: a lost outcome row keeps the 201 and marks the response
                   // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
-                  (void)detail::emit_behavioral_audit(audit_fn, req, res,
-                                                      "management_group.add_member", "success",
-                                                      "ManagementGroup", group_id, agent_id);
+                  // The success row's detail ends with the `agent_known=` flag (see
+                  // mgmt_group_agent_known.hpp for how a reader takes it).
+                  (void)detail::emit_behavioral_audit(
+                      audit_fn, req, res, "management_group.add_member", "success",
+                      "ManagementGroup", group_id, add_member_success_detail(agent_id, agent_known));
                   res.status = 201;
-                  res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
+                  JObj added;
+                  added.add("added", true);
+                  if (agent_known != AgentKnown::Unreadable) // omitted, never false, when unreadable
+                      added.add("known", agent_known == AgentKnown::Known);
+                  res.set_content(ok_json(added.str()), "application/json");
               });
 
     sink.Delete(

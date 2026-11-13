@@ -62,6 +62,7 @@
 #include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "mgmt_group_agent_known.hpp" // lookup_agent_known: the add-member `known` flag, REST and MCP
 #include "mgmt_group_error.hpp"            // mgmt_group_error_is_store_fault: one classifier for REST and MCP
 #include "rbac_text.hpp"                  // rbac_text_is_clean — identifier check shared with the owner
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
@@ -1158,12 +1159,16 @@ static const ToolDef kTools[] = {
      "Add a static member to a management group. Idempotent — adding an agent already in the "
      "group is a no-op. Mirrors POST /api/v1/management-groups/{id}/members. Requires "
      "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
-     "extends the member set, overwrites nothing.",
+     "extends the member set, overwrites nothing. An agent id the server has not enrolled is "
+     "still added; the result's `known` says whether it is an enrolled device (omitted when that "
+     "could not be checked).",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent to add as a static member"})j"
      R"j(},"required":["group_id","agent_id"]})j",
-     R"j({"type":"object","properties":{"added":{"type":"boolean"}},"required":["added"]})j"},
+     R"j({"type":"object","properties":{"added":{"type":"boolean"},)j"
+     R"j("known":{"type":"boolean","description":"True when the agent id is an enrolled device, false when it is not; omitted when the enrolment lookup could not be made"}},)j"
+     R"j("required":["added"]})j"},
 
     {"list_management_group_roles",
      "List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer "
@@ -14159,6 +14164,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Is this a device the server has enrolled? A read, made after the group-exists
+                // answer and before the `attempted` row. It only FLAGS the id: an unknown id is
+                // accepted and no lookup outcome refuses the add. Unreadable is reported as
+                // neither known nor unknown (the REST twin does the same).
+                const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
                 if (!mcp_audit_attempted_or_refuse("management_group.add_member", group_id,
                                                    agent_id,
                                                    "audit unavailable; member not added"))
@@ -14206,10 +14216,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     mcp_audit("failure", "store_error");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "management_group.add_member", "success",
-                                               "ManagementGroup", group_id, agent_id);
+                // The success row's detail ends with the `agent_known=` flag (see
+                // mgmt_group_agent_known.hpp for how a reader takes it).
+                const bool audit_ok =
+                    audit_fn(req, "management_group.add_member", "success", "ManagementGroup",
+                             group_id, add_member_success_detail(agent_id, agent_known));
                 JObj payload;
                 payload.add("added", true);
+                if (agent_known != AgentKnown::Unreadable) // omitted, never false, when unreadable
+                    payload.add("known", agent_known == AgentKnown::Known);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", group_id);
