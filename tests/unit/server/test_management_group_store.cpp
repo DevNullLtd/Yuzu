@@ -25,6 +25,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // plant_group_role_row (test-only raw group-role insert)
 
 #include <yuzu/metrics.hpp>
 
@@ -404,6 +405,97 @@ TEST_CASE("ManagementGroupStore: engine principals cannot hold scoped role assig
     a.role_name = "Viewer";
     auto r = store.assign_role(a);
     REQUIRE(!r.has_value());
+}
+
+// PR-1a: the store refuses a group-scoped ITServiceOwner grant. EXACT byte match (no case
+// folding, no trimming); a variant is an ordinary custom role. Rows already stored stay readable
+// and removable.
+TEST_CASE("ManagementGroupStore: assign_role refuses a group-scoped ITServiceOwner grant",
+          "[pg][management_group][roles]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    ManagementGroup g;
+    g.name = "ItsoGroup";
+    g.membership_type = "static";
+    auto group_id = store.create_group(g);
+    REQUIRE(group_id.has_value());
+
+    auto make = [&](const std::string& ptype, const std::string& pid, const std::string& role) {
+        GroupRoleAssignment a;
+        a.group_id = *group_id;
+        a.principal_type = ptype;
+        a.principal_id = pid;
+        a.role_name = role;
+        return a;
+    };
+    const std::string kFixed = "this role cannot be assigned at management-group scope";
+
+    SECTION("a user principal is refused with the fixed, non-fault message") {
+        auto r = store.assign_role(make("user", "alice", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == kFixed);
+        CHECK_FALSE(mgmt_group_error_is_store_fault(r.error()));
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("a group principal is refused") {
+        auto r = store.assign_role(make("group", "ops-team", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == kFixed);
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("the engine refusal still wins over the deny-list (check order)") {
+        auto r = store.assign_role(make("engine", "engine:nvd", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error().find("cannot hold scoped") != std::string::npos);
+        CHECK(r.error() != kFixed);
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("other roles are accepted, built-in and custom") {
+        REQUIRE(store.assign_role(make("user", "alice", "Operator")).has_value());
+        REQUIRE(store.assign_role(make("user", "alice", "Viewer")).has_value());
+        REQUIRE(store.assign_role(make("user", "alice", "ForensicsScoped")).has_value());
+        CHECK(store.get_group_roles(*group_id).size() == 3);
+    }
+
+    SECTION("variants of the name are ordinary custom roles (exact byte match)") {
+        const std::string nul_form("ITServiceOwner\0", 15);
+        REQUIRE(nul_form.size() == 15);
+        const std::vector<std::string> variants = {"itserviceowner", "ITServiceOwner ", nul_form};
+        for (const auto& v : variants) {
+            INFO("variant size " << v.size());
+            REQUIRE(store.assign_role(make("user", "bob", v)).has_value());
+        }
+        auto roles = store.get_group_roles(*group_id);
+        REQUIRE(roles.size() == 3);
+        std::vector<std::string> stored;
+        for (const auto& r : roles)
+            stored.push_back(r.role_name);
+        CHECK(std::find(stored.begin(), stored.end(), "itserviceowner") != stored.end());
+        CHECK(std::find(stored.begin(), stored.end(), "ITServiceOwner ") != stored.end());
+        // sanitize_pg_text substitutes the NUL with U+FFFD (never deletes), so the stored name
+        // is a different string from the refused one.
+        CHECK(std::find(stored.begin(), stored.end(), std::string("ITServiceOwner\xEF\xBF\xBD")) !=
+              stored.end());
+        CHECK(std::find(stored.begin(), stored.end(), "ITServiceOwner") == stored.end());
+    }
+
+    SECTION("an already-stored row is still read and still removable") {
+        const auto planted = make("user", "carol", "ITServiceOwner");
+        yuzu::test::plant_group_role_row(db.dsn(), planted);
+        auto roles = store.get_group_roles(*group_id);
+        REQUIRE(roles.size() == 1);
+        CHECK(roles[0].role_name == "ITServiceOwner");
+        // The refusal does not touch it; the same assign is still refused.
+        CHECK_FALSE(store.assign_role(planted).has_value());
+        auto d = store.unassign_role(*group_id, "user", "carol", "ITServiceOwner");
+        REQUIRE(d.has_value());
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
 }
 
 TEST_CASE("ManagementGroupStore: get_assignments_for_principal unions user and group arms",

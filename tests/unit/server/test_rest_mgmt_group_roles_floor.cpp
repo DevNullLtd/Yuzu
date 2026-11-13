@@ -1236,7 +1236,8 @@ TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the
                                 "assigned under principal_type=\"engine\"",
                                 "engine principals cannot be granted the admin/full-access role "
                                 "'failed' — no admin, ever (design §4.2)",
-                                "group not found", "a group with that name already exists", ""}) {
+                                "group not found", "a group with that name already exists",
+                                "this role cannot be assigned at management-group scope", ""}) {
             INFO(msg);
             CHECK_FALSE(mgmt_group_error_is_store_fault(msg));
         }
@@ -1271,6 +1272,7 @@ TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_s
         "cannot delete root group",
         "engine principals cannot hold scoped role assignments in this release",
         "a group with that name already exists",
+        "this role cannot be assigned at management-group scope",
     };
     // Faults of the read paths (get_assignments_for_principal, get_member_agents_in_subtrees),
     // which count their own degrade metric and never reach the REST/MCP write classifier.
@@ -1296,13 +1298,13 @@ TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_s
                        "or name it in this test");
         }
     }
-    // The file holds 46 literals today (28 faults, 14 validation occurrences of 9 distinct
+    // The file holds 47 literals today (28 faults, 15 validation occurrences of 10 distinct
     // messages, 4 read-path). Minimum floors equal to those counts, so a change in literal shape
     // cannot silently shrink what the scan sees. Messages RbacStore::validate_assignment returns
     // through `v.error()` are not literals in this file and are outside the scan.
-    CHECK(seen >= 46);
+    CHECK(seen >= 47);
     CHECK(faults >= 28);
-    CHECK(validations >= 14);
+    CHECK(validations >= 15);
     CHECK(reads >= 4);
 }
 
