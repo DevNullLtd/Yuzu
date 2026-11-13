@@ -120,7 +120,7 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
 
 The `created_by` field is set automatically from the authenticated session.
 
-Creating a group is audit-first: an `attempted` audit row is stored before the group is created. If it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and creates nothing. A fault of the group store also answers `503` (with a fixed message), while an empty name, a name already in use, an unknown parent or a hierarchy that is too deep answers `400`. The Settings form and the MCP tool `create_management_group` follow the same order. The rows and their details are listed in [Audit Log](audit-log.md).
+Creating a group is audit-first: an `attempted` audit row is stored before the group is created. If it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and creates nothing. A fault of the group store also answers `503` (with a fixed message), including a failed read of the parent group, while an empty name, a name already in use, an unknown parent or a hierarchy that is too deep answers `400`. A name over 256 bytes or holding a control character (a tab or newline, for example) answers `400` too, as does a parent id over 256 bytes or holding one (`parent group not found`); nothing is written for those. The Settings form and the MCP tool `create_management_group` follow the same order. A supervised MCP call that is refused because the audit row cannot be stored has already used its one-time approval, so retry it with a new approval. The rows and their details are listed in [Audit Log](audit-log.md).
 
 Returns `201 Created`:
 
@@ -305,7 +305,7 @@ Returns `201 Created`:
 }
 ```
 
-An agent id the server has not enrolled is still added, so you can place a device in a group before it first appears. Whether the id is an enrolled device is recorded on the success audit row (`agent_known=<1|0|unreadable>` as the last token of its `detail`; see [Audit Log](audit-log.md)), not returned in the response. Matching is exact, letter case included.
+An agent id with no enrolment record is still added, so you can place a device in a group before it first appears. Whether the id has an enrolment record (pending, approved or denied) is recorded on the success audit row (`agent_known=<1|0|unreadable>` as the last token of its `detail`; filter on `result=success` before parsing it, see [Audit Log](audit-log.md)), not returned in the response. Matching is exact, letter case included, so an id in the wrong case is still added and reads `agent_known=0`. The flag is a point-in-time lookup and is not evidence that the device is enrolled; `0` is also the normal value when you stage a membership ahead of the device, so it does not by itself protect a group's scope. An `agent_id` over 256 bytes answers `400` and writes nothing.
 
 Adding and removing a member are audit-first like creating a group: an `attempted` audit row is stored before the change, and if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and changes nothing.
 
