@@ -90,37 +90,60 @@ of the HA "safe-to-scale" gate. The design:
   revoked/demoted/elevated session cannot ride the cache past ~30s of outage,
   not to its 8h absolute expiry.
 - **Account state at session validation.** A session built from a durable
-  row is served only while its LOCAL account is active:
-  `validate_session_durable` reads `AuthDB::user_exists` (active-only) where the
-  row becomes a session, and refuses (401) when the account is inactive or
-  deleted or when the read fails; nothing is cached on either refusal. Three
-  parts hold this together. (1) The account deactivation transaction
-  (`RbacAdminAuthorityOwner::deactivate_account`, when a `SessionStore` is wired)
-  bumps the session write-generation as its last statement, so every replica
-  clears its validate cache on its next poll whether or not the later session
-  wipe succeeded. (2) The validate cache carries an epoch (`session_cache_epoch_`,
-  under `mu_`) incremented with the one `sessions_.clear()`; a validation
-  captures it before any store read and inserts its session at the tail only if
-  it is unchanged (the ADR-0012 section 4 guarded-insert rule). On a mismatch the
-  session is still returned to that one request, uncached. The mint insert is
-  deliberately unguarded: the post-mint recheck erases this replica's entries on
-  its own. (3) `AuthManager::reactivate_user` erases the account's cached
-  sessions and wipes its durable ones first, and leaves the account inactive when
-  that wipe does not persist; a sign-in that completes after the reactivation is
-  a new sign-in. The lock order for (1) is `rbac_enabled`, the grant rows, one
-  `auth.users` row, then the `session_meta` row last, bounded by the lifecycle
-  `lock_timeout`. Limits: federated (OIDC, SAML) sessions are keyed on a principal
-  that need not be an `auth.users` account and are not gated; API-token and MCP
-  token sessions are unchanged; an out-of-band SQL change to `auth.users` bumps
-  no generation, so a replica with a warm cache keeps the session until the next
-  generation change (a cold read refuses it); the guarantee holds once every
-  replica runs this build; a session whose role is stale after a failed wipe on
-  demotion is a separate case and is not addressed here. A refusal is logged at
-  debug level and counted by `yuzu_auth_session_account_inactive_total`; the
+  row is served only while its LOCAL account is active. `validate_session_durable`
+  applies one account gate at both places a session is built from a store row
+  (the cold read and the idle-expiry re-read). The gate is a closed three-way
+  decision on the row's `auth_source`: `local` reads `AuthDB::user_exists`
+  (active-only) and refuses (401) when the account is inactive or deleted or when
+  the read fails; `oidc` and `saml` pass without an account read; any other stored
+  source is refused and counted by `yuzu_auth_session_unknown_source_total`
+  (expected 0). A refusal also drops any cached copy of that session, and nothing
+  is cached on a refusal. Three parts hold this together. (1) The account
+  deactivation transaction (`RbacAdminAuthorityOwner::deactivate_account`, when a
+  `SessionStore` is wired) bumps the session write-generation as its last
+  statement, so every replica clears its validate cache on its next poll whether
+  or not the later session wipe succeeded. The bump is part of the deactivation
+  transaction: if it cannot complete (the `session_meta` row stays locked past the
+  lifecycle `lock_timeout`, or the session store cannot be reached from the
+  owner's pool) the transaction aborts, the account stays active and the caller
+  sees a store failure (`503`), which the response does not tell apart from a lock
+  timeout elsewhere in the transaction. (2) The validate cache carries an epoch
+  (`session_cache_epoch_`, under `mu_`) incremented by the generation poll's
+  `sessions_.clear()` and by every targeted erase (sign-out, deactivation,
+  reactivation, password change); a validation captures it before any store read
+  and inserts its session at the tail only if it is unchanged (the ADR-0012 section
+  4 guarded-insert rule). On a mismatch the session is still returned to that one
+  request, uncached. The mint insert is deliberately unguarded: the post-mint
+  recheck re-reads the role, the credential hash and the active state and erases
+  this replica's entries when they changed. (3) `AuthManager::reactivate_user`
+  erases the account's cached sessions and wipes its durable ones first (also for
+  an account that is already active), and leaves the account inactive when that
+  wipe does not persist. A sign-in that completes after the reactivation is not
+  always a new sign-in: see the residual under "Deprovision and reactivation". The
+  lock order for (1) is `rbac_enabled`, the grant rows, one `auth.users` row, then
+  the `session_meta` row last; each lock wait is bounded by the lifecycle
+  `lock_timeout` (2000 ms), so a deactivation can wait several times that, plus the
+  pool acquire. Limits:
+  federated (OIDC, SAML) sessions are keyed on a principal that need not be an
+  `auth.users` account and are not gated here: they are ended by the principal-link
+  revoke at deprovision. API-token, MCP-token and engine-token sessions are
+  unchanged. These are known limits that this change does not close. An out-of-band
+  SQL change to `auth.users` bumps no generation, so a replica with a warm cache
+  keeps the session until the next generation change (a cold read refuses it). The
+  gate keys on the username only, so deleting an account and recreating it under
+  the same name does not end a surviving session of the old account. Mixed-version
+  operation is outside the guarantee: the guarantee holds once every replica runs
+  this build, and a deactivation committed by a replica on an earlier build bumps
+  no generation. A session whose role is stale after a failed wipe on demotion is
+  a separate case and is not addressed here. The refusal is bounded by the
+  generation poll: about one second on a healthy poll, at most about 30 seconds
+  while a replica's poll fails (the stale-serve bound above). A refusal is logged
+  at debug level and counted by `yuzu_auth_session_account_inactive_total`; the
   count is not evidence of a failed wipe (a healthy deactivation can increment
   it). An unreadable account store counts
   `yuzu_auth_session_store_degrade_total{op="account_state"}`. No audit row is
-  written at validation.
+  written at validation: the evidence is the deactivation audit row plus the
+  aggregate counter.
 - **Authoritative reads.** A `SessionStore::find` returns
   `expected<optional<Row>>`: `nullopt` = definitively absent, `unexpected` = DB
   degraded. `validate_session` never treats a degraded read as "no valid
@@ -382,8 +405,11 @@ anything else (formerly the audit INSERT, behind a lock someone held on
 waits on `auth.users` or `audit_events`: no `session_store` transaction touches
 another schema, no audit writer touches `session_store`, and the post-mint
 re-read takes `auth.users` only after its session INSERT committed.
-`RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and never a
-session/audit lock. The owner requires AuthDB, SessionStore and AuditStore on
+`RbacAdminAuthorityOwner` takes `principal_roles` → `auth.users` and no audit
+lock; in `deactivate_account` (when a `SessionStore` is wired) it then takes the
+`session_store.session_meta` `write_generation` row last, the same position
+`CredentialChangeOwner` takes it in, before COMMIT. That edge is acyclic because
+no session writer takes an RBAC or account lock. The owner requires AuthDB, SessionStore and AuditStore on
 ONE pool/database (ADR-0006; server.cpp builds all three on `*pg_pool_`); a
 split fails every statement closed, never a partial write.
 
@@ -2514,7 +2540,17 @@ the same audit behavior described below, not a silent no-op:
   stuck behind a lockout window from before their termination. **MFA is
   NOT restored** — a reactivated user re-enrolls TOTP from scratch on next
   login, the same posture as any other de-enrolled account; SCIM never
-  resurrects a stale second factor.
+  resurrects a stale second factor. Reactivation also **ends the user's
+  existing sessions first** (their cached and durable rows), and also when the
+  account is already active (a retry after a failed mirror write signs the
+  user out again). If that session removal does not persist, the call answers
+  `500` and the account stays inactive. A sign-in after the reactivation is a
+  new sign-in, with one residual: a login whose first factor was verified
+  before the deactivation can still mint after the reactivation, because the
+  post-mint recheck compares only role, credential hash and active state.
+  Deactivation clears the TOTP secret and recovery codes, so a pending MFA
+  login cannot complete unless the user re-enrols inside the pending window
+  (`--mfa-login-pending-secs`, default 120).
 
 `DELETE /scim/v2/Users/{id}` is the equivalent one-shot deprovision (`204`),
 for IdPs that issue a hard delete rather than a PATCH/PUT-to-inactive.
@@ -2739,10 +2775,10 @@ operator-facing matrix of every case, including what is not covered, is in
 | `scim.user.provisioned` | `success` | `POST /scim/v2/Users` succeeds (new account, or a revived reprovision) |
 | `scim.user.provisioned` | `denied` | `POST` rejected `409` — `userName` collision against a currently-active account |
 | `scim.user.provisioned` | `partial` | `POST /scim/v2/Users` with `active:false`: the credential revoke before the immediate deactivation did not persist its API tokens (`500`, detail `api_tokens_db_error=true`; the account was already created or revived and mapped, so the IdP's retry meets `409`). `target_id` is the new resource's SCIM id, where the rollback `failure` rows below use the userName. A `success` row for the same request can carry `sessions_db_error=true session_leg_backstopped=true` (the session delete did not persist and the account removal's own wipe covered it); a deactivation whose wipe also failed is `failure` with `account deactivated; durable session wipe failed` |
-| `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails). (#6836) A revive whose post-reactivation role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone and the account stays down); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed` |
+| `scim.user.provisioned` | `failure` | `POST` rolls back after a `500` (e.g. the account-creation transaction fails). A revive whose reactivation could not remove the user's existing sessions first (the durable session wipe did not persist) is `failure` / `500` with no detail, and the account stays inactive. (#6836) A revive whose post-reactivation role re-check could not be read is `failure` / `503` with `detail` `store_unavailable: revive role check` (`target_id` is the userName; the reactivation was undone and the account stays down); if the undo did not complete it is `failure` / `500` with `detail` `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed` |
 | `scim.user.updated` | `success` / `failure` | `PUT /scim/v2/Users/{id}` succeeds / fails `500`; `failure` / `503` (#6836) with `detail` `store_unavailable: provenance check` or `store_unavailable: role check` when the provenance re-check, or the role re-check on an active resource (including straight after a reactivation), that a `PUT` (always) or a `PATCH` with `externalId` runs before its `externalId` write could not read the user store; when it follows an `active` change, that change was already applied and has its own `success` row |
 | `scim.user.deactivated` | `success` / `failure` / `partial` | `PATCH`/`PUT`/`DELETE` sets the account inactive; `failure` (set-and-proceed) if the audit write could not persist. (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#4772) `partial` / `500`: the credential revoke did not persist (`api_tokens_db_error=true` and/or `sessions_db_error=true` in `detail`); the account stays active, the SCIM resource and links are untouched (credentials that did revoke stay revoked) and a retry completes. |
-| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`. `failure` causes (#4966): the tombstone's role could not be read (`500`, `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, `administrator grant check unavailable`), or the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is a `scim.user.provenance_denied` (`404`), not a `reactivated` row. (#6836) The provenance check inside the reactivation, when the user store could not answer it, is `failure` / `503` with `detail` `store_unavailable: provenance check`; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard="provenance"}`. The role re-check that a `PUT`/`PATCH` carrying `externalId` runs straight after a reactivation is audited as `scim.user.updated`, not `scim.user.reactivated`. |
+| `scim.user.reactivated` | `success` / `failure` | `PATCH` or `PUT` sets `active:true`. `failure` causes (#4966): the tombstone's role could not be read (`500`, `tombstone role unreadable before reactivation`), the Administrator-grant read was unavailable (`503`, `administrator grant check unavailable`), or the durable session wipe before the reactivation did not persist (`500`; the account stays inactive), or the account or mirror write failed (`500`). An elevated tombstone or a name holding an Administrator grant is a `scim.user.provenance_denied` (`404`), not a `reactivated` row. (#6836) The provenance check inside the reactivation, when the user store could not answer it, is `failure` / `503` with `detail` `store_unavailable: provenance check`; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard="provenance"}`. The role re-check that a `PUT`/`PATCH` carrying `externalId` runs straight after a reactivation is audited as `scim.user.updated`, not `scim.user.reactivated`. |
 | `scim.user.deleted` | `success` / `failure` / `partial` | `DELETE /scim/v2/Users/{id}` succeeds / audit-write failure (set-and-proceed). (#4966) A guarded deactivation that hit a store failure is also `failure`, answered `503`, with `detail` starting `account_state=unknown credentials_revoked=true` (the linked credentials were revoked; the account may or may not be deactivated), and a failed durable session wipe after the deactivation is `failure` with `account deactivated; durable session wipe failed` (`500`). (#6836) A provenance or role re-check that the user store could not answer is `failure` / `503` with `detail` `store_unavailable: provenance check` or `store_unavailable: role check`, on the request's own action; it is not a `scim.user.provenance_denied` and is counted on `yuzu_scim_guard_store_unavailable_total{guard}`. (#4772) `partial` / `500`: the credential revoke did not persist (`api_tokens_db_error=true` and/or `sessions_db_error=true` in `detail`); the account stays active, the SCIM resource and links are untouched (credentials that did revoke stay revoked) and a retry completes. |
 | `scim.user.provenance_denied` | `denied` | A deactivate/reactivate/delete/update targets an account whose `provisioning_source != "scim"`, **or** whose current `role != "user"`; **or** (#4966) a `POST /Users` or an `active:true` reactivation names a username that already holds an `Administrator` grant or a deactivated record whose role is not `user`. Counted on `yuzu_scim_provenance_denied_total` for the same causes (including the group-recompute provenance skip, which writes no audit row; a FAILED provenance read in the recompute is not a provenance refusal and is recorded as an undetermined member instead). For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial (#6836): when the user store cannot answer the provenance or role read (a `POST` revive re-reads only the role), no `scim.user.provenance_denied` row is written, `yuzu_scim_provenance_denied_total` does not move and the linked-identity escalation does not fire; the request answers `503` and is audited as its own action with `store_unavailable`. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). |
 | `scim.user.last_administrator_refused` | `denied` / `partial` | (#4966) The last-Administrator guard refused a deactivation, delete, `POST` with `active:false` or group-derived demotion (`409` `mutability` on the Users routes; a refused group-derived demotion is not a `409`: the Group request keeps its `2xx` and the member keeps the role). `partial` for a LATE refusal (the linked credentials were revoked before the guard refused); `denied` for an early refusal and for a refused demotion. Every refusal also raises a critical analytics event. Counted on `yuzu_server_rbac_last_admin_guard_refused_total{transport="scim"}` |
@@ -2961,10 +2997,11 @@ and detail `account deactivated; durable session wipe failed`.
 **Residual after a failed wipe.** If that post-deactivation wipe itself fails
 (`RemovedSessionWipeFailed`), the account is deactivated and the durable session
 row survives, but session validation no longer serves it: a session whose
-account is inactive or deleted is rejected (see "Account state at session
-validation" below). The row stays until the account is reactivated (which
-removes it) or it expires; a SCIM retry of an already-deactivated resource does
-not re-run the wipe. The narrower limits are listed in that section.
+account is inactive or deleted is rejected (see the "Account state at session
+validation" bullet under "Durable operator sessions" near the top of this
+document). The row stays until the account is reactivated (which removes it) or
+it expires; a SCIM retry of an already-deactivated resource does not re-run the
+wipe. The narrower limits are listed in that bullet.
 
 **Audit vocabulary.** Three tokens mean "the durable session delete did not
 persist", and each is kept where it is documented: `db_error=true` (logout,
@@ -3163,8 +3200,9 @@ must not treat the list as an identity key; the exact identities are in the
   soft-deletes the auth account and touches SCIM state is not one atomic
   cross-schema transaction. A crash between the two steps remains an
   **irreducible** window given the two-store design — it is reconciled by
-  the IdP's own periodic re-sync (a deactivated user whose session survived
-  the crash gets a follow-up deactivate call on the next sync cycle), not by
+  the IdP's own periodic re-sync (a deactivated user whose session row survived
+  the crash, and is no longer served, gets a follow-up deactivate call on the
+  next sync cycle), not by
   a code-level fix. The Postgres migration changed the storage engine under
   each store, not this cross-store boundary.
 - **No per-route SCIM rate limit.** SCIM calls share the server's global
