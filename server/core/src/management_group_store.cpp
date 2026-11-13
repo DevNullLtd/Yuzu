@@ -44,11 +44,13 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 // Validated trees never approach it (`create_group` caps hierarchy at 5).
 constexpr int kMaxHierarchyDepth = 10;
 
-// Roles `assign_role` refuses at management-group scope (PR-1a). A one-line diff adds the next
-// entry. EXACT byte match only: no case folding, no trimming. Every consumer of a stored role
-// name matches it exactly, and `sanitize_pg_text` only SUBSTITUTES bad bytes (it never deletes
-// one), so a stored value equals the name only if the input did; a variant ("itserviceowner",
-// a trailing space, an embedded NUL) is an ordinary custom role, not this one.
+// Roles `assign_role` refuses at management-group scope. Add the next one here. This is NOT the
+// delegation allowlist: any other role name still stores, so a caller that must restrict which
+// roles it hands out (the REST and MCP routes allow only Operator and Viewer) applies its own
+// check first. EXACT byte match only: no case folding, no trimming. Every consumer of a stored
+// role name matches it exactly, and `sanitize_pg_text` only SUBSTITUTES bad bytes (it never
+// deletes one), so a stored value equals the name only if the input did; a variant
+// ("itserviceowner", a trailing space, an embedded NUL) is an ordinary custom role, not this one.
 constexpr std::array<std::string_view, 1> kRefusedGroupScopedRoles = {"ITServiceOwner"};
 
 // Read-degrade reason labels (ADR-0037 convention).

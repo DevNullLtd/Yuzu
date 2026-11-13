@@ -213,7 +213,9 @@ public:
     /// store's one-entry deny-list (`ITServiceOwner`, matched EXACTLY, byte for
     /// byte: a differently-cased or padded name is an ordinary custom role); then
     /// `RbacStore::validate_assignment`. The deny-list refusal is a fixed message
-    /// that never echoes the caller's value and is not a store fault. Rows
+    /// that never echoes the caller's value and is not a store fault. Every other
+    /// role name is stored: this is not the delegation allowlist, so a caller
+    /// that restricts which roles it hands out applies its own check first. Rows
     /// already stored are untouched by the refusal and stay removable through
     /// `unassign_role`, which is deliberately unrestricted.
     std::expected<void, std::string> assign_role(const GroupRoleAssignment& assignment);
