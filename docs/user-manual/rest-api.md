@@ -713,7 +713,9 @@ Create a new management group.
 }
 ```
 
-**Errors:** `400` if the name is empty or already used by another group (`a group with that name already exists`; the MCP tools answer the same conflict as invalid params with no retry hint), or if the parent is missing, would be too deep, or the body is not valid.
+**Errors:** `400` if the name is empty or already used by another group (`a group with that name already exists`; the MCP tools answer the same conflict as invalid params with no retry hint), or if the parent is missing, would be too deep, or the body is not valid. `503` if the group store could not answer, with a fixed message and a retry hint (the store's own error text is not returned; this was a `400` carrying that text before), and `503` with `Sec-Audit-Failed: true` and a retry hint if the audit row that is written before the group is created cannot be stored: nothing is created in either case.
+
+**Audit:** the call is audit-first. An `attempted` row is stored before the group is created, then a `success` or `failure` row (`management_group.create`; the rows and their details are in `audit-log.md`). A request refused before any write (permission, invalid body, empty name, unknown parent, depth) writes no `management_group.create` row. The session and the permission are checked again after the `attempted` row. If only the outcome row cannot be stored the `201` stands and the response carries `Sec-Audit-Failed: true`.
 
 ---
 
@@ -906,12 +908,14 @@ Add an agent to a static management group.
 
 ```json
 {
-  "data": { "added": true },
+  "data": { "added": true, "known": true },
   "meta": { "api_version": "v1" }
 }
 ```
 
-**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.add_member`, `result=denied`, `detail=invalid_agent_id`). `404` if the group does not exist (no audit row, no retry hint). `503` if the store could not apply the add (audited `result=failure`, `detail=store_error`, with a retry hint). `added: true` and the success audit row are only produced after the store reports the add. The MCP twin `add_management_group_member` refuses and answers the same cases (see `mcp.md`).
+`known` says whether the server holds an enrolment record for `agent_id` (any status: pending, approved or denied). `false` means it holds none: the id is still added, so a membership can be staged ahead of the device. `known` is omitted when the lookup could not be made, never reported as `false`. Matching is exact, so an id that differs from an enrolled id only in letter case is `false`. `known` is also written into the success audit row's `detail` (`<agent_id> agent_known=<1|0|unreadable>`; see `audit-log.md`).
+
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.add_member`, `result=denied`, `detail=invalid_agent_id`). `404` if the group does not exist (no audit row, no retry hint). `503` if the store could not apply the add (audited `result=failure`, `detail=store_error`, with a retry hint). `503` with `Sec-Audit-Failed: true` and a retry hint if the `attempted` audit row that is written before the member is added cannot be stored: nothing is added. `added: true` and the success audit row are only produced after the store reports the add. If only the outcome row cannot be stored the `201` stands and the response carries `Sec-Audit-Failed: true`. The session and the permission are checked again after the `attempted` row. The MCP twin `add_management_group_member` refuses and answers the same cases (see `mcp.md`).
 
 ---
 
@@ -930,7 +934,7 @@ Remove an agent from a management group.
 }
 ```
 
-**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`); a member whose stored id already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `removed: true` and the success audit row are only produced after the store reports the removal.
+**Errors:** `400` if `agent_id` contains a NUL or other control byte, or is not valid UTF-8 (audited `management_group.remove_member`, `result=denied`, `detail=invalid_agent_id`); a member whose stored id already carries a control byte therefore cannot be removed through this route (see the upgrade note in `upgrading.md`). `503` if the store could not apply the removal (audited `result=failure`, `detail=store_error`). `503` with `Sec-Audit-Failed: true` if the `attempted` audit row that is written before the removal cannot be stored: nothing is removed. `removed: true` and the success audit row are only produced after the store reports the removal. If only the outcome row cannot be stored the `200` stands and the response carries `Sec-Audit-Failed: true`. The session and the permission are checked again after the `attempted` row.
 
 ---
 

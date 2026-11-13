@@ -120,6 +120,8 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
 
 The `created_by` field is set automatically from the authenticated session.
 
+Creating a group is audit-first: an `attempted` audit row is stored before the group is created. If it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and creates nothing. A fault of the group store also answers `503` (with a fixed message), while an empty name, a name already in use, an unknown parent or a hierarchy that is too deep answers `400`. The Settings form and the MCP tool `create_management_group` follow the same order. The rows and their details are listed in [Audit Log](audit-log.md).
+
 Returns `201 Created`:
 
 ```json
@@ -298,10 +300,14 @@ Returns `201 Created`:
 
 ```json
 {
-  "data": { "added": true },
+  "data": { "added": true, "known": true },
   "meta": { "api_version": "v1" }
 }
 ```
+
+`known` is `true` when the server holds an enrolment record for the agent id and `false` when it holds none. An agent id with no enrolment record is still added, so you can place a device in a group before it first appears; `known: false` only flags it (matching is exact, letter case included). `known` is omitted when the lookup could not be made.
+
+Adding and removing a member are audit-first like creating a group: an `attempted` audit row is stored before the change, and if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and changes nothing.
 
 This endpoint is intended for static membership groups. For a dynamic group the server computes members only for the root group (filled at enrollment) and, as a one-time snapshot at creation, for the `Service: {name}` groups it creates itself when a `service` tag is first written; for any other dynamic group created through the API, members are not computed from the scope expression.
 
@@ -473,7 +479,7 @@ Groups are created and deleted through the **Settings** page in the HTMX dashboa
 
 From the Settings page, administrators can:
 
-- **Create groups** -- specify name, description, parent, and membership type.
+- **Create groups** -- specify name, description, parent, and membership type. If the audit row for the create cannot be stored the form shows an error toast and creates nothing.
 - **View member counts** -- each group row shows the number of member agents.
 - **Delete groups** -- a delete button appears on every group except the root group.
 
