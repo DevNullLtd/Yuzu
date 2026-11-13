@@ -909,6 +909,15 @@ public:
     /// (nullptr) by default; install it before any concurrent validation starts.
     void set_validate_pre_cache_hook_for_test(std::function<void()> hook);
 
+    /// TEST-ONLY: installs a callback fired in `reactivate_user` and `update_role_checked`
+    /// BETWEEN the local cache erase and the durable session wipe, with NO lock held. It lets a
+    /// test run a validation inside that gap, which reads the still-present row and caches the
+    /// pre-change session, to prove the cache is dropped again after the wipe. It also fires for
+    /// the validations the test itself makes there. Production code MUST NOT call this - no
+    /// caller in `server/core/src/**` references it. A no-op (nullptr) by default; install it
+    /// before the call under test.
+    void set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook);
+
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
     /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
@@ -1690,6 +1699,11 @@ private:
     /// lifetime/production-reachability as `role_recheck_race_hook_for_test_` above.
     std::function<void()> validate_pre_cache_hook_for_test_;
 
+    /// Backing field for `set_between_local_erase_and_wipe_hook_for_test` - see that method's
+    /// doc. Invoked (if set) from `reactivate_user` and `update_role_checked` only, with no lock
+    /// held. Same shape/lifetime/production-reachability as the hooks above.
+    std::function<void()> between_local_erase_and_wipe_hook_for_test_;
+
     /// #5342: the credential-change query owner (`set_credential_change_owner`).
     /// Borrowed, never owned; null ⇒ no credential writes.
     CredentialChangeOwner* credential_change_owner_{nullptr};
@@ -1764,6 +1778,14 @@ private:
     /// idempotent, so an operator retry after a false return is safe. No-op
     /// (true) without a store. Caller must NOT hold `mu_`.
     [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
+
+    /// `wipe_user_sessions_durable`, then drop the user's cached sessions AGAIN (and advance the
+    /// cache epoch) once it has returned, success or not. A cold validation that began after
+    /// the caller's first local erase can read the row before the durable delete commits, pass
+    /// the account gate and cache the pre-change session; the second drop erases whatever such a
+    /// validation inserted and makes one still in flight drop its insert. Other replicas clear
+    /// at their next generation poll. Same return and `mu_` contract as the wrapped call.
+    [[nodiscard]] bool wipe_user_sessions_then_drop_cache(const std::string& username);
 
     /// #4966: after a guarded lifecycle write answered StoreFailure (it MAY have committed: a
     /// lost COMMIT ack), evict the TARGET's `users_` entry and in-memory sessions and attempt the

@@ -1016,3 +1016,50 @@ TEST_CASE("cache epoch: a revoke on the SAME replica drops a validation held acr
         CHECK_FALSE(a.validate_session(token).has_value());
     }
 }
+
+TEST_CASE("cache epoch: a validation inside the gap between a role change's local erase and its "
+          "durable wipe does not leave the pre-change session cached (T-R12)",
+          "[auth][session_store][account_active][cache_epoch][pg]") {
+    // The validation runs after the local erase and before the wipe, so it reads the still
+    // present row, passes the account gate (the account is active) and caches the pre-change
+    // session. Only the second drop after the wipe removes it. No poll runs afterwards.
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    bool gap_validation_served = false;
+    a.set_between_local_erase_and_wipe_hook_for_test(
+        [&] { gap_validation_served = a.validate_session(token).has_value(); });
+    REQUIRE(a.update_role_checked("alice", Role::admin) ==
+            yuzu::server::auth::UpdateRoleOutcome::Updated);
+    a.set_between_local_erase_and_wipe_hook_for_test(nullptr);
+
+    REQUIRE(gap_validation_served); // the validation did cache the pre-change session ...
+    CHECK(f.durable_sessions_of("alice") == 0);
+    // ... and the wipe must have removed it from the cache too.
+    CHECK_FALSE(a.validate_session(token).has_value());
+}
+
+TEST_CASE("cache epoch: a validation inside the gap between a reactivation's local erase and its "
+          "durable wipe does not leave the pre-change session cached (T-R13)",
+          "[auth][session_store][account_active][cache_epoch][reactivation][pg]") {
+    // The already-active shape (T-R10): the account passes the gate inside the gap, so the
+    // gap validation is served and cached. Reactivation then wipes, and the cache must not keep it.
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    bool gap_validation_served = false;
+    a.set_between_local_erase_and_wipe_hook_for_test(
+        [&] { gap_validation_served = a.validate_session(token).has_value(); });
+    (void)a.reactivate_user("alice");
+    a.set_between_local_erase_and_wipe_hook_for_test(nullptr);
+
+    REQUIRE(gap_validation_served);
+    CHECK(f.durable_sessions_of("alice") == 0);
+    CHECK_FALSE(a.validate_session(token).has_value());
+}

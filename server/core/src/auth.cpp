@@ -608,6 +608,15 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     return true;
 }
 
+bool AuthManager::wipe_user_sessions_then_drop_cache(const std::string& username) {
+    const bool persisted = wipe_user_sessions_durable(username);
+    // No lock is held across the durable wipe above; mu_ is taken only for the erase and the
+    // epoch bump.
+    std::unique_lock lock(mu_);
+    drop_cached_user_sessions_locked(username);
+    return persisted;
+}
+
 bool AuthManager::persist_new_session(const std::string& raw_token,
                                       const yuzu::server::SessionWriteParams& params) {
     // The cached Session's non-time fields come straight from params; its
@@ -1556,6 +1565,10 @@ void AuthManager::set_validate_pre_cache_hook_for_test(std::function<void()> hoo
     validate_pre_cache_hook_for_test_ = std::move(hook);
 }
 
+void AuthManager::set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook) {
+    between_local_erase_and_wipe_hook_for_test_ = std::move(hook);
+}
+
 void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
     role_recheck_race_hook_for_test_ = std::move(hook);
 }
@@ -2173,7 +2186,7 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     // fixed Role::user). A future
     // demote-via-upsert MUST recompute role_changed against the durable/DB row (or
     // wipe unconditionally) before relying on retry to converge.
-    if (role_changed && !wipe_user_sessions_durable(username))
+    if (role_changed && !wipe_user_sessions_then_drop_cache(username))
         return false;
 
     // Only save config file if NOT using DB (backwards compat)
@@ -2201,7 +2214,7 @@ void AuthManager::evict_target_after_indeterminate_write(const std::string& user
         users_.erase(username);
         drop_cached_user_sessions_locked(username);
     }
-    if (!wipe_user_sessions_durable(username))
+    if (!wipe_user_sessions_then_drop_cache(username))
         spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
                      "lifecycle write also failed; the durable session row may survive until "
                      "the operation is retried",
@@ -2339,11 +2352,21 @@ bool AuthManager::reactivate_user(const std::string& username) {
         std::unique_lock lock(mu_);
         drop_cached_user_sessions_locked(username);
     }
+    // TEST-ONLY seam (see set_between_local_erase_and_wipe_hook_for_test's doc); no lock held.
+    if (between_local_erase_and_wipe_hook_for_test_)
+        between_local_erase_and_wipe_hook_for_test_();
     if (!wipe_user_sessions_durable(username)) {
         spdlog::error("AuthManager::reactivate_user: durable session wipe for '{}' failed, "
                       "leaving the account inactive",
                       ::yuzu::log_key_token(username));
         return false;
+    }
+    {
+        // Drop again now the wipe has persisted: a validation that began after the local erase
+        // above can have read the then-present row and cached the pre-change session. (Not on
+        // the failure path: the account stays inactive there and the account gate refuses.)
+        std::unique_lock lock(mu_);
+        drop_cached_user_sessions_locked(username);
     }
 
     // DB write FIRST, outside mu_ — mirrors remove_user/update_role's lock
@@ -2613,9 +2636,13 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
         // Prevents stale session role from granting old privileges
         drop_cached_user_sessions_locked(username);
         lock.unlock();
+        // TEST-ONLY seam (see set_between_local_erase_and_wipe_hook_for_test's doc); no lock held.
+        if (between_local_erase_and_wipe_hook_for_test_)
+            between_local_erase_and_wipe_hook_for_test_();
         // Fail closed on a durable-wipe error: a demoted user's higher-role session must not
-        // survive a lost durable delete (see the helper). The role IS changed by now.
-        if (!wipe_user_sessions_durable(username)) {
+        // survive a lost durable delete (see the helper). The role IS changed by now. The cache is
+        // dropped again after the wipe (success or not) for a validation that straddled it.
+        if (!wipe_user_sessions_then_drop_cache(username)) {
             spdlog::error("AuthManager::update_role_checked: durable session wipe for '{}' failed "
                           "(the role IS changed)",
                           username);
@@ -2637,7 +2664,10 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
     drop_cached_user_sessions_locked(username);
 
     lock.unlock();
-    if (!wipe_user_sessions_durable(username)) // no-op (true) w/o store
+    // TEST-ONLY seam (see set_between_local_erase_and_wipe_hook_for_test's doc); no lock held.
+    if (between_local_erase_and_wipe_hook_for_test_)
+        between_local_erase_and_wipe_hook_for_test_();
+    if (!wipe_user_sessions_then_drop_cache(username)) // no-op (true) w/o store
         return UpdateRoleOutcome::UpdatedSessionWipeFailed;
     save_config();
 
