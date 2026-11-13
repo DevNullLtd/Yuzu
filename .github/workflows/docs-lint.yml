@@ -100,6 +100,18 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey, never a
+      # service-scoped session's username, and neither list gate hands a service-scoped session
+      # unrestricted authority. Best-effort lexical (not a control-flow proof): the dispatched_by
+      # uses, scope constructions, scope arguments, predicate calls, mutation requests, raw-username
+      # guards and gate refusals are frozen exact sets. The self-test mutates the sources in memory
+      # and proves every mutation (including the two bypasses a first draft let through) is caught.
+      - name: Execution owner key tripwire (#5557)
+        run: python3 -I tests/test_execution_owner_key_tripwire.py
+
+      - name: Execution owner key tripwire self-test (#5557)
+        run: python3 -I tests/test_execution_owner_key_tripwire_selftest.py
+
       # The one set_known_plugins(...) line in server.cpp bounds the yuzu_fleet_plugin_init_failed
       # label; no unit test builds ServerImpl, so dropping it leaves every test green.
       - name: Plugin init failed wiring gate

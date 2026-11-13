@@ -4884,6 +4884,24 @@ test('forensics tier wiring lexical selftest',
   timeout: 30,
 )
 
+# #5557: ownership-based execution admission is keyed on ExecutionOwnerKey and neither list gate
+# hands a service-scoped session unrestricted authority. Best-effort lexical tripwire over the server
+# tree + a selftest that mutates the sources in memory and requires every mutation to fail; both also
+# run in .github/workflows/docs-lint.yml.
+test('execution owner key tripwire',
+  _python3_test,
+  args: [files('test_execution_owner_key_tripwire.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+test('execution owner key tripwire selftest',
+  _python3_test,
+  args: [files('test_execution_owner_key_tripwire_selftest.py')],
+  suite: 'docs',
+  # One scan of the tree plus about a hundred mutations, each re-scanning only the file it changed.
+  timeout: 300,
+)
+
 # yuzu_fleet_plugin_init_failed label catalogue: the one production set_known_plugins(...) line must
 # exist exactly once and precede the health recompute thread (no unit test builds ServerImpl; an
 # unwired store labels every real plugin "unknown"), and both metrics_.describe rows must exist.
