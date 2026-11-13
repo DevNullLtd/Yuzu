@@ -30,9 +30,10 @@
 /// fail-closed posture `member_set_owned` already holds for result-set
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
-/// (the roster read: Hardware list/record, viz, MCP, and the Software page's
+/// (the roster read: Hardware list, viz, MCP, and the Software page's
 /// hostname map) is typed the same way (#5531) — a failed read is
-/// `std::unexpected`, never an empty roster.
+/// `std::unexpected`, never an empty roster — and a read past `kQueryRowCap` is a typed
+/// PARTIAL success (`OfflineRoster::truncated`, #5712), never the `Truncated` error.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -154,9 +155,11 @@ public:
     /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
     /// (gov sec-LOW / UP-5): the viz machines_max ceiling, so the store can
     /// never allocate more than the page could ever serve even if the table
-    /// has grown large. Public so tests can size a truncation fixture against
-    /// the real value rather than a hardcoded duplicate.
-    static constexpr int kQueryRowCap = 100000;
+    /// has grown large. Both reads fetch ONE row past it to DETECT a cap hit:
+    /// `query_live_ids` fails closed (`Truncated`), `query_stale_within` serves
+    /// the cap's worth flagged `truncated` (#5712). Public so tests can size a
+    /// truncation fixture against the real value rather than a hardcoded duplicate.
+    static constexpr int kQueryRowCap = kOfflineRosterRowCap;
 
     /// #5678 / #1545 UP-4 endpoint prune: rows are deleted only once unseen for
     /// the roster read window PLUS this margin. The prune keys on the PG-authored
@@ -191,7 +194,7 @@ public:
     /// startup, before serving threads read it without synchronisation —
     /// same idiom as `AppPerfDailyStore::set_metrics` and its siblings. Null
     /// (the default, e.g. unit tests / pre-WS-5 callers) disables emission.
-    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+    void set_metrics(yuzu::MetricsRegistry* m);
 
     /// Upsert one agent's last-known identity + last-seen. Best-effort: returns
     /// false (logged at debug) on an empty lease or a query error so a slow or
@@ -220,22 +223,40 @@ public:
                 std::string_view agent_version = {}, std::string_view arch = {},
                 std::string_view session_id = {});
 
-    /// Every endpoint whose last heartbeat is within `window` of now, newest
-    /// first. Its consumers (Hardware list/record, viz, MCP, and the Software
-    /// page's display-only hostname map) render those NOT currently online as
+    /// The newest `kQueryRowCap` endpoints whose last heartbeat is within `window` of now, newest
+    /// first. Its consumers (Hardware list, viz, MCP, and the Software page's
+    /// display-only hostname map) render those NOT currently online as
     /// offline rows / stale cubes; rows older than `window` are withheld so a
     /// long-departed host eventually stops cluttering the view. #5531: typed —
     /// `std::unexpected` (`StoreUnavailable`: no connection in time; `DbError`:
-    /// the query failed) on a failed read, never an empty vector; an empty success
-    /// means "no rows". `Truncated` is never produced: the read keeps
-    /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
-    /// is counted on `yuzu_server_agent_presence_store_failed_total`
-    /// (`op=query_stale_within`) and logged at warn once per failed call (a
-    /// store that never opened — boot-time migration failure — answers
-    /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
+    /// the query failed) on a failed read, never an empty roster; an empty success
+    /// means "no rows". #5712: a fleet past the cap is a typed PARTIAL success, not an
+    /// error — the query runs at `LIMIT kQueryRowCap + 1`, the extra row is discarded and
+    /// `OfflineRoster::truncated` is set. `Truncated` is NEVER returned here: a display read that
+    /// refused past the cap would be a refusal that never clears (#5371). The flag is recomputed on
+    /// every read, so it clears the moment the fleet is back under the cap. A truncated roster is a
+    /// LOWER BOUND — `find_within` is the exact answer for one agent. Ties on `last_heartbeat_ms`
+    /// at the cut are broken arbitrarily (no composite index; a tiebreak could force a full sort
+    /// at fleet scale). A failure is counted on `yuzu_server_agent_presence_store_failed_total`
+    /// (`op=query_stale_within`) and logged at warn once per failed call (a store that never
+    /// opened — boot-time migration failure — answers `StoreUnavailable` without a count or
+    /// warn, as `query_live_ids` does). A truncated read increments
+    /// `yuzu_server_agent_presence_roster_truncated_total` (a steady state on a fleet over the cap,
+    /// so it is a counter and a debug log, not a per-read warn).
     [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
 
-    /// Fleet tallies over the same roster window `query_stale_within` serves,
+    /// One agent's endpoint row if its last heartbeat is within `window` of now (#5712) — the same
+    /// window predicate as `query_stale_within`, answered by a primary-key lookup, so it is EXACT
+    /// at any fleet size where a roster scan is a lower bound past `kQueryRowCap`. An engaged
+    /// optional is the row; an empty one is a CONFIRMED absence from the window (never a failed
+    /// read); a failed read is `std::unexpected` (`StoreUnavailable` / `DbError`, counted on
+    /// `yuzu_server_agent_presence_store_failed_total{op=find_within}`), never "absent".
+    /// `Truncated` is never produced: one row is read. Display/identity read only — it grants no
+    /// authority, and the callers authorise the id BEFORE calling it.
+    [[nodiscard]] OfflineEndpointRead find_within(std::string_view agent_id,
+                                                  std::chrono::seconds window);
+
+    /// Fleet tallies over the same roster window `query_stale_within` serves (exact past the cap),
     /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement.
     /// `now_ms` is injected (the caller's clock); `stale_after` is the "not seen"
     /// threshold; `live_ttl` is the presence TTL for `FleetStateCounts::live`
