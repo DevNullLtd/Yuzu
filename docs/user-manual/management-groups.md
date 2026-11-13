@@ -305,7 +305,7 @@ Returns `201 Created`:
 }
 ```
 
-`known` is `true` when the server holds an enrolment record for the agent id and `false` when it holds none. An agent id with no enrolment record is still added, so you can place a device in a group before it first appears; `known: false` only flags it (matching is exact, letter case included). `known` is omitted when the lookup could not be made.
+`known` is `true` when the server holds an enrolment record for the agent id and `false` when it holds none. An agent id with no enrolment record is still added, so you can place a device in a group before it first appears; `known: false` only flags it (matching is exact, letter case included). `known` is returned only to a caller who may read enrolment status for that agent (the same fleet-read check as `GET /api/v1/enrollment/pending-agents`: `Enrollment:Read`, with the agent inside the caller's scope). It is omitted for any other caller, and when the lookup could not be made, so an omitted `known` does not say which of the two it is. The add itself and the success audit row do not depend on it.
 
 Adding and removing a member are audit-first like creating a group: an `attempted` audit row is stored before the change, and if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and changes nothing.
 
