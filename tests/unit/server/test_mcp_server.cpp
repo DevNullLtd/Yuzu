@@ -53363,41 +53363,396 @@ TEST_CASE("MCP real-session seam: production admission refuses a tierless servic
           2);
 }
 
-// ASSERT-CURRENT. FLIPS in the MCP conversion commit (#5557, commit 8): the service-scoped
-// credential's list must become exactly the agent-evidence set (`service_a_ids()`), with the two
-// minter rows below gone and `minter_in_a` kept. The non-service controls stay as asserted:
-// MCP's owner-only filter for a confined non-service caller is deliberate (D2 option A).
-TEST_CASE("MCP real-session seam: list_executions through a tiered service-scoped token "
-          "still serves the minter's own dispatches",
-          "[pg][mcp][execution][owner_rig][owner_rig_current][5557]") {
+namespace {
+
+using OwnerRig = yuzu::test::ExecutionOwnerRig;
+
+/// A tools/call as `token` through the real session seam. `args_json` is the arguments object.
+std::unique_ptr<httplib::Response> mcp_tool_as(McpTestServer& ts, const std::string& token,
+                                               const std::string& tool,
+                                               const std::string& args_json) {
+    return ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5557,"params":{"name":")" + tool +
+            R"(","arguments":)" + args_json + "}}",
+        {{"Authorization", "Bearer " + token}});
+}
+
+nlohmann::json mcp_structured(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    return body["result"]["structuredContent"];
+}
+
+bool mcp_is_error(const std::unique_ptr<httplib::Response>& res) {
+    return res && nlohmann::json::parse(res->body).contains("error");
+}
+
+std::string mcp_error_message(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    return body["error"]["message"].get<std::string>();
+}
+
+std::string replace_all(std::string text, const std::string& from, const std::string& to) {
+    for (std::size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + 1))
+        text.replace(at, from.size(), to);
+    return text;
+}
+
+std::vector<std::string> mcp_children_ids(const std::unique_ptr<httplib::Response>& res) {
+    std::vector<std::string> ids;
+    for (const auto& c : mcp_structured(res)["children"])
+        ids.push_back(c["id"].get<std::string>());
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+/// The seeded ids a credential can read through `get_execution_status`.
+std::vector<std::string> mcp_status_visible_ids(McpTestServer& ts, const OwnerRig& r,
+                                                const std::string& token) {
+    std::vector<std::string> visible;
+    for (const auto& id : r.all_seeded_ids()) {
+        auto res = mcp_tool_as(ts, token, "get_execution_status",
+                               R"({"execution_id":")" + id + R"("})");
+        REQUIRE(res);
+        if (!mcp_is_error(res))
+            visible.push_back(id);
+    }
+    return visible;
+}
+
+} // namespace
+
+// The exact id sets the five confined/unconfined caller classes see, shared by the list and the
+// status cases. `bob_owner` is what MCP's owner-only list (D-2 option A) shows a non-service
+// confined caller; status keeps the owner-or-visible-agent rule for him.
+TEST_CASE("MCP execution tools: list_executions serves exact sets through the real session",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
-    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    auto list_as = [&](const std::string& token,
+                       const std::string& args = R"({"definition_id":"def-owner-rig"})") {
+        return mcp_tool_as(ts, token, "list_executions", args);
+    };
+
+    SECTION("a service-scoped credential sees the agent-evidence set, never the minter's rows") {
+        // service A = {a1,a2}: minter_out (z1) and minter_pending (no rows) are gone, minter_in_a
+        // stays because an in-scope agent answered it.
+        auto svc = list_as(r.creds.mcp_svc_a);
+        REQUIRE(svc);
+        CHECK(svc->status == 200);
+        CHECK(mcp_list_execution_ids(svc) == r.service_a_ids());
+        for (const auto& hidden : {r.ids.minter_out, r.ids.minter_pending, r.ids.foreign,
+                                   r.ids.empty_pending, r.ids.bob_out, r.ids.bob_pending})
+            CHECK(svc->body.find(hidden) == std::string::npos);
+
+        // service B = {b1}: only the two executions with a b1 row, none of the minter's.
+        auto b = list_as(r.creds.mcp_svc_b);
+        REQUIRE(b);
+        CHECK(mcp_list_execution_ids(b) == OwnerRig::sorted({r.ids.mixed, r.ids.run}));
+
+        // A service with no tagged agent is ADMITTED with an empty scope: an empty list, never
+        // the owner-only list and never the unfiltered one (the empty-key-widens defect).
+        auto none = list_as(r.creds.mcp_svc_none);
+        REQUIRE(none);
+        CHECK(none->status == 200);
+        CHECK(mcp_list_execution_ids(none).empty());
+
+        // Minter bob (group-scoped to a1): service A meet his scope = {a1}. a2-ONLY is excluded,
+        // which separates {a1} from the widened {a1,a2}; his own dispatches give nothing.
+        auto bob_a = list_as(r.creds.mcp_svc_bob_a);
+        REQUIRE(bob_a);
+        CHECK(mcp_list_execution_ids(bob_a) ==
+              OwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a}));
+        CHECK(bob_a->body.find(r.ids.a2) == std::string::npos);
+        CHECK(bob_a->body.find(r.ids.bob_out) == std::string::npos);
+        CHECK(bob_a->body.find(r.ids.bob_pending) == std::string::npos);
+    }
+
+    SECTION("projection: counts cover only the in-scope agents and running is not responded") {
+        auto row_of = [](const nlohmann::json& payload, const std::string& id) {
+            for (const auto& e : payload["executions"])
+                if (e["id"] == id)
+                    return e;
+            return nlohmann::json{};
+        };
+        auto a = mcp_structured(list_as(r.creds.mcp_svc_a));
+        const auto mixed = row_of(a, r.ids.mixed);
+        CHECK(mixed["agents_targeted"] == 1);
+        CHECK(mixed["agents_responded"] == 1);
+        CHECK(mixed["agents_success"] == 1);
+        CHECK(mixed["agents_failure"] == 0);
+        const auto run = row_of(a, r.ids.run);
+        CHECK(run["agents_targeted"] == 2); // a1 running + a2 success
+        CHECK(run["agents_responded"] == 1);
+        CHECK(run["agents_success"] == 1);
+        CHECK(run["agents_failure"] == 0);
+        CHECK(nlohmann::json(a).dump().find("SECRET-B-ERR") == std::string::npos);
+
+        auto b = mcp_structured(list_as(r.creds.mcp_svc_b));
+        const auto b_mixed = row_of(b, r.ids.mixed);
+        CHECK(b_mixed["agents_targeted"] == 1);
+        CHECK(b_mixed["agents_failure"] == 1);
+        CHECK(b_mixed["error_preview"].get<std::string>().find("SECRET-B-ERR") !=
+              std::string::npos);
+        const auto b_run = row_of(b, r.ids.run);
+        CHECK(b_run["agents_targeted"] == 1); // b1 running
+        CHECK(b_run["agents_responded"] == 0);
+    }
+
+    SECTION("the owner key is dropped in SQL before the page LIMIT") {
+        // 60 NEWER minter rows on z1 would fill a limit-50 page under minter-keyed admission.
+        (void)r.seed_starvation(60);
+        auto svc = list_as(r.creds.mcp_svc_a, R"({"definition_id":"def-owner-rig","limit":50})");
+        REQUIRE(svc);
+        CHECK(svc->status == 200);
+        CHECK(mcp_list_execution_ids(svc) == r.service_a_ids());
+    }
+
+    SECTION("non-service callers keep today's behaviour (D-2 option A)") {
+        // Confined non-service bob: owner-only. NONE of carol's a1 executions on MCP.
+        auto bob = list_as(r.creds.mcp_bob);
+        REQUIRE(bob);
+        CHECK(mcp_list_execution_ids(bob) == OwnerRig::sorted({r.ids.bob_out, r.ids.bob_pending}));
+        for (const auto& carol : {r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a})
+            CHECK(bob->body.find(carol) == std::string::npos);
+        // Global mina: unconfined.
+        auto mina = list_as(r.creds.mcp_mina);
+        REQUIRE(mina);
+        CHECK(mcp_list_execution_ids(mina) == r.all_seeded_ids());
+        // dan holds no Execution:Read: refused at the real gate (403), distinct from the
+        // admitted-empty service C answer above.
+        auto dan = list_as(r.creds.mcp_dan);
+        REQUIRE(dan);
+        CHECK(dan->status == 403);
+        for (const auto& id : r.all_seeded_ids())
+            CHECK(dan->body.find(id) == std::string::npos);
+    }
+
+    SECTION("RBAC off: service-scoped is refused, non-service stays unconfined") {
+        r.rbac.set_rbac_enabled(false);
+        auto svc = list_as(r.creds.mcp_svc_a);
+        REQUIRE(svc);
+        CHECK(svc->status == 403);
+        for (const auto& id : r.all_seeded_ids())
+            CHECK(svc->body.find(id) == std::string::npos);
+        auto mina = list_as(r.creds.mcp_mina);
+        REQUIRE(mina);
+        CHECK(mcp_list_execution_ids(mina) == r.all_seeded_ids());
+    }
+}
+
+TEST_CASE("MCP execution tools: get_execution_status serves exact sets and a normalized not-found",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
     McpTestServer ts;
     r.wire_mcp(ts);
     ts.start("readonly");
 
-    // The real session reaches the tool: the owner-only filter is keyed on the MINTER (mina),
-    // which is the leak: minter_out and minter_pending are out of service A's scope.
-    auto svc = mcp_list_executions_as(ts, r.creds.mcp_svc_a);
-    REQUIRE(svc);
-    CHECK(svc->status == 200);
-    CHECK(mcp_list_execution_ids(svc) ==
-          yuzu::test::ExecutionOwnerRig::sorted(
-              {r.ids.minter_out, r.ids.minter_in_a, r.ids.minter_pending}));
+    SECTION("exact visible id sets per credential") {
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_a) == r.service_a_ids());
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_b) ==
+              OwnerRig::sorted({r.ids.mixed, r.ids.run}));
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_none).empty());
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_bob_a) ==
+              OwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a}));
+        // Non-service controls: bob keeps the owner disjunct (his own pending row) beside his
+        // visible agent a1; mina is unconfined.
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_bob) ==
+              OwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a,
+                                r.ids.bob_out, r.ids.bob_pending}));
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_mina) == r.all_seeded_ids());
+        // No Execution:Read grant: the gate refuses before any lookup.
+        auto dan = mcp_tool_as(ts, r.creds.mcp_dan, "get_execution_status",
+                               R"({"execution_id":")" + r.ids.in_a + R"("})");
+        REQUIRE(dan);
+        CHECK(dan->status == 403);
+        CHECK(dan->body.find(r.ids.in_a) == std::string::npos);
+    }
 
-    // Controls. Non-service group-scoped bob: owner-only (his own dispatches), none of carol's
-    // a1 executions. Global mina: unconfined, every seeded id. dan (no grant): refused at the
-    // fleet-read gate, which is the real gate here, not the fixture's permissive fake.
-    auto bob = mcp_list_executions_as(ts, r.creds.mcp_bob);
+    SECTION("the minter's out-of-scope and pending executions read as not found, normalized") {
+        auto not_found = [&](const std::string& id) {
+            const auto audit_before = ts.audit_log.size();
+            auto res = mcp_tool_as(ts, r.creds.mcp_svc_a, "get_execution_status",
+                                   R"({"execution_id":")" + id + R"("})");
+            REQUIRE(res);
+            REQUIRE(mcp_is_error(res));
+            // The error echoes the requested id (MCP's own shape): compare it normalized.
+            std::string audit_detail;
+            std::size_t denied = 0;
+            for (std::size_t i = audit_before; i < ts.audit_log.size(); ++i)
+                if (ts.audit_log[i] == "mcp.get_execution_status|denied") {
+                    ++denied;
+                    audit_detail = replace_all(ts.audit_details[i], id, "<ID>");
+                }
+            CHECK(denied == 1);
+            return std::make_pair(replace_all(mcp_error_message(res), id, "<ID>"), audit_detail);
+        };
+        const auto absent = not_found("exec-never-existed");
+        CHECK(absent.first == "Execution not found: <ID>");
+        CHECK(not_found(r.ids.minter_out) == absent);
+        CHECK(not_found(r.ids.minter_pending) == absent);
+        CHECK(not_found(r.ids.foreign) == absent);
+    }
+
+    SECTION("projection and the per-agent expansion are confined to the service scope") {
+        auto status = [&](const std::string& token, const std::string& id, bool agents = false) {
+            return mcp_structured(mcp_tool_as(
+                ts, token, "get_execution_status",
+                R"({"execution_id":")" + id + R"(")" +
+                    (agents ? R"(,"include":["agents"])" : "") + "}"));
+        };
+        const auto mixed = status(r.creds.mcp_svc_a, r.ids.mixed);
+        CHECK(mixed["agents_targeted"] == 1);
+        CHECK(mixed["agents_responded"] == 1);
+        CHECK(mixed["agents_success"] == 1);
+        CHECK(mixed["agents_failure"] == 0);
+        CHECK(mixed["scope_expression"] == "(redacted - confined view)");
+        const auto run = status(r.creds.mcp_svc_a, r.ids.run, /*agents=*/true);
+        CHECK(run["agents_targeted"] == 2);
+        CHECK(run["agents_responded"] == 1);
+        CHECK(run["agents_success"] == 1);
+        CHECK(run["agents_failure"] == 0);
+        std::vector<std::string> agent_ids;
+        for (const auto& a : run["agents"])
+            agent_ids.push_back(a["agent_id"].get<std::string>());
+        std::sort(agent_ids.begin(), agent_ids.end());
+        CHECK(agent_ids == std::vector<std::string>{"a1", "a2"});
+        CHECK(run.dump().find("b1") == std::string::npos);
+        CHECK(status(r.creds.mcp_svc_a, r.ids.mixed, true).dump().find("SECRET-B-ERR") ==
+              std::string::npos);
+        // Service B reads the same execution and DOES see its own failure text.
+        CHECK(status(r.creds.mcp_svc_b, r.ids.mixed, true).dump().find("SECRET-B-ERR") !=
+              std::string::npos);
+    }
+
+    SECTION("RBAC off: service-scoped refused, non-service unconfined") {
+        r.rbac.set_rbac_enabled(false);
+        auto svc = mcp_tool_as(ts, r.creds.mcp_svc_a, "get_execution_status",
+                               R"({"execution_id":")" + r.ids.in_a + R"("})");
+        REQUIRE(svc);
+        CHECK(svc->status == 403);
+        CHECK(svc->body.find(r.ids.in_a) == std::string::npos);
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_mina) == r.all_seeded_ids());
+    }
+}
+
+TEST_CASE("MCP execution tools: get_execution_children serves exact sets and honours the cap",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    const auto c = r.seed_children();
+    const auto cap = r.seed_children_cap();
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    auto children_as = [&](const std::string& token, const std::string& parent) {
+        return mcp_tool_as(ts, token, "get_execution_children",
+                           R"({"execution_id":")" + parent + R"("})");
+    };
+
+    SECTION("a service-scoped credential sees only the in-scope children of a visible parent") {
+        auto in = children_as(r.creds.mcp_svc_a, c.parent_in);
+        REQUIRE_FALSE(mcp_is_error(in));
+        CHECK(mcp_children_ids(in) == std::vector<std::string>{c.c_in});
+        // The minter's z1 and pending children and carol's b1 child are all absent.
+        for (const auto& hidden : {c.c_minter_out, c.c_minter_pending, c.c_b})
+            CHECK(in->body.find(hidden) == std::string::npos);
+
+        // parent_minter_out is a z1-only execution the MINTER dispatched: hidden parent, even
+        // though it has a visible child (c_x on a1).
+        const auto hidden_parent = children_as(r.creds.mcp_svc_a, c.parent_minter_out);
+        REQUIRE(mcp_is_error(hidden_parent));
+        const auto absent = children_as(r.creds.mcp_svc_a, "exec-never-existed");
+        REQUIRE(mcp_is_error(absent));
+        CHECK(replace_all(mcp_error_message(hidden_parent), c.parent_minter_out, "<ID>") ==
+              replace_all(mcp_error_message(absent), "exec-never-existed", "<ID>"));
+        CHECK(hidden_parent->body.find(c.c_x) == std::string::npos);
+
+        // Service B cannot see parent_in (a1 only); service C (empty scope) sees nothing.
+        CHECK(mcp_is_error(children_as(r.creds.mcp_svc_b, c.parent_in)));
+        CHECK(mcp_is_error(children_as(r.creds.mcp_svc_none, c.parent_in)));
+        // Minter bob (service A meet {a1}): the same children as service A here.
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_svc_bob_a, c.parent_in)) ==
+              std::vector<std::string>{c.c_in});
+    }
+
+    SECTION("the cap applies to the caller's own visible children (scope before LIMIT)") {
+        // kRigChildrenOverCap NEWER minter children on z1 sit above ONE older in-scope child:
+        // the scope clause precedes ORDER BY ... LIMIT, so the visible child survives and the
+        // truncation marker (which reports the SCOPED row set) is absent.
+        auto svc = children_as(r.creds.mcp_svc_a, cap.parent_cap);
+        REQUIRE_FALSE(mcp_is_error(svc));
+        CHECK(mcp_children_ids(svc) == std::vector<std::string>{cap.c_old_in});
+        CHECK_FALSE(mcp_structured(svc).contains("result_truncated_by_cap"));
+        // Control: unconfined mina's raw set exceeds the cap and says so.
+        auto mina = children_as(r.creds.mcp_mina, cap.parent_cap);
+        REQUIRE_FALSE(mcp_is_error(mina));
+        CHECK(mcp_structured(mina)["result_truncated_by_cap"] == true);
+    }
+
+    SECTION("non-service callers keep today's behaviour") {
+        // mina is unconfined: every child, including the minter's.
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_mina, c.parent_in)) ==
+              OwnerRig::sorted({c.c_in, c.c_minter_out, c.c_minter_pending, c.c_b}));
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_mina, c.parent_minter_out)) ==
+              std::vector<std::string>{c.c_x});
+        // Group-scoped bob (visible a1): his parent is visible by agent evidence, and each child
+        // passes the same owner-or-visible-agent test independently.
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_bob, c.parent_in)) ==
+              std::vector<std::string>{c.c_in});
+        auto dan = children_as(r.creds.mcp_dan, c.parent_in);
+        REQUIRE(dan);
+        CHECK(dan->status == 403);
+        CHECK(dan->body.find(c.c_in) == std::string::npos);
+    }
+
+    SECTION("a denial for a service-scoped credential is audited and names the parent only") {
+        const auto before = ts.audit_log.size();
+        REQUIRE(mcp_is_error(children_as(r.creds.mcp_svc_a, c.parent_minter_out)));
+        std::size_t denied = 0;
+        for (std::size_t i = before; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i] == "execution.read|denied")
+                ++denied;
+        CHECK(denied == 1);
+    }
+}
+
+TEST_CASE("MCP execution tools: summarize_working_set kind=execution keys on the owner key",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    // The tool's first gate is a GLOBAL Infrastructure:Read; give group-scoped bob that grant so
+    // the call reaches the execution branch (his Execution:Read stays group-scoped to {a1}).
+    REQUIRE(r.rbac.create_role({"InfraReader5557", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"InfraReader5557", "Infrastructure", "Read", "allow"})
+                .has_value());
+    REQUIRE(r.rbac.assign_role({"user", "bob", "InfraReader5557"}).has_value());
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    auto summarize_as = [&](const std::string& token, const std::string& id) {
+        return mcp_tool_as(ts, token, "summarize_working_set",
+                           R"({"kind":"execution","id":")" + id + R"("})");
+    };
+    // The tool is `denied` for a service-scoped token by its ServiceScopeClass today, so the
+    // conversion is reachable here only for non-service callers. Pin both: a service-scoped
+    // credential never reaches the minter's execution, and a confined non-service owner still
+    // reads his own pending one (the owner disjunct is the key, not a regression).
+    auto svc = summarize_as(r.creds.mcp_svc_a, r.ids.minter_pending);
+    REQUIRE(svc);
+    CHECK(svc->body.find(r.ids.minter_pending + " is running") == std::string::npos);
+    auto bob = summarize_as(r.creds.mcp_bob, r.ids.bob_pending);
     REQUIRE(bob);
-    CHECK(mcp_list_execution_ids(bob) ==
-          yuzu::test::ExecutionOwnerRig::sorted({r.ids.bob_out, r.ids.bob_pending}));
-    auto mina = mcp_list_executions_as(ts, r.creds.mcp_mina);
-    REQUIRE(mina);
-    CHECK(mcp_list_execution_ids(mina) == r.all_seeded_ids());
-    auto dan = mcp_list_executions_as(ts, r.creds.mcp_dan);
-    REQUIRE(dan);
-    CHECK(dan->status == 403);
-    for (const auto& id : r.all_seeded_ids())
-        CHECK(dan->body.find(id) == std::string::npos);
+    CHECK(bob->body.find("is running") != std::string::npos);
+    auto bob_other = summarize_as(r.creds.mcp_bob, r.ids.minter_pending);
+    REQUIRE(bob_other);
+    CHECK(bob_other->body.find("was not found") != std::string::npos);
 }
