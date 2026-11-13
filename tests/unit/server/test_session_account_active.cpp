@@ -891,3 +891,44 @@ TEST_CASE("reactivation with a validation in flight: that session is not served 
     REQUIRE_FALSE(after.empty());
     CHECK(b.validate_session(after).has_value());
 }
+
+TEST_CASE("cache epoch: a revoke on the SAME replica drops a validation held across it, with no "
+          "poll in between (T-R9)",
+          "[auth][session_store][account_active][cache_epoch][pg]") {
+    // The generation poll is not what protects this: the revoking replica sees its own bump only
+    // on its next poll, so without an epoch bump at the targeted erase the held validation would
+    // put its session back and a cache hit would serve it. No poll runs between the release and
+    // the final validate (the poll interval is 1 s and the steps below take milliseconds).
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+    f.seed("bob", Role::user);
+
+    // Sign-out form: invalidate_session erases the key.
+    {
+        const auto token = a.create_local_session_for_test("alice", Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        REQUIRE(a.validate_session(token).has_value()); // warm on A
+        HeldValidation held;
+        held.install(a);
+        held.start([&] { return a.validate_session(token); });
+
+        REQUIRE(a.invalidate_session(token));
+        CHECK(held.release_and_join().has_value()); // concurrent with the revoke: served once
+        CHECK_FALSE(a.validate_session(token).has_value()); // not re-cached
+    }
+
+    // Account-removal form: remove_user_checked erases every session of the account.
+    {
+        const auto token = a.create_local_session_for_test("bob", Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        REQUIRE(a.validate_session(token).has_value()); // warm on A
+        HeldValidation held;
+        held.install(a);
+        held.start([&] { return a.validate_session(token); });
+
+        REQUIRE(a.remove_user_checked("bob") == RemoveUserOutcome::Removed);
+        CHECK(held.release_and_join().has_value());
+        CHECK_FALSE(a.validate_session(token).has_value());
+    }
+}

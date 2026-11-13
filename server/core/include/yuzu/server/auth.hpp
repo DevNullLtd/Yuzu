@@ -1815,11 +1815,25 @@ private:
     // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
     // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
-    // section as every `sessions_.clear()` (the generation poll is the only one).
+    // section as every `sessions_.clear()` (the generation poll) and every targeted
+    // erase that revokes a session (`drop_cached_session_locked`,
+    // `drop_cached_user_sessions_locked`). Expiry and idle hygiene drops do not move it.
     // `validate_session_durable` captures it under its step-1 shared lock and inserts
     // its session at the tail only if it is unchanged, so a validation that straddles
-    // a clear cannot put the session back (ADR-0012 section 4, rule 2).
+    // a clear or a revoke cannot put the session back (ADR-0012 section 4, rule 2). The
+    // generation poll alone cannot do that for a revoke on THIS replica: it sees its own
+    // bump only on the next poll.
     mutable std::uint64_t session_cache_epoch_ = 0;
+
+    /// Targeted cache erase for a revoke, wipe, account removal or gate refusal: erases
+    /// from `sessions_` AND advances `session_cache_epoch_` in the SAME critical section.
+    /// The caller MUST hold `mu_` exclusively. Never erase `sessions_` for one of those
+    /// purposes directly: a validation held across the erase would re-insert its session.
+    void drop_cached_session_locked(const std::string& key) const;
+
+    /// As `drop_cached_session_locked`, for every cached session of `username`. Returns
+    /// how many entries were erased. The epoch advances even when none were.
+    std::size_t drop_cached_user_sessions_locked(const std::string& username) const;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;

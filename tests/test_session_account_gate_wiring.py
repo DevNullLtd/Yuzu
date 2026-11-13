@@ -23,10 +23,17 @@ comment-stripped text, not a proof.
         comes after the last of them, after the idle re-read's expiry test, and before the cache
         insert. The account read (`auth_db_->user_exists(`) lives only in
         `session_account_admits`, which counts a degrade, closes on `auth_source` (three
-        comparisons) and erases the cached entry on every refusal (`if (!admit)`).
+        comparisons) and erases the cached entry on every refusal (`if (!admit)`, through the epoch helper).
   (v)   the validate tail's cache insert is the only `sessions_[key] = *session_copy` and is
         guarded by `session_cache_epoch_ == cache_epoch`.
   (vi)  the cache epoch is incremented in the same block as the single `sessions_.clear()`.
+  (vii) in `validate_session_durable` the `cache_epoch = session_cache_epoch_;` capture appears
+        BEFORE the first `session_store_->find(`: a capture taken after the store read would let
+        a revoke that landed in between go unnoticed by the guarded insert.
+  (viii) targeted erases go through the epoch-advancing helpers: the two helpers each pair the
+        erase with `++session_cache_epoch_;`, and `sessions_.erase(` / `erase_if(sessions_` appear
+        nowhere else in auth.cpp except the cache-hygiene drops in `validate_session` and
+        `validate_session_durable` (expired or idle entries, not a revocation).
 
 Comments and string-literal contents are excluded from every scan except (i), which reads
 literals on purpose. Wired into tests/meson.build (suite 'docs') and docs-lint.yml.
@@ -138,7 +145,7 @@ def check_auth(auth_src: str):
     if helper is None:
         fails.append("(iv) AuthManager::session_account_admits not found")
     else:
-        refuse = re.search(r"if \(!admit\) \{[^}]*sessions_\.erase\(key\);", helper)
+        refuse = re.search(r"if \(!admit\) \{[^}]*drop_cached_session_locked\(key\);", helper)
         if (helper.count("auth_db_->user_exists(") != 1
                 or "note_session_store_degrade(" not in helper
                 or helper.count("auth_source ==") != 3
@@ -155,6 +162,32 @@ def check_auth(auth_src: str):
         fails.append("(v) the validate tail's cache insert must be the only "
                      "`sessions_[key] = *session_copy` and be guarded by "
                      "`if (session_cache_epoch_ == cache_epoch)`")
+    # (vii)
+    capture = body.find("cache_epoch = session_cache_epoch_;")
+    first_find = body.find("session_store_->find(")
+    if capture == -1 or first_find == -1 or capture > first_find:
+        fails.append("(vii) in validate_session_durable `cache_epoch = session_cache_epoch_;` must "
+                     "come before the first `session_store_->find(`")
+    # (viii)
+    one = function_body(flat, "AuthManager::drop_cached_session_locked(")
+    many = function_body(flat, "AuthManager::drop_cached_user_sessions_locked(")
+    if (one is None or many is None or "sessions_.erase(key); ++session_cache_epoch_;" not in one
+            or "++session_cache_epoch_;" not in many or "erase_if(sessions_" not in many):
+        fails.append("(viii) drop_cached_session_locked and drop_cached_user_sessions_locked must "
+                     "each erase from sessions_ and advance ++session_cache_epoch_")
+    else:
+        rest = flat
+        for sig in ("AuthManager::drop_cached_session_locked(",
+                    "AuthManager::drop_cached_user_sessions_locked(",
+                    "AuthManager::validate_session(", "AuthManager::validate_session_durable("):
+            part = function_body(rest, sig)
+            if part is not None:
+                rest = rest.replace(part, "", 1)
+        raw = len(re.findall(r"sessions_\.erase\(|erase_if\( ?sessions_", rest))
+        if raw:
+            fails.append(f"(viii) {raw} raw sessions_ erase(s) outside the epoch helpers and the "
+                         "validate cache-hygiene drops: use drop_cached_session_locked / "
+                         "drop_cached_user_sessions_locked")
     # (vi)
     if flat.count("sessions_.clear();") != 1 or "sessions_.clear(); ++session_cache_epoch_;" not in flat:
         fails.append("(vi) the single sessions_.clear() must be followed by "
@@ -192,9 +225,15 @@ def _selfcheck() -> None:
             "  if (!a) { note_session_store_degrade(op); } else if (!*a) { x(); } else { admit = true; } }\n"
             " } else if (s.auth_source == \"oidc\" || s.auth_source == \"saml\") { admit = true; }\n"
             " else { y(); }\n"
-            " if (!admit) { std::unique_lock w(mu_); sessions_.erase(key); }\n"
+            " if (!admit) { std::unique_lock w(mu_); drop_cached_session_locked(key); }\n"
             " return admit; }\n"
+            "void AuthManager::drop_cached_session_locked(const std::string& key) const {\n"
+            " sessions_.erase(key);\n ++session_cache_epoch_; }\n"
+            "std::size_t AuthManager::drop_cached_user_sessions_locked(const std::string& u) const {\n"
+            " std::erase_if(sessions_, pred);\n ++session_cache_epoch_; return 0; }\n"
             "std::optional<Session> AuthManager::validate_session_durable(const std::string& t) const {\n"
+            " { std::shared_lock l(mu_); cache_epoch = session_cache_epoch_; }\n"
+            " auto f = session_store_->find(key);\n"
             " auto s = session_from_row(row, now); from_store = true;\n"
             " if (expired_now(*session_copy)) { return std::nullopt; }\n"
             " if (from_store && !session_account_admits(key, *session_copy))\n"
@@ -219,7 +258,19 @@ def _selfcheck() -> None:
         "(iv) account read outside the helper": auth.replace(
             " auto s = session_from_row(row, now);",
             " auto q = auth_db_->user_exists(n); auto s = session_from_row(row, now);"),
-        "(iv) no erase on refusal": auth.replace("sessions_.erase(key);", ""),
+        "(iv) no erase on refusal": auth.replace(
+            " if (!admit) { std::unique_lock w(mu_); drop_cached_session_locked(key); }\n", ""),
+        "(vii) capture after the store read": auth.replace(
+            " { std::shared_lock l(mu_); cache_epoch = session_cache_epoch_; }\n", "").replace(
+            " auto s = session_from_row(row, now);",
+            " { std::shared_lock l(mu_); cache_epoch = session_cache_epoch_; }"
+            " auto s = session_from_row(row, now);"),
+        "(vii) capture removed": auth.replace(
+            " { std::shared_lock l(mu_); cache_epoch = session_cache_epoch_; }\n", ""),
+        "(viii) helper without the epoch bump": auth.replace(
+            " sessions_.erase(key);\n ++session_cache_epoch_; }\n", " sessions_.erase(key); }\n"),
+        "(viii) raw erase in a revoke path": auth + "void AuthManager::invalidate_session(t) {"
+                                                    " sessions_.erase(key); }\n",
         "(iv) fourth source arm": auth.replace('s.auth_source == "oidc"',
                                                's.auth_source == "x" || s.auth_source == "oidc"'),
         "(v) epoch guard removed": auth.replace("if (session_cache_epoch_ == cache_epoch)", ""),

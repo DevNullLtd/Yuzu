@@ -1929,7 +1929,9 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         std::unique_lock wlock(mu_);
         // Insert only if no cache invalidation ran since this validation started
         // (ADR-0012 section 4, rule 2). The epoch moves with every clear of the cache
-        // (the generation poll). On a mismatch the session is
+        // (the generation poll) and every targeted erase (drop_cached_session_locked,
+        // drop_cached_user_sessions_locked), so a revoke, wipe, account removal or refusal on
+        // THIS replica also drops a validation held across it. On a mismatch the session is
         // still returned to THIS caller, whose request is concurrent with the invalidation
         // and linearises before it, but it is not cached: a refusal here would reject an
         // unrelated in-flight request whenever any session anywhere is created or revoked,
@@ -1942,6 +1944,18 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
             sessions_[key] = *session_copy;
     }
     return session_copy;
+}
+
+void AuthManager::drop_cached_session_locked(const std::string& key) const {
+    sessions_.erase(key);
+    ++session_cache_epoch_;
+}
+
+std::size_t AuthManager::drop_cached_user_sessions_locked(const std::string& username) const {
+    const auto before = sessions_.size();
+    std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
+    ++session_cache_epoch_;
+    return before - sessions_.size();
 }
 
 bool AuthManager::session_account_admits(const std::string& key, const Session& session) const {
@@ -1990,7 +2004,7 @@ bool AuthManager::session_account_admits(const std::string& key, const Session& 
         // cached from before a stale-distrust window, where it was not consulted; leaving it
         // would flip this refusal back to a grant as soon as trust returns.
         std::unique_lock wlock(mu_);
-        sessions_.erase(key);
+        drop_cached_session_locked(key);
     }
     return admit;
 }
@@ -2016,7 +2030,7 @@ bool AuthManager::invalidate_session(const std::string& token) {
         }
     }
     std::unique_lock lock(mu_);
-    sessions_.erase(key);
+    drop_cached_session_locked(key);
     return db_persisted;
 }
 
@@ -2055,21 +2069,15 @@ AuthManager::invalidate_user_sessions(const std::string& username) {
             note_session_store_degrade("invalidate_user"); // parity with wipe/other sites
         }
         std::unique_lock lock(mu_);
-        const auto before = sessions_.size();
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        const auto erased = drop_cached_user_sessions_locked(username);
         if (!db_persisted)
-            count = before - sessions_.size();
+            count = erased;
         return RevokeResult{count, db_persisted};
     }
 
     bool db_persisted = true;
     std::unique_lock lock(mu_);
-    const auto before = sessions_.size();
-    std::erase_if(sessions_, [&](const auto& pair) {
-        return pair.second.username == username;
-    });
-    return RevokeResult{before - sessions_.size(), db_persisted};
+    return RevokeResult{drop_cached_user_sessions_locked(username), db_persisted};
 }
 
 // ── User management ─────────────────────────────────────────────────────────
@@ -2145,8 +2153,7 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     if (role_changed) {
         // Invalidate sessions so the user picks up the new role on next login
         // Prevents stale session role from granting old privileges (G4-CON-AUTH-001)
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
     lock.unlock(); // release before durable I/O and save_config (both take their own locks)
 
@@ -2192,8 +2199,7 @@ void AuthManager::evict_target_after_indeterminate_write(const std::string& user
     {
         std::unique_lock lock(mu_);
         users_.erase(username);
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
     if (!wipe_user_sessions_durable(username))
         spdlog::warn("AuthManager: durable session wipe for '{}' after an indeterminate "
@@ -2249,8 +2255,7 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
         users_.erase(username);
         // Invalidate all active sessions belonging to this user
         // to prevent deleted users from retaining access (CHAOS-T1-001)
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
         lock.unlock();
         // Fail closed on a durable-wipe error (see wipe_user_sessions_durable): a removed
         // user's sessions must not survive because the durable delete was lost; the operator
@@ -2271,8 +2276,7 @@ RemoveUserOutcome AuthManager::remove_user_checked(const std::string& username) 
     if (erased) {
         // Invalidate all active sessions belonging to this user
         // to prevent deleted users from retaining access (CHAOS-T1-001)
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
 
     lock.unlock();
@@ -2329,8 +2333,7 @@ bool AuthManager::reactivate_user(const std::string& username) {
     // stays inactive and the caller retries (invalidate_user is idempotent).
     {
         std::unique_lock lock(mu_);
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
     }
     if (!wipe_user_sessions_durable(username)) {
         spdlog::error("AuthManager::reactivate_user: durable session wipe for '{}' failed, "
@@ -2403,8 +2406,7 @@ AuthManager::commit_password_change(const yuzu::server::CredentialChangeRequest&
         it->second.hash_hex = request.new_hash_hex;
         it->second.salt_hex = request.new_salt_hex;
     }
-    std::erase_if(sessions_,
-                  [&](const auto& pair) { return pair.second.username == request.username; });
+    drop_cached_user_sessions_locked(request.username);
     return outcome;
 }
 
@@ -2605,8 +2607,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
 
         // Invalidate sessions so the user picks up the new role on next login
         // Prevents stale session role from granting old privileges
-        std::erase_if(sessions_,
-                      [&](const auto& pair) { return pair.second.username == username; });
+        drop_cached_user_sessions_locked(username);
         lock.unlock();
         // Fail closed on a durable-wipe error: a demoted user's higher-role session must not
         // survive a lost durable delete (see the helper). The role IS changed by now.
@@ -2629,7 +2630,7 @@ UpdateRoleOutcome AuthManager::update_role_checked(const std::string& username, 
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges
-    std::erase_if(sessions_, [&](const auto& pair) { return pair.second.username == username; });
+    drop_cached_user_sessions_locked(username);
 
     lock.unlock();
     if (!wipe_user_sessions_durable(username)) // no-op (true) w/o store
