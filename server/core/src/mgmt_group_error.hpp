@@ -2,9 +2,9 @@
 
 /// @file mgmt_group_error.hpp
 /// The one answer to "is this ManagementGroupStore error message a store fault?", shared by the
-/// REST assign-role route (rest_api_v1.cpp) and the four MCP management-group write tools
-/// (mcp_server.cpp: create, update, add member, assign role) so those two cannot drift. The other
-/// REST group routes (create, update, delete, add and remove member) map store errors on their
+/// REST create and assign-role routes (rest_api_v1.cpp) and the four MCP management-group write
+/// tools (mcp_server.cpp: create, update, add member, assign role) so those two cannot drift. The
+/// other REST group routes (update, delete, add and remove member) map store errors on their
 /// own and are NOT routed through it.
 ///
 /// The store returns `std::expected<..., std::string>`. A fault of the store itself (not open, no

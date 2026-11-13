@@ -4706,9 +4706,28 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn,
-                                            mgmt_store](const httplib::Request& req,
-                                                        httplib::Response& res) {
+    // A management-group write whose store call reported an error answers a
+    // retryable 503 with a fixed message (the store's libpq text is never
+    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
+    const auto mgmt_write_failed = [](httplib::Response& res) {
+        res.status = 503;
+        res.set_content(
+            detail::a4_error(res, "management group store unavailable",
+                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
+                                                 .remediation = "retry shortly"}),
+            "application/json");
+    };
+
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074): the
+    // `attempted` row is stored BEFORE create_group and a row that cannot be stored refuses the
+    // create (503 + Sec-Audit-Failed). Every refusal that needs no write to decide (permission,
+    // body, `validate_new_group`) answers first and burns no row. The attempted row can wait on
+    // the audit pool, so the session and the permission are decided again after it (#3619, the
+    // dashboard's group.create_from_results twin). Failure rows carry FIXED detail tokens only;
+    // the group name (success/attempted detail) is the existing raw-name contract.
+    sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store,
+                                            mgmt_write_failed](const httplib::Request& req,
+                                                               httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
         if (!mgmt_store) {
@@ -4731,17 +4750,70 @@ void RestApiV1::register_routes(
         g.membership_type = body.value("membership_type", "static");
         g.scope_expression = body.value("scope_expression", "");
 
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row. A fault of the store itself is a retryable 503, never a 400.
+        if (auto valid = mgmt_store->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error())) {
+                mgmt_write_failed(res);
+                return;
+            }
+            res.status = 400;
+            res.set_content(detail::a4_error(res, valid.error()), "application/json");
+            return;
+        }
+
         auto session = auth_fn(req, res);
         if (session)
             g.created_by = session->username;
 
+        if (!detail::audit_attempted(audit_fn, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name))
+            return;
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing.
+        const auto fresh_session = auth_fn(req, res);
+        if (!fresh_session) {
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                "session_revoked");
+            if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            return;
+        }
+        if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(audit_fn, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                "permission_revoked");
+            return;
+        }
+        g.created_by = fresh_session->username;
+
         auto result = mgmt_store->create_group(g);
         if (!result) {
+            // The attempted row is stored, so it gets an outcome. The detail is a fixed token,
+            // never the store text (which can carry database error output).
+            const bool conflict = result.error() == "a group with that name already exists";
+            const bool fault = !conflict && mgmt_group_error_is_store_fault(result.error());
+            (void)detail::emit_behavioral_audit(
+                audit_fn, req, res, "management_group.create", "failure", "ManagementGroup", "",
+                conflict ? "name_conflict" : (fault ? "store_error" : "validation_refused"));
+            if (fault) {
+                mgmt_write_failed(res);
+                return;
+            }
+            // A name conflict or a validation literal: closed text, safe to echo.
             res.status = 400;
             res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
-        audit_fn(req, "management_group.create", "success", "ManagementGroup", *result, g.name);
+        // The group exists: a lost outcome row keeps the 201 and marks the response
+        // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
+        (void)detail::emit_behavioral_audit(audit_fn, req, res, "management_group.create",
+                                            "success", "ManagementGroup", *result, g.name);
         res.status = 201;
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
     });
@@ -4917,18 +4989,6 @@ void RestApiV1::register_routes(
             audit_fn(req, "management_group.delete", "success", "ManagementGroup", id, "");
             res.set_content(ok_json(JObj().add("deleted", true).str()), "application/json");
         });
-
-    // A management-group write whose store call reported an error answers a
-    // retryable 503 with a fixed message (the store's libpq text is never
-    // echoed), never a 2xx. The caller writes the matching `failure` audit row.
-    const auto mgmt_write_failed = [](httplib::Response& res) {
-        res.status = 503;
-        res.set_content(
-            detail::a4_error(res, "management group store unavailable",
-                             detail::A4ErrorOpts{.retry_after_ms = mcp::kMcpStoreFaultRetryMs,
-                                                 .remediation = "retry shortly"}),
-            "application/json");
-    };
 
     // The member and role id fields reach a text bind: a control byte or an
     // invalid UTF-8 sequence is refused up front (400) instead of becoming a
