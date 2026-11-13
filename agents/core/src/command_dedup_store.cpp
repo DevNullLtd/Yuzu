@@ -16,7 +16,6 @@
 #include <spdlog/spdlog.h>
 
 #include <cctype>
-#include <chrono>
 #include <cstddef>
 #include <format>
 #include <memory>
@@ -29,11 +28,7 @@ namespace yuzu::agent {
 
 namespace {
 
-std::int64_t now_epoch_seconds() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
+using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
@@ -97,7 +92,9 @@ constexpr int kStateTerminal = 1;
 // journal_mode/synchronous pragmas, or creating the two tables. Damage confined to the unused
 // `meta` table is tolerated (see the schema_version seed below).
 //
-// Deliberately STRICTER than echo's integrity_ok(), in two ways:
+// Two deliberate rules; echo's classify_integrity_rc makes the first rc split the same way (echo
+// also quarantines on a failed integrity_check row, which this store never runs) (#7286), the
+// second is this store's alone:
 //  1. Only SQLITE_CORRUPT / SQLITE_NOTADB counts. BUSY / LOCKED / IOERR / FULL / CANTOPEN / PERM are
 //     transient or environmental; quarantining on them would discard good history, which lets an
 //     already-run command re-execute (the outcome invariants 4 and 5 forbid).
@@ -279,10 +276,14 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
         // a disk that corrupts every fresh file degrades (observably) instead of spinning. The
         // failed attempt's handle is already closed (DbGuard) before the rename.
         const std::string reason = attempt.error().message;
-        auto moved =
+        const auto quarantine =
             dedup_quarantine::quarantine_corrupt_db(db_path, now_epoch_seconds());
+        for (const auto& note : quarantine.notes)
+            spdlog::warn("CommandDedupStore: {}", note);
+        const auto& moved = quarantine.dest;
         if (!moved) {
-            // Fail-open, observable (invariant 7): the original file is untouched.
+            // Fail-open, observable (invariant 7): the original file is untouched, except for the
+            // keep outcome in sqlite_quarantine.hpp (the judged file stays under its claimed name).
             return std::unexpected(CommandDedupError{
                 std::format("command_dedup.db is corrupt ({}) and could not be quarantined: {}",
                             reason, db_path.string())});

@@ -164,6 +164,7 @@
 #include "saml_provider.hpp"
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
+#include "refusal_log_throttle.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
 #include "result_set_store.hpp"
@@ -214,6 +215,7 @@
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 #include "capability_fragments.hpp" // YUZU_ALL_CAPABILITY_FRAGMENTS: every capability fragment, spelled once
+#include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label (yuzu_fleet_plugin_init_failed)
 #include "forensics_plugin_set.hpp"   // #4990: catalogue-derived Forensics plugin set (response read tier)
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
@@ -691,6 +693,13 @@ public:
                           "registrations are refused until lookups return",
                           "gauge");
         metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight").set(0.0);
+        metrics_.describe("yuzu_server_oidc_resolver_in_flight",
+                          "Name lookups outstanding in the resolver pool the OIDC egress path "
+                          "resolves hosts in, published every 15 s; a value at or above the "
+                          "pool's cap means new OIDC lookups fail at once until lookups return; "
+                          "fed only on POSIX builds, 0 elsewhere",
+                          "gauge");
+        metrics_.gauge("yuzu_server_oidc_resolver_in_flight").set(0.0);
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
@@ -2566,7 +2575,8 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field/per_agent_cap) - the executions ladder still tracks the "
+                          "malformed_identity_field/per_agent_cap/unverified_registry_overflow) "
+                          "- the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/Echo result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
@@ -2574,7 +2584,17 @@ public:
                           "here means an agent sent a malformed identity field, not store "
                           "unhealth. per_agent_cap is likewise agent behaviour: an agent exceeded "
                           "the per-(command, agent) row cap (--response-max-rows-per-agent), "
-                          "not store unhealth",
+                          "not store unhealth. unverified_registry_overflow is not a row either: "
+                          "it counts entries evicted from the in-memory record of answers that may "
+                          "be missing (a streaming frame whose provenance lookup failed, or an "
+                          "answer the store did not keep, for example per_agent_cap, "
+                          "malformed_identity_field or a failed terminal finalize, whose tracker "
+                          "write failed: closed, or failed twice; only the latter logs "
+                          "'upsert failed twice', a closed tracker or store leaves only the "
+                          "store_not_open count; a failed terminal finalize is "
+                          "counted in no reason here, its evidence is the "
+                          "finalize_terminal_status log line), or an over-long agent id; the "
+                          "affected answers are reported as not fully stored instead",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
@@ -2600,7 +2620,7 @@ public:
         // spurious always-zero series for a reason it can never emit.
         for (const auto reason :
              {"store_not_open", "pool_acquire_timeout", "query_error", "malformed_identity_field",
-              "per_agent_cap"})
+              "per_agent_cap", "unverified_registry_overflow"})
             metrics_.counter("yuzu_server_response_ingest_dropped_total", {{"reason", reason}});
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_response_read_degrade_total",
@@ -2730,8 +2750,14 @@ public:
                           "gauge");
         metrics_.describe("yuzu_fleet_plugin_init_failed",
                           "Agents reporting a plugin that failed init, by plugin name (absent "
-                          "when none; at most 64 named labels, the rest under plugin=other)",
+                          "when none). The label is bounded to the server's plugin catalogue: a "
+                          "well-formed name the catalogue does not know is summed under "
+                          "plugin=unknown, which sums each agent's distinct reported names (tokens), so "
+                          "one agent can add several; matching is exact and case sensitive (see "
+                          "yuzu_fleet_plugin_init_failed_rejected, which counts agents)",
                           "gauge");
+        metrics_.describe(yuzu::server::kPluginInitFailedRejectedGauge,
+                          yuzu::server::kPluginInitFailedRejectedHelp, "gauge");
         metrics_.describe("yuzu_fleet_inventory_sync_skipping",
                           "Agents currently reporting heartbeats whose daily-sync source skipped "
                           "its latest collection cycle(s) (heartbeat tag "
@@ -5336,6 +5362,12 @@ public:
                                                "tier would exclude nothing"});
             startup_failed_ = true;
         }
+
+        // The plugin label of yuzu_fleet_plugin_init_failed is bounded to this server's own
+        // catalogue: an agent-reported name the catalogue does not know is summed under
+        // plugin="unknown" and can neither displace a real plugin nor collide with one. Set once,
+        // before the health recompute thread's first sweep (started in run()).
+        health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
 
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
@@ -9821,6 +9853,9 @@ public:
                 // from a request path), so the in-flight gauge cannot sit stale after a lookup ends.
                 metrics_.gauge("yuzu_server_revocation_source_resolver_in_flight")
                     .set(static_cast<double>(::yuzu::server::net::process_resolver_in_flight()));
+                // The OIDC egress resolver pool, from the same tick.
+                metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
+                    .set(static_cast<double>(::yuzu::server::oidc::oidc_resolver_in_flight()));
                 // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
                 // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
                 // connection), noexcept (a failed sample keeps the previous gauge values).
@@ -15135,8 +15170,10 @@ private:
     // owner-resolve against), "owner_check_failed" (#4981 PR-1 A3, a
     // referenced set is absent/expired/not owned — including the Finding A
     // TOCTOU case), "presence_degraded" (#4981 PR-1 B, the cross-replica
-    // presence read could not answer), or "unresolvable" (a store the atom
-    // needs was never wired at this call site). Without this, a dispatch
+    // presence read could not answer), "result_set_unusable" (a referenced
+    // set is not ready, or is incomplete where a missing member would match,
+    // for example under NOT, LEN or STARTSWITH), or "unresolvable" (a store
+    // the atom needs was never wired at this call site). Without this, a dispatch
     // silently reduced to 0 targets by an ABORT is indistinguishable in
     // telemetry/audit from a genuine "0 agents matched" (UP-12) — an operator
     // investigating "why did my command reach nobody" would find nothing. The
@@ -16392,6 +16429,12 @@ private:
             is_login = is_login ||
                        (req.path == "/auth/saml/start" && req.method == "GET") ||
                        (req.path == "/saml/acs"        && req.method == "POST");
+            // OIDC sign-in start and callback are unauthenticated entry points that trigger
+            // outbound requests, so they share the per-source login bucket like local login
+            // and SAML.
+            is_login = is_login ||
+                       (req.path == "/auth/oidc/start" && req.method == "GET") ||
+                       (req.path == "/auth/callback"   && req.method == "GET");
             // #5342: POST /api/v1/users/me/password verifies the current
             // password, so it is the same online-guessing surface as /login
             // (lockout bounds it only while --auth-lockout-threshold > 0).
@@ -19069,14 +19112,50 @@ private:
                             if (p.source_execution_id.empty())
                                 continue;
                             bool terminal = false;
+                            // Targeted agents that never answered: absent from a set filled at
+                            // the timeout, and not counted in agents_failed. Never 0 without
+                            // proof that every agent answered.
+                            int64_t targeted = 0, responded = 0, dropped = 0;
+                            bool count_unreadable = false; // filled as incomplete without the count
                             if (execution_tracker_) {
                                 auto sum = execution_tracker_->get_summary(p.source_execution_id);
-                                terminal = sum.agents_targeted > 0 &&
-                                           sum.agents_responded >= sum.agents_targeted;
+                                targeted = sum.agents_targeted;
+                                responded = sum.agents_responded;
+                                terminal = targeted > 0 && responded >= targeted;
                             }
                             const bool timed_out = now - p.created_at > kPendingTimeoutSeconds;
                             if (!terminal && !timed_out)
                                 continue;
+                            // Only a set about to be filled pays for the dropped-answer count. A
+                            // count that cannot be read skips the set for this tick (it retries on
+                            // the next) and never reads as zero; once the set is three timeouts
+                            // old it is filled as incomplete instead of staying pending.
+                            if (execution_tracker_) {
+                                const auto lost =
+                                    execution_tracker_->count_response_dropped(p.source_execution_id);
+                                const auto use = rs_matcher::fill_count_decision(
+                                    lost, now - p.created_at, kPendingTimeoutSeconds * 3);
+                                if (!lost) {
+                                    static RefusalLogThrottle unreadable_log(
+                                        std::chrono::seconds(30));
+                                    if (unreadable_log.should_warn(p.id))
+                                        spdlog::warn("result set {}: dropped-answer count for "
+                                                     "execution {} unreadable; {} (at most one "
+                                                     "log per 30 s per set)",
+                                                     p.id, p.source_execution_id,
+                                                     use ? "the set is filled as incomplete "
+                                                           "once its members are read"
+                                                         : "fill retried next tick");
+                                }
+                                if (!use)
+                                    continue;
+                                count_unreadable = !lost;
+                                dropped = *use;
+                            }
+                            // An agent counted as responded whose answer was not persisted is
+                            // absent from the stored rows the membership is built from: unanswered.
+                            const int64_t agents_unanswered = rs_matcher::unanswered_agent_count(
+                                targeted, responded, execution_tracker_ != nullptr, dropped);
 
                             // Membership: every responder whose (status,
                             // output) satisfies the pending row's matcher.
@@ -19121,12 +19200,20 @@ private:
                                              "answered execution {} with a failure and never "
                                              "matched",
                                              p.id, agents_failed, p.source_execution_id);
-                            if (result_set_store_->materialize(p.id, members, agents_failed)) {
+                            if (result_set_store_->materialize(p.id, members, agents_failed,
+                                                              agents_unanswered)) {
                                 metrics_
                                     .counter("yuzu_result_sets_total",
                                              {{"source_kind", p.source_kind},
                                               {"result", "materialized"}})
                                     .increment();
+                                // Counted once, for the fill that actually happened.
+                                if (count_unreadable)
+                                    metrics_
+                                        .counter("yuzu_result_sets_total",
+                                                 {{"source_kind", p.source_kind},
+                                                  {"result", "count_unreadable"}})
+                                        .increment();
                             } else {
                                 // Don't count a materialization that didn't happen
                                 // (review finding bug_008); surface the failure so
@@ -20000,6 +20087,9 @@ private:
             dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
                                          std::move(dex_policy_fn));
         }
+        // The Apps tab reads the same DexApi::apps model as REST and MCP (null store: its error panel).
+        if (dex_routes_)
+            dex_routes_->set_dex_api(dex_api);
         // ADR-0031 WS-A4 (seventh family): the schedule-read API seam — ONE
         // instance backing GET /fragments/schedules (WorkflowRoutes),
         // GET /api/v1/schedules (also WorkflowRoutes), and MCP
