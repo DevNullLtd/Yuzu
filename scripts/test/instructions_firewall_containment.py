@@ -176,16 +176,24 @@ def release_and_confirm(client: Client, agent_id: str) -> bool:
         return False
 
 
+_ASCII_NUM = re.compile(r"[0-9]+")
+
+
 def _entry_covers(entry: str, addr, port: int) -> bool:
     """Does one allow-set entry (the plugin grammar `addr[/prefix][:port][/tcp|udp][/in|out]`, defaults:
     both protocols, outbound, any port) let an outbound TCP connection to addr:port through?"""
-    segs = entry.strip().split("/")
+    entry = entry.strip()
+    if not entry.isascii() or len(entry) > 96:  # the plugin's token alphabet is ASCII and bounded
+        return False
+    segs = entry.split("/")
     s0, port_text = segs[0], None
     if s0.startswith("["):
         close = s0.find("]")
         if close < 0:
             return False
         ip, rest = s0[1:close], s0[close + 1:]
+        if ":" not in ip:  # a bracketed address must be IPv6
+            return False
         if rest:
             if not rest.startswith(":"):
                 return False
@@ -196,11 +204,11 @@ def _entry_covers(entry: str, addr, port: int) -> bool:
         ip, port_text = s0.split(":")
     else:
         ip = s0
-    prefix, proto, direction = None, "both", "out"
+    prefix, proto, direction = None, None, None
     for i, seg in enumerate(segs[1:], 1):
         if not seg:
             return False
-        if seg[0].isdigit():
+        if seg[0] in "0123456789":
             if i != 1:
                 return False
             prefix, _, more = seg.partition(":")
@@ -209,16 +217,20 @@ def _entry_covers(entry: str, addr, port: int) -> bool:
                     return False
                 port_text = more
         elif seg in ("tcp", "udp"):
+            if proto is not None:
+                return False
             proto = seg
         elif seg in ("in", "out"):
+            if direction is not None:
+                return False
             direction = seg
         else:
             return False
-    if direction != "out" or proto == "udp":
+    if direction == "in" or proto == "udp":
         return False
-    if port_text is not None and (not port_text.isdigit() or int(port_text) != port):
+    if port_text is not None and (not _ASCII_NUM.fullmatch(port_text) or int(port_text) != port):
         return False
-    if prefix is not None and (not prefix.isdigit() or int(prefix) == 0):
+    if prefix is not None and (not _ASCII_NUM.fullmatch(prefix) or int(prefix) == 0):
         return False  # a /0 would not be a containment at all
     try:
         return addr in ipaddress.ip_network(f"{ip}/{prefix}" if prefix is not None else ip, strict=False)

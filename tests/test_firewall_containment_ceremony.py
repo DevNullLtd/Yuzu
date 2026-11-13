@@ -134,7 +134,9 @@ class Reachable(unittest.TestCase):
     def test_an_entry_that_does_not_let_the_release_through_is_refused(self):
         dash = "https://10.0.0.5:8443"
         for entry in ("10.0.0.5:22", "10.0.0.5/udp", "10.0.0.5/in", "10.0.0.5/out/in", "10.0.0.0/8/in",
-                      "10.0.0.5:8443/udp", "10.0.0.5:8444", "0.0.0.0/0", "10.0.0.5/8/16", "10.0.0.5/x"):
+                      "10.0.0.5:8443/udp", "10.0.0.5:8444", "0.0.0.0/0", "10.0.0.5/8/16", "10.0.0.5/x",
+                      "10.0.0.5:\u00b2", "10.0.0.5/\u00b2", "10.0.0.5:\u0664\u0664\u0663", "[10.0.0.5]:8443",
+                      "10.0.0.5/tcp/tcp", "10.0.0.5/out/out", "10.0.0.5" + "/tcp" * 40):
             with self.subTest(entry=entry):
                 self.assertFalse(self.ok(dash, entry))
         for entry in ("10.0.0.5:8443", "10.0.0.5:8443/tcp/out", "10.0.0.0/8", "10.0.0.0/8:8443/tcp"):
