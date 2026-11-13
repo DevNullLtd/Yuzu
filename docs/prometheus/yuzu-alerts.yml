@@ -3029,7 +3029,11 @@ groups:
             one. The quarantine plugin's own control actions stay
             reachable throughout - releasing a device does not depend on this
             read - as do the four system-reserved internal pushes
-            (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
+            (yuzu_server_system_reserved_push_total). The firewall plugin's
+            four containment actions are protective for plugin enablement but
+            are NOT exempt from this gate until #7437, so while this alert
+            fires they are refused too (the agent-local time limit still ends
+            a firewall containment). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
             increment, so one fail-closed evaluation still pages, two minutes

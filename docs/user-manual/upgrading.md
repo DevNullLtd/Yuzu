@@ -3693,7 +3693,7 @@ not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-
 the plugin-presence filter, and not a degraded plugin-config store. The set is closed: the other
 firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The four quarantine actions are
 **newly** exempt; before this change only the containment gate exempted them. The firewall four were
-added to the set later, so a kill-switch row you hold on one of them also stops stopping anything on
+added to the set later, so a kill-switch row you hold on one of them stops taking effect on
 upgrade. The containment gate's own exemption is a separate, narrower predicate and still names the
 quarantine plugin only: while the quarantine store cannot be read for longer than a minute, that gate
 refuses every non-exempt dispatch, whichever device it names, including the four firewall actions, until

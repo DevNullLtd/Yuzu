@@ -174,7 +174,7 @@ informational only.
 ### Update (2026-11-13) — the firewall plugin's four containment actions are protective
 
 `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and
-`firewall.quarantine_allow` join the protective set on the owner's decision, as a second CLOSED
+`firewall.quarantine_allow` join the protective set on the owner's decision of 2026-11-12, as a second CLOSED
 four-action predicate (`is_firewall_control_plugin`) behind the same single `is_protective_action`:
 `firewall.release` is the way out of a firewall containment, so no enablement gate may refuse it.
 The other firewall actions (`state`, `rules`) stay ordinary, so a plugin-level `firewall` kill-switch
