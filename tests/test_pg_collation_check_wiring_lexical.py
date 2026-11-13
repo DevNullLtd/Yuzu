@@ -63,6 +63,10 @@ Invariants:
      can wait out a check stuck against a frozen backend, and a kill during that wait must not skip
      the lease release or the flushes (it is the last step before the pool is reset).
 
+  14. The recheck `start()` is wrapped in try/catch(const std::exception&) that resets the unstarted
+     recheck: a refused thread creation (a task or thread limit) must degrade a report-only feature,
+     not abort the boot (found by an external review; one mutant).
+
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
 the preprocessor-dead branches of `#if 0` / `#if 1 ... #else` (nested, with `#elif`) are removed,
@@ -140,6 +144,11 @@ BEFORE_JOIN = ("leader_elector_->resign();", "audit_store_->stop_cleanup();",
 MSG_JOIN_LATE = ("the PgCollationRecheck join must come after the leader resign, the audit cleanup "
                  "and the offload flush in stop(): a join that waits on a wedged check must not be "
                  "able to skip them")
+START_CATCH = "} catch (const std::exception& e) {"
+RESET_ARM = "pg_collation_recheck_.reset();"
+MSG_START_UNGUARDED = ("the PgCollationRecheck start() is not wrapped in try/catch(const std::exception&) "
+                       "that resets the unstarted recheck: a refused thread creation would abort the "
+                       "boot of a report-only feature")
 MSG_DECL_ORDER = ("the pg_collation_recheck_ member is not declared after the pg_pool_ member it "
                   "borrows")
 
@@ -328,6 +337,8 @@ def recheck_problems(t, report_pos):
         start = t.find(START, pos)
         if start < 0 or not (run[0] < start < run[1]):
             out.append(MSG_NO_START)
+        elif not (0 <= t.find(START_CATCH, start) < start + 120) or t.find(RESET_ARM, start, run[1]) < 0:
+            out.append(MSG_START_UNGUARDED)
     stops = [m.start() for m in re.finditer(re.escape(STOP), t)]
     if len(stops) != 1:
         out.append(MSG_STOP_COUNT.format(n=len(stops)))
@@ -555,6 +566,12 @@ class PgCollationCheckWiring(unittest.TestCase):
         m = rest[:k] + STOP + "\n            " + rest[k:]
         self.assertNotEqual(m, self.src)
         self.assertEqual(problems(m), [MSG_JOIN_LATE])
+
+    def test_start_not_guarded_against_a_refused_thread(self):
+        m, n = re.subn(r"try \{\s*pg_collation_recheck_->start\(\);\s*\} catch \(const std::exception& e\) \{.*?pg_collation_recheck_\.reset\(\);\s*\}",
+                       "pg_collation_recheck_->start();", self.src, count=1, flags=re.S)
+        self.assertEqual(n, 1)
+        self.assertEqual(problems(m), [MSG_START_UNGUARDED])
 
     def test_start_guard_with_the_stop_condition_not_negated(self):
         m = self.src.replace("!stop_requested_.load(std::memory_order_acquire)) {\n                    pg_collation_recheck_",
