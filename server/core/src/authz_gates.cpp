@@ -21,6 +21,21 @@
 
 namespace yuzu::server {
 
+void authz::seed_service_scope_unrestricted_refusal_metrics(yuzu::MetricsRegistry& metrics) {
+    metrics.describe("yuzu_server_authz_service_scope_unrestricted_refused_total",
+                     "Requests refused because a service-scoped session would have been handed "
+                     "unrestricted list authority, by gate (fleet_read, list_read) and site "
+                     "(engine_entry = a corrupted scope_service on an engine credential, "
+                     "refused 403; postcondition = the admit would have been unrestricted, "
+                     "refused 500). Any non-zero value is an authorization invariant violation: "
+                     "investigate the audit trail for the principal.",
+                     "counter");
+    for (const char* gate : {"fleet_read", "list_read"})
+        for (const char* site : {"engine_entry", "postcondition"})
+            metrics.counter("yuzu_server_authz_service_scope_unrestricted_refused_total",
+                            {{"gate", gate}, {"site", site}});
+}
+
 const char* authz::ceiling_degrade_reason(std::string_view read_error) noexcept {
     // Closed label set of yuzu_server_rbac_read_degrade_total for the ceiling read:
     // {pool_acquire_timeout, query_error}. The read is breaker-gated, so an open breaker

@@ -43,6 +43,10 @@
 /// current caller count before trusting this as exhaustive — more routes
 /// migrate incrementally per the Phase-2 backlog
 /// (`docs/security-reviews/service-scope-phase2-migrations-2026-08.md`).
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::server {
 class AuthRoutes;
 class RbacStore;
@@ -133,6 +137,10 @@ template <class Scope>
 /// (closed sets; `refuse_service_scoped_unrestricted` maps them to label text).
 enum class UnrestrictedRefusalGate : std::uint8_t { kFleetRead, kListRead };
 enum class UnrestrictedRefusalSite : std::uint8_t { kEngineEntry, kPostcondition };
+
+/// Describe the counter and zero-seed its four closed series, so the family exists on a healthy
+/// server and `increase()` sees the first refusal. Called once at server start.
+void seed_service_scope_unrestricted_refusal_metrics(yuzu::MetricsRegistry& metrics);
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of
 /// `AuthRoutes::require_fleet_read`. `in_scope`/`filter` are the only

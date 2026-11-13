@@ -1656,6 +1656,7 @@ if build_server
       'unit/server/test_execution_owner_legacy.cpp', # #5557: legacy /api/executions* exact-set cases under service-scoped credentials
       'unit/server/test_execution_owner_rest_v1.cpp', # #5557: REST v1 execution reads and /api/v1/events exact-set cases under service-scoped credentials
       'unit/server/test_execution_owner_dashboard.cpp', # #5557: dashboard execution fragments and /sse/executions exact-set cases under service-scoped credentials
+      'unit/server/test_service_scope_refusal.cpp', # #5557: service-scoped refusal counter seed + plugin-config list-read consumer (corrupted engine row)
       'unit/server/test_execution_mutation_owner_key.cpp', # #5557: cancel/rerun admission keys on ExecutionOwnerKey; username stays the audit principal
       'unit/server/test_workflow_executions_list_authz.cpp', # #3526: /fragments/executions real fleet-read confinement
       'unit/server/test_workflow_executions_real_gate_authz.cpp', # GET /api/v1/workflow-executions real fleet-read confinement

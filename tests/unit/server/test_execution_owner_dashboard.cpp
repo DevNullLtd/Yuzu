@@ -12,6 +12,7 @@
  */
 
 #include "execution_event_bus.hpp"
+#include "test_execution_owner_engine.hpp"
 #include "test_execution_owner_scope_rig.hpp"
 #include "test_route_sink.hpp"
 #include "workflow_routes.hpp"
@@ -196,7 +197,8 @@ TEST_CASE("owner dashboard: the detail fragment serves the in-scope ids and hide
     CHECK(attr_values(D.detail(id.mixed, a).body, "data-agent-id") == Ids{"a1"});
     CHECK_FALSE(has(D.detail(id.mixed, a).body, "SECRET-B-ERR"));
     // The selected-execution panel of the executions page projects the same counts.
-    CHECK(D.detail(id.run, a).body.find("b1") == std::string::npos);
+    // Quoted, so a random hex execution id that happens to contain "b1" cannot match.
+    CHECK(D.detail(id.run, a).body.find("\"b1\"") == std::string::npos);
 
     // Hidden: the minter's rows and a foreign one answer like a never-existing id, with one
     // `denied` audit row carrying the non-distinguishing detail.
@@ -330,4 +332,46 @@ TEST_CASE("owner dashboard: /sse/executions/{id} attach, replay and live events 
     auto all = agents_of(frames_of(yuzu::server::test::drain_chunked_provider_once(*mina)));
     std::sort(all.begin(), all.end());
     CHECK(all == std::vector<std::string>{"a1", "a2", "b1", "z1", "z1"});
+}
+
+// The list fragment rewrites the gate's 403 to a 200 "no permission" note (htmx drops 4xx
+// bodies), so a refusal is read from the note's `data-denied` marker, not from the status.
+static int denied_as_403(const Resp& got) {
+    return got.status == 200 && has(got.body, "data-denied=\"true\"") ? 403 : got.status;
+}
+
+// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list.
+TEST_CASE("owner dashboard: a service-scoped engine row is refused 403 on /fragments/executions, "
+          "RBAC on",
+          "[pg][execution][owner_rig][owner_dashboard][5557]") {
+    yuzu::MetricsRegistry metrics; // before the rig: AuthManager keeps a pointer to it
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ExecutionEventBus bus;
+    ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    Dash D{r, bus};
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, /*rbac_on=*/true, [&](const std::string& token) {
+            auto got = D.get("/fragments/executions", ExecutionOwnerRig::bearer(token));
+            yuzu::test::EngineListResult out{denied_as_403(got), got.body, {}};
+            if (out.status == 200)
+                out.ids = attr_values(got.body, "data-execution-id");
+            return out;
+        });
+}
+
+TEST_CASE("owner dashboard: a service-scoped engine row is refused 403 on /fragments/executions, "
+          "RBAC off",
+          "[pg][execution][owner_rig][owner_dashboard][5557]") {
+    yuzu::MetricsRegistry metrics;
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ExecutionEventBus bus;
+    ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    Dash D{r, bus};
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, /*rbac_on=*/false, [&](const std::string& token) {
+            auto got = D.get("/fragments/executions", ExecutionOwnerRig::bearer(token));
+            return yuzu::test::EngineListResult{denied_as_403(got), got.body, {}};
+        });
 }

@@ -15,6 +15,7 @@
 
 #include "execution_event_bus.hpp"
 #include "rest_api_v1.hpp"
+#include "test_execution_owner_engine.hpp"
 #include "test_execution_owner_scope_rig.hpp"
 #include "test_route_sink.hpp"
 
@@ -469,4 +470,42 @@ TEST_CASE("owner rest v1: GET /api/v1/events attach, replay and live events for 
     auto transitions = agents_of(all, "agent-transition");
     std::sort(transitions.begin(), transitions.end());
     CHECK(transitions == std::vector<std::string>{"a1", "a2", "b1", "z1", "z1"});
+}
+
+// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list.
+TEST_CASE("owner REST v1: a service-scoped engine row is refused 403 on GET /api/v1/executions, "
+          "RBAC on",
+          "[pg][execution][owner_rig][owner_rest][5557]") {
+    yuzu::MetricsRegistry metrics; // before the rig: AuthManager keeps a pointer to it
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ExecutionEventBus bus;
+    ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    RestV1 R{r, bus};
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, /*rbac_on=*/true, [&](const std::string& token) {
+            auto c = R.get("/api/v1/executions?limit=50", ExecutionOwnerRig::bearer(token));
+            yuzu::test::EngineListResult out{c.status, c.body.dump(), {}};
+            if (c.status == 200)
+                for (const auto& e : c.body["data"])
+                    out.ids.push_back(e["id"].get<std::string>());
+            std::sort(out.ids.begin(), out.ids.end());
+            return out;
+        });
+}
+
+TEST_CASE("owner REST v1: a service-scoped engine row is refused 403 on GET /api/v1/executions, "
+          "RBAC off",
+          "[pg][execution][owner_rig][owner_rest][5557]") {
+    yuzu::MetricsRegistry metrics;
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ExecutionEventBus bus;
+    ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    RestV1 R{r, bus};
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, /*rbac_on=*/false, [&](const std::string& token) {
+            auto c = R.get("/api/v1/executions?limit=50", ExecutionOwnerRig::bearer(token));
+            return yuzu::test::EngineListResult{c.status, c.body.dump(), {}};
+        });
 }

@@ -14,6 +14,7 @@
  */
 
 #include "execution_routes.hpp"
+#include "test_execution_owner_engine.hpp"
 #include "test_execution_owner_scope_rig.hpp"
 #include "test_route_sink.hpp"
 
@@ -350,4 +351,40 @@ TEST_CASE("owner legacy: a degraded tracker is a 503 for a service-scoped list, 
     CHECK(c.body["error"]["retry_after_ms"] == 5000);
     CHECK(L.audits.empty()); // a degrade is never recorded as a confinement denial
     r.exec_sql("ALTER TABLE execution_tracker.executions_hidden_5557 RENAME TO executions");
+}
+
+// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list.
+TEST_CASE("owner legacy: a service-scoped engine row is refused 403 on GET /api/executions, "
+          "RBAC on",
+          "[pg][execution][owner_rig][owner_legacy][5557]") {
+    yuzu::MetricsRegistry metrics; // before the rig: AuthManager keeps a pointer to it
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    Legacy L{r};
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, /*rbac_on=*/true, [&](const std::string& token) {
+            auto c = L.get("/api/executions?limit=50", ExecutionOwnerRig::bearer(token));
+            yuzu::test::EngineListResult out{c.status, c.body.dump(), {}};
+            if (c.status == 200)
+                for (const auto& e : c.body["executions"])
+                    out.ids.push_back(e["id"].get<std::string>());
+            std::sort(out.ids.begin(), out.ids.end());
+            return out;
+        });
+}
+
+TEST_CASE("owner legacy: a service-scoped engine row is refused 403 on GET /api/executions, "
+          "RBAC off",
+          "[pg][execution][owner_rig][owner_legacy][5557]") {
+    yuzu::MetricsRegistry metrics;
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    Legacy L{r};
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, /*rbac_on=*/false, [&](const std::string& token) {
+            auto c = L.get("/api/executions?limit=50", ExecutionOwnerRig::bearer(token));
+            return yuzu::test::EngineListResult{c.status, c.body.dump(), {}};
+        });
 }

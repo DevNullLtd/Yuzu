@@ -2289,6 +2289,8 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        // #5557: the service-scoped unrestricted-authority refusal on the two list gates.
+        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);
         // Last-Administrator guard refusals: A2's role-unassign guard
         // (RbacStore::unassign_role) and, since #4966, the account-lifecycle guard
         // (RbacStore::deactivate_account / set_local_role: a deactivation or a demotion

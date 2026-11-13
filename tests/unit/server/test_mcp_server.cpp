@@ -42,6 +42,7 @@
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
 #include "test_response_execution_authz_pg_helper.hpp"
+#include "test_execution_owner_engine.hpp"    // #5557: corrupted service-scoped engine credentials
 #include "test_execution_owner_scope_rig.hpp" // #5557: shared real-gate rig + the real-session seam below
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
@@ -53651,7 +53652,8 @@ TEST_CASE("MCP execution tools: get_execution_status serves exact sets and a nor
             agent_ids.push_back(a["agent_id"].get<std::string>());
         std::sort(agent_ids.begin(), agent_ids.end());
         CHECK(agent_ids == std::vector<std::string>{"a1", "a2"});
-        CHECK(run.dump().find("b1") == std::string::npos);
+        // Quoted, so a random hex execution id that happens to contain "b1" cannot match.
+        CHECK(run.dump().find("\"b1\"") == std::string::npos);
         CHECK(status(r.creds.mcp_svc_a, r.ids.mixed, true).dump().find("SECRET-B-ERR") ==
               std::string::npos);
         // Service B reads the same execution and DOES see its own failure text.
@@ -53781,4 +53783,39 @@ TEST_CASE("MCP execution tools: summarize_working_set kind=execution keys on the
     auto bob_other = summarize_as(r.creds.mcp_bob, r.ids.minter_pending);
     REQUIRE(bob_other);
     CHECK(bob_other->body.find("was not found") != std::string::npos);
+}
+
+// #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list_executions.
+// Through the real-session seam, so the production admission and the real fleet-read gate decide.
+namespace {
+
+void check_mcp_engine_refusal(bool rbac_on) {
+    yuzu::MetricsRegistry metrics; // before the rig: AuthManager keeps a pointer to it
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, rbac_on, [&](const std::string& token) {
+            auto res = mcp_list_executions_as(ts, token);
+            REQUIRE(res);
+            yuzu::test::EngineListResult out{res->status, res->body, {}};
+            if (res->status == 200 && !mcp_is_error(res))
+                out.ids = mcp_list_execution_ids(res);
+            return out;
+        });
+}
+
+} // namespace
+
+TEST_CASE("MCP list_executions: a service-scoped engine row is refused 403, RBAC on",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    check_mcp_engine_refusal(/*rbac_on=*/true);
+}
+
+TEST_CASE("MCP list_executions: a service-scoped engine row is refused 403, RBAC off",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    check_mcp_engine_refusal(/*rbac_on=*/false);
 }
