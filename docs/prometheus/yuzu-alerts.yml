@@ -6062,7 +6062,9 @@ groups:
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
         # sections_query_error (source=device_ci: the hardware record read answered but its
-        # sections did not) and admission_full (source=installed_software or ca_issued):
+        # sections did not), keyed_read_budget (source=device_ci only: the Hardware list's CI
+        # read ran out of its 20 s budget between 10,000-id chunks, so the page shows "CI
+        # columns unavailable") and admission_full (source=installed_software or ca_issued):
         # a /crypto read refused by its per-process in-flight bound BEFORE any store call.
         # The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
@@ -6095,7 +6097,13 @@ groups:
             (source=device_ci) means the hardware record read answered but its v2
             sections did not, so the REST record route answered 503 (the MCP tool, a
             retryable error): check yuzu_pg_* and the DeviceInventoryStore warning in
-            the server log. A source=installed_software
+            the server log. keyed_read_budget (source=device_ci) means the Hardware
+            list could not read device CI inside its 20-second budget, so the page
+            showed the "CI columns unavailable" notice and never partial CI; there is
+            no setting to change, so look for pool saturation or a slow database
+            (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds, YuzuPgPoolSaturated)
+            and a roster at the 100,000 cap. A pool_acquire_timeout on
+            source=device_ci means the same notice with the pool as the cause. A source=installed_software
             query_error that fires together with YuzuInventoryCatalogRollupStale or
             YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
             its 5s bound (too many distinct package names): retrying will not help, fix

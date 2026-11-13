@@ -2904,8 +2904,9 @@ TEST_CASE("DeviceInventoryStore::list_device_ci_for reads exactly the named agen
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
 
-    // Seven agents whose hostnames sort in the REVERSE of their ids, so the read's result cannot
-    // depend on the old hostname ordering (#7549: that ordering is what put devices past the cut).
+    // Seven agents whose hostnames sort in the REVERSE of their ids, so a result that happened to
+    // depend on hostname order would show. (The 100,000-row cut itself cannot be reproduced at this
+    // size; the chunk boundaries below are what pin that no id is dropped or repeated.)
     constexpr int kAgents = 7;
     std::vector<std::string> all_ids;
     for (int i = 0; i < kAgents; ++i) {
@@ -2942,6 +2943,12 @@ TEST_CASE("DeviceInventoryStore::list_device_ci_for reads exactly the named agen
         CHECK(ids_of(*got) == std::vector<std::string>{"agent-k1", "agent-k5"});
     }
     SECTION("an empty id list is an empty success and takes no connection") {
+        // Hold EVERY connection of the 2-connection pool: a read that took a lease before checking
+        // for an empty list would wait out the 3 s acquire timeout and come back nullopt.
+        auto held_a = pool.try_acquire_for(std::chrono::seconds{2});
+        auto held_b = pool.try_acquire_for(std::chrono::seconds{2});
+        REQUIRE(held_a);
+        REQUIRE(held_b);
         auto got = store.list_device_ci_for({});
         REQUIRE(got.has_value());
         CHECK(got->empty());
@@ -2994,11 +3001,36 @@ TEST_CASE("DeviceInventoryStore::list_device_ci_for is all-or-nothing: a spent b
         CHECK(got->size() == ids.size());
         CHECK(degrades("keyed_read_budget") == 0.0);
     }
+    SECTION("an effectively unlimited budget is clamped, not an overflow, and the read completes") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 2, .budget = std::chrono::milliseconds::max()});
+        REQUIRE(got.has_value());
+        CHECK(got->size() == ids.size());
+        CHECK(degrades("keyed_read_budget") == 0.0);
+    }
+    SECTION("a hugely negative budget is clamped to zero, not an overflow: it degrades after the first chunk") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 2, .budget = std::chrono::milliseconds::min()});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("keyed_read_budget") == 1.0);
+    }
     SECTION("a failed statement is nullopt and counts query_error") {
         exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
         auto got = store.list_device_ci_for(ids, {.chunk = 2});
         CHECK_FALSE(got.has_value());
         CHECK(degrades("query_error") == 1.0);
         CHECK(degrades("keyed_read_budget") == 0.0);
+    }
+    SECTION("a statement that fails in a MIDDLE chunk is nullopt for the whole read, never the earlier chunks") {
+        // The failure above hits chunk one, so it would also pass if a later chunk's failure were
+        // swallowed. Here chunk one (two real agents) succeeds and returns rows; chunk two carries
+        // an id the server rejects (a lone 0xff is not valid UTF-8), so only that statement fails.
+        const std::vector<std::string> mixed{"agent-b0", "agent-b1", std::string("bad\xff"), "agent-b2"};
+        auto got = store.list_device_ci_for(mixed, {.chunk = 2});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("keyed_read_budget") == 0.0);
+        // The pooled connection came back healthy: the same store reads normally straight away.
+        auto again = store.list_device_ci_for(ids, {.chunk = 2});
+        REQUIRE(again.has_value());
+        CHECK(again->size() == ids.size());
     }
 }

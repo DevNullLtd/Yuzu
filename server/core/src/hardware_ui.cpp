@@ -458,8 +458,9 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     // only #hw-results (results_only=1), so a banner in the page shell would vanish on
     // the first refresh and leave a blank cell reading as "no CI" / "no tags".
     if (ci_degraded)
-        h += "<div class=\"gp-banner hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
-             "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
+        h += "<div class=\"gp-banner hw-degrade\"><b>CI columns unavailable.</b> The device-CI read did not "
+             "complete (the store failed, or a connection or time limit was reached) &mdash; a blank "
+             "cell here is not \"no CI\", it is a degraded read.</div>";
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";

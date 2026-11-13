@@ -246,7 +246,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "  arch          TEXT NOT NULL DEFAULT '',"
          "  first_seen    BIGINT NOT NULL,"
          "  last_seen     BIGINT NOT NULL);"
-         // Roster reads order by hostname; the index keeps the LIMIT scan ordered.
+         // Historical: built for an ordered roster read that no longer exists (the Hardware list
+         // joins CI by agent_id, #7549). No read relies on this index.
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
         {2, kMigrationV2Sql},
         {3, kMigrationV3Sql},
@@ -738,7 +739,13 @@ DeviceInventoryStore::list_device_ci_for(const std::vector<std::string>& agent_i
         return std::nullopt;
     }
     const std::size_t chunk = limits.chunk > 0 ? limits.chunk : 1;
-    const auto deadline = std::chrono::steady_clock::now() + limits.budget;
+    // Clamped both ways so neither an "unlimited" sentinel (milliseconds::max()) nor a hugely
+    // negative value can overflow the time_point arithmetic (signed overflow is UB). A day is far
+    // past any real read, and a negative budget behaves like zero: the first chunk runs, then the
+    // read degrades.
+    const auto budget = std::clamp(limits.budget, std::chrono::milliseconds{0},
+                                   std::chrono::milliseconds{std::chrono::hours{24}});
+    const auto deadline = std::chrono::steady_clock::now() + budget;
     const std::string sql =
         std::string("SELECT ") + kSelectCols +
         " FROM device_inventory_store.device_ci WHERE agent_id = ANY($1::text[])";
@@ -765,7 +772,8 @@ DeviceInventoryStore::list_device_ci_for(const std::vector<std::string>& agent_i
             return std::nullopt;
         }
         const int rows = PQntuples(res.get());
-        out.reserve(out.size() + static_cast<std::size_t>(rows));
+        // No per-chunk reserve: reserve(n) allocates exactly n, which defeats the vector's geometric
+        // growth and reallocates the whole result once per chunk.
         for (int i = 0; i < rows; ++i) {
             DeviceCiRecord r;
             fill_record(res.get(), i, r);

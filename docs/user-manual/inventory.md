@@ -1167,8 +1167,9 @@ device outside it shows its `agent_id` in place of the hostname.
 
 The KPI strip's other figures are derived from the same capped roster: the CI-coverage count,
 the manufacturer counts and "Showing a-b of N" are lower bounds too, while the median memory
-and the CI-coverage ratio describe only the listed devices. The notice says so, though only the
-four count tiles carry the `≥` mark.
+and the CI-coverage ratio describe only the listed devices. The notice says so for the median; the
+CI-coverage ratio likewise describes only the listed devices, and only the four count tiles carry the
+`≥` mark.
 
 ### Known limits above 100,000 devices
 
@@ -1184,6 +1185,9 @@ The roster cap is a display and read cap, not a tested capacity. Above it:
   than one server replica, if that read fails, or the fleet has more than 100,000 live agents (in
   which case it is refused every time, not just briefly), agents connected to another replica
   read Offline with no flag, and the Offline tile is not a true lower bound (#7566).
+- Every render of the Hardware list reads the CI of the whole roster, up to 100,000 rows, on one
+  database connection, and the Home page's confined estate view reads it too for counts that never
+  use CI. A burst of concurrent renders on a large fleet can hold the shared database pool (#1783).
 - Search, filter and sort run over the capped set, and there is no way to page past the cap
   (#7567). A device seen within the window is always reachable by its id.
 
@@ -1353,7 +1357,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
   signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `keyed_read_budget` for `source="device_ci"` only: the Hardware list's roster-keyed CI read ran out of its overall budget between chunks, so the list shows "CI columns unavailable" and never partial CI; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
@@ -1551,6 +1555,8 @@ rollout) are not counted, so a zero there does not rule out a skipping collector
 
 **The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed. A fleet with more than 100,000 endpoints in the window is **not** this fault: it shows the "Partial list" notice with the table, and `yuzu_server_agent_presence_roster_truncated_total` counts each truncated read (a steady state on such a fleet, so it has no alert). The per-device record's identity lookup counts its own failures under `op="find_within"` of the same failure counter.
 
+**The Hardware list shows "CI columns unavailable".** The device-CI read failed or ran out of its 20-second budget, so a blank CI cell is a failed read, not "no CI". The list reads CI for the listed devices only, in chunks of 10,000 on one connection. Split `yuzu_inventory_read_degrade_total{source="device_ci"}` by `reason`: `keyed_read_budget` or `pool_acquire_timeout` points at pool saturation or a slow database (`yuzu_pg_pool_waiters`, `yuzu_pg_acquire_wait_seconds`, `yuzu_pg_acquire_timeout_total`, the `YuzuPgPoolSaturated` alert); `query_error` has its detail in the `DeviceInventoryStore` warning in the server log; `store_not_open` means the store failed at boot. The banner clears on the next successful render; no restart is needed.
+
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
 MSI-registered products, SDK and runtime component packages and some system components never populate (182 of
@@ -1615,8 +1621,12 @@ sync, defeating the hash-skip protocol.
   `pool_acquire_timeout`, `query_error`, `sections_query_error` or `keyed_read_budget`, the Hardware
   list's CI join giving up between chunks; each series appears on its first occurrence). The Hardware
   list reads CI only for the devices on its roster, in chunks of 10,000 on one connection, so a
-  listed device is never left without CI by a row cap. The store joins
-  `/readyz` + `/healthz`.
+  listed device is never left without CI by a row cap. The 20-second budget is checked between
+  chunks, so it applies only to rosters over 10,000 devices, and one slow statement can still run
+  to the pool's 30-second statement bound: the worst case for one read is about 50 seconds of one
+  connection. A Postgres setting that logs statements (`log_statement=all`, a low
+  `log_min_duration_statement`) records each chunk's id list; set `log_parameter_max_length` to
+  limit how much of each id list is logged. The store joins `/readyz` + `/healthz`.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.

@@ -16,7 +16,7 @@
 ///
 /// `apply_ci_read` is the one place the roster-keyed read (#7549) is driven: it asks for the CI
 /// of exactly the ids in the roster, so the read is bounded by the roster and cannot drop a
-/// listed device the way the hostname-ordered whole-table read it replaced did. It is a pure
+/// listed device to a row cap. It is a pure
 /// function over an injected reader so a test can prove WHICH ids are requested and what a failed
 /// read does, which the `ServerImpl` lambda that wires the real store could not show.
 

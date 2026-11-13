@@ -11,8 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <algorithm>
+#include <initializer_list>
+#include <optional>
+#include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -158,4 +161,13 @@ TEST_CASE("apply_ci_read: an empty roster makes no read and is not degraded", "[
     });
     CHECK(calls == 0);
     CHECK_FALSE(result.ci_degraded);
+}
+
+TEST_CASE("apply_ci_read: an unwired reader is degraded even when the roster is empty",
+          "[inventory][ci-join][keyed]") {
+    // The unwired check comes BEFORE the empty-roster early return (an unwired store must never
+    // read as "healthy, nothing to enrich"); a wired reader on an empty roster is the case above.
+    InventoryDevicesResult result;
+    apply_ci_read(result, CiKeyedReadFn{});
+    CHECK(result.ci_degraded);
 }
