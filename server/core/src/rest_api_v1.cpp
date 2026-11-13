@@ -12506,6 +12506,7 @@ void RestApiV1::register_routes(
 
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             if (gate.scope) {
                 auto session = auth_fn(req, res);
                 if (!session)
@@ -12523,10 +12524,8 @@ void RestApiV1::register_routes(
                         "application/json");
                     return;
                 }
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
@@ -12579,7 +12578,7 @@ void RestApiV1::register_routes(
                     auto it = statuses_opt->find(e.id);
                     const auto& statuses =
                         it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(e, statuses, gate.scope, username))
+                    if (!execution_visible(e, statuses, gate.scope, owner))
                         continue;
                     auto counts = confined_projection(statuses, gate.scope);
                     ExecutionListRow row;
@@ -13429,8 +13428,10 @@ void RestApiV1::register_routes(
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
+            // #5557: the ownership disjunct takes the owner KEY, never the raw username (a
+            // service-scoped session's username is its minter's).
             const bool owns_execution =
-                exec_opt && exec_opt->dispatched_by == session->username;
+                exec_opt && execution_owner_key(*session).owns(*exec_opt);
             const bool visible = !gate.scope || owns_execution || has_visible_agent;
             if (!exec_opt || !visible) {
                 // #1634 (governance Gate 4 consistency-auditor finding): a
@@ -13609,6 +13610,7 @@ void RestApiV1::register_routes(
 
             auto exec_id = req.matches[1].str();
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             if (gate.scope) {
                 auto session = auth_fn(req, res);
@@ -13635,10 +13637,8 @@ void RestApiV1::register_routes(
                 // the cap-before-scope defect where an invisible sibling
                 // could displace this caller's own visible children out of
                 // the capped window.
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto exec_r = execution_tracker->get_execution_checked(exec_id);
@@ -13666,7 +13666,7 @@ void RestApiV1::register_routes(
 
             const bool parent_visible =
                 exec_opt.has_value() &&
-                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
             if (!exec_opt || !parent_visible) {
                 // #3789: audit ONLY under an engaged scope -- matches the
                 // legacy route's identical rationale (compliance-officer F2).
@@ -13715,7 +13715,7 @@ void RestApiV1::register_routes(
                     auto it = child_statuses_opt->find(c.id);
                     const auto& c_statuses =
                         it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                    if (!execution_visible(c, c_statuses, gate.scope, owner))
                         continue;
                     arr.add_raw(execution_child_row_json(c).dump());
                 }
@@ -22479,8 +22479,8 @@ void RestApiV1::register_routes(
             for (const auto& a : *agents_opt)
                 has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
         }
-        const bool owns_execution =
-            exec_opt && exec_opt->dispatched_by == session->username;
+        // #5557: the ownership disjunct takes the owner KEY, never the raw username.
+        const bool owns_execution = exec_opt && execution_owner_key(*session).owns(*exec_opt);
         const bool visible = !gate.scope || owns_execution || has_visible_agent;
         if (!exec_opt || !visible) {
             // Keep nonexistent and outside-scope cases caller-identical. The
