@@ -67,10 +67,10 @@
 /// committed (releasing `session_meta`); `RbacAdminAuthorityOwner` takes
 /// `principal_roles` → `auth.users` and, for `deactivate_account` with a `SessionStore`
 /// wired, the `session_meta` row last (same relative order as here: `auth.users` before
-/// `session_meta`), and never an `audit_store` lock or a `sessions` row. Safe ONLY because `AuthDB`, `SessionStore` and `AuditStore` share ONE
-/// PgPool/database (ADR-0006; server.cpp constructs all three on `*pg_pool_`)
-/// — a split onto separate databases fails every statement here closed (SQL
-/// error → rollback → 503), never a silent partial write, but still needs this
+/// `session_meta`), and never an `audit_store` lock or a `sessions` row. Safe ONLY because
+/// `AuthDB`, `SessionStore` and `AuditStore` share ONE PgPool/database (ADR-0006; server.cpp
+/// constructs all three on `*pg_pool_`) — a split onto separate databases fails every statement
+/// here closed (SQL error → rollback → 503), never a silent partial write, but still needs this
 /// owner re-plumbed.
 ///
 /// Holds no in-process lock and never calls back into `AuthManager`; it borrows

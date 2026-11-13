@@ -438,7 +438,9 @@ public:
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
     /// AuthManager wipes its own in-memory `sessions_` map for this
-    /// username).
+    /// username). It does not bump the session write-generation either (no production
+    /// caller: `RbacAdminAuthorityOwner::deactivate_account` is the production soft delete
+    /// and bumps it in its own transaction).
     std::expected<bool, AuthDBError> remove_user(const std::string& username);
 
     /// Check if a user exists (active only).

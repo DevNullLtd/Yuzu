@@ -1324,7 +1324,7 @@ TEST_CASE("AuthManager lifecycle guard: the session generation moves with the de
 }
 
 TEST_CASE("AuthManager lifecycle guard: concurrent session creates and deactivations finish "
-          "inside the lock timeout (T13, smoke only)",
+          "all complete without a lock timeout (T13, smoke only)",
           "[pg][auth_db][lifecycle_guard][session_generation][auth]") {
     // SMOKE ONLY. This shows the session_meta row edge does not stall the pair of workloads; it
     // proves nothing about publication or the lock graph, and the DDL fault trigger is
@@ -1337,7 +1337,6 @@ TEST_CASE("AuthManager lifecycle guard: concurrent session creates and deactivat
 
     std::atomic<int> removed{0};
     std::atomic<int> other{0};
-    const auto t0 = std::chrono::steady_clock::now();
     {
         Workers workers({});
         for (int i = 0; i < kUsers; ++i) {
@@ -1355,11 +1354,11 @@ TEST_CASE("AuthManager lifecycle guard: concurrent session creates and deactivat
         }
         workers.join_all();
     }
-    const auto elapsed = std::chrono::steady_clock::now() - t0;
 
+    // Every removal completing with Removed (none timed out into another outcome) IS the check;
+    // a wall-clock bound here would only make the case flaky on a loaded runner.
     CHECK(removed.load() == kUsers);
     CHECK(other.load() == 0);
-    CHECK(elapsed < std::chrono::seconds(10)); // the lifecycle lock_timeout is 2 s per wait
     for (int i = 0; i < kUsers; ++i)
         CHECK_FALSE(account_active(f.db.pool(), "t13_u" + std::to_string(i)));
 }

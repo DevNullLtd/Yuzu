@@ -3697,8 +3697,9 @@ public:
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
             "elevate / account_state, the last being the read of the account store "
-            "that gates a durable local session); a validate degrade fails the request closed, and elevate / "
-            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "that gates a durable local session); a validate degrade fails the request "
+            "closed, and elevate / revoke (via invalidate_user) degrades fail the "
+            "privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");

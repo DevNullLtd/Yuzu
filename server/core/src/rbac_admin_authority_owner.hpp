@@ -40,15 +40,14 @@
 /// `rbac_meta` write_generation row (the grant mutators only: `deactivate_account` and
 /// `set_local_role` change no `principal_roles` row and never bump it), then, for
 /// `deactivate_account` in `SessionGenerationMode::kBumpSessionGeneration` only, the
-/// `session_store.session_meta` `write_generation` row, LAST, bounded by the lifecycle
-/// `lock_timeout`, then COMMIT. A path that holds an `auth.users` row lock and then touches
-/// those would invert it. The `session_meta` row is the one lock every session create/revoke in
-/// the fleet shares, so nothing in the deactivation may wait after taking it. That edge is
-/// acyclic because no session writer takes an RBAC or account lock (session_store.cpp touches
-/// the `session_store` schema only) and `CredentialChangeOwner` takes `auth.users` before
-/// `session_meta` too.
-/// `provision_first_admin` is a DISJOINT lock path: it never touches the
-/// `rbac_enabled` row at all, and its `auth.users` interaction is a plain
+/// `session_store.session_meta` `write_generation` row, LAST (each lock wait in the transaction
+/// is bounded by the lifecycle `lock_timeout`, see the step 8 comment), then COMMIT. A path that
+/// holds an `auth.users` row lock and then touches those would invert it. The `session_meta` row is
+/// the one lock every session create/revoke in the fleet shares, so nothing in the deactivation may
+/// wait after taking it. That edge is acyclic because no session writer takes an RBAC or account
+/// lock (session_store.cpp touches the `session_store` schema only) and `CredentialChangeOwner`
+/// takes `auth.users` before `session_meta` too. `provision_first_admin` is a DISJOINT lock path:
+/// it never touches the `rbac_enabled` row at all, and its `auth.users` interaction is a plain
 /// INSERT of a NEW row (there is nothing existing to lock; the table is, by
 /// construction, empty at that point), so it cannot participate in the
 /// inversion this order guards against; its own ordering is just its own
@@ -230,8 +229,8 @@ public:
     /// other character outside `[A-Za-z0-9._-]`) can never be a stored account: it answers
     /// `kNotFound` before any statement runs, as do `set_local_role` and (as "not a member",
     /// `ok` with `would_strand` false) `would_strand_last_administrator` below.
-    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username,
-                                                               SessionGenerationMode session_mode) const;
+    [[nodiscard]] AccountDeactivationResult
+    deactivate_account(const std::string& username, SessionGenerationMode session_mode) const;
 
     /// #4966: the guarded role-column write behind `AuthManager::update_role_checked`. ONE
     /// transaction: the transaction-local `lock_timeout`; `rbac_enabled` FOR UPDATE on EVERY call

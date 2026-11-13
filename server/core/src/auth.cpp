@@ -599,8 +599,8 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     if (!session_store_)
         return true; // legacy in-memory path — nothing durable to fail
     if (auto r = session_store_->invalidate_user(username); !r) {
-        spdlog::error("durable session wipe for user '{}' failed ({}) — role change NOT honored, "
-                      "retry (invalidate_user is idempotent)",
+        spdlog::error("durable session wipe for user '{}' failed ({}) - session wipe did not "
+                      "persist, retry (invalidate_user is idempotent)",
                       username, r.error().message);
         note_session_store_degrade("invalidate_user"); // parity with the other degrade sites
         return false; // fail closed — caller must not report success (authdb-BLOCKING)

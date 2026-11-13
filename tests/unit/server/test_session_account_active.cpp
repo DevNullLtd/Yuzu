@@ -42,14 +42,19 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using yuzu::server::SessionStore;
@@ -101,7 +106,10 @@ public:
             result_ = fn();
         });
         std::unique_lock lk(mu_);
-        cv_.wait(lk, [this] { return reached_; });
+        // Bounded: a validation that never reaches the hook must fail the test, not hang it. The
+        // destructor still releases and joins the worker on the way out of the failed test.
+        if (!cv_.wait_for(lk, std::chrono::seconds(10), [this] { return reached_; }))
+            FAIL("the held validation never reached the pre-cache hook within 10 s");
     }
 
     // Lets the held validation finish and returns its result.
@@ -606,7 +614,8 @@ TEST_CASE("account gate: federated sessions are not gated on an account row (T9)
     auto& b = f.add();
     CHECK(b.validate_session(oidc).has_value());
 
-    // OIDC with a provisioned row.
+    // OIDC with a provisioned row. A regression pin, not a second behaviour: federated
+    // sessions are never gated on an `auth.users` row, so provisioning one changes nothing.
     const auto oidc2 = a.create_oidc_session("Fed Two", "two@example.com", "sub-two", iss);
     REQUIRE_FALSE(oidc2.empty());
     a.provision_sso_identity(yuzu::server::oidc::oidc_principal_id(iss, "sub-two"), iss, "sub-two",
@@ -686,8 +695,13 @@ TEST_CASE("account gate: a replica that cannot read the generation distrusts its
         "ALTER TABLE session_store.session_meta_gone RENAME TO session_meta"};
     meta_gone.arm();
 
-    // Generation reads fail, session and account reads are healthy. Inside the 30 s bound the
-    // warm entry is still served (the documented bound) ...
+    // Generation reads fail, session and account reads are healthy. The stale-serve bound is
+    // kSessionGenStaleServeBoundMs = 30000 (a private constant in auth.cpp, deliberately not
+    // exposed): 20 s of aging is inside it and 20 s + 11 s = 31 s is past it. If that constant
+    // changes, these two ages must be re-derived. Inside the bound the warm entry is still
+    // served (the documented bound) ...
+    const double inactive0 = f.counter(kInactiveCounter);
+    const double validate_degrade0 = f.degrade("validate");
     b.expire_session_generation_poll_for_test();
     CHECK(b.validate_session(token).has_value());
     b.age_session_generation_refresh_for_test(std::chrono::seconds(20));
@@ -697,6 +711,10 @@ TEST_CASE("account gate: a replica that cannot read the generation distrusts its
     b.age_session_generation_refresh_for_test(std::chrono::seconds(11));
     b.expire_session_generation_poll_for_test();
     CHECK_FALSE(b.validate_session(token).has_value());
+    // The refusal is the account gate's (the inactive counter moved), not a degraded session
+    // read (that counter did not).
+    CHECK(f.counter(kInactiveCounter) == inactive0 + 1.0);
+    CHECK(f.degrade("validate") == validate_degrade0);
     meta_gone.repair();
 }
 
@@ -883,6 +901,10 @@ TEST_CASE("reactivation with a validation in flight: that session is not served 
     f.deactivate_leaving_session(a, "alice");
     CHECK_FALSE(poll_and_validate(b, token).has_value());
     REQUIRE(a.reactivate_user("alice"));
+    // B observes the reactivation's own generation change (its session wipe) BEFORE the held
+    // validation finishes. Without this poll the checks below would observe that change
+    // themselves, clear the cache, and hide a held validation that re-cached its session.
+    CHECK_FALSE(poll_and_validate(b, token).has_value());
 
     CHECK(held.release_and_join().has_value()); // concurrent with the invalidation: served once
     check_stays_refused(b, token);              // never again, though the account is active
@@ -890,6 +912,55 @@ TEST_CASE("reactivation with a validation in flight: that session is not served 
     const auto after = a.create_local_session_for_test("alice", Role::user, false);
     REQUIRE_FALSE(after.empty());
     CHECK(b.validate_session(after).has_value());
+}
+
+TEST_CASE("reactivating an account that is already active still removes its sessions (T-R10)",
+          "[auth][session_store][account_active][reactivation][pg]") {
+    // Ruled behaviour: the wipe runs first and unconditionally, so reactivation never depends on
+    // knowing whether the account was inactive. A live session of an active account is a casualty.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a.validate_session(token).has_value());
+    REQUIRE(b.validate_session(token).has_value()); // warm on both replicas
+    REQUIRE(f.durable_sessions_of("alice") == 1);
+
+    // The account is active throughout; whatever the call answers, the wipe has run.
+    (void)a.reactivate_user("alice");
+    CHECK(f.durable_sessions_of("alice") == 0);
+    CHECK_FALSE(a.validate_session(token).has_value());
+    CHECK_FALSE(poll_and_validate(b, token).has_value());
+}
+
+TEST_CASE("a failed deactivation bump through remove_user_checked evicts the target's local "
+          "sessions while the account stays active (T-R11)",
+          "[auth][session_store][account_active][pg]") {
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a.validate_session(token).has_value()); // warm on A
+
+    {
+        // The session generation table moved aside: the deactivation's bump (and so the whole
+        // deactivation transaction) fails; the write is indeterminate to the caller.
+        yuzu::test::SqlFault meta_gone{
+            f.db.pool(), "ALTER TABLE session_store.session_meta RENAME TO session_meta_gone",
+            "ALTER TABLE session_store.session_meta_gone RENAME TO session_meta"};
+        meta_gone.arm();
+        CHECK(a.remove_user_checked("alice") == RemoveUserOutcome::StoreFailure);
+        meta_gone.repair();
+    }
+    // The account was never deactivated ...
+    CHECK(f.db->user_exists("alice").value_or(false));
+    // ... but the local cache no longer holds its session: with the durable row removed behind
+    // the cache's back (no generation bump) a cached entry would still be served.
+    delete_durable_row_silently(f.db.pool(), token);
+    CHECK_FALSE(a.validate_session(token).has_value());
 }
 
 TEST_CASE("cache epoch: a revoke on the SAME replica drops a validation held across it, with no "
