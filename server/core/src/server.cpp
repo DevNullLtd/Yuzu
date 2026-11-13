@@ -9534,7 +9534,19 @@ public:
                         [this] { return pg::check_collation_version(*pg_pool_); }, &metrics_,
                         kCollationRecheckInterval, collation_state_,
                         kCollationUnsettledRecheckInterval);
-                    pg_collation_recheck_->start();
+                    // The repeat is optional (the start-time check has already reported), so a
+                    // refusal to create its thread (a task or thread limit) degrades instead of
+                    // failing the boot: the check only reports. Without the repeat the last-
+                    // completed gauge stops advancing and YuzuPgCollationCheckStale fires.
+                    try {
+                        pg_collation_recheck_->start();
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[PG] could not start the collation version recheck thread "
+                                     "(continuing with the start-time check only; the repeat will "
+                                     "not run): {}",
+                                     ::yuzu::log_key_token(e.what()));
+                        pg_collation_recheck_.reset();
+                    }
                 }
             }
         }

@@ -190,7 +190,10 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
                             CollationState& state) noexcept {
     try {
         const CollationStep step = next_collation_state(state, report.verdict);
-        state = step.next;
+        // `state` advances LAST. The transition-only log lines (the mismatch ERROR, the unreadable
+        // WARN, the clearing INFO) are decided by comparing a verdict with the previous state, so a
+        // transient failure in the metric or log work below must leave the state behind: the next
+        // report then repeats the transition (at-least-once) instead of losing its line for good.
         if (metrics) {
             metrics->counter(kCollationCheckCounter, {{"result", to_string(report.verdict)}})
                 .increment();
@@ -274,8 +277,10 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
                          "PostgreSQL before 15); the mismatch gauge has no series");
             break;
         }
+        state = step.next;
     } catch (...) {
-        // Logging and metrics are best effort; the check never affects the server.
+        // Logging and metrics are best effort; the check never affects the server. `state` was not
+        // advanced if the work above failed, so the next report repeats the transition.
     }
 }
 
