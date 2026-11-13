@@ -9252,8 +9252,12 @@ tests:
   # CASE -- YuzuPgCollationCheckStale: the last-completed timestamp stops advancing (a check stuck
   # mid-query, the series stays at its last value 1000, a Unix time 1000 s after the epoch). The
   # promtool clock starts at the epoch, so time() - 1000 passes 7200 at 8200 s (136m40s): the
-  # first true evaluation is at 137m, the 10m hold ends at 147m. Quiet at 130m (the timestamp is
-  # 6800 s old at 7800 s), pending at 140m, firing at 150m. Red if the threshold or the hold moved.
+  # first true evaluation is at 137m and the 10m hold ends at 147m. What is pinned (asserted
+  # below): nothing pending at 130m (the timestamp is 6800 s old), pending at 138m and 140m, not
+  # firing at 140m and 146m, firing at 148m and 150m. Pending at 138m with nothing pending at 130m
+  # puts the threshold between 6800 s and 7280 s; no firing at 146m and firing at 148m, given
+  # pending from about 137m, puts the hold between 10m and 11m (a hold of 9m or less or of 12m
+  # or more would redden). It does not pin the exact threshold or the exact hold to the minute.
   - interval: 1m
     name: pg collation check stale - a timestamp that stops advancing fires after two hours and the hold
     input_series:
@@ -9264,6 +9268,11 @@ tests:
         eval_time: 130m
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending"}'
+        eval_time: 138m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending"}'
         eval_time: 140m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
@@ -9272,19 +9281,30 @@ tests:
         eval_time: 140m
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
+        eval_time: 146m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
+        eval_time: 148m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
         eval_time: 150m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
-  # CASE -- a settled replica whose timestamp advances once an hour (the hourly cadence) never gets
-  # more than 3600 s stale, so YuzuPgCollationCheckStale stays quiet for the whole run. The values
-  # are the Unix time of each hourly check (3600, 7200, ... in seconds).
+  # CASE -- a settled replica whose timestamp advances once an hour (the hourly cadence) stays quiet.
+  # The series is built in five blocks of exactly 60 samples a minute apart (0, 3600, 7200, 10800 and
+  # 14400 s: each value is the Unix time of the first minute of its block), so each block spans one
+  # hour. The worst staleness in the model is the last sample of a block, 59 minutes after its
+  # timestamp, 3540 s, far below 7200 s. It pins that an hourly-advancing timestamp never fires, not
+  # the exact threshold.
   - interval: 1m
     name: pg collation check stale - a timestamp that advances hourly stays quiet
     input_series:
       - series: 'yuzu_pg_collation_check_last_completed_timestamp_seconds{job="yuzu",instance="s1"}'
-        values: "0x59 3600x60 7200x60 10800x60 14400x60"
+        values: "0x59 3600x59 7200x59 10800x59 14400x59"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuPgCollationCheckStale", alertstate="firing"}'
         eval_time: 100m

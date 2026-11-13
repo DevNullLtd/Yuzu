@@ -6238,18 +6238,21 @@ a rollback is genuinely needed.
   up to 15 s waiting for a `registry.write` audit write that a gateway
   forwarder thread has in flight (milliseconds unless the database is stuck
   or slow: a connect or a lock wait can use the whole bound). Stacked, this can reach
-  **~130 s** in the worst case if more than one stage is genuinely wedged;
-  one further stage, the join of the PostgreSQL collation-version recheck, runs
+  **~130 s** in the worst case if more than one stage is genuinely wedged.
+  One further wait, the join of the PostgreSQL collation-version recheck, runs
   late in `stop()` (after the leader-lease release, the audit cleanup and the
   offload flush, just before the PostgreSQL pool is reset) and is not in that
-  figure: a check in flight adds up to about 15 s (about 35 s on a network that
-  drops packets, and no bound against a backend that never answers), so the
-  documented total becomes about 145 s (about 165 s), which the 210 s shipped
-  grace covers; on top of the ~190 s fallback path described in
-  `server-admin.md` it is about 205 s (about 225 s), which does not clearly
-  fit in 210 s;
-  the total and each stage's own bound are
-  unchanged by the reorder, only their relative sequence is. **(#3495) The policy
+  figure. The check is told to stop at the start of the drain and overlaps the
+  earlier stages, so the late join adds only what is left of a check in flight,
+  at most about 15 s (about 35 s on a network that drops packets, and no bound
+  against a backend that never answers). The totals that follow are therefore
+  UPPER BOUNDS: about 145 s (about 165 s) in place of ~130 s, which the 210 s
+  shipped grace covers; on top of the ~190 s fallback path described in
+  `server-admin.md` about 205 s (about 225 s). 225 s exceeds the 210 s shipped
+  grace, and 205 s leaves only 5 s. If your network drops packets or you expect
+  the fallback path, raise `TimeoutStopSec` (systemd) or `stop_grace_period`
+  (compose) to 240 s or more.
+  The #3495 reorder leaves the total and each stage's own bound unchanged, only their relative sequence is. **(#3495) The policy
   evaluation, pre-flight runner, quarantine containment reconciler, and
   schedule tick background threads' gRPC dispatch calls now ride on the
   same 5 s gRPC shutdown deadline bucket above, not a separate stage** —

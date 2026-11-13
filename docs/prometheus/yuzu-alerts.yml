@@ -4706,7 +4706,8 @@ groups:
         # than 3 resets of yuzu_server_uptime_seconds in 3 hours and one continuous series per
         # instance, and a loop faster than the metrics sweep can keep it silent; see its comment).
         # The 10m window, the threshold of 5 and the 5m hold are claims reasoned from the
-        # cadence, not measured values.
+        # cadence, not measured values. With N replicas one database problem raises N alerts
+        # (each replica exports its own counter): group the notifications by alertname and job.
         expr: |
           sum by (job, instance) (increase(yuzu_pg_collation_check_total{result="unreadable"}[10m])) >= 5
         for: 5m
@@ -4738,7 +4739,9 @@ groups:
             datcollversion, pg_database_collation_actual_version(oid) FROM pg_database
             WHERE datname = current_database();
             With a continuous outage this fires about ten minutes after the first counted
-            failure and clears about six minutes after the last failed check. A check that
+            failure and clears about six minutes after the last failed check (reasoned, not
+            measured). Each replica exports its own series, so one database problem raises one
+            alert per replica: group the notifications by alertname and job. A check that
             cannot read from boot fires about ten to fifteen minutes after boot (the failure of
             the start-time check itself is counted but cannot be seen by increase()).
             Known limits: a check stuck mid-query is covered by YuzuPgCollationCheckStale, not
@@ -4752,16 +4755,20 @@ groups:
         # The third collation alert: no check has COMPLETED (with any verdict, ok, mismatch,
         # not_applicable or unreadable) for two hours. The server sets
         # yuzu_pg_collation_check_last_completed_timestamp_seconds on every applied report, the
-        # start-time one included; it is absent only until the first report and never removed. The
-        # settled cadence is one hour, so 7200 s is two missed hourly checks, and the 10m hold
-        # rides out a scrape or recheck jitter; a check stuck mid-query is therefore seen after
-        # about two hours plus the hold. It covers what neither of the other two can: a stuck
-        # check adds no counter increments, leaves the mismatch gauge as it was and logs nothing.
+        # start-time one included; it is absent only until the first report and never removed.
+        # The settled cadence is one hour, so the rule means: no check completed for two hours,
+        # counted from the last completed check (so about an hour after the hang began when the
+        # cadence is hourly), plus the 10m hold, which rides out scrape or recheck jitter. It
+        # covers what neither of the other two can: a stuck check adds no counter increments,
+        # leaves the mismatch gauge as it was and logs nothing.
         # An absent series (a process that never finished its boot check, or a scrape gap) is
         # silent here: keep your own `up == 0` rule. The value is a replica wall-clock time
-        # compared with Prometheus's time(), so a replica clock that is off by hours moves the
-        # threshold (reasoned). The 7200 s and the 10m hold are reasoned from the cadence, not
-        # measured; promtool covers the arithmetic only.
+        # compared with Prometheus's time(), so a replica clock that is more than about an hour
+        # off moves the threshold, and the hourly wait uses a clock that does not advance while
+        # the host is suspended, so a suspend can also fire it (both reasoned): check the
+        # replica's uptime and clock before treating it as a hang. The 7200 s and the 10m hold
+        # are reasoned from the cadence, not measured; promtool covers the arithmetic only.
+        # With N replicas one database problem raises N alerts: group by alertname and job.
         expr: |
           time() - max by (job, instance) (yuzu_pg_collation_check_last_completed_timestamp_seconds) > 7200
         for: 10m
@@ -4771,14 +4778,20 @@ groups:
           summary: "Yuzu server {{ $labels.instance }}: no PostgreSQL collation check has completed for two hours"
           description: >-
             The latest completed collation check on {{ $labels.instance }} is more than two
-            hours old; the settled cadence is one hour, so at least two checks were missed. The
-            recheck thread is hung (for example a check stuck mid-query) or the process is
-            wedged. While this fires, yuzu_pg_collation_version_mismatch and
+            hours old: no check completed for two hours, counted from the last completed check
+            (so about an hour after the hang began when the cadence is hourly). The recheck
+            thread is hung (for example a check stuck mid-query) or the process is wedged.
+            While this fires, yuzu_pg_collation_version_mismatch and
             yuzu_pg_collation_check_total say nothing about the database. Look at the server
-            log and the thread state of the process. An absent series (a process that never
-            finished its boot check, or a scrape gap) does not fire this alert: keep your
-            own `up == 0` rule. Runbook: docs/user-manual/server-admin.md, "PostgreSQL
-            collation version".
+            log and the thread state of the process; restart the replica if the log shows
+            nothing. It can also fire after a host suspend (the hourly wait uses a clock that
+            does not advance while suspended) or when the replica's clock is more than about an
+            hour off the Prometheus server's, so check the replica's uptime and clock before
+            treating it as a hang. An absent series (a process that never finished its boot
+            check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
+            Each replica exports its own series, so one database problem raises one alert per
+            replica: group the notifications by alertname and job. Runbook:
+            docs/user-manual/server-admin.md, "PostgreSQL collation version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
   # HA WS-11 (#4014, ADR-2002 §3/§6/§10/§11): the fenced LeaderElector, as each
