@@ -89,6 +89,38 @@ of the HA "safe-to-scale" gate. The design:
   and **fails closed (401)** while the store stays degraded. So a
   revoked/demoted/elevated session cannot ride the cache past ~30s of outage,
   not to its 8h absolute expiry.
+- **Account state at session validation.** A session built from a durable
+  row is served only while its LOCAL account is active:
+  `validate_session_durable` reads `AuthDB::user_exists` (active-only) where the
+  row becomes a session, and refuses (401) when the account is inactive or
+  deleted or when the read fails; nothing is cached on either refusal. Three
+  parts hold this together. (1) The account deactivation transaction
+  (`RbacAdminAuthorityOwner::deactivate_account`, when a `SessionStore` is wired)
+  bumps the session write-generation as its last statement, so every replica
+  clears its validate cache on its next poll whether or not the later session
+  wipe succeeded. (2) The validate cache carries an epoch (`session_cache_epoch_`,
+  under `mu_`) incremented with the one `sessions_.clear()`; a validation
+  captures it before any store read and inserts its session at the tail only if
+  it is unchanged (the ADR-0012 section 4 guarded-insert rule). On a mismatch the
+  session is still returned to that one request, uncached. The mint insert is
+  deliberately unguarded: the post-mint recheck erases this replica's entries on
+  its own. (3) `AuthManager::reactivate_user` erases the account's cached
+  sessions and wipes its durable ones first, and leaves the account inactive when
+  that wipe does not persist; a sign-in that completes after the reactivation is
+  a new sign-in. The lock order for (1) is `rbac_enabled`, the grant rows, one
+  `auth.users` row, then the `session_meta` row last, bounded by the lifecycle
+  `lock_timeout`. Limits: federated (OIDC, SAML) sessions are keyed on a principal
+  that need not be an `auth.users` account and are not gated; API-token and MCP
+  token sessions are unchanged; an out-of-band SQL change to `auth.users` bumps
+  no generation, so a replica with a warm cache keeps the session until the next
+  generation change (a cold read refuses it); the guarantee holds once every
+  replica runs this build; a session whose role is stale after a failed wipe on
+  demotion is a separate case and is not addressed here. A refusal is logged at
+  debug level and counted by `yuzu_auth_session_account_inactive_total`; the
+  count is not evidence of a failed wipe (a healthy deactivation can increment
+  it). An unreadable account store counts
+  `yuzu_auth_session_store_degrade_total{op="account_state"}`. No audit row is
+  written at validation.
 - **Authoritative reads.** A `SessionStore::find` returns
   `expected<optional<Row>>`: `nullopt` = definitively absent, `unexpected` = DB
   degraded. `validate_session` never treats a degraded read as "no valid
@@ -2926,11 +2958,13 @@ succeeds only if that later wipe persisted. If the wipe also fails, the
 account is deactivated and the call returns 500 with audit result `failure`
 and detail `account deactivated; durable session wipe failed`.
 
-**Known residual.** If that post-deactivation wipe itself fails
-(`RemovedSessionWipeFailed`), the account is deactivated but a surviving
-durable session row is not checked against account state by session
-validation and can keep validating until its expiry; a SCIM retry of an
-already-deactivated resource does not re-run the wipe.
+**Residual after a failed wipe.** If that post-deactivation wipe itself fails
+(`RemovedSessionWipeFailed`), the account is deactivated and the durable session
+row survives, but session validation no longer serves it: a session whose
+account is inactive or deleted is rejected (see "Account state at session
+validation" below). The row stays until the account is reactivated (which
+removes it) or it expires; a SCIM retry of an already-deactivated resource does
+not re-run the wipe. The narrower limits are listed in that section.
 
 **Audit vocabulary.** Three tokens mean "the durable session delete did not
 persist", and each is kept where it is documented: `db_error=true` (logout,

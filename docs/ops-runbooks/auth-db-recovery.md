@@ -397,7 +397,9 @@ then clear this replica's cache. If the response body reports
 `db_error=true`), only this replica's cache was cleared. The rows survive, and
 any replica that misses its cache, including this one after a restart, will
 rebuild those sessions from them. Retry the revoke once the database is
-healthy.
+healthy. A session whose local account is inactive or deleted is refused at
+validation regardless, so a surviving row of a deactivated account does not
+serve (see `docs/auth-architecture.md`, "Account state at session validation").
 
 API tokens are a separate credential class. The admin `?username=` call does
 **not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
@@ -653,7 +655,7 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
     ORDER BY timestamp DESC;"
 ```
 
-`target_id` is the username for `user.delete` and the SCIM id for the three SCIM actions; the username is in `scim_store.scim_resources` (`SELECT username FROM scim_store.scim_resources WHERE scim_id = '<target_id>';`). A `scim.user.provisioned` row is a `POST /Users` with `active:false`: the account already exists and the IdP's retry meets `409`, so deactivate it by a `PATCH` with `active:false` (or from the dashboard) once the store has recovered. A `scim.user.provisioned` `success` row with `session_leg_backstopped=true` is not a failure: the account removal's own session wipe covered the delete. A `failure` row with `account deactivated; durable session wipe failed` means the account is down but a session may survive; end it with `DELETE /api/v1/sessions?username=<name>`. That call writes to the same session store, so it works only once PostgreSQL is healthy; it needs `UserManagement:Write` and asks for an MFA step-up only when the caller is a session whose account has an enrolled factor (see "Ending the sessions by hand" below).
+`target_id` is the username for `user.delete` and the SCIM id for the three SCIM actions; the username is in `scim_store.scim_resources` (`SELECT username FROM scim_store.scim_resources WHERE scim_id = '<target_id>';`). A `scim.user.provisioned` row is a `POST /Users` with `active:false`: the account already exists and the IdP's retry meets `409`, so deactivate it by a `PATCH` with `active:false` (or from the dashboard) once the store has recovered. A `scim.user.provisioned` `success` row with `session_leg_backstopped=true` is not a failure: the account removal's own session wipe covered the delete. A `failure` row with `account deactivated; durable session wipe failed` means the account is down and its session row may survive; the row is not served (a session whose account is inactive is rejected at validation), and you can remove it with `DELETE /api/v1/sessions?username=<name>`. `yuzu_auth_session_account_inactive_total` counts those refusals; it is not evidence of a failed wipe, because a healthy deactivation can increment it too. That call writes to the same session store, so it works only once PostgreSQL is healthy; it needs `UserManagement:Write` and asks for an MFA step-up only when the caller is a session whose account has an enrolled factor (see "Ending the sessions by hand" below).
 
 **Confirming it converged.** After the retry succeeds, the matching `scim.user.deactivated`, `scim.user.deleted` or `user.delete` row has result `success`, and no session row is left for the account:
 

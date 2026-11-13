@@ -414,10 +414,10 @@ This case answers `500`, not `503` with `Retry-After` (tracked separately), so
 configure the connector to retry a `500`. Some identity providers pause or
 quarantine the provisioning app after repeated 5xx responses (Microsoft Entra
 does); after the store recovers, confirm the provisioning job is running and
-re-trigger a sync. If the post-deactivation session wipe itself fails, a
-surviving durable session is not checked against account state by session
-validation and can keep validating until it expires; end it with
-`DELETE /api/v1/sessions?username=<name>`.
+re-trigger a sync. If the post-deactivation session wipe itself fails, the
+account is deactivated and a session whose account is inactive is rejected at
+validation; the surviving row is removed when the account is reactivated or you
+end it with `DELETE /api/v1/sessions?username=<name>`.
 
 **SCIM will not deactivate an account that is currently `role=admin`,**
 whether that admin role came from a dashboard promotion or from
