@@ -2302,6 +2302,7 @@ delta is attributable to one axis ("never bundled with a topology change"):
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
 | 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
 | 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
+| 2d | Gateway EUnit shards without cover, three shards, `gateway ct` `priority: 120` (see Push 2d below) | cost + ordering | | | | | | |
 | 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8 (moot: the step was removed by ADR-0035 step 1), non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
@@ -2804,7 +2805,10 @@ invocation 362 s to 375 s where the log carries per-line timestamps.
 priority order, which reproduces two observed baseline walls to within 3 s, gives
 269 s to 279 s with the shards at about 100 s and `gateway ct` at 130 s to 160 s,
 and 290 s to 302 s with the shards at 130 s; the invocation only gets longer than
-today if each shard runs past about 190 s. Local runs, all four entries at once:
+today if each shard runs past about 190 s. This takes the `gateway ct` half of
+the rung Push 2b named, at the shards' 120 rather than its own duration: ct is no
+longer the 37 s entry Push 2b measured but 124 s to 136 s under the concurrent
+halves, so it needs to start with the shards. Local runs, all four entries at once:
 92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average of 20
 to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no priority); a
 priority for it is the next rung. The non-pg half should fall from about 480 s to
@@ -2813,15 +2817,19 @@ about 390 s to 400 s, which leaves the pg half the longer one.
 logs), judged on the cheap-suites invocation wall and the non-pg half's wall:
 (a) the invocation median improves by 10% or more; (b) no entry of 5 s or more
 other than the gateway entries takes more than 1.5x its baseline; (c) no entry
-reaches 80% of its own meson timeout, and the EUnit test count stays 2807 across
-the three shards. Windows (Wee Tam) runs the same entries: its
+reaches 80% of its own meson timeout, and the EUnit test count across the three
+shards equals a contemporaneous `dev` push's (2807 at the time of writing; a test
+module added to `dev` meanwhile would move it). Windows (Wee Tam) runs the same entries: its
 `agent tsan-heavy checkpoints` barrier (`is_parallel: false`) now waits for C and
 `gateway ct` as well as A and B, which should still be shorter than the two
 covered shards were, but is not measured; read its first runs. Unfiltered nightly
 runs now start `gateway ct` with the shards, after the pg shards. Faster code
 without cover can move a race: watch about five runs per leg for a gateway flake
 and name the module before any re-run. To revert, take the shards back to two in
-the root `meson.build` table and `REQUIRED` in `scripts/ci/assert-gateway-tests.py`,
+the root `meson.build` table, `REQUIRED` in `scripts/ci/assert-gateway-tests.py`
+and the names in `tests/test_gateway_test_summary.py` (and the shard count in
+`docs/erlang-gateway-build.md`, `docs/testing/integration-tests.md` and
+`docs/rhel9-build-setup.md`),
 delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
 priority; each of the three is separable.
 *Samples.* To be recorded here after the change's own runs.
