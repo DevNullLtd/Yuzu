@@ -412,7 +412,8 @@ void apply_tag_read(InventoryDevicesResult& result,
 
 /// One device's identity from the offline point read (`OfflineEndpointStore::find_within`, #5712):
 /// the error is propagated (a failed read is never "not in the roster"); a hit yields the row
-/// (online=false, stale past 2 days) and an empty read is a CONFIRMED absence (nullopt) — the
+/// (online = the endpoint's `live` flag, i.e. connected to some replica per the database; offline
+/// and stale past 2 days otherwise) and an empty read is a CONFIRMED absence (nullopt) — the
 /// point read is a primary-key lookup, so unlike the roster scan it replaced (a lower bound past
 /// the row cap, which read an enrolled offline device as absent) its miss is exact.
 [[nodiscard]] std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>

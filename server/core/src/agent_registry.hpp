@@ -942,6 +942,14 @@ public:
     // wired), this is byte-identical to the pre-WS-5 local-only behavior.
     std::vector<std::string> all_ids() const;
 
+    // The ids of the sessions held ON THIS REPLICA only, under the same lock all_ids() takes, and
+    // with NO presence read at all: nothing here can fail, be truncated or hit Postgres. The
+    // Hardware list uses it for the part of "online" the database cannot know (a session whose
+    // row has not recorded a session id yet) and takes the rest of "online" from the roster read
+    // itself (#7566), so a failed or truncated presence read can no longer turn connected devices
+    // into Offline. Everything that must see other replicas' agents keeps using all_ids().
+    [[nodiscard]] std::vector<std::string> local_ids() const;
+
     // Count of `all_ids()` (local sessions UNION cached durable presence)
     // without materialising the id list. Unlike `all_ids()`, a degraded
     // presence read is a typed `std::unexpected` — never a silently

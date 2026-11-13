@@ -907,7 +907,17 @@ place, **Hardware** and **Software**, each its own page:
   plus a sticky bulk-tag bar let you apply or remove one tag across every selected
   device in one action — under the hood it loops the existing single-device tag routes,
   so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
-  audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
+  audit row; nothing is bulk-authorized. **Online** means the device holds a session on the
+  server answering the request, or the database says it is connected to some server (it has
+  recorded a session and been seen within the presence window, the server's session timeout,
+  90 seconds by default). The database half is read in the same statement as the roster, so
+  there is no second read to fail: on a deployment with more than one server replica a device
+  connected to another replica reads Online, on the list, the per-device record, `GET
+  /api/v1/hardware/{id}` and MCP `get_hardware_ci` alike, and the Online/Offline filter, the
+  status sort and the Online and Offline tiles agree with it. Two limits remain: a device that
+  drops without saying goodbye reads Online until the window passes, and a device whose first
+  heartbeat has not recorded a session yet reads Offline on a replica other than the one it
+  is connected to until its next heartbeat. The KPI strip (Total CIs / Online / Offline /
   Stale / CI coverage) is computed over the same rows the table shows. Two readouts sit
   beside it: **Median memory** (over the devices that have synced a positive RAM figure,
   with that device count in the label) and a **By manufacturer** line (case-folded, the
@@ -1179,12 +1189,6 @@ The roster cap is a display and read cap, not a tested capacity. Above it:
 - The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
   the Software page, show only devices inside the capped roster (a host outside it appears as
   its `agent_id`, or not at all in the type-ahead).
-- The CI record's online state comes from the local session map of the replica serving the
-  request (#7551).
-- Online and Offline on the list derive from the live-presence read. On a deployment with more
-  than one server replica, if that read fails, or the fleet has more than 100,000 live agents (in
-  which case it is refused every time, not just briefly), agents connected to another replica
-  read Offline with no flag, and the Offline tile is not a true lower bound (#7566).
 - Search, filter and sort run over the capped set, and there is no way to page past the cap
   (#7567). A device seen within the window is always reachable by its id.
 

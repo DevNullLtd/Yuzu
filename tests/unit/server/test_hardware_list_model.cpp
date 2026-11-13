@@ -1056,6 +1056,33 @@ TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullo
     CHECK_FALSE(miss->has_value());
 }
 
+// Kills (#7551): the offline fallback hard-coding online=false, so a device connected to ANOTHER
+// replica read as offline on its own record, REST GET /hardware/{id} and MCP get_hardware_ci.
+TEST_CASE("offline_identity_row: a row the database says is live reads online, not offline",
+          "[hardware][model]") {
+    OfflineEndpoint live = make_offline_ep("a1", 10 * kDayMs - 5000); // heartbeat five seconds ago
+    live.live = true;
+    const auto hit = offline_identity_row(OfflineEndpointRead{std::optional<OfflineEndpoint>{live}},
+                                          10 * kDayMs, fake_age);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->has_value());
+    CHECK((*hit)->online);
+    CHECK((*hit)->last_seen == "now");              // the list's own wording for a connected device
+    CHECK((*hit)->last_seen_ms == 10 * kDayMs);     // the read's clock, as the list does
+    CHECK_FALSE((*hit)->stale);
+
+    // The same row without the flag (a read that was not given a ttl, or a departed device) is the
+    // offline row it always was: the flag is the ONLY thing that changes it.
+    const auto not_live = offline_identity_row(
+        OfflineEndpointRead{std::optional<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - 5000)}},
+        10 * kDayMs, fake_age);
+    REQUIRE(not_live.has_value());
+    REQUIRE(not_live->has_value());
+    CHECK_FALSE((*not_live)->online);
+    CHECK((*not_live)->last_seen == "aged");
+    CHECK((*not_live)->last_seen_ms == 10 * kDayMs - 5000);
+}
+
 // Kills: apply_identity_read never setting identity_degraded, or setting it on a clean miss.
 TEST_CASE("apply_identity_read: error degrades; nullopt is absent; row is identity", "[hardware][model]") {
     HardwareCiDetail d;

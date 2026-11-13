@@ -1625,6 +1625,15 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     return ids;
 }
 
+std::vector<std::string> AgentRegistry::local_ids() const {
+    std::lock_guard lock(mu_);
+    std::vector<std::string> ids;
+    ids.reserve(agents_.size());
+    for (const auto& id : agents_ | std::views::keys)
+        ids.push_back(id);
+    return ids;
+}
+
 std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
     auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
     if (!presence)

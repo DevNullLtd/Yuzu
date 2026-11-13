@@ -105,7 +105,10 @@ TEST_CASE("hw_identity_fn wiring (LEXICAL pin, not behaviour): the offline fallb
     REQUIRE_FALSE(body.empty());
 
     // The offline fallback is the point read, named exactly once, with the roster's own window.
-    CHECK(count_occurrences(body, "offline_endpoint_store_->find_within(agent_id,kHardwareRosterWindow)") == 1);
+    // #7551: ...and it is asked whether the device is live on ANOTHER replica (the session ttl), so a
+    // device connected elsewhere is not hard-coded offline.
+    CHECK(count_occurrences(body,
+                            "offline_endpoint_store_->find_within(agent_id,kHardwareRosterWindow,cfg_.session_timeout)") == 1);
     // ... and the roster scan is not named anywhere in the closure.
     CHECK(count_occurrences(body, "query_stale_within(") == 0);
     CHECK(count_occurrences(body, "offline_endpoint_store_->") == 1);
@@ -128,13 +131,21 @@ TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the roster read 
     const std::string roster_body =
         lambda_body(comment_free_source("server.cpp"), "build_hw_roster", "-> InventoryDevicesResult");
     REQUIRE_FALSE(roster_body.empty());
-    const auto read = roster_body.find("offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)");
+    const auto read = roster_body.find(
+        "offline_endpoint_store_->query_stale_within(kHardwareRosterWindow,cfg_.session_timeout)");
     const auto apply = roster_body.find("apply_roster_read(result,eps)");
     REQUIRE(read != std::string::npos);
     REQUIRE(apply != std::string::npos);
     CHECK(read < apply);
     CHECK(count_occurrences(roster_body, "query_stale_within(") == 1);
     CHECK(count_occurrences(roster_body, "apply_roster_read(") == 1);
+    // #7566: "online" is the roster row's own `live` flag OR a session held on THIS replica. The
+    // registry's presence-merged `all_ids()` (a second read that can fail or be truncated on its own
+    // and silently read connected devices as Offline) must not come back into this closure, and the
+    // ttl must be the session timeout (the presence window the registry itself uses).
+    CHECK(count_occurrences(roster_body, "registry_.all_ids()") == 0);
+    CHECK(count_occurrences(roster_body, "registry_.local_ids()") == 1);
+    CHECK(count_occurrences(roster_body, "r.online=e.live||online.count(e.agent_id)>0;") == 1);
     // The rows come from the served partial's `.rows`, not from a re-read.
     CHECK(count_occurrences(roster_body, "eps->rows") >= 1);
 }
