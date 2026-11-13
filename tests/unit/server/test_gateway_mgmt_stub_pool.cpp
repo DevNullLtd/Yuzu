@@ -17,6 +17,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <map>
+#include <string>
+
 using yuzu::server::GatewayMgmtStubPool;
 using yuzu::server::kDefaultGatewayClusterKey;
 using yuzu::server::kUnknownGatewayClusterLabel;
@@ -392,4 +395,61 @@ TEST_CASE("is_terminal_command_status: RUNNING is the ONLY non-terminal status "
     CHECK(yuzu::server::is_terminal_command_status(S::FAILURE));
     CHECK(yuzu::server::is_terminal_command_status(S::TIMEOUT));
     CHECK(yuzu::server::is_terminal_command_status(S::REJECTED));
+}
+
+// ── HA WS-13 slice 13.7 (#7062): keepalive on the management channel ────
+
+namespace {
+
+// Reads the integer-valued args back out of a ChannelArguments the way gRPC
+// itself will see them (SetChannelArgs fills a C struct that aliases the
+// object's storage, so it must not outlive `args`).
+std::map<std::string, int> integer_args_of(const grpc::ChannelArguments& args) {
+    grpc_channel_args c{};
+    args.SetChannelArgs(&c);
+    std::map<std::string, int> out;
+    for (size_t i = 0; i < c.num_args; ++i) {
+        if (c.args[i].type == GRPC_ARG_INTEGER) {
+            out[c.args[i].key] = c.args[i].value.integer;
+        }
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("GatewayMgmtStubPool: the default management channel pings an idle channel so a "
+          "silent gateway node fails like a closed one",
+          "[server][gateway_mgmt_stub_pool][ha]") {
+    const auto args = integer_args_of(GatewayMgmtStubPool::default_channel_arguments());
+
+    // Each of these four is load-bearing; dropping any one silently restores
+    // the 300 s-per-forward hang this slice exists to bound.
+    REQUIRE(args.contains(GRPC_ARG_KEEPALIVE_TIME_MS));
+    CHECK(args.at(GRPC_ARG_KEEPALIVE_TIME_MS) == GatewayMgmtStubPool::kKeepaliveTimeMs);
+    REQUIRE(args.contains(GRPC_ARG_KEEPALIVE_TIMEOUT_MS));
+    CHECK(args.at(GRPC_ARG_KEEPALIVE_TIMEOUT_MS) == GatewayMgmtStubPool::kKeepaliveTimeoutMs);
+    // The channel is idle between commands: with no calls in flight nothing is
+    // pinged unless this is set.
+    REQUIRE(args.contains(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS));
+    CHECK(args.at(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS) == 1);
+    REQUIRE(args.contains(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA));
+    CHECK(args.at(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA) == 0);
+
+    // Detection bound the docs promise (40 s) and a floor so a future edit
+    // cannot turn the ping into a flood against the gateway listener.
+    CHECK(GatewayMgmtStubPool::kKeepaliveTimeMs + GatewayMgmtStubPool::kKeepaliveTimeoutMs <=
+          60000);
+    CHECK(GatewayMgmtStubPool::kKeepaliveTimeMs >= 10000);
+}
+
+TEST_CASE("GatewayMgmtStubPool: the default channel factory builds a channel from the keepalive "
+          "arguments without dialling",
+          "[server][gateway_mgmt_stub_pool][ha]") {
+    // grpc::CreateCustomChannel is lazy-connecting like CreateChannel, so this
+    // proves the production factory is constructible with these arguments
+    // (a malformed arg would yield a null/lame channel on some gRPC builds).
+    auto ch = GatewayMgmtStubPool::default_channel_factory("127.0.0.1:0",
+                                                           grpc::InsecureChannelCredentials());
+    REQUIRE(ch != nullptr);
 }

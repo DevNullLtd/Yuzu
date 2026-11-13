@@ -186,10 +186,45 @@ public:
         std::function<std::shared_ptr<grpc::Channel>(const std::string& address,
                                                        std::shared_ptr<grpc::ChannelCredentials>)>;
 
+    /// HA WS-13 slice 13.7 (#7062): HTTP/2 keepalive for the server->gateway
+    /// management channel. The channel sits idle between commands, and a
+    /// gateway node that stops answering WITHOUT resetting the connection (a
+    /// dropped route, a frozen host, a partition) is otherwise undetectable:
+    /// every forward then runs to its 300 s deadline on a detached thread
+    /// (`forward_gateway_pending`). Pinging detects it in about
+    /// `kKeepaliveTimeMs + kKeepaliveTimeoutMs` (40 s), after which gRPC fails
+    /// the call as UNAVAILABLE and the forwarder's own retry/`gateway_unavailable`
+    /// path takes over.
+    ///
+    /// This does NOT add a second address or any failover: the management
+    /// address is still ONE name, and surviving a dead node still depends on
+    /// that name resolving to a live one (a TCP-passthrough VIP with a
+    /// `/readyz` check, or multi-address DNS: docs/user-manual/gateway.md
+    /// "Management plane addressing"). It only makes a silent node fail like
+    /// a closed one.
+    ///
+    /// Safe against the gateway's own listener: cowboy_http2 has no minimum
+    /// ping interval (no `too_many_pings` GOAWAY), only a flood limit
+    /// (`enhance_your_calm`) orders of magnitude above one ping per 30 s, and
+    /// the agents already ping the same listener every 60 s.
+    static constexpr int kKeepaliveTimeMs = 30000;
+    static constexpr int kKeepaliveTimeoutMs = 10000;
+
+    [[nodiscard]] static grpc::ChannelArguments default_channel_arguments() {
+        grpc::ChannelArguments args;
+        args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kKeepaliveTimeMs);
+        args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, kKeepaliveTimeoutMs);
+        // The channel is idle between commands; without this no ping is sent.
+        args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+        // Client side: never stop pinging because no DATA frame went by.
+        args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+        return args;
+    }
+
     static std::shared_ptr<grpc::Channel>
     default_channel_factory(const std::string& address,
                             std::shared_ptr<grpc::ChannelCredentials> creds) {
-        return grpc::CreateChannel(address, std::move(creds));
+        return grpc::CreateCustomChannel(address, std::move(creds), default_channel_arguments());
     }
 
     /// `default_address` is `Config::gateway_command_address` (may be
