@@ -211,6 +211,18 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Rollback.** No migration and no schema change, and this change writes no new durable state. A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this page, and it does not reverse the Echo changes described in the "Echo stores roll-ups only" and "Echo holds `echo.db` to a byte budget" sections below.
 
+## Behaviour change: the server checks the PostgreSQL collation version (a gauge, a counter and two alerts)
+
+**What changed.** The server now compares the database's recorded collation version with the version the operating system of the PostgreSQL server reports. It does this at each start and then at intervals. The check only reports: the server starts whatever it finds, and nothing is stopped, refused or paused because of it.
+
+**What the server reports.** A database that already differs when you upgrade, typically after an operating-system or libc upgrade or a base-image change under an existing data volume, logs one `[PG]` error at the first start after this upgrade and exports `yuzu_pg_collation_version_mismatch` = `1`. The counter `yuzu_pg_collation_check_total{result}` counts every check. While the picture is unsettled (a mismatch stands, no check has concluded yet, or the latest check could not run) the check repeats every minute instead of every hour. Drift that begins while the server runs is seen at the next check, up to an hour later. Once `docs/prometheus/yuzu-alerts.yml` is loaded, the alert `YuzuPgCollationVersionMismatch` (warning, after 1 minute, group `yuzu-postgres`) fires on the gauge and clears without a restart after the fix. A second alert in the same group, `YuzuPgCollationCheckBlind` (warning), fires when the check has failed at least five times in ten minutes (held for 5 minutes; at the one-minute cadence that takes six failures), because the gauge is then stale.
+
+**What it does not do.** Nothing in the database is changed. A database on the `C`/`POSIX` collation or a PostgreSQL before 15 exports no gauge series. A check that could not run leaves the gauge as it was, and a gauge that was never set stays absent, which is not the same as healthy: the alert `YuzuPgCollationCheckBlind` covers this, and the server log has a WARN line naming the cause.
+
+**What to check before upgrading.** Run `SELECT datname, datcollversion, pg_database_collation_actual_version(oid) FROM pg_database WHERE datname = current_database()`, connected to the Yuzu database. Two different values mean the first start will report a mismatch; a NULL `datcollversion` means the check does not apply.
+
+**What to do on a mismatch.** Follow "PostgreSQL collation version" in [server-admin.md](server-admin.md#postgresql-collation-version): reindex every index and confirm it finished, then refresh the recorded version (refreshing first clears the gauge over indexes that are still stale). The next check (within about a minute) clears the gauge. No restart is needed.
+
 ## Behaviour change: the server refuses to start on a device inventory schema it cannot read (`device_inventory_store`)
 
 **Scope of this note.** The device-CI v2 record (migrations v2 and v3 of `device_inventory_store`) has not shipped in a release. A supported deployment starts from a fresh database (see "Deployment contract (hard cutover)" in the Forensics section of this page) and is not affected; this note matters only to a development or UAT database that ran an earlier build of the unreleased migrations. It is not a procedure for any other database: if a production database reaches this refusal, stop, do not run the statements below, and open an issue.

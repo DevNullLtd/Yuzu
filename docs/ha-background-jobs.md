@@ -14,7 +14,9 @@ table disagree, the table wins.
   leader-gated — the event-outbox poll (`poll_event_outbox_once`) is the reference
   case (ADR-2002 §5: every replica polls its own bus, or non-leader SSE goes dark);
   the `/readyz` Postgres reachability probe (`pg_reachability_probe.tick`, HA WS-8)
-  is another — each replica must measure its own path to Postgres.
+  is another (each replica must measure its own path to Postgres), and so is the
+  collation-version recheck (`pg_collation_recheck.tick`), because each replica exports its
+  own `yuzu_pg_collation_version_mismatch` gauge.
 - **FencedLeaderOnly** — side-effecting singleton work that double-fires across
   replicas (agent dispatch: schedule tick, policy remediation, quarantine
   reconcile; CRL numbering). Runs only on the WS-3 fenced leader. *Enforcement is
@@ -46,7 +48,7 @@ threads (cert reloader, catalogue rollup, software-title normalisation, provisio
 cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
 WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-an earlier revision missed eight of these; later additions (51 passes now, including the one-shot
+an earlier revision missed eight of these; later additions (53 passes now, including the one-shot
 `inventory_store.purge_typed_sources` on `typed_purge_thread_` and the hourly
 `software_normalization_job.run_tick` on `SoftwareNormalizationJob::thread_`) are recorded in
 that header.
