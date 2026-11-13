@@ -688,6 +688,8 @@ subscriber.
 
 **Limit (b): withheld-event counts are inferable.** Bus ids are per-execution counters (one per event, for all agents) sent raw, so a confined subscriber can infer how many events were withheld from gaps in the ids, the sanitized terminal frame's id and the replay-gap `missing_to`; no content or attribution leaks. A dense per-connection id would break `Last-Event-ID` resume; an opaque resumable cursor is tracked as a follow-up.
 
+**Recorded gap (b): the MCP stream bridge does not apply the scope projection.** `McpStreamBridge` is a live bus consumer that relays `execution-progress` counts and the terminal event (`agents_responded`, `agents_success`, `agents_failure`) to the session that armed it and does not call `classify_execution_event_for_scope`; only the REST and dashboard consumers do, and only they are pinned by the source tripwires above. It is armed solely by `execute_instruction` for the caller's own dispatch, whose targets are already narrowed to the caller's visible set, and a service-scoped session cannot reach it. The one case where it differs from the REST route is a principal holding global `Execution:Execute` but only scoped `Execution:Read`, whose own fleet-wide dispatch reports fleet-wide counts on the bridge. This is a recorded gap, tracked as a follow-up (apply the projection, or record that a dispatcher's own-dispatch counts are intentionally unsanitized), not a decision that the bridge is exempt.
+
 Both call sites are pinned by source-tripwire tests
 (`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
 **A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
