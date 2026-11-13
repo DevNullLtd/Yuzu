@@ -1063,3 +1063,26 @@ TEST_CASE("cache epoch: a validation inside the gap between a reactivation's loc
     CHECK(f.durable_sessions_of("alice") == 0);
     CHECK_FALSE(a.validate_session(token).has_value());
 }
+
+TEST_CASE("cache epoch: the same role-change gap with no AuthDB (config-file user map, durable "
+          "sessions) does not leave the pre-change session cached (T-R12b)",
+          "[auth][session_store][account_active][cache_epoch][pg]") {
+    // The legacy branch of update_role_checked: users_ is the truth, the account gate is skipped
+    // (no AuthDB), and the session store is still wired. Same gap, same expectation.
+    AcctFx f;
+    auto& a = f.add(/*with_auth_db=*/false);
+    REQUIRE(a.upsert_user("cfguser", "a-sufficiently-long-password-1", Role::user));
+    const auto token = a.create_local_session_for_test("cfguser", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+
+    bool gap_validation_served = false;
+    a.set_between_local_erase_and_wipe_hook_for_test(
+        [&] { gap_validation_served = a.validate_session(token).has_value(); });
+    REQUIRE(a.update_role_checked("cfguser", Role::admin) ==
+            yuzu::server::auth::UpdateRoleOutcome::Updated);
+    a.set_between_local_erase_and_wipe_hook_for_test(nullptr);
+
+    REQUIRE(gap_validation_served);
+    CHECK(f.durable_sessions_of("cfguser") == 0);
+    CHECK_FALSE(a.validate_session(token).has_value());
+}
