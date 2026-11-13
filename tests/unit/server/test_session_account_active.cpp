@@ -673,3 +673,94 @@ TEST_CASE("account gate: a replica that cannot read the generation distrusts its
     CHECK_FALSE(b.validate_session(token).has_value());
     meta_gone.repair();
 }
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Reactivation (#7223): sessions that exist when an account is reactivated are removed first
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("reactivation removes the sessions that existed, and a later sign-in works (T6)",
+          "[auth][session_store][account_active][reactivation][pg]") {
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto old_token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(old_token.empty());
+    REQUIRE(b.validate_session(old_token).has_value()); // warm on both replicas
+    REQUIRE(a.validate_session(old_token).has_value());
+
+    f.deactivate_leaving_session(a, "alice"); // inactive, durable row survives
+
+    // Without the wipe the surviving row would pass the account gate again from here on.
+    REQUIRE(a.reactivate_user("alice"));
+    CHECK(f.durable_sessions_of("alice") == 0);
+    CHECK_FALSE(poll_and_validate(b, old_token).has_value());
+    check_stays_refused(b, old_token);
+    check_stays_refused(a, old_token);
+    auto& c = f.add();
+    CHECK_FALSE(c.validate_session(old_token).has_value());
+
+    // A sign-in that completes after the reactivation is a new sign-in.
+    const auto fresh = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(fresh.empty());
+    CHECK(b.validate_session(fresh).has_value());
+    CHECK(c.validate_session(fresh).has_value());
+}
+
+TEST_CASE("reactivation is refused when the session wipe does not persist (T7)",
+          "[auth][session_store][account_active][reactivation][pg]") {
+    AcctFx f;
+    auto& a = f.add();
+    f.seed_world("alice");
+    REQUIRE_FALSE(a.create_local_session_for_test("alice", Role::user, false).empty());
+    REQUIRE(a.remove_user_checked("alice") == RemoveUserOutcome::Removed);
+
+    const auto active = [&] {
+        auto lease = f.db.pool().acquire();
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(
+            lease.get(), "SELECT 1 FROM auth.users WHERE username = 'alice' AND is_active",
+            std::vector<std::string>{});
+        return PQntuples(r.get()) == 1;
+    };
+    REQUIRE_FALSE(active());
+    {
+        yuzu::test::SessionWipeFault wipe_fault{f.db.pool()};
+        wipe_fault.arm();
+        CHECK_FALSE(a.reactivate_user("alice")); // the SCIM callers answer 500 on false
+        wipe_fault.repair();
+    }
+    CHECK_FALSE(active()); // the account stays inactive
+    CHECK(a.reactivate_user("alice")); // repaired: the retry succeeds
+    CHECK(active());
+}
+
+TEST_CASE("reactivation with a validation in flight: that session is not served afterwards, and "
+          "a sign-in completed after reactivation is accepted (T-R8)",
+          "[auth][session_store][account_active][reactivation][cache_epoch][pg]") {
+    // The "new sign-in" ruling, tested as a decision: a sign-in that finishes after the
+    // reactivation is a new sign-in (reactivation keeps the password, so the caller holds a valid
+    // credential at that moment). Only sessions that EXISTED at reactivation are removed.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+    const auto token = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(b.validate_session(token).has_value()); // warm
+
+    HeldValidation held;
+    held.install(b);
+    held.start([&] { return b.validate_session(token); });
+
+    f.deactivate_leaving_session(a, "alice");
+    CHECK_FALSE(poll_and_validate(b, token).has_value());
+    REQUIRE(a.reactivate_user("alice"));
+
+    CHECK(held.release_and_join().has_value()); // concurrent with the invalidation: served once
+    check_stays_refused(b, token);              // never again, though the account is active
+
+    const auto after = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(after.empty());
+    CHECK(b.validate_session(after).has_value());
+}

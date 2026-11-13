@@ -2289,6 +2289,23 @@ bool AuthManager::reactivate_user(const std::string& username) {
         return false;
     }
 
+    // Wipe-first: sessions that exist when an account is reactivated are removed, so a
+    // session left behind by an earlier deactivation (whose own wipe may not have persisted)
+    // cannot become valid again. A sign-in that completes after the reactivation is a new
+    // sign-in. Local erase, then the durable wipe; if the wipe does not persist the account
+    // stays inactive and the caller retries (invalidate_user is idempotent).
+    {
+        std::unique_lock lock(mu_);
+        std::erase_if(sessions_,
+                      [&](const auto& pair) { return pair.second.username == username; });
+    }
+    if (!wipe_user_sessions_durable(username)) {
+        spdlog::error("AuthManager::reactivate_user: durable session wipe for '{}' failed, "
+                      "leaving the account inactive",
+                      ::yuzu::log_key_token(username));
+        return false;
+    }
+
     // DB write FIRST, outside mu_ — mirrors remove_user/update_role's lock
     // ordering: the durable row is authoritative, the in-memory map is a
     // read-optimization layered on top, never the other way around.
