@@ -5142,7 +5142,7 @@ void RestApiV1::register_routes(
                       mgmt_group_not_found(res);
                       return;
                   }
-                  // Is this a device the server has enrolled? A read, made after the group-exists
+                  // Does the server hold an enrolment record for this id? A read, made after the group-exists
                   // answer and before the `attempted` row. It only FLAGS the id, on the success audit
                   // row; it is never returned (a response field would reveal enrolment status to a
                   // caller whose scope hides the device). An unknown id is accepted (an operator may

@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file mgmt_group_agent_known.hpp
-/// "Is this agent id a device the server has enrolled?", for the add-member surfaces: the REST
+/// "Does the server hold an enrolment record for this agent id?", for the add-member surfaces: the REST
 /// route POST /api/v1/management-groups/{id}/members (rest_api_v1.cpp) and the MCP tool
 /// add_management_group_member (mcp_server.cpp). Both call `lookup_agent_known` and record the
 /// same `agent_known` audit suffix, so the two cannot drift (#7074, #6967).
@@ -13,7 +13,7 @@
 ///
 /// The answer is recorded on the success audit row ONLY. It is NEVER returned in a REST or MCP
 /// response: a response field would tell any ManagementGroup:Write holder whether an arbitrary
-/// agent id is an enrolled device, even one their management-group scope hides, which makes the
+/// agent id has an enrolment record, even one their management-group scope hides, which makes the
 /// route an enrolment-existence oracle. The audit row is read only through AuditLog:Read.
 ///
 /// An unknown id is ACCEPTED, never refused: an operator may stage a membership before the

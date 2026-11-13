@@ -1126,7 +1126,7 @@ static const ToolDef kTools[] = {
      R"j("membership_type":{"type":"string","enum":["static","dynamic"],"default":"static","description":"static = explicit member list via add_management_group_member; dynamic = scope_expression-evaluated"},)j"
      R"j("scope_expression":{"type":"string","maxLength":4096,"description":"Scope DSL expression for a dynamic group; ignored for static"})j"
      R"j(},"required":["name"]})j",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row (success or failure outcome) could not be stored; the group exists"}},"required":["id"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing success row could not be stored; the group exists. A closing failure row that could not be stored is not reported here (no group exists then)"}},"required":["id"]})j"},
 
     {"get_management_group",
      "Get one management group's metadata plus its current member list. #1762: "
@@ -1160,17 +1160,18 @@ static const ToolDef kTools[] = {
      "Add a static member to a management group. Idempotent — adding an agent already in the "
      "group is a no-op. Mirrors POST /api/v1/management-groups/{id}/members. Requires "
      "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
-     "extends the member set, overwrites nothing. An agent id the server has not enrolled is "
-     "still added; whether it has an enrolment record is recorded on the success audit row "
-     "(`agent_known`), not returned. Audit-first: an `attempted` audit row is stored before the "
-     "member is added; if it cannot be stored the call is refused with an internal error "
+     "extends the member set, overwrites nothing. An agent id with no enrolment record "
+     "(pending, approved or denied) is still added; whether it has one is recorded on the "
+     "success audit row (`agent_known`), not returned. Audit-first: an `attempted` audit row is "
+     "stored before the member is added; if it cannot be stored the call is refused with an "
+     "internal error "
      "(retryable) and nothing is added. audit_persisted:false in a success means only the "
      "closing outcome row was lost.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
      R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent to add as a static member"})j"
      R"j(},"required":["group_id","agent_id"]})j",
-     R"j({"type":"object","properties":{"added":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing audit row (success or failure outcome) could not be stored; the member was added"}},"required":["added"]})j"},
+     R"j({"type":"object","properties":{"added":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the closing success row could not be stored; the member was added. A closing failure row that could not be stored is not reported here (nothing was added then)"}},"required":["added"]})j"},
 
     {"list_management_group_roles",
      "List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer "
@@ -14218,7 +14219,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Is this a device the server has enrolled? A read, made after the group-exists
+                // Does the server hold an enrolment record for this id? A read, made after the group-exists
                 // answer and before the `attempted` row. It only FLAGS the id, on the success audit
                 // row; it is never returned. An unknown id is accepted and no lookup outcome
                 // refuses the add. Unreadable is recorded as neither known nor unknown (the REST
