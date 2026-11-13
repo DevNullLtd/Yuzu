@@ -2783,6 +2783,49 @@ and 1.96 to 1.97 at np=2. Shard times show no change from the width beyond the
 about the 12-shard regime, which only the post-merge watch can reach. The
 max_connections and `pg_stat_activity` peak were not measured.
 
+**Push 2d (gateway EUnit shards without cover, three shards, `gateway ct` at
+`priority: 120`).** Three changes to the gateway entries of the Linux cheap-suites
+invocation, made together because each one alone leaves the gateway as that
+invocation's tail. (1) The EUnit shards run with the `test` profile's
+`cover_enabled` false (`gateway/eunit_shard.config.script`; a plain
+`rebar3 eunit --dir` and `gateway ct` keep cover). meck preserves cover data on
+every `meck:new`/`meck:unload` of a cover-compiled module, and the foreach
+fixtures pay that per test: the whole suite took 459 s with cover and 268 s
+without, the same 2807 tests passing, and nothing reads a shard's cover data.
+(2) Three shards instead of two, balanced by weights measured without cover
+(`scripts/gateway_eunit_shards.py`). (3) `gateway ct`, last to finish in all 22
+sampled runs because it had no priority and is defined after every `tests/`
+entry, gets the shards' `priority: 120`, so the four gateway entries start at t=0.
+
+*Baseline.* The concurrent-halves runs (2026-11-10 to -13): shard A 234 s to
+267 s, shard B 191 s to 214 s, `gateway ct` 124 s to 136 s, cheap-suites
+invocation 362 s to 375 s where the log carries per-line timestamps.
+*Expectation (an estimate).* A replay of a four-worker list scheduler in meson's
+priority order, which reproduces two observed baseline walls to within 3 s, gives
+269 s to 279 s with the shards at about 100 s and `gateway ct` at 130 s to 160 s,
+and 290 s to 302 s with the shards at 130 s; the invocation only gets longer than
+today if each shard runs past about 190 s. Local runs, all four entries at once:
+92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average of 20
+to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no priority); a
+priority for it is the next rung. The non-pg half should fall from about 480 s to
+about 390 s to 400 s, which leaves the pg half the longer one.
+*Measurement and rule* are Push 2b's (two same-SHA samples, attempt-specific
+logs), judged on the cheap-suites invocation wall and the non-pg half's wall:
+(a) the invocation median improves by 10% or more; (b) no entry of 5 s or more
+other than the gateway entries takes more than 1.5x its baseline; (c) no entry
+reaches 80% of its own meson timeout, and the EUnit test count stays 2807 across
+the three shards. Windows (Wee Tam) runs the same entries: its
+`agent tsan-heavy checkpoints` barrier (`is_parallel: false`) now waits for C and
+`gateway ct` as well as A and B, which should still be shorter than the two
+covered shards were, but is not measured; read its first runs. Unfiltered nightly
+runs now start `gateway ct` with the shards, after the pg shards. Faster code
+without cover can move a race: watch about five runs per leg for a gateway flake
+and name the module before any re-run. To revert, take the shards back to two in
+the root `meson.build` table and `REQUIRED` in `scripts/ci/assert-gateway-tests.py`,
+delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
+priority; each of the three is separable.
+*Samples.* To be recorded here after the change's own runs.
+
 ### Persistent runner-local test history
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its

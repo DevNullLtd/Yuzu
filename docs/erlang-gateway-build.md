@@ -188,7 +188,9 @@ OFF (the config script below forces the test profile's `cover_enabled` to
 false): meck's cover preservation on every mock of a `src/` module made the
 suite take 459s instead of 268s, and nothing reads a shard's cover data. A
 plain `rebar3 eunit --dir apps/yuzu_gw/test` still runs with cover, so it is
-slower than the shards together. Between them the shards run exactly the module set that
+slower than the shards together.
+
+Between them the shards run exactly the module set that
 `rebar3 eunit --dir apps/yuzu_gw/test` runs, each module in its own test
 process, as under `--dir`. The shard's module list reaches rebar3 through
 `gateway/eunit_shard.config.script` (`REBAR_CONFIG`), not through `--module`,

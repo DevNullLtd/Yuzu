@@ -89,8 +89,9 @@ COVER: a shard runs with the test profile's `cover_enabled` forced to false
   yuzu_gw_heartbeat_binding_tests 43.0s -> 14.4s). Nothing reads a shard's
   cover data (no CI step runs `rebar3 cover` or uploads
   `_build_eunit_*/test/cover`), and no test reads cover state: turning it
-  off only stops instrumenting the code under test, which then runs faster. `gateway ct` keeps cover:
-  measured, it costs ct nothing (103.4s of cases without, 104.0s with).
+  off only stops instrumenting the code under test, which then runs faster.
+  `gateway ct` keeps cover: measured, it costs ct nothing (103.4s of cases
+  without, 104.0s with).
 """
 import os
 import re
