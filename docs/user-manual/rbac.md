@@ -283,8 +283,9 @@ Recommended order for a fresh install:
 > `403` with RBAC off), and a service-scoped token is refused (`403`; the dashboard fragment shows a "You do not have permission to view executions." note at HTTP `200`). A service-scoped
 > token sees on the fragment only executions that touched an in-scope agent: the
 > owner disjunct (a principal's own dispatches) is suppressed for it, because its
-> session username is the account that minted it (the other execution read
-> surfaces still show a minter's executions to a service-scoped token, #5557).
+> session username is the account that minted it. Since #5557 the same holds on
+> every other execution read surface: a service-scoped token sees an execution only
+> once an agent in its service scope has a status row for it, whoever dispatched it.
 > **Exception to
 > the degraded-store sentence above:** a degrade on the Executions panel is NOT a
 > `503` the operator sees. The fragment's own failure notes (tracker or status
@@ -322,8 +323,9 @@ Recommended order for a fresh install:
 > the dashboard `GET /sse/executions/{id}` migrated in the same round. See
 > `docs/auth-architecture.md`'s "Third migration (#1634)" section for the full
 > account, including the residuals it left open (a weaker own-dispatches-only
-> confinement for MCP `list_executions`, since execution rows carry no single
-> `agent_id` to filter by).
+> confinement for MCP `list_executions` for a management-group-confined caller,
+> since execution rows carry no single `agent_id` to filter by; a service-scoped
+> token has been the exception since #5557 and uses the agent-evidence rule).
 
 ## The authorization topology floor (#2376)
 

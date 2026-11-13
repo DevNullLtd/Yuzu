@@ -404,9 +404,13 @@ a confined caller does not pull every agent row of a fleet-wide execution; `exec
 `confined_projection` still do the redaction, and the served result is identical because both
 ignore out-of-scope rows. **Never use a filtered read where the complete cohort is needed**
 (`admit_confined_mutation` must see every agent row to decide a mutation). Service-scoped sessions
-get no owner disjunct on the fragment, because a service-scoped token's session username is its
-minter; the other surfaces that read the disjunct still show a minter's executions to a
-service-scoped token (#5557). Full account: `docs/auth-architecture.md`'s "Sixth migration".
+get no owner disjunct on any execution surface (#5557), because a service-scoped token's session
+username is its minter: every visibility and mutation-admission decision takes its ownership key from
+`execution_owner_key(session)` (`execution_scope_rules.hpp`), which is empty for such a session, so it
+sees an execution only once an agent in its service scope has a status row for it (a row is written
+when an agent's response arrives; the cohort rule above is unchanged). Real dispatch attribution and
+audit identity still use the session's own username. A service scope with no tagged agent is an
+engaged-empty scope and sees nothing. Full account: `docs/auth-architecture.md`'s "Sixth migration".
 
 **#3526 (per-agent execution-statistics rollup):** REST `GET /api/v1/execution-statistics/agents` and
 MCP `get_execution_statistics_by_agent` gate on `fleet_read_fn` and pass the visible set as

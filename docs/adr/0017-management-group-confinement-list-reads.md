@@ -272,8 +272,9 @@ gate.
   replaced with an HTTP 200 note (`data-denied="true"` for a 403, `data-degraded="gate"` for a 503;
   a 401 passes through), because the dashboard drops 4xx/5xx bodies; the REST and MCP twins keep the
   real 403/503. The fragment suppresses the owner disjunct for service-scoped sessions
-  (a service-scoped token's session username is its minter); the other execution read surfaces still show
-  a minter's executions to a service-scoped token (#5557). The fragment pushes the scope into SQL
+  (a service-scoped token's session username is its minter); since #5557 every other execution read
+  surface does too, through the ownership key `execution_owner_key(session)`, so a service-scoped
+  token sees an execution only once an agent in its service scope has a status row for it. The fragment pushes the scope into SQL
   before its LIMIT and bounds the agent-status read to the visible agents; MCP's first gate stays a
   plain `Infrastructure:Read`. **NOT covered, disclosed:** `summarize_working_set` `kind=fleet` and
   `kind=result_set` return the whole-registry agent count from `agents_fn()` (#4753, checklist still
@@ -291,7 +292,8 @@ gate.
   migration (#3789)". The LIST route's confinement predicate is pushed into SQL before `LIMIT`
   (INV-3) via a correlated `EXISTS` over `agent_exec_status` plus an owner disjunct — a real
   visible-agent intersection, not the own-dispatches-only shortcut MCP `list_executions` still uses
-  (`docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
+  for a management-group-confined caller (a service-scoped caller has used the agent-evidence rule
+  since #5557; `docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
   `require_fleet_read(..., "Read")` (the fleet gate is structurally Read-only, INV — see
   `authz_gates.cpp`) and apply a stricter complete-cohort-in-scope rule, not bare visibility, before
   allowing a rerun/cancel. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp`.
