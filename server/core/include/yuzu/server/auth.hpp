@@ -891,6 +891,17 @@ public:
     /// anchor. Production code MUST NOT call this.
     void expire_session_generation_poll_for_test();
 
+    /// TEST-ONLY: installs a callback fired in `validate_session_durable` after the
+    /// session to serve has been obtained (from the cache, or from the store on a
+    /// miss) and before the tail's cache insert, with NO lock held. It lets a test
+    /// hold one validation open while another manager signs the session out or a
+    /// generation poll clears this manager's cache, to prove the late insert is
+    /// dropped. A hook shared by several threads must select its own thread (it also
+    /// fires for the validations the test itself makes). Production code MUST NOT
+    /// call this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default; install it before any concurrent validation starts.
+    void set_validate_pre_cache_hook_for_test(std::function<void()> hook);
+
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
     /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
@@ -1658,6 +1669,11 @@ private:
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;
 
+    /// Backing field for `set_validate_pre_cache_hook_for_test` - see that method's
+    /// doc. Invoked (if set) from `validate_session_durable` only. Same shape/
+    /// lifetime/production-reachability as `role_recheck_race_hook_for_test_` above.
+    std::function<void()> validate_pre_cache_hook_for_test_;
+
     /// #5342: the credential-change query owner (`set_credential_change_owner`).
     /// Borrowed, never owned; null ⇒ no credential writes.
     CredentialChangeOwner* credential_change_owner_{nullptr};
@@ -1783,6 +1799,12 @@ private:
     // store row key too), by the raw token in the legacy in-memory-only mode.
     // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
+    // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
+    // section as every `sessions_.clear()` (the generation poll is the only one).
+    // `validate_session_durable` captures it under its step-1 shared lock and inserts
+    // its session at the tail only if it is unchanged, so a validation that straddles
+    // a clear cannot put the session back (ADR-0012 section 4 guarded-insert rule).
+    mutable std::uint64_t session_cache_epoch_ = 0;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;

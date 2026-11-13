@@ -717,9 +717,13 @@ void AuthManager::maybe_refresh_session_generation() const {
         // The generation moved (a mutation landed, possibly on another replica,
         // or the counter regressed): drop the whole cache so the next lookup
         // re-reads authoritative state. Cleared under mu_, which is never held
-        // together with session_gen_mtx_.
+        // together with session_gen_mtx_. The epoch moves in the SAME critical
+        // section as the clear: a validation that captured the old epoch under its
+        // step-1 shared lock may no longer insert its session (see the tail of
+        // validate_session_durable).
         std::unique_lock lock(mu_);
         sessions_.clear();
+        ++session_cache_epoch_;
     }
 }
 
@@ -1543,6 +1547,10 @@ void AuthManager::expire_session_generation_poll_for_test() {
     last_session_gen_refresh_ms_ = steady_now_ms() - kSessionGenRefreshMs - 1;
 }
 
+void AuthManager::set_validate_pre_cache_hook_for_test(std::function<void()> hook) {
+    validate_pre_cache_hook_for_test_ = std::move(hook);
+}
+
 void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
     role_recheck_race_hook_for_test_ = std::move(hook);
 }
@@ -1772,11 +1780,22 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
     // blocker #2): this bounds how long a revoked/demoted/elevated session can
     // ride a stale cache during a PG brownout to ~kSessionGenStaleServeBoundMs
     // rather than its 8h absolute expiry.
+    //
+    // The cache epoch is captured under this same shared lock, BEFORE any store
+    // read and whether or not the cached entry is used, so it is ordered against
+    // the clear in maybe_refresh_session_generation (which increments it under the
+    // unique lock). The staleness check runs first, outside mu_: it takes
+    // session_gen_mtx_, which is never held together with mu_.
+    const bool cache_trusted = !session_generation_view_stale();
     std::optional<Session> session_copy;
-    if (!session_generation_view_stale()) {
+    std::uint64_t cache_epoch = 0;
+    {
         std::shared_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            session_copy = it->second;
+        cache_epoch = session_cache_epoch_;
+        if (cache_trusted) {
+            if (auto it = sessions_.find(key); it != sessions_.end())
+                session_copy = it->second;
+        }
     }
 
     // 2. Cache miss (or a distrusted stale cache) → authoritative store lookup.
@@ -1888,9 +1907,22 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
             }
         }
     }
+    // TEST-ONLY seam: no lock is held here (it may block, or run a deactivation or
+    // a sign-out on another manager, to straddle the cache clear).
+    if (validate_pre_cache_hook_for_test_)
+        validate_pre_cache_hook_for_test_();
     {
         std::unique_lock wlock(mu_);
-        sessions_[key] = *session_copy;
+        // Insert only if no cache invalidation ran since this validation started
+        // (ADR-0012 section 4 guarded-insert rule). On a mismatch the session is still
+        // returned to THIS caller, whose request is concurrent with the invalidation
+        // and linearises before it, but it is not cached: a refusal here would reject
+        // an unrelated in-flight request on every sign-in anywhere, and a retry would
+        // add a second read for nothing. The next request finds no entry and reads the
+        // authoritative row. The mint insert in persist_new_session is deliberately
+        // unguarded: the post-mint recheck erases this replica's entries on its own.
+        if (session_cache_epoch_ == cache_epoch)
+            sessions_[key] = *session_copy;
     }
     return session_copy;
 }
