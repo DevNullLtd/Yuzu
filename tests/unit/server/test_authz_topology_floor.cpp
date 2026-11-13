@@ -1653,9 +1653,14 @@ TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an u
         DegradedReplica breaker(rig);
         DegradedReplica svc_replica(rig);
         std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gates
+        // Each scenario must still see a FRESH view when it starts (its answer comes from the
+        // starved read, not the stale-view path): on a starved runner the shared wait plus the
+        // earlier scenarios could outlast the 5 s stale bound, and that must fail here, loudly,
+        // rather than pass by the other path.
 
         { // a starved pool
             DegradedReplica& d = starved;
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded());
             auto held = d.pool.acquire();
             REQUIRE(held);
             expect_aware_503(d, ana);
@@ -1663,6 +1668,7 @@ TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an u
         }
         { // an open breaker
             DegradedReplica& d = breaker;
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded());
             auto held = d.pool.acquire();
             REQUIRE(held);
             // Two uncached misses reach the trip threshold.
@@ -1674,6 +1680,7 @@ TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an u
         }
         { // a service-scoped token is unchanged: a degraded read is still a definitive 403
             DegradedReplica& d = svc_replica;
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded());
             auto held = d.pool.acquire();
             REQUIRE(held);
             httplib::Response res;
