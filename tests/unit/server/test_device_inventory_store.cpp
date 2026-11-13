@@ -1263,7 +1263,8 @@ TEST_CASE("DeviceInventoryStore degrades (not empty) on a broken pool", "[device
     auto g = store.get_device_ci("a");
     CHECK(!g.has_value()); // std::unexpected(kDegraded)
     CHECK(g.error() == CiReadError::kDegraded);
-    CHECK(!store.list_device_ci(10).has_value()); // nullopt (degraded), not an empty vector
+    CHECK(!store.list_device_ci_for({"a"}).has_value()); // nullopt (degraded), not an empty vector
+    CHECK(!store.list_device_ci_for({}).has_value());    // a closed store degrades even when nothing was asked
     auto sec = store.get_device_ci_sections("a");
     REQUIRE(!sec.has_value()); // unexpected(kDegraded), never an empty success
     CHECK(sec.error() == CiReadError::kDegraded);
@@ -1355,16 +1356,14 @@ TEST_CASE("DeviceInventoryStore hash-skip ingest round-trip", "[pg][device_ci]")
         CHECK((**r).ram_bytes == "0");
     }
 
-    SECTION("roster list + delete + absent") {
+    SECTION("keyed list + delete + absent") {
         REQUIRE(store.apply_device_ci("agent-d", h, std::optional<DeviceCiRecord>{rec}, 1000) ==
                 InventoryIngestOutcome::kStored);
-        auto roster = store.list_device_ci(100);
+        // "nobody" has no CI row: it is simply absent from the result (not yet synced), not an error.
+        auto roster = store.list_device_ci_for({"agent-d", "nobody"});
         REQUIRE(roster.has_value());
-        bool found = false;
-        for (const auto& d : *roster)
-            if (d.agent_id == "agent-d")
-                found = true;
-        CHECK(found);
+        REQUIRE(roster->size() == 1);
+        CHECK(roster->front().agent_id == "agent-d");
 
         CHECK(store.delete_agent("agent-d")); // committed → true
         auto gone = store.get_device_ci("agent-d");
@@ -2894,5 +2893,112 @@ TEST_CASE("the read-degrade counter tells a failed record read from a failed sec
         REQUIRE_FALSE(got.has_value());
         CHECK(degrades("query_error") == 1.0);
         CHECK(degrades("sections_query_error") == 0.0);
+    }
+}
+
+TEST_CASE("DeviceInventoryStore::list_device_ci_for reads exactly the named agents, at every chunk boundary",
+          "[pg][device_ci][keyed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Seven agents whose hostnames sort in the REVERSE of their ids, so the read's result cannot
+    // depend on the old hostname ordering (#7549: that ordering is what put devices past the cut).
+    constexpr int kAgents = 7;
+    std::vector<std::string> all_ids;
+    for (int i = 0; i < kAgents; ++i) {
+        DeviceCiRecord rec = parse_device_ci_blob(sample_blob());
+        rec.hostname = "host-" + std::to_string(kAgents - i);
+        rec.serial = "SN-" + std::to_string(i);
+        const std::string id = "agent-k" + std::to_string(i);
+        REQUIRE(store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(rec),
+                                      std::optional<DeviceCiRecord>{rec}, 100 + i) ==
+                InventoryIngestOutcome::kStored);
+        all_ids.push_back(id);
+    }
+
+    const auto ids_of = [](const std::vector<DeviceCiRecord>& v) {
+        std::vector<std::string> out;
+        for (const auto& r : v)
+            out.push_back(r.agent_id);
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+
+    // chunk = 3: N = chunk (1 statement), chunk + 1 (2, the last holding one id) and 2 x chunk + 1 (3).
+    for (const std::size_t n : {std::size_t{3}, std::size_t{4}, std::size_t{7}}) {
+        CAPTURE(n);
+        const std::vector<std::string> asked(all_ids.begin(), all_ids.begin() + static_cast<std::ptrdiff_t>(n));
+        auto got = store.list_device_ci_for(asked, {.chunk = 3});
+        REQUIRE(got.has_value());
+        CHECK(ids_of(*got) == asked); // every asked id, none missing, none twice
+    }
+
+    SECTION("only the named agents come back; an unknown id is absent, not an error") {
+        auto got = store.list_device_ci_for({"agent-k5", "no-such-agent", "agent-k1"}, {.chunk = 2});
+        REQUIRE(got.has_value());
+        CHECK(ids_of(*got) == std::vector<std::string>{"agent-k1", "agent-k5"});
+    }
+    SECTION("an empty id list is an empty success and takes no connection") {
+        auto got = store.list_device_ci_for({});
+        REQUIRE(got.has_value());
+        CHECK(got->empty());
+    }
+    SECTION("an id list longer than the table is fine and the record content survives") {
+        auto got = store.list_device_ci_for(all_ids);
+        REQUIRE(got.has_value());
+        REQUIRE(got->size() == static_cast<std::size_t>(kAgents));
+        for (const auto& r : *got)
+            CHECK(r.serial == "SN-" + r.agent_id.substr(std::string("agent-k").size()));
+    }
+}
+
+TEST_CASE("DeviceInventoryStore::list_device_ci_for is all-or-nothing: a spent budget or a failed statement degrades the whole read",
+          "[pg][device_ci][keyed][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    const auto degrades = [&](const char* reason) {
+        return metrics
+            .counter("yuzu_inventory_read_degrade_total",
+                     {{"reason", reason}, {"source", "device_ci"}})
+            .value();
+    };
+
+    std::vector<std::string> ids;
+    for (int i = 0; i < 5; ++i) {
+        DeviceCiRecord rec = parse_device_ci_blob(sample_blob());
+        rec.serial = "SN-B" + std::to_string(i);
+        const std::string id = "agent-b" + std::to_string(i);
+        REQUIRE(store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(rec),
+                                      std::optional<DeviceCiRecord>{rec}, 1 + i) ==
+                InventoryIngestOutcome::kStored);
+        ids.push_back(id);
+    }
+
+    SECTION("budget spent between chunks: nullopt, never the chunks already read") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 2, .budget = std::chrono::milliseconds{0}});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("keyed_read_budget") == 1.0);
+        CHECK(degrades("query_error") == 0.0);
+    }
+    SECTION("the budget is only checked BETWEEN chunks: a single-chunk read always runs") {
+        auto got = store.list_device_ci_for(ids, {.chunk = 10, .budget = std::chrono::milliseconds{0}});
+        REQUIRE(got.has_value());
+        CHECK(got->size() == ids.size());
+        CHECK(degrades("keyed_read_budget") == 0.0);
+    }
+    SECTION("a failed statement is nullopt and counts query_error") {
+        exec_stmt(pool, "ALTER TABLE device_inventory_store.device_ci RENAME COLUMN model TO model_x");
+        auto got = store.list_device_ci_for(ids, {.chunk = 2});
+        CHECK_FALSE(got.has_value());
+        CHECK(degrades("query_error") == 1.0);
+        CHECK(degrades("keyed_read_budget") == 0.0);
     }
 }

@@ -20285,49 +20285,27 @@ private:
                 r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
             }
-            // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
-            // clamped to DeviceInventoryStore's kListRowCap (100k)" per that store's own
-            // limit-clamp contract, not "zero rows" — (symmetric with the capped
-            // offline roster read above, #5712), joined by agent_id via the pure
-            // attach_device_ci (inventory_ci_join.cpp). `out` is the
-            // UNFILTERED roster — confinement is HardwareRoutes' `scoped_roster` on the
-            // FleetReadGate scope, downstream of this join; attach_device_ci only ever
-            // looks up by an agent_id already in `out`, never re-deriving
-            // visibility. A CI-join degrade (nullopt) leaves CI columns
-            // blank; the roster read itself is typed and handled by apply_roster_read above.
-            // KNOWN FOLLOW-UP (#1783 — gov Gate 3 performance + architect + Gate 5 chaos
-            // review): this reads the WHOLE fleet's CI on every render regardless of how
-            // few devices are visible, unlike the Software tab's hourly rollup
-            // (software_catalog_rollup.cpp) which exists specifically to avoid this
-            // read-cadence-vs-write-cadence mismatch for daily-synced data. Deferred rather
-            // than fixed here to keep this PR scoped to dashboard-read enrichment.
-            //
-            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's UI banner and
-            // the REST `ci_degraded` field whether the CI columns above are genuinely
-            // enriched or blank because this join failed/was unwired (the audit row is
-            // emitted regardless) — an unwired store is treated the same as a live failure
-            // (mirrors the Hardware CI record's CiDetailFn contract).
-            if (device_inventory_store_) {
-                auto ci_list = device_inventory_store_->list_device_ci(0);
-                if (ci_list) {
-                    std::unordered_map<std::string, DeviceCiRecord> ci_by_agent;
-                    ci_by_agent.reserve(ci_list->size());
-                    for (auto& rec : *ci_list)
-                        // Safe: pair's members initialize in declaration order (`first`
-                        // before `second`), so the key copies from `rec.agent_id` before
-                        // `std::move(rec)` constructs `second` and leaves `rec` (incl. its
-                        // own .agent_id member) moved-from. Don't read the map VALUE's own
-                        // .agent_id after this, though — it's redundant with (and no longer
-                        // matches) the key; attach_device_ci never does (gov Gate 3
-                        // cpp-expert review).
-                        ci_by_agent.emplace(rec.agent_id, std::move(rec));
-                    attach_device_ci(out, ci_by_agent);
-                } else {
-                    result.ci_degraded = true;
-                }
-            } else {
-                result.ci_degraded = true;
-            }
+            // Device-CI enrichment: ONE read keyed by the roster's own agent ids (#7549), joined by
+            // agent_id via the pure attach_device_ci (inventory_ci_join.cpp). It replaced a
+            // whole-table read ordered by hostname and capped at 100,000 rows, which silently gave
+            // every device past the cut a blank CI. The keyed read is bounded by the roster, which
+            // is itself capped (#5712), so it cannot drop a listed device. It must cover the whole
+            // roster, not just a page: the search haystack, the model/serial sorts and the
+            // CI-coverage KPI all read the CI columns before any paging happens.
+            // `out` is the UNFILTERED roster: confinement is HardwareRoutes' `scoped_roster` on
+            // the FleetReadGate scope, downstream of this join, and the join only ever looks up
+            // an agent_id already in `out`.
+            // `result.ci_degraded` (#1785 review HIGH-1) tells the route's UI banner and the REST
+            // `ci_degraded` field whether the CI columns are genuinely enriched or blank because
+            // this read failed, ran out of its budget or was never wired (the audit row is emitted
+            // regardless) - mirrors the Hardware CI record's CiDetailFn contract.
+            // KNOWN FOLLOW-UP (#1783): the read is still up to roster-size rows per render, unlike
+            // the Software tab's hourly rollup (software_catalog_rollup.cpp).
+            apply_ci_read(result, device_inventory_store_
+                                      ? CiKeyedReadFn{[this](const std::vector<std::string>& ids) {
+                                            return device_inventory_store_->list_device_ci_for(ids);
+                                        }}
+                                      : CiKeyedReadFn{});
             // Round-3 Devices-page merge: agent version/arch (session-sourced,
             // online rows only — an offline row's version/arch come from the
             // endpoint_state v2 columns via the CI-attach step above, not here),

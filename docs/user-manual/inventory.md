@@ -921,7 +921,8 @@ place, **Hardware** and **Software**, each its own page:
   rows, and the KPI counts drawn from them, genuinely narrow to their scope, the same
   confinement class the REST/MCP software-query surfaces use (see above). The roster
   read is audited as `inventory.devices` (unchanged verb, still the behavioural-PII
-  tier). A store-wide CI or Tags read failure shows its own explicit **"CI columns
+  tier). A store-wide CI or Tags read failure (for CI that includes the read running out of its 20-second
+  budget) shows its own explicit **"CI columns
   unavailable"** / **"Tags unavailable"** banner (never silently "no CI"/"no tags") —
   distinct from a single device that simply hasn't synced yet, which still shows a plain
   `—` placeholder in just that cell.
@@ -1173,8 +1174,6 @@ four count tiles carry the `≥` mark.
 
 The roster cap is a display and read cap, not a tested capacity. Above it:
 
-- The Hardware CI columns come from a separate read with its own 100,000-row cap (ordered by
-  hostname), so CI columns can be blank for devices that are listed (#7549).
 - Fleet topology answers `413` above the ceiling and cannot be raised past it (#7550).
 - The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
   the Software page, show only devices inside the capped roster (a host outside it appears as
@@ -1612,7 +1611,11 @@ sync, defeating the hash-skip protocol.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
-  `yuzu_inventory_read_degrade_total{source="device_ci"}`. The store joins
+  `yuzu_inventory_read_degrade_total{source="device_ci"}` (`reason` is `store_not_open`,
+  `pool_acquire_timeout`, `query_error`, `sections_query_error` or `keyed_read_budget`, the Hardware
+  list's CI join giving up between chunks; each series appears on its first occurrence). The Hardware
+  list reads CI only for the devices on its roster, in chunks of 10,000 on one connection, so a
+  listed device is never left without CI by a row cap. The store joins
   `/readyz` + `/healthz`.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`

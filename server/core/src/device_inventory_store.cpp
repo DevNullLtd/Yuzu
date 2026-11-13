@@ -43,14 +43,14 @@ constexpr const char* kStoreName = "device_inventory_store";
 // reads are user-facing dashboard requests and can wait a little longer.
 constexpr std::chrono::milliseconds kIngestAcquireTimeout{500};
 constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
-// Hard cap on roster rows materialised regardless of the caller's `limit`, so the
-// store can never allocate an unbounded result set.
-constexpr int kListRowCap = 100000;
 
 // Read-degrade reason labels (mirror SoftwareInventoryStore / the alert taxonomy).
 constexpr const char* kReasonStoreNotOpen = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
 constexpr const char* kReasonQueryError = "query_error";
+// The keyed list read (`list_device_ci_for`) ran out of its overall budget between chunks (#7549): the
+// whole read is reported degraded rather than returned partial.
+constexpr const char* kReasonKeyedBudget = "keyed_read_budget";
 // A failed read of the v2 per-section statements (the section status SELECT or a per-kind row
 // SELECT) after - or, for the standalone `get_device_ci_sections`, instead of - the record read:
 // kept apart from `query_error` (the record read failed) because the two are answered differently
@@ -717,40 +717,60 @@ DeviceInventoryStore::get_device_ci(std::string_view agent_id) {
     return std::optional<DeviceCiRecord>{std::move(out)};
 }
 
-std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(int limit) {
+std::optional<std::vector<DeviceCiRecord>>
+DeviceInventoryStore::list_device_ci_for(const std::vector<std::string>& agent_ids,
+                                         DeviceCiKeyedReadLimits limits) {
     if (!open_) {
         static DegradeSampler s;
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, s).should_log)
-            spdlog::warn("DeviceInventoryStore: list on a closed store");
+            spdlog::warn("DeviceInventoryStore: keyed list on a closed store");
         return std::nullopt;
     }
+    std::vector<DeviceCiRecord> out;
+    if (agent_ids.empty())
+        return out; // nothing asked, nothing to read: an empty success, no lease taken
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
     if (!lease) {
         static DegradeSampler s;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, s).should_log)
-            spdlog::warn("DeviceInventoryStore: list skipped, no connection in time ({})",
+            spdlog::warn("DeviceInventoryStore: keyed list skipped, no connection in time ({})",
                          pool_.last_error());
         return std::nullopt;
     }
-    int eff = limit > 0 && limit < kListRowCap ? limit : kListRowCap;
+    const std::size_t chunk = limits.chunk > 0 ? limits.chunk : 1;
+    const auto deadline = std::chrono::steady_clock::now() + limits.budget;
     const std::string sql =
         std::string("SELECT ") + kSelectCols +
-        " FROM device_inventory_store.device_ci ORDER BY hostname ASC, agent_id ASC LIMIT $1::bigint";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
-                                       std::vector<std::string>{std::to_string(eff)});
-    if (res.status() != PGRES_TUPLES_OK) {
-        static DegradeSampler s;
-        if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
-            spdlog::warn("DeviceInventoryStore: list failed: {}", PQerrorMessage(lease.get()));
-        return std::nullopt;
-    }
-    const int rows = PQntuples(res.get());
-    std::vector<DeviceCiRecord> out;
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
-        DeviceCiRecord r;
-        fill_record(res.get(), i, r);
-        out.push_back(std::move(r));
+        " FROM device_inventory_store.device_ci WHERE agent_id = ANY($1::text[])";
+    std::vector<std::string_view> views;
+    views.reserve(std::min(chunk, agent_ids.size()));
+    for (std::size_t off = 0; off < agent_ids.size(); off += chunk) {
+        if (off > 0 && std::chrono::steady_clock::now() >= deadline) {
+            static DegradeSampler s;
+            if (note_read_degrade(metrics_, kReasonKeyedBudget, s).should_log)
+                spdlog::warn("DeviceInventoryStore: keyed list abandoned after {} of {} ids, "
+                             "budget {} ms spent",
+                             off, agent_ids.size(), limits.budget.count());
+            return std::nullopt; // never a partial map: an absent row must mean "no CI", not "not read"
+        }
+        const std::size_t end = std::min(off + chunk, agent_ids.size());
+        views.assign(agent_ids.begin() + static_cast<std::ptrdiff_t>(off),
+                     agent_ids.begin() + static_cast<std::ptrdiff_t>(end));
+        pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                           std::vector<std::string>{pg::to_text_array(views)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            static DegradeSampler s;
+            if (note_read_degrade(metrics_, kReasonQueryError, s).should_log)
+                spdlog::warn("DeviceInventoryStore: keyed list failed: {}", PQerrorMessage(lease.get()));
+            return std::nullopt;
+        }
+        const int rows = PQntuples(res.get());
+        out.reserve(out.size() + static_cast<std::size_t>(rows));
+        for (int i = 0; i < rows; ++i) {
+            DeviceCiRecord r;
+            fill_record(res.get(), i, r);
+            out.push_back(std::move(r));
+        }
     }
     return out;
 }
