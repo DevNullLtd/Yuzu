@@ -351,17 +351,13 @@ struct Call {
     nlohmann::json body;
 };
 
-/// One audit row as the route's `audit_fn` saw it, with the principal resolved from the request's
-/// REAL session exactly as server.cpp's audit sink does (never from the mutation request).
+/// One audit row as the route's `audit_fn` saw it. The principal is deliberately not recorded:
+/// resolving it from the request here would only re-test the harness, not the handler. The
+/// attribution evidence is the mutation ports' `cancel_users` / `rerun_users` and the rerun
+/// records' `dispatched_by`.
 struct SeenAudit {
-    std::string action, result, target, principal;
+    std::string action, result, target;
 };
-
-SeenAudit capture(const ExecutionOwnerRig& r, const httplib::Request& req,
-                  const std::string& action, const std::string& result, const std::string& target) {
-    auto s = r.auth->resolve_session(req);
-    return {action, result, target, s ? s->username : std::string("<none>")};
-}
 
 /// Wraps the real tracker ports; counts and records every MUTATION port call.
 struct CountingPorts {
@@ -408,10 +404,10 @@ struct RestV1Mutations {
     RestV1Mutations(ExecutionOwnerRig& rig, ExecutionOwnerRig::PermFn perm)
         : r(rig), counting(rig.tracker) {
         api.set_execution_mutation_ports_for_test(counting.ports());
-        auto audit_fn = [this](const httplib::Request& req, const std::string& a,
+        auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& res, const std::string&,
                                const std::string& target, const std::string&) -> bool {
-            audits.push_back(capture(r, req, a, res, target));
+            audits.push_back({a, res, target});
             return true;
         };
         api.register_routes(sink, r.auth_fn(), std::move(perm), audit_fn,
@@ -475,10 +471,10 @@ struct LegacyMutations {
         d.perm_fn = std::move(perm);
         d.fleet_read_fn = r.fleet_read_fn();
         d.resolve_session_fn = r.resolve_session_fn();
-        d.audit_fn = [this](const httplib::Request& req, const std::string& a,
+        d.audit_fn = [this](const httplib::Request&, const std::string& a,
                             const std::string& res, const std::string&, const std::string& target,
                             const std::string&) {
-            audits.push_back(capture(r, req, a, res, target));
+            audits.push_back({a, res, target});
             return true;
         };
         d.emit_event_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
@@ -538,12 +534,12 @@ TEST_CASE("mutation owner key REST v1: a service-scoped session cannot mutate by
         CHECK(rerun_dispatchers(r, id).empty());
     }
     CHECK(api.counting.effects() == 0); // the refusals never reached a mutation port
-    // Every refusal is audited under the REAL principal (the minter), never under a key.
+    // Every refusal is audited as denied. (Attribution to the real principal is asserted where
+    // it is observable: the mutation ports' `cancel_users` / `rerun_users` and the rerun
+    // records' `dispatched_by`; the sink's own principal resolution is the harness's.)
     REQUIRE(api.audits.size() == 6);
-    for (const auto& a : api.audits) {
+    for (const auto& a : api.audits)
         CHECK(a.result == "denied");
-        CHECK(a.principal == "mina");
-    }
     CHECK(api.audits[0].action == "execution.cancel");
     CHECK(api.audits[1].action == "execution.rerun");
 }
@@ -570,10 +566,8 @@ TEST_CASE("mutation owner key REST v1: a service-scoped session mutates a comple
     CHECK(api.counting.rerun_users == std::vector<std::string>{"mina"});
     CHECK(rerun_dispatchers(r, r.ids.in_a) == std::vector<std::string>{"mina"});
 
-    // The audit trail names the real principal on every row.
+    // Every mutation wrote its audit row (the real principal is asserted on the port users above).
     REQUIRE_FALSE(api.audits.empty());
-    for (const auto& a : api.audits)
-        CHECK(a.principal == "mina");
 }
 
 TEST_CASE("mutation owner key REST v1: a non-service session of the same human keeps the owner "
@@ -652,10 +646,8 @@ TEST_CASE("mutation owner key legacy: a service-scoped session cannot mutate by 
         CHECK(rerun_dispatchers(r, id).empty());
     }
     REQUIRE(api.audits.size() == 6);
-    for (const auto& a : api.audits) {
+    for (const auto& a : api.audits)
         CHECK(a.result == "denied");
-        CHECK(a.principal == "mina"); // the REAL principal, not the key
-    }
     CHECK(api.audits[0].action == "execution.cancel");
     CHECK(api.audits[1].action == "execution.rerun");
 
@@ -684,8 +676,7 @@ TEST_CASE("mutation owner key legacy: a non-service session of the same human ke
     CHECK(api.rerun(r.ids.empty_pending, bob).status == 404);
     CHECK(is_2xx(api.rerun(r.ids.bob_pending, bob).status));
     CHECK(rerun_dispatchers(r, r.ids.bob_pending) == std::vector<std::string>{"bob"});
-    for (const auto& a : api.audits)
-        CHECK(a.principal == "bob");
+    REQUIRE_FALSE(api.audits.empty());
 }
 
 TEST_CASE("mutation owner key legacy: RBAC off refuses a service-scoped session",

@@ -42,6 +42,9 @@ public:
         metrics_ = &metrics;
     }
     ~OwnerEngineCreds() {
+        // The rig outlives this and `metrics` outlives the rig, but do not leave a registry
+        // pointer in the shared AuthManager that this object installed.
+        r_.auth_mgr.set_metrics_registry(nullptr);
         r_.api_tokens->set_engine_referent_check({});
         r_.auth->set_engine_principal_store(nullptr);
     }

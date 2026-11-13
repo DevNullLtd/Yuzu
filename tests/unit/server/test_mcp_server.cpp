@@ -53785,6 +53785,56 @@ TEST_CASE("MCP execution tools: summarize_working_set kind=execution keys on the
     CHECK(bob_other->body.find("was not found") != std::string::npos);
 }
 
+// The MCP twin of the REST/legacy permit-all cases in test_execution_mutation_owner_key.cpp: the
+// per-tool Execute / Infrastructure permission check is replaced by a permit-all, so the ONLY thing
+// between a service-scoped token and the mutation handlers (and the execution branch of
+// summarize_working_set) is the C8 service-scope default-deny. The handlers also key on
+// `execution_owner_key(*session)`, but that layer sits behind this one and is not separately
+// reachable from a service-scoped session, so a revert of those three conversions is NOT
+// observable here: this pins the outer layer (refused, no mutation port called, tracker unchanged).
+TEST_CASE("MCP execution tools: past a permit-all permission check a service-scoped token is "
+          "still refused by the default-deny on cancel, rerun and summarize",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.real_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                  const std::string&) { return true; };
+    const auto real_ports = yuzu::server::make_tracker_mutation_ports(&r.tracker);
+    int effects = 0;
+    auto ports = real_ports;
+    ports.mark_cancelled = [&](const std::string& id, const std::string& user) {
+        ++effects;
+        return real_ports.mark_cancelled(id, user);
+    };
+    ports.create_rerun = [&](const std::string& id, const std::string& user, bool failed_only) {
+        ++effects;
+        return real_ports.create_rerun(id, user, failed_only);
+    };
+    ts.execution_mutation_ports_for_test = ports;
+    ts.start("readonly");
+
+    const auto before = r.tracker.get_execution(r.ids.minter_pending);
+    REQUIRE(before.has_value());
+    const std::string id_arg = R"({"execution_id":")" + r.ids.minter_pending + R"("})";
+    for (const auto& [tool, args] : std::vector<std::pair<std::string, std::string>>{
+             {"cancel_execution", id_arg},
+             {"record_execution_rerun", id_arg},
+             {"summarize_working_set",
+              R"({"kind":"execution","id":")" + r.ids.minter_pending + R"("})"}}) {
+        INFO(tool);
+        const auto res = mcp_tool_as(ts, r.creds.mcp_svc_a, tool, args);
+        REQUIRE(mcp_is_error(res));
+        CHECK(mcp_error_message(res) == "service-scoped tokens cannot call this tool");
+        CHECK(res->body.find(r.ids.minter_pending + " is running") == std::string::npos);
+    }
+    CHECK(effects == 0); // neither mutation port was called
+    const auto after = r.tracker.get_execution(r.ids.minter_pending);
+    REQUIRE(after.has_value());
+    CHECK(after->status == before->status);
+}
+
 // #5557 D-E: a corrupted service-scoped ENGINE credential gets no unrestricted list_executions.
 // Through the real-session seam, so the production admission and the real fleet-read gate decide.
 namespace {

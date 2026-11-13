@@ -196,8 +196,8 @@ TEST_CASE("owner dashboard: the detail fragment serves the in-scope ids and hide
     CHECK(attr_values(D.detail(id.run, a).body, "data-agent-id") == Ids{"a1", "a2"});
     CHECK(attr_values(D.detail(id.mixed, a).body, "data-agent-id") == Ids{"a1"});
     CHECK_FALSE(has(D.detail(id.mixed, a).body, "SECRET-B-ERR"));
-    // The selected-execution panel of the executions page projects the same counts.
-    // Quoted, so a random hex execution id that happens to contain "b1" cannot match.
+    // No out-of-scope agent id reaches the panel. (The panel's agent counts are not asserted
+    // here.) Quoted, so a random hex execution id that happens to contain "b1" cannot match.
     CHECK(D.detail(id.run, a).body.find("\"b1\"") == std::string::npos);
 
     // Hidden: the minter's rows and a foreign one answer like a never-existing id, with one
@@ -235,7 +235,7 @@ TEST_CASE("owner dashboard: the detail fragment serves the in-scope ids and hide
     // the gate, which is not a 404.
     for (const auto& any : r.all_seeded_ids())
         CHECK(D.detail(any, ExecutionOwnerRig::bearer(r.creds.svc_none)).status == 404);
-    CHECK(D.detail(id.in_a, ExecutionOwnerRig::bearer(r.creds.dan)).status != 200);
+    CHECK(D.detail(id.in_a, ExecutionOwnerRig::bearer(r.creds.dan)).status == 403);
 }
 
 TEST_CASE("owner dashboard: RBAC off refuses a service-scoped token; a degraded tracker is a 503",
@@ -258,7 +258,7 @@ TEST_CASE("owner dashboard: RBAC off refuses a service-scoped token; a degraded 
     CHECK(svc.status == 200);
     CHECK(has(svc.body, "data-denied=\"true\""));
     CHECK(attr_values(svc.body, "data-execution-id").empty());
-    CHECK(D.detail(r.ids.minter_out, ExecutionOwnerRig::bearer(r.creds.svc_a)).status != 200);
+    CHECK(D.detail(r.ids.minter_out, ExecutionOwnerRig::bearer(r.creds.svc_a)).status == 403);
     // A non-service session of the same human is unconfined, as before.
     CHECK(D.detail(r.ids.minter_out, ExecutionOwnerRig::bearer(r.creds.mina)).status == 200);
 }
@@ -296,7 +296,7 @@ TEST_CASE("owner dashboard: /sse/executions/{id} attach, replay and live events 
     CHECK(attach(id.bob_pending, ExecutionOwnerRig::bearer(r.creds.bob))->status == 200);
     CHECK(attach(id.bob_pending, ExecutionOwnerRig::bearer(r.creds.svc_bob_a))->status == 404);
     CHECK(attach(id.run, ExecutionOwnerRig::bearer(r.creds.svc_none))->status == 404);
-    CHECK(attach(id.run, ExecutionOwnerRig::bearer(r.creds.dan))->status != 200);
+    CHECK(attach(id.run, ExecutionOwnerRig::bearer(r.creds.dan))->status == 403);
 
     // Buffered replay: three transitions and a progress event are published BEFORE the attach.
     bus.publish(id.run, "agent-transition", R"({"agent_id":"a1","status":"running"})", false);

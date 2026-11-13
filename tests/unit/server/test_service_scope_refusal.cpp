@@ -103,6 +103,8 @@ void check_plugin_config_list_read(bool rbac_on) {
     // store, past the gate) and refused as today when it is off (engines are RBAC-only).
     const auto control = L.get(ctl);
     CHECK(control->status == (rbac_on ? 503 : 403));
+    if (rbac_on) // the ROUTE's null-store 503, not a gate 503 ("authorization store unavailable")
+        CHECK(control->body.find("plugin config store unavailable") != std::string::npos);
     CHECK(e.refused_total() == 0.0);
     CHECK(corrupted_rows() == 0);
 

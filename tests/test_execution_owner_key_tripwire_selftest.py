@@ -231,6 +231,23 @@ def main() -> int:
     must_fail("a mutation owner taken from the raw username", t.check_mutation_requests,
               mutate(files, "rest_api_v1.cpp", "mreq.owner = execution_owner_key(*session);",
                      "mreq.owner = session->username;"), "CHECK 5")
+    # The three MCP conversions (cancel, rerun, summarize) sit behind the C8 default-deny and have no
+    # behavioural twin that can reach them with a service-scoped session, so this is their guard.
+    for nth, what in ((0, "MCP cancel_execution"), (1, "MCP record_execution_rerun")):
+        text = files[S + "mcp_server.cpp"]
+        needle = "mreq.owner = execution_owner_key(*session);"
+        at = -1
+        for _ in range(nth + 1):
+            at = text.index(needle, at + 1)
+        must_fail(f"{what} mutation owner reverted to the raw username", t.check_mutation_requests,
+                  {**files, S + "mcp_server.cpp": text[:at] + "mreq.owner = session->username;" +
+                   text[at + len(needle):]}, "CHECK 5")
+    must_fail("MCP summarize_working_set execution_visible fed the raw username", t.check_predicate_calls,
+              mutate(files, "mcp_server.cpp",
+                     "execution_visible(*exec, exec_agents, gate.scope,\n"
+                     "                                                  execution_owner_key(*session))",
+                     "execution_visible(*exec, exec_agents, gate.scope,\n"
+                     "                                                  session->username)"), "CHECK 4")
     must_fail("a mutation username taken from the owner key", t.check_mutation_requests,
               mutate(files, "rest_api_v1.cpp", "mreq.username = session->username;",
                      "mreq.username = owner;"), "CHECK 5")
@@ -374,6 +391,17 @@ def main() -> int:
     must_fail("the funnel without its postcondition", t.check_gates,
               mutate(files, "authz_gates.cpp", r"if \(!authz::service_scope_authority_ok\(session, scope\)\) \{",
                      "if (false) {", regex=True), "CHECK 8")
+
+    must_fail("the counter seed call deleted from server.cpp", t.check_gates,
+              mutate(files, "server.cpp", "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);", ""),
+              "CHECK 8")
+    must_fail("the counter seed call only commented out in server.cpp", t.check_gates,
+              mutate(files, "server.cpp", "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);",
+                     "// authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);"), "CHECK 8")
+    must_fail("the counter seed called a second time", t.check_gates,
+              mutate(files, "server.cpp", "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);",
+                     "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);\n"
+                     "        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);"), "CHECK 8")
 
     # ---- the frozen lists are load-bearing: a stale entry fails ------------------------------
     for name, table, key, value in (

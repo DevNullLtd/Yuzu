@@ -104,6 +104,10 @@ TEST_CASE("execution_owner_key: an engine session keeps its principal; a corrupt
 
 TEST_CASE("execution_owner_key: an empty username owns nothing, even an empty dispatched_by",
           "[execution][owner_key][5557]") {
+    // The detail, events, SSE and get_execution_status ownership compares used to carry an
+    // unguarded "empty username owns an empty dispatched_by" admit; every one of them now goes
+    // through this key, which owns nothing. Unreachable in production (session creation rejects
+    // an empty username), pinned here so the compare cannot quietly come back.
     const auto key = execution_owner_key(make_session(""));
     CHECK(key.empty());
     CHECK_FALSE(key.owns(dispatched_by("")));

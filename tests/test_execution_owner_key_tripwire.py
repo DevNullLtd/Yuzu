@@ -55,7 +55,8 @@ CHECK 8 (gates). In `AuthRoutes::require_fleet_read` and `AuthRoutes::require_li
   wrapper and the ONLY caller of `require_list_read_unchecked`, running the postcondition;
   `service_scope_authority_ok` and `refuse_service_scoped_unrestricted` are each DEFINED once under
   server/; `admit_fleet_read` is the only place a `ListAuthority` is constructed, and it runs the
-  postcondition first. The postconditions are pinned FAIL-CLOSED: `admit_fleet_read` returns
+  postcondition first. `seed_service_scope_unrestricted_refusal_metrics(` is called exactly once, from
+  server.cpp (the counter family exists on a healthy server). The postconditions are pinned FAIL-CLOSED: `admit_fleet_read` returns
   `InvariantViolated` straight after its refusal, and the `require_list_read` wrapper refuses an admit
   that carries no session, un-admits the gate and drops its scope.
 
@@ -96,6 +97,7 @@ MUTATION_HPP = _SRC + "execution_mutation.hpp"
 MUTATION_CPP = _SRC + "execution_mutation.cpp"
 GATES_CPP = _SRC + "authz_gates.cpp"
 AUTH_ROUTES_CPP = _SRC + "auth_routes.cpp"
+SERVER_CPP = _SRC + "server.cpp"
 
 _SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
 
@@ -1208,6 +1210,17 @@ def check_gates(files: dict[str, str]) -> list[str]:
                 errs.append("CHECK 8: the postcondition block of AuthRoutes::admit_fleet_read must END with "
                             "refuse_service_scoped_unrestricted(... kFleetRead, kPostcondition); "
                             "return std::unexpected(GateFailure::InvariantViolated);")
+
+    # The refusal counter's four zero-seeded series exist only if server.cpp seeds them at start
+    # (nothing else would, and a missing family makes `increase()` blind to the first refusal):
+    # exactly ONE call, in server.cpp, beside the definition in authz_gates.cpp / declaration in
+    # authz_gates.hpp. Lexical: it proves the call is present, not that it is reached.
+    seed_calls = [rel for rel, sc in _each(files, "seed_service_scope_unrestricted_refusal_metrics")
+                  if rel not in (GATES_CPP, _SRC + "authz_gates.hpp")
+                  for _m in re.finditer(r"\bseed_service_scope_unrestricted_refusal_metrics\s*\(", sc.masked)]
+    if seed_calls != [SERVER_CPP]:
+        errs.append(f"CHECK 8: seed_service_scope_unrestricted_refusal_metrics( must be called exactly "
+                    f"once under server/, from {SERVER_CPP}; found {seed_calls}")
     return errs
 
 
