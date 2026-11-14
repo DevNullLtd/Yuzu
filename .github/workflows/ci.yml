@@ -1833,7 +1833,7 @@ jobs:
             # runner has its own Postgres container, so the checkpoint FILE_COPY
             # forces stays inside this job's cluster. Needs PostgreSQL 15+, and
             # is only a gain with fsync off, as ensure-postgres.sh's Docker
-            # cluster runs (on an fsync-on cluster each clone measured ~9x slower).
+            # cluster runs (with fsync on, each clone measured ~9x slower).
             # Revert: `git revert -m 1` the merge commit of the PR that added
             # this line (the step's contract test and the leak warning above
             # change with it). YUZU_CI_SEQUENTIAL_HALVES=1 does not undo it.
