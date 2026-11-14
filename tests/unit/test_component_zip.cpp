@@ -262,6 +262,39 @@ TEST_CASE("zip: more declared entries than records is truncated", "[component_zi
     CHECK(r.error() == ZipError::truncated);
 }
 
+TEST_CASE("zip: a directory with bytes past its declared records is refused", "[component_zip]") {
+    SECTION("fewer declared entries than records") {
+        const auto b = build({{"a", 0, ""}, {"b", 0, ""}});
+        int visited = 0;
+        auto r = for_each_central_entry(view(b.file, b.cd_off, b.cd_size), 1, [&](const ZipEntry&) {
+            ++visited;
+            return true;
+        });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ZipError::bad_record);
+        CHECK(visited == 1); // returned after the declared records were visited
+    }
+    SECTION("no declared entries over a directory that holds one") {
+        const auto b = build({{"a", 0, ""}});
+        int visited = 0;
+        auto r = for_each_central_entry(view(b.file, b.cd_off, b.cd_size), 0, [&](const ZipEntry&) {
+            ++visited;
+            return true;
+        });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ZipError::bad_record);
+        CHECK(visited == 0);
+    }
+    SECTION("stray bytes after the last record") {
+        Bytes cd;
+        put_central(cd, Item{"a", 0, ""}, 0);
+        cd.insert(cd.end(), 3, std::byte{0});
+        auto r = for_each_central_entry(cd, 1, [](const ZipEntry&) { return true; });
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ZipError::bad_record);
+    }
+}
+
 TEST_CASE("zip: ZIP64 markers are refused", "[component_zip]") {
     SECTION("sentinel cd_offset") {
         Bytes f;

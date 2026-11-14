@@ -24,6 +24,13 @@
  * ZipFile does: ZipTail::cd_offset is already absolute, and the local header
  * of an entry is at tail.prefix + entry.local_header_offset.
  *
+ * The end record's entry count and the directory's length must agree. A
+ * reader that walks the directory by its length (Python's zipfile does)
+ * still sees every record, so a count lowered below the records really
+ * present would hide entries from this reader that such a reader loads.
+ * for_each_central_entry() refuses that directory; it never lists a part
+ * of it as the whole.
+ *
  * ZIP64, multi-disk archives and encrypted entries are refused, never
  * guessed at; the caller reports the archive as not enumerated.
  */
@@ -167,8 +174,14 @@ inline std::expected<ZipTail, ZipError> find_central_directory(std::span<const s
 
 /**
  * Visit exactly `declared_entries` central-directory records, one at a time.
- * on_entry(const ZipEntry&) returns false to stop early without an error.
- * Fewer records than declared is `truncated`. ZipEntry::name points into `cd`.
+ * `cd` must be the whole directory (ZipTail::cd_size bytes) and the count
+ * must account for all of it: fewer records than declared is `truncated`;
+ * any byte left after the last declared record (more records than the end
+ * record counts, or stray bytes) is `bad_record`. That error is returned
+ * after the declared records were visited, so a caller discards what it
+ * collected on any error. on_entry(const ZipEntry&) returns false to stop
+ * early without an error (the rest of the directory is then not checked).
+ * ZipEntry::name points into `cd`.
  */
 template <typename Fn>
 std::expected<void, ZipError> for_each_central_entry(std::span<const std::byte> cd,
@@ -219,6 +232,10 @@ std::expected<void, ZipError> for_each_central_entry(std::span<const std::byte> 
 
         pos += kCentralHeaderLen + name_len + extra_len + comment_len;
     }
+    // Every directory byte must belong to a declared record. A directory
+    // whose count is short of its records is refused, not recounted.
+    if (pos != cd.size())
+        return std::unexpected(ZipError::bad_record);
     return {};
 }
 
