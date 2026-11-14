@@ -30,6 +30,7 @@
 /// `end_of_support`; else any resolved date -> `supported`; no date at all -> `unknown`, never
 /// `supported`. Dates are `YYYY-MM-DD` text, compared lexicographically.
 
+#include "model_param_helpers.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <algorithm>
@@ -235,18 +236,8 @@ parse_lifecycle_rules_csv(std::string_view text, LifecycleSource source) {
             header_seen = true;
             continue;
         }
-        std::array<std::string_view, 5> f{};
-        std::size_t n = 0;
-        for (std::string_view rest = line;; ) {
-            const auto c = rest.find(',');
-            if (n == f.size())
-                return fail("expected 5 columns");
-            f[n++] = rest.substr(0, c);
-            if (c == std::string_view::npos)
-                break;
-            rest.remove_prefix(c + 1);
-        }
-        if (n != f.size())
+        const auto f = model_detail::split(line, ',');
+        if (f.size() != 5)
             return fail("expected 5 columns");
         const auto ev = parse_lifecycle_event(f[2]);
         if (!ev)

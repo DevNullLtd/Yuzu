@@ -86,14 +86,13 @@ std::int64_t cell_i64(const pg::PgResult& res, int row, int col) {
 constexpr const char* kReadFamily = "yuzu_server_software_lifecycle_store_read_degrade_total";
 constexpr const char* kWriteFamily = "yuzu_server_software_lifecycle_store_write_degrade_total";
 
-/// Count a degrade on `family` and report whether this occurrence should be logged (the first of
-/// each kind of path, then every 100th). Reads and writes sample independently.
+/// Count a degrade on `family` and report whether this occurrence should be logged: the first
+/// degrade and every 100th after it. The counters are exact per family and reason; only the log
+/// sampling shares one counter.
 bool note_degrade(yuzu::MetricsRegistry* metrics, const char* family, const char* reason) {
-    static std::atomic<std::uint64_t> read_n{0};
-    static std::atomic<std::uint64_t> write_n{0};
+    static std::atomic<std::uint64_t> n{0};
     if (metrics)
         metrics->counter(family, {{"reason", reason}}).increment();
-    auto& n = family == kReadFamily ? read_n : write_n;
     return (n.fetch_add(1, std::memory_order_relaxed) % kLogSample) == 0;
 }
 
