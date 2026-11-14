@@ -5,6 +5,7 @@
 /// no store scan for non-admins. Every closure is a fake; nothing spawns or sleeps.
 
 #include "home_routes.hpp"
+#include "offline_endpoint_types.hpp" // kOfflineRosterRowCap
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -602,27 +603,33 @@ TEST_CASE("summary: a scoped caller never touches the estate seam", "[home][rout
     CHECK(estate_calls == 0);
 }
 
-// Kills: a scoped caller's capped roster presented as an exact count (PLAN section 2:
-// "bounded at 100k and labelled"). Below the cap the figure stays exact.
-TEST_CASE("summary: a scoped roster read at the row cap is labelled a lower bound",
-          "[home][route]") {
-    auto render = [](std::size_t n) {
+// Kills: a scoped caller's truncated roster presented as an exact count (PLAN section 2:
+// "bounded at 100k and labelled"), and the label being inferred from a row COUNT: a fleet of
+// exactly the cap is a complete read and stays exact. #5712: the label is the store's typed bit.
+TEST_CASE("summary: a scoped roster read flagged truncated is labelled a lower bound",
+          "[home][route][roster_truncated]") {
+    auto render = [](std::size_t n, bool truncated) {
         HomeHarness h;
         h.scope = std::unordered_set<std::string>{"a", "b"};
         h.roster.rows.assign(n, row("z", "linux", true));
         h.roster.rows[0] = row("a", "windows", true);
         h.roster.rows[1] = row("b", "linux", false, true);
+        h.roster.roster_truncated = truncated;
         auto out = h.sink.Get("/fragments/dashboard/summary");
         REQUIRE(out);
         return out->body;
     };
-    const std::string capped = render(kRosterReadCap);
-    CHECK(has(capped, "<div class=\"v\">at least 1</div>"));
-    CHECK(has(capped, "of at least 2 seen in the last 30 days"));
-    CHECK(has(capped, "At least 1 device has not reported for 2 days or more"));
-    const std::string exact = render(kRosterReadCap - 1);
+    const std::string flagged = render(3, /*truncated=*/true);
+    CHECK(has(flagged, "<div class=\"v\">at least 1</div>"));
+    CHECK(has(flagged, "of at least 2 seen in the last 30 days"));
+    CHECK(has(flagged, "At least 1 device has not reported for 2 days or more"));
+    const std::string exact = render(3, /*truncated=*/false);
     CHECK(has(exact, "of 2 seen in the last 30 days"));
     CHECK_FALSE(has(exact, "at least"));
+    // Exactly the cap, NOT flagged: complete and exact (the old row-count heuristic called this partial).
+    const std::string at_cap = render(static_cast<std::size_t>(kOfflineRosterRowCap), /*truncated=*/false);
+    CHECK(has(at_cap, "of 2 seen in the last 30 days"));
+    CHECK_FALSE(has(at_cap, "at least"));
 }
 
 // ── degrade ───────────────────────────────────────────────────────────────
