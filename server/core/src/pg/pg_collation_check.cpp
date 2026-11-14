@@ -89,12 +89,11 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
             }
             // pg_database.datcollversion exists from PostgreSQL 15. Naming a missing column is a
             // parse error, so look the column up first and only then select it.
-            PgResult col = exec_params(
-                c,
-                "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
-                "WHERE attrelid = 'pg_catalog.pg_database'::regclass "
-                "AND attname = 'datcollversion' AND NOT attisdropped)",
-                std::vector<std::string>{});
+            PgResult col = exec_params(c,
+                                       "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+                                       "WHERE attrelid = 'pg_catalog.pg_database'::regclass "
+                                       "AND attname = 'datcollversion' AND NOT attisdropped)",
+                                       std::vector<std::string>{});
             if (col.status() != PGRES_TUPLES_OK || PQntuples(col.get()) != 1) {
                 failure = PQerrorMessage(c);
                 return false;
@@ -104,12 +103,12 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
                 facts_read = true;
                 return true;
             }
-            PgResult row = exec_params(
-                c,
-                "SELECT current_database(), d.datcollversion, "
-                "pg_catalog.pg_database_collation_actual_version(d.oid) "
-                "FROM pg_catalog.pg_database d WHERE d.datname = current_database()",
-                std::vector<std::string>{});
+            PgResult row =
+                exec_params(c,
+                            "SELECT current_database(), d.datcollversion, "
+                            "pg_catalog.pg_database_collation_actual_version(d.oid) "
+                            "FROM pg_catalog.pg_database d WHERE d.datname = current_database()",
+                            std::vector<std::string>{});
             if (row.status() != PGRES_TUPLES_OK || PQntuples(row.get()) != 1) {
                 failure = row.status() != PGRES_TUPLES_OK
                               ? std::string(PQerrorMessage(c))
@@ -139,14 +138,12 @@ CollationReport check_collation_version(PgPool& pool) noexcept {
         // is noexcept, so the verdict above is the part that must survive.
         try {
             out.failure = e.what();
-        } catch (...) {
-        }
+        } catch (...) {}
     } catch (...) {
         out.verdict = CollationVerdict::Unreadable;
         try {
             out.failure = "unknown exception";
-        } catch (...) {
-        }
+        } catch (...) {}
     }
     return out;
 }
@@ -254,17 +251,19 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
                 "rows. Remedy, in this order: connect to that database; reindex it (REINDEX "
                 "DATABASE CONCURRENTLY {} on a server that is serving traffic, or REINDEX DATABASE "
                 "{} with the Yuzu servers stopped); run ALTER DATABASE {} REFRESH COLLATION "
-                "VERSION (only once the reindex has finished for every index). The server checks again every minute while this stands, so this clears "
+                "VERSION (only once the reindex has finished for every index). The server checks "
+                "again every minute while this stands, so this clears "
                 "without a restart.{} See docs/user-manual/server-admin.md, 'PostgreSQL collation "
                 "version'. The server keeps running.",
                 db, ::yuzu::log_key_token(report.recorded), ::yuzu::log_key_token(report.actual),
                 quoted, quoted, quoted, name_note);
             break;
         case LogAction::WarnUnreadable:
-            spdlog::warn("[PG] could not check the database collation version (continuing; the "
-                         "check is repeated every minute until one concludes, and this is logged once "
-                         "per spell): {}",
-                         ::yuzu::log_key_token(report.failure));
+            spdlog::warn(
+                "[PG] could not check the database collation version (continuing; the "
+                "check is repeated every minute until one concludes, and this is logged once "
+                "per spell): {}",
+                ::yuzu::log_key_token(report.failure));
             break;
         case LogAction::InfoMismatchNoLongerApplies:
             spdlog::info("[PG] database '{}': the earlier collation version mismatch no longer "
@@ -273,8 +272,9 @@ void report_collation_check(const CollationReport& report, yuzu::MetricsRegistry
                          db);
             break;
         case LogAction::InfoNotApplicable:
-            spdlog::info("[PG] database collation version check not applicable (no recorded version, or "
-                         "PostgreSQL before 15); the mismatch gauge has no series");
+            spdlog::info(
+                "[PG] database collation version check not applicable (no recorded version, or "
+                "PostgreSQL before 15); the mismatch gauge has no series");
             break;
         }
         state = step.next;

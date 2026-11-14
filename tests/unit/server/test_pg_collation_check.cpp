@@ -33,7 +33,8 @@ using namespace yuzu::server::pg;
 
 namespace {
 
-CollationFacts facts(bool column, std::optional<std::string> recorded, std::optional<std::string> actual) {
+CollationFacts facts(bool column, std::optional<std::string> recorded,
+                     std::optional<std::string> actual) {
     return CollationFacts{column, std::move(recorded), std::move(actual)};
 }
 
@@ -63,24 +64,33 @@ CollationState st(CollationLast last, bool unreadable = false) {
 constexpr CollationVerdict kAllVerdicts[] = {CollationVerdict::Ok, CollationVerdict::NotApplicable,
                                              CollationVerdict::Mismatch,
                                              CollationVerdict::Unreadable};
-const CollationState kAllStates[] = {
-    st(CollationLast::None),          st(CollationLast::None, true),
-    st(CollationLast::Ok),            st(CollationLast::Ok, true),
-    st(CollationLast::Mismatch),      st(CollationLast::Mismatch, true),
-    st(CollationLast::NotApplicable), st(CollationLast::NotApplicable, true)};
+const CollationState kAllStates[] = {st(CollationLast::None),
+                                     st(CollationLast::None, true),
+                                     st(CollationLast::Ok),
+                                     st(CollationLast::Ok, true),
+                                     st(CollationLast::Mismatch),
+                                     st(CollationLast::Mismatch, true),
+                                     st(CollationLast::NotApplicable),
+                                     st(CollationLast::NotApplicable, true)};
 
 } // namespace
 
 TEST_CASE("collation verdict: every combination of the three facts", "[pg_collation][decision]") {
     // no column (PostgreSQL before 15): nothing to compare, whatever else is set
-    CHECK(decide_collation_verdict(facts(false, std::nullopt, std::nullopt)) == CollationVerdict::NotApplicable);
-    CHECK(decide_collation_verdict(facts(false, "2.36", "2.36")) == CollationVerdict::NotApplicable);
-    CHECK(decide_collation_verdict(facts(false, "2.36", "2.39")) == CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(false, std::nullopt, std::nullopt)) ==
+          CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(false, "2.36", "2.36")) ==
+          CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(false, "2.36", "2.39")) ==
+          CollationVerdict::NotApplicable);
     // column present, recorded NULL (C/POSIX/builtin): no version to drift
-    CHECK(decide_collation_verdict(facts(true, std::nullopt, std::nullopt)) == CollationVerdict::NotApplicable);
-    CHECK(decide_collation_verdict(facts(true, std::nullopt, "2.39")) == CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(true, std::nullopt, std::nullopt)) ==
+          CollationVerdict::NotApplicable);
+    CHECK(decide_collation_verdict(facts(true, std::nullopt, "2.39")) ==
+          CollationVerdict::NotApplicable);
     // recorded set, the operating system reports none: cannot compare
-    CHECK(decide_collation_verdict(facts(true, "2.36", std::nullopt)) == CollationVerdict::Unreadable);
+    CHECK(decide_collation_verdict(facts(true, "2.36", std::nullopt)) ==
+          CollationVerdict::Unreadable);
     // both known
     CHECK(decide_collation_verdict(facts(true, "2.36", "2.36")) == CollationVerdict::Ok);
     CHECK(decide_collation_verdict(facts(true, "2.36", "2.39")) == CollationVerdict::Mismatch);
@@ -99,7 +109,8 @@ TEST_CASE("collation verdict: fixed names", "[pg_collation][decision]") {
     CHECK(std::string(to_string(CollationVerdict::Unreadable)) == "unreadable");
 }
 
-TEST_CASE("collation state machine: every (previous state, verdict) pair", "[pg_collation][state]") {
+TEST_CASE("collation state machine: every (previous state, verdict) pair",
+          "[pg_collation][state]") {
     for (const CollationState& prev : kAllStates) {
         INFO("prev.last=" << static_cast<int>(prev.last) << " prev.unreadable=" << prev.unreadable);
         for (const CollationVerdict v : kAllVerdicts) {
@@ -111,9 +122,8 @@ TEST_CASE("collation state machine: every (previous state, verdict) pair", "[pg_
                 CHECK(step.gauge == GaugeAction::SetZero);
                 // A standing mismatch that clears is announced; a repeat is silent; a first
                 // conclusive Ok (or Ok after NotApplicable) is announced once.
-                CHECK(step.log == (prev.last == CollationLast::Mismatch
-                                       ? LogAction::InfoCleared
-                                       : prev.last == CollationLast::Ok ? LogAction::None
+                CHECK(step.log == (prev.last == CollationLast::Mismatch ? LogAction::InfoCleared
+                                   : prev.last == CollationLast::Ok     ? LogAction::None
                                                                         : LogAction::InfoMatches));
                 break;
             case CollationVerdict::Mismatch:
@@ -121,20 +131,20 @@ TEST_CASE("collation state machine: every (previous state, verdict) pair", "[pg_
                 CHECK(step.gauge == GaugeAction::SetOne);
                 // The ERROR is logged on entry only: a mismatch seen again, even across an
                 // unreadable spell, is the same mismatch.
-                CHECK(step.log == (prev.last == CollationLast::Mismatch ? LogAction::None
-                                                                        : LogAction::ErrorMismatch));
+                CHECK(step.log == (prev.last == CollationLast::Mismatch
+                                       ? LogAction::None
+                                       : LogAction::ErrorMismatch));
                 break;
             case CollationVerdict::NotApplicable:
                 CHECK(step.next == st(CollationLast::NotApplicable));
                 CHECK(step.gauge == GaugeAction::Remove);
                 // A repeat is silent; a Mismatch that becomes NotApplicable (the series is removed
-                // without ever reading 0) is announced at INFO; any other entry says once, at INFO, that the check
-                // does not apply.
-                CHECK(step.log == (prev.last == CollationLast::NotApplicable
-                                       ? LogAction::None
-                                       : prev.last == CollationLast::Mismatch
-                                             ? LogAction::InfoMismatchNoLongerApplies
-                                             : LogAction::InfoNotApplicable));
+                // without ever reading 0) is announced at INFO; any other entry says once, at INFO,
+                // that the check does not apply.
+                CHECK(step.log == (prev.last == CollationLast::NotApplicable ? LogAction::None
+                                   : prev.last == CollationLast::Mismatch
+                                       ? LogAction::InfoMismatchNoLongerApplies
+                                       : LogAction::InfoNotApplicable));
                 break;
             case CollationVerdict::Unreadable:
                 // Never flips the gauge, remembers the last conclusive finding, and warns once
@@ -189,8 +199,8 @@ TEST_CASE("collation state machine: named sequences", "[pg_collation][state]") {
     }
     SECTION("a second spell warns again") {
         const auto [logs, gauges] = run({V::Ok, V::Unreadable, V::Ok, V::Unreadable});
-        CHECK(logs == std::vector<L>{L::InfoMatches, L::WarnUnreadable, L::None,
-                                     L::WarnUnreadable});
+        CHECK(logs ==
+              std::vector<L>{L::InfoMatches, L::WarnUnreadable, L::None, L::WarnUnreadable});
     }
 }
 
@@ -198,7 +208,9 @@ TEST_CASE("collation report drives the gauge through Mismatch, Unreadable, Ok an
           "[pg_collation][state][metrics]") {
     yuzu::MetricsRegistry m;
     CollationState state;
-    const auto gauge = [&] { return m.gauge(kCollationMismatchGauge).value(); };
+    const auto gauge = [&] {
+        return m.gauge(kCollationMismatchGauge).value();
+    };
 
     report_collation_check(report(CollationVerdict::Mismatch, "2.36", "2.39"), &m, state);
     REQUIRE(has_series(m));
@@ -284,21 +296,23 @@ TEST_CASE("collation report: the last-completed time is set by every verdict and
           "[pg_collation][metrics]") {
     yuzu::MetricsRegistry m;
     const auto has_series = [&] {
-        return ("\n" + m.serialize()).find(std::string("\n") + kCollationLastCompletedGauge + " ") !=
+        return ("\n" + m.serialize())
+                   .find(std::string("\n") + kCollationLastCompletedGauge + " ") !=
                std::string::npos;
     };
     CollationState state;
     CHECK_FALSE(has_series()); // nothing has completed yet
-    const double before = static_cast<double>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
+    const double before =
+        static_cast<double>(std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
     // The first report creates the series by itself (no gauge() call has touched it before).
     report_collation_check(report(CollationVerdict::Unreadable), &m, state);
     CHECK(has_series());
     for (const auto v : {CollationVerdict::Unreadable, CollationVerdict::Ok,
                          CollationVerdict::Mismatch, CollationVerdict::NotApplicable}) {
-        m.gauge(kCollationLastCompletedGauge).set(0.0); // would stay 0 if the verdict did not stamp it
+        m.gauge(kCollationLastCompletedGauge)
+            .set(0.0); // would stay 0 if the verdict did not stamp it
         report_collation_check(report(v, "a", v == CollationVerdict::Mismatch ? "b" : "a"), &m,
                                state);
         const double stamped = m.gauge(kCollationLastCompletedGauge).value();
@@ -372,8 +386,8 @@ TEST_CASE("collation metrics: the counter pre-seed covers every verdict, and the
         INFO("verdict=" << entry.name);
         // The label value is to_string(verdict): the same text the report path increments.
         CHECK(std::string(to_string(entry.verdict)) == entry.name);
-        const std::string sample = std::string("\n") + kCollationCheckCounter + "{result=\"" +
-                                   entry.name + "\"} 0";
+        const std::string sample =
+            std::string("\n") + kCollationCheckCounter + "{result=\"" + entry.name + "\"} 0";
         CHECK(text.find(sample) != std::string::npos);
     }
     // Only the counter is pre-seeded: the gauge stays absent until a check concludes something.
@@ -402,12 +416,11 @@ TEST_CASE("unreadable failure text: a failed COMMIT is not blamed on the pool", 
     // earlier pool error must not be echoed as its cause.
     CHECK(unreadable_failure_text("", true, "connection refused earlier") == "commit failed");
     CHECK(unreadable_failure_text("", true, "") == "commit failed");
-    // Facts not read: the pool's own error (the acquire or BEGIN failed), marked as possibly from an
-    // earlier attempt because the pool keeps only its latest error; else a fixed text.
+    // Facts not read: the pool's own error (the acquire or BEGIN failed), marked as possibly from
+    // an earlier attempt because the pool keeps only its latest error; else a fixed text.
     CHECK(unreadable_failure_text("", false, "pool acquire timeout") ==
           "the pool's last error (may be from an earlier attempt): pool acquire timeout");
-    CHECK(unreadable_failure_text("", false, "") ==
-          "could not run the collation version query");
+    CHECK(unreadable_failure_text("", false, "") == "could not run the collation version query");
 }
 
 TEST_CASE("collation check on an unreachable pool is Unreadable, never a throw", "[pg_collation]") {
@@ -418,7 +431,8 @@ TEST_CASE("collation check on an unreachable pool is Unreadable, never a throw",
     CHECK_FALSE(r.failure.empty());
 }
 
-TEST_CASE("collation report: the gauge is set on Ok and Mismatch and absent otherwise", "[pg_collation][metrics]") {
+TEST_CASE("collation report: the gauge is set on Ok and Mismatch and absent otherwise",
+          "[pg_collation][metrics]") {
     SECTION("Ok sets 0") {
         yuzu::MetricsRegistry m;
         CollationState state;
@@ -448,8 +462,9 @@ TEST_CASE("collation report: the gauge is set on Ok and Mismatch and absent othe
     }
 }
 
-TEST_CASE("collation report: a mismatch logs one error naming the database, both versions and the remedy",
-          "[pg_collation][log]") {
+TEST_CASE(
+    "collation report: a mismatch logs one error naming the database, both versions and the remedy",
+    "[pg_collation][log]") {
     yuzu::test::LogCapture cap(spdlog::level::warn);
     CollationState state;
     report_collation_check(report(CollationVerdict::Mismatch, "2.36", "2.39"), nullptr, state);
@@ -508,7 +523,8 @@ TEST_CASE("collation report: a database name the log token changes gets no paste
     }
 }
 
-TEST_CASE("collation check against a real database: Ok, then Mismatch once the recorded version is changed",
+TEST_CASE("collation check against a real database: Ok, then Mismatch once the recorded version is "
+          "changed",
           "[pg][pg_collation]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
@@ -519,7 +535,8 @@ TEST_CASE("collation check against a real database: Ok, then Mismatch once the r
                     << " database=" << first.database << " recorded=" << first.recorded
                     << " actual=" << first.actual);
     if (first.verdict == CollationVerdict::NotApplicable)
-        SKIP("this PostgreSQL has no recorded collation version for the test database (C/POSIX locale "
+        SKIP("this PostgreSQL has no recorded collation version for the test database (C/POSIX "
+             "locale "
              "or a server before 15)");
     // A cluster whose template database was created under an older library carries a recorded
     // version that already differs, so a database cloned from it starts as a Mismatch. That is the
@@ -529,7 +546,8 @@ TEST_CASE("collation check against a real database: Ok, then Mismatch once the r
     if (first.verdict == CollationVerdict::Mismatch && !first.recorded.empty() &&
         !first.actual.empty() && first.recorded != first.actual)
         SKIP("this cluster's template database already has a collation version mismatch "
-             "(recorded=" << first.recorded << " actual=" << first.actual << "); a clean start is needed");
+             "(recorded="
+             << first.recorded << " actual=" << first.actual << "); a clean start is needed");
     REQUIRE(first.verdict == CollationVerdict::Ok);
     CHECK(first.database == db.db_name());
     CHECK_FALSE(first.recorded.empty());
@@ -543,7 +561,8 @@ TEST_CASE("collation check against a real database: Ok, then Mismatch once the r
                                "WHERE datname = current_database()",
                                std::vector<std::string>{});
         if (res.status() != PGRES_COMMAND_OK)
-            SKIP("the test role cannot update pg_database (not a superuser): " << PQerrorMessage(lease.get()));
+            SKIP("the test role cannot update pg_database (not a superuser): "
+                 << PQerrorMessage(lease.get()));
     }
 
     const CollationReport second = check_collation_version(pool);

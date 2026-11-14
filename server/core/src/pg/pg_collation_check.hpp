@@ -8,7 +8,8 @@
 /// WHY. Text-keyed indexes are ordered by the database's default collation. After an operating-
 /// system or libc upgrade that changes collation rules, an index built under the old rules can
 /// disagree with the new ones, and an ordered read of a text key can then skip or repeat rows.
-/// Keyset walks over a text primary key depend on that agreement. PostgreSQL 15 and later record the collation version a database was created with
+/// Keyset walks over a text primary key depend on that agreement. PostgreSQL 15 and later record
+/// the collation version a database was created with
 /// (`pg_database.datcollversion`) and can compute the current one
 /// (`pg_database_collation_actual_version(oid)`); a difference is the signal checked here.
 ///
@@ -34,7 +35,8 @@
 ///     database, so it must neither clear a standing mismatch nor invent a healthy 0.
 ///   - The state remembers the last conclusive finding and whether the checks since then have
 ///     been unreadable, so a mismatch that is interrupted by an unreadable spell and then seen
-///     again is the same mismatch (silent), and a WARN is logged once per spell, not on every repeat.
+///     again is the same mismatch (silent), and a WARN is logged once per spell, not on every
+///     repeat.
 ///   - Every check, the start-time one included, increments
 ///     `yuzu_pg_collation_check_total{result}`, so a check that cannot run is visible.
 ///
@@ -86,8 +88,8 @@ all_collation_verdicts() noexcept {
 
 /// The three facts the decision is made from.
 struct CollationFacts {
-    bool column_exists{false};            ///< `pg_database.datcollversion` exists (PostgreSQL 15+)
-    std::optional<std::string> recorded;  ///< `datcollversion`; nullopt when NULL
+    bool column_exists{false};           ///< `pg_database.datcollversion` exists (PostgreSQL 15+)
+    std::optional<std::string> recorded; ///< `datcollversion`; nullopt when NULL
     /// `pg_database_collation_actual_version(oid)`; nullopt when NULL.
     std::optional<std::string> actual;
 };
@@ -115,10 +117,10 @@ struct CollationFacts {
 
 struct CollationReport {
     CollationVerdict verdict{CollationVerdict::Unreadable};
-    std::string database;    ///< `current_database()`; empty when it could not be read
-    std::string recorded;    ///< empty when absent
-    std::string actual;      ///< empty when absent
-    std::string failure;     ///< why the facts could not be read (Unreadable only), for the log
+    std::string database; ///< `current_database()`; empty when it could not be read
+    std::string recorded; ///< empty when absent
+    std::string actual;   ///< empty when absent
+    std::string failure;  ///< why the facts could not be read (Unreadable only), for the log
 };
 
 /// What the previous checks concluded. `last` is the last CONCLUSIVE verdict (None before any);
@@ -133,12 +135,12 @@ struct CollationState {
 enum class GaugeAction { Leave, SetZero, SetOne, Remove };
 enum class LogAction {
     None,
-    InfoMatches,         ///< first conclusive Ok (or Ok after NotApplicable)
-    ErrorMismatch,       ///< entering Mismatch
-    InfoCleared,         ///< Mismatch to Ok
-    WarnUnreadable,      ///< entering an Unreadable spell
-    InfoNotApplicable,   ///< entering NotApplicable (once; the gauge series is absent)
-    InfoMismatchNoLongerApplies,  ///< Mismatch to NotApplicable (the gauge series is removed)
+    InfoMatches,                 ///< first conclusive Ok (or Ok after NotApplicable)
+    ErrorMismatch,               ///< entering Mismatch
+    InfoCleared,                 ///< Mismatch to Ok
+    WarnUnreadable,              ///< entering an Unreadable spell
+    InfoNotApplicable,           ///< entering NotApplicable (once; the gauge series is absent)
+    InfoMismatchNoLongerApplies, ///< Mismatch to NotApplicable (the gauge series is removed)
 };
 
 struct CollationStep {
@@ -165,10 +167,10 @@ inline constexpr const char* kCollationCheckStatementTimeout = "5s";
 /// set of four.
 inline constexpr const char* kCollationMismatchGauge = "yuzu_pg_collation_version_mismatch";
 inline constexpr const char* kCollationCheckCounter = "yuzu_pg_collation_check_total";
-/// Unix time, in seconds, of the latest check that COMPLETED with any verdict (Unreadable included).
-/// Absent until the first report, never removed. A stale value means the recheck loop has stopped
-/// completing checks (a check stuck mid-query, a wedged thread), which the mismatch gauge and the
-/// counter cannot show.
+/// Unix time, in seconds, of the latest check that COMPLETED with any verdict (Unreadable
+/// included). Absent until the first report, never removed. A stale value means the recheck loop
+/// has stopped completing checks (a check stuck mid-query, a wedged thread), which the mismatch
+/// gauge and the counter cannot show.
 inline constexpr const char* kCollationLastCompletedGauge =
     "yuzu_pg_collation_check_last_completed_timestamp_seconds";
 

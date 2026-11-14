@@ -363,7 +363,8 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "verdict is conclusive yet or the latest check was unreadable) of pg_database.datcollversion "
      "against pg_database_collation_actual_version() (one short catalog read on a pooled "
      "connection, bounded by the pool and server-side timeouts but not against a backend that is "
-     "frozen while still acknowledging data; writes nothing to the database); each replica exports its OWN "
+     "frozen while still acknowledging data; writes nothing to the database); each replica exports "
+     "its OWN "
      "yuzu_pg_collation_version_mismatch gauge, so it MUST run per-replica and is never "
      "leader-gated (WS-4: do not reclassify it to a leader-only job, a follower's gauge would then "
      "go stale); no shared state, and a failed read leaves the gauge as it was"},

@@ -36,8 +36,7 @@ void PgCollationRecheck::tick() noexcept {
         // Best effort: assigning the text can throw (out of memory) and this function is noexcept.
         try {
             report.failure = "the collation check threw";
-        } catch (...) {
-        }
+        } catch (...) {}
     }
     // A check cut short by stop() is not reported: the server is going down.
     if (stop_.load(std::memory_order_acquire))
@@ -55,7 +54,8 @@ void PgCollationRecheck::start() {
     std::lock_guard<std::mutex> lk(mu_);
     if (started_ || stop_.load(std::memory_order_acquire))
         return;
-    thread_ = std::thread([this] { run_loop(); }); // may throw (thread exhaustion): started_ stays false
+    thread_ =
+        std::thread([this] { run_loop(); }); // may throw (thread exhaustion): started_ stays false
     started_ = true;
 }
 

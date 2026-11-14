@@ -205,8 +205,8 @@ TEST_CASE("PgCollationRecheck: the first recheck is one interval after start, th
     // The first check came about one interval after start (measured at the check itself). The 50 ms
     // slack is for a timer that wakes a little early on some platforms; the "no check yet after
     // 50 ms" assertion above pins the other side.
-    const auto first = std::chrono::steady_clock::time_point(
-        std::chrono::nanoseconds(check.first_call_ns.load()));
+    const auto first =
+        std::chrono::steady_clock::time_point(std::chrono::nanoseconds(check.first_call_ns.load()));
     REQUIRE(check.first_call_ns.load() != 0);
     CHECK(first - started >= kInterval - 50ms);
 
@@ -226,8 +226,8 @@ TEST_CASE("PgCollationRecheck: stop is idempotent and sticky", "[pg_collation][r
     recheck.stop();
 
     const int after = check.calls.load();
-    recheck.start(); // sticky: no restart after stop
-    recheck.tick();  // and a direct tick after stop does nothing
+    recheck.start();                    // sticky: no restart after stop
+    recheck.tick();                     // and a direct tick after stop does nothing
     std::this_thread::sleep_for(150ms); // several intervals of the restarted loop, were there one
     CHECK(check.calls.load() == after);
     recheck.stop(); // idempotent
@@ -255,7 +255,7 @@ TEST_CASE("PgCollationRecheck: stop waits out a check in flight and reports noth
     yuzu::MetricsRegistry m;
     std::atomic<bool> in_check{false};
     std::atomic<bool> release{false};
-    std::atomic<bool> entered{false};       // the stopper thread is about to call stop()
+    std::atomic<bool> entered{false}; // the stopper thread is about to call stop()
     std::atomic<bool> stop_returned{false};
     PgCollationRecheck recheck(
         [&]() -> CollationReport {
@@ -493,8 +493,7 @@ TEST_CASE("PgCollationRecheck against a real database: a forced Mismatch, then O
     CHECK(recheck.state() == CollationState{CollationLast::Ok, false});
 }
 
-TEST_CASE("PgCollationRecheck: the state follows every report",
-          "[pg_collation][recheck]") {
+TEST_CASE("PgCollationRecheck: the state follows every report", "[pg_collation][recheck]") {
     ScriptedCheck check;
     check.script = {CollationVerdict::Mismatch, CollationVerdict::Unreadable, CollationVerdict::Ok,
                     CollationVerdict::Mismatch};
@@ -502,7 +501,8 @@ TEST_CASE("PgCollationRecheck: the state follows every report",
     recheck.tick();
     CHECK(recheck.state().last == CollationLast::Mismatch); // Mismatch
     recheck.tick();
-    CHECK(recheck.state().last == CollationLast::Mismatch); // Unreadable: the last conclusive answer stands
+    CHECK(recheck.state().last ==
+          CollationLast::Mismatch); // Unreadable: the last conclusive answer stands
     CHECK(recheck.state().unreadable);
     recheck.tick();
     CHECK(recheck.state().last == CollationLast::Ok); // Ok
@@ -512,7 +512,8 @@ TEST_CASE("PgCollationRecheck: the state follows every report",
 
 TEST_CASE("PgCollationRecheck: an unsettled state is rechecked sooner than the hourly interval",
           "[pg_collation][recheck]") {
-    // The long interval is far beyond the test's wait; only the short (unsettled) interval can fire.
+    // The long interval is far beyond the test's wait; only the short (unsettled) interval can
+    // fire.
     constexpr auto kLong = 1h;
     constexpr auto kShort = 20ms;
     SECTION("seeded Mismatch: the loop uses the short interval until a check clears it") {
@@ -626,8 +627,8 @@ TEST_CASE("PgCollationRecheck: an unsettled state is rechecked sooner than the h
 // run against the throwaway database, and the recheck loop, with nothing faked after the first
 // UPDATE, must see the repair and clear the gauge by itself. Kills: a gauge that never clears and a
 // loop that stays on the hourly interval while a mismatch stands. It does NOT show that the REINDEX
-// rebuilt anything: this database holds no user index, and REFRESH COLLATION VERSION alone clears the
-// gauge (the docs say so). The [nonsuper] case below checks the rebuild on an index it creates.
+// rebuilt anything: this database holds no user index, and REFRESH COLLATION VERSION alone clears
+// the gauge (the docs say so). The [nonsuper] case below checks the rebuild on an index it creates.
 TEST_CASE("PgCollationRecheck against a real database: the documented reindex clears the gauge "
           "within the Mismatch interval",
           "[pg][pg_collation][recheck]") {
@@ -653,8 +654,8 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     {
         auto lease = pool.acquire();
         REQUIRE(lease);
-        auto res = pg::exec_params(lease.get(), "SELECT current_database()",
-                                   std::vector<std::string>{});
+        auto res =
+            pg::exec_params(lease.get(), "SELECT current_database()", std::vector<std::string>{});
         REQUIRE(res.status() == PGRES_TUPLES_OK);
         name = PQgetvalue(res.get(), 0, 0);
     }
@@ -676,8 +677,8 @@ TEST_CASE("PgCollationRecheck against a real database: the documented reindex cl
     REQUIRE(state.last == CollationLast::Mismatch);
     REQUIRE(gauge(m) == 1.0);
 
-    PgCollationRecheck recheck([&pool] { return pg::check_collation_version(pool); }, &m, 1h,
-                               state, unsettled_interval);
+    PgCollationRecheck recheck([&pool] { return pg::check_collation_version(pool); }, &m, 1h, state,
+                               unsettled_interval);
     recheck.start();
 
     // While broken the gauge stays at 1 across several rechecks (it does not flap).
@@ -802,17 +803,15 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
         ~RoleGuard() {
             try {
                 undo();
-            } catch (...) {
-            }
+            } catch (...) {}
         }
     } role_guard{[&] {
-        // Each statement on its own: a failure of one (a dead admin lease throws from `sql`) must not
-        // skip the rest, or the cluster-wide role is left behind.
+        // Each statement on its own: a failure of one (a dead admin lease throws from `sql`) must
+        // not skip the rest, or the cluster-wide role is left behind.
         const auto attempt = [&](const std::string& text) {
             try {
                 sql(admin, text);
-            } catch (...) {
-            }
+            } catch (...) {}
         };
         attempt("ALTER DATABASE " + quoted_db + " OWNER TO " + pg::quote_identifier(admin_name));
         attempt("DROP OWNED BY " + quoted_role);
@@ -821,8 +820,8 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
 
     // A table the admin owns and an index on its text key: what the repair has to rebuild.
     REQUIRE(sql(admin, "CREATE TABLE ci_probe (k text PRIMARY KEY)"));
-    // The role is cluster-wide and has a fixed test password, so it expires by itself in an hour if a
-    // killed run never reaches the guard above.
+    // The role is cluster-wide and has a fixed test password, so it expires by itself in an hour if
+    // a killed run never reaches the guard above.
     const std::string valid_until = text_of(admin, "SELECT (now() + interval '1 hour')::text");
     REQUIRE(sql(admin, "CREATE ROLE " + quoted_role + " LOGIN NOSUPERUSER NOCREATEDB PASSWORD '" +
                            kPassword + "' VALID UNTIL '" + valid_until + "'"));
@@ -866,8 +865,8 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
     std::this_thread::sleep_for(500ms);
     CHECK(gauge(m) == 1.0);
 
-    // The rebuild is observable: a rebuilt index gets a new relfilenode. Without this the case would
-    // stay green if REINDEX did nothing, because REFRESH alone clears the gauge.
+    // The rebuild is observable: a rebuilt index gets a new relfilenode. Without this the case
+    // would stay green if REINDEX did nothing, because REFRESH alone clears the gauge.
     const std::string probe_file_before = text_of(
         role_pool, "SELECT relfilenode::text FROM pg_class WHERE relname = 'ci_probe_pkey'");
     REQUIRE(sql(role_pool, "REINDEX DATABASE CONCURRENTLY " + quoted_db));
@@ -890,8 +889,8 @@ TEST_CASE("PgCollationRecheck as a non-superuser: the verdict is readable and th
 
 TEST_CASE("PgCollationRecheck: the destructor joins a loop that is still running",
           "[pg_collation][recheck]") {
-    // Every other started case calls stop() (or a guard) first: this one lets scope end, so removing
-    // the destructor's stop() would hang or crash here instead of passing.
+    // Every other started case calls stop() (or a guard) first: this one lets scope end, so
+    // removing the destructor's stop() would hang or crash here instead of passing.
     ScriptedCheck check;
     {
         PgCollationRecheck recheck(check.fn(), nullptr, 5ms);

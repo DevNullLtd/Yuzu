@@ -87,10 +87,10 @@ public:
     /// constructor-time report. While the state is unsettled (last conclusive verdict Mismatch or
     /// none yet, or the latest check unreadable) the loop waits `unsettled_interval` instead of
     /// `interval` when that is shorter.
-    PgCollationRecheck(CheckFn check, yuzu::MetricsRegistry* metrics,
-                       std::chrono::milliseconds interval, pg::CollationState initial = {},
-                       std::chrono::milliseconds unsettled_interval =
-                           kCollationUnsettledRecheckInterval);
+    PgCollationRecheck(
+        CheckFn check, yuzu::MetricsRegistry* metrics, std::chrono::milliseconds interval,
+        pg::CollationState initial = {},
+        std::chrono::milliseconds unsettled_interval = kCollationUnsettledRecheckInterval);
     ~PgCollationRecheck();
     PgCollationRecheck(const PgCollationRecheck&) = delete;
     PgCollationRecheck& operator=(const PgCollationRecheck&) = delete;

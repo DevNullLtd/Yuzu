@@ -590,8 +590,9 @@ class PgCollationCheckWiring(unittest.TestCase):
         self.assertEqual(problems(m), [MSG_SEED])
 
     def test_a_collation_series_not_described(self):
-        m = self.src.replace("metrics_.describe(pg::kCollationLastCompletedGauge,",
-                             "metrics_.describe(\"yuzu_other\",", 1)
+        # A regex, not a literal: clang-format may break the call after "(".
+        m = re.sub(r"metrics_\.describe\(\s*pg::kCollationLastCompletedGauge,",
+                   'metrics_.describe("yuzu_other",', self.src, count=1)
         self.assertNotEqual(m, self.src)
         self.assertEqual(problems(m), [MSG_DESCRIBE])
 

@@ -286,7 +286,7 @@
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
 #include "leader_metrics.hpp"  // WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
 #include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
-#include "pg_collation_recheck.hpp"   // repeat of the collation version check
+#include "pg_collation_recheck.hpp"  // repeat of the collation version check
 #include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
@@ -2222,23 +2222,25 @@ public:
         // Set at start and rechecked (hourly when settled, every minute when not), only when the
         // check learned something (absent, not zero, otherwise); an unreadable check leaves it as
         // it was.
-        metrics_.describe(pg::kCollationMismatchGauge,
-                          "1 when the PostgreSQL database's recorded collation version differs from "
-                          "the version the operating system reports now (text-keyed index order may "
-                          "be stale; ordered reads can skip or repeat rows), 0 when they match; "
-                          "absent when not applicable or no check has been able to run",
-                          "gauge");
+        metrics_.describe(
+            pg::kCollationMismatchGauge,
+            "1 when the PostgreSQL database's recorded collation version differs from "
+            "the version the operating system reports now (text-keyed index order may "
+            "be stale; ordered reads can skip or repeat rows), 0 when they match; "
+            "absent when not applicable or no check has been able to run",
+            "gauge");
         metrics_.describe(pg::kCollationCheckCounter,
                           "Total PostgreSQL collation version checks by result (ok, mismatch, "
                           "not_applicable, unreadable); unreadable means the facts could not be "
                           "read or the operating system reported no version",
                           "counter");
-        metrics_.describe(pg::kCollationLastCompletedGauge,
-                          "Unix time in seconds of the latest PostgreSQL collation version check "
-                          "that completed with any verdict (unreadable included); absent until the "
-                          "first check; a stale value means the recheck loop has stopped completing "
-                          "checks",
-                          "gauge");
+        metrics_.describe(
+            pg::kCollationLastCompletedGauge,
+            "Unix time in seconds of the latest PostgreSQL collation version check "
+            "that completed with any verdict (unreadable included); absent until the "
+            "first check; a stale value means the recheck loop has stopped completing "
+            "checks",
+            "gauge");
         // Pre-seeded so every result reads 0, not absent, before it first happens
         // (docs/observability-conventions.md): the closed set is pg::all_collation_verdicts().
         pg::seed_collation_metrics(metrics_);
@@ -12484,9 +12486,9 @@ public:
         // that is bounded by about 15 s (the 5 s acquire and two 5 s statements,
         // pg_collation_check.hpp), up to about 35 s if the network drops packets (a new connection
         // adds the pool's 10 s connect timeout and a silent connection is given up on by
-        // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce; pg_pool.hpp).
-        // It is NOT bounded against a backend that is frozen while its connection keeps
-        // acknowledging data, a host-name lookup that hangs, or a connection string that sets
+        // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce;
+        // pg_pool.hpp). It is NOT bounded against a backend that is frozen while its connection
+        // keeps acknowledging data, a host-name lookup that hangs, or a connection string that sets
         // tcp_user_timeout to 0: libpq has no client-side query deadline here, so such a wait ends
         // only when the orchestrator kills the process (or a second termination signal hard-exits
         // it), after everything above has run, before the pools are reset. stop() is
