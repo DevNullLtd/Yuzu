@@ -3295,12 +3295,22 @@ TEST_CASE("Establishment: the live watch gate rejects a key superseded while que
 //    test here can directly observe without mocking sd-bus.
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
 
+#include <fcntl.h>  // open flags, pipe2
+#include <poll.h>   // poll
+#include <signal.h> // kill
+#include <spawn.h>  // posix_spawn (the private-bus child, #5719 item 5)
+#include <sys/wait.h> // waitpid
 #include <unistd.h> // getpid
 
+#include <yuzu/agent/scoped_fd.hpp> // ScopedFd
+
 #include <cstdlib>     // getenv
+#include <cstring>     // strlen
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+
+extern char** environ;
 
 namespace {
 std::size_t linux_fd_count() {
@@ -3618,6 +3628,299 @@ TEST_CASE("Service spark (real mechanism): live unit transition fires Running th
         },
         30000ms));
     engine.stop();
+}
+
+// ── #5719 item 5 (B3): Linux Service deaf watch, system bus lost ────────────
+//
+// Hunted failure: a Service spark whose bus connection is gone stays armed,
+// reports Healthy and delivers nothing (a "deaf watch"). The oracle is the
+// literal one of docs/spark-flip-gate.md precondition (e): within a bound the
+// mechanism calls fault(), i.e. `engine.stats().armed_faulted == 1`.
+//
+// The bus is a PRIVATE `dbus-daemon` the parent spawns on a socket path salted
+// per process (CLAUDE.md #1871), and the mechanism reaches it through
+// DBUS_SYSTEM_BUS_ADDRESS, which libsystemd's sd_bus_open_system() reads.
+// That variable is process-global and the mechanism re-reads it on every bus
+// reopen, so the scenario runs in a CHILD PROCESS: the parent test binary's
+// other Service cases keep using the real system bus untouched. The child is
+// the hidden ("[.]") case below, selected by EXACT NAME only; the parent is a
+// POSIX posix_spawn of /proc/self/exe (no fork-without-exec, no shell).
+//
+// Protocol (one token per line on a pipe the child inherits as
+// YUZU_5719_REPORT_FD): "R" = armed on the private bus and not yet faulted (the
+// precondition, so the oracle cannot pass vacuously); then "F" = armed_faulted
+// reached 1 inside the bound after the parent killed the daemon, or "N" = it
+// did not. "I" = the mechanism reported inert (no bus reachable).
+#define YUZU_SPARK_5719_SERVICE_CHILD_CASE_NAME \
+    "Service 5719 child: arm on a private bus then await the bus-loss fault"
+
+namespace {
+constexpr int kDeafChildReportFd = 61;
+
+/// Writes one report token to the parent. Best effort: a failed write shows up
+/// in the parent as a missing token, which fails its assertion.
+void deaf_child_report(int fd, const char* token) {
+    const std::size_t n = std::strlen(token);
+    const ssize_t w = ::write(fd, token, n);
+    (void)w;
+}
+} // namespace
+
+TEST_CASE(YUZU_SPARK_5719_SERVICE_CHILD_CASE_NAME, "[.][5719-service-child]") {
+    const char* fd_env = std::getenv("YUZU_5719_REPORT_FD");
+    REQUIRE(fd_env != nullptr);
+    const int report_fd = std::atoi(fd_env);
+    REQUIRE(report_fd > 0);
+    // The parent points this at its private daemon. Refuse to run against
+    // anything else: killing a real system bus is not an option.
+    const char* addr = std::getenv("DBUS_SYSTEM_BUS_ADDRESS");
+    REQUIRE(addr != nullptr);
+    REQUIRE(std::string_view{addr}.starts_with("unix:path="));
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    // The private bus has no org.freedesktop.systemd1, so LoadUnit answers
+    // ServiceUnknown, which the mechanism reads as an absent unit: Stopped
+    // plus Poll coverage, not a fault.
+    const std::string name = "yuzu-5719-nosuch-" + std::to_string(::getpid()) + ".service";
+    auto sub = engine.arm(*c, service_spec(name));
+    if (!sub.has_value()) {
+        deaf_child_report(report_fd, "I\n");
+        engine.stop();
+        FAIL("service mechanism reported inert on the private bus: " << sub.error());
+    }
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+    REQUIRE(engine.stats().armed_faulted == 0); // precondition: not already faulted
+    deaf_child_report(report_fd, "R\n");
+
+    // The parent now kills the daemon. Bound: the poll thread is woken by the
+    // socket hangup, so this is liveness only, never a timing property.
+    const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, 10000ms);
+    deaf_child_report(report_fd, faulted ? "F\n" : "N\n");
+    CHECK(faulted);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+namespace {
+/// Absolute path of an executable named `name` on PATH, or empty.
+std::string find_on_path(const std::string& name) {
+    const char* path = std::getenv("PATH");
+    if (path == nullptr)
+        return {};
+    std::string_view rest{path};
+    while (!rest.empty()) {
+        const auto colon = rest.find(':');
+        const std::string_view dir = rest.substr(0, colon);
+        if (!dir.empty()) {
+            const std::string cand = std::string{dir} + "/" + name;
+            if (::access(cand.c_str(), X_OK) == 0)
+                return cand;
+        }
+        if (colon == std::string_view::npos)
+            break;
+        rest.remove_prefix(colon + 1);
+    }
+    return {};
+}
+
+/// A spawned child that is killed (SIGKILL) and reaped on every exit path.
+class SpawnedChild {
+public:
+    SpawnedChild() = default;
+    explicit SpawnedChild(pid_t pid) : pid_(pid) {}
+    SpawnedChild(const SpawnedChild&) = delete;
+    SpawnedChild& operator=(const SpawnedChild&) = delete;
+    ~SpawnedChild() { kill_and_reap(); }
+    [[nodiscard]] pid_t pid() const { return pid_; }
+    void kill_and_reap() {
+        if (pid_ <= 0)
+            return;
+        ::kill(pid_, SIGKILL);
+        int status = 0;
+        while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+        }
+        pid_ = -1;
+    }
+    /// True once the child has exited; `status` then holds its wait status.
+    bool try_reap(int& status) {
+        if (pid_ <= 0)
+            return false;
+        const pid_t w = ::waitpid(pid_, &status, WNOHANG);
+        if (w == pid_) {
+            pid_ = -1;
+            return true;
+        }
+        return false;
+    }
+
+private:
+    pid_t pid_{-1};
+};
+
+/// Reads until `until` has passed or `stop_when(buf)` is true, polling `fd`.
+/// Returns everything read. Liveness bound only.
+template <typename Done>
+std::string read_until(int fd, std::chrono::milliseconds bound, Done done) {
+    std::string buf;
+    const auto until = std::chrono::steady_clock::now() + bound * yuzu::test::kSpinScale;
+    while (!done(buf)) {
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            until - std::chrono::steady_clock::now());
+        if (left.count() <= 0)
+            break;
+        struct pollfd pfd{fd, POLLIN, 0};
+        const int pr = ::poll(&pfd, 1, static_cast<int>(std::min<long long>(left.count(), 100)));
+        if (pr < 0 && errno != EINTR)
+            break;
+        if (pr > 0) {
+            char tmp[256];
+            const ssize_t n = ::read(fd, tmp, sizeof(tmp));
+            if (n > 0)
+                buf.append(tmp, static_cast<std::size_t>(n));
+            else if (n == 0)
+                break; // EOF: the writer closed
+        }
+    }
+    return buf;
+}
+
+std::string slurp(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+} // namespace
+
+TEST_CASE("Service spark (real mechanism, private bus): losing the bus faults an armed unit "
+          "inside the bound (#5719 item 5, precondition (e))",
+          "[spark][mechanism][linux][5719]") {
+    const std::string daemon = find_on_path("dbus-daemon");
+    if (daemon.empty())
+        SKIP("dbus-daemon is not installed: the private-bus Service deaf-watch case needs it");
+
+    // One salted scratch dir holds the socket and the child's captured output.
+    // Salted per process by unique_temp_path, so two jobs on one box never
+    // share a socket path (CLAUDE.md #1871).
+    yuzu::test::TempDir scratch("yuzu_test_5719_");
+    std::error_code ec;
+    std::filesystem::create_directories(scratch.path, ec);
+    REQUIRE(!ec);
+    const std::string sock = (scratch.path / "bus").string();
+    // sockaddr_un.sun_path is 108 bytes including the NUL.
+    REQUIRE(sock.size() < 100);
+    const std::string bus_addr = "unix:path=" + sock;
+    const std::string child_log = (scratch.path / "child.log").string();
+
+    // 1) The private daemon, on a minimal config of its own: no <servicedir>,
+    //    so nothing can auto-activate org.freedesktop.systemd1 (the stock
+    //    session config does, and a failed activation reads as a bus fault
+    //    before the test has done anything). --print-address writes the
+    //    address once the socket is listening, which is the readiness signal.
+    const std::string conf_path = (scratch.path / "bus.conf").string();
+    {
+        std::ofstream conf(conf_path, std::ios::binary | std::ios::trunc);
+        conf << "<busconfig>\n"
+             << "  <type>session</type>\n"
+             << "  <listen>" << bus_addr << "</listen>\n"
+             << "  <auth>EXTERNAL</auth>\n"
+             << "  <policy context=\"default\">\n"
+             << "    <allow send_destination=\"*\" eavesdrop=\"true\"/>\n"
+             << "    <allow eavesdrop=\"true\"/>\n"
+             << "    <allow own=\"*\"/>\n"
+             << "  </policy>\n"
+             << "</busconfig>\n";
+        REQUIRE(conf.good());
+    }
+    int dpipe[2];
+    REQUIRE(::pipe2(dpipe, O_CLOEXEC) == 0);
+    yuzu::agent::ScopedFd daemon_out_r{dpipe[0]};
+    yuzu::agent::ScopedFd daemon_out_w{dpipe[1]};
+    posix_spawn_file_actions_t dfa;
+    REQUIRE(::posix_spawn_file_actions_init(&dfa) == 0);
+    ::posix_spawn_file_actions_adddup2(&dfa, daemon_out_w.get(), 1);
+    ::posix_spawn_file_actions_addopen(&dfa, 2, "/dev/null", O_WRONLY, 0);
+    const std::string conf_arg = "--config-file=" + conf_path;
+    char* dargv[] = {const_cast<char*>(daemon.c_str()), const_cast<char*>(conf_arg.c_str()),
+                     const_cast<char*>("--nofork"), const_cast<char*>("--print-address"),
+                     nullptr};
+    pid_t dpid = -1;
+    const int dsp = ::posix_spawn(&dpid, daemon.c_str(), &dfa, nullptr, dargv, environ);
+    ::posix_spawn_file_actions_destroy(&dfa);
+    REQUIRE(dsp == 0);
+    SpawnedChild daemon_proc{dpid};
+    daemon_out_w.reset(); // the daemon holds the only write end now
+    const std::string printed = read_until(daemon_out_r.get(), 10000ms, [](const std::string& b) {
+        return b.find('\n') != std::string::npos;
+    });
+    REQUIRE(printed.find("unix:path=") != std::string::npos); // listening
+
+    // 2) The child: this binary, the hidden case selected by exact name.
+    char exe[4096];
+    const ssize_t exe_len = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    REQUIRE(exe_len > 0);
+    exe[exe_len] = '\0';
+
+    int rpipe[2];
+    REQUIRE(::pipe2(rpipe, O_CLOEXEC) == 0);
+    yuzu::agent::ScopedFd report_r{rpipe[0]};
+    yuzu::agent::ScopedFd report_w{rpipe[1]};
+    posix_spawn_file_actions_t cfa;
+    REQUIRE(::posix_spawn_file_actions_init(&cfa) == 0);
+    ::posix_spawn_file_actions_adddup2(&cfa, report_w.get(), kDeafChildReportFd);
+    ::posix_spawn_file_actions_addopen(&cfa, 1, child_log.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                                       0600);
+    ::posix_spawn_file_actions_adddup2(&cfa, 1, 2);
+    std::vector<std::string> env_store;
+    for (char** e = environ; e != nullptr && *e != nullptr; ++e) {
+        const std::string_view kv{*e};
+        if (kv.starts_with("DBUS_SYSTEM_BUS_ADDRESS=") || kv.starts_with("YUZU_5719_REPORT_FD="))
+            continue;
+        env_store.emplace_back(kv);
+    }
+    env_store.push_back("DBUS_SYSTEM_BUS_ADDRESS=" + bus_addr);
+    env_store.push_back("YUZU_5719_REPORT_FD=" + std::to_string(kDeafChildReportFd));
+    std::vector<char*> envp;
+    for (auto& e : env_store)
+        envp.push_back(e.data());
+    envp.push_back(nullptr);
+    char* cargv[] = {exe, const_cast<char*>(YUZU_SPARK_5719_SERVICE_CHILD_CASE_NAME), nullptr};
+    pid_t cpid = -1;
+    const int csp = ::posix_spawn(&cpid, exe, &cfa, nullptr, cargv, envp.data());
+    ::posix_spawn_file_actions_destroy(&cfa);
+    REQUIRE(csp == 0);
+    SpawnedChild child{cpid};
+    report_w.reset();
+
+    // 3) Wait for the child to be armed on the private bus, then kill the daemon.
+    std::string reports = read_until(report_r.get(), 15000ms, [](const std::string& b) {
+        return b.find('R') != std::string::npos || b.find('I') != std::string::npos;
+    });
+    INFO("child output:\n" << slurp(child_log));
+    REQUIRE(reports.find('R') != std::string::npos); // armed, not yet faulted
+    daemon_proc.kill_and_reap();
+
+    // 4) The child reports whether the mechanism faulted inside its bound.
+    reports += read_until(report_r.get(), 20000ms, [&](const std::string& b) {
+        return (reports + b).find('F') != std::string::npos ||
+               (reports + b).find('N') != std::string::npos;
+    });
+
+    int status = 0;
+    const bool exited = yuzu::test::spin_until([&] { return child.try_reap(status); }, 10000ms);
+    INFO("child output after the bus was killed:\n" << slurp(child_log));
+    CHECK(reports.find('F') != std::string::npos); // fault() was called: armed_faulted == 1
+    CHECK(reports.find('N') == std::string::npos);
+    REQUIRE(exited);
+    CHECK(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
 }
 
 #endif // __linux__ && YUZU_HAVE_LIBSYSTEMD
