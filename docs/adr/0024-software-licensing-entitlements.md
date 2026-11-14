@@ -431,7 +431,8 @@ Decision numbers are stable, since other documents cite them.
     Decision 5) — a globally-granted engine acting for a group-confined operator reaches
     only that operator's groups. SLE's in-server gates use the fail-closed
     `rbac_enforcement_in_effect()` primitive, not the `is_rbac_enabled()` shape whose
-    corrupt-rbac.db fail-open is tracked by #1717. *Rejected: an ad-hoc per-row filter for
+    corrupt-rbac.db fail-open is tracked by #1717 (SQLite-era wording; RBAC is the Postgres
+    `rbac_store` schema since ADR-0041, noted 2026-11-14). *Rejected: an ad-hoc per-row filter for
     the fan-out reads — exactly the pattern ADR-0017 exists to replace.*
 
 11. **Per-user discovery is a contained ADR-0016 deviation, pseudonymous by default. [core]**

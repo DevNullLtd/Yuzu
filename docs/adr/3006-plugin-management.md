@@ -1,5 +1,21 @@
 ---
-status: proposed
+status: accepted
+status-note: >-
+  Status reconciled 2026-11-14 against dev @ 2c49b4ea0: this ADR's own `effective` clause binds
+  it on merge as direction, and it is merged. Implementation is partial: the server-side
+  enablement store (`server/core/src/enablement_store.{hpp,cpp}`, `enablement_state_core.hpp`,
+  ADR-3005 schema v3) is built and opened at boot; enforcement on the endpoint is not delivered.
+  Recorded exception (PR #6360, authored and merged by @Doomgoose, approved by @FortitudeEtc
+  (2026-10-23); its body records the ruling as an owner ruling without naming the owner): every
+  Echo capture source, DNS and ARP included, was made on by default on every OS where it is
+  supported, and upgraded agents were moved to on (Echo schema v8), including the eight
+  formerly opt-in sources an operator had switched off before the upgrade (every stored `false`,
+  seeded by default or written by an operator). That departs from
+  three normative clauses: the `effective` clause's "new defaults are not delivered ahead of
+  enforcement", the D2 ordering, and D9 ("whatever is off at the moment of upgrade ... stays
+  off"). The other new defaults are not delivered: the four
+  plugins seeded off at server start (`server.cpp` `seed_kill_switch_default_off`) stay off.
+  Kept accepted with this exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14.
 date: 2026-10-06
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
@@ -36,7 +52,12 @@ context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#
 ## Summary
 
 This ADR sets a direction. It is not current behaviour: nothing described here is in the product
-until the retrofit it calls for lands (see `effective` above, and D2).
+until the retrofit it calls for lands (see `effective` above, and D2). (2026-11-14: the server-side
+enablement store has landed and endpoint enforcement has not. One default shipped early by a ruling
+recorded as an owner ruling: every Echo capture source is on by default (PR #6360, authored and
+merged by @Doomgoose, approved by @FortitudeEtc (2026-10-23); its body records the ruling as an
+owner ruling without naming the owner). The other defaults are unchanged. Kept accepted with this
+exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14. See `status-note`.)
 
 Yuzu will ship with everything in the box and everything switched on. Every plugin will be
 installed on every endpoint, and every capture source and every other unit that runs by itself
@@ -714,7 +735,8 @@ Not in scope, and not changed by this ADR:
 The following existing behaviour is replaced or brought into line. The list is the starting
 point for the roadmap, which decides order and grouping.
 
-- The three plugins seeded off at server start, the tests and documents that pin that state,
+- The plugins seeded off at server start (three when this ADR was written; four since
+  `remote_access_audit`, 2026-10-17), the tests and documents that pin that state,
   and the invariants that cite "default-off" as a safeguard.
 - Every document, definition and statement that describes a source as opt-in, off by default or
   a deploy-time opt-out: the Echo implementer guide and dashboard (including the
