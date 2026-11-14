@@ -3526,10 +3526,12 @@ tests:
   # `sum(rate(yuzu_server_guardian_read_degrade_total[5m])) by (reason,
   # source) > 0`, for: 5m, warning. Four sources share the counter:
   # "guardian_state" (DEX/observation reads, fail-soft), "guardian_rules"
-  # (authoritative rule/status reads, fail-hard), "guardian_census" (the
-  # census pending-evidence count read, #5690) and "guardian_census_device"
-  # (the two per-device unrepresented-pending reads, #7217, whose reasons add
-  # statement_timeout) - each pages on a sustained non-zero rate, keyed by both
+  # (authoritative rule/status reads, fail-hard, including the request-path
+  # unordered-agents read), "guardian_census" (the two census gauge reads:
+  # the pending-evidence count and the unordered-agents count, #5690) and
+  # "guardian_census_device" (the per-device unrepresented-pending read and
+  # the per-device order read, #7217, whose reasons add statement_timeout)
+  # - each pages on a sustained non-zero rate, keyed by both
   # labels (the expr has no source filter; the cases below exercise
   # guardian_state, guardian_rules and guardian_census_device).
 
