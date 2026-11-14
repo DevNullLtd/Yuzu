@@ -1773,7 +1773,30 @@ flip, with a red-first test each:
     limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
-    #5719); (e) is tracked in #5719; (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
+    #5719); (e) is tracked in #5719, and its tests are #5719 item 5 (tests only, no production change; status below); (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
+    **(e) status, #5719 item 5 (a test-only change; (e) stays OPEN).** The oracle is the literal one in (e):
+    within a bound the mechanism calls `fault()`, read as `engine.stats().armed_faulted == 1`; a watch
+    that only drops its coverage, or only stops delivering, is a red test, not a pass; delivery after
+    the object is repaired is a secondary check. All cases are in `tests/unit/test_spark_mechanism.cpp`,
+    tag `[5719]` (with `[mechanism]`). Covered and green: the Linux Service mechanism, with a private
+    `dbus-daemon` the test spawns on a per-process salted socket and a child process whose
+    `DBUS_SYSTEM_BUS_ADDRESS` points at it (libsystemd honours that variable in the build used; the case
+    SKIPs where `dbus-daemon` is not installed), the parent kills the daemon and the child reaches
+    `armed_faulted == 1`; on Windows, the File mechanism with a parent directory held pending-delete by
+    a second handle (it faults, then recovers and fires once the holder closes and the path is
+    recreated) and with a failed ancestor re-arm plus a failing re-probe (it faults, the dead ancestor
+    is gone, it recovers when both injections are lifted). Covered and RED, kept red as the evidence
+    for a fix that is not part of this change: the File mechanism with the watched file's parent
+    directory renamed away, and the Registry mechanism with the parent of the watched key renamed
+    (`RegRenameKey`). In both the rename succeeds, the watch keeps reporting `Notification` coverage,
+    no `fault()` is called within the bound, and a change at the recreated original path does not fire:
+    a Healthy, silent, deaf watch, which is the loss (6) shape. NOT covered: the Windows Service
+    mechanism (owner ruling: deleting a Windows service needs administrator rights). Runs: Linux debug
+    (the Linux case 20 of 20 green; `[mechanism]`, `[5719]` and `[4415prA]` green); Windows (MSVC, a
+    single weecolin build of `origin/dev` `2c49b4ea0f` plus these tests) the two green File cases 20 of
+    20 each, the two red cases 5 of 5 red each, the rest of `[mechanism]` (167 cases), the other
+    `[5719]` cases (42) and `[4415prA]` (105 cases) green. No sanitizer, macOS or CI run. The set of cases is not a proof that no other deaf path exists in any
+    mechanism.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
