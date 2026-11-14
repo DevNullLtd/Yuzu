@@ -2065,7 +2065,7 @@ TEST_CASE("capture-sources push: a grant withdrawn during the audit wait dispatc
         CHECK(h.dispatch_calls == 0);
         const auto* failure = first_row(h, "failure");
         REQUIRE(failure != nullptr);
-        CHECK(failure->detail == "permission_revoked process_enabled=true");
+        CHECK(failure->detail == "permission_revoked sent=0 process_enabled=true");
         CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
         const auto toast = toast_of(*r);
         REQUIRE(toast.is_object());
@@ -2086,6 +2086,66 @@ TEST_CASE("capture-sources push: a grant withdrawn during the audit wait dispatc
         CHECK(h.dispatch_calls == 0);
         CHECK(first_row(h, "failure") != nullptr);
         CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+    }
+}
+
+TEST_CASE("capture-sources push: permissions and caller are decided again before each source",
+          "[echo][routes][capture-sources][audit]") {
+    // Each outcome row is a wait in which a grant or the session can go, so the second source is
+    // dispatched on its own decision, not on the one taken for the first.
+    SECTION("Execute withdrawn between two sources stops the rest") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.allow_execute = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 1);
+        const std::vector<std::string> expected{
+            "audit:echo.sources.configure/attempted", "dispatch",
+            "audit:echo.sources.configure/dispatched", "audit:echo.sources.configure/failure"};
+        CHECK(h.order == expected);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=1 tcp_enabled=false");
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("1 of 2") != std::string::npos);
+        CHECK(r->body.find("<b>Execute</b>") != std::string::npos);
+        CHECK(r->body.find("data-applied=\"1\"") != std::string::npos);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        CHECK(h.metric(kSourcesPushMetric, "pushed") == 0);
+    }
+    SECTION("a session withdrawn between two sources stops the rest, on the gate's own 403") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.allow_read = false; // production: the scoped gate fails at its require_auth
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK(h.dispatch_calls == 1);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        CHECK(failure->detail == "permission_revoked sent=1 tcp_enabled=false");
+        CHECK(toast_of(*r).at("message").get<std::string>().find("1 of 2") != std::string::npos);
+    }
+    SECTION("the caller is derived again for the second source") {
+        EchoHarness h;
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "dispatched")
+                h.session_user = "bob";
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 2);
+        CHECK(h.last_dispatch_caller.principal == "bob");
     }
 }
 

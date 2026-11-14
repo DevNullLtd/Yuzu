@@ -873,7 +873,7 @@ The Echo metrics were named `yuzu_tar_*` (and `yuzu_fleet_tar_db_corruption_agen
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_echo_retention_paused_devices{source}` | gauge | Devices reporting a paused Echo source, by `source` (`process` / `tcp` / `service` / `user`). Set each time the retention-paused page renders, from the rows of the viewing operator's own most recent scan (limited to the agents that operator can see), so it is a per-render view, not a fleet total. A scan whose response read was cut by its 10,000-row / 50 MiB cap (`result_truncated_by_cap` on `GET /api/v1/echo/retention-paused`) does not update it: its rows would under-count (it could read `0` with paused sources present on the dropped agents), so the gauge keeps the last value from an uncut scan and can be stale. |
-| `yuzu_echo_sources_push_total{result}` | counter | Operator Capture-sources pushes by `result`: `pushed` (at least one change reached an agent), `none_applied` (none did), `audit_unavailable` (the `attempted` audit row could not be stored; nothing dispatched) or `permission_revoked` (a grant was withdrawn during that wait; nothing dispatched). A request with no valid change is not counted. |
+| `yuzu_echo_sources_push_total{result}` | counter | Operator Capture-sources pushes by `result`: `pushed` (at least one change reached an agent) or `none_applied` (none did), each counting only a push that ran to the end; `audit_unavailable` (the `attempted` audit row could not be stored; nothing dispatched); or `permission_revoked` (a grant or session was withdrawn after that row, before the first source or between two; the rest were not dispatched). A request with no valid change is not counted. |
 
 ## MCP progress-bridge metrics
 

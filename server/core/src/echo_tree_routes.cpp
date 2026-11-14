@@ -1272,7 +1272,9 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
     // `attempted` row listing every validated change is stored before anything is dispatched, and
     // if it cannot be stored the push is refused (503 + Sec-Audit-Failed) with zero dispatches.
     // Then one `echo configure` dispatch per source, each with its own outcome row
-    // (echo.sources.configure) — DNS enable is its own audit row.
+    // (echo.sources.configure) — DNS enable is its own audit row. The permissions are decided and
+    // the caller derived again before EACH dispatch (each outcome row is a wait in which a grant
+    // or the session can be withdrawn), and a refusal stops the rest of the batch.
     sink.Post("/fragments/echo/capture-sources/push", [this, can_execute](const httplib::Request& req,
                                                                          httplib::Response& res) {
         auto session = auth_fn_(req, res);
@@ -1331,16 +1333,21 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                 continue;
             staged[static_cast<std::size_t>(known - kKnown.begin())] = (val == "on");
         }
-        std::string pairs;
-        int total = 0;
-        for (std::size_t i = 0; i < kKnown.size(); ++i) {
-            if (!staged[i])
-                continue;
-            ++total;
-            if (!pairs.empty())
-                pairs += ' ';
-            pairs += std::format("{}_enabled={}", kKnown[i], *staged[i] ? "true" : "false");
-        }
+        // The staged `<source>_enabled=<bool>` pairs from slot @p from on, in kKnown order.
+        const auto pairs_from = [&staged](std::size_t from) {
+            std::string out;
+            for (std::size_t i = from; i < kKnown.size(); ++i) {
+                if (!staged[i])
+                    continue;
+                if (!out.empty())
+                    out += ' ';
+                out += std::format("{}_enabled={}", kKnown[i], *staged[i] ? "true" : "false");
+            }
+            return out;
+        };
+        const std::string pairs = pairs_from(0);
+        const int total = static_cast<int>(
+            std::count_if(staged.begin(), staged.end(), [](const auto& slot) { return slot.has_value(); }));
         if (total == 0) {
             push_toast(res, "No valid capture-source changes to push.", "error");
             res.set_content("<span data-applied=\"0\">0 change(s) pushed</span>",
@@ -1362,34 +1369,43 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             count("audit_unavailable");
             return;
         }
-        // Both permissions were admitted before the audit wait; decide them again so a grant
-        // withdrawn during the wait dispatches nothing. The hard gate writes its own 403; the soft
-        // one answers with the Execute note.
-        const bool read_ok = scoped_perm_fn_(req, res, "Infrastructure", "Read", device);
-        const bool exec_ok = read_ok && can_execute(req, device);
-        if (!exec_ok) {
-            (void)detail::emit_behavioral_audit(audit_fn_, req, res, "echo.sources.configure",
-                                                "failure", "Agent", device,
-                                                "permission_revoked " + pairs);
-            if (read_ok)
-                note(res, "Pushing capture-source changes needs the <b>Execute</b> permission.");
-            push_toast(res, "Permission was withdrawn during the push, so nothing was sent.", "error");
-            count("permission_revoked");
-            return;
-        }
-
-        // Review finding (#3133): this route gates only Infrastructure:Read above,
-        // but `echo.configure` is classified Infrastructure:Write — the route relied
-        // on the chokepoint to enforce Write, and the chokepoint only does that when
-        // handed a real, non-system caller. Deriving it here (not a bare Read-only
-        // gate) is the complete fix: an operator who lacks Write is refused by
-        // build_classified_command exactly like every other Write-classified action.
-        const auto caller = caller_fn_(req);
+        // Both permissions were admitted before the audit wait, and every dispatch below is
+        // followed by another wait (its outcome row), so they are decided and the caller derived
+        // again before EACH source; the first pass is the re-decision after the `attempted` row.
+        // A grant or session withdrawn in any of those waits sends nothing further and stops the
+        // batch. The hard gate writes its own 403 (an expired session fails at its require_auth);
+        // the soft one answers with the Execute note.
         int applied = 0;
         int refused_or_unreached = 0;
         for (std::size_t i = 0; i < kKnown.size(); ++i) {
             if (!staged[i])
                 continue;
+            const bool read_ok = scoped_perm_fn_(req, res, "Infrastructure", "Read", device);
+            const bool exec_ok = read_ok && can_execute(req, device);
+            if (!exec_ok) {
+                (void)detail::emit_behavioral_audit(
+                    audit_fn_, req, res, "echo.sources.configure", "failure", "Agent", device,
+                    std::format("permission_revoked sent={} {}", applied, pairs_from(i)));
+                if (read_ok)
+                    note(res, std::format("Pushing capture-source changes needs the <b>Execute</b> "
+                                          "permission. <span data-applied=\"{0}\">{0} change(s) "
+                                          "pushed</span>",
+                                          applied));
+                push_toast(res,
+                           std::format("Permission was withdrawn during the push: {} of {} "
+                                       "change(s) were sent, the rest were not.",
+                                       applied, total),
+                           "error");
+                count("permission_revoked");
+                return;
+            }
+            // Review finding (#3133): this route gates only Infrastructure:Read above,
+            // but `echo.configure` is classified Infrastructure:Write — the route relied
+            // on the chokepoint to enforce Write, and the chokepoint only does that when
+            // handed a real, non-system caller. Deriving it here (not a bare Read-only
+            // gate) is the complete fix: an operator who lacks Write is refused by
+            // build_classified_command exactly like every other Write-classified action.
+            const auto caller = caller_fn_(req);
             const std::string src{kKnown[i]};
             const std::string enabled = *staged[i] ? "true" : "false";
             const auto outcome = dispatch_fn_("echo", "configure", {device}, "",
