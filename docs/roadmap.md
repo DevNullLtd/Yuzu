@@ -11,8 +11,8 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
      i<N>: issueOrPullRequest(number: <N>) { ... on Issue { number state stateReason closedAt title }
      ... on PullRequest { number state mergedAt title } } ... } }"` (`issueOrPullRequest`, not `issue`, so
      #236 — a PR — resolves instead of erroring; the repo moved from `Tr3kkR` to the `DevNullLtd` org, PR #5101) (one alias per issue
-     number, extracted via `grep -oE 'issues/[0-9]+' docs/roadmap.md | sort -u` — 130 unique numbers: the
-     127 Index rows plus #251/#252 (decision log) and #1562 (15.H follow-up); #555–#557 are cited twice) —
+     number, extracted via `grep -oE 'issues/[0-9]+' docs/roadmap.md | sort -u` — 132 unique numbers: the
+     127 Index rows plus #251/#252 (decision log), #2665/#6051 (open decisions D5/D6) and #1562 (15.H follow-up); #555–#557 are cited twice) —
      then diff against the tables below. **`stateReason` is load-bearing, not optional**: a `state`-only
      pull cannot distinguish a genuinely-delivered `COMPLETED` closure from a `NOT_PLANNED` backlog-reset
      closure (2026-07-14 closed 11 issues NOT_PLANNED — #252, #263–#268, #283, #286, #292, #552 — none of
@@ -233,7 +233,7 @@ Capability that shipped without being scheduled on this roadmap — each item is
 - **Fleet visualization (3D)** — `server/core/src/viz_routes.cpp`.
 - **Plugin-config plane** (ADR-3005, `docs/adr/3005-plugin-config-store.md`).
 - **PKI/CA + KEK routes** — `server/core/src/ca_routes.cpp`, `server/core/src/kek_routes.hpp`.
-- **Management-plane server authorization** — SPKI pinning (#1422, `mgmt_peer_pins` in `gateway/apps/yuzu_gw/src/yuzu_gw_authz.erl`) is superseded as the shipped default by CA-issued identity (URI SAN `yuzu://<install>/server`, ADR-2004; #6072, #6131, #6857), with withdrawal by CRL (#7060, #7197); #6016 remains open for its remaining steps.
+- **Management-plane server authorization** — SPKI pinning (#1422, `mgmt_peer_pins` in `gateway/apps/yuzu_gw/src/yuzu_gw_authz.erl`) is superseded as the shipped default by CA-issued identity (URI SAN `yuzu://<install>/server`, ADR-2004; #6072, #6131, #6857), with opt-in CRL withdrawal (#7060, #7197; `mgmt_crl_source` is unset in the shipped `gateway/config/sys.config.prod`, where withdrawal is the serial deny-list plus a gateway restart); #6016 remains open for its remaining steps.
 - **Agent daily-sync framework** (ADR-0016, `docs/adr/0016-agent-daily-sync-framework.md`) — `agents/core/src/sync_scheduler.cpp`.
 - **New agent plugins**: `power_health`, `disk_actions`, `filesystem_posture`, `device_identity`, `netprobe`, `procfetch`, `rdp_control`, `vuln_scan` (all present under `agents/plugins/`). **Added 2026-09 → 2026-11** (22, by `agents/plugins/` at `d295db964` vs `54c5c2b37`): `app_control`, `app_usage`, `autoruns`, `browser_inventory`, `browser_policy`, `execution_artifacts`, `firmware_posture`, `local_security_policy`, `mgmt_posture`, `middleware`, `peripherals`, `pkg_inventory`, `platform_security`, `printing`, `privacy_permissions`, `remote_access_audit`, `runtimes`, `shares`, `system_hardening`, `update_source_trust`, `virtualization`, `windows_optional_features` — plus the activity-record plugin's rename to `echo` (#6728).
 
@@ -250,7 +250,7 @@ Capability that shipped without being scheduled on this roadmap — each item is
 - **Plugin management** (ADR-3006) — per-OS kill switch (#5355), protective-action exemption (#5768), enablement resolver + durable enablement store with a rollback anchor (#5938, #6147), System > Plugins page (#6026).
 - **DEX scoring** — DEX statistics core, stability score and score-policy model, writer and MCP (#5588, #5583, #5752, #6080, #6268, #6475, #6617, #7319, #7395, #7544); per-OS denominators and macOS DEX primitives (#4558, #4550); per-version crash/hang (#5789, #5815).
 - **Echo roll-up architecture** (Phase 15) — rename to Echo (#6728); the agent stores roll-ups only (schema v10, #7037); the server reads Echo as roll-up only (#7318, #7371) and the raw-table compatibility surfaces are removed (#7507); registry capture source with process attribution (#6507, #6658, #6989); timeline view (#6292, #6371); byte budget (#6889); every source on by default (#6360); corruption alerts (#7421).
-- **PKI: management-plane server identity** (ADR-2004) — URI SAN on the default server leaf (#6072), gateway admits by identity (#6131), shipped in the default configs (#6857), CRL withdrawal (#7060, #7197), CRL validity bound (#6919), CRL freshness and future-dated alerts (#7100, #7196); gateway-upstream peer authorization (#5565); TLS cipher policy pin (#4747).
+- **PKI: management-plane server identity** (ADR-2004) — URI SAN on the default server leaf (#6072), gateway admits by identity (#6131), shipped in the default configs (#6857), opt-in CRL withdrawal (#7060, #7197; `mgmt_crl_source` is unset in the shipped `gateway/config/sys.config.prod`, where withdrawal is the serial deny-list plus a gateway restart), CRL validity bound (#6919), CRL freshness and future-dated alerts (#7100, #7196); gateway-upstream peer authorization (#5565); TLS cipher policy pin (#4747).
 - **Reflex programme slice R0** — design contract, ADR-0021 amendment and wire proto (#4565); and the **macOS agent programme** — foundation (#4482), Endpoint Security helpers + launchctl parser (#4561), macOS DEX primitives (#4550, #4558). See Phases 20 and 16.C.
 
 ---
@@ -2039,10 +2039,10 @@ HTMX `/reflex` dashboard round-tripping the YAML — never the model.
 |---|-------|-------|--------|
 | D1 | [#251](https://github.com/DevNullLtd/Yuzu/issues/251) | License key generation and signing strategy | **Open** — Options: signed keys (offline), license server (online), or hybrid. Blocks production use of capability 22.3. |
 | D2 | [#252](https://github.com/DevNullLtd/Yuzu/issues/252) | CEL is a custom subset, not full Common Expression Language | **Closed — not planned** (NOT_PLANNED, 2026-07-14) — decided to keep the custom CEL subset; full `cel-cpp` adoption will not be pursued |
-| D3 | #556 | 16.B sequencing — accept the early Linux start and drop the 16.A-soak gate, or pause 16.B | **Open** — pending (PO) since 2026-09-07 |
-| D4 | #256–#262 | Phase 9 connector placement — core estate-fact collection or a use-case engine | **Open** — the draft network-element connector ADRs (0067/0068, PR #5367) bear on it |
-| D5 | #6051 | ADR-1005 placement of the cryptographic asset inventory | **Open** — ADR-0070 has merged; the issue is still open |
-| D6 | #2665 | ADR-0032 (b): reconcile run confinement with ADR-0017 additive authorization | **Open** |
+| D3 | [#556](https://github.com/DevNullLtd/Yuzu/issues/556) | 16.B sequencing — accept the early Linux start and drop the 16.A-soak gate, or pause 16.B | **Open** — pending (PO) since 2026-09-07 |
+| D4 | [#256](https://github.com/DevNullLtd/Yuzu/issues/256)–[#262](https://github.com/DevNullLtd/Yuzu/issues/262) | Phase 9 connector placement — core estate-fact collection or a use-case engine | **Open** — the draft network-element connector ADRs (0067/0068, PR #5367) bear on it |
+| D5 | [#6051](https://github.com/DevNullLtd/Yuzu/issues/6051) | ADR-1005 placement of the cryptographic asset inventory | **Open** — ADR-0070 has merged; the issue is still open |
+| D6 | [#2665](https://github.com/DevNullLtd/Yuzu/issues/2665) | ADR-0032 (b): reconcile run confinement with ADR-0017 additive authorization | **Open** |
 | D7 | — | Recommended execution order (below) | **Open** — under owner review (2026-11-14) |
 
 ## Future Phase (T3 Items — Not Scheduled)

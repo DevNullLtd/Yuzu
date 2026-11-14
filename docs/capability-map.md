@@ -1,6 +1,6 @@
 # Yuzu Capability Map
 
-**Version:** 4.1 | **Date:** 2026-11-14 | **Status:** v4.1 re-baseline against dev @ 628b88894 (see Method)
+**Version:** 4.1 | **Date:** 2026-11-14 | **Status:** v4.1 re-baseline against dev @ 2c49b4ea0 (see Method)
 
 ---
 
@@ -36,7 +36,7 @@ Each capability is rated on two axes:
 > T3 `12 13 21 46`.
 > **v4.1 re-verification (2026-11-14).** A row-by-row audit of this file against the code (taken
 > at dev @ 54c5c2b37, 2026-11-13) was applied here and its claims re-checked against the code at
-> dev @ 628b88894 (no source change from 2c49b4ea0, against which the counts were taken). It
+> dev @ 2c49b4ea0, against which the counts were taken. It
 > demoted §3.6, §10.13 and §20.3, promoted §4.11, §5.4, §27.2, §29.2 and §35.3, corrected
 > over-claims and stale line cites across most domains, and added 48 rows for shipped work the
 > map did not list (34 Done, 13 Partial, 1 Not Started), including the new domain 42. Counts
@@ -497,7 +497,7 @@ date, and scan timestamp. `get_fleet_patch_summary()` returns per-KB missing cou
 `get_missing_patches()` and `get_installed_patches()` support severity and agent filtering — all
 correctly implemented, but **`record_patches()`, the only method that writes `patch_inventory`,
 has no production caller** (verified by grep — pre-existing, predates the Postgres migration),
-so every one of these reads returns empty in any real deployment today. See #3676. Agent-side, missing-update data does exist: `windows_updates.missing` (§8.10) reports it per device on demand, but nothing feeds it into `patch_inventory`.
+so every one of these reads returns empty in any real deployment (verified 2026-11-14). See #3676. Agent-side, missing-update data does exist: `windows_updates.missing` (§8.10) reports it per device on demand, but nothing feeds it into `patch_inventory`.
 
 ### 8.6 Reboot Management (Post-Patch) :x: `T2`
 
@@ -1621,7 +1621,7 @@ TLS-by-default images shipped (#1314, merged 2026-06-21). Management-plane SPKI 
 
 ### 37.6 Single CRL Publisher :white_check_mark: `T2` *(new row, v4.1)*
 
-`CrlPublisher` (`server/core/src/crl_publisher.{hpp,cpp}`, HA WS-6 slice 6.1) behind `GET /api/v1/ca/crl`, wrapping `CaStore::publish_next_crl` — the single CRL publisher, which reads the revoked set under its table lock; the revoked set is append-only (a trigger keeps revoked rows). `is_revoked()`, the mTLS-accept gate, fails closed on any degradation. *(Evidence: `docs/pki-architecture.md` "Catastrophic invariants"; `server.cpp` `crl_publisher_`.)*
+`CrlPublisher` (`server/core/src/crl_publisher.{hpp,cpp}`, HA WS-6 slice 6.1) wrapping `CaStore::publish_next_crl` — the single CRL publisher, which reads the revoked set under its table lock; the revoked set is append-only (a trigger keeps revoked rows). The public `GET /api/v1/ca/crl` only serves the latest published CRL and never signs; publishing runs at boot, on the leader-gated freshness tick, and on the revoke and import paths. `is_revoked()`, the mTLS-accept gate, fails closed on any degradation. *(Evidence: `docs/pki-architecture.md` "Catastrophic invariants"; `server.cpp` `crl_publisher_`.)*
 
 ### 37.7 Gateway Management-Plane Authorization :large_orange_diamond: `T2` *(new row, v4.1)*
 
@@ -1774,7 +1774,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 ## 42. Endpoint Security Posture *(new domain, v4.1)*
 
-*Read-only posture facts from the endpoint's own security controls, reported as facts, never as verdicts. Every plugin here reports a failed or refused read as `unreadable`/`constrained` with a named token, never as "absent" or "not hardened". One plugin (`rdp_control`) also has a gated mutating action. Previously visible only in Appendix A. `app_control` (WDAC/AppLocker posture) stays at §9.10.*
+*Read-only posture facts from the endpoint's own security controls, reported as facts, never as verdicts. Every plugin here reports a failed or refused read as `unreadable`/`constrained` with a named token, never as "absent" or "not hardened" — except the disclosed `firmware_posture` cases where a failure cannot be told from an absence (§42.6; #4897, #4900). One plugin (`rdp_control`) also has a gated mutating action. Previously visible only in Appendix A. `app_control` (WDAC/AppLocker posture) stays at §9.10.*
 
 ### 42.1 Secure Boot and Code-Integrity Posture :white_check_mark: `T2` *(new row, v4.1)*
 

@@ -5,7 +5,8 @@ status-note: >-
   it on merge, and it is merged. The runner (#2321) has landed
   (`agents/core/src/subprocess_runner.cpp`, `agents/core/include/yuzu/agent/subprocess_launch_spec.hpp`,
   `runner_status.hpp`, with `tests/unit/test_subprocess_runner.cpp`), so the runner-routing
-  obligations are operative.
+  obligations are operative; the grandfathered raw-spawn sites remain frozen per Decision 1
+  (see `docs/agent-spawn-sink-manifest.md`).
 date: 2026-07-21
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
