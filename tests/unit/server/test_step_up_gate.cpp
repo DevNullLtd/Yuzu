@@ -2367,41 +2367,45 @@ TEST_CASE_METHOD(EquivFixture,
         }
     }
 
+    // Every cell runs against the ONE fixture this case builds: both entry points only READ the
+    // AuthDB (the MFA status of `alice`/`bob`/`ghost`) and `audits` is cleared per cell, so no cell
+    // can see another's effects. A DYNAMIC_SECTION per cell re-ran the whole case, fixture
+    // included (an AuthDB clone, two users and an MFA enrolment), once per cell. INFO names the
+    // failing cell exactly as the section name did.
     for (const auto& c : cells) {
-        DYNAMIC_SECTION(c.name << " / user=" << c.user << " mode=" << c.mode
-                               << " window=" << c.window) {
-            const auto session = make_session(c.user, c.source, c.role, c.verified_at);
+        INFO("cell: " << c.name << " / user=" << c.user << " mode=" << c.mode
+                      << " window=" << c.window);
+        const auto session = make_session(c.user, c.source, c.role, c.verified_at);
 
-            const auto verdict = decide_step_up(session, *db, c.window, c.mode);
+        const auto verdict = decide_step_up(session, *db, c.window, c.mode);
 
-            httplib::Request req;
-            httplib::Response res;
-            res.status = 200;
-            audits.clear();
-            const bool passed = require_mfa_step_up(req, res, session, *db, c.window, audit_fn,
-                                                    "POST /api/v1/whatever", c.mode);
+        httplib::Request req;
+        httplib::Response res;
+        res.status = 200;
+        audits.clear();
+        const bool passed = require_mfa_step_up(req, res, session, *db, c.window, audit_fn,
+                                                "POST /api/v1/whatever", c.mode);
 
-            // Both entry points against the hand-written expectation, never against each other.
-            CHECK(verdict.passed() == (c.expected_status == 200));
-            CHECK(passed == (c.expected_status == 200));
-            if (!passed) {
-                CHECK(res.status == c.expected_status);
-                // The renderer, called directly, writes the status the table expects.
-                httplib::Response direct;
-                render_step_up_refusal(req, direct, verdict, StepUpSurface::kRest);
-                CHECK(direct.status == c.expected_status);
-                auto a = body_of(direct);
-                auto b = body_of(res);
-                a["error"].erase("correlation_id");
-                b["error"].erase("correlation_id");
-                CHECK(a == b);
-                // One audit row per refusal, none on a pass.
-                CHECK(audits.size() == 1);
-            } else {
-                CHECK(res.status == 200);
-                CHECK(res.body.empty());
-                CHECK(audits.empty());
-            }
+        // Both entry points against the hand-written expectation, never against each other.
+        CHECK(verdict.passed() == (c.expected_status == 200));
+        CHECK(passed == (c.expected_status == 200));
+        if (!passed) {
+            CHECK(res.status == c.expected_status);
+            // The renderer, called directly, writes the status the table expects.
+            httplib::Response direct;
+            render_step_up_refusal(req, direct, verdict, StepUpSurface::kRest);
+            CHECK(direct.status == c.expected_status);
+            auto a = body_of(direct);
+            auto b = body_of(res);
+            a["error"].erase("correlation_id");
+            b["error"].erase("correlation_id");
+            CHECK(a == b);
+            // One audit row per refusal, none on a pass.
+            CHECK(audits.size() == 1);
+        } else {
+            CHECK(res.status == 200);
+            CHECK(res.body.empty());
+            CHECK(audits.empty());
         }
     }
 }

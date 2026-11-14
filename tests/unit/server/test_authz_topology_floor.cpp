@@ -65,6 +65,14 @@ using namespace yuzu::server;
 
 namespace {
 
+// The conninfo of an RbacStore that is NOT open: its connect fails at once (a Unix-domain socket
+// in a directory that does not exist, ENOENT, no network round trip), so the store's first lease
+// is empty and it reports !is_open(), which is all these cases need. The former unroutable
+// "host=192.0.2.1 port=1 connect_timeout=1" reached the same state only after libpq's 2 s
+// connect_timeout floor, paid once per store.
+constexpr const char* kUnopenableConninfo =
+    "host=/nonexistent/yuzu_test_no_such_dir port=1 connect_timeout=1";
+
 // AuditStore migrated to Postgres (ADR-0006) — mirrors
 // test_auth_routes_hardened.cpp's HardenedHarness: a template-cloned
 // ephemeral database + pool, cached once and cloned per fixture
@@ -1280,7 +1288,7 @@ TEST_CASE("forensics visibility: the resolver's dependencies are the auth routes
     // An unreachable management-group store behind the auth routes does not turn a definitive
     // denial into Unknown: the resolver never reads it.
     yuzu::server::pg::PgPool bad_pool{
-        {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+        {.conninfo = kUnopenableConninfo, .size = 1}};
     ManagementGroupStore bad_mgmt(bad_pool);
     REQUIRE_FALSE(bad_mgmt.is_open());
     AuthRoutes ar_bad_mgmt(rig.cfg, rig.auth_mgr, &rig.rbac, rig.api_tokens.get(),
@@ -1440,7 +1448,7 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         // for an ordinary session exactly as it does for an engine principal, so a surface shows
         // the retryable error or notice instead of a 200 with the Forensics rows silently missing.
         yuzu::server::pg::PgPool bad_pool{
-            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+            {.conninfo = kUnopenableConninfo, .size = 1}};
         RbacStore bad_rbac(bad_pool);
         REQUIRE_FALSE(bad_rbac.is_open());
         AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(),
@@ -1460,7 +1468,7 @@ TEST_CASE("forensics visibility: a degraded or unwired input is Unknown, a defin
         REQUIRE(raw.has_value());
         auto req = rig.bearer_request(*raw);
         yuzu::server::pg::PgPool bad_pool{
-            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+            {.conninfo = kUnopenableConninfo, .size = 1}};
         RbacStore bad_rbac(bad_pool);
         REQUIRE_FALSE(bad_rbac.is_open());
         AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(),
@@ -1491,7 +1499,11 @@ struct DegradedReplica {
     // `audit` (optional) is the audit sink this replica's AuthRoutes writes its denial rows to, for
     // the cases that assert the audit trail; the default keeps the existing cases audit-free.
     explicit DegradedReplica(ForensicsVisRig& rig, AuditStore* audit = nullptr)
-        : pool{{.conninfo = rig.rbac_bundle.dsn(), .size = 1}}, store{pool},
+        : DegradedReplica(rig, audit, rig.rbac_bundle.dsn()) {}
+    // The same replica over ANOTHER rbac_store database (`rbac_dsn`), for a case that needs two
+    // durable RBAC states at once; everything else (sessions, tokens, engines) is the rig's.
+    DegradedReplica(ForensicsVisRig& rig, AuditStore* audit, const std::string& rbac_dsn)
+        : pool{{.conninfo = rbac_dsn, .size = 1}}, store{pool},
           ar{rig.cfg,           rig.auth_mgr,          &store,        rig.api_tokens.get(),
              audit,             &rig.mgmt,             /*tag_store=*/nullptr,
              /*analytics_store=*/nullptr, rig.oidc_mu, rig.oidc_provider} {
@@ -1628,31 +1640,58 @@ TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an u
         CHECK(d.ar.probe_permission_unavailable_aware(ana, res, "Forensics", "Read"));
     }
 
-    SECTION("a starved pool") {
-        DegradedReplica d(rig);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
-        auto held = d.pool.acquire();
-        REQUIRE(held);
-        expect_aware_503(d, ana);
-        expect_default_403(d, ana);
-    }
+    SECTION("a starved pool, an open breaker, and a service-scoped token over a starved pool") {
+        // Three replicas, each with its own one-connection pool, breaker and counters, share ONE
+        // 1.1 s wait for their refresh gates to clear instead of one wait each; each scenario then
+        // starves its own pool and keeps the assertions it had as its own section.
+        REQUIRE(rig.auth_mgr.upsert_user("minter", "password1234", auth::Role::admin));
+        REQUIRE(rig.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
+        auto raw = rig.api_tokens->create_token("svc", "minter", forensics_vis_now() + 3600, "billing");
+        REQUIRE(raw.has_value());
+        auto svc = rig.bearer_request(*raw);
+        DegradedReplica starved(rig);
+        DegradedReplica breaker(rig);
+        DegradedReplica svc_replica(rig);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gates
+        // Each scenario must still see a FRESH view when it starts (its answer comes from the
+        // starved read, not the stale-view path): on a starved runner the shared wait plus the
+        // earlier scenarios could outlast the 5 s stale bound, and that must fail here, loudly,
+        // rather than pass by the other path.
 
-    SECTION("an open breaker") {
-        DegradedReplica d(rig);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-        auto held = d.pool.acquire();
-        REQUIRE(held);
-        // Two uncached misses reach the trip threshold.
-        CHECK_FALSE(d.store.check_permission("ana", "Forensics", "Write"));
-        CHECK_FALSE(d.store.check_permission("ana", "Forensics", "Delete"));
-        REQUIRE(d.store_metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
-        expect_aware_503(d, ana);
-        expect_default_403(d, ana);
+        { // a starved pool
+            DegradedReplica& d = starved;
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded());
+            auto held = d.pool.acquire();
+            REQUIRE(held);
+            expect_aware_503(d, ana);
+            expect_default_403(d, ana);
+        }
+        { // an open breaker
+            DegradedReplica& d = breaker;
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded());
+            auto held = d.pool.acquire();
+            REQUIRE(held);
+            // Two uncached misses reach the trip threshold.
+            CHECK_FALSE(d.store.check_permission("ana", "Forensics", "Write"));
+            CHECK_FALSE(d.store.check_permission("ana", "Forensics", "Delete"));
+            REQUIRE(d.store_metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+            expect_aware_503(d, ana);
+            expect_default_403(d, ana);
+        }
+        { // a service-scoped token is unchanged: a degraded read is still a definitive 403
+            DegradedReplica& d = svc_replica;
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded());
+            auto held = d.pool.acquire();
+            REQUIRE(held);
+            httplib::Response res;
+            CHECK_FALSE(d.ar.probe_permission_unavailable_aware(svc, res, "Forensics", "Read"));
+            CHECK(res.status == 403); // the allow-list refuses it whatever the store says
+        }
     }
 
     SECTION("a store that is not open") {
         yuzu::server::pg::PgPool bad_pool{
-            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+            {.conninfo = kUnopenableConninfo, .size = 1}};
         RbacStore bad_rbac(bad_pool);
         REQUIRE_FALSE(bad_rbac.is_open());
         AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(),
@@ -1682,20 +1721,6 @@ TEST_CASE("AuthRoutes: probe_permission_unavailable_aware answers 503 where an u
         expect_default_403(d, req);
     }
 
-    SECTION("a service-scoped token is unchanged: a degraded read is still a definitive 403") {
-        REQUIRE(rig.auth_mgr.upsert_user("minter", "password1234", auth::Role::admin));
-        REQUIRE(rig.rbac.assign_role({"user", "minter", "Administrator"}).has_value());
-        auto raw = rig.api_tokens->create_token("svc", "minter", forensics_vis_now() + 3600, "billing");
-        REQUIRE(raw.has_value());
-        auto req = rig.bearer_request(*raw);
-        DegradedReplica d(rig);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-        auto held = d.pool.acquire();
-        REQUIRE(held);
-        httplib::Response res;
-        CHECK_FALSE(d.ar.probe_permission_unavailable_aware(req, res, "Forensics", "Read"));
-        CHECK(res.status == 403); // the allow-list refuses it whatever the store says
-    }
 }
 
 TEST_CASE("AuthRoutes: an engine principal's gate decides 'RBAC is off' from the enforcement view, "
@@ -1755,21 +1780,26 @@ TEST_CASE("AuthRoutes: an engine principal's gate decides 'RBAC is off' from the
         CHECK(is_global(resolve_forensics_visible(d.deps(rig), req)));
     }
 
-    SECTION("a stale-false view whose refresh succeeds adopts the enable and admits the granted engine") {
-        DegradedReplica d(rig); // loaded while RBAC was off: cached false
-        rig.rbac.set_rbac_enabled(true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
-        expect_status(d, 200, 200);
-    }
-
-    SECTION("a stale-false view whose refresh keeps failing is Unknown under the opt-in, 403 by default") {
-        DegradedReplica d(rig); // loaded while RBAC was off: cached false
-        rig.rbac.set_rbac_enabled(true); // another replica enables; this one cannot observe it
-        auto held = d.pool.acquire();    // starve the refresh and every role read on this replica
+    SECTION("a stale-false view whose refresh succeeds adopts the enable and admits the granted "
+            "engine; one whose refresh keeps failing is Unknown under the opt-in, 403 by default") {
+        // Two replicas, each with its own pool and cache, loaded together and aged through ONE
+        // window: `adopts` is checked once its refresh gate clears, `starved` once past the bound.
+        DegradedReplica adopts(rig);  // loaded while RBAC was off: cached false
+        DegradedReplica starved(rig); // likewise
+        const auto loaded = std::chrono::steady_clock::now();
+        rig.rbac.set_rbac_enabled(true); // another replica enables
+        // `starved` cannot observe it: its pool's one connection is held, which starves its
+        // refresh and every role read on it. `adopts` has its own pool and reads freely.
+        auto held = starved.pool.acquire();
         REQUIRE(held);
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+        expect_status(adopts, 200, 200);
+
+        DegradedReplica& d = starved;
         // Past kRbacStaleServeBoundMs the cached false is no longer proof of "disabled".
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+        std::this_thread::sleep_until(loaded + std::chrono::milliseconds(5200));
         while (!d.store.rbac_enabled_view_degraded() &&
                std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1896,9 +1926,12 @@ TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view admits no en
 
     // The replica loaded while RBAC was off (cached false); another replica then enables it; the
     // refresh on THIS replica cannot read `rbac_meta`, while every role and permission read works.
-    auto wait_until_view_degraded = [&](DegradedReplica& d) {
+    // `not_before` is a time taken AFTER the replica was constructed (its last successful
+    // refresh), so sleeping until 5.2 s past it puts the replica past kRbacStaleServeBoundMs.
+    auto wait_until_view_degraded = [&](DegradedReplica& d,
+                                        std::chrono::steady_clock::time_point not_before) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-        std::this_thread::sleep_for(std::chrono::milliseconds(5200)); // past kRbacStaleServeBoundMs
+        std::this_thread::sleep_until(not_before + std::chrono::milliseconds(5200));
         while (!d.store.rbac_enabled_view_degraded() &&
                std::chrono::steady_clock::now() < deadline)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1907,62 +1940,114 @@ TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view admits no en
         REQUIRE(rbac_enforcement_label(&d.store) == RbacEnforcementLabel::kDegraded);
     };
 
-    SECTION("durable RBAC enabled, the cached false view degraded past the bound, the refresh "
-            "failing, the grant read healthy - the GRANTED engine is NOT admitted: a definitive "
-            "403 by default, a retryable 503 and an Unknown resolver answer under the opt-in") {
-        DegradedReplica d(rig, &audit);
-        rig.rbac.set_rbac_enabled(true);
-        RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
-        fault.arm();
-        wait_until_view_degraded(d);
-        CHECK(d.degrade("generation_refresh_failed") >= 1.0); // the refresh really is failing
-        // The enforcement state is unconfirmed, so `engine_grant_checked` refuses before it reads
-        // any grant (the same answer the list-read and fleet-read engine gates give). The default
-        // mapping keeps the terminal 403; only the opt-in mapping reports the outage.
-        expect_403(gate(d.ar, granted, /*opt_in=*/false));
-        expect_unavailable_503(gate(d.ar, granted, /*opt_in=*/true));
-        const auto before = rig.withheld("rbac_unavailable");
-        std::size_t rows = 0;
-        CHECK(is_unknown(resolve(d, granted, rows), ForensicsUnknown::RbacUnavailable));
-        CHECK(rows == 1);
-        CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
-        CHECK(d.degrade("query_error") == 0.0); // no grant read was attempted or failed
-    }
+    SECTION("a cached false view whose refresh keeps failing, the grant read healthy: inside the "
+            "5 s bound a definitive 403; past it NO engine is admitted, granted or not, with RBAC "
+            "ON or OFF in the database - a definitive 403 by default, a retryable 503 and an "
+            "Unknown resolver answer under the opt-in") {
+        // Four replicas, one per scenario, each with its own pool, cache and degrade counters,
+        // age through ONE stale-serve window instead of one window each (each window is a real
+        // 5 s of kRbacStaleServeBoundMs). Every scenario keeps the assertions it had as its own
+        // section; the counters it reads are its replica's own or are compared before/after.
+        //
+        // `rbac_off_bundle` is a second rbac_store database whose durable flag STAYS OFF, holding
+        // the same engine grant: the RBAC-off scenario needs a database in that state while the
+        // rig's database is enabled for the others. (A replica cannot read `rbac_meta` in either
+        // database once the fault is armed; the database state is what the scenario is about.)
+        yuzu::test::RbacStorePg rbac_off_bundle;
+        RbacStore& rbac_off = *rbac_off_bundle;
+        REQUIRE(rbac_off.create_role({"EngineForensicsRead10", "", false, 0}).has_value());
+        REQUIRE(rbac_off.set_permission({"EngineForensicsRead10", "Forensics", "Read", "allow"})
+                    .has_value());
+        REQUIRE(rbac_off.assign_role({"engine", "engine:vuln10", "EngineForensicsRead10"})
+                    .has_value());
+        REQUIRE_FALSE(rbac_off.is_rbac_enabled());
 
-    SECTION("the same degraded view with NO grant: the same answers as the granted engine, because "
-            "no grant is read") {
-        DegradedReplica d(rig, &audit);
-        rig.rbac.set_rbac_enabled(true);
+        // All loaded while RBAC is off in both databases: cached false.
+        DegradedReplica on_granted(rig, &audit);
+        DegradedReplica on_ungranted(rig, &audit);
+        DegradedReplica off_granted(rig, &audit, rbac_off_bundle.dsn());
+        DegradedReplica within(rig, &audit);
+        const auto loaded = std::chrono::steady_clock::now();
+        rig.rbac.set_rbac_enabled(true); // the rig's database only; rbac_off stays off
         RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
         fault.arm();
-        wait_until_view_degraded(d);
-        expect_403(gate(d.ar, ungranted, /*opt_in=*/false));
-        expect_unavailable_503(gate(d.ar, ungranted, /*opt_in=*/true));
-        const auto before = rig.withheld("rbac_unavailable");
-        std::size_t rows = 0;
-        CHECK(is_unknown(resolve(d, ungranted, rows), ForensicsUnknown::RbacUnavailable));
-        CHECK(rows == 1);
-        CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
-        CHECK(d.degrade("query_error") == 0.0);
-    }
+        RoleReadFault off_fault(rbac_off_bundle.dsn(), "rbac_meta");
+        off_fault.arm();
 
-    SECTION("RBAC OFF in the database, the cached false view degraded past the bound, the grant "
-            "read healthy - the granted engine is NOT admitted") {
-        // The case the unconfirmed state exists for: the view cannot say whether RBAC is on, and
-        // here it is off. An engine holds no legacy fallback, so admitting it on its grant alone
-        // would grant authority a fresh view would refuse. (Durable RBAC stays off: no
-        // `set_rbac_enabled(true)`.)
-        DegradedReplica d(rig, &audit);
-        RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
-        fault.arm();
-        wait_until_view_degraded(d);
-        expect_403(gate(d.ar, granted, /*opt_in=*/false));
-        expect_unavailable_503(gate(d.ar, granted, /*opt_in=*/true));
-        const auto before = rig.withheld("rbac_unavailable");
-        std::size_t rows = 0;
-        CHECK(is_unknown(resolve(d, granted, rows), ForensicsUnknown::RbacUnavailable));
-        CHECK(rows == 1);
-        CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
+        // (1) INSIDE the bound: a stale-false view with the refresh failing is a definitive 403.
+        // The narrowed window b3293b2d8's message overstates ("only a view proven fresh and
+        // disabled is refused"): "fresh" means refreshed within kRbacStaleServeBoundMs, so a
+        // stale-false replica whose refreshes are failing still answers the definitive 403 until
+        // the bound passes. It fails CLOSED (a refusal, never an admission), identically to the
+        // ordinary RBAC branch; the opt-in mapping cannot report 503 because the typed check is
+        // never reached. This pins that boundary so a later change to it is deliberate. Checked
+        // first, so nothing below has moved the withheld counters yet.
+        {
+            DegradedReplica& d = within;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+            REQUIRE_FALSE(d.store.is_rbac_enabled()); // attempts the refresh, which fails; still false
+            REQUIRE_FALSE(d.store.rbac_enabled_view_degraded()); // ~1.1 s < the 5 s bound
+            REQUIRE(rbac_enforcement_label(&d.store) == RbacEnforcementLabel::kDisabled);
+            CHECK(d.degrade("generation_refresh_failed_within_bound") >= 1.0);
+            expect_403(gate(d.ar, granted, /*opt_in=*/false));
+            expect_403(gate(d.ar, granted, /*opt_in=*/true)); // even the GRANTED engine
+            std::size_t rows = 0;
+            CHECK(is_present_empty(resolve(d, granted, rows)));
+            CHECK(rows == 1);
+            no_withheld();
+        }
+
+        // (2) Durable RBAC enabled, the cached false view degraded past the bound, the refresh
+        // failing, the grant read healthy - the GRANTED engine is NOT admitted.
+        {
+            DegradedReplica& d = on_granted;
+            wait_until_view_degraded(d, loaded);
+            CHECK(d.degrade("generation_refresh_failed") >= 1.0); // the refresh really is failing
+            // The enforcement state is unconfirmed, so `engine_grant_checked` refuses before it
+            // reads any grant (the same answer the list-read and fleet-read engine gates give).
+            // The default mapping keeps the terminal 403; only the opt-in mapping reports the
+            // outage.
+            expect_403(gate(d.ar, granted, /*opt_in=*/false));
+            expect_unavailable_503(gate(d.ar, granted, /*opt_in=*/true));
+            const auto before = rig.withheld("rbac_unavailable");
+            std::size_t rows = 0;
+            CHECK(is_unknown(resolve(d, granted, rows), ForensicsUnknown::RbacUnavailable));
+            CHECK(rows == 1);
+            CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
+            CHECK(d.degrade("query_error") == 0.0); // no grant read was attempted or failed
+        }
+
+        // (3) The same degraded view with NO grant: the same answers as the granted engine,
+        // because no grant is read.
+        {
+            DegradedReplica& d = on_ungranted;
+            wait_until_view_degraded(d, loaded);
+            expect_403(gate(d.ar, ungranted, /*opt_in=*/false));
+            expect_unavailable_503(gate(d.ar, ungranted, /*opt_in=*/true));
+            const auto before = rig.withheld("rbac_unavailable");
+            std::size_t rows = 0;
+            CHECK(is_unknown(resolve(d, ungranted, rows), ForensicsUnknown::RbacUnavailable));
+            CHECK(rows == 1);
+            CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
+            CHECK(d.degrade("query_error") == 0.0);
+        }
+
+        // (4) RBAC OFF in the database, the cached false view degraded past the bound, the grant
+        // read healthy - the granted engine is NOT admitted. The case the unconfirmed state exists
+        // for: the view cannot say whether RBAC is on, and here it is off. An engine holds no
+        // legacy fallback, so admitting it on its grant alone would grant authority a fresh view
+        // would refuse.
+        {
+            DegradedReplica& d = off_granted;
+            wait_until_view_degraded(d, loaded);
+            expect_403(gate(d.ar, granted, /*opt_in=*/false));
+            expect_unavailable_503(gate(d.ar, granted, /*opt_in=*/true));
+            const auto before = rig.withheld("rbac_unavailable");
+            std::size_t rows = 0;
+            CHECK(is_unknown(resolve(d, granted, rows), ForensicsUnknown::RbacUnavailable));
+            CHECK(rows == 1);
+            CHECK(rig.withheld("rbac_unavailable") == before + 1.0);
+        }
     }
 
     SECTION("a healthy, enforced view: the granted engine is admitted and the ungranted one is a "
@@ -1978,33 +2063,9 @@ TEST_CASE("AuthRoutes: an engine principal's gate - a degraded view admits no en
         no_withheld();
     }
 
-    SECTION("a stale-false view INSIDE the 5 s bound with the refresh failing is a definitive 403") {
-        // The narrowed window b3293b2d8's message overstates ("only a view proven fresh and
-        // disabled is refused"): "fresh" means refreshed within kRbacStaleServeBoundMs, so a
-        // stale-false replica whose refreshes are failing still answers the definitive 403 until
-        // the bound passes. It fails CLOSED (a refusal, never an admission), identically to the
-        // ordinary RBAC branch; the opt-in mapping cannot report 503 because the typed check is
-        // never reached. This pins that boundary so a later change to it is deliberate.
-        DegradedReplica d(rig, &audit);
-        rig.rbac.set_rbac_enabled(true);
-        RoleReadFault fault(rig.rbac_bundle.dsn(), "rbac_meta");
-        fault.arm();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
-        REQUIRE_FALSE(d.store.is_rbac_enabled()); // attempts the refresh, which fails; still false
-        REQUIRE_FALSE(d.store.rbac_enabled_view_degraded()); // 1.1 s < the 5 s bound
-        REQUIRE(rbac_enforcement_label(&d.store) == RbacEnforcementLabel::kDisabled);
-        CHECK(d.degrade("generation_refresh_failed_within_bound") >= 1.0);
-        expect_403(gate(d.ar, granted, /*opt_in=*/false));
-        expect_403(gate(d.ar, granted, /*opt_in=*/true)); // even the GRANTED engine
-        std::size_t rows = 0;
-        CHECK(is_present_empty(resolve(d, granted, rows)));
-        CHECK(rows == 1);
-        no_withheld();
-    }
-
     SECTION("a store that is not open: 503 under both mappings, with the permission field") {
         yuzu::server::pg::PgPool bad_pool{
-            {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+            {.conninfo = kUnopenableConninfo, .size = 1}};
         RbacStore bad_rbac(bad_pool);
         REQUIRE_FALSE(bad_rbac.is_open());
         AuthRoutes bad_ar(rig.cfg, rig.auth_mgr, &bad_rbac, rig.api_tokens.get(), &audit, &rig.mgmt,
