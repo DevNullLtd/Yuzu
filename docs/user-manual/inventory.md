@@ -412,6 +412,40 @@ cadences.
   installed-software inventory. Deploy-time opt-out; not a server-side runtime
   toggle. It does not gate the operator `list`/`query`/`list_per_user` actions.
 
+### Java components (`component_inventory`)
+
+The `component_inventory` plugin's `scan` action (instruction `crossplatform.components.scan`) lists
+software that no package manager owns: Java archives (`.jar`, `.war`, `.ear`) found in application
+trees, and the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF/lib/` or `lib/`).
+It reads the archive files themselves in-process; nothing is started or unpacked.
+
+- **Where.** Linux and macOS only, in machine-wide locations only. Linux: `/opt`,
+  `/usr/share/java`, `/usr/lib/jvm`, `/usr/local/lib`, `/usr/local/share` and `/usr/share/maven`.
+  macOS: `/Applications`, `/Library/Java`, `/usr/local` and `/opt/homebrew`. Per-user locations
+  are never scanned, so an archive under a home directory is not listed. Windows is not read
+  yet: it answers one `unsupported` status row (`windows:planned`). Python and Node components
+  are not collected.
+- **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
+  `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
+  `<archive path>!<entry>`), size, modification time and the application folder it sits under.
+- **Bounds.** One scan stops at 400,000 directory entries or 45 seconds, reads at most 32
+  directory levels, 50,000 entries per directory, 3,000 rows per application folder and 20,000 rows
+  in all, and reads at most a 16 MiB archive directory and 64 KiB per version entry.
+- **When the list may be incomplete.** The status row reads `constrained` when any bound was
+  reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`), a directory
+  could not be listed (`dir_unreadable`) or was cut at its cap (`dir_truncated`), an archive could
+  not be enumerated or changed while it was read (`archive_unenumerated`, `archive_changed`), or the
+  mount table could not be read so nothing was walked (`mount_table_unreadable`). Each token is
+  prefixed `<os>:component_inventory:`. The rows that were reachable are still returned. Only
+  `supported` means the scan finished with nothing hidden.
+- **Reported without blocking the answer.** A root dropped because it is a link
+  (`root_link_skipped`), a root or directory on a network mount that was passed over
+  (`network_fs_skipped`) and a row with no readable version (`version_unreadable`) ride the
+  `supported` status row as information. Missing roots and system trees such as `Windows` or
+  `System` directories are skipped silently.
+- **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
+  yet, so they do not appear in the software inventory views.
+
 ### Install type, scope and location, and the sectioned report
 
 Each stored software row carries four more attributes. They are read-side facts today: the

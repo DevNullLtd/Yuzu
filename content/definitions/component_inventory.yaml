@@ -1,0 +1,128 @@
+## Component Inventory Definitions
+## Reports Java archives and the libraries nested inside them, found by reading application
+## trees. Read-only, zero subprocess.
+## Plugin: component_inventory | Action: scan
+##
+## SHIPPED LEGS: Linux and macOS, machine-wide roots only (per-user locations are never read).
+## Windows is planned: it answers one `unsupported` status row (`windows:planned`).
+##   Linux:   /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and
+##            /usr/share/maven.
+##   macOS:   /Applications, /Library/Java, /usr/local and /opt/homebrew.
+##   Both:    a root that is missing is not an error; a root reached through a link or sitting on
+##            a network mount is dropped and reported. No link is followed at any path component.
+##            Network mounts are read from /proc/self/mountinfo (Linux) or getmntinfo_r_np (macOS).
+## Candidates are files ending .jar, .war or .ear. For each one the archive's central directory
+## is read in-process; the libraries nested one level deep (BOOT-INF/lib/, WEB-INF/lib/ or lib/)
+## are listed from that directory alone, none is unpacked.
+##
+## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
+## entries per directory listing, 3,000 rows per top-level application folder, 20,000 rows in all,
+## a 16 MiB archive directory, 64 KiB per version entry read.
+##
+## Output: one `status|scan|<level>|<tokens>` row FIRST, then zero or more
+## `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>` rows.
+## A `supported` status means the scan finished with nothing hidden; it does not mean nothing is
+## installed outside the roots above. A `constrained` status means a bound was hit, a directory
+## or an archive could not be read in full, or the mount table was unreadable: the list may be
+## incomplete, and the rows that were reachable are still returned.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.components.scan
+  displayName: Component Inventory
+  version: 1.0.0
+  description: >
+    Reports Java archives (.jar, .war, .ear) and the libraries nested one level inside them,
+    found under the machine-wide application roots: one row per archive and per nested library
+    (name, version and where the version came from, path, size, modification time and the
+    application folder it sits under). Linux and macOS only; per-user locations are not read and
+    Windows is not read yet. Nothing is started or unpacked. A `supported` status means the scan
+    finished with nothing hidden; a `constrained` status means a bound was hit or something could
+    not be read in full, so the list may be incomplete.
+  tags: [components, java, inventory]
+
+spec:
+  type: question
+  platforms: [darwin, linux]
+
+  execution:
+    plugin: component_inventory
+    action: scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # status|scan|<level>|<tokens or ->   (always first)
+    # comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>
+    columns:
+      - name: row_kind
+        type: string
+        description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), comp (one per archive or nested library found).'
+        values: [status, comp]
+        example: comp
+        platforms: [darwin, linux]
+      - name: kind
+        type: string
+        description: 'Component kind. Values: java. Status rows: the action name (scan).'
+        example: java
+        platforms: [darwin, linux]
+      - name: name
+        type: string
+        description: 'Artifact name taken from the file name, without the version and extension (log4j-core-2.17.1.jar reads log4j-core). A name with bytes outside printable ASCII is kept with those bytes shown as ?. Status rows: the level (supported, constrained or unsupported).'
+        example: log4j-core
+        platforms: [darwin, linux]
+      - name: version
+        type: string
+        description: 'Version from the file name, else from the archive''s pom.properties, else from its MANIFEST.MF; empty when none gives one. Nested libraries take it from the entry name only. Status rows: the comma-joined cause tokens, or -.'
+        example: 2.17.1
+        platforms: [darwin, linux]
+      - name: version_source
+        type: string
+        description: 'Where the version came from. Values: filename, pom, manifest, unreadable (no source gave a version; the row is still listed and the scan is not made incomplete by it).'
+        values: [filename, pom, manifest, unreadable]
+        example: filename
+        platforms: [darwin, linux]
+      - name: path
+        type: string
+        description: 'Absolute path of the archive; a nested library is <archive path>!<entry name>.'
+        example: /opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar
+        platforms: [darwin, linux]
+      - name: size
+        type: int64
+        description: 'Size in bytes: the archive file size, or the nested entry''s uncompressed size.'
+        example: "1789769"
+        platforms: [darwin, linux]
+      - name: mtime
+        type: int64
+        description: 'Modification time of the archive file as Unix seconds; a nested library carries its archive''s.'
+        example: "1700000000"
+        platforms: [darwin, linux]
+      - name: anchor_app
+        type: string
+        description: 'First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root).'
+        example: app
+        platforms: [darwin, linux]
+
+  readablePayload: "Scan application trees for Java components"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [component_inventory]
+
+status:
+  phase: active

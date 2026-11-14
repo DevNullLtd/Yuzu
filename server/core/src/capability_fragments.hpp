@@ -38,6 +38,7 @@
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "capability_decls/plugin_action_catalogue_privacy_permissions.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
+#include "capability_decls/plugin_action_catalogue_component_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_system_hardening.hpp"
@@ -65,6 +66,7 @@
     ::yuzu::server::capdecls::plugin_action_catalogue_update_source_trust(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_app_control(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_firmware_posture(),\
+    ::yuzu::server::capdecls::plugin_action_catalogue_component_inventory(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_runtimes(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_platform_security(),\
     ::yuzu::server::capdecls::plugin_action_catalogue_browser_inventory(),\

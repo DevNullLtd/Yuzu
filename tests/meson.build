@@ -3793,6 +3793,16 @@ test('runtimes definition columns',
   timeout: 30,
 )
 
+# component_inventory's definition-column contract (content/definitions/component_inventory.yaml):
+# row_kind first and the column order match the comp wire row component_scan.hpp emits; parses the
+# YAML directly.
+test('component_inventory definition columns',
+  _python3_test,
+  args: [files('test_component_inventory_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # middleware's definition-column contract (content/definitions/middleware.yaml): row_kind first and the
 # column order match the wire row middleware_parsers.hpp emits; parses the YAML directly.
 test('middleware definition columns',

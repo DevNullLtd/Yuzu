@@ -1485,3 +1485,44 @@ on its own terms.
 
 Route via the normal review / `/governance` path. Record the accepting reviewer(s) + date here on
 acceptance.
+
+## Update (2026-11-14) — first slice shipped: Java archives on Linux and macOS, machine roots only
+
+**What shipped.** A `component_inventory` plugin with one action, `scan` (no parameters), and the
+definition `crossplatform.components.scan`. Kind: `java` — archives ending `.jar`, `.war` or `.ear`,
+plus the libraries nested one level inside them (`BOOT-INF/lib/`, `WEB-INF/lib/`, `lib/`), listed from
+the archive's central directory alone. OSes: Linux and macOS. Roots, machine-wide only, per Decision 1
+(per-user locations are never read): Linux `/opt`, `/usr/share/java`, `/usr/lib/jvm`, `/usr/local/lib`,
+`/usr/local/share`, `/usr/share/maven`; macOS `/Applications`, `/Library/Java`, `/usr/local`,
+`/opt/homebrew`. No link is followed at any path component, and a root on a network mount is dropped.
+The action runs on demand; the daily sync does not carry it yet.
+
+**Bounds as built.** 400,000 directory entries and 45 seconds per scan (one deadline covering the walk,
+the archive reads and the parsing, checked between directories and between archives, so one blocked
+read is not interrupted), 32 directory levels, 50,000 entries per directory listing, 3,000 rows per
+application folder, 20,000 rows per scan. Per archive: a 16 MiB central directory, 1,024-byte entry
+names, and the `pom.properties` and `MANIFEST.MF` entries read only up to 64 KiB compressed and 64 KiB
+inflated. ZIP64 archives are not enumerated.
+
+**Completeness rule as built (Decision 4).** The answer is `supported` (typed result OK/FULL) only when
+nothing was hidden. It is `constrained` (CONSTRAINED/PARTIAL), with the first cause as an
+`<os>:component_inventory:<cause>` token, for: `budget_entries`, `budget_time`, `section_rows`,
+`anchor_rows`, `depth`, `dir_unreadable`, `dir_truncated`, `archive_unenumerated` (an archive that could
+not be opened, read or parsed, ZIP64 included), `archive_changed` (an archive that changed while it was
+read) and `mount_table_unreadable` (nothing is walked, because a network mount could not be told from a
+local one). The rows that were reachable are returned at both levels. Reported but not blocking
+(informational tokens on a `supported` row): `root_link_skipped`, `network_fs_skipped` and
+`version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
+Directories of system trees (for example `Windows`, `System32`) are skipped silently.
+
+**Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
+(`zip_directory.hpp`: the end-record search, the directory walk and the local-header offset) with
+arbitrary bytes. It is registered in `tests/fuzz/meson.build` and `.clusterfuzzlite/build.sh` and runs
+in ClusterFuzzLite on pull requests (`cflite-pr.yml`) and in the batch run (`cflite-batch.yml`), both
+path-filtered to `zip_directory*`. The Java file-name, manifest and `pom.properties` parsers and the
+capped inflate are covered by unit tests only, not by a fuzz target.
+
+**Still open.** The Windows leg (answers `windows:planned` today); Python and Node kinds; the daily-report
+section and the amendment to Decision 3 that goes with it; the customer opt-out switch (Decision 2 and
+Decision 8); and the `component_inventory.future_dated_rejected` audit event, which belongs to the store
+that does not exist yet.
