@@ -1773,8 +1773,8 @@ flip, with a red-first test each:
     limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
-    #5719); (e) is tracked in #5719, and its tests are #5719 item 5 (tests only, no production change; status below); (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
-    **(e) status, #5719 item 5 (a test-only change; (e) stays OPEN).** The oracle is the literal one in (e):
+    #5719); (e) is tracked in #5719, and its tests are #5719 item 5 (tests for every mechanism plus one File-mechanism fix; status below); (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
+    **(e) status, #5719 item 5 (tests for every mechanism, plus one File-mechanism fix; (e) stays OPEN).** The oracle is the literal one in (e):
     within a bound the mechanism calls `fault()`, read as `engine.stats().armed_faulted == 1`; a watch
     that only drops its coverage, or only stops delivering, is a red test, not a pass; delivery after
     the object is repaired is a secondary check. All cases are in `tests/unit/test_spark_mechanism.cpp`,
@@ -1784,19 +1784,57 @@ flip, with a red-first test each:
     SKIPs where `dbus-daemon` is not installed), the parent kills the daemon and the child reaches
     `armed_faulted == 1`; on Windows, the File mechanism with a parent directory held pending-delete by
     a second handle (it faults, then recovers and fires once the holder closes and the path is
-    recreated) and with a failed ancestor re-arm plus a failing re-probe (it faults, the dead ancestor
-    is gone, it recovers when both injections are lifted). Covered and RED, kept red as the evidence
-    for a fix that is not part of this change: the File mechanism with the watched file's parent
-    directory renamed away, and the Registry mechanism with the parent of the watched key renamed
-    (`RegRenameKey`). In both the rename succeeds, the watch keeps reporting `Notification` coverage,
-    no `fault()` is called within the bound, and a change at the recreated original path does not fire:
-    a Healthy, silent, deaf watch, which is the loss (6) shape. NOT covered: the Windows Service
-    mechanism (owner ruling: deleting a Windows service needs administrator rights). Runs: Linux debug
-    (the Linux case 20 of 20 green; `[mechanism]`, `[5719]` and `[4415prA]` green); Windows (MSVC, a
-    single weecolin build of `origin/dev` `2c49b4ea0f` plus these tests) the two green File cases 20 of
-    20 each, the two red cases 5 of 5 red each, the rest of `[mechanism]` (167 cases), the other
-    `[5719]` cases (42) and `[4415prA]` (105 cases) green. No sanitizer, macOS or CI run. The set of cases is not a proof that no other deaf path exists in any
-    mechanism.
+    recreated), with a failed ancestor re-arm plus a failing re-probe (it faults, the dead ancestor
+    is gone, it recovers when both injections are lifted), and with the watched file's parent
+    directory renamed away, replaced by a different directory at the same path, or reached through a
+    junction whose target is renamed away. Those last cases are the fix in this change: an idle File
+    watch re-opens its directory path every `path_verify_interval` (5 s in production; a sampled check,
+    not continuous) on a detached worker and compares the directory identity (volume serial plus
+    `FileIdInfo` file id) with the identity its own handle was opened on; a different identity, or a
+    path that names nothing, faults the watch with the reason `file watch parent directory renamed or
+    replaced`, cancels the stale read, and hands the watch to the ordinary retry once the cancelled
+    read's completion has been consumed. Covered and still RED, kept red as the evidence for a fix
+    that is not part of this change: the Registry mechanism with the parent of the watched key
+    renamed (`RegRenameKey`): the rename succeeds, the watch keeps reporting `Notification` coverage,
+    no `fault()` is called within the bound, and a value write at the recreated original path does
+    not fire. NOT covered: the Windows Service mechanism (owner ruling: deleting a Windows service
+    needs administrator rights).
+    **Open residuals of the File fix** (none of these is claimed as covered): detection is sampled, so
+    a watch can be deaf for up to one interval and then stays Faulted until the retry (30 s in
+    production, the first backend retry) shelters or re-attaches it; a rename away and back between
+    two samples is not noticed; an ancestor shelter whose own parent is renamed away is
+    not verified; a watch whose directory gives no usable file id is never verified (on a FAT32 volume
+    on the rig no verification ran and the rename went undetected; ReFS, SMB, OneDrive and other
+    filesystems were not tested); a verification that cannot decide (open refused, no id, worker
+    threw) is counted and never faults, so a persistently undecidable path stays unverified; a
+    verification that hangs pins one of 4 verification slots and that watch stays unverified; when
+    all slots are busy a refused verification is retried after 50 ms, not a full interval. The one
+    branch of the fix no run reached: the stale read's completion arriving with a success status
+    rather than as an abort (it is meant to be dropped unfired); 40 runs with a writer changing the
+    renamed directory every time drained with an abort (`ok == 0`), and the mutation that restricts
+    that branch to aborts was not caught by any test.
+    Runs: Linux debug (`[mechanism]` 62 cases and `[5719]` 43 cases green; the File mechanism is
+    Windows-only, so nothing new runs there). Windows (MSVC, weecolin, this branch at the fix commit,
+    debug-type build without debug info): `[mechanism]` 176 cases, 175 green and the one red Registry
+    case; `[5719]` 51 cases, 50 green and the same red case; `[4415prA]` 105 cases green; each of the
+    six File cases added or changed by the fix (renamed away, idle healthy watch verified, replaced
+    directory, rename away and back, junction, no Fired event between Faulted and Recovered) 20 of
+    20 green. The Registry red case was run in the broad tags only. Mutation checks on Windows (3 runs of each of
+    the File cases per mutation): removing the idle-watch wake clause, treating every verification as
+    lost, comparing existence instead of identity, and routing detection through the generic backend
+    failure path (which enters the retry before the stale read drained) each turned at least one case
+    red; restricting the drain branch to aborts turned none red. The cancelled read's completion
+    was consumed in the same millisecond as detection in the one run whose log was read. The
+    identity read was stable across repeated opens on the NTFS temp volume (the healthy-watch case
+    requires none unverifiable and passed 20 of 20; the cost probe below saw none in about 5300
+    verifications), and the four File identity cases passed on a subst drive over that volume
+    (one run each); the junction case is one of the six above. A measurement of the
+    idle cost (a throw-away probe, not committed) at a 1 s interval over 30 s: 50 watched directories
+    1450 verifications and about 0.9 s more process CPU than the same run with the check effectively
+    off; 200 directories 3864 verifications and about 0.95 s more CPU; each verification runs on its own
+    short-lived thread, and run to run noise in the baseline was about 0.3 s, so these are order-of-magnitude
+    figures, not a budget. No sanitizer, macOS or CI run. The set of cases is not a proof that no other
+    deaf path exists in any mechanism.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
