@@ -87,6 +87,9 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
     /// agent_id -> hostname: the device table's roster (the one the UI device table reads).
     using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
+    /// The same roster, but a failed read is nullopt instead of an empty map. The hosts search
+    /// decides from the roster, so it must tell "no such device" from "the roster could not be read".
+    using RosterFn = std::function<std::optional<std::unordered_map<std::string, std::string>>()>;
     /// The current fleet snapshot, or null before the first successful refresh.
     using SnapshotFn = std::function<std::shared_ptr<const SoftwareFleetSnapshot>()>;
     using NowFn = std::function<std::int64_t()>; ///< epoch seconds; empty = the system clock
@@ -114,6 +117,7 @@ public:
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
         HostnamesFn hostnames_fn;
+        RosterFn roster_fn; ///< checked roster for the hosts `q` search; empty = hostnames_fn
         SnapshotFn snapshot_fn;
         NowFn now_fn;
         SoftwareInventoryStore* store{nullptr}; ///< borrowed; null (with no `reads`) answers 503

@@ -9057,7 +9057,7 @@ The install-change feed: one row per install, removal or upgrade of a package th
 
 **Settle window.** A change is published only once it is more than 60 seconds old: `stable_before` in the response is the horizon applied to that request (now minus 60 seconds), and every row on the page has `observed_at` below it. A change stamped in the last minute appears on a later request.
 
-**Order and paging.** Rows are ordered by `(observed_at, change_id)`, and the cursor is that pair taken from the last row of the page, so a page never skips or repeats a row that was visible when it was read. `observed_at` is the clock of the server that wrote the row and `change_id` is assigned at insert, so ordering by `change_id` alone could step over a lower id that becomes visible later. The cursor is not tied to `stable_before`: it stays valid on the next request.
+**Order and paging.** Rows are ordered by `(observed_at, change_id)`, and the cursor is that pair taken from the last row of the page, so a page never skips or repeats a row that was visible when it was read. `observed_at` is the clock of the server that wrote the row and `change_id` is assigned at insert, so ordering by `change_id` alone could step over a lower id that becomes visible later. The cursor is not tied to `stable_before`: it stays valid on the next request. A page carries `next_cursor` only when it is full, so page until `next_cursor` is `null`, which marks a caught-up feed. To follow the feed, start the next poll from `since` set to the `stable_before` of the previous response (earlier by whatever overlap you want) and de-duplicate on `change_id`.
 
 **Lateness contract.** The 60-second window is the contract and there is no watermark. A row that commits more than 60 seconds after its own `observed_at` (a slow writer, or a clock behind the others) can land behind a cursor that has already passed its position, and a consumer walking forward on that cursor will not see it. To recover, re-read from an earlier `since` and de-duplicate on `change_id`: `change_id` is unique, so a row seen twice is the same row. A consumer that must not miss a change re-reads a trailing overlap of at least the lateness it is willing to tolerate on every poll. Nothing counts late rows today; that is tracked by #7766.
 
@@ -9091,7 +9091,7 @@ Audited as `inventory.software.summary`.
 }
 ```
 
-`devices_stale` counts reporting devices whose last report is more than 48 hours old; the 24-hour counts are part of the 7-day counts.
+`devices.stale` counts reporting devices whose last report is more than 48 hours old; the 24-hour counts are part of the 7-day counts.
 
 **Null plus omitted.** A block that cannot be given is `null`, never a zero, and `omitted` says why: `scope` (the caller's scope does not allow it) or `building` (the figure has not been computed yet, for example just after a restart before the first snapshot or before the first catalogue refresh). `omitted` is `null` when every block is present. A client must read `null` as "not available", not as "none".
 

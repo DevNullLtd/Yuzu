@@ -42,10 +42,12 @@ nlohmann::json plugin_health_json(const std::vector<FacetHealth>& facets,
 
         auto slowest = nlohmann::json::array();
         for (const auto& s : f.slowest) {
+            // A blank roster hostname reads as unknown: null, not "".
             const auto h = hostnames.find(s.agent_id);
             slowest.push_back({{"agent_id", s.agent_id},
-                               {"hostname", h == hostnames.end() ? nlohmann::json(nullptr)
-                                                                 : nlohmann::json(h->second)},
+                               {"hostname", h == hostnames.end() || h->second.empty()
+                                                ? nlohmann::json(nullptr)
+                                                : nlohmann::json(h->second)},
                                {"duration_ms", s.duration_ms}});
         }
         arr.push_back({

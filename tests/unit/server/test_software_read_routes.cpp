@@ -102,6 +102,7 @@ struct Harness {
 
     // The data and the read counters.
     std::unordered_map<std::string, std::string> roster;
+    bool roster_fails{false}; ///< the checked roster read (hosts `q` search) reports a failure
     std::vector<SoftwareHostRow> hosts;
     std::vector<SoftwareChangeRow> changes;
     std::vector<SoftwareFleetRow> installs;
@@ -114,7 +115,7 @@ struct Harness {
     std::optional<std::vector<std::string>> last_aggregate_ids;
     std::string last_install_agent;
 
-    explicit Harness(bool wire_reads = true, bool wire_roster = true) {
+    explicit Harness(bool wire_reads = true, bool wire_roster = true, bool wire_checked_roster = true) {
         SoftwareReadRoutes::Deps deps;
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
                                     const std::string&,
@@ -137,6 +138,12 @@ struct Harness {
         };
         if (wire_roster)
             deps.hostnames_fn = [this] { return roster; };
+        if (wire_roster && wire_checked_roster)
+            deps.roster_fn = [this]() -> std::optional<std::unordered_map<std::string, std::string>> {
+                if (roster_fails)
+                    return std::nullopt;
+                return roster;
+            };
         deps.snapshot_fn = [this] {
             ++snapshot_reads;
             return snapshot;
@@ -407,6 +414,36 @@ TEST_CASE("hosts: a search with no roster wired is a 503, not an empty answer",
     CHECK(h.sink.Get("/api/v1/inventory/software/hosts")->status == 200); // names are just null
 }
 
+TEST_CASE("hosts: a search over a roster that could not be read is a 503, never an empty 200",
+          "[software][routes][software_read_routes]") {
+    Harness h;
+    h.hosts = {host_row("a1")};
+    h.roster = {{"a1", "alpha"}};
+    h.roster_fails = true;
+
+    const auto res = h.sink.Get("/api/v1/inventory/software/hosts?q=alpha");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(body_of(*res).at("error").at("retry_after_ms") == 5000);
+    CHECK(h.audits("inventory.software.hosts", "failure") == 1);
+    CHECK(h.host_reads == 0); // nothing is read once the scope cannot be resolved
+
+    // Without q the roster only names devices, so the page is still served.
+    const auto plain = h.sink.Get("/api/v1/inventory/software/hosts");
+    REQUIRE(plain);
+    CHECK(plain->status == 200);
+    CHECK(body_of(*plain).at("data").at("hosts").size() == 1);
+
+    // A roster read that works answers the search, and so does the display roster alone.
+    h.roster_fails = false;
+    CHECK(ids_of(body_of(*h.sink.Get("/api/v1/inventory/software/hosts?q=alpha")).at("data").at("hosts")) ==
+          std::vector<std::string>{"a1"});
+    Harness display_only(/*wire_reads=*/true, /*wire_roster=*/true, /*wire_checked_roster=*/false);
+    display_only.hosts = {host_row("a1")};
+    display_only.roster = {{"a1", "alpha"}};
+    CHECK(display_only.sink.Get("/api/v1/inventory/software/hosts?q=alpha")->status == 200);
+}
+
 TEST_CASE("host detail: out-of-scope and unknown hosts answer the same 404",
           "[software][routes][software_read_routes]") {
     Harness h;
@@ -506,6 +543,29 @@ TEST_CASE("changes: an agent_id outside the scope is an empty page and a denied 
     CHECK(res->status == 200);
     CHECK(body_of(*res).at("data").at("changes").empty());
     CHECK(h.audits("inventory.software.changes", "denied") == 1);
+}
+
+TEST_CASE("a blank roster hostname reads as unknown on the change feed and plugin-health slowest[]",
+          "[software][routes][software_read_routes]") {
+    Harness h;
+    h.roster = {{"b", ""}, {"a1", ""}}; // endpoints.hostname defaults to ''
+    h.changes = {change_row(1, "b", 10)};
+    auto snap = std::make_shared<SoftwareFleetSnapshot>();
+    snap->facets = {facet("software.installed", 1)}; // slowest names a1
+    snap->as_of = kNow - 600;
+    h.snapshot = snap;
+
+    const auto feed = h.sink.Get("/api/v1/inventory/software/changes");
+    REQUIRE(feed);
+    REQUIRE(feed->status == 200);
+    const auto rows = body_of(*feed).at("data").at("changes");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].at("hostname").is_null());
+
+    const auto health = h.sink.Get("/api/v1/inventory/software/plugin-health");
+    REQUIRE(health);
+    REQUIRE(health->status == 200);
+    CHECK(body_of(*health).at("data").at("facets")[0].at("slowest")[0].at("hostname").is_null());
 }
 
 TEST_CASE("parse and cursor refusals are 400s through the A4 envelope, before any read",

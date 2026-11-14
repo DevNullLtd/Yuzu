@@ -39,6 +39,7 @@ struct Ctx {
     SoftwareReadRoutes::FleetReadFn fleet_read_fn;
     SoftwareReadRoutes::AuditFn audit_fn;
     SoftwareReadRoutes::HostnamesFn hostnames_fn;
+    SoftwareReadRoutes::RosterFn roster_fn;
     SoftwareReadRoutes::SnapshotFn snapshot_fn;
     SoftwareReadRoutes::NowFn now_fn;
     SoftwareReadRoutes::Reads reads;
@@ -51,7 +52,14 @@ struct Ctx {
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
     }
+    // Display-only: a roster that is not wired or cannot be read leaves the names null.
     [[nodiscard]] swh::Roster roster() const { return hostnames_fn ? hostnames_fn() : swh::Roster{}; }
+    // For a decision made FROM the roster (the `q` search): nullopt = the read failed.
+    [[nodiscard]] std::optional<swh::Roster> checked_roster() const {
+        if (roster_fn)
+            return roster_fn();
+        return roster();
+    }
 };
 
 // Bind every read the caller left empty to the store.
@@ -169,13 +177,13 @@ bool audit_page(const Ctx& c, const httplib::Request& req, const char* verb,
            ok;
 }
 
-// Hostnames for the page's devices from one roster read. A device the roster does not know has no
-// entry (rendered null).
+// Hostnames for the page's devices from one roster read. A device the roster does not know, or
+// knows with a blank hostname (`endpoints.hostname` defaults to ''), has no entry (rendered null).
 template <class Row>
 swl::DeviceFacts facts_for(const std::vector<Row>& rows, const swh::Roster& roster) {
     swl::DeviceFacts f;
     for (const auto& r : rows)
-        if (const auto it = roster.find(r.agent_id); it != roster.end())
+        if (const auto it = roster.find(r.agent_id); it != roster.end() && !it->second.empty())
             f.hostname.emplace(it->first, it->second);
     return f;
 }
@@ -222,6 +230,7 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     Ctx built{.fleet_read_fn = std::move(deps.fleet_read_fn),
               .audit_fn = std::move(deps.audit_fn),
               .hostnames_fn = std::move(deps.hostnames_fn),
+              .roster_fn = std::move(deps.roster_fn),
               .snapshot_fn = std::move(deps.snapshot_fn),
               .now_fn = std::move(deps.now_fn),
               .reads = std::move(deps.reads)};
@@ -248,13 +257,19 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
                  // The search runs over the device roster CUT TO THE CALLER'S SCOPE, so a device
                  // outside it takes no part in the match or the cap. A search with no roster
-                 // wired cannot be answered, and an empty answer would read as "no such device".
-                 if (!rq.q.empty() && !ctx->hostnames_fn) {
+                 // wired, or one whose roster read failed, cannot be answered, and an empty answer
+                 // would read as "no such device". Without a `q` the roster only names devices.
+                 if (!rq.q.empty() && !ctx->hostnames_fn && !ctx->roster_fn) {
                      fail(res, 503, "device roster not available",
                           {.retry_after_ms = 5000, .remediation = "retry the request"});
                      return;
                  }
-                 const auto roster = ctx->roster();
+                 const auto checked = rq.q.empty() ? std::optional(ctx->roster()) : ctx->checked_roster();
+                 if (!checked) {
+                     degraded(*ctx, req, res, cid, kVerbHosts, target, "device roster read");
+                     return;
+                 }
+                 const auto& roster = *checked;
                  const auto scope = swh::resolve_host_search(rq.q, roster, gate.scope);
                  if (!scope) {
                      fail(res, 400, scope.error());

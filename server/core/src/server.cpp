@@ -20813,6 +20813,20 @@ private:
                     .fleet_read_fn = fleet_read_fn,
                     .audit_fn = audit_fn,
                     .hostnames_fn = hw_hostnames_fn,
+                    // The hosts `q` search decides from the roster, so unlike the display-only
+                    // hw_hostnames_fn a failed read is reported (the route answers 503), never an
+                    // empty roster that would read as "no such device".
+                    .roster_fn = [this]() -> std::optional<std::unordered_map<std::string, std::string>> {
+                        if (!offline_endpoint_store_)
+                            return std::nullopt;
+                        auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+                        if (!roster)
+                            return std::nullopt;
+                        std::unordered_map<std::string, std::string> out;
+                        for (auto& e : roster->rows)
+                            out.emplace(std::move(e.agent_id), std::move(e.hostname));
+                        return out;
+                    },
                     .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
                     .store = software_inventory_store_.get(),
                 });

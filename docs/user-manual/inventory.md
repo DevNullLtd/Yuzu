@@ -901,7 +901,7 @@ Three REST reads show how installed-software collection is going. Parameters and
 - The fleet figures are a snapshot recomputed about hourly; `as_of` says when. A caller confined to some management groups sees figures for only those devices, computed on the request. A block that cannot be given is `null` with `omitted` of `scope` or `building`; it is never shown as zero.
 - A `constrained` or `timeout` facet keeps the device's last confirmed rows, shown as unconfirmed, so a failing collector never makes software disappear.
 
-**Following changes.** `GET /api/v1/inventory/software/changes` lists installs, removals and upgrades in `(observed_at, change_id)` order. Poll with the `next_cursor` of the last page. Rows appear after a 60-second settle window. A row that commits more than 60 seconds after its own `observed_at` can be missed by a cursor that already passed it; to recover, re-read from an earlier `since` and de-duplicate on `change_id`. A consumer that cannot tolerate a miss should re-read a trailing overlap on every poll.
+**Following changes.** `GET /api/v1/inventory/software/changes` lists installs, removals and upgrades in `(observed_at, change_id)` order. Page with `next_cursor` until it is `null`; a page that is not full has none, so a caught-up feed ends on `null` and there is no cursor to poll with. Start the next poll from `since` set to the `stable_before` of the previous response (earlier by whatever overlap you want), and de-duplicate on `change_id`. Rows appear after a 60-second settle window. A row that commits more than 60 seconds after its own `observed_at` can be missed by a cursor that already passed it; to recover, re-read from an earlier `since` and de-duplicate on `change_id`. A consumer that cannot tolerate a miss should re-read a trailing overlap on every poll.
 
 #### Software facet timeout share
 
@@ -913,8 +913,8 @@ Alert `YuzuSoftwareFacetTimeoutShareHigh` (warning).
 
 1. Open `GET /api/v1/inventory/software/plugin-health` and find the facet. Is only this facet over the line, or are several from the same plugin or all of them? One facet points at that collector; all of them point at load on the devices or the agent.
 2. Compare `duration_ms` p95 and max with the facet's deadline (60 seconds, or 120 for `installed_apps`, `windows_optional_features` and `hardware`). A p95 near the deadline means the collector is slow; a max at the deadline with a low p95 means a few devices.
-3. Take the ten `slowest` devices and read them with `GET /api/v1/inventory/software/hosts/{agent_id}`. Are they one OS, one agent version, or one management group? Check the OS and the agent version of each.
-4. Read the `token` column. `busy` means a worker of the same plugin was still running from an earlier day, so every facet of that plugin times out together: look at the plugin's other facets and at what the long-running action is. A timeout with an empty token is a plain deadline miss.
+3. Take the ten `slowest` devices and read each one's collector state with `GET /api/v1/inventory/software/hosts/{agent_id}`; that response carries the section statuses and tokens, not the OS, the agent version or the management groups. Read the OS and the agent version from `GET /api/v1/devices/{id}`, and the members of a management group from `GET /api/v1/management-groups/{id}`. Are the slow devices one OS, one agent version, or one management group?
+4. Read the `token` column. `busy` means a worker of the same plugin was still running from an earlier day, so every facet of that plugin times out together: look at the plugin's other facets and at what the long-running action is. A `timeout` token is a plain deadline miss, and `rejected` is a worker that could not start.
 5. If the slow devices share an agent version, check whether the share began when that version was rolled out.
 
 #### Software facet failing share
@@ -928,8 +928,8 @@ Alert `YuzuSoftwareFacetFailingShareHigh` (warning).
 1. Open `GET /api/v1/inventory/software/plugin-health` and read the per-status split (`devices`) for the facet. Which of the three dominates? If it is `timeout`, follow the timeout runbook above.
 2. Is it this facet only or all facets of one plugin? All facets of a plugin failing together suggests the plugin, not one collector.
 3. Is it one OS or all? A facet that cannot run on an OS reports `not_collected`, not `constrained`; a `constrained` share concentrated on one OS usually means a tool the collector needs is missing or returning errors there.
-4. Check the agent version of the failing devices through `GET /api/v1/inventory/software/hosts/{agent_id}` and whether the share began with a rollout.
-5. Read the `token` column on the failing devices: `rc=<n>` is a non-zero exit, `truncated` is cut-off output, `no_rows` is a clean read that found no applications, `unavailable` is a tool that did not answer, `rejected` is a worker that could not start. For `oversize` the token carries `rows=<n>` or `bytes=<n>`; a facet over 20,000 rows or one report cannot carry sends no rows at all, so consider whether that device is expected to hold that much.
+4. Check the agent version of the failing devices through `GET /api/v1/devices/{id}` (the software host response does not carry it) and whether the share began with a rollout.
+5. Read the `token` column on the failing devices: `rc=<n>` is a non-zero exit, `truncated` is cut-off output, `no_rows` is a read that returned no applications, which the collector treats as a fault and reports as `constrained`, never as an empty estate, `unavailable` is a tool that did not answer, `rejected` is a worker that could not start. For `oversize` the token carries `rows=<n>` or `bytes=<n>`; a facet over 20,000 rows or one report cannot carry sends no rows at all, so consider whether that device is expected to hold that much.
 
 While a facet fails, the server keeps each device's last confirmed rows, so the software list stays complete but is marked unconfirmed until a later `full` section.
 
