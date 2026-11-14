@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <expected>
 #include <map>
 #include <set>
 #include <memory>
@@ -100,7 +101,7 @@ inline constexpr const char* kOwnAddress = "10.9.9.9";
 /// Knobs of the fake environment beyond the DNS table and own addresses.
 struct FakeEnvOptions {
     std::vector<std::string> own{kOwnAddress};
-    bool own_fails{false};                       ///< interface enumeration fails (nullopt)
+    bool own_fails{false};                       ///< interface enumeration fails (an error)
     std::set<std::string> dns_unavailable;       ///< hosts whose lookup times out
     std::vector<yuzu::server::oidc::egress::Nat64Prefix> nat64;
     std::vector<std::string>* degrades{nullptr}; ///< records every note_degrade reason
@@ -124,11 +125,11 @@ fake_env(std::map<std::string, std::vector<std::string>> dns = {}, FakeEnvOption
     };
     env.local_addresses = [own = opt.own, fails = opt.own_fails, calls = opt.own_calls](
                               std::chrono::milliseconds)
-        -> std::optional<std::vector<std::string>> {
+        -> std::expected<std::vector<std::string>, EgressEnv::OwnAddressesError> {
         if (calls)
             ++*calls;
         if (fails)
-            return std::nullopt;
+            return std::unexpected(EgressEnv::OwnAddressesError::kUnavailable);
         return own;
     };
     env.nat64_prefixes = opt.nat64;

@@ -523,7 +523,9 @@ std::vector<Addr> embedded_v4(const Addr& a, std::span<const eg::Nat64Prefix> pr
 std::expected<void, ServiceError> load_own(Ctx& ctx) {
     if (ctx.own_loaded)
         return {};
-    std::optional<std::vector<std::string>> addrs;
+    // No callback = the set cannot be determined: the same fail-closed answer as a failed one.
+    std::expected<std::vector<std::string>, EgressEnv::OwnAddressesError> addrs =
+        std::unexpected(EgressEnv::OwnAddressesError::kUnavailable);
     if (ctx.env.local_addresses) {
         const auto now = std::chrono::steady_clock::now();
         const auto remaining =
@@ -536,7 +538,11 @@ std::expected<void, ServiceError> load_own(Ctx& ctx) {
         spdlog::error("revocation source: this server's own addresses could not be determined "
                       "(interface enumeration or a listen host failed); refusing registrations "
                       "until it can");
-        ctx.degrade("own_addresses_unavailable");
+        // A refusal because the resolver pool was at its cap is counted like a refused URL host
+        // lookup; the answer to the caller is the same retryable 503 either way.
+        ctx.degrade(addrs.error() == EgressEnv::OwnAddressesError::kBusy
+                        ? "dns_busy"
+                        : "own_addresses_unavailable");
         return unavailable("this server's own addresses could not be determined; retry");
     }
     for (const auto& t : *addrs)
@@ -775,15 +781,17 @@ bool is_wildcard(const std::string& host) { return host.empty() || host == "0.0.
 
 EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
                                  std::vector<eg::Nat64Prefix> nat64_prefixes,
-                                 net::LookupFn listen_lookup) {
+                                 net::LookupFn listen_lookup,
+                                 std::shared_ptr<net::ResolverPool> listen_pool) {
     EgressEnv env;
     env.resolve = [](const std::string& host, std::chrono::milliseconds budget) {
         return system_resolve(host, budget);
     };
     env.nat64_prefixes = std::move(nat64_prefixes);
-    env.local_addresses = [specs = std::move(listen_specs), lookup = std::move(listen_lookup)](
-                                  std::chrono::milliseconds budget)
-        -> std::optional<std::vector<std::string>> {
+    env.local_addresses = [specs = std::move(listen_specs), lookup = std::move(listen_lookup),
+                           pool = std::move(listen_pool)](std::chrono::milliseconds budget)
+        -> std::expected<std::vector<std::string>, EgressEnv::OwnAddressesError> {
+        using Err = EgressEnv::OwnAddressesError;
         const auto until = std::chrono::steady_clock::now() + budget;
         std::vector<std::string> out;
         std::optional<std::vector<std::string>> ifaces; // read once, only if a wildcard needs it
@@ -796,7 +804,7 @@ EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
                 if (!ifaces)
                     ifaces = interface_addresses();
                 if (!ifaces)
-                    return std::nullopt;
+                    return std::unexpected(Err::kUnavailable);
                 out.insert(out.end(), ifaces->begin(), ifaces->end());
             } else if (eg::classify_literal(host).has_value()) {
                 out.push_back(host);
@@ -807,10 +815,13 @@ EgressEnv make_system_egress_env(std::vector<std::string> listen_specs,
                 const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
                     until - std::chrono::steady_clock::now());
                 if (left <= std::chrono::milliseconds{0})
-                    return std::nullopt;
-                const auto r = net::bounded_resolve(host, std::min(kPerLookupBudget, left), lookup);
+                    return std::unexpected(Err::kUnavailable);
+                const auto r =
+                    net::bounded_resolve(host, std::min(kPerLookupBudget, left), lookup, pool);
                 if (r.status != net::ResolveStatus::kOk)
-                    return std::nullopt;
+                    return std::unexpected(r.status == net::ResolveStatus::kBusy
+                                               ? Err::kBusy
+                                               : Err::kUnavailable);
                 out.insert(out.end(), r.addresses.begin(), r.addresses.end());
             }
         }
