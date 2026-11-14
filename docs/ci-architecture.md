@@ -2989,7 +2989,9 @@ ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
 real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
 **PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
 legs test against it; the server SQL is version-agnostic (13+), so a
-runner-native cluster on an older major still exercises the suites correctly.
+runner-native cluster on an older major still exercises the suites correctly,
+except where a step sets `YUZU_TEST_PG_CLONE_STRATEGY` (the Linux test step's
+pg half does), which needs 15+.
 One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
 as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
 (linux) and nightly.yml (asan / tsan / coverage).
@@ -3089,14 +3091,19 @@ Resolution order inside the script:
    | 2 | 927 s / 3303 s | 869 s / 3133 s, 870 s / 3136 s | not finished (step timeout) |
 
    Every default pass was slower than both file_copy passes of its run: about
-   6-7% wall and 5-6% serial. Run 2 was on a busier box (all of its numbers
+   6-7% wall and 5-7% serial. Run 2 was on a busier box (all of its numbers
    about 20% higher), so compare within a run, not across. Result: the Linux
    test step's `pg_half` exports `YUZU_TEST_PG_CLONE_STRATEGY=file_copy` for
    both `pg_mode`s (a value leaking in from the runner is warned about and
    overridden; `tests/shell/test_linux_concurrent_step.sh` pins both). The
    checkpoint `FILE_COPY` forces stays inside the job's own per-runner
-   Postgres container. No other workflow sets it. Revert: delete that one
-   `export`. Contract: `docs/testing/unit-test-conventions.md`.
+   Postgres container. No other workflow sets it. It needs PostgreSQL 15+ (every
+   Big Tam agent runs the pinned 18 image). It moves the pg step's baseline:
+   pg-step samples taken for a later push (the tmpfs push, Push 3, or the
+   concurrent-halves acceptance) compare only against runs that include it.
+   Revert: `git revert` the commit that wired it (the export, the step's
+   contract test and the leak warning text move together). Contract:
+   `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.

@@ -295,8 +295,9 @@ inline const char* pg_admin_dsn_env() {
 /// An invalid value fails the fixture (PostgresTestDb::error(), surfaced by the
 /// YUZU_REQUIRE_PG_DB* macros' REQUIRE) rather than being silently ignored, so
 /// a typo can never silently run the default strategy instead.
-/// The Linux CI test step's pg half sets it to file_copy; nothing else does
-/// (docs/testing/unit-test-conventions.md).
+/// The Linux CI test step's pg half sets it to file_copy; no other CI job sets
+/// it (tests/unit/server/test_pg_template_cleanup.cpp sets it per case with
+/// ScopedEnv; docs/testing/unit-test-conventions.md).
 struct PgCloneStrategy {
     bool ok = true;
     std::string clause; ///< appended verbatim after the TEMPLATE clause

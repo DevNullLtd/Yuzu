@@ -1831,7 +1831,9 @@ jobs:
             # two same-job A/B runs (#7701): the server-pg suite ran about 6-7%
             # faster in wall time than with the server default (WAL_LOG). Each
             # runner has its own Postgres container, so the checkpoint FILE_COPY
-            # forces stays inside this job's cluster. Revert: delete this line.
+            # forces stays inside this job's cluster. Needs PostgreSQL 15+.
+            # Revert: git revert the commit that added this line (the step's
+            # contract test and the leak warning above change with it).
             export YUZU_TEST_PG_CLONE_STRATEGY=file_copy
             if [[ "$PG_MODE" == "full" ]]; then
               bash scripts/ci/with-test-slot.sh 3 -- \
