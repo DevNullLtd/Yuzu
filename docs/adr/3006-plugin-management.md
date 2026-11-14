@@ -1,5 +1,11 @@
 ---
-status: proposed
+status: accepted
+status-note: >-
+  Status reconciled 2026-11-14 against dev @ 2c49b4ea0: this ADR's own `effective` clause binds
+  it on merge as direction, and it is merged. Implementation is partial: the server-side
+  enablement store (`server/core/src/enablement_store.{hpp,cpp}`, `enablement_state_core.hpp`,
+  ADR-3005 schema v3) is built and opened at boot; enforcement on the endpoint and the new
+  defaults are not delivered, so the shipped defaults are unchanged.
 date: 2026-10-06
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
@@ -36,7 +42,9 @@ context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#
 ## Summary
 
 This ADR sets a direction. It is not current behaviour: nothing described here is in the product
-until the retrofit it calls for lands (see `effective` above, and D2).
+until the retrofit it calls for lands (see `effective` above, and D2). (2026-11-14: the server-side
+enablement store has landed; the defaults and endpoint enforcement have not, so shipped behaviour
+is still as before. See `status-note`.)
 
 Yuzu will ship with everything in the box and everything switched on. Every plugin will be
 installed on every endpoint, and every capture source and every other unit that runs by itself

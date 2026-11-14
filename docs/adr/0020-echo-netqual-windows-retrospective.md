@@ -9,7 +9,8 @@
 > **Naming (2026-10).** The feature this record describes was renamed to Echo, and this file was
 > renamed with it. The body uses the current spelling throughout; the decision itself is unchanged.
 
-> **Amendment pending: ADR-3006 (plugin management, proposed 2026-10-06).** ADR-3006 sets
+> **Amendment pending delivery: ADR-3006 (plugin management, 2026-10-06; accepted, status
+> reconciled 2026-11-14).** ADR-3006 sets
 > the direction that, for new installations, the opt-in default for `netqual` and `netconn` is
 > replaced by on-by-default with customer-controlled switch-off, and that look-back becomes a
 > switchable unit of its own that runs by default for the sources that ship off today.
