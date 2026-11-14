@@ -394,7 +394,7 @@ std::expected<void, std::string>
 QuarantineStore::mark_endpoint_applied(const std::string& agent_id, std::int64_t record_id,
                                        std::int64_t at) {
     return guarded_record_update(pool_, open_, agent_id, record_id,
-                                 {"last_applied_at", "last_applied_at = $3::bigint",
+                                 {"mark_endpoint_applied", "last_applied_at = $3::bigint",
                                   "status = 'active'", {std::to_string(at)}});
 }
 
@@ -402,7 +402,7 @@ std::expected<void, std::string>
 QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id,
                                          std::int64_t at) {
     return guarded_record_update(pool_, open_, agent_id, record_id,
-                                 {"last_confirmed_at", "last_confirmed_at = $3::bigint",
+                                 {"mark_endpoint_confirmed", "last_confirmed_at = $3::bigint",
                                   "status = 'active'", {std::to_string(at)}});
 }
 
