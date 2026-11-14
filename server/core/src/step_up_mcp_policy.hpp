@@ -125,14 +125,16 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::exempt ("pin_result_set",                       step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)"),
     step_up_mcp_detail::exempt ("unpin_result_set",                     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)"),
     // InstructionDefinition:Delete / Write (#2146 batch C): content authoring, the REST twins' class.
-    // The MCP tier ladder is stricter than the REST row: every one is supervised-only and
-    // ticketed (mcp_policy.hpp requires_approval), so a human approves each write.
+    // The MCP tier ladder is stricter than the REST row: each of these is ticketed at the
+    // supervised tier (mcp_policy.hpp requires_approval), so a human approves each write.
     step_up_mcp_detail::exempt ("create_definition",                    step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions)"),
     step_up_mcp_detail::exempt ("delete_definition",                    step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instructions/([^/]+))"),
     step_up_mcp_detail::exempt ("import_definition",                    step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions/import)"),
     step_up_mcp_detail::exempt ("save_definition_yaml",                 step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions/yaml)"),
     step_up_mcp_detail::exempt ("update_definition",                    step_up_detail::kContentAuthoring,  "PUT",    R"(/api/v1/instructions/([^/]+))"),
-    // InstructionSet:Delete / Write (#2146 batch C)
+    // InstructionSet:Delete / Write (#2146 batch C). delete_instruction_set is ticketed at the
+    // supervised tier; create_instruction_set is NOT (InstructionSet:Write is deliberately not
+    // gated, see mcp_policy.hpp).
     step_up_mcp_detail::exempt ("create_instruction_set",               step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instruction-sets)"),
     step_up_mcp_detail::exempt ("delete_instruction_set",               step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instruction-sets/([^/]+))"),
     // Inventory:Write

@@ -2,15 +2,20 @@
 
 New or modified owned resources in `server/core/src/` (`instruction_store.cpp`,
 `instruction_authoring_routes.cpp`, `mcp_instruction_authoring.cpp`, `mcp_server.cpp`,
-`instruction_referrers.{hpp,cpp}`, `instruction_routes.cpp`, `workflow_routes.cpp`,
+`instruction_referrers.{hpp,cpp}`,
 `product_pack_store.cpp`, `policy_store.cpp`, `workflow_engine.cpp`, `server.cpp`) and their unit
-tests, across commits `9d425b09f2` to `09dcec48a2` (fix rounds 6 to 11 added the legacy-route and
-pack-uninstall referrer guards, the version-bound delete, the pack advisory and the pre-mint
-reads). No file descriptor, `FILE*`, socket, `HANDLE`, subprocess, mapped library, temp path,
-OpenSSL object, BCrypt handle, C string, thread or callback-owned raw pointer is added to
+tests, across commits `9d425b09f2` to `09dcec48a2` (fix rounds 6 to 11 added the version-bound delete,
+the pack advisory and the pre-mint reads; the legacy-route and pack-uninstall referrer guards
+they also added are NOT in this split PR, see the scope note below). No file descriptor, `FILE*`,
+socket, `HANDLE`, subprocess, mapped library, temp path, OpenSSL object, BCrypt handle, C string, thread or callback-owned raw pointer is added to
 production code. The owned things are one persisted column, three transaction shapes, a set of
 short read-only pooled leases (each taken and released inside one store method), one shared
 throttle, and some value containers. The test-side resources are listed last.
+
+**Scope note (split PR 1).** This ledger covers the tree of the first PR of the split. The legacy
+`DELETE /api/instructions/{id}` (`instruction_routes.cpp`) and the product-pack uninstall
+(`workflow_routes.cpp`) are unchanged here and do not check referrers; their guards, the pack
+uninstall pre-check reads and their resources are carried by the second PR.
 
 ## Resources
 
@@ -56,9 +61,11 @@ throttle, and some value containers. The test-side resources are listed last.
 - **Site:** `make_definition_referrers_fn` in `instruction_referrers.cpp`, called once from
   `server.cpp` (`DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
   schedule_engine_.get(), workflow_engine_.get(), policy_store_.get())`, hoisted in round 7 to
-  before `register_instruction_routes`) and copied into FOUR consumers: `instruction::Deps` (legacy
-  DELETE), `authoring_deps.referrers_fn` (v1 REST DELETE), `wf_deps.referrers_fn` (pack uninstall)
-  and `mcp_server_->set_definition_referrers_fn(...)` (MCP delete).
+  before `register_instruction_routes`) and copied into TWO consumers in this tree:
+  `authoring_deps.referrers_fn` (v1 REST DELETE, `server.cpp:23364`) and
+  `mcp_server_->set_definition_referrers_fn(...)` (MCP delete, `server.cpp:23476`). The legacy
+  `DELETE /api/instructions/{id}` (`instruction::Deps`) and the pack uninstall (`wf_deps`) receive no
+  referrer closure here and still delete without checking; wiring them is the second PR.
 - **Owner type:** `DefinitionReferrersFn` is a small class wrapping a type-erased
   `std::function<Result(const std::string&, const Exclusions&)>` (`fn_`); it owns no raw resource.
   Its converting constructors take a callable of either arity and leave `fn_` EMPTY for a null
@@ -87,8 +94,9 @@ throttle, and some value containers. The test-side resources are listed last.
 
 ### `PolicyStore::fragments_referencing_instruction` and `WorkflowEngine::workflows_referencing_instruction`
 - **Site:** `policy_store.cpp` and `workflow_engine.cpp`. Read-only methods; no new resource type.
-  Round 9 added an `exclude_ids` parameter (`const std::unordered_set<std::string>&`) used by the
-  pack uninstall.
+  Round 9 added an `exclude_ids` parameter (`const std::unordered_set<std::string>&`). It is
+  exercised by unit tests here, but no production caller in this tree passes a non-empty exclusion
+  set: its consumer is the pack uninstall, which is in the second PR.
 - **Owner type:** one pooled connection lease each (`pool_.try_acquire_for(kAcquireTimeout)` /
   `kReadTimeout`), one `pg::PgResult` for the SELECT, and a local `std::vector<std::string>` of
   ids returned by value inside `std::expected`. The exclusion set is a parameter, not owned: it is
@@ -102,29 +110,10 @@ throttle, and some value containers. The test-side resources are listed last.
 - **Failure cleanup:** store not open, no connection in time and a failed query each return
   `std::unexpected(...)` (a degraded read); RAII only, no partial state.
 
-### Pack-uninstall pre-check reads (`workflow_routes.cpp`, `DELETE /api/product-packs/{id}`)
-- **Site:** the `DELETE` handler's block that runs before `product_pack_store->uninstall`.
-- **Owner type:** local value containers only: `own_workflows` and `own_fragments`
-  (`std::unordered_set<std::string>`) filled from `ProductPackStore::get`, a
-  `DefinitionReferrerExclusions`, a `std::unordered_map<std::string, std::vector<HeldByPolicy>>`
-  (`policy_held`, folded policy id and name for the 409 text), and `std::vector<DefinitionReferrer>
-  blocking`. The reads are `ProductPackStore::get` (one lease inside the store), then one
-  `PolicyStore::query_policies` per own fragment (`fragment_filter`, `limit` 4, one lease each), then
-  one `referrers_fn` call per contained definition (three leases inside it). They run SEQUENTIALLY,
-  each taking and releasing its own lease; no lease is held across the next read and NONE is held
-  across `uninstall()`, which takes its own.
-- **Release point:** scope exit; every refusal returns before `uninstall()` is reached, so a refused
-  pack is untouched.
-- **Transfer:** the exclusion set is moved into `exclusions` and read by reference per call; blockers
-  are moved into `blocking`.
-- **Failure cleanup:** an unwired closure or policy store, or a failing read, is a 503 with the audit
-  row (`referrer_check_unwired` / `referrer_check_unavailable`); never treated as "no referrers". The
-  check is advisory-not-transactional (a referrer created after the reads is not seen), by design.
-
 ### `ProductPackStore::packs_containing_item` and `DefinitionPackAdvisoryFn`
 - **Site:** `product_pack_store.cpp` (`packs_containing_item`), `instruction_referrers.{hpp,cpp}`
   (`DefinitionPackAdvisoryFn`, `make_definition_pack_advisory_fn`, `pack_advisory_note`), read at the
-  legacy DELETE, v1 DELETE and MCP `delete_definition` call sites.
+  v1 DELETE and MCP `delete_definition` call sites (the legacy DELETE reads it in the second PR).
 - **Owner type:** `packs_containing_item` takes ONE pooled lease (`pool_.try_acquire_for(
   kReadTimeout)`, bounded acquire, no nested lease) and runs ONE bounded SELECT on
   `product_pack_store.product_pack_items` (`ORDER BY pack_id LIMIT $3`, limit 20 from
