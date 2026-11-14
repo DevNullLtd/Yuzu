@@ -1958,10 +1958,16 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
                 n.fetch_sub(1, std::memory_order_relaxed);
         }
     } slot{confirms_in_flight_, false};
-    if (confirms_in_flight_.fetch_add(1, std::memory_order_relaxed) < kMaxConcurrentConfirms) {
-        slot.admitted = true;
-    } else {
-        confirms_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    // Compare-and-swap, not add-then-undo: a shed caller never touches the count, so it cannot
+    // make another caller shed spuriously.
+    for (int cur = confirms_in_flight_.load(std::memory_order_relaxed);
+         cur < kMaxConcurrentConfirms;) {
+        if (confirms_in_flight_.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
+            slot.admitted = true;
+            break;
+        }
+    }
+    if (!slot.admitted) {
         count("shed", remote_only.size());
         warn_limited("shed (too many in flight)", remote_only.size());
         return missing;

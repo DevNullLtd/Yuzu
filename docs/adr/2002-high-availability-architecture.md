@@ -2372,17 +2372,20 @@ only (consistent with §2: gateway-fronting is mandatory in HA, and a non-owning
 agent anyway); and an agent that was gateway-connected and then reconnects directly keeps its old row, so its old
 list can still match on a non-owning replica until the row is reaped, a wrong cause label on an agent that
 replica cannot reach. The confirmation is as of the moment of the read, so a session registered an instant
-later is the ordinary race any dispatch has. 
+later is the ordinary race any dispatch has.
+
 The ARRIVAL mirror (`mirror_arrival_to_presence`, fired where a
 stream is established: direct Subscribe start and gateway CONNECTED on any replica, never in Register) still
 deletes plugin lists published by OTHER sessions of the agent (`clear_plugins_of_other_sessions`, best effort,
 250 ms acquire, counted `op="clear_plugins"`) as housekeeping: its failure changes no verdict. It is skipped for
 a lost-race session (it would delete the winner's list), and the direct Subscribe call site is pinned by a
-source-text gate, not by a behavioural test. 
+source-text gate, not by a behavioural test.
+
 Cost and limits: one directory query per dispatch over the candidate ids (up
 to the 100,000-row cap of the candidate read), only when the durable presence holds rows beyond this replica's
 own sessions; measured on a scratch Postgres at about 60 ms for 50,000 ids and 100 to 120 ms for 100,000, with
-one pool lease held for it, and not measured end to end in the server (the pool is shared with presence upserts, lease renewals and registration; the cap of two in flight and the 2 s statement bound are what keep a dispatch burst from taking it over, at the price that under a burst the cross-replica `plugin_not_found` is switched off, visibly, on `shed`). Not done, to be tracked before the safe-to-scale gate lifts: confirming only the dispatch's resolved targets, a duration histogram, an alert on `degraded`/`shed`, and a TSan/ASan run of the new locking. An agent's plugin set is fixed for its process lifetime (`plugin_names_` is appended only by the startup plugin load in `agent.cpp`), so a published list cannot go stale inside one session. A gateway crash that leaves the old route row routable keeps the SG-1 case alive for the 90 s lease. 
+one pool lease held for it, and not measured end to end in the server (the pool is shared with presence upserts, lease renewals and registration; the cap of two in flight and the 2 s statement bound are what keep a dispatch burst from taking it over, at the price that under a burst the cross-replica `plugin_not_found` is switched off, visibly, on `shed`). Not done, to be tracked before the safe-to-scale gate lifts: confirming only the dispatch's resolved targets, a duration histogram, an alert on `degraded`/`shed`, and a TSan/ASan run of the new locking. An agent's plugin set is fixed for its process lifetime (`plugin_names_` is appended only by the startup plugin load in `agent.cpp`), so a published list cannot go stale inside one session. A gateway crash that leaves the old route row routable keeps the reconnect-directly case above alive for the 90 s lease.
+
 Reasoned, not tested end to end: an
 OLDER session can be written back into `agent_routes.session_id` only by `reclaim_tombstoned_session` (guarded
 on `session_id IS NULL`) after the newer session's row was tombstoned, which leaves the row unplaced (so it does

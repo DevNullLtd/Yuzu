@@ -1358,7 +1358,9 @@ private:
     static constexpr int kMaxConcurrentConfirms = 2;
     mutable std::atomic<int> confirms_in_flight_{0};
     /// Steady-clock ms of the last warn for a degraded or shed confirmation (rate limit).
-    mutable std::atomic<std::int64_t> confirm_warn_at_ms_{0};
+    /// Starts one interval in the past so the FIRST warning is never suppressed, whatever the
+    /// steady clock reads at process start.
+    mutable std::atomic<std::int64_t> confirm_warn_at_ms_{-60'000};
     std::chrono::seconds missing_plugin_ttl_{};
     mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
     mutable std::unordered_set<std::string> missing_plugin_inflight_;

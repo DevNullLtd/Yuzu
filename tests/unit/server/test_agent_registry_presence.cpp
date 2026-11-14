@@ -779,12 +779,34 @@ TEST_CASE("HA WS-5: a cross-replica plugin absence is withheld only while the di
         throw_on_read = true;
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
         CHECK(outcome("degraded") == 2.0);
+        // A reader that throws must release its in-flight slot: after more throws than the cap
+        // (2) a healthy read is still admitted and withholds.
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        throw_on_read = false;
+        CHECK(r2.ids_missing_plugin("echo", "sql") == withheld);
+        CHECK(outcome("shed") == 0.0);
     }
 
     SECTION("the outcome series are seeded at 0 once configured, with or without a reader") {
-        r2.configure_route_session_reader({});
-        for (const char* o : {"withheld", "not_confirmed", "degraded", "shed", "unwired"})
-            CHECK(outcome(o) == 0.0);
+        // A FRESH registry and metrics: `outcome()` above creates a series on demand, so only the
+        // exposition of a registry nothing else has touched can show that the seeding happened.
+        for (const bool with_reader : {false, true}) {
+            yuzu::MetricsRegistry fresh;
+            AgentRegistry r3(bus, fresh);
+            if (with_reader)
+                r3.configure_route_session_reader(
+                    [](std::span<const yuzu::server::PluginAbsence>)
+                        -> std::optional<std::unordered_set<std::string>> { return std::nullopt; });
+            else
+                r3.configure_route_session_reader({});
+            const std::string text = fresh.serialize();
+            for (const char* o : {"withheld", "not_confirmed", "degraded", "shed", "unwired"}) {
+                CAPTURE(with_reader, o);
+                CHECK(text.find(std::string("yuzu_server_plugin_absence_confirm_total{outcome=\"") +
+                                o + "\"}") != std::string::npos);
+            }
+        }
     }
 
     SECTION("no confirmation reader wired: nothing cross-replica is ever withheld") {
@@ -950,13 +972,18 @@ TEST_CASE("ids_missing_plugin sheds a confirmation past the in-flight cap and fa
     CHECK(registry.ids_missing_plugin("echo", "sql").empty());
     CHECK(entered.load() == 2); // it never reached the reader
     CHECK(outcome("shed") == 1.0);
+    // Shedding must not disturb the in-flight count: shed more times than the cap, then free the
+    // slots and the next call must still be admitted.
+    CHECK(registry.ids_missing_plugin("echo", "sql").empty());
+    CHECK(registry.ids_missing_plugin("echo", "sql").empty());
+    CHECK(outcome("shed") == 3.0);
     release = true;
     for (auto& t : blocked)
         t.join();
     // With the readers free again the slot is released and the next call is admitted.
     CHECK(registry.ids_missing_plugin("echo", "sql") ==
           std::unordered_set<std::string>{"yuzu_test_shed_a"});
-    CHECK(outcome("shed") == 1.0);
+    CHECK(outcome("shed") == 3.0);
 }
 
 // A direct register writes no route row, so an agent that registers on THIS replica while the
@@ -999,6 +1026,12 @@ TEST_CASE("ids_missing_plugin does not withhold an agent that became local durin
         });
     const auto missing = registry.ids_missing_plugin("echo", "sql");
     CHECK(missing == std::unordered_set<std::string>{"yuzu_test_local_race_other"});
+    const auto outcome = [&](const char* o) {
+        return metrics.counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", o}})
+            .value();
+    };
+    CHECK(outcome("withheld") == 1.0);      // the other agent
+    CHECK(outcome("not_confirmed") == 1.0); // the agent that became local during the read
 }
 
 // A held `stream_mu` means a send to that session is in flight: it must read as HAVING a path and
