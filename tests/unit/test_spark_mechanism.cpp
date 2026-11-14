@@ -15706,4 +15706,105 @@ TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing 
     engine.stop();
 }
 
+namespace {
+/// RegRenameKey is exported by advapi32 but not declared by every SDK, so it is
+/// resolved at run time; nullptr when absent.
+using RegRenameKeyFn = LONG(WINAPI*)(HKEY, LPCWSTR, LPCWSTR);
+RegRenameKeyFn resolve_reg_rename_key() {
+    const HMODULE adv = ::GetModuleHandleW(L"advapi32.dll");
+    if (adv == nullptr)
+        return nullptr;
+    return reinterpret_cast<RegRenameKeyFn>(::GetProcAddress(adv, "RegRenameKey"));
+}
+} // namespace
+
+TEST_CASE("Registry spark (real mechanism): a parent key renamed away faults the watch inside "
+          "the bound (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    const RegRenameKeyFn rename_key = resolve_reg_rename_key();
+    REQUIRE(rename_key != nullptr); // present on every supported Windows; absence is a finding
+
+    // <parent>\Child is the watched key. ScratchRegKey deletes <parent> by its
+    // ORIGINAL name, so the renamed tree is removed by its own guard below.
+    ScratchRegKey parent("deaf5719_rename");
+    REQUIRE(parent.h != nullptr);
+    ::RegCloseKey(parent.h); // keep the mechanism's handle the only one open on the tree
+    parent.h = nullptr;
+    const std::string child = parent.sub + "\\Child";
+    HKEY ch = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, child.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                              nullptr, &ch, nullptr) == ERROR_SUCCESS);
+    ::RegCloseKey(ch);
+
+    const auto slash = parent.sub.rfind('\\');
+    const std::string leaf = parent.sub.substr(slash + 1);
+    const std::string renamed_sub = parent.sub.substr(0, slash + 1) + leaf + "_renamed";
+    // Removes both the renamed tree and the recreated original tree (the
+    // secondary check below recreates <parent>\Child), by handle-free path.
+    struct TreeGuard {
+        std::string renamed;
+        std::string original;
+        ~TreeGuard() {
+            ::RegDeleteTreeA(HKEY_CURRENT_USER, renamed.c_str());
+            ::RegDeleteTreeA(HKEY_CURRENT_USER, original.c_str());
+        }
+    } tree_guard{renamed_sub, parent.sub};
+
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_registry_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Registry, std::move(mech)).has_value());
+    {
+        RegistryMechanismTestControls ctl;
+        ctl.health_grace = 100ms;
+        ctl.backend_retry_base = 100ms;
+        ctl.sweep_cadence = 20ms;
+        REQUIRE(set_registry_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = registry_spec("HKCU", child);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0); // precondition: healthy before the rename
+
+    const std::wstring wsub(parent.sub.begin(), parent.sub.end());
+    const std::wstring wnew(leaf.begin(), leaf.end());
+    const LONG rr = rename_key(HKEY_CURRENT_USER, wsub.c_str(), (wnew + L"_renamed").c_str());
+    INFO("RegRenameKey returned " << rr);
+    REQUIRE(rr == ERROR_SUCCESS);
+    {
+        HKEY probe = nullptr;
+        const LONG orc = ::RegOpenKeyExA(HKEY_CURRENT_USER, parent.sub.c_str(), 0, KEY_READ, &probe);
+        if (probe)
+            ::RegCloseKey(probe);
+        REQUIRE(orc == ERROR_FILE_NOT_FOUND); // the original path is gone
+    }
+
+    // Oracle: the watch no longer covers its path, so it must be reported
+    // faulted rather than left Healthy and silent.
+    const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound);
+    INFO("coverage after the rename: " << deaf_coverage_text(engine, *sub));
+    CHECK(faulted);
+
+    // Secondary: after the original path is repaired a value write there must fire.
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    HKEY again = nullptr;
+    REQUIRE(::RegCreateKeyExA(HKEY_CURRENT_USER, child.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                              nullptr, &again, nullptr) == ERROR_SUCCESS);
+    std::this_thread::sleep_for(100ms);
+    const DWORD v = 7;
+    ::RegSetValueExA(again, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
+    ::RegCloseKey(again);
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+        kDeafBound));
+    engine.disarm(*sub);
+    engine.stop();
+}
+
 #endif // _WIN32
