@@ -51,6 +51,7 @@
 #include <latch>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -3260,11 +3261,13 @@ TEST_CASE("QuarantineContainmentReconciler::seed_metrics: every series exists at
     CHECK(kQuarantineReapplyResults.size() == 14);
     CHECK(std::find(kQuarantineReapplyResults.begin(), kQuarantineReapplyResults.end(), "drift") !=
           kQuarantineReapplyResults.end());
-    for (const char* reach : {"connected", "offline"})
-        for (const char* name : {"yuzu_server_quarantine_endpoint_unconfirmed",
-                                 "yuzu_server_quarantine_release_pending",
-                                 "yuzu_server_quarantine_forced_release_owed"})
-            CHECK(metrics.gauge(name, {{"reachability", reach}}).value() == 0);
+    // Read from the snapshot taken above, never through metrics.gauge(): a lookup creates a missing
+    // series at 0, so it would pass with the seed loop deleted.
+    for (const std::string reach : {"connected", "offline"})
+        for (const std::string name : {"yuzu_server_quarantine_endpoint_unconfirmed",
+                                       "yuzu_server_quarantine_release_pending",
+                                       "yuzu_server_quarantine_forced_release_owed"})
+            CHECK(text.find(name + "{reachability=\"" + reach + "\"} 0") != std::string::npos);
     CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 1);
     // a plausible epoch (after 2020), so the stall alert does not fire before the first tick
     CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_last_tick_unixtime").value() > 1.6e9);
@@ -3326,6 +3329,57 @@ TEST_CASE("QuarantineContainmentReconciler: a heartbeat only marks the device du
         CHECK(call.action == "quarantine");
     // the marks were taken: a second drain has nothing to do
     CHECK(reconciler.drain_heartbeat_due() == 0);
+}
+
+TEST_CASE("QuarantineContainmentReconciler: a heartbeat drain dispatches at most one pass's budget and "
+          "carries the rest to the next drain, each device once",
+          "[pg][quarantine][reconciler][heartbeat]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 2}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    // One more device than a pass may dispatch to (kMaxDispatchesPerTick, 50, a private constant).
+    std::vector<std::string> ids;
+    for (int i = 0; i < 51; ++i)
+        ids.push_back("agent-" + std::to_string(i));
+    for (const auto& id : ids)
+        REQUIRE(qstore.quarantine_device(id, "admin", "malware", "").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    MockDispatch dispatch;
+    FakeSteady steady;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .steady_now_fn = steady.fn(),
+    });
+    reconciler.tick(); // all offline: the entries and the cache exist, nothing sent
+    REQUIRE(dispatch.calls.empty());
+    for (const auto& id : ids)
+        REQUIRE(registry.register_agent(make_info(id)).has_value());
+    for (const auto& id : ids)
+        reconciler.notify_agent_heartbeat(id);
+
+    CHECK(reconciler.drain_heartbeat_due() == 50); // the budget of one pass
+    CHECK(dispatch.calls.size() == 50);
+    // the device left over was put back marked, with no new heartbeat
+    CHECK(reconciler.drain_heartbeat_due() == 1);
+    CHECK(dispatch.calls.size() == 51);
+    std::set<std::string> reached;
+    for (const auto& call : dispatch.calls) {
+        REQUIRE(call.agent_ids.size() == 1);
+        reached.insert(call.agent_ids.front());
+    }
+    CHECK(reached.size() == 51); // every device once, none twice
+    CHECK(reconciler.drain_heartbeat_due() == 0);
+    CHECK(dispatch.calls.size() == 51);
 }
 
 TEST_CASE("redispatch_stored_containment claims the apply: the token is empty inside the dispatch, the new "

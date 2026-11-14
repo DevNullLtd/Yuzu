@@ -15,6 +15,7 @@
 #include "response_store.hpp"
 #include "authz_gates.hpp"
 #include "command_capability.hpp"
+#include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -1350,6 +1351,23 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a device that is offline -> 202 relea
     const auto body = parse_body(res->body);
     CHECK(body["data"]["released"] == false);
     CHECK(body["data"]["state"] == "releasing");
+    // The published 202 schema describes this body: every required name is served and every
+    // served name is declared.
+    const auto spec = nlohmann::json::parse(openapi_spec_json());
+    const auto& schema = spec.at("paths")
+                             .at("/quarantine/{agent_id}")
+                             .at("delete")
+                             .at("responses")
+                             .at("202")
+                             .at("content")
+                             .at("application/json")
+                             .at("schema")
+                             .at("properties")
+                             .at("data");
+    for (const auto& name : schema.at("required"))
+        CHECK(body["data"].contains(name.get<std::string>()));
+    for (const auto& served : body["data"].items())
+        CHECK(schema.at("properties").contains(served.key()));
     CHECK(h.is_quarantined("agent-B"));
     const auto rec = active_record(h.quarantine_store, "agent-B");
     REQUIRE(rec.has_value());

@@ -8978,8 +8978,10 @@ tests:
   # window's first sample is not 0 and the extrapolation cannot clamp to zero: three drifts read
   # a little over 3, two read a little over 2, which keeps both sides clear of the threshold.
 
-  # CASE M -- three drifts inside the hour fire; two on another instance do not. RED if the
-  # threshold moves to > 3 (the firing side reads about 3.05) or to >= 2 (the other side fires).
+  # CASE M -- three drifts inside the hour fire; two on another instance do not. RED if the alert
+  # is removed, or its threshold moves to 4 or more (the firing side reads about 3.05 and goes
+  # quiet) or to 2 or less (the other instance reads about 2.03 and fires). It cannot tell >= 3
+  # from > 3: both sit under 3.05.
   - interval: 1m
     name: quarantine drift - three drifts in an hour fire, two do not
     input_series:

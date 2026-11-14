@@ -1527,13 +1527,18 @@ struct FakeDevice {
 // An apply that has claimed the record and is blocked inside its dispatch, on another thread: the
 // MCP quarantine_device re-dispatch, or the reconciler's. `release()` lets the dispatch finish
 // (it queues the apply and the claim is released), and joins. The thread asserts nothing: Catch2
-// assertions are not thread-safe, so the outcome is read after the join.
+// assertions are not thread-safe, so the outcome is read after the join. The constructor always
+// returns: the worker signals `in_dispatch` from inside the dispatch, or, when the chokepoint
+// refused before dispatching (a claim refused, a store error), right after it returns. The case
+// then asserts `dispatch_entered` with REQUIRE, so a failed setup is a failure and not a hang.
 struct BlockedApply {
     Rig& rig;
     std::promise<void> in_dispatch;
     std::promise<void> go;
     std::thread worker;
     bool released{false};
+    // Written by the worker before it sets `in_dispatch`, read by the test thread after the wait.
+    bool dispatch_entered{false};
     std::expected<ContainmentReapplyResult, ContainmentReapplyError> result{
         std::unexpected(ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, "unset"})};
 
@@ -1545,6 +1550,7 @@ struct BlockedApply {
                 rig.quarantine, kAgent,
                 [&](const std::unordered_map<std::string, std::string>& params)
                     -> std::pair<std::string, int> {
+                    dispatch_entered = true;
                     in_dispatch.set_value();
                     go_future.wait();
                     const auto out = rig.system_dispatch("firewall", "quarantine", {kAgent}, "",
@@ -1552,8 +1558,10 @@ struct BlockedApply {
                     return {out.command_id, out.sent};
                 },
                 stored);
+            if (!dispatch_entered)
+                in_dispatch.set_value(); // refused before the dispatch: let the constructor go
         });
-        entered.wait(); // the claim is live and the dispatch is blocked
+        entered.wait(); // the claim is live and the dispatch is blocked, or the apply did not start
     }
     void release() {
         if (released)
@@ -1587,6 +1595,7 @@ TEST_CASE("quarantine release (p): a late apply -- the device answers inactive t
     device.check_invariant();
 
     BlockedApply apply(rig); // an apply holds the claim, blocked inside its dispatch
+    REQUIRE(apply.dispatch_entered);
     // From the pause between the route's polls: the device runs the release (inactive), then the
     // apply is let go and delivered AFTER it.
     int pauses = 0;
@@ -1690,6 +1699,7 @@ TEST_CASE("quarantine release (r): the late apply with force=true: the record en
         REQUIRE(res->status == 201);
     }
     BlockedApply apply(rig);
+    REQUIRE(apply.dispatch_entered);
     detail::release_confirm_pause_hook() = [&] {
         device.deliver();
         apply.release();

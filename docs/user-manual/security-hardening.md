@@ -840,8 +840,8 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes an empty queue from a tick that
   could not read at all: check it first when a gauge looks suspiciously static.
   `yuzu_server_quarantine_reconciler_last_tick_unixtime` is when a tick last finished, and
-  `YuzuQuarantineReconcilerStalled` fires when no server of the job has finished one for five minutes:
-  while it fires, the gauges above are frozen at their last values.
+  `YuzuQuarantineReconcilerStalled` fires when no server of the job has finished one for about ten minutes
+  (five minutes stale, held for five): while it fires, the gauges above are frozen at their last values.
 
 **The apply fence, and what it does not close.** A record ends on the device's `inactive` answer, and an
 apply that reaches the device after the observation that produced that answer would leave the device

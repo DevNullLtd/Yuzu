@@ -402,7 +402,9 @@ private:
         bool owed_release_sent{false};
         bool owed_parked{false};
         // Releasing entries (#7625): the `release_sent` audit row is written once per agent session,
-        // not once per cycle; the counter still counts every dispatch.
+        // not once per cycle; the counter still counts every dispatch. The bool is needed beside the
+        // id because a session id can be empty (an agent registered with no mapped session), and ""
+        // must not read as "already audited" or the first release_sent row would be skipped.
         bool release_audited{false};
         std::string release_audited_session_id;
         std::chrono::steady_clock::time_point pending_since{};

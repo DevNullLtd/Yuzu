@@ -889,7 +889,7 @@ bool ResponseStore::shorten_ttl(const std::string& instruction_id, const std::st
     if (!lease)
         return false;
     const std::string expires = std::to_string(now_epoch() + static_cast<int64_t>(keep.count()));
-    // Never raises an earlier expiry: only a row with no expiry (0 = default retention) or a later
+    // Never raises an earlier expiry: only a row with no expiry (0 = kept forever) or a later
     // one is moved.
     pg::PgResult res = pg::exec_params(
         lease.get(),

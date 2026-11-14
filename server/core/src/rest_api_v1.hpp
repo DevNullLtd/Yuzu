@@ -124,7 +124,9 @@ std::atomic<int>& release_confirm_max_polls(); // default 10
 // TEST SEAM, in the pattern of the two above and never set outside tests: called by the DELETE
 // handler's reply wait before every poll after the first, just ahead of the interval sleep. A test
 // stores the device's reply from it, so a reply that arrives BETWEEN polls (the late confirmation,
-// #7584a) is produced without a thread or a sleep. Empty in production.
+// #7584a) is produced without a thread or a sleep. Empty in production. Unlike the atomics above it
+// is not synchronised: set it only while no request is in flight (the tests run the handler on
+// their own thread through TestRouteSink).
 std::function<void()>& release_confirm_pause_hook();
 } // namespace detail
 

@@ -3226,10 +3226,11 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "The quarantine reconciler has not finished a tick for over five minutes"
+          summary: "The quarantine reconciler has not finished a tick for about ten minutes"
           description: >-
-            yuzu_server_quarantine_reconciler_last_tick_unixtime is older than
-            five minutes on every server of this job, and the reconciler ticks
+            yuzu_server_quarantine_reconciler_last_tick_unixtime has been more
+            than five minutes old on every server of this job for five minutes,
+            so no tick has finished for about ten minutes. The reconciler ticks
             every 20 seconds, so its thread is stuck or no longer running. While
             this fires, yuzu_server_quarantine_release_pending and
             yuzu_server_quarantine_endpoint_unconfirmed are FROZEN at their last

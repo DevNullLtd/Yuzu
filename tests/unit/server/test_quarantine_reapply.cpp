@@ -263,11 +263,13 @@ TEST_CASE("endpoint_state_name: the enumerator's name, never device text", "[ser
 // ── The mapper against the agent's grammar (#7585a) ───────────────────────────
 
 // Each address is sent twice (/out and /in), and the agent refuses more than kMaxExceptions
-// entries, so the server's address cap must stay at or under half of it. Raising either number
-// alone fails the build here instead of failing on a device.
-static_assert(2 * yuzu::server::kContainmentMaxAddresses <=
+// entries, so the server's address cap is exactly half of it. The two caps must move together:
+// changing either number alone fails the build here instead of failing on a device (or leaving a
+// cap the other side never reaches).
+static_assert(2 * yuzu::server::kContainmentMaxAddresses ==
                   yuzu::firewall::quarantine::kMaxExceptions,
-              "the server may send more exception entries than the agent accepts");
+              "the server's address cap and the agent's exception cap must be changed together: "
+              "each address is sent as two entries");
 
 TEST_CASE("map_whitelist_to_exceptions: what the mapper emits is accepted by the agent's own parser, "
           "with twice as many endpoints as addresses",

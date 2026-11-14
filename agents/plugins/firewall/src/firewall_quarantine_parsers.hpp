@@ -2450,7 +2450,7 @@ struct IptablesListing {
 
 /// Whether `a` is one of the argv shapes the agent's sudoers grants for iptables / ip6tables
 /// (`scripts/install-agent-user.sh`, #7634) and nothing else. This is the SINGLE statement of those
-/// shapes: the sudoers lines are written from it and `tests/test_legacy_quarantine_plugin_removed_lexical.py`
+/// shapes: the sudoers lines are hand-written to match it, `tests/test_legacy_quarantine_plugin_removed_lexical.py`
 /// checks the two against each other, and a unit test feeds it every argv the plans above build.
 ///   {tool, -S}                           list
 ///   {tool, -N, ours}                     create a generation chain
