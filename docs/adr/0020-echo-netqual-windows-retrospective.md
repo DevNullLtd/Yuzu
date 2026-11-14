@@ -17,9 +17,9 @@
 > **The default half shipped early, by a ruling recorded as an owner ruling** (PR #6360,
 > authored and merged by @Doomgoose, approved by @FortitudeEtc (2026-10-23); its body records
 > the ruling as an owner ruling without naming the owner): `netqual` and `netconn`, like every
-> Echo capture source, are on by default on every OS, and agents upgraded past schema v8 were
+> Echo capture source, are on by default on every OS where supported, and agents upgraded past schema v8 were
 > moved to on once, **including a source an operator had switched off before the upgrade** (the
-> v8 migration flips every stored `false` for the eight formerly opt-in sources, `echo_db.cpp`);
+> v8 migration flips every stored `false`, seeded or operator-written, for the eight formerly opt-in sources, `echo_db.cpp`);
 > a source an operator switches off afterwards stays off. The opt-in default
 > described below no longer describes what ships. ADR-3006 was kept accepted with this
 > exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14. The switchable look-back unit

@@ -9,7 +9,8 @@ status-note: >-
   (2026-10-23); its body records the ruling as an owner ruling without naming the owner): every
   Echo capture source, DNS and ARP included, was made on by default on every OS where it is
   supported, and upgraded agents were moved to on (Echo schema v8), including the eight
-  formerly opt-in sources an operator had switched off before the upgrade. That departs from
+  formerly opt-in sources an operator had switched off before the upgrade (every stored `false`,
+  seeded by default or written by an operator). That departs from
   three normative clauses: the `effective` clause's "new defaults are not delivered ahead of
   enforcement", the D2 ordering, and D9 ("whatever is off at the moment of upgrade ... stays
   off"). The other new defaults are not delivered: the four
