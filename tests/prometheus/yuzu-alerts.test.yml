@@ -9222,3 +9222,92 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s3", severity="warning"}'
             value: 1
+
+  # ── yuzu-crl-source: CRL source registration refused while name lookups are backing up ──────
+  #
+  # Which case is meant to catch which change to YuzuCrlSourceResolverBusy (each one mutation-run):
+  #   * the `reason="dns_busy"` filter lost                -> CRL case B (the other five reasons,
+  #                                                           however fast they rise, are quiet)
+  #   * the filter value changed to another reason         -> CRL case A (nothing fires)
+  #   * `> 0` weakened to `>= 0`                           -> CRL cases B and D (a flat series fires)
+  #   * `[15m]` shortened to 10m or below                  -> CRL case A (still firing at 14m)
+  #   * `for: 0m` lengthened to 5m or more                 -> CRL case A (firing at 5m)
+  #   * `sum by (instance)` replaced by a fleet sum        -> CRL case D (the sample loses its
+  #                                                           instance label)
+  #   (a change of the window from 15m to 12m is not caught: no case fixes the window exactly)
+
+  # CRL CASE A -- the dns_busy counter is seeded at 0 and rises once at 3m: the alert fires at
+  # 5m, is still firing at 14m, and has resolved by 30m once the window has passed.
+  - interval: 1m
+    name: crl source resolver busy - one refusal fires and then resolves
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0 0 0 1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CRL CASE B -- the other five reasons rise by one a minute and stay quiet, and a dns_busy
+  # series that was seeded at 0 and never moved stays quiet too.
+  - interval: 1m
+    name: crl source resolver busy - the other five reasons and a flat dns_busy are quiet
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="own_addresses_unavailable"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_unavailable"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_timeout"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_budget_exhausted"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="validation_busy"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CRL CASE C -- no CRL source series at all (a server that has not published the counter) is
+  # quiet. This documents the silence, it does not endorse it: the server seeds every reason at
+  # boot, so an absent series is a server that is not running, which the up-based rules cover.
+  - interval: 1m
+    name: crl source resolver busy - an absent counter is quiet
+    input_series:
+      - series: 'up{job="yuzu",instance="s1"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CRL CASE D -- two replicas: only the one that refused a request alerts, under its own
+  # instance label; the other (seeded at 0, never moved) is quiet.
+  - interval: 1m
+    name: crl source resolver busy - only the replica that refused alerts
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0 0 0 1 1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s2",reason="dns_busy"}'
+        values: "0x44"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1

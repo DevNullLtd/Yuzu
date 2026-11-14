@@ -8250,3 +8250,45 @@ groups:
             yuzu_server_oidc_resolver_in_flight against
             yuzu_server_oidc_resolver_pool_capacity and the outcome="timeout" series of
             the same counter, then the host's name resolver.
+
+  - name: yuzu-crl-source
+    # Registering or replacing a CRL source (POST, PUT and their MCP twins) resolves each URL host,
+    # and each listen-host name of this server, through a resolver pool that holds at most 16
+    # lookups. When the pool is at its cap a lookup is refused and not started; the request is
+    # answered with a retryable 503 and yuzu_server_revocation_source_degrade_total{reason="dns_busy"}
+    # is incremented once. All six reasons (own_addresses_unavailable, dns_unavailable, dns_timeout,
+    # dns_busy, dns_budget_exhausted, validation_busy) are zero-seeded at boot. Only dns_busy is
+    # alerted: the others are outcomes of a single request that the caller sees in its own 503.
+    #
+    # Only registration resolves names today: no CRL fetcher exists yet, so a refused fetch cannot
+    # be counted here. When one lands, its lookups must reach this same counter under dns_busy
+    # before this rule says anything about them.
+    #
+    # The counter moves once per refused request, which is occasional administrator activity, so
+    # this is an increase over a window with no hold, not a sustained rate: one refusal fires it
+    # and it resolves when the window has passed.
+    #
+    # Known blind spots: lookups backing up while nobody registers or replaces a source raise
+    # nothing here (yuzu_server_revocation_source_resolver_in_flight shows it, and no rule reads
+    # it); and a counter that starts life at its first increment, with no seeded 0 before it,
+    # contributes no increase.
+    rules:
+      - alert: YuzuCrlSourceResolverBusy
+        expr: |
+          sum by (instance) (
+            increase(yuzu_server_revocation_source_degrade_total{reason="dns_busy"}[15m])
+          ) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CRL source registration was refused because name lookups are backing up"
+          description: >-
+            yuzu_server_revocation_source_degrade_total{reason="dns_busy"} increased on
+            {{ $labels.instance }} in the last 15 minutes: a CRL source registration or
+            replacement was answered with a retryable 503 because the resolver pool was at its
+            cap and the lookup was not started. Nothing was changed; repeat the request once
+            lookups drain. Check that name resolution from this server is answering, then read
+            yuzu_server_revocation_source_resolver_in_flight: a value of 16 means every slot is
+            in use.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#registering-a-crl-source"
