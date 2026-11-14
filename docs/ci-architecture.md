@@ -3104,9 +3104,8 @@ Resolution order inside the script:
    636 ms against 68 ms with fsync on. The pg half sets it whatever the
    cluster, so a Linux runner whose pre-set DSN or native fallback reaches a
    durable cluster would lose time instead (no Big Tam agent does). It moves the
-   pg step's baseline:
-   pg-step samples for a later push (the tmpfs push, Push 3) compare only
-   against runs that include it, and samples taken before it (the
+   pg step's baseline: pg-step samples for a later push (the tmpfs push, Push 3)
+   compare only against runs that include it, and samples taken before it (the
    concurrent-halves runs, and #7703's Push 2d samples) do not. Revert:
    `git revert -m 1` the merge commit of the PR that wired it. The
    concurrent-halves kill switch (`YUZU_CI_SEQUENTIAL_HALVES=1`) does not undo
