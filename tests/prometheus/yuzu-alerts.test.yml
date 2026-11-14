@@ -9016,3 +9016,122 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="wmi", severity="warning"}'
             value: 1
+
+  # ── yuzu-delivery: webhook and offload delivery backlog ─────────────────────────────────────
+  #
+  # Which case is meant to catch which change to which rule (reasoned, NOT mutation-run):
+  #   YuzuWebhookDeliveriesDropped / YuzuOffloadDeliveriesDropped
+  #     * the `reason="queue_full"` filter lost          -> delivery case C (quiescing-only drops
+  #                                                         must stay quiet) and case D
+  #     * `for: 10m` shortened well below 4m             -> delivery case B (one burst must not fire)
+  #     * `for: 10m` shortened by a few minutes          -> delivery case A (quiet at 8m)
+  #       (a change from 10m to 9m is not caught: no case pins the hold exactly)
+  #     * `> 0` weakened to `>= 0`                       -> delivery case B (a flat counter must not fire)
+  #   YuzuDeliveryPoolBacklogHigh
+  #     * `> 0.8` weakened to `>= 0.8`                   -> delivery case E (exactly 80% is quiet)
+  #     * the join narrowed with on()/ignoring()         -> delivery case E (the offload store's
+  #                                                         own ratio must not be reported as webhook's)
+
+  # DELIVERY CASE A -- a webhook queue that keeps refusing (one drop a minute) is pending, then
+  # firing from about 11m (`for: 10m`), labelled with the instance only.
+  - interval: 1m
+    name: webhook deliveries dropped - a sustained queue_full rate fires
+    input_series:
+      - series: 'yuzu_server_webhook_delivery_dropped_total{job="yuzu",instance="s1",reason="queue_full"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWebhookDeliveriesDropped", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWebhookDeliveriesDropped", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuWebhookDeliveriesDropped", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # DELIVERY CASE B -- one burst of drops that then stops never fires: the 5m rate window empties
+  # before `for: 10m` is satisfied. A flat counter is quiet too.
+  - interval: 1m
+    name: webhook deliveries dropped - a single burst and a flat counter are quiet
+    input_series:
+      - series: 'yuzu_server_webhook_delivery_dropped_total{job="yuzu",instance="s1",reason="queue_full"}'
+        values: "0 0 5 5x40"
+      - series: 'yuzu_server_webhook_delivery_dropped_total{job="yuzu",instance="s2",reason="queue_full"}'
+        values: "3x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuWebhookDeliveriesDropped", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWebhookDeliveriesDropped", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuWebhookDeliveriesDropped", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # DELIVERY CASE C -- drops with reason="quiescing" (a shutdown) never alert, however long they
+  # run.
+  - interval: 1m
+    name: webhook and offload deliveries dropped - quiescing drops are quiet
+    input_series:
+      - series: 'yuzu_server_webhook_delivery_dropped_total{job="yuzu",instance="s1",reason="quiescing"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_offload_delivery_dropped_total{job="yuzu",instance="s1",reason="quiescing"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuWebhookDeliveriesDropped|YuzuOffloadDeliveriesDropped", alertstate=~"firing|pending"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # DELIVERY CASE D -- the two stores alert independently: offload queue_full drops fire the offload
+  # alert only, while a webhook counter that stays flat stays quiet.
+  - interval: 1m
+    name: offload deliveries dropped - a sustained queue_full rate fires the offload alert only
+    input_series:
+      - series: 'yuzu_server_offload_delivery_dropped_total{job="yuzu",instance="s1",reason="queue_full"}'
+        values: "0+2x40"
+      - series: 'yuzu_server_webhook_delivery_dropped_total{job="yuzu",instance="s1",reason="queue_full"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuWebhookDeliveriesDropped|YuzuOffloadDeliveriesDropped", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuWebhookDeliveriesDropped|YuzuOffloadDeliveriesDropped", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOffloadDeliveriesDropped", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # DELIVERY CASE E -- backlog ratio. The capacity here is an illustrative 250 (production is 260
+  # per store); the ratio is what is under test. The webhook store at 84% (210 of 250) is pending
+  # from 4m, then firing from 9m (`for: 5m`); the offload store at 40% and a third replica at exactly
+  # 80% stay quiet, and the alert carries the store label.
+  - interval: 1m
+    name: delivery pool backlog - above 80 percent fires per store, exactly 80 percent is quiet
+    input_series:
+      - series: 'yuzu_server_delivery_pool_pending{job="yuzu",instance="s1",store="webhook"}'
+        values: "10x3 210x40"
+      - series: 'yuzu_server_delivery_pool_capacity{job="yuzu",instance="s1",store="webhook"}'
+        values: "250x43"
+      - series: 'yuzu_server_delivery_pool_pending{job="yuzu",instance="s1",store="offload"}'
+        values: "100x43"
+      - series: 'yuzu_server_delivery_pool_capacity{job="yuzu",instance="s1",store="offload"}'
+        values: "250x43"
+      - series: 'yuzu_server_delivery_pool_pending{job="yuzu",instance="s2",store="webhook"}'
+        values: "200x43"
+      - series: 'yuzu_server_delivery_pool_capacity{job="yuzu",instance="s2",store="webhook"}'
+        values: "250x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuDeliveryPoolBacklogHigh", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeliveryPoolBacklogHigh", alertstate="pending", instance="s1", job="yuzu", severity="warning", store="webhook"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuDeliveryPoolBacklogHigh", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuDeliveryPoolBacklogHigh", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuDeliveryPoolBacklogHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning", store="webhook"}'
+            value: 1

@@ -26,6 +26,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <chrono>
 #include <cstddef>
@@ -3791,7 +3792,10 @@ TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fe
         return plan;
     };
 
-    SECTION("rollup") {
+    // Both checks below read the ONE seeded fleet (the EXPLAINs run inside a rolled-back
+    // transaction and the drill only reads), so they share it: two SECTIONs re-ran the case and
+    // re-seeded the ~24,000 rows for each.
+    { // the rollup
         yuzu::server::NamePatternQuery q;
         q.patterns = {"libssl%"};
         q.labels = {"openssl"};
@@ -3819,7 +3823,7 @@ TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fe
         CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
     }
 
-    SECTION("drill, scope holding none of the family's devices") {
+    { // the drill, a scope holding none of the family's devices
         yuzu::server::NamePatternDevicesQuery q;
         q.patterns = {"libssl%"};
         q.leads = {"lib"};
@@ -7341,8 +7345,8 @@ TEST_CASE("query_software: match=prefix and a status filter run under the 5 s st
     // kSearchStatementTimeout) cancels that wait; the bare-lease path would wait to the pool's
     // lock_timeout (10 s) and, on a scan, its statement_timeout (30 s). Elapsed time therefore
     // tells the two paths apart: both shapes must degrade (nullopt) well inside 10 s. Costs
-    // about 10 s of wall-clock (two 5 s bounds); the ordering is of two server-side timers, not
-    // of this process's scheduling.
+    // about 5 s of wall-clock (the two 5 s bounds run concurrently); the ordering is of two
+    // server-side timers, not of this process's scheduling.
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
     REQUIRE(pool.valid());
@@ -7362,14 +7366,31 @@ TEST_CASE("query_software: match=prefix and a status filter run under the 5 s st
     SoftwareFleetQuery status;
     status.status = "disabled";
     status.limit = 10;
-    for (const auto* q : {&prefix, &status}) {
-        CAPTURE(q->name, q->status);
-        const auto t0 = std::chrono::steady_clock::now();
-        CHECK_FALSE(store.query_software(*q).has_value()); // degraded, never an empty page
-        const auto secs =
-            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0)
-                .count();
-        CHECK(secs < 9); // the 5 s bound fired, not the 10 s lock_timeout
+    // The two shapes wait on the same lock side by side (the pool has a lease for each beside the
+    // holder's), so the case costs one 5 s bound, not two: each still times its own read.
+    struct Shape {
+        const SoftwareFleetQuery* q;
+        bool answered{true};
+        std::chrono::milliseconds took{0};
+    };
+    std::array<Shape, 2> shapes{Shape{&prefix}, Shape{&status}};
+    {
+        std::vector<std::jthread> readers;
+        for (auto& sh : shapes)
+            readers.emplace_back([&store, &sh] {
+                const auto t0 = std::chrono::steady_clock::now();
+                sh.answered = store.query_software(*sh.q).has_value();
+                sh.took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0);
+            });
+    } // joined
+    for (const auto& sh : shapes) {
+        CAPTURE(sh.q->name, sh.q->status, sh.took.count());
+        CHECK_FALSE(sh.answered); // degraded, never an empty page
+        // It waited on the lock until a server-side bound cancelled it ...
+        CHECK(sh.took >= std::chrono::milliseconds{4500});
+        // ... and that bound was the 5 s statement_timeout, not the 10 s lock_timeout.
+        CHECK(sh.took < std::chrono::seconds{9});
     }
     pg::PgResult rb = pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
     REQUIRE(rb.status() == PGRES_COMMAND_OK);

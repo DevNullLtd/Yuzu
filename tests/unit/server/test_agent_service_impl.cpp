@@ -27,6 +27,7 @@
  *      actually emits two stamped rows from a single mapping.
  */
 
+#include "delivery_pool_metrics.hpp"
 #include "agent_service_impl.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -4152,35 +4153,65 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
     CHECK(off_after_reauth.size() == 2);
 }
 
-// ── Metric: all 6 webhook/offload delivery counters pre-seeded to 0 ────────
+// ── Metric: the delivery drop counters and pool gauges, registered and pre-seeded ──
 //
-// Mirrors server.cpp's ServerImpl constructor pre-seed block (the six
-// metrics_.counter(name) calls right after the six describe() calls,
-// server.cpp:~1614-1633) — same pattern as
-// test_principal_quota_chokepoint.cpp's preseed_quota_metric() helper.
-// Regression guard for the adversarial-review round-2 fix (bf5582461):
-// describe() alone only writes HELP/TYPE metadata, it does not materialize
-// a series, so before that fix a fresh server exposed none of these six
-// series until the first delivery incremented one - breaking absent()-based
-// alerting. This test does not construct a real ServerImpl (too heavyweight
-// for a unit test); it exercises the exact same describe()+counter() calls
-// against a bare MetricsRegistry.
-TEST_CASE("Webhook/offload delivery counters: all 6 pre-seeded to 0 at boot",
+// Exercises `register_delivery_pool_metrics` and `publish_delivery_pool` (delivery_pool_metrics.hpp),
+// the one definition server.cpp's boot path and its 15 s tick call. describe() alone only writes
+// HELP/TYPE metadata and does not materialise a series, so without the pre-seed a fresh server
+// exposes none of these series until the first drop, which breaks absent()-based alerting
+// (adversarial-review round 2 of #3261). This does not construct a ServerImpl (too heavyweight for
+// a unit test), so that server.cpp calls those two functions with the right store labels is pinned
+// separately by the lexical wiring test, test_delivery_pool_metrics_wiring_lexical.cpp. The other
+// four webhook/offload counters (success, failed, secret_unavailable, ...) are pre-seeded by a
+// loop in server.cpp that no unit test reaches.
+TEST_CASE("Delivery pool metrics: both drop reasons and both store gauges are present at 0 after "
+          "registration, and there is no bare drop series",
           "[agent_service][issue3261][metrics]") {
     yuzu::MetricsRegistry reg;
-    const char* names[] = {"yuzu_server_webhook_delivery_success_total",
-                           "yuzu_server_webhook_delivery_failed_total",
-                           "yuzu_server_webhook_delivery_dropped_total",
-                           "yuzu_server_offload_delivery_success_total",
-                           "yuzu_server_offload_delivery_failed_total",
-                           "yuzu_server_offload_delivery_dropped_total"};
-    for (const char* name : names) {
-        reg.describe(name, "test", "counter");
-        reg.counter(name);
+    yuzu::server::register_delivery_pool_metrics(reg);
+    const std::string text = reg.serialize();
+    for (const char* name : {"yuzu_server_webhook_delivery_dropped_total",
+                             "yuzu_server_offload_delivery_dropped_total"}) {
+        for (const char* reason : {"queue_full", "quiescing"}) {
+            CHECK(reg.counter(name, {{"reason", reason}}).value() == 0.0);
+            CHECK(text.find(std::string(name) + "{reason=\"" + reason + "\"} 0") !=
+                  std::string::npos);
+        }
+        // The earlier unlabelled series must not be exposed alongside the labelled ones. A
+        // sample line starts at a line boundary; "# HELP <name> ..." and "# TYPE <name> ..."
+        // lines do not, so anchor on the newline.
+        CHECK(("\n" + text).find("\n" + std::string(name) + " ") == std::string::npos);
     }
-    for (const char* name : names) {
-        CHECK(reg.counter(name).value() == 0.0);
-    }
+    for (const char* name : {"yuzu_server_delivery_pool_pending",
+                             "yuzu_server_delivery_pool_capacity"})
+        for (const char* store : {"webhook", "offload"})
+            CHECK(text.find(std::string(name) + "{store=\"" + store + "\"} 0") !=
+                  std::string::npos);
+}
+
+TEST_CASE("Delivery pool metrics: publish sets pending and capacity, and a store that is not open "
+          "reads 0",
+          "[agent_service][issue3261][metrics]") {
+    yuzu::MetricsRegistry reg;
+    yuzu::server::register_delivery_pool_metrics(reg);
+    const auto pending = [&](const char* store) {
+        return reg.gauge("yuzu_server_delivery_pool_pending", {{"store", store}}).value();
+    };
+    const auto capacity = [&](const char* store) {
+        return reg.gauge("yuzu_server_delivery_pool_capacity", {{"store", store}}).value();
+    };
+
+    yuzu::server::publish_delivery_pool(reg, "webhook", /*open=*/true, 210, 260);
+    yuzu::server::publish_delivery_pool(reg, "offload", /*open=*/true, 3, 260);
+    CHECK(pending("webhook") == 210.0);
+    CHECK(capacity("webhook") == 260.0);
+    CHECK(pending("offload") == 3.0);
+
+    // The store closes: both gauges go back to 0 rather than keeping the last reading.
+    yuzu::server::publish_delivery_pool(reg, "webhook", /*open=*/false, 210, 260);
+    CHECK(pending("webhook") == 0.0);
+    CHECK(capacity("webhook") == 0.0);
+    CHECK(pending("offload") == 3.0); // the other store is untouched
 }
 
 TEST_CASE("typed_inventory_sources: app_usage is a typed source (PR7b.3 guard)",

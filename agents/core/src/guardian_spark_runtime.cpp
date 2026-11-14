@@ -2473,7 +2473,8 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
     switch (core.state) {
     case AttachCoreState::Armed:
         return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = core.generation,
-                          .receipt = {}, .skipped = core.skipped};
+                          .receipt = {}, .skipped = core.skipped,
+                          .rebuild_reason = core.rebuild_reason};
     case AttachCoreState::Failed:
         // rung 9c PR-5c round 2 (#4221): carry attach_core()'s own
         // prior_state_preserved bit through to the caller - see ArmError's doc
@@ -2509,7 +2510,8 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         // changes an already-settled `end`, short of a genuinely different
         // rule_id/spec reaching this key.
         return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
-                          .receipt = ArmReceipt{core.claim}, .skipped = core.skipped};
+                          .receipt = ArmReceipt{core.claim}, .skipped = core.skipped,
+                          .rebuild_reason = core.rebuild_reason};
     }
 
     // Astra opine review, Blocker 1 step 3: "Reacquire registry_mu_ and inspect this
@@ -2519,6 +2521,16 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
     // reported Pending a moment ago may already be terminal. Mirrors wait_for_claim's
     // own terminal check exactly, minus the cv wait itself - this never blocks.
     std::unique_lock<std::mutex> lk{registry_mu_};
+    // #5719 test seam (default empty, one-shot): lets a test hold this caller here until the
+    // claim has settled, which forces the Armed return below. The same single lock acquisition
+    // serves the empty (production) case; the hook runs with the lock released.
+    if (attach_resume_hook_for_test_) {
+        auto resume_hook = std::move(attach_resume_hook_for_test_);
+        attach_resume_hook_for_test_ = nullptr;
+        lk.unlock();
+        resume_hook();
+        lk.lock();
+    }
     if (arm_claim->commit_exception) {
         const std::exception_ptr e = arm_claim->commit_exception;
         claim_rollback.committed = true; // terminal result observed
@@ -2531,7 +2543,7 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         lk.unlock();
         if (outcome)
             return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = *outcome,
-                              .receipt = {}};
+                              .receipt = {}, .rebuild_reason = core.rebuild_reason};
         // This call's own NEW claim (attach_core() already ran
         // detach_rule_locked(rule_id) on rule_id's prior generation to create it)
         // resolved to a failure by the time we re-checked - rule_id has nothing
@@ -2549,7 +2561,7 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
     claim_rollback.committed = true;
     lk.unlock();
     return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
-                      .receipt = ArmReceipt{arm_claim}};
+                      .receipt = ArmReceipt{arm_claim}, .rebuild_reason = core.rebuild_reason};
 }
 
 void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
@@ -2944,13 +2956,37 @@ bool GuardianSparkRuntime::is_dead_claim(const KeyClaim& claim) noexcept {
            static_cast<bool>(claim.commit_exception);
 }
 
-std::optional<GuardianSparkRuntime::AttachCoreResult>
+std::expected<GuardianSparkRuntime::AttachCoreResult, GuardianRebuildReason>
 GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::string& rule_id,
                                             const SparkSpec& spec,
                                             const RuleGeneration& pushed,
                                             const std::optional<KeyHealthProbe>& probe) const noexcept {
     // Every term below is load-bearing: a skip asserts the rule is healthy, so a term that is
     // missing turns "rebuild what is wrong" into "leave what is wrong" (#4415).
+    //
+    // #5719: every non-skip return names the first rebuild condition that holds, in the fixed
+    // precedence of guardian_rebuild_tally.hpp. This attributes a reason to conditions that
+    // already rebuilt; it adds none and removes none, so the skip decision is unchanged. The
+    // order of evaluation below IS the precedence (first match wins):
+    //   1. a key with any claim: own identical live arm -> skip (Reobserved); own arm with other
+    //      content, spec or ownership -> ContentChanged; any other claim -> KeyBusy;
+    //   2. no committed rules_/keys_ entry -> FirstAttach; likewise a committed rule whose live
+    //      arm is mapped to another key (a retarget onto a key someone else holds);
+    //   3. committed path, HEALTH before content: the recorded bit (its recorded cause, else
+    //      KeyFaulted), an absent probe (HealthUnknown), a probe of another subscription
+    //      (SubscriptionReplaced), a Dead probe (KeyDead), any other non-Healthy probe
+    //      (KeyFaulted), an Unknown evaluation episode (UnknownEpisode); this is the code's
+    //      order, not the declaration order of GuardianRebuildReason;
+    //   4. content: a changed content id (ContentChanged), then for FileHashEquals an empty
+    //      (BaselineEmpty) or differing (BaselineDiffers) pushed hash;
+    //   5. defensive invariants no public path violates (inactive generation, spec mismatch, an
+    //      index that does not own the generation although the rule is mapped to this key, or
+    //      has no mapping at all) -> Other.
+    // On the committed path (steps 3 and 4) health outranks content, so a committed rule on a
+    // broken key is reported as a broken key even when its content also changed; step 1 comes
+    // first, so a changed rule that still has its own arm in flight is ContentChanged even when
+    // the key is unhealthy. Pure map reads under registry_mu_, no allocation: the noexcept
+    // contract holds.
     const auto cit = claims_.find(key);
     if (cit != claims_.end() && !cit->second.fifo.empty()) {
         // A key with ANY claim never takes the committed path below (a disarm, a parked or
@@ -2968,27 +3004,53 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
                 index_->owns(key, rule_id, c->generation))
                 return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
                                         .error = {}, .claim = c};
-            return std::nullopt; // same rule, different content: the new push replaces it
+            // same rule, different content: the new push replaces it
+            return std::unexpected(GuardianRebuildReason::ContentChanged);
         }
-        return std::nullopt;
+        return std::unexpected(GuardianRebuildReason::KeyBusy);
     }
 
     const auto rit = rules_.find(rule_id);
     const auto kit = keys_.find(key);
     if (rit == rules_.end() || kit == keys_.end())
-        return std::nullopt;
+        return std::unexpected(GuardianRebuildReason::FirstAttach);
+    // A retarget onto a key another rule already holds: keys_ has the key, but this rule's live
+    // arm is mapped to a different key. From this key's side it is a first attach, exactly as
+    // when the key is new (the check above, which also precedes every health and content term).
+    // It is decided here, ahead of those terms, so for such a rule they are not consulted: a
+    // retarget onto a faulted or dead key, or one that also changed content, is labelled
+    // first_attach, and the next full push reports the key's own cause. For a healthy,
+    // unchanged rule the invariant at step 5 would report `other`, a label documented as a
+    // defect (found on the flipped rig, #5719). The index is the only record of a committed
+    // rule's key, so index corruption of this shape is indistinguishable from a retarget and
+    // reads first_attach too. The skip decision is unchanged: owns() at step 5 needs the rule
+    // mapped to this key, so no state that reaches here could have skipped. Non-allocating, so
+    // the noexcept contract holds.
+    if (index_->mapped_to_other_key(key, rule_id))
+        return std::unexpected(GuardianRebuildReason::FirstAttach);
     const RuleGeneration& live = *rit->second;
-    if (!live.active || live.content_id != pushed.content_id || live.eval.in_unknown ||
-        kit->second->faulted || !(kit->second->spec == spec) ||
-        !index_->owns(key, rule_id, live.generation))
-        return std::nullopt;
-    // The recorded bit above depends on an event having been delivered, and one can be lost (a
-    // full queued channel, or a Faulted that arrived before keys_ held the key). The backend's
-    // own answer, taken against THIS subscription, is the authority: anything but Healthy, an
-    // absent probe or a probe of a different subscription rebuilds.
-    if (!probe || probe->subscription != kit->second->subscription ||
-        probe->health != SubscriptionHealth::Healthy)
-        return std::nullopt;
+    // Health terms first (precedence step 3). The recorded bit depends on an event having been
+    // delivered, and one can be lost (a full queued channel, or a Faulted that arrived before
+    // keys_ held the key). The backend's own answer, taken against THIS subscription, is the
+    // authority: anything but Healthy, an absent probe or a probe of a different subscription
+    // rebuilds.
+    if (kit->second->faulted)
+        return std::unexpected(kit->second->unhealthy_why != GuardianRebuildReason::None
+                                   ? kit->second->unhealthy_why
+                                   : GuardianRebuildReason::KeyFaulted);
+    if (!probe)
+        return std::unexpected(GuardianRebuildReason::HealthUnknown);
+    if (probe->subscription != kit->second->subscription)
+        return std::unexpected(GuardianRebuildReason::SubscriptionReplaced);
+    if (probe->health == SubscriptionHealth::Dead)
+        return std::unexpected(GuardianRebuildReason::KeyDead);
+    if (probe->health != SubscriptionHealth::Healthy)
+        return std::unexpected(GuardianRebuildReason::KeyFaulted);
+    if (live.eval.in_unknown)
+        return std::unexpected(GuardianRebuildReason::UnknownEpisode);
+    // Content terms (precedence step 4).
+    if (live.content_id != pushed.content_id)
+        return std::unexpected(GuardianRebuildReason::ContentChanged);
     if (pushed.assertion.kind == AssertionKind::FileHashEquals) {
         // The pushed hash is the post-seed expected hash (authored, or the persisted baseline the
         // engine read). It must equal what the live rule actually compares against, which is its
@@ -2999,9 +3061,18 @@ GuardianSparkRuntime::reuse_existing_locked(const std::string& key, const std::s
                                            ? live.assertion.expected_hash
                                        : live.eval.baseline_set ? live.eval.baseline_hash
                                                                 : live.assertion.expected_hash;
-        if (pushed.assertion.expected_hash.empty() || pushed.assertion.expected_hash != live_hash)
-            return std::nullopt;
+        if (pushed.assertion.expected_hash.empty())
+            return std::unexpected(GuardianRebuildReason::BaselineEmpty);
+        if (pushed.assertion.expected_hash != live_hash)
+            return std::unexpected(GuardianRebuildReason::BaselineDiffers);
     }
+    // Defensive invariants (precedence step 5): unreachable through the public API, which keeps
+    // an active generation, the key's spec and the index's ownership in step. The runtime
+    // tests check that no attach (attach_nw) and no forced cause (forced_summary) is `other`,
+    // in test_guardian_spark_reapply_skip_runtime.cpp.
+    if (!live.active || !(kit->second->spec == spec) ||
+        !index_->owns(key, rule_id, live.generation))
+        return std::unexpected(GuardianRebuildReason::Other);
     return AttachCoreResult{.state = AttachCoreState::Armed, .generation = live.generation,
                             .error = {}, .claim = nullptr};
 }
@@ -3025,6 +3096,10 @@ GuardianSparkRuntime::probe_key_health(const std::string& key, const std::string
         return KeyHealthProbe{.subscription = subscription,
                               .health = backend_->subscription_health(subscription)};
     } catch (...) {
+        // #5719 item 4: counted, in-process only (read by tests; no log, heartbeat or export
+        // reads it). registry_mu_ is not held here (the lock above is scoped to its own block),
+        // and a relaxed fetch_add takes no lock and allocates nothing.
+        health_probe_failures_.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt; // unknown health is not healthy: the rule is rebuilt
     }
 }
@@ -3035,10 +3110,23 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (stopping_)
             return;
+        // TEST-ONLY seam (#5719): consumed inside the try, after the lock_guard and before the
+        // allocation it stands in for, so the catch below sees exactly what a real bad_alloc from
+        // the reserve or an emplace_back would give it. The relaxed load comes first so that a
+        // sweep with the flag clear (every production sweep) performs no read-modify-write; only
+        // when the flag is set does the exchange run, and it lets exactly one concurrent sweeper
+        // consume the flag.
+        if (fail_next_sweep_snapshot_.load(std::memory_order_relaxed) &&
+            fail_next_sweep_snapshot_.exchange(false, std::memory_order_relaxed))
+            throw std::bad_alloc{};
         snapshot.reserve(keys_.size());
         for (const auto& [key, pk] : keys_)
             snapshot.emplace_back(key, pk->subscription);
     } catch (...) {
+        // #5719 item 4: counted, in-process only (read by tests; no log, heartbeat or export
+        // reads it). The lock_guard above was destroyed during the unwind, so registry_mu_ is
+        // released here; the counter is a relaxed atomic add.
+        sweep_snapshot_failures_.fetch_add(1, std::memory_order_relaxed);
         return; // best-effort: the caller's teardown must still run (same posture as the probe)
     }
     for (const auto& [key, subscription_id] : snapshot) {
@@ -3046,7 +3134,9 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
         try {
             health = backend_->subscription_health(subscription_id);
         } catch (...) {
-            // unknown health is not healthy; the loop goes on to the other keys
+            // unknown health is not healthy; the loop goes on to the other keys. #5719 item 4:
+            // counted once per throwing key (registry_mu_ is not held in this loop body).
+            sweep_health_query_failures_.fetch_add(1, std::memory_order_relaxed);
         }
         if (report_dead && health == SubscriptionHealth::Dead) {
             on_subscription_lost(key, subscription_id,
@@ -3067,8 +3157,17 @@ void GuardianSparkRuntime::sweep_key_health(bool report_dead) {
             continue;
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (const auto kit = keys_.find(key);
-            kit != keys_.end() && kit->second->subscription == subscription_id)
+            kit != keys_.end() && kit->second->subscription == subscription_id) {
             kit->second->faulted = true; // a write naming a superseded subscription is dropped
+            // #5719: record the cause too, FIRST CAUSE WINS. An event-edge KeyFaulted (set under
+            // this same lock, possibly between the health read above and here) is authoritative
+            // and a sweep answer never overwrites a cause already recorded.
+            if (kit->second->unhealthy_why == GuardianRebuildReason::None)
+                kit->second->unhealthy_why = !health ? GuardianRebuildReason::HealthUnknown
+                                             : *health == SubscriptionHealth::Dead
+                                                 ? GuardianRebuildReason::KeyDead
+                                                 : GuardianRebuildReason::KeyFaulted;
+        }
     }
 }
 
@@ -3113,6 +3212,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
     // lock-only query; nullopt, so no query, for a first attach or a key with a claim). The
     // locked skip decision below revalidates it against the subscription it sees.
     const std::optional<KeyHealthProbe> health_probe = probe_key_health(key, rule_id);
+
+    // #5719: why reuse_existing_locked did not skip; set inside the locked block below, read by the
+    // returns after it. Declared here because those returns are outside that block's scope. None
+    // until the skip decision has run, so every return before it carries no reason.
+    GuardianRebuildReason rebuild_reason{GuardianRebuildReason::None};
 
     {
         std::unique_lock<std::mutex> lk{registry_mu_};
@@ -3224,13 +3328,22 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // clear, so the full_sync scoped detach and every sibling on the key see it.
         if (health_probe && health_probe->health == SubscriptionHealth::Faulted) {
             if (const auto kit = keys_.find(key);
-                kit != keys_.end() && kit->second->subscription == health_probe->subscription)
+                kit != keys_.end() && kit->second->subscription == health_probe->subscription) {
                 kit->second->faulted = true;
+                // #5719: first cause wins here, as in sweep_key_health; only the mechanism's own
+                // event edge (on_subscription_faulted) overwrites a recorded cause.
+                if (kit->second->unhealthy_why == GuardianRebuildReason::None)
+                    kit->second->unhealthy_why = GuardianRebuildReason::KeyFaulted;
+            }
         }
-        if (auto reuse = reuse_existing_locked(key, rule_id, spec, *rg, health_probe)) {
+        // #5719: hoisted so the reason survives the `if` for the post-check returns below. A
+        // skip returns here; the reason names why every later (rebuilding) return was not one.
+        auto reuse = reuse_existing_locked(key, rule_id, spec, *rg, health_probe);
+        if (reuse) {
             reuse->skipped = true; // reported up so apply_rules can name the preserved rule
             return std::move(*reuse);
         }
+        rebuild_reason = reuse.error();
 
         // PR #3821 review (fjarvis, cpp-safety re-review): armed BEFORE
         // prior_disarm is even populated below, not after - fn is a std::function
@@ -3417,6 +3530,8 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                     // state, or deadline - re-observation never revives or
                     // restarts anything, it only reports what is already true.
                     wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
+                    // No rebuild_reason: a wedge re-observation constructs nothing and appears
+                    // in neither the rebuilt nor the preserved line.
                     return AttachCoreResult{.state = AttachCoreState::Reobserved,
                                             .generation = 0, .error = {}, .claim = head};
                 }
@@ -3604,7 +3719,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         if (outbox_waker)
             outbox_waker();
         return AttachCoreResult{.state = AttachCoreState::Armed, .generation = new_gen,
-                                .error = {}, .claim = nullptr};
+                                .error = {}, .claim = nullptr, .rebuild_reason = rebuild_reason};
     }
 
     // Still pending: `arm_claim` (the caller's own local, written above) is this
@@ -3615,7 +3730,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
     // wait_for_claim(); a future non-waiting entry point would return it as
     // Accepted(claim) instead, without waiting.
     return AttachCoreResult{.state = AttachCoreState::Pending, .generation = 0,
-                            .error = {}, .claim = arm_claim};
+                            .error = {}, .claim = arm_claim, .rebuild_reason = rebuild_reason};
 }
 
 void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
@@ -3634,11 +3749,13 @@ void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
         outbox_waker();
 }
 
-void GuardianSparkRuntime::detach_all() { detach_rules_except({}); }
+void GuardianSparkRuntime::detach_all() { (void)detach_rules_except({}); }
 
-void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<>>& keep) {
+std::vector<GuardianSparkRuntime::ForcedRebuild>
+GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::less<>>& keep) {
     std::function<void()> outbox_waker;
     std::vector<std::shared_ptr<KeyClaim>> works;
+    std::vector<ForcedRebuild> forced; // #5719: see the declaration; built under registry_mu_
     // #4415: the faulted bit below decides which kept rules are torn down with their key, and a
     // lost Faulted event leaves it clear. Refresh it from the backend first (registry_mu_ is not
     // held yet). Nothing is kept for detach_all(), so it pays nothing there.
@@ -3679,6 +3796,23 @@ void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::
             (void)withdraw_rule_after_wedge_sweep_locked(rid, "disarmed");
         std::vector<std::string> rule_ids;
         rule_ids.reserve(rules_.size());
+        // #5719: at most one entry per kept rule. Deliberately not reserved, so a push that
+        // tears down no kept rule allocates nothing for it. The consequence: `forced` grows by
+        // push_back under registry_mu_ and that can throw std::bad_alloc part-way through this
+        // loop (the entry copies the rule id and moves its key string, which key_for_rule
+        // allocated just above), before the withdrawals below have run. Nothing catches it
+        // here; it propagates to apply_rules' teardown firewall, which counts a reconcile
+        // failure and holds the generation so the server retries the push.
+        // State when such a throw leaves this block: detach_epoch_ has been bumped, the wedge
+        // candidates have been deactivated, and the pending-arm (claimed) withdrawals for the
+        // rules the push omits have run. The withdrawals of the rules_ entries below have NOT run
+        // (this loop only reads rules_, so the retry sees the same rules_), and neither has the
+        // detach_all complete log line. The engine's teardown catch counts the failure and holds
+        // the generation, and the retried push runs this teardown again over that unchanged
+        // rules_. The window is unreachable in production: a push_back happens only for a kept
+        // rule whose key is marked faulted, keys_ is filled only by attach_rule, and the engine
+        // reaches attach_rule only when prefer_spark_ is true, so keys_ is empty while
+        // prefer_spark_ is false (the production configuration).
         for (const auto& [rid, rg] : rules_) {
             // A kept rule on a key the mechanism reported faulted is detached too. Every rule on
             // a key shares its bit, so the key's refcount reaches zero and its deaf watcher is
@@ -3686,13 +3820,22 @@ void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::
             // would each rejoin the same faulted watcher (the per-rule reconcile cannot skip
             // them, but a refcount of 2 stops its detach from dropping the watcher).
             bool rebuild_key = false;
+            GuardianRebuildReason why = GuardianRebuildReason::None;
+            std::optional<std::string> old_key; // the key the teardown inspected (#5719)
             if (keep.contains(rid)) {
-                const auto key = index_->key_for_rule(rid);
-                const auto kit = key ? keys_.find(*key) : keys_.end();
+                old_key = index_->key_for_rule(rid);
+                const auto kit = old_key ? keys_.find(*old_key) : keys_.end();
                 rebuild_key = kit != keys_.end() && kit->second->faulted;
+                if (rebuild_key)
+                    why = kit->second->unhealthy_why != GuardianRebuildReason::None
+                              ? kit->second->unhealthy_why
+                              : GuardianRebuildReason::KeyFaulted;
             }
             if (!keep.contains(rid) || rebuild_key)
                 rule_ids.push_back(rid);
+            if (rebuild_key)
+                // a kept rule torn down with its key; old_key is not used again
+                forced.push_back(ForcedRebuild{rid, why, std::move(*old_key)});
         }
         works.reserve(rule_ids.size()); // Astra opine review Blocker 4: "detach_all()
                                         // currently accumulates returned claims in a
@@ -3743,6 +3886,7 @@ void GuardianSparkRuntime::detach_rules_except(const std::set<std::string, std::
         submit_disarm_off_lock(work);
     if (outbox_waker)
         outbox_waker();
+    return forced;
 }
 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>
@@ -4165,6 +4309,11 @@ void GuardianSparkRuntime::on_subscription_faulted(const std::string& key,
             return; // stale - same guard as on_subscription_lost
         // #4415: record it so an identical re-push does not skip a rule whose watch is deaf.
         kit->second->faulted = faulted; // a recovered edge clears it
+        // #5719: the event edge is AUTHORITATIVE for the cause: KeyFaulted while faulted, cleared
+        // with the bit. It overwrites a cause a sweep recorded first (the mechanism itself says
+        // faulted, which outranks the sweep's Dead / unknown inference).
+        kit->second->unhealthy_why =
+            faulted ? GuardianRebuildReason::KeyFaulted : GuardianRebuildReason::None;
         const auto now_wall = std::chrono::system_clock::now().time_since_epoch();
         const std::int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now_wall).count();
         const std::int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(now_wall).count();
@@ -5558,6 +5707,11 @@ void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hoo
 void GuardianSparkRuntime::set_dispatch_entry_hook_for_test(std::function<void()> hook) {
     std::lock_guard<std::mutex> lk{registry_mu_};
     dispatch_entry_hook_for_test_ = std::move(hook);
+}
+
+void GuardianSparkRuntime::set_attach_resume_hook_for_test(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    attach_resume_hook_for_test_ = std::move(hook);
 }
 
 void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker) {

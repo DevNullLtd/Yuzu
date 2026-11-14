@@ -13,7 +13,8 @@ esac
 if [ -d /out ]; then
   echo "Yuzu agent bundle $(cat "$SRC/VERSION") -> /out/yuzu-agents"
   cp -a "$SRC" /out/
-  echo "done. Verify with: cd /out/yuzu-agents && sha256sum -c SHA256SUMS"
+  echo "done. cd /out/yuzu-agents && sha256sum -c SHA256SUMS only shows the tree is intact;"
+  echo "what shows it is genuine is the image signature: cosign verify <image> (see README.txt, Integrity)."
 else
   cat "$SRC/README.txt"
   echo

@@ -126,9 +126,15 @@ struct Harness {
     PgPool pool;
     AuthDB db;
 
+    // The background provisional-MFA reaper is OFF (`cleanup_interval_secs` 0), as in the shared
+    // yuzu::test::AuthDbPg fixture: no case here waits on its 60 s cadence, and with it on every
+    // destructor waited out the reaper's 1 s sleep step to join it - about 1 s per case. The
+    // production two-argument constructor (reaper on) is exercised by "AuthDB constructs,
+    // migrates, and opens" below.
     explicit Harness(const std::string& dsn)
         : provider(keys.path), codec(provider), conn(connect(dsn)),
-          pool(PgPool::Options{.conninfo = dsn, .size = 4}), db(pool, codec) {
+          pool(PgPool::Options{.conninfo = dsn, .size = 4}),
+          db(pool, codec, /*cleanup_interval_secs=*/0) {
         REQUIRE(codec.init(conn.get()).has_value());
         REQUIRE(pool.valid());
         REQUIRE(db.is_open());
@@ -240,9 +246,18 @@ TEST_CASE("acquire_with_bounded_retry rides a transient empty acquire out to suc
 
 TEST_CASE("AuthDB constructs, migrates, and opens", "[pg][auth_db]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
-    Harness h{db.dsn()};
-    CHECK(h.db.is_ready());
-    CHECK(h.db.is_open());
+    // The PRODUCTION two-argument constructor, reaper thread on (60 s): the one case here that
+    // builds it, so its construction, and the join of its reaper on destruction, stay covered.
+    yuzu::test::TempDir keys;
+    FileKeyProvider provider(keys.path);
+    SecretCodec codec(provider);
+    PgConn conn = connect(db.dsn());
+    PgPool pool{PgPool::Options{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AuthDB adb(pool, codec);
+    REQUIRE(codec.init(conn.get()).has_value());
+    CHECK(adb.is_ready());
+    CHECK(adb.is_open());
 }
 
 TEST_CASE("AuthDB reports !is_open on a migration failure", "[pg][auth_db]") {
@@ -1043,7 +1058,7 @@ TEST_CASE("AuthDB consume_and_enroll: exactly one winner for max_uses=1 across c
     PgConn conn = connect(db.dsn());
     REQUIRE(codec.init(conn.get()).has_value());
     PgPool pool{PgPool::Options{.conninfo = db.dsn(), .size = 16}};
-    AuthDB adb(pool, codec);
+    AuthDB adb(pool, codec, /*cleanup_interval_secs=*/0);
     REQUIRE(adb.is_open());
 
     const std::string raw = make_token(adb, 1);
@@ -1064,7 +1079,7 @@ TEST_CASE("AuthDB consume_and_enroll: exactly N winners for max_uses=N across co
     PgConn conn = connect(db.dsn());
     REQUIRE(codec.init(conn.get()).has_value());
     PgPool pool{PgPool::Options{.conninfo = db.dsn(), .size = 16}};
-    AuthDB adb(pool, codec);
+    AuthDB adb(pool, codec, /*cleanup_interval_secs=*/0);
     REQUIRE(adb.is_open());
 
     const std::string raw = make_token(adb, 5);
@@ -1592,7 +1607,7 @@ TEST_CASE("AuthDB migrates v1 -> v2: clean enrollment/pending shape + import_met
     }
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
-    AuthDB adb{pool, codec};
+    AuthDB adb{pool, codec, /*cleanup_interval_secs=*/0};
     REQUIRE(adb.is_open()); // the v2 step applied
 
     PgConn conn = connect(db.dsn());

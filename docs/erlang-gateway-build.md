@@ -177,16 +177,22 @@ Erlang/OTP 28.4 or later 28.x is the only supported toolchain for the gateway te
 override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
 
-**Meson runs the EUnit suite as two shards: `gateway eunit shard A` and
-`gateway eunit shard B`.** Each is `scripts/test_gateway.py gateway eunit
---shard K/2` with its own `REBAR_BASE_DIR` (`gateway/_build_eunit_1`,
-`_build_eunit_2`), a 540s wrapper deadline and a 600s meson timeout. The whole
-suite had outgrown one 540s run on the Windows leg (PR #5695). The partition is
-deterministic and weighted by measured per-module Windows times
-(`scripts/gateway_eunit_shards.py`). A new test module lands in a shard without
-any edit. Between them the two shards run exactly the module set that
-`rebar3 eunit --dir apps/yuzu_gw/test` runs, each module in its own test
-process, as under `--dir`. The shard's module list reaches rebar3 through
+**Meson runs the EUnit suite as three shards: `gateway eunit shard A`, `B`
+and `C`.** Each is `scripts/test_gateway.py gateway eunit --shard K/3` with its
+own `REBAR_BASE_DIR` (`gateway/_build_eunit_1` to `_build_eunit_3`), a 540s
+wrapper deadline and a 600s meson timeout. The whole suite had outgrown one
+540s run on the Windows leg (PR #5695). The partition is deterministic and
+weighted by measured per-module times (`scripts/gateway_eunit_shards.py`). A
+new test module lands in a shard without any edit. A shard runs with cover
+OFF (the config script below forces the test profile's `cover_enabled` to
+false): meck's cover preservation on every mock of a `src/` module made the
+suite take 459s instead of 268s, and nothing reads a shard's cover data. A
+plain `rebar3 eunit --dir apps/yuzu_gw/test` still runs with cover, so it is
+slower than the shards together.
+
+Between them the shards run exactly the module set that `rebar3 eunit --dir
+apps/yuzu_gw/test` runs, each module in its own test process, as under `--dir`.
+The shard's module list reaches rebar3 through
 `gateway/eunit_shard.config.script` (`REBAR_CONFIG`), not through `--module`,
 because `--module m1,m2` runs every listed module in one shared process.
 `tests/test_gateway_eunit_shards.py` pins this. `python3 scripts/test_gateway.py
