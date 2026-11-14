@@ -79,6 +79,22 @@ history:
     File worker or Registry sweeper" bullet is corrected the same way; `docs/spark-flip-gate.md`
     gains a closed-by-fix #4704 entry in section 5 and section 7's #4704 precondition is marked
     fixed. PR #5004, merged `063885c9e`, full `/governance` (Spark row).
+  - 2026-11-14 - #5719 item 5, R5.7 (c) - the File mechanism is now run against a rename of
+    the watched directory (it was only inferred before; Windows rig, local NTFS, see
+    `docs/spark-flip-gate.md` precondition (e) for what was run and what was only the author's
+    report). Result: the handle follows the rename and the old read stays quiet, as measured in
+    the 2026-09-21 probe, so the mechanism now re-opens the path every `path_verify_interval`
+    (5 s in production) on a detached worker and compares the directory identity (volume serial
+    plus `FileIdInfo` file id) with the identity its handle was opened on; a different identity or
+    a path that names nothing reports the watch faulted, cancels the stale read and hands the
+    watch to the ordinary retry (up to 30 s). Sampled, Windows only, id-bearing filesystems only.
+    **#4676 is NOT resolved by this change** (it is partly addressed: File, local NTFS, sampled);
+    still open there: filesystems that give no file id (a FAT32 volume was observed undetected),
+    SMB and ReFS (untested), an ancestor shelter whose own parent is renamed, a rename away and
+    back between two samples, and the Registry twin (parked, an issue to be filed). The
+    statement below that a rename of the PARENT is refused while the handle is open rests on the
+    2026-09-21 probe (three runs); the File code comment that a handle follows its directory when
+    "an ancestor" is renamed is NOT backed by any run and has been reworded.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -1695,12 +1711,15 @@ silent-drop case was not measured), a hung server fails the read after about 64 
 (`STATUS_CONNECTION_DISCONNECTED`, one run). A server-side rename of the watched directory gives
 no completion in 30 s, and a server-side delete gives only the child's REMOVED record, no failed
 completion in 30 s. After a failed completion the old handle stays dead until reopened. The real
-File mechanism was not run against a rename: its outcome is inferred from these results and
-`process_completion_locked`. So a local rename or move, and a rename or delete on a share, leave
-coverage at `Notification` while the target path is unwatched; #4676 tracks the resolution. Until
-it lands, a reader must treat File `Notification` as unconfirmed for a target that could be
-renamed, and a post-establishment write to the original path is only a point-in-time liveness
-check. Raw transcripts: `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`. (d)
+File mechanism was not run against a rename when that probe was written: its outcome was
+inferred from these results and `process_completion_locked`. Since #5719 item 5 (2026-11-14) it
+has been run on local NTFS, and it now detects a rename or move of the watched directory by
+sampling (see the 2026-11-14 entry in the history above); that does not cover a share, a
+filesystem that gives no file id, or an ancestor shelter, where a rename or delete still leaves
+coverage at `Notification` while the target path is unwatched. #4676 tracks the resolution and
+is NOT closed by this change. Until it is, a reader must treat File `Notification` as
+unconfirmed for a target that could be renamed on those filesystems, and a post-establishment
+write to the original path is only a point-in-time liveness check. Raw transcripts: `docs/spark-rebuild-baselines/raw/4659-file-rename-probe.txt`. (d)
 `coverage == None` with `established_at` unset
 means never confirmed (an absent target, a pending arm or a failed arm; NOT necessarily deaf).
 With `established_at` set it means one of: the Registry one-shot flap (brief, on the order of
