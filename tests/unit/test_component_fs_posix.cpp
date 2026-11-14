@@ -630,8 +630,7 @@ TEST_CASE("component_fs_posix: the walk over the real leg skips links and mounts
     targets.network_mounts = {(t.root / "app" / "mnt").string()};
     const auto ops = make_fs_ops(targets);
 
-    const auto r = walk(std::span<const std::string>{targets.roots}, WalkLimits{}, ops, '/',
-                        ops.now() + 1h);
+    const auto r = walk(std::span<const std::string>{targets.roots}, WalkLimits{}, ops, ops.now() + 1h);
     CHECK(r.stop == Stop::complete);
     REQUIRE(r.candidates.size() == 1);
     CHECK(r.candidates[0].path == (t.root / "app" / "lib" / "x.jar").string());

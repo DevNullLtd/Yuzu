@@ -127,7 +127,7 @@ public:
             namespace ci = yuzu::component_inventory;
             const ci::Targets t = ci::scan_targets();
             const ci::Answer a = ci::answer_scan(
-                kOs, t, [](const ci::Targets& x) { return ci::make_fs_ops(x); }, ci::WalkLimits{}, '/');
+                kOs, t, [](const ci::Targets& x) { return ci::make_fs_ops(x); }, ci::WalkLimits{});
             // The cost of this scan, published by the agent as yuzu.plugin.component_inventory.* tags.
             yuzu::PluginContext pctx{plugin_ctx_};
             ci::emit_answer(ctx, plugin_ctx_ != nullptr ? &pctx : nullptr, a, wrote);

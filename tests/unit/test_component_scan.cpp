@@ -23,7 +23,8 @@
  *  - verdict: returning supported for any non-complete stop fails the verdict table.
  *  - mount-table guard: walking when mount_table_unreadable is set fails the "no walk" case (its
  *    filesystem callbacks and its factory count every call).
- *  - heartbeat: deleting the storage_set loop, or any one key, fails the recorder assertions.
+ *  - heartbeat: deleting any one storage_set in write_heartbeat, or renaming a key, fails the recorder
+ *    assertions.
  *  - emission: setting `wrote` before the write fails the first-write-throws case; a catch-all that
  *    can throw fails the answer_internal_error cases.
  */
@@ -37,6 +38,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <new>
 #include <string>
 #include <string_view>
@@ -77,8 +79,17 @@ constexpr const char* kPomEntry = "META-INF/maven/org.acme/widget/pom.properties
 
 ScanResult run(MemTree& tree, const std::vector<std::string>& roots = {"/opt"}, WalkLimits limits = {}) {
     const FsOps fs = tree.ops();
-    return scan(roots, limits, fs, '/');
+    return scan(roots, limits, fs);
 }
+
+/// Plugin-context recorder for the KV keys.
+struct FakeKv {
+    std::vector<std::pair<std::string, std::string>> sets;
+    bool storage_set(std::string_view k, std::string_view v) {
+        sets.emplace_back(std::string(k), std::string(v));
+        return true;
+    }
+};
 
 /// One archive with a nested library, under /opt/app/lib.
 constexpr const char* kVictim = "/opt/app/lib/victim-1.0.jar";
@@ -107,7 +118,6 @@ TEST_CASE("scan: rows carry the right version_source for each way a version is f
 
     const auto* log4j = find_row(r, "log4j-core");
     REQUIRE(log4j != nullptr);
-    CHECK(log4j->kind == "java");
     CHECK(log4j->version == "2.17.1");
     CHECK(log4j->version_source == "filename");
     CHECK(log4j->path == "/opt/acme/lib/log4j-core-2.17.1.jar");
@@ -491,7 +501,6 @@ TEST_CASE("verdict: only a complete scan is supported; the table is a pure funct
         CHECK(v.level == StatusLevel::constrained);
         CHECK_FALSE(v.complete);
         CHECK(v.tokens == "linux:component_inventory:" + std::string(to_token(s)));
-        CHECK(v.provenance == v.tokens);
     }
 
     SECTION("mount table unreadable maps to constrained (that nothing is walked is pinned by answer_scan)") {
@@ -526,30 +535,33 @@ TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[runtime
     tree.list_step = 5ms;
     const auto r = run(tree);
     REQUIRE(r.rows.size() == 2);
-
-    const auto values = heartbeat_values(r, 7);
-    REQUIRE(kHeartbeatKeys.size() == 6);
-    CHECK(values[0] == std::to_string(r.stats.entries));
-    CHECK(values[1] == "2");
-    CHECK(values[2] == std::to_string(r.elapsed_ms));
-    CHECK(values[3] == "7");
-    CHECK(values[4] == "0");
-    CHECK(values[5] == "0");
     CHECK(r.elapsed_ms > 0);
 
+    FakeKv kv;
+    write_heartbeat(kv, r, 7);
+
     const std::string_view prefix = yuzu::agent::kPluginHeartbeatPrefix;
-    for (std::size_t i = 0; i < kHeartbeatKeys.size(); ++i) {
-        INFO(kHeartbeatKeys[i]);
-        REQUIRE(kHeartbeatKeys[i].substr(0, prefix.size()) == prefix);
-        CHECK(yuzu::agent::plugin_heartbeat_key_ok(kHeartbeatKeys[i].substr(prefix.size())));
-        CHECK(values[i].size() <= yuzu::agent::kPluginHeartbeatMaxValueBytes);
+    for (const auto& [key, value] : kv.sets) {
+        INFO(key);
+        REQUIRE(std::string_view{key}.starts_with(prefix));
+        CHECK(yuzu::agent::plugin_heartbeat_key_ok(std::string_view{key}.substr(prefix.size())));
+        CHECK(value.size() <= yuzu::agent::kPluginHeartbeatMaxValueBytes);
     }
-    CHECK(kHeartbeatKeys.size() <= yuzu::agent::kPluginHeartbeatMaxKeys);
+    CHECK(kv.sets.size() <= yuzu::agent::kPluginHeartbeatMaxKeys);
+
+    const std::map<std::string, std::string> got(kv.sets.begin(), kv.sets.end());
+    REQUIRE(kv.sets.size() == 6);
+    REQUIRE(got.size() == 6); // six distinct keys
+    CHECK(got.at("heartbeat.walk_entries") == std::to_string(r.stats.entries));
+    CHECK(got.at("heartbeat.walk_rows") == "2");
+    CHECK(got.at("heartbeat.walk_ms") == std::to_string(r.elapsed_ms));
+    CHECK(got.at("heartbeat.roots_skipped") == "7");
+    CHECK(got.at("heartbeat.links_skipped") == "0");
+    CHECK(got.at("heartbeat.mounts_skipped") == "0");
 }
 
 TEST_CASE("wire row: nine fields, every text field escaped", "[runtime][component_scan][wire]") {
     Row r;
-    r.kind = "java";
     r.name = "a|b";
     r.version = "1.0";
     r.version_source = "filename";
@@ -595,19 +607,10 @@ struct FakeCtx {
     }
 };
 
-/// Plugin-context recorder for the KV keys.
-struct FakeKv {
-    std::vector<std::pair<std::string, std::string>> sets;
-    bool storage_set(std::string_view k, std::string_view v) {
-        sets.emplace_back(std::string(k), std::string(v));
-        return true;
-    }
-};
-
 constexpr std::string_view kInternalErrorToken = "linux:component_inventory:internal_error";
 
 Answer answer_over(MemTree& tree, const FakeTargets& t = {}) {
-    return answer_scan("linux", t, [&tree](const FakeTargets&) { return tree.ops(); }, WalkLimits{}, '/');
+    return answer_scan("linux", t, [&tree](const FakeTargets&) { return tree.ops(); }, WalkLimits{});
 }
 
 } // namespace
@@ -635,13 +638,13 @@ TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[runti
         return fs;
     };
 
-    const auto a = answer_scan("macos", t, make_fs, WalkLimits{}, '/');
+    const auto a = answer_scan("macos", t, make_fs, WalkLimits{});
     CHECK(made == 0);    // not even the factory is reached
     CHECK(touched == 0); // no list, no open, no clock read
     REQUIRE(a.lines.size() == 1);
     CHECK(a.lines[0] == "status|scan|constrained|macos:component_inventory:mount_table_unreadable");
     CHECK_FALSE(a.verdict.complete);
-    CHECK(a.verdict.provenance == "macos:component_inventory:mount_table_unreadable");
+    CHECK(a.verdict.tokens == "macos:component_inventory:mount_table_unreadable");
     CHECK(a.res.rows.empty());
 }
 
@@ -656,7 +659,7 @@ TEST_CASE("answer: a readable table scans through the factory and carries what t
     const auto a = answer_scan("linux", t, [&](const FakeTargets&) {
         ++made;
         return tree.ops();
-    }, WalkLimits{}, '/');
+    }, WalkLimits{});
 
     CHECK(made == 1);
     CHECK(a.verdict.complete);
@@ -690,13 +693,10 @@ TEST_CASE("emit: rows first, the typed result, then all six heartbeat keys with 
     CHECK(ctx.status == YUZU_RESULT_STATUS_OK);
     CHECK(ctx.completeness == YUZU_RESULT_COMPLETENESS_FULL);
 
-    REQUIRE(kv.sets.size() == kHeartbeatKeys.size());
-    const auto expect = heartbeat_values(a.res, 3);
-    for (std::size_t i = 0; i < kHeartbeatKeys.size(); ++i) {
-        INFO(kHeartbeatKeys[i]);
-        CHECK(kv.sets[i].first == kHeartbeatKeys[i]);
-        CHECK(kv.sets[i].second == expect[i]);
-    }
+    REQUIRE(kv.sets.size() == 6);
+    FakeKv expect;
+    write_heartbeat(expect, a.res, 3);
+    CHECK(kv.sets == expect.sets); // the scan's own result and the targets' dropped roots
     CHECK(kv.sets[1].second == "2");  // walk_rows: the outer row and the nested one
     CHECK(kv.sets[2].second != "0");  // walk_ms: the listings cost the fake clock 5 ms each
     CHECK(kv.sets[3].second == "3");  // roots_skipped: links plus network
@@ -720,7 +720,7 @@ TEST_CASE("emit: an incomplete scan still writes its rows and answers CONSTRAINE
     CHECK(ctx.status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(ctx.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(ctx.provenance == token);
-    CHECK(kv.sets.size() == kHeartbeatKeys.size()); // the cost of a degraded scan is published too
+    CHECK(kv.sets.size() == 6); // the cost of a degraded scan is published too
 }
 
 TEST_CASE("emit: no plugin context is tolerated", "[runtime][component_scan][answer]") {
@@ -825,7 +825,7 @@ TEST_CASE("scan: through the real POSIX leg over a materialised tree", "[runtime
     Targets t;
     t.roots = {tmp.root.string()};
     const FsOps fs = make_fs_ops(t);
-    const auto r = scan(t.roots, WalkLimits{}, fs, '/');
+    const auto r = scan(t.roots, WalkLimits{}, fs);
 
     CHECK(r.stop == Stop::complete);
     REQUIRE(r.rows.size() == 3);

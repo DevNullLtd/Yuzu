@@ -109,6 +109,32 @@ private:
     DIR* d_ = nullptr;
 };
 
+/// Move-only owner of a file descriptor (the file-side twin of ScopedDir).
+class ScopedFile {
+public:
+    ScopedFile() noexcept = default;
+    explicit ScopedFile(int fd) noexcept : fd_(fd) {}
+    ~ScopedFile() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    ScopedFile(const ScopedFile&) = delete;
+    ScopedFile& operator=(const ScopedFile&) = delete;
+    ScopedFile(ScopedFile&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    ScopedFile& operator=(ScopedFile&& o) noexcept {
+        if (this != &o) {
+            if (fd_ >= 0) ::close(fd_);
+            fd_ = o.fd_;
+            o.fd_ = -1;
+        }
+        return *this;
+    }
+    [[nodiscard]] int fd() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
+private:
+    int fd_ = -1;
+};
+
 /// Result of a directory open: `err` is 0 on success, else the errno.
 struct DirOpen {
     ScopedDir dir;
@@ -179,10 +205,7 @@ inline DirOpen finish_dir_open(int raw_fd) {
 
 inline FileRead read_open_fd(int fd, std::size_t cap) {
     FileRead out;
-    struct FdCloser {
-        int fd;
-        ~FdCloser() { ::close(fd); }
-    } closer{fd};
+    ScopedFile closer{fd};
 
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
@@ -302,32 +325,6 @@ inline FileRead read_file_no_follow_at(int dir_fd, const char* name, std::size_t
     return read_file_at(dir_fd, name, cap, Leaf::no_follow);
 }
 
-/// Move-only owner of a file descriptor (the file-side twin of ScopedDir).
-class ScopedFile {
-public:
-    ScopedFile() noexcept = default;
-    explicit ScopedFile(int fd) noexcept : fd_(fd) {}
-    ~ScopedFile() {
-        if (fd_ >= 0) ::close(fd_);
-    }
-    ScopedFile(const ScopedFile&) = delete;
-    ScopedFile& operator=(const ScopedFile&) = delete;
-    ScopedFile(ScopedFile&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
-    ScopedFile& operator=(ScopedFile&& o) noexcept {
-        if (this != &o) {
-            if (fd_ >= 0) ::close(fd_);
-            fd_ = o.fd_;
-            o.fd_ = -1;
-        }
-        return *this;
-    }
-    [[nodiscard]] int fd() const noexcept { return fd_; }
-    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
-
-private:
-    int fd_ = -1;
-};
-
 /// Result of open_file_no_follow_at: the open regular file, or why not. `error`/`err` follow the
 /// read forms (symlink_refused for a link leaf, not_regular for a directory, FIFO or device,
 /// io + errno for the rest). `size` and `mtime` come from the fstat of the opened descriptor, so
@@ -340,6 +337,15 @@ struct FileOpen {
     struct timespec mtime {};
     [[nodiscard]] bool opened() const noexcept { return file.valid(); }
 };
+
+/// The modification time of a stat result, at nanosecond resolution (the field name differs by OS).
+[[nodiscard]] inline struct timespec mtime_of(const struct stat& st) noexcept {
+#if defined(__APPLE__)
+    return st.st_mtimespec;
+#else
+    return st.st_mtim;
+#endif
+}
 
 /// Open the regular file `name` under `dir_fd` for ranged reads by the caller (pread, fstat), the
 /// leaf not followed. Same single-component contract, flags and by-descriptor regular-file check
@@ -368,11 +374,7 @@ inline FileOpen open_file_no_follow_at(int dir_fd, const char* name) {
         return out;
     }
     out.size = static_cast<std::uint64_t>(st.st_size);
-#if defined(__APPLE__)
-    out.mtime = st.st_mtimespec;
-#else
-    out.mtime = st.st_mtim;
-#endif
+    out.mtime = mtime_of(st);
     out.file = std::move(file);
     return out;
 }

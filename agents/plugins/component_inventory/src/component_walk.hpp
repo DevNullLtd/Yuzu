@@ -21,13 +21,14 @@
  * reaching it is an incomplete walk, never a silent cut (ADR-0028 Decision 4,
  * docs/adr/0028-agent-component-inventory-collection.md).
  *
- * Excluded directories are Windows OS trees (WindowsApps, Windows Kits, WinSxS, Windows, System32,
- * SysWOW64), matched by name case-insensitively and ONLY on a backslash walk. A '/' walk (Linux, macOS)
- * excludes nothing by name: those names are ordinary application directories there (an OSGi container
- * keeps its bundles in <product>/system). A skip is deliberate and does not make the walk incomplete.
- * Links, network mounts and other entry types are never listed; each is counted in its own stat.
+ * Paths are joined with '/': only the POSIX legs ship. No directory is excluded by name (an OSGi
+ * container keeps its bundles in <product>/system, so such names are ordinary application directories).
+ * Links and network mounts are never listed; each is counted in its own stat. Any other entry type is
+ * skipped uncounted.
  */
 #pragma once
+
+#include "component_java_parsers.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -93,10 +94,8 @@ struct Candidate {
 
 struct WalkStats {
     std::size_t entries{0};
-    std::size_t dirs_listed{0};
     std::size_t links_skipped{0};
     std::size_t mounts_skipped{0};
-    std::size_t other_skipped{0};
 };
 
 // archive_unenumerated and archive_changed are set by the scan, never by the walk; the enum lives
@@ -138,45 +137,10 @@ struct WalkResult {
 
 namespace walk_detail {
 
-[[nodiscard]] inline char ascii_lower(char c) noexcept {
-    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-[[nodiscard]] inline bool ends_with_ci(std::string_view s, std::string_view suffix) noexcept {
-    if (s.size() < suffix.size())
-        return false;
-    s.remove_prefix(s.size() - suffix.size());
-    for (std::size_t i = 0; i < suffix.size(); ++i)
-        if (ascii_lower(s[i]) != suffix[i]) // suffix is already lower case
-            return false;
-    return true;
-}
-
-[[nodiscard]] inline bool is_candidate_name(std::string_view n) noexcept {
-    return ends_with_ci(n, ".jar") || ends_with_ci(n, ".war") || ends_with_ci(n, ".ear");
-}
-
-// Windows OS trees, by name. Applies only to a backslash walk: the fixed roots of the POSIX legs hold no OS
-// tree, so on a '/' walk the same names can only be application directories and are listed, never skipped.
-// The name match is not anchored to a volume root; the Windows leg must anchor it before it ships.
-[[nodiscard]] inline bool is_excluded_dir(std::string_view path, char sep) noexcept {
-    if (sep != '\\')
-        return false;
-    static constexpr std::string_view kNames[] = {"\\windowsapps", "\\windows kits", "\\winsxs",
-                                                  "\\windows",     "\\system32",     "\\syswow64"};
-    std::string norm(path);
-    for (char& c : norm)
-        c = ascii_lower(c);
-    for (auto n : kNames)
-        if (ends_with_ci(norm, n))
-            return true;
-    return false;
-}
-
-[[nodiscard]] inline std::string join(const std::string& dir, const std::string& name, char sep) {
-    if (!dir.empty() && dir.back() == sep)
+[[nodiscard]] inline std::string join(const std::string& dir, const std::string& name) {
+    if (!dir.empty() && dir.back() == '/')
         return dir + name;
-    return dir + sep + name;
+    return dir + '/' + name;
 }
 
 } // namespace walk_detail
@@ -188,8 +152,7 @@ namespace walk_detail {
  * budget is also enforced entry by entry so stats.entries never exceeds limits.max_entries.
  */
 [[nodiscard]] inline WalkResult walk(std::span<const std::string> roots, const WalkLimits& limits,
-                                     const FsOps& fs, char sep,
-                                     std::chrono::steady_clock::time_point deadline) {
+                                     const FsOps& fs, std::chrono::steady_clock::time_point deadline) {
     using Type = DirEntry::Type;
     WalkResult out;
 
@@ -223,7 +186,6 @@ namespace walk_detail {
                 record(Stop::dir_unreadable);
                 continue;
             }
-            ++out.stats.dirs_listed;
             if (listing.truncated || listing.entries.size() > limits.max_dir_entries)
                 record(Stop::dir_truncated);
             const std::size_t n = std::min(listing.entries.size(), limits.max_dir_entries);
@@ -241,22 +203,20 @@ namespace walk_detail {
                 switch (e.type) {
                 case Type::link: ++out.stats.links_skipped; continue;
                 case Type::network_mount: ++out.stats.mounts_skipped; continue;
-                case Type::other: ++out.stats.other_skipped; continue;
+                case Type::other: continue;
                 case Type::dir: {
                     if (cur.depth + 1 > limits.max_depth) {
                         record(Stop::depth);
                         continue;
                     }
-                    std::string path = walk_detail::join(cur.path, e.name, sep);
-                    if (walk_detail::is_excluded_dir(path, sep))
-                        continue;
-                    queue.push_back({std::move(path), cur.depth + 1, cur.anchor.empty() ? e.name : cur.anchor});
+                    queue.push_back({walk_detail::join(cur.path, e.name), cur.depth + 1,
+                                     cur.anchor.empty() ? e.name : cur.anchor});
                     continue;
                 }
                 case Type::file: break;
                 }
 
-                if (!walk_detail::is_candidate_name(e.name))
+                if (!is_java_archive_name(e.name))
                     continue;
                 const std::string& anchor = cur.anchor.empty() ? e.name : cur.anchor;
                 std::size_t& rows = anchor_rows[anchor];
@@ -269,7 +229,7 @@ namespace walk_detail {
                     return out;
                 }
                 ++rows;
-                out.candidates.push_back({walk_detail::join(cur.path, e.name, sep), anchor});
+                out.candidates.push_back({walk_detail::join(cur.path, e.name), anchor});
             }
         }
     }

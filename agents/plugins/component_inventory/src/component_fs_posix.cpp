@@ -187,15 +187,7 @@ public:
         if (!f.opened())
             return std::nullopt;
 
-        struct Held {
-            shared::ScopedFile file;
-            std::uint64_t size{0};
-            struct timespec mtime {};
-        };
-        auto held = std::make_shared<Held>();
-        held->file = std::move(f.file);
-        held->size = f.size;
-        held->mtime = f.mtime;
+        const auto held = std::make_shared<shared::FileOpen>(std::move(f));
 
         FileView v;
         v.size = held->size;
@@ -205,11 +197,7 @@ public:
             struct stat st {};
             if (::fstat(held->file.fd(), &st) != 0)
                 return false;
-#if defined(__APPLE__)
-            const struct timespec mt = st.st_mtimespec;
-#else
-            const struct timespec mt = st.st_mtim;
-#endif
+            const struct timespec mt = shared::mtime_of(st);
             return static_cast<std::uint64_t>(st.st_size) == held->size && mt.tv_sec == held->mtime.tv_sec &&
                    mt.tv_nsec == held->mtime.tv_nsec;
         };
@@ -300,7 +288,7 @@ DirEntry::Type classify_dirent(int dir_fd, const std::string& dir, const struct 
                                const std::unordered_set<std::string>& network_mounts, const AccessLog& on_access,
                                bool& untyped) {
     using Type = DirEntry::Type;
-    const std::string full = walk_detail::join(dir, e.d_name, '/');
+    const std::string full = walk_detail::join(dir, e.d_name);
     if (network_mounts.contains(full))
         return Type::network_mount; // decided from the path alone: never stat'ed
     switch (e.d_type) {

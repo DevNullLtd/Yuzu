@@ -52,7 +52,6 @@
 #include <zlib.h>
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -75,7 +74,6 @@ inline constexpr std::string_view kSourceUnreadable = "unreadable";
 inline constexpr std::size_t kMaxEntryBytes = 64 * 1024;
 
 struct Row {
-    std::string kind; // 'java'
     std::string name;
     std::string version;
     std::string version_source; // filename | pom | manifest | unreadable
@@ -117,8 +115,6 @@ struct ArchiveRead {
 /// inside the size the file had when it was opened, so a short read means it changed or failed.
 [[nodiscard]] inline std::optional<std::string> read_exact(const FileView& fv, std::uint64_t offset,
                                                            std::size_t len) {
-    if (!fv.read_at)
-        return std::nullopt;
     auto s = fv.read_at(offset, len);
     if (!s || s->size() != len)
         return std::nullopt;
@@ -184,7 +180,7 @@ struct ArchiveRead {
     r.mtime = fv->mtime;
     // Evaluated on every exit below, after the reads.
     const auto finish = [&] {
-        r.changed = fv->unchanged && !fv->unchanged();
+        r.changed = !fv->unchanged();
         return std::move(r);
     };
 
@@ -226,8 +222,8 @@ struct ArchiveRead {
     return finish();
 }
 
-[[nodiscard]] inline std::string_view leaf_of(std::string_view path, char sep) noexcept {
-    const auto i = path.rfind(sep);
+[[nodiscard]] inline std::string_view leaf_of(std::string_view path) noexcept {
+    const auto i = path.rfind('/');
     return i == std::string_view::npos ? path : path.substr(i + 1);
 }
 
@@ -248,15 +244,15 @@ struct ArchiveRead {
 } // namespace scan_detail
 
 /**
- * Walk `roots`, then read every candidate archive. `sep` is the path separator the walk joins with.
+ * Walk `roots`, then read every candidate archive.
  */
 [[nodiscard]] inline ScanResult scan(std::span<const std::string> roots, const WalkLimits& limits,
-                                     const FsOps& fs, char sep) {
+                                     const FsOps& fs) {
     ScanResult out;
     const auto started = fs.now();
     const auto deadline = started + limits.max_wall;
 
-    WalkResult walked = walk(roots, limits, fs, sep, deadline);
+    WalkResult walked = walk(roots, limits, fs, deadline);
     out.stats = walked.stats;
     out.stop = walked.stop;
     const auto record = [&out](Stop s) {
@@ -288,7 +284,7 @@ struct ArchiveRead {
             record(Stop::budget_time);
             break;
         }
-        JarName jn = scan_detail::name_of(scan_detail::leaf_of(c.path, sep));
+        JarName jn = scan_detail::name_of(scan_detail::leaf_of(c.path));
         const auto ar = scan_detail::read_archive(fs, c.path, jn.version.empty());
         if (!ar.enumerated)
             record(Stop::archive_unenumerated);
@@ -296,7 +292,6 @@ struct ArchiveRead {
             record(Stop::archive_changed);
 
         Row outer;
-        outer.kind = "java";
         outer.name = std::move(jn.artifact);
         if (!jn.version.empty()) {
             outer.version = std::move(jn.version);
@@ -316,9 +311,8 @@ struct ArchiveRead {
 
         bool full = false;
         for (const auto& n : ar.nested) {
-            JarName nn = scan_detail::name_of(scan_detail::leaf_of(n.entry, '/'));
+            JarName nn = scan_detail::name_of(scan_detail::leaf_of(n.entry));
             Row row;
-            row.kind = "java";
             row.name = std::move(nn.artifact);
             row.version_source = std::string(nn.version.empty() ? kSourceUnreadable : kSourceFilename);
             row.version = std::move(nn.version);
@@ -350,9 +344,7 @@ struct ArchiveRead {
 /// comp|java|name|version|version_source|path|size|mtime|anchor_app, every text field escaped.
 [[nodiscard]] inline std::string format_component_row(const Row& r) {
     using yuzu::util::safe_output_field;
-    std::string s = "comp|";
-    s += safe_output_field(r.kind);
-    s += '|';
+    std::string s = "comp|java|";
     s += safe_output_field(r.name);
     s += '|';
     s += safe_output_field(r.version);
@@ -371,9 +363,8 @@ struct ArchiveRead {
 
 struct ScanVerdict {
     yuzu::shared::StatusLevel level{yuzu::shared::StatusLevel::constrained};
-    std::string tokens;     // comma-joined, '' when none (the status row writes '-')
-    std::string provenance; // typed-result provenance: the cause token when constrained
-    bool complete{false};   // typed result OK/FULL when true, CONSTRAINED/PARTIAL when false
+    std::string tokens; // comma-joined, '' when none (the status row writes '-')
+    bool complete{false}; // typed result OK/FULL when true, CONSTRAINED/PARTIAL when false
 };
 
 [[nodiscard]] inline std::string component_token(std::string_view os, std::string_view cause) {
@@ -397,7 +388,6 @@ struct ScanVerdict {
     if (mount_table_unreadable || stop != Stop::complete) {
         v.level = yuzu::shared::StatusLevel::constrained;
         v.tokens = component_token(os, mount_table_unreadable ? "mount_table_unreadable" : to_token(stop));
-        v.provenance = v.tokens;
         return v;
     }
     v.level = yuzu::shared::StatusLevel::supported;
@@ -415,26 +405,17 @@ struct ScanVerdict {
     return v;
 }
 
-/// The plugin's own KV keys; the agent publishes each as yuzu.plugin.component_inventory.<suffix>.
-inline constexpr std::array<std::string_view, 6> kHeartbeatKeys = {
-    "heartbeat.walk_entries", "heartbeat.walk_rows",     "heartbeat.walk_ms",
-    "heartbeat.roots_skipped", "heartbeat.links_skipped", "heartbeat.mounts_skipped"};
-
-/// Decimal values for kHeartbeatKeys, in the same order. `roots_skipped` is the targets' dropped
-/// roots (links plus network); the other five come from the scan.
-[[nodiscard]] inline std::array<std::string, 6> heartbeat_values(const ScanResult& r,
-                                                                 std::size_t roots_skipped) {
-    return {std::to_string(r.stats.entries),         std::to_string(r.rows.size()),
-            std::to_string(r.elapsed_ms),            std::to_string(roots_skipped),
-            std::to_string(r.stats.links_skipped),   std::to_string(r.stats.mounts_skipped)};
-}
-
-/// Writes the six heartbeat keys through `kv` (yuzu::PluginContext in the plugin, a recorder in tests).
+/// Writes the six cost keys through `kv` (yuzu::PluginContext in the plugin, a recorder in tests); the
+/// agent publishes each as yuzu.plugin.component_inventory.<suffix>. `roots_skipped` is the targets'
+/// dropped roots (links plus network); the other five come from the scan.
 template <class Kv>
 inline void write_heartbeat(Kv& kv, const ScanResult& r, std::size_t roots_skipped) {
-    const auto values = heartbeat_values(r, roots_skipped);
-    for (std::size_t i = 0; i < kHeartbeatKeys.size(); ++i)
-        kv.storage_set(kHeartbeatKeys[i], values[i]);
+    kv.storage_set("heartbeat.walk_entries", std::to_string(r.stats.entries));
+    kv.storage_set("heartbeat.walk_rows", std::to_string(r.rows.size()));
+    kv.storage_set("heartbeat.walk_ms", std::to_string(r.elapsed_ms));
+    kv.storage_set("heartbeat.roots_skipped", std::to_string(roots_skipped));
+    kv.storage_set("heartbeat.links_skipped", std::to_string(r.stats.links_skipped));
+    kv.storage_set("heartbeat.mounts_skipped", std::to_string(r.stats.mounts_skipped));
 }
 
 // ---- the `scan` action around the scan: answer, emit, and the catch-all's answer ----
@@ -459,11 +440,11 @@ struct Answer {
  */
 template <class Targets, class MakeFs>
 [[nodiscard]] inline Answer answer_scan(std::string_view os, const Targets& t, MakeFs&& make_fs,
-                                        const WalkLimits& limits, char sep) {
+                                        const WalkLimits& limits) {
     Answer a;
     if (!t.mount_table_unreadable) {
         const FsOps fs = make_fs(t);
-        a.res = scan(t.roots, limits, fs, sep);
+        a.res = scan(t.roots, limits, fs);
     }
     a.roots_skipped = t.roots_link_skipped + t.roots_network_skipped;
     a.verdict = scan_verdict(os, a.res.stop, t.mount_table_unreadable, t.roots_link_skipped,
@@ -491,7 +472,7 @@ inline void emit_answer(Ctx& ctx, Kv* kv, const Answer& a, bool& wrote) {
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL);
     else
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                              a.verdict.provenance);
+                              a.verdict.tokens);
     if (kv != nullptr)
         write_heartbeat(*kv, a.res, a.roots_skipped);
 }

@@ -5,8 +5,8 @@
  *
  *   build_zip   a ZIP archive as bytes (stored or deflated entries, optional prepended bytes such as
  *               an executable jar's launch script), so no fixture is ever captured from a host.
- *   MemTree     an in-memory FsOps with a fake clock that records every open and every read, and can
- *               be told to fail an open, fail a read, or report a file as changed.
+ *   MemTree     an in-memory FsOps with a fake clock that records every listing, open and read, and
+ *               can be told to fail an open, fail a read, or report a file as changed.
  *
  * Header-only and portable: it uses no OS header, so every test that includes it builds on all three
  * hosts.
@@ -164,6 +164,7 @@ struct MemTree {
     std::map<std::string, std::int64_t> mtimes;
 
     // What the scan did.
+    std::vector<std::string> listed; // every directory list() was called with, in order
     std::map<std::string, int> opens;
     int total_opens{0};
     std::vector<Read> reads;
@@ -197,6 +198,7 @@ struct MemTree {
     [[nodiscard]] FsOps ops() {
         FsOps o;
         o.list = [this](const std::string& d, std::size_t cap) {
+            listed.push_back(d);
             clock += list_step;
             ListResult r;
             const auto it = dirs.find(d);

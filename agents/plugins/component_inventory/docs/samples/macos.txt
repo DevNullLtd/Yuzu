@@ -1,0 +1,5 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-14 · euid 501 · leg-hash pending
+== action=scan
+status|scan|constrained|macos:component_inventory:budget_entries
+[result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
+

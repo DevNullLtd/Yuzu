@@ -59,6 +59,14 @@ TEST_CASE("jar filename: non-archives and empties are rejected", "[runtime][comp
     CHECK_FALSE(parse_jar_filename("\0\xff\x01"sv).has_value());
 }
 
+TEST_CASE("archive name: .jar, .war and .ear in any case, nothing shorter or longer",
+          "[runtime][component_inventory][java]") {
+    for (const char* f : {"a.jar", "A.JAR", "x.War", "y.eAr", ".jar", "dir.name.jar"})
+        CHECK(is_java_archive_name(f));
+    for (const char* f : {"", "jar", "ar", "a.zip", "a.jar.bak", "x.jarx", "x.warx", "a.ja"})
+        CHECK_FALSE(is_java_archive_name(f));
+}
+
 TEST_CASE("jar filename: binary bytes are rejected on both branches", "[runtime][component_inventory][java]") {
     // Valid archive suffix, so these reach the artifact/version scan.
     for (const std::string_view f : {"a\0.jar"sv, "a\0-1.jar"sv, "a-1\0.jar"sv, "a\x01-1.0.jar"sv,

@@ -84,11 +84,16 @@ inline std::string_view next_line(std::string_view& text) noexcept {
     return line;
 }
 
-constexpr bool has_suffix(std::string_view s, std::string_view suf) noexcept {
-    return s.size() >= suf.size() && s.substr(s.size() - suf.size()) == suf;
-}
-
 } // namespace java_detail
+
+/// A candidate archive file name: at least four bytes, ending in .jar, .war or .ear in any case.
+[[nodiscard]] constexpr bool is_java_archive_name(std::string_view name) noexcept {
+    using namespace java_detail;
+    if (name.size() < 4)
+        return false;
+    const std::string_view ext = name.substr(name.size() - 4);
+    return iequals(ext, ".jar") || iequals(ext, ".war") || iequals(ext, ".ear");
+}
 
 /// <artifact>-<version>[-classifier] for .jar/.war/.ear (case-insensitive).
 /// The version is the digit-led run after the LAST '-' that starts one and is
@@ -104,10 +109,7 @@ constexpr bool has_suffix(std::string_view s, std::string_view suf) noexcept {
 // name must stay valid UTF-8 downstream. Upgrade to a UTF-8 validator if needed.
 inline std::optional<JarName> parse_jar_filename(std::string_view filename) {
     using namespace java_detail;
-    if (filename.size() < 4 || filename.size() > kMaxJarFilenameBytes || !is_printable_ascii(filename))
-        return std::nullopt;
-    const std::string_view ext = filename.substr(filename.size() - 4);
-    if (!iequals(ext, ".jar") && !iequals(ext, ".war") && !iequals(ext, ".ear"))
+    if (filename.size() > kMaxJarFilenameBytes || !is_printable_ascii(filename) || !is_java_archive_name(filename))
         return std::nullopt;
     const std::string_view stem = filename.substr(0, filename.size() - 4);
     if (stem.empty())
@@ -154,7 +156,7 @@ inline std::optional<std::string> parse_pom_properties_version(std::string_view 
         if (line.empty() || line.front() == '#' || line.front() == '!')
             continue;
         constexpr std::string_view kKey = "version";
-        if (line.substr(0, kKey.size()) != kKey)
+        if (!line.starts_with(kKey))
             continue;
         line.remove_prefix(kKey.size());
         line = trim(line);
@@ -221,23 +223,21 @@ inline std::optional<std::string> parse_manifest_version(std::string_view text) 
 
 /// BOOT-INF/lib/<x>.jar, WEB-INF/lib/<x>.jar or lib/<x>.jar, no further '/'.
 inline bool is_nested_lib_entry(std::string_view entry) noexcept {
-    using namespace java_detail;
     for (const std::string_view prefix : {std::string_view{"BOOT-INF/lib/"}, std::string_view{"WEB-INF/lib/"},
                                           std::string_view{"lib/"}}) {
-        if (entry.substr(0, prefix.size()) != prefix)
+        if (!entry.starts_with(prefix))
             continue;
         const std::string_view rest = entry.substr(prefix.size());
-        return rest.size() > 4 && rest.find('/') == std::string_view::npos && has_suffix(rest, ".jar");
+        return rest.size() > 4 && rest.find('/') == std::string_view::npos && rest.ends_with(".jar");
     }
     return false;
 }
 
 /// META-INF/maven/<g>/<a>/pom.properties
 inline bool is_pom_properties_entry(std::string_view entry) noexcept {
-    using namespace java_detail;
     constexpr std::string_view kPrefix = "META-INF/maven/";
     constexpr std::string_view kSuffix = "/pom.properties";
-    if (entry.substr(0, kPrefix.size()) != kPrefix || !has_suffix(entry, kSuffix))
+    if (!entry.starts_with(kPrefix) || !entry.ends_with(kSuffix))
         return false;
     if (entry.size() < kPrefix.size() + kSuffix.size())
         return false;
