@@ -15,12 +15,15 @@
  * are maintained as their own section.
  */
 
+#include "bundled_content.hpp"
+#include "instruction_definition_model.hpp"
 #include "instruction_schema_test_util.hpp"
 #include "instruction_store.hpp"
 #include "instruction_param_schema.hpp"
 #include "reserved_definition_id.hpp"
 #include "store_errors.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -32,6 +35,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -187,6 +191,21 @@ TEST_CASE("InstructionStore: explicit id is bounded to a safe charset", "[instru
         REQUIRE(!result.has_value());
         CHECK(result.error() == "definition id too long (max 128 characters)");
     }
+    SECTION("'.' and '..' are refused on create with a controlled error; dotted names stay legal") {
+        for (const char* bad : {".", ".."}) {
+            def.id = bad;
+            auto result = store.create_definition(def);
+            REQUIRE(!result.has_value());
+            CHECK(result.error() == "definition id may not be '.' or '..'");
+        }
+        for (const char* ok : {"...", ".a", "a.", "a..b"}) {
+            def.id = ok;
+            CHECK(store.create_definition(def).has_value());
+        }
+        auto all = store.query_definitions();
+        REQUIRE(all.has_value());
+        CHECK(all->size() == 4);
+    }
     SECTION("empty id still store-generates") {
         def.id = "";
         auto result = store.create_definition(def);
@@ -293,6 +312,120 @@ TEST_CASE("InstructionStore: NUL in yaml_source is rejected at the store chokepo
     auto result = store.create_definition(def);
     REQUIRE(!result.has_value());
     CHECK(result.error() == "yaml_source contains a NUL byte");
+}
+
+TEST_CASE("InstructionStore: NUL in an unsanitised column is a client error and not a store fault",
+          "[instruction_store][pg]") {
+    // result_schema, concurrency_mode, visualization_spec, response_templates_spec and
+    // parameter_schema are bound without sanitize_pg_text. pg::exec_params refuses a NUL
+    // parameter (22021), which the twins would classify as a 503 "outcome unknown" store
+    // fault, so the store refuses it first with a plain validation error (no db-error prefix)
+    // on create, import and update.
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto is_client_error = [](const std::string& err, std::string_view column) {
+        return err == std::string(column) + " contains a NUL byte" &&
+               err.rfind(std::string(kInstructionStoreDbErrorPrefix), 0) != 0;
+    };
+
+    InstructionDefinition base;
+    base.name = "Nul Column Probe";
+    base.type = "question";
+    base.plugin = "test";
+    base.action = "test";
+    base.version = "1.0";
+    const std::string nul = std::string("a") + '\0' + "b";
+
+    SECTION("create refuses each column") {
+        for (const std::string_view column :
+             {"result_schema", "concurrency_mode", "visualization_spec",
+              "response_templates_spec", "parameter_schema"}) {
+            auto def = base;
+            if (column == "result_schema")
+                def.result_schema = nul;
+            else if (column == "concurrency_mode")
+                def.concurrency_mode = nul;
+            else if (column == "visualization_spec")
+                def.visualization_spec = nul;
+            else if (column == "response_templates_spec")
+                def.response_templates_spec = nul;
+            else
+                def.parameter_schema = nul;
+            auto result = store.create_definition(def);
+            INFO(std::string(column));
+            REQUIRE_FALSE(result.has_value());
+            CHECK(is_client_error(result.error(), column));
+        }
+        InstructionQuery q;
+        auto all = store.query_definitions(q);
+        REQUIRE(all.has_value());
+        CHECK(std::none_of(all->begin(), all->end(),
+                           [](const auto& d) { return d.name == "Nul Column Probe"; }));
+    }
+
+    SECTION("import refuses a NUL escape in a string field") {
+        store.set_require_signed_definitions(false);
+        const std::string body =
+            R"({"name":"Nul Column Probe","type":"question","plugin":"system_info",)"
+            R"("action":"query","concurrency_mode":"per-device\u0000x"})";
+        auto result = store.import_definition_json(body);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "concurrency_mode"));
+    }
+
+    SECTION("trusted import refuses a NUL escape in result_schema") {
+        const std::string body =
+            R"({"name":"Nul Column Probe","type":"question","plugin":"system_info",)"
+            R"("action":"query","result_schema":"{}\u0000"})";
+        auto result = store.import_definition_json_trusted(body);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "result_schema"));
+    }
+
+    SECTION("update refuses concurrency_mode and leaves the row untouched") {
+        auto created = store.create_definition(base);
+        REQUIRE(created.has_value());
+        auto def = base;
+        def.id = *created;
+        def.concurrency_mode = nul;
+        auto result = store.update_definition(def);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "concurrency_mode"));
+        auto stored = store.get_definition(*created);
+        REQUIRE(stored.has_value());
+        REQUIRE(stored->has_value());
+        CHECK((*stored)->concurrency_mode == "per-device");
+    }
+
+    SECTION("update refuses a NUL in type, which update_definition does not close to a set") {
+        // The legacy dashboard PUT stores whatever string it is given as type, so this column
+        // reaches the bind unchecked on update (create closes it to question/action).
+        auto created = store.create_definition(base);
+        REQUIRE(created.has_value());
+        auto def = base;
+        def.id = *created;
+        def.type = nul;
+        auto result = store.update_definition(def);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "type"));
+        auto stored = store.get_definition(*created);
+        REQUIRE(stored.has_value());
+        REQUIRE(stored->has_value());
+        CHECK((*stored)->type == "question");
+    }
+
+    SECTION("import refuses a NUL escape in a non-JSON visualization_spec string") {
+        store.set_require_signed_definitions(false);
+        const std::string body =
+            R"({"name":"Nul Column Probe","type":"question","plugin":"system_info",)"
+            R"("action":"query","visualization_spec":"not json\u0000"})";
+        auto result = store.import_definition_json(body);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(is_client_error(result.error(), "visualization_spec"));
+    }
 }
 
 // ── spec.scope (scope-walking DSL) validation (PR-E) ────────────────────────
@@ -779,6 +912,69 @@ TEST_CASE("InstructionStore: delete nonexistent returns not_found", "[instructio
     auto deleted = store.delete_definition("nonexistent-id");
     REQUIRE_FALSE(deleted.has_value());
     CHECK(deleted.error().starts_with("not_found:"));
+}
+
+// M3-1: delete_definition with a version token. Turns red if the `AND updated_at=$2` clause or the
+// existence probe in InstructionStore::delete_definition is removed (a mismatch would delete the
+// row, or answer not_found for a row that is still there).
+TEST_CASE("InstructionStore: delete with expected_updated_at deletes only that version",
+          "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto id = store.create_definition(make_question("Versioned Delete"));
+    REQUIRE(id.has_value());
+    const auto token = [&] {
+        auto r = store.get_definition(*id);
+        REQUIRE(r.has_value());
+        REQUIRE(r->has_value());
+        return (*r)->updated_at;
+    };
+    const std::int64_t v1 = token();
+
+    // A moved-on version is a conflict (not not_found) and the row survives.
+    auto stale = store.delete_definition(*id, v1 + 1);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(stale.error().starts_with(std::string(kConflictPrefix)));
+    CHECK(token() == v1);
+
+    // A token from before an update no longer matches the updated row.
+    auto def = store.get_definition(*id);
+    REQUIRE(def.has_value());
+    REQUIRE(def->has_value());
+    InstructionDefinition edited = **def;
+    edited.description = "edited";
+    edited.parameter_schema.clear();
+    REQUIRE(store.update_definition(edited, v1).has_value());
+    const std::int64_t v2 = token();
+    REQUIRE(v2 > v1);
+    auto old_token = store.delete_definition(*id, v1);
+    REQUIRE_FALSE(old_token.has_value());
+    CHECK(old_token.error().starts_with(std::string(kConflictPrefix)));
+    CHECK(token() == v2);
+
+    // The matching version deletes it, and a retry with the same token is not_found.
+    REQUIRE(store.delete_definition(*id, v2).has_value());
+    auto gone = store.get_definition(*id);
+    REQUIRE(gone.has_value());
+    CHECK_FALSE(gone->has_value());
+    auto again = store.delete_definition(*id, v2);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error().starts_with("not_found:"));
+
+    // A re-created id lands above the deleted row's token, so the old token never matches it.
+    InstructionDefinition recreated = make_question("Versioned Delete");
+    recreated.id = *id;
+    REQUIRE(store.create_definition(recreated).has_value());
+    CHECK(token() > v2);
+    auto after_recreate = store.delete_definition(*id, v2);
+    REQUIRE_FALSE(after_recreate.has_value());
+    CHECK(after_recreate.error().starts_with(std::string(kConflictPrefix)));
+
+    // No token = unconditional (the legacy route and a pack uninstall).
+    REQUIRE(store.delete_definition(*id).has_value());
 }
 
 // ── Import/Export JSON ─────────────────────────────────────────────────────
@@ -1332,6 +1528,117 @@ yuzu::test::PgTestTemplate instruction_store_seed_tpl{
     }};
 } // namespace
 
+// Gate 8 F10: migration v4 on a database an earlier build left, with a tombstone already recorded
+// (so last_version arrives as 0). The upgrade must keep delete, re-create and the stale-token
+// refusal working for every id deleted from here on. Turns red if v4 stops adding the column with
+// a 0 default (the floor read, or the delete's upsert, then fails) or the floor stops applying to
+// ids deleted after the upgrade.
+TEST_CASE("InstructionStore: migration v4 over a v3 database with a recorded tombstone keeps "
+          "delete; re-create and the stale-token refusal working",
+          "[instruction_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const auto run = [](PgPool& pool, const char* sql, std::vector<std::string> binds = {}) {
+        auto lease = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(lease.get(), sql, binds);
+        INFO(sql);
+        REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+        return r;
+    };
+    {
+        PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        {
+            InstructionStore head{pool};
+            REQUIRE(head.is_open());
+        }
+        // What a v3 build left: no last_version column, version 3, one tombstone.
+        run(pool, "ALTER TABLE instruction_store.deleted_seed_content DROP COLUMN last_version");
+        run(pool, "UPDATE public.schema_meta SET version = 3 WHERE store = 'instruction_store'");
+        run(pool, "INSERT INTO instruction_store.deleted_seed_content (kind, id, deleted_at) "
+                  "VALUES ('definition', 'v3.tomb', 1)");
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool}; // runs v4
+    REQUIRE(store.is_open());
+    const auto tomb_version = [&] {
+        auto r = run(pool, "SELECT last_version FROM instruction_store.deleted_seed_content "
+                           "WHERE kind='definition' AND id='v3.tomb'");
+        REQUIRE(PQntuples(r.get()) == 1);
+        return std::stoll(PQgetvalue(r.get(), 0, 0));
+    };
+    CHECK(tomb_version() == 0); // recorded before the column existed
+
+    InstructionDefinition def;
+    def.id = "v3.tomb";
+    def.name = "n";
+    def.type = "question";
+    def.plugin = "os_info";
+    def.action = "os_name";
+    // An operator create over the old tombstone is not suppressed (only the seed path is).
+    REQUIRE(store.create_definition(def).has_value());
+    const std::int64_t far =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() + 3600;
+    run(pool, "UPDATE instruction_store.instruction_definitions SET updated_at = $1::bigint "
+              "WHERE id = 'v3.tomb'",
+        {std::to_string(far)});
+
+    // Delete after the upgrade: the tombstone now carries the row's token.
+    REQUIRE(store.delete_definition("v3.tomb").has_value());
+    CHECK(tomb_version() == far);
+    // Re-create: strictly above the stale token, so a token read before the delete is refused.
+    REQUIRE(store.create_definition(def).has_value());
+    auto again = store.get_definition("v3.tomb");
+    REQUIRE((again.has_value() && again->has_value()));
+    CHECK((*again)->updated_at > far);
+    InstructionDefinition stale = **again;
+    stale.description = "from before the delete";
+    auto refused = store.update_definition(stale, far);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(is_conflict_error(refused.error()));
+}
+
+// Gate 8 F6: the boot seed imports every bundled envelope through the trusted path, and an envelope
+// the store refuses (a ttlSeconds above 86400, a type outside question/action) fails only at boot,
+// as a warn line. This turns that into a CI failure. It also pushes each definition's yaml_source
+// through the authoring validation (the name/version bounds the YAML twins apply), so content the
+// product ships can never be uneditable through the YAML save. Turns red on the first bundled
+// definition either gate refuses.
+TEST_CASE("InstructionStore: every bundled definition passes the trusted import and its yaml_source "
+          "passes the authoring validation",
+          "[instruction_store][seed][pg][bundled]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_seed_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::size_t imported = 0;
+    std::size_t with_yaml = 0;
+    for (const auto& env : yuzu::server::kBundledDefinitions) {
+        const nlohmann::json parsed = nlohmann::json::parse(env, nullptr, false);
+        REQUIRE_FALSE(parsed.is_discarded());
+        const std::string id = parsed.value("id", std::string{});
+        INFO("bundled definition " << id);
+        auto r = store.import_definition_json_trusted(env);
+        INFO("import error: " << (r ? std::string{} : r.error()));
+        CHECK(r.has_value());
+        if (r)
+            ++imported;
+        if (parsed.contains("yaml_source") && parsed["yaml_source"].is_string()) {
+            const std::string yaml = parsed["yaml_source"].get<std::string>();
+            if (!yaml.empty()) {
+                ++with_yaml;
+                const auto errors = yuzu::server::validate_yaml_for_authoring(yaml);
+                INFO("first yaml error: " << (errors.empty() ? std::string{} : errors.front()));
+                CHECK(errors.empty());
+            }
+        }
+    }
+    CHECK(imported == yuzu::server::kBundledDefinitions.size());
+    CHECK(imported > 0);
+    CHECK(with_yaml > 0);
+}
+
 TEST_CASE("InstructionStore: trusted reseed of an untouched bundled definition "
           "is a conflict-skip, not a re-import",
           "[instruction_store][seed][pg]") {
@@ -1699,6 +2006,28 @@ TEST_CASE("InstructionStore: read and write degrade counters increment on a stor
               .value() == 1.0);
 }
 
+// H5: a plain create that never got a transaction must not be reported as a COMMIT problem, and
+// the text is a DB fault (kDb) either way. Turns red if the no-connection branch goes back to the
+// shared `failure.empty()` fallback text.
+TEST_CASE("InstructionStore: a create with every pooled connection leased reports that no "
+          "transaction was obtained; as a DB fault",
+          "[instruction_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    auto held_a = pool.try_acquire_for(std::chrono::seconds(5));
+    auto held_b = pool.try_acquire_for(std::chrono::seconds(5));
+    REQUIRE(held_a);
+    REQUIRE(held_b);
+    auto r = store.create_definition(make_question("no-connection-create"));
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() ==
+          std::string(yuzu::server::kInstructionStoreDbErrorPrefix) +
+              "pool acquire timeout or BEGIN failed");
+    CHECK(yuzu::server::classify_store_error(r.error()) == yuzu::server::StoreFault::kDb);
+}
+
 // -- Stored parameter_schema: write-time gate and preserve-on-empty ---------
 
 TEST_CASE("InstructionStore: parameter_schema write gate rejects an oversize or invalid schema "
@@ -1797,4 +2126,83 @@ TEST_CASE("InstructionStore: update keeps the stored parameter_schema when the s
     def.parameter_schema.clear();
     CHECK(store.update_definition(def).has_value());
     CHECK(stored() == legacy);
+}
+
+TEST_CASE("InstructionStore: a NUL in a read or delete key answers not found and not a store fault",
+          "[instruction_store][pg]") {
+    // pg::exec_params refuses a NUL parameter (22021). A string holding a NUL can never equal a
+    // stored id or filter value, so the store answers "nothing matches" itself instead of
+    // surfacing a client error as a db-error on every caller (the legacy routes and the older MCP
+    // list/get tools pass the raw id and filters straight through).
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto kept = make_question("Nul Read Keeper");
+    auto kept_id = store.create_definition(kept);
+    REQUIRE(kept_id.has_value());
+    InstructionSet iset;
+    iset.name = "Nul Read Set";
+    auto set_id = store.create_set(iset);
+    REQUIRE(set_id.has_value());
+
+    // The row a truncating driver would have matched: the id up to the NUL.
+    const std::string nul_id = *kept_id + '\0' + "tail";
+    const std::string nul_set = *set_id + '\0' + "tail";
+
+    SECTION("get and export answer not found") {
+        auto got = store.get_definition(nul_id);
+        REQUIRE(got.has_value());
+        CHECK_FALSE(got->has_value());
+        auto exported = store.export_definition_json(nul_id);
+        REQUIRE(exported.has_value());
+        CHECK(*exported == "{}");
+    }
+
+    SECTION("each query filter answers an empty list") {
+        for (int field = 0; field < 4; ++field) {
+            InstructionQuery q;
+            // The text before the NUL names the stored row, so a truncating driver would match it.
+            const std::string v = "Nul Read Keeper" + std::string(1, '\0') + "y";
+            if (field == 0)
+                q.name_filter = v;
+            else if (field == 1)
+                q.plugin_filter = v;
+            else if (field == 2)
+                q.type_filter = v;
+            else
+                q.set_id_filter = v;
+            INFO("filter " << field);
+            auto res = store.query_definitions(q);
+            REQUIRE(res.has_value());
+            CHECK(res->empty());
+        }
+    }
+
+    SECTION("delete answers not_found and removes nothing") {
+        auto del = store.delete_definition(nul_id);
+        REQUIRE_FALSE(del.has_value());
+        CHECK(del.error().starts_with("not_found:"));
+        auto stale = store.delete_definition(nul_id, std::int64_t{1});
+        REQUIRE_FALSE(stale.has_value());
+        CHECK(stale.error().starts_with("not_found:"));
+        auto upd = kept;
+        upd.id = nul_id;
+        upd.description = "should never land";
+        auto updated = store.update_definition(upd);
+        REQUIRE_FALSE(updated.has_value());
+        CHECK(updated.error().starts_with("not_found:"));
+        auto set_del = store.delete_set(nul_set);
+        REQUIRE_FALSE(set_del.has_value());
+        CHECK(set_del.error().starts_with("not_found:"));
+
+        auto still = store.get_definition(*kept_id);
+        REQUIRE(still.has_value());
+        CHECK(still->has_value());
+        auto sets = store.list_sets();
+        REQUIRE(sets.has_value());
+        CHECK(std::any_of(sets->begin(), sets->end(),
+                          [&](const auto& s) { return s.id == *set_id; }));
+    }
 }

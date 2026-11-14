@@ -371,6 +371,16 @@ public:
     /// treat the latter as "not found".
     std::expected<std::optional<ProductPack>, std::string> get(const std::string& id);
 
+    /// The ids of the installed packs that record `(kind, item_id)` among their items, oldest id
+    /// first, at most `limit` (clamped to at least 1). ONE bounded SELECT on `product_pack_items`
+    /// (the table is small and has no index on `item_id`). `unexpected(msg)` (prefixed
+    /// `kProductPackDbErrorPrefix`) is a read failure, never "no pack contains it". Unlike `get`
+    /// and `list` it does NOT feed the read-degrade counter: its only caller is an advisory note
+    /// on a definition delete's audit row (instruction_referrers.hpp), which must stay silent in
+    /// metrics when it fails.
+    std::expected<std::vector<std::string>, std::string>
+    packs_containing_item(const std::string& kind, const std::string& item_id, int limit);
+
     /// Uninstall a product pack, removing all contained items via uninstall_fn. Stamps `id` into
     /// `deleted_pack_ids` in the SAME transaction as the metadata delete, under
     /// `kErasureCoordLockSql` (ADR-0009 erasure consistency — originally serialized against the

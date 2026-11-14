@@ -210,7 +210,12 @@ TEST_CASE("operate pages: Approvals copy is exact and claims no second person",
     CHECK(has(js, "field(detail, 'actions').hidden = !(pending && !mine && canDecide);"));
     CHECK(has(js, "field(detail, 'excluded').hidden = !(pending && !mine && excluded && canDecide);"));
     CHECK(has(js, "d.excluded === '1'"));
-    CHECK(has(js, "approveBtn.hidden = excluded || d.unreadable === '1';"));
+    CHECK(has(js, "approveBtn.hidden = excluded || d.unreadable === '1' || !!clipped;"));
+    // D3: a clipped scope shows the notice naming where the full scope is, and the dialog
+    // refuses to open for Approve even if the button were reached another way.
+    CHECK(has(js, "field(detail, 'scope-clipped')"));
+    CHECK(has(js, "if (approve && d.scopeClipped) return;"));
+    CHECK(has(body, "data-f=\"scope-clipped\""));
     CHECK_FALSE(has(js, "!(pending && !mine && !excluded && canDecide)"));
     // The dialog copy does not claim the reviewer saw everything when the summary was cut.
     CHECK(has(js, "d.request && d.shortened === '1' ?"));

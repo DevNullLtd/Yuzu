@@ -665,6 +665,32 @@ std::expected<std::vector<Workflow>, std::string> WorkflowEngine::list_workflows
     return result;
 }
 
+std::expected<std::vector<std::string>, std::string>
+WorkflowEngine::workflows_referencing_instruction(
+    const std::string& instruction_id, int limit,
+    const std::unordered_set<std::string>& exclude_ids) const {
+    if (!open_)
+        return std::unexpected(std::string(kDbErrorPrefix) + "workflow engine not available");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
+    std::vector<std::string_view> excluded(exclude_ids.begin(), exclude_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT w.id FROM workflow_engine.workflows w WHERE w.deleted_at = 0 AND EXISTS "
+        "(SELECT 1 FROM workflow_engine.workflow_steps s WHERE s.workflow_id = w.id "
+        "AND s.instruction_id = $1) AND NOT (w.id = ANY($3::text[])) "
+        "ORDER BY w.created_at ASC, w.id ASC LIMIT $2",
+        std::vector<std::string>{instruction_id, std::to_string(std::max(limit, 1)),
+                                 pg::to_text_array(excluded)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
+    std::vector<std::string> ids;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        ids.push_back(col_str(res.get(), i, 0));
+    return ids;
+}
+
 std::expected<std::optional<Workflow>, std::string> WorkflowEngine::get_workflow(
     const std::string& id) const {
     if (!open_)

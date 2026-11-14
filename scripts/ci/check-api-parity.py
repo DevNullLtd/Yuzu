@@ -512,7 +512,10 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # 204 -> 208 (DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
 # preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
 # 208 -> 204 (#6087): get_/set_/reset_dex_score_policy retire all four (preview twins onto the dry-run PUT).
-BASELINE_UNTWINNED = 204
+# 204 -> 195 (instruction authoring twins, #2146 batch C): nine rows flipped from planned to twinned
+# (POST/PUT/DELETE /api/v1/instructions*, import, yaml, validate-yaml and the three /api/v1/instruction-sets
+# routes, with their nine MCP tools).
+BASELINE_UNTWINNED = 195
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -526,7 +529,8 @@ GENERIC_PLANNED_ISSUE = 2146
 # 83 -> 80 (twin batch B: commands, execution cancel/rerun): three rows became twinned.
 # 80 -> 79 (instruction-definition execute twins): post.api-instructions-param-execute became twinned.
 # 79 -> 78 (workflow execute twins, #2146 batch B): post.api-workflows-param-execute became twinned.
-BASELINE_GENERIC_PLANNED = 78
+# 78 -> 69 (instruction authoring twins, #2146 batch C): nine rows became twinned.
+BASELINE_GENERIC_PLANNED = 69
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.

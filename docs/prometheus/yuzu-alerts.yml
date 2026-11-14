@@ -3432,6 +3432,40 @@ groups:
             n_live_tup), and the step results table is not included. The
             threshold is a sizing claim, not tuned against fleet data.
 
+      # Approval-gated execute and ticket-mint refusals (#2146). The counter is pre-seeded to 0 at
+      # boot for every reason, so increase() > 0 is meaningful. Only the two reasons that are
+      # CAPACITY signals are alerted: approval_queue_full (the global 1000-row pending queue is
+      # full, so nobody can submit until a reviewer decides) and approval_cap_reached (one
+      # principal holds about 25 pending approvals). approval_unavailable and
+      # approval_submit_failed are storage or wiring faults the Postgres and store-degrade rules
+      # already cover. DELIBERATELY the simplest shape: ANY refusal in 15 minutes, a warning, with
+      # no rate threshold. How many refusals a healthy fleet sees is not known, so a rate
+      # threshold would be an invented number; this rule is a claim only that a refusal means a
+      # human or a looping client needs to look. Each replica counts its own, so the rule is
+      # per series (instance, reason). No gauge of the pending count or the oldest pending
+      # age exists yet; that is a follow-up.
+      - alert: YuzuApprovalSubmitRefused
+        expr: |
+          increase(yuzu_server_approval_submit_refused_total{reason=~"approval_queue_full|approval_cap_reached"}[15m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Approval submissions are being refused ({{ $labels.reason }})"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#approval-submissions-refused-queue-full-or-per-principal-cap-2146"
+          description: >-
+            yuzu_server_approval_submit_refused_total{reason="{{ $labels.reason }}"} moved on
+            {{ $labels.instance }} in the last 15 minutes: an approval-gated execute call or an
+            MCP supervised-tier ticket mint was refused and no approval row was created.
+            approval_queue_full means the shared 1000-row pending queue is full, so NOBODY can
+            submit until a reviewer decides pending approvals or the 7-day expiry clears them
+            (a retry loop cannot help). approval_cap_reached means one principal, typically a
+            looping agentic worker or script, holds its whole share of about 25 pending
+            approvals. The per-event evidence is the denied audit row whose detail carries
+            reason=approval_cap_reached (instruction.execute, mcp.execute_instruction_definition
+            or mcp.<tool>). This alert fires on any refusal in 15 minutes, not on a rate: the
+            threshold is not tuned against fleet data.
+
   - name: yuzu-tls
     rules:
       # Expiry ladder (server and gateway alike): one rule fires at a time,
@@ -5140,7 +5174,13 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way, and so do four
+            directory sync, group mappings, MCP settings), the seven instruction definition
+            and instruction set writes of the REST v1 and MCP twins (instruction.create,
+            instruction.update, instruction.delete, instruction.import, instruction_set.create
+            and instruction_set.delete, six audit actions because the YAML save audits as
+            instruction.create or instruction.update: nothing is created, changed or deleted while the
+            "attempted" row cannot be stored) and workflow execution (workflow.execute: nothing
+            is sent while its "requested" row cannot be stored) 503 the same way, and so do four
             dashboard mutations (#3619): every console send (POST /api/dashboard/execute),
             group-from-results, and the Echo retention-paused re-enable and purge, which send,
             create or purge nothing while their "attempted" row cannot be stored. Upload-grant

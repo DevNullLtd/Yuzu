@@ -74,6 +74,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [RBAC](#rbac)
   - [Tags](#tags)
   - [Definitions](#definitions)
+  - [Instruction Authoring and Instruction Sets](#instruction-authoring-and-instruction-sets)
   - [Product Packs](#product-packs)
   - [Response Templates](#response-templates)
   - [Audit Log](#audit-log)
@@ -382,7 +383,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | any | `/api/v1/inventory/software/normalization/pack` | 1 MiB | `software_alias_pack` | The alias-pack CSV upload. The raw body is the CSV, which `parse_normalization_pack` refuses over 1 MiB, so the cap mirrors that bound exactly. A longer prefix than the row above, so it wins for this path. |
 | any | `/api/v1/crypto/revocation-sources` | 192 KiB | `crypto_revocation_sources` | ADR-0070 R1 registered CRL sources: `POST` and `PUT` carry `{name, ca_certificates (up to 8 PEM certificates), crl_urls (up to 8 URLs of up to 2,048 bytes)}`. 192 KiB mirrors the handler's own `revocation_source::kBodyMaxBytes` exactly (a `static_assert` pins the pair) and outranks the 16 KiB `/api/v1/crypto` row for this subtree only (longest match). |
 | any | `/api/v1/inventory/software/collection-settings` | 16 KiB | `software_collection_settings` | The per-group collection settings routes. The only body-bearing route is `PUT .../{group_id}`: one small JSON object (an interval, a window, a zone name, six boolean switches, a priority and a version). The GET siblings share the prefix. |
-| any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
+| any (catch-all) | *(empty prefix: matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. Reviewed defaults (no table row of their own): the instruction authoring twins under `/api/v1/instructions` and `/api/v1/instruction-sets`, including `POST /api/v1/instructions/import`, which is therefore 4 MiB where the legacy `POST /api/instructions/import` is 16 MiB (`instruction_import`). |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `echo_dashboard_sql`/`echo_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the five 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
@@ -3857,7 +3858,7 @@ List all instruction definitions.
 
 #### `GET /api/v1/instructions/{id}`
 
-(#4029) Single-definition detail — the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`) — both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue. The detail also carries `secret_params`, the parameter names a client must render as write-only inputs (today `grant_secret` and `grant_id`, the server's one shared list); it is a client hint and is not part of the export.
+(#4029) Single-definition detail: the RECONCILED SUPERSET of the legacy `GET /api/instructions/{id}` fragment's fields (`gather_ttl_seconds`/`response_ttl_days`/`created_by`/timestamps) and MCP `get_definition`'s pre-existing fields (`approval_mode`/`parameter_schema`/`result_schema`/`yaml_source`): both surfaces call the same builder (`instruction_definition_detail_json`) now, closing the field-set drift that existed between them before this issue. The detail also carries `secret_params`, the parameter names a client must render as write-only inputs (today `grant_secret` and `grant_id`, the server's one shared list); it is a client hint and is not part of the export. `updated_at` is the definition's version token (monotonic; see `PUT /api/v1/instructions/{id}`), not necessarily the epoch second of the last write: pass it back as `expected_updated_at`.
 
 **Permission:** `InstructionDefinition:Read`
 
@@ -3967,6 +3968,60 @@ Other errors use the A4 envelope with a `reason`: `500` `dispatch_exception` (th
 - No send accepted (or none known) and a row exists: the targeted count stays 0 and the row stays `running` until the stuck-execution sweep cancels it, which it does only for a row that is still `running` with a targeted count of 0, no per-agent response at all and no pending command-outbox delivery, dispatched more than about 30 minutes ago (the same closes-by-itself-only-if-no-agent-answers wording is in the remediation); `POST /api/v1/executions/{id}/cancel` closes it at once.
 
 `agents_sent` is a lower bound (a gateway-routed agent counts once its command is queued for forwarding, which can still fail), so the row can complete early: a count that is too low lets the row complete through the ordinary count refresh as soon as that many agents have answered, before an uncounted agent has (this is not the stuck-execution sweep, which never closes a row an agent has answered), and a swept row means "no agent answered", not "no agent received the command". The error carries **no retry hint** (`retry_after_ms` is `null`, and the text does not suggest a retry), because a dispatch that threw may already have reached some agents and sending it again could run it twice; check that execution's per-agent results before running the definition again. If the execution row cannot be created (the store throws), nothing is dispatched: the answer is `503` `execution_record_unavailable` with `retry_after_ms: 5000` and a `failure` audit row with `reason=execution_record_exception`.
+
+---
+
+### Instruction Authoring and Instruction Sets
+
+(#2146, api-parity batch C) Nine routes that author instruction definitions and manage instruction sets. Each is the REST v1 twin of a legacy `/api/instructions*` or `/api/instruction-sets*` route and of one MCP tool (see the MCP table in `docs/user-manual/mcp.md`). All nine answer in the v1 envelope (`{ "data": ..., "meta": { "api_version": "v1" } }`) and report errors in the A4 envelope. The routes are authenticated by the ordinary permission gate (a global grant); a service-scoped API token is refused because no permission is on the service-scope allow-list. The legacy routes keep their request and response shapes, with these changes: a supervised-tier MCP token is refused `403` on the ones that gate on `InstructionDefinition:Write`, and the legacy import applies the stricter type, range and bound checks described under the import twin below.
+
+**Audit-first.** Every write route here writes an `attempted` audit row BEFORE it changes anything. If that row cannot be stored the route answers `503` with `Sec-Audit-Failed: true` and `retry_after_ms` 5000 and changes nothing; otherwise it audits the outcome (`success`, `denied` or `error`) under the same action name as the legacy route (`instruction.create`, `instruction.update`, `instruction.delete`, `instruction.import`, `instruction_set.create`, `instruction_set.delete`). If the OUTCOME row cannot be stored after the change was made, the answer is the ordinary `200` or `201` carrying `Sec-Audit-Failed: true` (MCP: `audit_persisted: false`) and the change STANDS; the missing outcome row is the only loss. A refusal whose own `denied` or `error` outcome row cannot be stored carries the same signal (`Sec-Audit-Failed: true` on REST; `audit_persisted: false` in `error.data` on MCP) and its status and message are unchanged. `POST /api/v1/instructions/validate-yaml` and `GET /api/v1/instruction-sets` are not audited. An `attempted` row records the target and the fields that decide what a later run executes (the delete rows carry the pre-image); the `denied` and `error` detail values, including the ones only these twins write, are in the audit-log manual.
+
+**Supervised-tier approval for `InstructionDefinition:Write`.** At the supervised MCP tier `InstructionDefinition:Write` now requires an approval ticket, because an unticketed update can set `approval_mode` to `auto` or repoint `plugin` and `action`, after which an existing schedule or an operator-tier run needs no human. The pair is shared by every route that gates on it, so a supervised-tier MCP token now gets `403` on the routes below that need `InstructionDefinition:Write`, on `POST /api/product-packs` (`ProductPack:Write` is gated the same way, because a pack install creates definitions with a pack-supplied `approval_mode`), on the legacy `POST /api/instructions`, `PUT /api/instructions/{id}`, `POST /api/instructions/import`, `POST /api/instructions/yaml` routes and on the `POST`, `PUT` and `DELETE /api/v1/definitions/{id}/response-templates` routes. `InstructionDefinition:Delete` was already ticketed at that tier, and `InstructionSet:Write` is not gated. `POST /api/v1/instructions/validate-yaml` stays `InstructionDefinition:Read`. Only the five definition tools have an MCP tool to take a ticket; the response-templates writes and the pack install have none, so a `supervised` token cannot perform them at all. What an approver approves is the call's arguments at one definition version (for `import_definition` and `save_definition_yaml`, the definition's approval mode, plugin, action, id and name as plain text, in that order, plus a digest of the document: byte length and SHA-256; the Approvals list cell shows only the start of that subject), not the document body; `update_definition`, `delete_definition` and an id-bearing `save_definition_yaml` must therefore carry the version they read. A token that no longer matches the stored row (changed, deleted or re-created) is refused before a ticket is minted or consumed and burns nothing; that read is a best-effort early check and the store's compare-and-set still decides atomically. Otherwise the ticket is spent before the tool runs, so a call refused afterwards (a `409` on a version that moved after that read, an audit `503`) burns the approval. The grant is checked before a ticket is minted, so a principal without it creates no approval row.
+
+**Ambiguous store faults.** A `503` on a write after its `attempted` row (audited `error` / `db_error`) may be a connection lost after the commit: the change may have landed. The message says `outcome unknown: read the definition before retrying`; read the definition (or set) first, because a blind retry of a landed create is a `409` and of a landed delete a `404`. There is no idempotency key, so this `503` carries no `retry_after_ms` (`null` on the MCP twin). **Retry contract:** read the definition first. To make a retry safe, send `id` on a create (a create that landed retries as a deterministic `409`), `expected_updated_at` on an update (a landed update retries as a stale-version `409`, because the version moved) and on a delete (a landed delete retries as a `404`). A create sent without an `id` and retried after a lost commit can create a second definition. Every store fault after the `attempted` row is reported this way (a pool timeout, a lock timeout, a store that is not open, a lost commit). The hint stays only on a `503` answered before the write was attempted: the store not open at the start, a failing read of the existing definition, the audit store failing to take the `attempted` row, or a failing referrer lookup on a delete. An unwired referrer lookup or audit sink is a configuration fault and carries none.
+
+**Events.** As the legacy routes do, a successful create, save, update or delete publishes the platform event `instruction.created`, `instruction.updated` or `instruction.deleted`. Import publishes no event. A failure to publish never changes the answer and is counted on `yuzu_server_event_emit_failed_total{event_type}`.
+
+**Definition fields (create and update).** `name`, `version`, `type` (`question` or `action`), `plugin`, `action` (lowercased before it is stored), `description`, `enabled`, `instruction_set_id`, `gather_ttl_seconds`, `response_ttl_days` and `approval_mode` (`auto`, `role-gated` or `always`). `id` is accepted on create only, and a new definition's `id` may not be `.` or `..` (`400`; a stored row with such an id is unchanged). On these twins `name` is 1 to 128 characters, `version` 1 to 64, `description` at most 512, `instruction_set_id` at most 128, `type` is exactly `question` or `action`, `plugin` and `action` are at most 128 characters of `A-Za-z0-9._-`, `gather_ttl_seconds` is `1` to `86400` and `response_ttl_days` is `1` to `3650`; a field that is present and out of bounds (an empty `name` on a `PUT`, an unknown `type` on a `PUT`) is `400` before any audit row is written (a `PUT` reads the definition first, so an unknown id is `404` before a bound is checked), and the MCP tools enforce the same numbers. A `plugin` that is present must also be non-empty (`{"plugin":""}` is `400`); an empty `action` is still accepted. These bounds are new to the twins: the legacy dashboard routes do not apply them, and the store checks `type` on create only. `parameter_schema`, `result_schema` and `yaml_source` are not accepted here. A create without `approval_mode` stores `auto`, which means later runs of the definition by schedules or by an operator-tier caller need no human approval.
+
+#### `POST /api/v1/instructions`
+
+Create an instruction definition. **Permission:** `InstructionDefinition:Write`. Required body keys: `name`, `type`, `plugin`; a key outside the field list above is refused `400`. When `id` is omitted the store generates one; an `id` that already exists is `409`. The store's own rules apply (a reserved id is refused). **`201`** `{ "data": { "id": "hardware.cpu-info" } }`. Other statuses: `400` invalid body or a bound exceeded, `403`, `409`, `413`, `503`.
+
+#### `PUT /api/v1/instructions/{id}`
+
+Partially update an instruction definition: only the keys present change. **Permission:** `InstructionDefinition:Write`. Optional `expected_updated_at` (non-negative integer): when the stored row no longer carries that `updated_at` the update is refused `409`; it is not required. `updated_at` is a monotonic version token, not a wall-clock reading: every write of the row (an update, or the unlink when its instruction set is deleted) moves it forward even inside one second, so two writers holding the same token can never both succeed, and a token read before a delete never matches a re-created definition with the same id (except that a tombstone written before schema v4 re-creates the row at the clock reading, which can be equal to or below the old token: see [Upgrading](upgrading.md)). An unknown key is refused `400`. **A changed `name`, `description`, `version`, `type`, `plugin`, `action` or `approval_mode` (`concurrency_mode`, the other column a YAML round trip can revert, is not accepted by this route) on a definition that has a stored `yaml_source` also clears that `yaml_source`** (it becomes empty, as it already is for every definition created through the JSON routes), because a YAML that still states the old values would let a later `GET`, edit, `POST /api/v1/instructions/yaml` round trip silently revert your change. An edit to any other field leaves the YAML alone, and a YAML save always writes the YAML it is given. A change to `enabled` alone leaves the YAML alone, because a YAML save never writes `enabled`. The audit detail of the `attempted` and `success` rows then ends with `yaml_source cleared yaml_source_bytes=<n> yaml_source_sha256=<hex>` (`yaml_source_sha256` is left out if the digest cannot be computed), the size and SHA-256 of the cleared text; just before that suffix the detail names which of `name`, `version` and `type` changed (`old -> new`) and that the `description` did (`description: changed <old> -> <new> bytes`, sizes only, never the text). **`200`** `{ "data": { "id": "hardware.cpu-info", "updated": true } }`. Other statuses: `400`, `403`, `404`, `409`, `413`, `503`.
+
+#### `DELETE /api/v1/instructions/{id}`
+
+Delete an instruction definition. **Permission:** `InstructionDefinition:Delete`. A supervised-tier MCP token is refused `403` (every `Delete` needs an approval ticket at that tier; use MCP `delete_definition`). **Optional query parameter `expected_updated_at`** (a non-negative integer, the `updated_at` read from the definition): the row is deleted only if it still carries that version, otherwise `409` (`modified since it was loaded`) and the row is kept, with one `attempted` and one `denied` / `conflict` audit row; a malformed or repeated value is `400` before any audit row. Omitted, the delete is unconditional. Deleting a definition that shipped with the product records it as deleted, so the bundled copy is not brought back at the next server start. **A definition that other things still name is refused `409`**, with the referrers in the message (the first 20 as `<kind> <id>`, then "and N more"; each of the three sources is read up to 21 rows, so N is a lower bound): a schedule, a live (not deleted) workflow with a step that runs it, or a policy fragment whose check, fix or post-check names it. Remove each referrer or point it at another definition, then delete again. One `instruction.delete` row with `result=denied` and detail `referenced` is written (no `attempted` row, nothing changed). A reference check that cannot be answered writes one `error` row with detail `referrer_check_unavailable` (`referrer_check_unwired` when it is not configured), and a definition that cannot be read first writes one `error` row with detail `db_error`; neither writes an `attempted` row. The check is advisory, not transactional: a schedule, workflow or policy fragment created between the check and the delete is not seen. If the reference check cannot be answered the answer is `503` (with `retry_after_ms` when a retry can help) and nothing is deleted: a failed lookup is never read as "no referrers". Not covered by the check: device tokens scoped to the definition (the device-token store is not wired on a running server), past execution history, and installed product-pack item records, which are advisory instead: the success row's detail ends with `packs=<id>,<id>,...` (at most 5 pack ids, then `,+N`) when an installed pack contains the definition, and a failed pack lookup changes nothing. **`200`** `{ "data": { "id": "hardware.cpu-info", "deleted": true } }`. Other statuses: `400` (a malformed id), `403`, `404`, `409`, `503`.
+
+#### `POST /api/v1/instructions/import`
+
+Import an exported definition document. **Permission:** `InstructionDefinition:Write`. Body: the JSON document `GET /api/v1/instructions/{id}/export` returns, plus optional `signature` and `publicKey` (hex Ed25519). **This twin admits a body of up to 4 MiB; the legacy `POST /api/instructions/import` admits up to 16 MiB.** An unsigned document is refused unless the server was started with `--allow-unsigned-definitions`. A signed document is verified against the `publicKey` carried in the same request, with no trust anchor, so the signature is integrity of the document and not authorization of its author: a holder of `InstructionDefinition:Write` can sign a document with a key of their own, and unsigned create and YAML save are separate, unsigned authoring paths (`POST /api/product-packs` is the only other signature-gated route). `GET /api/v1/instructions/{id}/export` returns a `{ "data": ..., "meta": ... }` envelope and a definition with no `signature` or `publicKey`: post its `data` object, and supply the signature from outside the product. **`201`** `{ "data": { "id": "..." } }`; the legacy route's `audit_emitted` field is not returned, because the audit row is written first. A field of the wrong JSON type (for example a numeric `id`) is a `400` naming the field, audited `denied`; so is a `gather_ttl_seconds` outside 1 to 86400 or a `response_ttl_days` outside 1 to 3650 (the same range `POST /api/v1/instructions` enforces; a float or `null` is not an integer). The operator import also bounds `name` (128), `version` (64), `description` (16384 bytes) and `instruction_set_id` (128), requires a non-empty `plugin` / `action` to be at most 128 characters of `A-Za-z0-9._-` (for a signed document that includes the values in the signed `yaml_source`), and lowercases `action`; an over-bound or malformed value is a `400` audited `denied` (`description` is bounded at 16384 bytes, not the 512 of the JSON field twins). The recorded `created_by` is the authenticated caller, whatever the document says. The `attempted` row names the document: its `target_id` is the document's own `id` when it states one as a string, and its `detail` is `body_bytes=<n>`, the request body size (the MCP twin's `document_bytes=<n>` counts the document as sent, a different unit). The `denied` row's detail is the store's error text with any caller-supplied `approval_mode` value neutralised. Import publishes no platform event. Other statuses: `400` (including a refused signature), `403`, `409`, `413`, `503`.
+
+#### `POST /api/v1/instructions/yaml`
+
+Create or update an instruction definition from YAML, with a JSON body in place of the legacy form body. **Permission:** `InstructionDefinition:Write`. Body: `yaml_source` (required), optional `id` (non-empty updates that definition, otherwise a new one is created) and optional `updated_at` (on an update, a value different from the stored `updated_at` is `409`). The YAML goes through the same validation as the validate route below, including a `name` over 128 characters, a `version` over 64 and a `description` over 16384 (not the 512 of the JSON field routes, because shipped definitions carry descriptions past 512 bytes); a source with a NUL byte or over 1 MiB is refused without being parsed. An `id` longer than 128 bytes or malformed is `400`. **`201`** `{ "data": { "id": "...", "created": true } }` when created, **`200`** with `"created": false` when updated. An `id` that disagrees with the YAML `metadata.id` is `400`. Other statuses: `400`, `403`, `404`, `409` (a duplicate id on create, or a moved `updated_at`), `413`, `503`.
+
+#### `POST /api/v1/instructions/validate-yaml`
+
+Validate instruction definition YAML without saving it. **Permission:** `InstructionDefinition:Read`. Body: `{ "yaml_source": "..." }` (`yaml_source` is required). Always `200` for a well-formed request (a missing `yaml_source` or a key other than it is `400`): `{ "data": { "valid": false, "errors": ["..."] } }`; `valid` is `true` with an empty `errors` list when the YAML passes, and a `valid` result means `POST /api/v1/instructions/yaml` will not refuse the document as invalid: the list also covers a `plugin` or `action` that is longer than 128 characters or has a character outside `A-Za-z0-9._-`, and a `name` over 128, a `version` over 64 characters or a `description` over 16384 bytes (the legacy validate route applies none of these checks); a source with a NUL byte or over 1 MiB gets that one error and is not parsed further. The legacy route returns an HTML fragment; this one returns JSON. Other statuses: `400`, `403`, `413`.
+
+#### `GET /api/v1/instruction-sets`
+
+List instruction sets. **Permission:** `InstructionSet:Read`. **`200`** `{ "data": [ { "id": "...", "name": "...", "description": "...", "created_by": "...", "created_at": 1700000000 } ], "pagination": { ... }, "meta": { ... } }`. `503` if the instruction store is unavailable or the read fails.
+
+#### `POST /api/v1/instruction-sets`
+
+Create an instruction set. **Permission:** `InstructionSet:Write`. Body: `name` (required, at most 128 characters) and optional `description` (at most 512). **`201`** `{ "data": { "id": "..." } }`. Other statuses: `400`, `403`, `409`, `413`, `503`.
+
+#### `DELETE /api/v1/instruction-sets/{id}`
+
+Delete an instruction set. **Permission:** `InstructionSet:Delete`. A supervised-tier MCP token is refused `403` (every `Delete` needs an approval ticket at that tier; use MCP `delete_instruction_set`). Definitions in the set are not deleted: their `instruction_set_id` is cleared. **`200`** `{ "data": { "id": "...", "deleted": true } }`. Other statuses: `400` (a malformed id), `403`, `404`, `503`.
+
+**Body cap.** None of these routes has its own `kBodyCapTable` class. They use the 4 MiB catch-all, recorded as a reviewed default; this is why the import twin is 4 MiB while the legacy import route has the 16 MiB `instruction_import` class.
 
 ---
 
@@ -4087,7 +4142,7 @@ Fetch a single template. The reserved id `__default__` always returns the synthe
 
 Create a new template. Like `PUT`/`DELETE` below, it is applied only to the definition version it read: a concurrent edit of the definition returns `409`. A browser (session-cookie) caller must send a same-site `Origin` or `Referer` (`403` otherwise); token callers are exempt. Returns the canonicalised template (with auto-assigned `id` when omitted) and 201.
 
-**Permission:** `InstructionDefinition:Write`
+**Permission:** `InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`); this route has no MCP tool to take an approval ticket, so use a credential without an MCP tier or a signed-in browser session.
 
 **Body:**
 
@@ -4127,7 +4182,7 @@ Create a new template. Like `PUT`/`DELETE` below, it is applied only to the defi
 
 Replace the named template in place.
 
-**Permission:** `InstructionDefinition:Write`
+**Permission:** `InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`); this route has no MCP tool to take an approval ticket, so use a credential without an MCP tier or a signed-in browser session.
 
 Returns 400 when `template_id` is `__default__` (the synthesised default cannot be overwritten). Same 64 KiB body cap as POST.
 
@@ -4145,7 +4200,7 @@ Returns 400 when `template_id` is `__default__` (the synthesised default cannot 
 
 Remove a template. Returns 400 when `template_id` is `__default__`.
 
-**Permission:** `InstructionDefinition:Write`
+**Permission:** `InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`); this route has no MCP tool to take an approval ticket, so use a credential without an MCP tier or a signed-in browser session.
 
 **Errors:**
 
@@ -4342,9 +4397,9 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) on the BARE route (no `include`) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text; there is no `result=success` row on the bare route's 200 path. **As of #4030, this no longer holds for the whole URL pattern:** `?include=agents` on this same route, and the sibling `GET /api/v1/executions/{id}/responses`, both DO write `result=success` rows under this identical verb name on their 200 path (see `docs/user-manual/audit-log.md`'s `execution.detail.fetch` row for the full, current three-way split). |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result` ∈ {`success`, `denied`}. `success` emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). `denied` emitted (#1634) on the 404 branch — execution genuinely nonexistent OR out of the caller's management-group scope, using non-distinguishing detail text so the two cases stay audit-indistinguishable. The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result` ∈ {`success`, `denied`}. `success` detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). `denied` emitted (#1634) on the 404 branch (unknown execution OR out of scope), using non-distinguishing detail text — corrects an earlier version of this row, which predated #1634 and said this 404 branch never audits. |
-| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
-| `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
-| `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
+| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058), distinct from `denied`, since an infra degrade is not an operator denial. Every REST v1 and MCP authoring write (`instruction.create`, `instruction.update`, `instruction.delete`, `instruction.import`, `instruction_set.create`, `instruction_set.delete`) writes `result=attempted` BEFORE the change and refuses 503 with `Sec-Audit-Failed: true`, changing nothing, when that row cannot be stored; the legacy routes do not. |
+| `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. On the v1 and MCP twins, a change of `name`, `description`, `version`, `type`, `plugin`, `action` or `approval_mode` (not `enabled` alone) on a definition with a stored YAML ends the detail, after naming which of `name`, `version`, `type` and `description` changed (the description as sizes only), with `yaml_source cleared yaml_source_bytes=<n> yaml_source_sha256=<hex>` (`yaml_source_sha256` is left out if the digest cannot be computed). Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). The audit-first `attempted` row of the v1 and MCP twins is described under `instruction.create`. |
+| `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail values: `not_found` (404, unknown id); `referenced` (409 on the v1 twin and MCP: a schedule, workflow or policy fragment still names the definition; the only row written for that refusal). `error` detail `db_error` on a genuine DB/lease failure (503); also `referrer_check_unavailable` and `referrer_check_unwired` (503, nothing deleted) on the v1 twin and MCP; `db_error` is also what a definition that cannot be read first (the pre-image read) writes on those two. On the v1 twin and MCP a `success` detail may end with ` packs=<id>,...` (installed product packs that contain the definition; advisory, at most 5 then `,+N`). The audit-first `attempted` row of the v1 and MCP twins is described under `instruction.create`. On the v1 and MCP twins the `attempted` and `success` rows of `instruction.delete` carry the deleted definition's dispatch tuple in the detail (`name=... plugin=... action=... approval_mode=... concurrency_mode=... enabled=...`, each value folded for the log), because once the row is gone nothing else records what it ran. |
 | `instruction_set.create` | Instruction set created via `POST /api/instruction-sets`. Every create first writes `result=attempted` (before the change; if that row cannot be stored the request is refused with 503 and `Sec-Audit-Failed: true` and no set is created), then the outcome. `result` ∈ {`attempted`, `success`, `denied`, `error`}. `success` carries `target_id=<set id>` and the set name as detail. Denied detail values: `conflict` (409, duplicate id), `invalid` (400, rejected input). `error` detail `db_error` on a genuine DB/lease failure (503). A failed audit write sets `Sec-Audit-Failed: true` on the response. |
 | `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. Every delete first writes `result=attempted` (target_id = the set id) and is refused with 503 and `Sec-Audit-Failed: true`, with nothing deleted, when that row cannot be stored. `result` ∈ {`attempted`, `success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A failed audit write on `success` sets `Sec-Audit-Failed: true`. |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
@@ -13121,14 +13176,14 @@ Create a new instruction definition from JSON. The `id` field is optional —
 when omitted the server generates a UUID; when supplied it is validated for
 uniqueness against existing definitions.
 
-**Permission:** `InstructionDefinition:Write`
+**Permission:** `InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`, audit `auth.approval_required`): the ticket flow exists only on `/mcp/v1/` (MCP ``create_definition``). Sessions and tokens without an MCP tier are unaffected.
 
 **Response (200):** `{"id": "<id>"}` for the newly-created definition.
 
 **Response (400):** Validation error (missing required field, invalid
 `approval_mode`, malformed JSON, a request/`parameter_schema`/`visualization_spec`/
 `response_templates_spec` body nesting deeper than 32 levels (`kMcpMaxJsonDepth`),
-or an `id` under the reserved `mcp.` or `guardian.` prefix). Body is `{"error": "<reason>"}`.
+or an `id` of `.` or `..` or under the reserved `mcp.` or `guardian.` prefix). Body is `{"error": "<reason>"}`.
 
 The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
 tickets, and a definition authored under that prefix could line up with an MCP
@@ -13160,7 +13215,7 @@ Audit event recorded as `instruction.create / error / db_error`.
 
 Update an existing instruction definition.
 
-**Permission:** `InstructionDefinition:Write`
+**Permission:** `InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`, audit `auth.approval_required`): the ticket flow exists only on `/mcp/v1/` (MCP ``update_definition``). Sessions and tokens without an MCP tier are unaffected.
 
 **Response (400):** Validation error (same shape as `POST` above).
 
@@ -13174,7 +13229,7 @@ a client retry. Audit event recorded as `instruction.update / error / db_error`.
 
 Delete an instruction definition.
 
-**Permission:** `InstructionDefinition:Delete`
+**Permission:** `InstructionDefinition:Delete`. A supervised-tier MCP token is refused (`403`, as above; MCP `delete_definition`), as it was before this release.
 
 **Response (200):** `{"deleted": true}`.
 
@@ -13200,9 +13255,11 @@ definition, distinct from the empty-body not-found case above, and worth a clien
 
 #### `POST /api/instructions/import`
 
-Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition:Write`.
+Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`): use MCP `import_definition`, whose ticket binds a SHA-256 of the document.
 
-**Signature enforcement** (since #1073 / W7.4 sibling-gap closure): the server rejects unsigned imports by default. Mirrors the [`POST /api/product-packs`](#post-apiproduct-packs) `--allow-unsigned-packs` model — closes the equivalent fleet-RCE surface where an operator with import permission can otherwise publish a definition carrying an arbitrary plugin invocation that dispatches on every targeted agent.
+**Signature enforcement** (since #1073 / W7.4 sibling-gap closure): the server rejects unsigned imports by default. Mirrors the [`POST /api/product-packs`](#post-apiproduct-packs) `--allow-unsigned-packs` model. The signature is verified against the `publicKey` carried in the same request, with no trust anchor, so it proves the integrity of the document, not the authorization of its author: a holder of `InstructionDefinition:Write` can sign a document with a key of their own. Unsigned `POST /api/instructions` and `POST /api/instructions/yaml` are separate authoring paths that are not signature-gated, and `POST /api/product-packs` is signature-gated in the same way. An export (`GET /api/instructions/{id}/export`) carries no `signature` or `publicKey`; a signed document is produced outside the product.
+
+**Field checks (since #2146).** A field of the wrong JSON type is `400` naming the field (`instruction-import field '<key>' must be a string`, `... must be an integer`, `... must be a boolean`); this includes `gather_ttl_seconds` and `response_ttl_days` as a float or `null`. They are range-checked, `gather_ttl_seconds` 1 to 86400 and `response_ttl_days` 1 to 3650 (`instruction-import field '<key>' must be an integer from 1 to <max>`). `name` is bounded at 128 characters, `version` at 64, `description` at 16384 and `instruction_set_id` at 128; a non-empty `plugin` or `action` must be at most 128 characters of `A-Za-z0-9._-` (for a signed document that includes the values in the signed `yaml_source`); `action` is lowercased. The boot-time seed shares the type and range checks but not the name, version, set id and identifier bounds.
 
 **Signed request body (recommended):**
 
@@ -13235,7 +13292,7 @@ New Definition panel's Save endpoint). Form-encoded: `yaml_source` carries the
 document verbatim (stored as the definition's source of truth); an optional
 `id` parameter switches to update mode. Responses are HTML fragments (this is
 a dashboard surface), plus an `HX-Trigger` toast header. Requires
-`InstructionDefinition:Write`.
+`InstructionDefinition:Write`. A supervised-tier MCP token is refused (`403`, `operation requires approval for this MCP tier on this transport`): use MCP `save_definition_yaml`.
 
 The queryable columns are derived schema-aware from the YAML — both the
 canonical nested schema and the flat form the panel's structured form
@@ -13255,7 +13312,7 @@ validate-yaml share one validation contract — YAML that passes validation
 always saves.
 
 **Audit:** emits `instruction.create` / `instruction.update` (`result=success`),
-and `instruction.create` with `result=denied` / `duplicate_id` on conflict.
+and `instruction.create` with `result=denied` / `duplicate_id` on conflict. This route writes no `attempted` row, unlike `POST /api/v1/instructions/yaml`.
 
 #### `POST /api/instructions/validate-yaml`
 
@@ -14615,6 +14672,8 @@ Install a product pack from a multi-document YAML bundle.
 
 **Permission:** `ProductPack:Write`.
 
+**Supervised MCP tokens:** a token whose `mcp_tier` is `supervised` is refused with `403` (`operation requires approval for this MCP tier on this transport`, permission `ProductPack:Write`). A pack install creates definitions with a pack-supplied `approval_mode`, `plugin` and `action`, so it is approval-gated at that tier like `InstructionDefinition:Write`. There is no MCP tool for a pack install, so the `remediation` points at a credential without an MCP tier or a signed-in browser session, not at a ticket flow. Untiered API tokens and cookie sessions are unaffected.
+
 **Request body (form-encoded or multipart):**
 
 | Parameter | Type | Required | Description |
@@ -14664,6 +14723,8 @@ Get a single pack with its items.
 Uninstall a pack, removing all delegated items.
 
 **Permission:** `ProductPack:Delete`.
+
+A supervised-tier MCP token is refused with `403` (every `Delete` is approval-gated at that tier); as for the install route there is no MCP tool, so the `remediation` names an untiered credential or a browser session.
 
 **Response:**
 - `200 OK` `{"status": "uninstalled"}` on success.
