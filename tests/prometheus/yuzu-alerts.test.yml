@@ -8949,3 +8949,63 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="wmi", severity="warning"}'
             value: 1
+
+  # SAM-33 plugin-health alerts. Series are the yuzu_software_facet_devices gauge: 30 collecting
+  # devices of which 3 time out (10%) and 0 are otherwise failing. Timeout share 10% > 5% but
+  # failing share 10% < 20%.
+  - interval: 1h
+    name: software facet timeout share - fires after 24h, not at 23h
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "27x30"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="timeout"}'
+        values: "3x30"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="not_collected"}'
+        values: "500x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 23h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing", facet="installed_software.dpkg", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples: []
+
+  - interval: 1h
+    name: software facet failing share - fires after 24h, not at 23h
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "20x30"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="constrained"}'
+        values: "5x30"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="oversize"}'
+        values: "5x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 23h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing", facet="installed_software.dpkg", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples: []
+
+  # Low volume: 19 collecting devices, 50% timing out -> neither rule fires.
+  - interval: 1h
+    name: software facet alerts - fewer than 20 collecting devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "9x30"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
