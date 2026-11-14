@@ -2039,6 +2039,7 @@ if build_server
       'unit/server/test_agent_registry_log_neutralisation.cpp',   # #5513: register_agent log lines neutralised
       'unit/server/test_secret_codec.cpp',
       'unit/server/test_software_inventory_store.cpp',
+      'unit/server/test_software_inventory_reads_v3.cpp', # SAM-33 reads: hosts, change feed, facet health, summary ([pg][software_inventory][reads_v3], shard E)
       'unit/server/test_inventory_blob_v3.cpp',          # pure blob-v3 grammar + install-type table
       'unit/server/test_purl_compose.cpp',               # pure purl composer (purl-spec vectors)
       'unit/server/test_software_catalog_rules.cpp',
