@@ -139,7 +139,7 @@ TEST_CASE("empty and binary input never crash", "[runtime][component_inventory][
     CHECK(parse_manifest_version(bin) == std::nullopt);
     CHECK(parse_manifest_version(std::string(1, '\0') + ":" + std::string(300, '\xff')) == std::nullopt);
     CHECK_FALSE(is_nested_lib_entry(bin));
-    CHECK_FALSE(is_pom_properties_entry(bin));
+    CHECK_FALSE(pom_properties_artifact(bin).has_value());
 }
 
 TEST_CASE("entry classifiers", "[runtime][component_inventory][java]") {
@@ -155,7 +155,7 @@ TEST_CASE("entry classifiers", "[runtime][component_inventory][java]") {
     // The directory prefixes stay exact.
     for (const char* e : {"boot-inf/lib/a.jar", "Lib/a.jar", "LIB/a.JAR", "web-inf/lib/a.jar"})
         CHECK_FALSE(is_nested_lib_entry(e));
-    CHECK(is_pom_properties_entry("META-INF/maven/org.apache/log4j-core/pom.properties"));
+    CHECK(pom_properties_artifact("META-INF/maven/org.apache/log4j-core/pom.properties").has_value());
     CHECK(pom_properties_artifact("META-INF/maven/org.apache/log4j-core/pom.properties") == "log4j-core");
     CHECK(pom_properties_artifact("META-INF/maven/g/a/b/pom.properties") == std::nullopt);
     CHECK(pom_properties_artifact("META-INF/maven/g//pom.properties") == std::nullopt);
@@ -163,5 +163,5 @@ TEST_CASE("entry classifiers", "[runtime][component_inventory][java]") {
     for (const char* e : {"META-INF/maven/org.apache/pom.properties", "META-INF/maven//a/pom.properties",
                           "META-INF/maven/g/a/b/pom.properties", "META-INF/maven/g/a/pom.xml",
                           "META-INF/maven/g/a/", "META-INF/maven/pom.properties", ""})
-        CHECK_FALSE(is_pom_properties_entry(e));
+        CHECK_FALSE(pom_properties_artifact(e).has_value());
 }

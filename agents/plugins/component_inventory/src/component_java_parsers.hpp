@@ -254,9 +254,4 @@ inline std::optional<std::string_view> pom_properties_artifact(std::string_view 
     return mid.substr(slash + 1);
 }
 
-/// META-INF/maven/<g>/<a>/pom.properties
-inline bool is_pom_properties_entry(std::string_view entry) noexcept {
-    return pom_properties_artifact(entry).has_value();
-}
-
 } // namespace yuzu::component_inventory
