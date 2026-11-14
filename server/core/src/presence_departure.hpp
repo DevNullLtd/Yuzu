@@ -28,11 +28,12 @@ bool mirror_departure_to_presence(bool removed_current_session, PresenceStore* s
 }
 
 /// The ARRIVAL counterpart, fired where a stream is established (direct Subscribe start, gateway
-/// CONNECTED), never in Register: drops plugin lists other sessions of this agent published, so a
-/// replica without the session cannot judge a restarted agent by its previous session's list
-/// (OfflineEndpointStore::clear_plugins_of_other_sessions). Best effort, fail-soft: a false return
-/// (no store, blank ids, a store failure) leaves the stale-list window open until the new
-/// session's first heartbeat and is never an error the caller must act on.
+/// CONNECTED), never in Register: drops plugin lists other sessions of this agent published
+/// (OfflineEndpointStore::clear_plugins_of_other_sessions). HYGIENE, not the control: the control
+/// is `AgentRegistry::ids_missing_plugin`'s confirmation against the agent's directory row, which
+/// stops an old session's list withholding a re-registered agent whether or not this write lands.
+/// Best effort, fail-soft: a false return (no store, blank ids, a store failure) changes no
+/// verdict and is never an error the caller must act on.
 template <class PresenceStore>
 bool mirror_arrival_to_presence(PresenceStore* store, std::string_view agent_id,
                                 std::string_view session_id) {

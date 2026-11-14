@@ -41,6 +41,15 @@ struct OfflineEndpoint {
     std::string arch;
 };
 
+/// One agent a plugin-absence read names as lacking a plugin, with the SESSION whose published
+/// list said so (`endpoint_plugins.session_id`). The session is the evidence: the verdict is a
+/// CANDIDATE that `AgentRegistry::ids_missing_plugin` withholds only while the agent's directory
+/// row still names that same session (#5685 follow-up).
+struct PluginAbsence {
+    std::string agent_id;
+    std::string session_id;
+};
+
 /// The typed failure surface of the presence reads `query_live_ids`, `query_stale_within` and
 /// `find_within` (#4981 PR-1, Finding B;
 /// #5531). Only `query_live_ids` produces `Truncated`: `query_stale_within` serves a capped roster

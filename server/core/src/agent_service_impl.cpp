@@ -1523,8 +1523,8 @@ grpc::Status AgentServiceImpl::Subscribe(
     registry_.set_stream(agent_id, stream, context,
                          revocation_checker_ ? extract_peer_cert_pem(*context) : std::string{});
     registry_.map_session(session_id, agent_id);
-    // HA WS-5 #5685 follow-up: the arrival mirror of the departure mirror below. A replica without
-    // this session must not keep judging the agent by a previous session's plugin list.
+    // HA WS-5 #5685 follow-up: the arrival mirror of the departure mirror below. Hygiene only (it
+    // drops a previous session's plugin list); the verdict is confirmed against the directory row.
     mirror_arrival_to_presence(
         heartbeat_ingestion_ ? heartbeat_ingestion_->offline_endpoint_store() : nullptr, agent_id,
         session_id);

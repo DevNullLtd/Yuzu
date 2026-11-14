@@ -427,7 +427,7 @@ bool OfflineEndpointStore::clear_plugins_of_other_sessions(std::string_view agen
     return true;
 }
 
-std::expected<std::vector<std::string>, PresenceReadError>
+std::expected<std::vector<PluginAbsence>, PresenceReadError>
 OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
                                                     std::string_view plugin) {
     if (!open_)
@@ -443,7 +443,7 @@ OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
     // endpoint_plugins row and never appears. The plugin is a bound parameter, never spliced.
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT e.agent_id FROM endpoint_state.endpoints e "
+        "SELECT e.agent_id, p.session_id FROM endpoint_state.endpoints e "
         "JOIN endpoint_state.endpoint_plugins p "
         "  ON p.agent_id = e.agent_id AND p.session_id = e.session_id "
         "WHERE e.last_seen_at >= now() - ($1::bigint * interval '1 second') "
@@ -464,10 +464,10 @@ OfflineEndpointStore::query_live_ids_without_plugin(std::chrono::seconds ttl,
                                       "truncated");
         return std::unexpected(PresenceReadError::Truncated);
     }
-    std::vector<std::string> out;
+    std::vector<PluginAbsence> out;
     out.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
-        out.emplace_back(PQgetvalue(res.get(), i, 0));
+        out.push_back({PQgetvalue(res.get(), i, 0), PQgetvalue(res.get(), i, 1)});
     return out;
 }
 

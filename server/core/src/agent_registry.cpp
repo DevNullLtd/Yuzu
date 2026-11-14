@@ -1755,6 +1755,11 @@ void AgentRegistry::configure_presence_plugin_reader(PluginMissingReadFn reader,
     missing_plugin_cache_.clear();
 }
 
+void AgentRegistry::configure_route_session_reader(RouteSessionReadFn reader) {
+    std::lock_guard lock(missing_plugin_mu_);
+    route_session_reader_ = std::move(reader);
+}
+
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
     // Borrowed, not owning: `store` is `ServerImpl::offline_endpoint_store_`, and `server.cpp`
     // unwires it with configure_presence(nullptr) at stop, before the store is destroyed. The
@@ -1877,7 +1882,7 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     // The cross-replica read runs OFF mu_ (same discipline as ids_with_os / all_ids) and shares
     // its cached result, so nothing here copies the id list.
     const MissingPluginIds remote = missing_plugin_from_presence(plugin);
-    std::vector<const std::string*> remote_only;
+    std::vector<const PluginAbsence*> remote_only;
     if (remote)
         remote_only.reserve(remote->size()); // a large allocation: never inside `mu_`
     {
@@ -1889,13 +1894,44 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
                 missing.insert(id);
         }
         if (remote) {
-            for (const auto& id : *remote)
-                if (!agents_.contains(id)) // local wins
-                    remote_only.push_back(&id);
+            for (const auto& a : *remote)
+                if (!agents_.contains(a.agent_id)) // local wins
+                    remote_only.push_back(&a);
         }
     }
-    for (const auto* id : remote_only) // set inserts happen off mu_
-        missing.insert(*id);
+    if (remote_only.empty())
+        return missing;
+    // A cached absence is only a CANDIDATE: it was true of the session that published the list.
+    // Withhold the agent only while its ROUTABLE directory row, read NOW (never cached), still
+    // names that same session. `agent_routes.session_id` is written by the registration that
+    // creates a new session, before the agent is handed it, so a restarted agent's old list stops
+    // matching at that instant, with no dependence on a best-effort clear or on the new session's
+    // first heartbeat. No row (a direct agent), a tombstone, an expired or unplaced row, a
+    // different session, an unset reader or a degraded read all fail open. Off every lock.
+    RouteSessionReadFn route_reader;
+    {
+        std::lock_guard lock(missing_plugin_mu_);
+        route_reader = route_session_reader_;
+    }
+    if (!route_reader)
+        return missing;
+    std::vector<std::string> ids;
+    ids.reserve(remote_only.size());
+    for (const auto* a : remote_only)
+        ids.push_back(a->agent_id);
+    std::optional<std::unordered_map<std::string, std::string>> current;
+    try {
+        current = route_reader(ids);
+    } catch (...) {
+        // A throwing confirmation read is a degraded one: fail open.
+    }
+    if (!current)
+        return missing;
+    for (const auto* a : remote_only) {
+        const auto it = current->find(a->agent_id);
+        if (it != current->end() && it->second == a->session_id)
+            missing.insert(a->agent_id);
+    }
     return missing;
 }
 
@@ -1937,7 +1973,7 @@ AgentRegistry::missing_plugin_from_presence(std::string_view plugin) const {
     MissingPluginIds ids;
     try {
         if (auto r = reader(ttl, plugin))
-            ids = std::make_shared<const std::vector<std::string>>(std::move(*r));
+            ids = std::make_shared<const std::vector<PluginAbsence>>(std::move(*r));
     } catch (...) {
         // A throwing reader is a failed read: fail open, never wedge the in-flight marker.
     }

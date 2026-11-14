@@ -31,6 +31,9 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <optional>
+#include <span>
+#include <unordered_map>
 #include <unordered_set>
 
 using yuzu::server::detail::AgentRegistry;
@@ -454,12 +457,41 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
     AgentRegistry r2(bus, metrics); // the NON-owning replica
     r2.configure_presence(&store, std::chrono::hours(1));
 
+    // The CONFIRMATION read: agent -> the session its routable directory row names. A cached
+    // absence is withheld only while this agrees with the session that published the list.
+    std::unordered_map<std::string, std::string> routes;
+    bool confirm_stub_ids = false; // stub readers below name ids no test row backs: confirm as "S"
+    r2.configure_route_session_reader(
+        [&](std::span<const std::string> ids)
+            -> std::optional<std::unordered_map<std::string, std::string>> {
+            std::unordered_map<std::string, std::string> m;
+            for (const auto& id : ids) {
+                if (const auto it = routes.find(id); it != routes.end())
+                    m.emplace(id, it->second);
+                else if (confirm_stub_ids)
+                    m.emplace(id, "S");
+            }
+            return m;
+        });
+    const auto absences = [](std::vector<std::string> ids) {
+        std::vector<yuzu::server::PluginAbsence> v;
+        for (auto& id : ids)
+            v.push_back({std::move(id), "S"});
+        return v;
+    };
+    const auto use_stub_reader = [&](AgentRegistry::PluginMissingReadFn fn) {
+        confirm_stub_ids = true;
+        routes.clear(); // stub ids are confirmed as session "S", whatever the store rows said
+        r2.configure_presence_plugin_reader(std::move(fn));
+    };
+
     // Published by the owning replica: one lacks "echo", one has it, one never published.
     REQUIRE(store.upsert("yuzu_test_pm_lacks", "h", "linux", 1, 0, "1", "x", "s1"));
     REQUIRE(store.publish_plugins("yuzu_test_pm_lacks", "s1", {"os_info"}));
     REQUIRE(store.upsert("yuzu_test_pm_has", "h", "linux", 1, 0, "1", "x", "s2"));
     REQUIRE(store.publish_plugins("yuzu_test_pm_has", "s2", {"echo"}));
     REQUIRE(store.upsert("yuzu_test_pm_unknown", "h", "linux", 1, 0, "1", "x", "s3"));
+    routes = {{"yuzu_test_pm_lacks", "s1"}, {"yuzu_test_pm_has", "s2"}, {"yuzu_test_pm_unknown", "s3"}};
 
     SECTION("a remote agent whose published list lacks the plugin is reported missing") {
         const auto missing = r2.ids_missing_plugin("echo", "sql");
@@ -489,9 +521,9 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
 
     SECTION("a degraded read fails OPEN and the failure is cached for the TTL") {
         std::atomic<int> calls{0};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 ++calls;
                 return std::unexpected(PresenceReadError::DbError);
             });
@@ -502,12 +534,12 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
 
     SECTION("a throwing reader fails open and does not wedge the plugin") {
         std::atomic<int> calls{0};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 if (++calls == 1)
                     throw std::runtime_error("boom");
-                return std::vector<std::string>{"yuzu_test_pm_lacks"};
+                return absences({"yuzu_test_pm_lacks"});
             });
         CHECK(r2.ids_missing_plugin("echo", "sql").empty()); // the throw: fail open
         r2.expire_presence_cache_for_test();
@@ -517,11 +549,11 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
 
     SECTION("the result is cached per plugin for the TTL and re-read after it") {
         std::atomic<int> calls{0};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view plugin)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 ++calls;
-                return std::vector<std::string>{"remote-" + std::string(plugin)};
+                return absences({"remote-" + std::string(plugin)});
             });
         CHECK(r2.ids_missing_plugin("echo", "sql") ==
               std::unordered_set<std::string>{"remote-echo"});
@@ -536,11 +568,11 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
 
     SECTION("the plugin cache is bounded: a flood of distinct names cannot grow it past the cap") {
         std::atomic<int> calls{0};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 ++calls;
-                return std::vector<std::string>{};
+                return absences({});
             });
         const int distinct = 200;
         for (int n = 0; n < distinct; ++n)
@@ -554,15 +586,15 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
     SECTION("concurrent dispatches for one plugin share a single refresh and none blocks") {
         std::atomic<int> calls{0};
         std::atomic<bool> release{false};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 // Only the FIRST read may block: a second one (single-flight broken) returns at
                 // once, so the assertions below FAIL instead of the test hanging.
                 if (++calls == 1)
                     while (!release.load())
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                return std::vector<std::string>{"yuzu_test_pm_lacks"};
+                return absences({"yuzu_test_pm_lacks"});
             });
         std::thread refresher([&] { (void)r2.ids_missing_plugin("echo", "sql"); });
         // Releases the blocked read and joins on EVERY exit, including a failed REQUIRE: a joinable
@@ -598,16 +630,16 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
         std::atomic<bool> block_next{false};
         std::atomic<bool> entered{false};
         std::atomic<bool> release{false};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 ++calls;
                 if (block_next.exchange(false)) {
                     entered = true;
                     while (!release.load())
                         std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
-                return std::vector<std::string>{"stale-x"};
+                return absences({"stale-x"});
             });
         // With the entry `age` old and a refresh blocked in flight, what does a second caller get?
         const auto during_refresh = [&](std::chrono::seconds age) {
@@ -641,11 +673,11 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
 
     SECTION("a single replica never pays the read: presence holds nothing beyond local sessions") {
         std::atomic<int> calls{0};
-        r2.configure_presence_plugin_reader(
+        use_stub_reader(
             [&](std::chrono::seconds, std::string_view)
-                -> std::expected<std::vector<std::string>, PresenceReadError> {
+                -> std::expected<std::vector<yuzu::server::PluginAbsence>, PresenceReadError> {
                 ++calls;
-                return std::vector<std::string>{"x"};
+                return absences({"x"});
             });
         // This replica holds a session for every one of the three presence rows.
         for (const char* id : {"yuzu_test_pm_lacks", "yuzu_test_pm_has", "yuzu_test_pm_unknown"})
@@ -658,6 +690,97 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
         r2.expire_presence_cache_for_test();
         CHECK(r2.ids_missing_plugin("echo", "sql") == std::unordered_set<std::string>{"x"});
         CHECK(calls.load() == 1);
+    }
+}
+
+// #5685 follow-up: a published absence is only a CANDIDATE. It is withheld while the agent's routable
+// directory row still names the session that published the list, so an agent that re-registered
+// (the registration rewrites the row before the agent is handed its new session) is no longer judged
+// by its previous session's list, with no dependence on a heartbeat or a best-effort clear.
+TEST_CASE("HA WS-5: a cross-replica plugin absence is withheld only while the directory row names "
+          "the session that published the list",
+          "[pg][ha][presence][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry r2(bus, metrics); // the NON-owning replica
+    r2.configure_presence(&store, std::chrono::hours(1));
+
+    const std::string agent = "yuzu_test_pm_conf";
+    // The OWNING replica's previous session s-old published a list lacking "echo"; the durable
+    // endpoint row still names s-old (the new session has not heartbeated).
+    REQUIRE(store.upsert(agent, "h", "linux", 1, 0, "1", "x", "s-old"));
+    REQUIRE(store.publish_plugins(agent, "s-old", {"os_info"}));
+
+    std::optional<std::unordered_map<std::string, std::string>> directory;
+    std::atomic<int> directory_reads{0};
+    bool throw_on_read = false;
+    r2.configure_route_session_reader(
+        [&](std::span<const std::string> ids)
+            -> std::optional<std::unordered_map<std::string, std::string>> {
+            ++directory_reads;
+            if (throw_on_read)
+                throw std::runtime_error("boom");
+            if (!directory)
+                return std::nullopt;
+            std::unordered_map<std::string, std::string> m;
+            for (const auto& id : ids)
+                if (const auto it = directory->find(id); it != directory->end())
+                    m.emplace(*it);
+            return m;
+        });
+    const std::unordered_set<std::string> withheld{agent};
+    const std::unordered_set<std::string> none{};
+
+    SECTION("the row still names the publishing session: withheld (the feature is intact)") {
+        directory = {{agent, "s-old"}};
+        CHECK(r2.ids_missing_plugin("echo", "sql") == withheld);
+    }
+
+    SECTION("the agent re-registered (row names a newer session) and has not heartbeated: sent") {
+        directory = {{agent, "s-new"}};
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+    }
+
+    SECTION("no row (a direct agent), or an unroutable row (absent from the confirmation): sent") {
+        directory = std::unordered_map<std::string, std::string>{};
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+    }
+
+    SECTION("a degraded or throwing confirmation read fails OPEN") {
+        directory = std::nullopt;
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        directory = {{agent, "s-old"}};
+        throw_on_read = true;
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+    }
+
+    SECTION("no confirmation reader wired: nothing cross-replica is ever withheld") {
+        r2.configure_route_session_reader({});
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+    }
+
+    SECTION("the confirmation is read per dispatch, never cached with the candidate list") {
+        directory = {{agent, "s-old"}};
+        CHECK(r2.ids_missing_plugin("echo", "sql") == withheld);
+        // The agent re-registers INSIDE the candidate cache's TTL: the very next dispatch sends.
+        directory = {{agent, "s-new"}};
+        CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        CHECK(directory_reads.load() == 2);
+    }
+
+    SECTION("a local session still wins and no confirmation is needed for it") {
+        directory = {{agent, "s-old"}};
+        auto info = make_agent_info(agent, "linux", "h");
+        info.add_plugins()->set_name("os_info"); // this replica's own session lacks "echo" too
+        (void)r2.register_agent(info);
+        CHECK(r2.ids_missing_plugin("echo", "sql") == withheld); // judged locally
+        CHECK(directory_reads.load() == 0);
     }
 }
 

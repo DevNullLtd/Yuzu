@@ -3096,7 +3096,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: a CONNECTED on a non-owning replica drops th
     {
         auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
         REQUIRE(r.has_value());
-        REQUIRE(std::ranges::find(*r, agent) != r->end()); // judged by the old list
+        REQUIRE(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end()); // judged by the old list
     }
 
     gw::StreamStatusNotification notif;
@@ -3111,7 +3111,67 @@ TEST_CASE("WS-5 NotifyStreamStatus: a CONNECTED on a non-owning replica drops th
 
     auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
     REQUIRE(r.has_value());
-    CHECK(std::ranges::find(*r, agent) == r->end()); // unknown now: fails open
+    CHECK(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) == r->end()); // unknown now: fails open
+}
+
+// #5685 follow-up: the confirmation against the REAL directory. The agent restarts (a second
+// ProxyRegister mints a new session and rewrites its directory row) and nothing else has happened:
+// no CONNECTED, no heartbeat, so no arrival mirror has run and the old session's published list is
+// still stored. A replica that does not own the session must nevertheless stop judging by it.
+TEST_CASE("WS-5 plugin visibility: a re-registration stops the previous session's list "
+          "withholding the agent before any heartbeat or arrival mirror",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    NonOwningReplica other(owner.auth_mgr, owner.store);
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    other.registry.configure_presence(&offline, std::chrono::hours(1));
+    auto& store = owner.store;
+    other.registry.configure_route_session_reader(
+        [&store](std::span<const std::string> ids)
+            -> std::optional<std::unordered_map<std::string, std::string>> {
+            auto rows = store.lookup_routes(ids);
+            if (!rows)
+                return std::nullopt;
+            std::unordered_map<std::string, std::string> out;
+            for (const auto& r : *rows)
+                if (r.routable && r.route.session_id)
+                    out.emplace(r.route.agent_id, *r.route.session_id);
+            return out;
+        });
+
+    const std::string agent = "yuzu_test_ws5_conf_real";
+    const std::string old_session = owner.register_live(agent);
+    {
+        gw::StreamStatusNotification up;
+        up.set_agent_id(agent);
+        up.set_session_id(old_session);
+        up.set_event(gw::StreamStatusNotification::CONNECTED);
+        up.set_cluster_id("cluster-a");
+        up.set_gateway_node("node-a");
+        gw::StreamStatusAck ack;
+        REQUIRE(owner.svc.NotifyStreamStatus(/*context=*/nullptr, &up, &ack).ok());
+        REQUIRE(ack.acknowledged());
+    }
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", old_session));
+    REQUIRE(offline.publish_plugins(agent, old_session, {"os_info"}));
+
+    // Before the restart the list is the truth: the agent lacks "echo" and is withheld.
+    CHECK(other.registry.ids_missing_plugin("echo", "sql") ==
+          std::unordered_set<std::string>{agent});
+
+    // The restart: a new session is registered. No CONNECTED, no heartbeat, no arrival mirror.
+    const std::string new_session = owner.register_live(agent);
+    REQUIRE(new_session != old_session);
+    {
+        // Prove the old list is STILL stored and still the endpoint's current-session list, so the
+        // outcome below comes from the directory confirmation and from nothing else.
+        auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
+        REQUIRE(r.has_value());
+        REQUIRE(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end());
+    }
+    CHECK(other.registry.ids_missing_plugin("echo", "sql").empty());
 }
 
 // A session that LOST its register_fresh epoch race belongs to an older connection; the durable row
@@ -3151,7 +3211,7 @@ TEST_CASE("WS-5 NotifyStreamStatus: the CONNECTED of a lost-race session leaves 
 
     auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
     REQUIRE(r.has_value());
-    CHECK(std::ranges::find(*r, agent) != r->end()); // the winner's list is still served
+    CHECK(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end()); // the winner's list is still served
 }
 
 TEST_CASE("WS-5 BatchHeartbeat: a session id carried by TWO directory rows is refused "

@@ -1332,7 +1332,10 @@ TEST_CASE("OfflineEndpointStore plugin lists (session-keyed and served only for 
     const auto without = [&](std::string_view plugin) {
         auto r = store.query_live_ids_without_plugin(ttl, plugin);
         REQUIRE(r.has_value());
-        return *r;
+        std::vector<std::string> ids;
+        for (const auto& a : *r)
+            ids.push_back(a.agent_id);
+        return ids;
     };
     using Ids = std::vector<std::string>;
 

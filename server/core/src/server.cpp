@@ -6609,6 +6609,28 @@ public:
             // production) leaves presence unconfigured: local-only behavior,
             // unchanged from pre-WS-5.
             registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);
+            // #5685 follow-up: the CONFIRMATION read for a cross-replica plugin-absence verdict. A
+            // published list is trusted only while the agent's routable directory row still names
+            // the session that published it. Borrowed raw pointer, same lifetime discipline as
+            // the store above: unwired in stop() before `gateway_route_store_` is reset, after
+            // every dispatch thread has been joined. No route store (direct-connect only) leaves
+            // it unset, so no cross-replica absence is ever withheld (fail open).
+            registry_.configure_route_session_reader(
+                gateway_route_store_ && gateway_route_store_->is_open()
+                    ? detail::AgentRegistry::RouteSessionReadFn{[rs = gateway_route_store_.get()](
+                                                            std::span<const std::string> ids)
+                          -> std::optional<std::unordered_map<std::string, std::string>> {
+                          auto rows = rs->lookup_routes(ids);
+                          if (!rows)
+                              return std::nullopt;
+                          std::unordered_map<std::string, std::string> out;
+                          out.reserve(rows->size());
+                          for (const auto& r : *rows)
+                              if (r.routable && r.route.session_id)
+                                  out.emplace(r.route.agent_id, *r.route.session_id);
+                          return out;
+                      }}
+                    : detail::AgentRegistry::RouteSessionReadFn{});
 
             // #5513: reconcile admission outcomes and duration. The counter family is bounded
             // (a closed `result` set), so every value is pre-seeded to 0 per
@@ -11609,6 +11631,7 @@ public:
         // raw-pointer null-out in this block (execution_tracker_,
         // blast_radius_detector, cert callbacks, session_store).
         registry_.configure_presence(nullptr, cfg_.session_timeout);
+        registry_.configure_route_session_reader({}); // before gateway_route_store_ is reset
         offline_endpoint_store_.reset();
         // #3425: same discipline — null the heartbeat-side caller of
         // quarantine_reconciler_ before dropping the object it calls into.
