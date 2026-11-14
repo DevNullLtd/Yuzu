@@ -138,6 +138,7 @@ TEST_CASE("zip: a small archive yields its entries with offsets and sizes", "[co
     CHECK(tail->entries == 2);
     CHECK(tail->cd_offset == b.cd_off);
     CHECK(tail->cd_size == b.cd_size);
+    CHECK(tail->prefix == 0);
 
     std::vector<ZipEntry> seen;
     auto r = for_each_central_entry(view(b.file, b.cd_off, b.cd_size), tail->entries,
@@ -212,7 +213,7 @@ TEST_CASE("zip: a directory that runs past the end record is refused", "[compone
     REQUIRE_FALSE(r.has_value());
     CHECK(r.error() == ZipError::bad_record);
 
-    Bytes wrap; // cd_offset + cd_size must not wrap
+    Bytes wrap; // a recorded offset far past the end record is refused
     put_eocd(wrap, 1, 0x10, 0xFFFFFFF0U);
     CHECK_FALSE(find_central_directory(wrap, wrap.size()).has_value());
 }
@@ -410,24 +411,89 @@ TEST_CASE("zip: local_data_offset reads the local lengths, not the central ones"
     e.method = 8;
     e.local_header_offset = 1000;
 
-    auto off = local_data_offset(local, e);
+    auto off = local_data_offset(local, e, 0);
     REQUIRE(off.has_value());
     CHECK(*off == 1000 + 30 + it.name.size() + 6);
 
     // Header bytes alone suffice (the caller need not read the data).
-    CHECK(local_data_offset(view(local, 0, 30), e).has_value());
+    CHECK(local_data_offset(view(local, 0, 30), e, 0).has_value());
 
     for (std::size_t n = 0; n < 30; ++n) {
-        auto r = local_data_offset(view(local, 0, n), e);
+        auto r = local_data_offset(view(local, 0, n), e, 0);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ZipError::truncated);
     }
 
     Bytes bad = local;
     bad[3] = std::byte{0};
-    CHECK(local_data_offset(bad, e).error() == ZipError::bad_record);
+    CHECK(local_data_offset(bad, e, 0).error() == ZipError::bad_record);
 
     ZipEntry far;
     far.local_header_offset = UINT64_MAX - 10;
-    CHECK(local_data_offset(local, far).error() == ZipError::bad_record);
+    CHECK(local_data_offset(local, far, 0).error() == ZipError::bad_record);
+
+    // The prefix is added, and its own overflow is refused.
+    auto shifted = local_data_offset(local, e, 77);
+    REQUIRE(shifted.has_value());
+    CHECK(*shifted == 77 + 1000 + 30 + it.name.size() + 6);
+    CHECK(local_data_offset(local, e, UINT64_MAX).error() == ZipError::bad_record);
+}
+
+TEST_CASE("zip: an archive with prepended bytes is read through its prefix", "[component_zip]") {
+    // An executable jar: a launch script in front, internal offsets unadjusted.
+    const auto inner = build({{"a.txt", 0, "hello"}, {"lib/b.class", 8, "xyz"}});
+    const std::string script = "#!/bin/sh\nexec java -jar \"$0\"\n";
+    // Second round: the stub is longer than the tail window a caller reads, so
+    // there the tail is a strict suffix of the file and the end record's
+    // absolute position depends on file_size - tail.size().
+    for (const std::size_t pad : {std::size_t{0}, std::size_t{70000}}) {
+        INFO("pad " << pad);
+        Bytes file;
+        put_str(file, script + std::string(pad, '#'));
+        const std::size_t prefix_len = file.size();
+        file.insert(file.end(), inner.file.begin(), inner.file.end());
+        if (pad > 0)
+            REQUIRE(file.size() > kMaxTailBytes);
+
+        const auto tail = find(file);
+        REQUIRE(tail.has_value());
+        CHECK(tail->prefix == prefix_len);
+        CHECK(tail->cd_offset == prefix_len + inner.cd_off);
+        CHECK(tail->cd_size == inner.cd_size);
+        CHECK(tail->entries == 2);
+
+        std::vector<ZipEntry> seen;
+        auto r = for_each_central_entry(view(file, tail->cd_offset, tail->cd_size), tail->entries,
+                                        [&](const ZipEntry& e) {
+                                            seen.push_back(e);
+                                            return true;
+                                        });
+        REQUIRE(r.has_value());
+        REQUIRE(seen.size() == 2);
+        CHECK(seen[1].name == "lib/b.class");
+        // As written in the archive, not shifted.
+        CHECK(seen[1].local_header_offset == 30 + 5 + 5);
+
+        // Prefix + stored offset lands on the real local header.
+        const auto abs = tail->prefix + seen[1].local_header_offset;
+        auto data = local_data_offset(view(file, abs, 30), seen[1], tail->prefix);
+        REQUIRE(data.has_value());
+        CHECK(*data == abs + 30 + seen[1].name.size());
+    }
+}
+
+TEST_CASE("zip: a directory offset past where the directory can start is refused",
+          "[component_zip]") {
+    // cd_offset beyond (end record - cd_size): negative prefix.
+    auto b = build({{"a.txt", 0, "hello"}});
+    Bytes f(b.file.begin(), b.file.end() - 22);
+    put_eocd(f, 1, static_cast<std::uint32_t>(b.cd_size), static_cast<std::uint32_t>(b.cd_off + 1));
+    auto r = find(f);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error() == ZipError::bad_record);
+
+    // cd_size larger than everything before the end record.
+    Bytes g(b.file.begin(), b.file.end() - 22);
+    put_eocd(g, 1, static_cast<std::uint32_t>(g.size() + 1), 0);
+    CHECK(find(g).error() == ZipError::bad_record);
 }

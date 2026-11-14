@@ -18,6 +18,12 @@
  * limit below what ordinary large archives carry would hold a host's whole
  * answer back.
  *
+ * An archive may have bytes in front of it (an executable jar's launch
+ * script, a self-extractor stub) that its internal offsets do not count.
+ * find_central_directory() measures them as ZipTail::prefix, the way Java's
+ * ZipFile does: ZipTail::cd_offset is already absolute, and the local header
+ * of an entry is at tail.prefix + entry.local_header_offset.
+ *
  * ZIP64, multi-disk archives and encrypted entries are refused, never
  * guessed at; the caller reports the archive as not enumerated.
  */
@@ -44,13 +50,22 @@ struct ZipEntry {
     std::uint16_t method{0};
     std::uint64_t comp_size{0};
     std::uint64_t uncomp_size{0};
+    /// As written in the archive: relative to the archive start, NOT adjusted
+    /// for ZipTail::prefix. The absolute file offset of the local header is
+    /// tail.prefix + local_header_offset (local_data_offset() applies it).
     std::uint64_t local_header_offset{0};
 };
 
 struct ZipTail {
+    /// ABSOLUTE file offset of the central directory (the end record's
+    /// offset plus `prefix`): read cd_size bytes at exactly this offset.
     std::uint64_t cd_offset{0};
     std::uint64_t cd_size{0};
     std::uint32_t entries{0};
+    /// Bytes in front of the archive proper (an executable jar's launch
+    /// script, a self-extractor stub); 0 for an ordinary archive. The
+    /// archive's internal offsets do not count these bytes.
+    std::uint64_t prefix{0};
 };
 
 inline constexpr std::uint64_t kMaxCdBytes = 16ULL * 1024 * 1024;
@@ -134,13 +149,18 @@ inline std::expected<ZipTail, ZipError> find_central_directory(std::span<const s
         if (cd_size > kMaxCdBytes)
             return std::unexpected(ZipError::directory_too_large);
 
-        // The directory must lie wholly before this end record.
+        // The directory ends where this end record begins. Any gap between
+        // the recorded cd_offset and where the directory really starts is the
+        // prefix (as Java's ZipFile does); a directory that would start
+        // before the recorded offset, or before byte 0, is malformed.
         const std::uint64_t eocd_abs = file_size - (tail.size() - pos);
-        const auto cd_end = checked_add(cd_offset, cd_size);
-        if (!cd_end || *cd_end > eocd_abs)
+        if (cd_size > eocd_abs)
+            return std::unexpected(ZipError::bad_record);
+        const std::uint64_t cd_abs = eocd_abs - cd_size;
+        if (cd_offset > cd_abs)
             return std::unexpected(ZipError::bad_record);
 
-        return ZipTail{cd_offset, cd_size, entries_total};
+        return ZipTail{cd_abs, cd_size, entries_total, cd_abs - cd_offset};
     }
     return std::unexpected(ZipError::not_zip);
 }
@@ -204,12 +224,13 @@ std::expected<void, ZipError> for_each_central_entry(std::span<const std::byte> 
 
 /**
  * Absolute file offset of an entry's data, from its local header bytes
- * (the caller reads kLocalHeaderLen-or-more bytes at entry.local_header_offset;
- * the local name/extra lengths may differ from the central ones, so they are
- * read here, not assumed).
+ * (the caller reads kLocalHeaderLen-or-more bytes at
+ * prefix + entry.local_header_offset; the local name/extra lengths may differ
+ * from the central ones, so they are read here, not assumed). `prefix` is
+ * ZipTail::prefix; it is a required argument so a caller cannot forget it.
  */
 inline std::expected<std::uint64_t, ZipError> local_data_offset(
-    std::span<const std::byte> local_header, const ZipEntry& entry) {
+    std::span<const std::byte> local_header, const ZipEntry& entry, std::uint64_t prefix) {
     using namespace zip_detail;
     if (local_header.size() < kLocalHeaderLen)
         return std::unexpected(ZipError::truncated);
@@ -217,7 +238,8 @@ inline std::expected<std::uint64_t, ZipError> local_data_offset(
         return std::unexpected(ZipError::bad_record);
     const std::uint64_t var_len =
         static_cast<std::uint64_t>(u16(local_header, 26)) + u16(local_header, 28);
-    const auto base = checked_add(entry.local_header_offset, kLocalHeaderLen);
+    const auto start = checked_add(prefix, entry.local_header_offset);
+    const auto base = start ? checked_add(*start, kLocalHeaderLen) : std::nullopt;
     if (!base)
         return std::unexpected(ZipError::bad_record);
     const auto off = checked_add(*base, var_len);

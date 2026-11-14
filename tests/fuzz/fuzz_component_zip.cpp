@@ -36,7 +36,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         });
         (void)ci::for_each_central_entry(cd, declared, [&](const ci::ZipEntry& e) {
             // Feed each entry back into local_data_offset with the same bytes.
-            (void)ci::local_data_offset(cd, e);
+            (void)ci::local_data_offset(cd, e, 0);
             return false;
         });
         (void)seen;
@@ -46,8 +46,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     //    near the 64-bit ceiling so the overflow check is reachable.
     ci::ZipEntry far_entry;
     far_entry.local_header_offset = UINT64_MAX - std::min<std::uint64_t>(size, 70000);
-    (void)ci::local_data_offset(bytes, far_entry);
+    (void)ci::local_data_offset(bytes, far_entry, 0);
+    (void)ci::local_data_offset(bytes, far_entry, UINT64_MAX); // prefix overflow path
     ci::ZipEntry near_entry;
-    (void)ci::local_data_offset(bytes, near_entry);
+    (void)ci::local_data_offset(bytes, near_entry, 0);
     return 0;
 }
