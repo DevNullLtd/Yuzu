@@ -1,0 +1,62 @@
+# Software lifecycle rules - the seed shipped with the server (source: shipped).
+#
+# Dates after which versions of a product or operating system are past a lifecycle event.
+# Embedded in the server binary and loaded into Postgres on every start, replacing the stored
+# shipped rows, so a newer binary's seed always applies. A rule from another source
+# (external, imported) or a date a host reports about itself outranks these (see
+# docs/user-manual/inventory.md, Software lifecycle).
+#
+# Columns:
+#   product_key,version_prefix,event,date,source_reference
+#
+#   product_key       product:<normalised vendor>:<normalised title> (the registry norm_key of the
+#                     product) or os:<distro_id> (Linux) / os:windows / os:macos.
+#   version_prefix    dot-component prefix of the version the rule covers ("3.8" covers 3.8.10 and
+#                     not 3.80); empty = every version. The longest matching prefix wins.
+#   event             end_of_support (the publisher's standard support ends) or end_of_life (all
+#                     support the publisher offers for the release has ended).
+#   date              YYYY-MM-DD, the date read from the publisher's page named in the last column.
+#   source_reference  the public page the date was read from, with the field it came from. No commas.
+#
+# Every date was read from the page named on its row; a release whose date could not be confirmed
+# there is absent (its state reads unknown) rather than estimated. Windows and macOS releases are
+# absent for that reason. Ubuntu rows end standard security maintenance; Expanded Security
+# Maintenance (a paid add-on) is not modelled.
+product_key,version_prefix,event,date,source_reference
+product:postgresql:postgresql,12,end_of_life,2024-11-21,https://www.postgresql.org/support/versioning/ final release
+product:postgresql:postgresql,13,end_of_life,2025-11-13,https://www.postgresql.org/support/versioning/ final release
+product:postgresql:postgresql,14,end_of_life,2026-11-12,https://www.postgresql.org/support/versioning/ final release
+product:postgresql:postgresql,15,end_of_life,2027-11-11,https://www.postgresql.org/support/versioning/ final release
+product:postgresql:postgresql,16,end_of_life,2028-11-09,https://www.postgresql.org/support/versioning/ final release
+product:postgresql:postgresql,17,end_of_life,2029-11-08,https://www.postgresql.org/support/versioning/ final release
+product:postgresql:postgresql,18,end_of_life,2030-11-14,https://www.postgresql.org/support/versioning/ final release
+product:python:python,3.8,end_of_life,2024-10-07,https://peps.python.org/pep-0569/ end-of-life phase
+product:python:python,3.9,end_of_life,2025-10-31,https://peps.python.org/pep-0596/ end-of-life phase
+product:python:python,3.10,end_of_life,2026-10-01,https://peps.python.org/pep-0619/ end-of-life phase
+product:openjs:node.js,16,end_of_life,2023-09-11,https://github.com/nodejs/Release/blob/main/schedule.json end
+product:openjs:node.js,18,end_of_life,2025-04-30,https://github.com/nodejs/Release/blob/main/schedule.json end
+product:openjs:node.js,20,end_of_life,2026-04-30,https://github.com/nodejs/Release/blob/main/schedule.json end
+product:openjs:node.js,22,end_of_life,2027-04-30,https://github.com/nodejs/Release/blob/main/schedule.json end
+product:openjs:node.js,24,end_of_life,2028-04-30,https://github.com/nodejs/Release/blob/main/schedule.json end
+product:microsoft:.net runtime,6,end_of_support,2024-11-12,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net runtime,7,end_of_support,2024-05-14,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net runtime,8,end_of_support,2026-11-10,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net runtime,9,end_of_support,2026-11-10,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net runtime,10,end_of_support,2028-11-14,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net sdk,6,end_of_support,2024-11-12,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net sdk,7,end_of_support,2024-05-14,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net sdk,8,end_of_support,2026-11-10,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net sdk,9,end_of_support,2026-11-10,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+product:microsoft:.net sdk,10,end_of_support,2028-11-14,https://dotnet.microsoft.com/en-us/platform/support/policy/dotnet-core end of support
+os:ubuntu,18.04,end_of_support,2023-05-31,https://git.launchpad.net/ubuntu/+source/distro-info-data/plain/ubuntu.csv eol (standard security maintenance)
+os:ubuntu,20.04,end_of_support,2025-05-29,https://git.launchpad.net/ubuntu/+source/distro-info-data/plain/ubuntu.csv eol (standard security maintenance)
+os:ubuntu,22.04,end_of_support,2027-06-01,https://git.launchpad.net/ubuntu/+source/distro-info-data/plain/ubuntu.csv eol (standard security maintenance)
+os:ubuntu,24.04,end_of_support,2029-05-31,https://git.launchpad.net/ubuntu/+source/distro-info-data/plain/ubuntu.csv eol (standard security maintenance)
+os:debian,10,end_of_support,2022-09-10,https://wiki.debian.org/DebianReleases EOL
+os:debian,10,end_of_life,2024-06-30,https://wiki.debian.org/DebianReleases EOL LTS
+os:debian,11,end_of_support,2024-08-14,https://wiki.debian.org/DebianReleases EOL
+os:debian,11,end_of_life,2026-08-31,https://wiki.debian.org/DebianReleases EOL LTS
+os:debian,12,end_of_life,2028-06-30,https://wiki.debian.org/DebianReleases EOL LTS
+os:rhel,8,end_of_support,2029-05-31,https://access.redhat.com/product-life-cycles/api/v1/products?name=Red%20Hat%20Enterprise%20Linux Maintenance support end
+os:rhel,9,end_of_support,2032-05-31,https://access.redhat.com/product-life-cycles/api/v1/products?name=Red%20Hat%20Enterprise%20Linux Maintenance support end
+os:rhel,10,end_of_support,2035-05-31,https://access.redhat.com/product-life-cycles/api/v1/products?name=Red%20Hat%20Enterprise%20Linux Maintenance support end
