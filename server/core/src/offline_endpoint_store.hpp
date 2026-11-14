@@ -253,10 +253,12 @@ public:
                                          std::string_view current_session_id);
 
     /// Agents (each with the session that published the list) that are LIVE (the `query_live_ids`
-    /// predicate) AND have a published plugin
-    /// list, from their CURRENT session, that does NOT contain `plugin`. An agent with no list, or
-    /// whose list came from an older session (a pre-v5 row, an agent with no inventory, a
-    /// re-registration whose owner has not heartbeated yet), is absent from the result: unknown is
+    /// predicate) AND have a published plugin list that does NOT contain `plugin`, where the list's
+    /// session equals the ENDPOINT ROW's session. That row's session only advances at the new
+    /// session's first heartbeat, so after a re-registration the OLD session's list still joins
+    /// until then: the result is only a set of CANDIDATES, which `AgentRegistry::ids_missing_plugin`
+    /// confirms against the agent's route-directory row before withholding anything. An agent with
+    /// no list (a pre-v5 row, an agent with no inventory) is absent from the result: unknown is
     /// not absent, so the caller fails open for it. Typed failure like `query_live_ids`
     /// (`Truncated` past `kQueryRowCap`); counted on
     /// `yuzu_server_agent_presence_store_failed_total{op="query_without_plugin"}`. Identity read

@@ -790,7 +790,7 @@ public:
     /// clock) names EXACTLY the claimed session. An agent with no row, a tombstone, an expired or
     /// unplaced row, or a different session is simply absent from the result. ONE statement
     /// (`unnest` of two parallel text arrays joined to the primary key) on one lease bounded by
-    /// `kReadTimeout`, returning only the matches, so a fleet-sized claim list neither builds a
+    /// `kReadTimeout` and the statement itself bounded to 2 s by `SET LOCAL statement_timeout` (the pool default is 30 s), returning only the matches, so a fleet-sized claim list neither builds a
     /// full `RouteRow` per agent nor returns the unmatched ones. Empty claims return empty with no
     /// lease. A failure is a typed error (the caller fails open). Logged at debug only: the
     /// caller counts the outcome per dispatch (`yuzu_server_plugin_absence_confirm_total`).

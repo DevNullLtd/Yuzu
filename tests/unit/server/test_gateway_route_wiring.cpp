@@ -3224,6 +3224,40 @@ TEST_CASE("WS-5 plugin visibility: the directory confirms each agent on its own 
     CHECK(other.registry.ids_missing_plugin("quarantine", "quarantine").empty());
 }
 
+// `confirm_sessions` through the real store: ids that would break a naive array literal (quote,
+// comma, brace, backslash, apostrophe) are matched exactly, the empty claim set short-circuits,
+// and a claim naming another session or an unknown agent is simply not confirmed.
+TEST_CASE("WS-5 plugin visibility: confirm_sessions matches hostile ids exactly and returns only "
+          "the confirmed claims",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    using yuzu::server::PluginAbsence;
+    CHECK(owner.store.confirm_sessions({}).value().empty());
+
+    const std::string agent = "yuzu_test_a\"b,c{d}\\e'f";
+    const std::string session = "s\"1,{x}\\'";
+    REQUIRE(owner.store.register_fresh(agent, session).has_value());
+    // Place it: a cluster and a live lease (what CONNECTED does), by direct row surgery so the
+    // hostile ids need not be routed through a gRPC message.
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* params[2] = {agent.c_str(), session.c_str()};
+        pg::PgResult r{PQexecParams(conn.get(),
+                                    "UPDATE gateway_route_store.agent_routes SET cluster_id='c', "
+                                    "gateway_node='n', lease_until = now() + interval '90 s' "
+                                    "WHERE agent_id=$1 AND session_id=$2",
+                                    2, nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+        REQUIRE(std::string_view(PQcmdTuples(r.get())) == "1");
+    }
+    const auto confirmed = owner.store.confirm_sessions(std::vector<PluginAbsence>{
+        {agent, session}, {agent, "another-session"}, {"unknown-agent", session}});
+    REQUIRE(confirmed.has_value());
+    CHECK(*confirmed == std::vector<std::string>{agent});
+}
+
 // An older session can be written back into a row only after the row was tombstoned (or deleted):
 // `reclaim_tombstoned_session` is guarded on `session_id IS NULL`. Pin what that leaves behind. The
 // reclaimed row names the OLD session but carries no placement (`deregister` NULLed it and reclaim

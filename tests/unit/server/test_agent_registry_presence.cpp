@@ -781,6 +781,12 @@ TEST_CASE("HA WS-5: a cross-replica plugin absence is withheld only while the di
         CHECK(outcome("degraded") == 2.0);
     }
 
+    SECTION("the outcome series are seeded at 0 once configured, with or without a reader") {
+        r2.configure_route_session_reader({});
+        for (const char* o : {"withheld", "not_confirmed", "degraded", "shed", "unwired"})
+            CHECK(outcome(o) == 0.0);
+    }
+
     SECTION("no confirmation reader wired: nothing cross-replica is ever withheld") {
         r2.configure_route_session_reader({});
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
@@ -838,6 +844,7 @@ TEST_CASE("ids_missing_plugin tolerates the confirmation reader being rewired co
 
     std::atomic<bool> stop{false};
     std::atomic<int> calls{0};
+    std::atomic<int> torn{0};
     std::vector<std::thread> readers;
     // Joins on every exit, including a failed REQUIRE (a joinable thread destroyed by the unwind
     // would std::terminate the whole binary).
@@ -857,7 +864,7 @@ TEST_CASE("ids_missing_plugin tolerates the confirmation reader being rewired co
                 const auto missing = registry.ids_missing_plugin("echo", "sql");
                 // Either rewired state is a valid answer: confirmed (both) or unwired (none).
                 if (missing.size() != 0 && missing.size() != 2)
-                    stop = true; // surfaced by the CHECK below
+                    ++torn;
                 ++calls;
             }
         });
@@ -869,9 +876,129 @@ TEST_CASE("ids_missing_plugin tolerates the confirmation reader being rewired co
     for (auto& t : readers)
         t.join();
     CHECK(calls.load() > 0);
+    CHECK(torn.load() == 0); // every answer seen during the rewiring was one of the two valid ones
     registry.configure_route_session_reader(confirm_all);
     registry.expire_presence_cache_for_test();
     CHECK(registry.ids_missing_plugin("echo", "sql").size() == 2);
+}
+
+// The admission cap: a dispatch burst must not be able to put an unbounded number of confirmation
+// reads (each a pool lease and fleet-sized arrays) in flight. A caller past the cap withholds
+// nothing and is counted `shed`.
+TEST_CASE("ids_missing_plugin sheds a confirmation past the in-flight cap and fails open",
+          "[server][ha][presence][plugin_visibility]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(
+        [](std::chrono::seconds)
+            -> std::expected<std::vector<yuzu::server::PresenceIdentity>,
+                             yuzu::server::PresenceReadError> {
+            return std::vector<yuzu::server::PresenceIdentity>{
+                yuzu::server::PresenceIdentity{.agent_id = "yuzu_test_shed_a"}};
+        },
+        std::chrono::hours(1));
+    registry.configure_presence_plugin_reader(
+        [](std::chrono::seconds, std::string_view)
+            -> std::expected<std::vector<yuzu::server::PluginAbsence>,
+                             yuzu::server::PresenceReadError> {
+            return std::vector<yuzu::server::PluginAbsence>{{"yuzu_test_shed_a", "S"}};
+        });
+    std::atomic<int> entered{0};
+    std::atomic<bool> release{true}; // open while the candidate cache is primed below
+    registry.configure_route_session_reader(
+        [&](std::span<const yuzu::server::PluginAbsence> claims)
+            -> std::optional<std::unordered_set<std::string>> {
+            ++entered;
+            while (!release.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            std::unordered_set<std::string> ids;
+            for (const auto& c : claims)
+                ids.insert(c.agent_id);
+            return ids;
+        });
+    const auto outcome = [&](const char* o) {
+        return metrics.counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", o}})
+            .value();
+    };
+    // Prime the per-plugin candidate cache so the callers below do not race its single-flight
+    // refresh (a caller that loses it fails open before the confirmation, which is not what this
+    // test is about), then close the gate so the next confirmations block inside the reader.
+    REQUIRE(registry.ids_missing_plugin("echo", "sql") ==
+            std::unordered_set<std::string>{"yuzu_test_shed_a"});
+    entered = 0;
+    release = false;
+    std::vector<std::thread> blocked;
+    struct Joiner {
+        std::atomic<bool>& release;
+        std::vector<std::thread>& threads;
+        ~Joiner() {
+            release = true;
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+    } joiner{release, blocked};
+    for (int i = 0; i < 2; ++i)
+        blocked.emplace_back([&] { (void)registry.ids_missing_plugin("echo", "sql"); });
+    const auto started = std::chrono::steady_clock::now();
+    while (entered.load() < 2 &&
+           std::chrono::steady_clock::now() - started < std::chrono::seconds(10))
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    REQUIRE(entered.load() == 2);
+    // The cap (2) is full: a third caller is shed and withholds nothing, without waiting.
+    CHECK(registry.ids_missing_plugin("echo", "sql").empty());
+    CHECK(entered.load() == 2); // it never reached the reader
+    CHECK(outcome("shed") == 1.0);
+    release = true;
+    for (auto& t : blocked)
+        t.join();
+    // With the readers free again the slot is released and the next call is admitted.
+    CHECK(registry.ids_missing_plugin("echo", "sql") ==
+          std::unordered_set<std::string>{"yuzu_test_shed_a"});
+    CHECK(outcome("shed") == 1.0);
+}
+
+// A direct register writes no route row, so an agent that registers on THIS replica while the
+// confirmation read is in flight can still be confirmed by an older routable row. Local wins, and
+// is re-checked after the read.
+TEST_CASE("ids_missing_plugin does not withhold an agent that became local during the read",
+          "[server][ha][presence][plugin_visibility]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    const std::string agent = "yuzu_test_local_race";
+    registry.configure_presence(
+        [&](std::chrono::seconds)
+            -> std::expected<std::vector<yuzu::server::PresenceIdentity>,
+                             yuzu::server::PresenceReadError> {
+            return std::vector<yuzu::server::PresenceIdentity>{
+                yuzu::server::PresenceIdentity{.agent_id = agent},
+                yuzu::server::PresenceIdentity{.agent_id = "yuzu_test_local_race_other"}};
+        },
+        std::chrono::hours(1));
+    registry.configure_presence_plugin_reader(
+        [&](std::chrono::seconds, std::string_view)
+            -> std::expected<std::vector<yuzu::server::PluginAbsence>,
+                             yuzu::server::PresenceReadError> {
+            return std::vector<yuzu::server::PluginAbsence>{{agent, "S"},
+                                                              {"yuzu_test_local_race_other", "S"}};
+        });
+    // The test reader stands in for a slow read: it lets the agent register locally mid-call (the
+    // production reader never calls back into the registry; the registry holds no lock here).
+    registry.configure_route_session_reader(
+        [&](std::span<const yuzu::server::PluginAbsence> claims)
+            -> std::optional<std::unordered_set<std::string>> {
+            auto info = make_agent_info(agent, "linux", "h");
+            info.add_plugins()->set_name("echo");
+            (void)registry.register_agent(info);
+            std::unordered_set<std::string> ids;
+            for (const auto& c : claims)
+                ids.insert(c.agent_id);
+            return ids;
+        });
+    const auto missing = registry.ids_missing_plugin("echo", "sql");
+    CHECK(missing == std::unordered_set<std::string>{"yuzu_test_local_race_other"});
 }
 
 // A held `stream_mu` means a send to that session is in flight: it must read as HAVING a path and

@@ -1351,6 +1351,14 @@ private:
     mutable std::mutex missing_plugin_mu_;
     PluginMissingReadFn presence_missing_plugin_reader_;
     RouteSessionReadFn route_session_reader_; ///< guarded by `missing_plugin_mu_`
+    /// At most this many confirmation reads may be in flight at once. Each holds a pool lease and
+    /// builds fleet-sized arrays, and the pool is shared with presence upserts, lease renewals and
+    /// registration, so a dispatch burst must not be able to take it over. A caller past the cap
+    /// is shed: it withholds nothing (fail open) and is counted `outcome="shed"`.
+    static constexpr int kMaxConcurrentConfirms = 2;
+    mutable std::atomic<int> confirms_in_flight_{0};
+    /// Steady-clock ms of the last warn for a degraded or shed confirmation (rate limit).
+    mutable std::atomic<std::int64_t> confirm_warn_at_ms_{0};
     std::chrono::seconds missing_plugin_ttl_{};
     mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
     mutable std::unordered_set<std::string> missing_plugin_inflight_;

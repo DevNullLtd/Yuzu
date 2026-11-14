@@ -105,6 +105,9 @@ PRUNE_START = "preflight_runner_thread_ = std::thread("
 PRUNE_END = '"Pre-flight runner thread stopped"'
 
 
+PRESENCE_BIND = normalise("registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);")
+PRESENCE_UNWIRE = normalise("registry_.configure_presence(nullptr, cfg_.session_timeout);")
+ROUTE_STORE_CONSTRUCT = normalise("gateway_route_store_ = std::make_unique<GatewayRouteStore>(*pg_pool_);")
 CONFIRM_BIND = normalise("registry_.configure_route_session_reader(gateway_route_store_ && "
                          "gateway_route_store_->is_open() ? make_route_session_confirmer("
                          "*gateway_route_store_) : detail::AgentRegistry::RouteSessionReadFn{});")
@@ -113,8 +116,10 @@ STORE_RESET = normalise("gateway_route_store_.reset();")
 
 
 def confirm_problems(src):
-    """One bind (the production factory, guarded), one unwire, the unwire before the store reset."""
-    t = normalise(src)
+    """The confirmation reader is bound once, right after the presence bind and after the route
+    store is constructed, and unwired once, right after the presence unwire (inside stop()) and
+    before the store reset. /* */ comments are stripped so a commented-out call cannot satisfy it."""
+    t = normalise(re.sub(r"/\*.*?\*/", " ", src, flags=re.S))
     out = []
     if t.count(CONFIRM_BIND) != 1:
         out.append(f"server.cpp: expected exactly one `{CONFIRM_BIND}` (found {t.count(CONFIRM_BIND)}) "
@@ -128,6 +133,18 @@ def confirm_problems(src):
     elif t.count(STORE_RESET) != 1 or not t.index(CONFIRM_UNWIRE) < t.index(STORE_RESET):
         out.append("server.cpp: the confirmation reader must be unwired BEFORE the one "
                    "`gateway_route_store_.reset();` (#5685 follow-up)")
+    # Placement: the bind sits straight after the presence bind (so it runs in start(), with the
+    # store already constructed above it); the unwire sits straight after the presence unwire, so
+    # it is in stop() and not at the bind site.
+    if t.count(PRESENCE_BIND + " " + CONFIRM_BIND) != 1:
+        out.append("server.cpp: the confirmation reader must be bound immediately after "
+                   f"`{PRESENCE_BIND}` (#5685 follow-up)")
+    if t.count(PRESENCE_UNWIRE + " " + CONFIRM_UNWIRE) != 1:
+        out.append("server.cpp: the confirmation reader must be unwired immediately after "
+                   f"`{PRESENCE_UNWIRE}` in stop() (#5685 follow-up)")
+    if t.count(ROUTE_STORE_CONSTRUCT) != 1 or t.find(CONFIRM_BIND) < t.find(ROUTE_STORE_CONSTRUCT):
+        out.append("server.cpp: the confirmation reader must be bound AFTER "
+                   f"`{ROUTE_STORE_CONSTRUCT}` (#5685 follow-up)")
     return out
 
 
@@ -139,6 +156,12 @@ CONFIRM_MUTATIONS = [
     (r"gateway_route_store_ && gateway_route_store_->is_open\(\)", "true"),  # unguarded
     (re.escape("registry_.configure_route_session_reader({}); "), "(void)0; "),  # no unwire
     (r"(registry_\.configure_route_session_reader\(\{\}\);[^\n]*\n)", r""),  # unwire deleted
+    # QE round 2: dead-code wrapping, block comments, bind moved ahead of the store, and the unwire
+    # moved to the bind site (still textually before the reset, but never in stop()).
+    (r"registry_\.configure_route_session_reader\(\s*gateway_route_store_ &&",
+     "if (false) registry_.configure_route_session_reader(gateway_route_store_ &&"),
+    (r"(registry_\.configure_route_session_reader\(\{\}\);)", r"/* \1 */"),
+    (r"(registry_\.configure_route_session_reader\(\s*gateway_route_store_ &&)", r"/* \1"),
 ]
 
 
