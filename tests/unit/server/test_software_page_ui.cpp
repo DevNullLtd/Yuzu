@@ -223,7 +223,16 @@ TEST_CASE("software page: search box carries the CSP-safe htmx wiring", "[invent
     // One shared sync scope (a stable container outside every swap) for every control that
     // re-requests the results, so a slow earlier response cannot overwrite a later one.
     REQUIRE(has(h, "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"#sw-filters:replace\""));
-    REQUIRE_FALSE(has(h, "hx-sync=\"this:replace\""));
+    {
+        // The search box itself never takes a per-element sync scope. The Find form further down
+        // the page carries its own `this:replace` (its results region is a separate swap scope),
+        // so the guard is the search box's own tag, not the whole page.
+        const auto q = h.find("id=\"sw-q\"");
+        REQUIRE(q != std::string::npos);
+        const auto tag_end = h.find('>', q);
+        REQUIRE(tag_end != std::string::npos);
+        REQUIRE(h.substr(q, tag_end - q).find("hx-sync=\"this:replace\"") == std::string::npos);
+    }
     REQUIRE(has(h, "<div id=\"sw-filters\""));
     REQUIRE(has(h, "hx-trigger=\"change\" hx-sync=\"#sw-filters:replace\" hx-include=\"#sw-state,#sw-q,#sw-agent\""));
     REQUIRE(has(h, "hx-include=\"#sw-q,#sw-agent\" hx-sync=\"#sw-filters:replace\""));
@@ -1185,7 +1194,7 @@ TEST_CASE("find software: a degraded read renders the retry banner and a refusal
     // A Load-more page degrades inside its own row.
     SoftwareFindData more = d;
     more.f.cursor = "cur";
-    REQUIRE(render_software_find(more).starts_with("<tr><td colspan=\"8\">"));
+    REQUIRE(render_software_find(more).starts_with("<tr><td colspan=\"8\" class=\"fs-msg\">"));
 }
 
 TEST_CASE("find software: nothing found is a real zero that offers the component search; Load more "

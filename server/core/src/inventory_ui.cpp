@@ -707,7 +707,8 @@ constexpr std::array<FindKind, 4> kFindKinds{{{"app", "Applications"},
                                               {"python", "Python"},
                                               {"node", "Node"}}};
 
-// Only the fs-* rules are new; everything else reuses the page's inv-*, gp-* and pill classes.
+// Every rule is scoped to an fs-* class, #fs-form or #fs-results, so nothing here restyles the
+// catalogue tables; everything else reuses the page's inv-*, gp-* and pill classes.
 std::string find_style() {
     return R"css(<style>
   .fs-head{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;padding:14px 16px;border-bottom:1px solid var(--line)}
@@ -716,7 +717,7 @@ std::string find_style() {
   .fs-hint{font-size:12.5px;color:var(--mut)}
   .fs-in{height:var(--ctl);width:150px;padding:0 10px;border:1px solid var(--line2);border-radius:var(--rad-ctl);background:var(--bg);color:var(--ink);font:inherit}
   .fs-in::placeholder{color:var(--faint)}
-  .inv-frow .inv-search{flex:1 1 320px}
+  #fs-form .inv-frow .inv-search{flex:1 1 320px}
   .fs-cards{display:flex;flex-wrap:wrap;gap:14px;align-items:stretch}
   .fs-cards>.inv-kpis{flex:3 1 520px}
   .fs-apart{flex:1 1 250px;display:flex;flex-direction:column;padding:14px 18px;border:1px dashed var(--line2);border-radius:var(--rad-panel);background:transparent}
@@ -725,8 +726,8 @@ std::string find_style() {
   .fs-apart .s2{margin-top:4px;font-size:12.5px;color:var(--mut)}
   .fs-apart .inv-link{align-self:flex-start;margin-top:6px}
   tr.fs-vgrp>td{padding:8px 16px;background:var(--surface2);color:var(--ink);font-weight:600}
-  table.inv-tbl tbody td{white-space:nowrap}
-  table.inv-tbl tr.inv-more td{white-space:normal}
+  #fs-results table.inv-tbl tbody td{white-space:nowrap}
+  #fs-results table.inv-tbl tr.inv-more td,#fs-results table.inv-tbl td.fs-msg,#fs-results table.inv-tbl td.inv-empty{white-space:normal}
   .fs-trunc{display:inline-block;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
   .fs-src{margin-left:6px}
   table.inv-tbl.fs-tight th,table.inv-tbl.fs-tight td{padding-left:12px;padding-right:12px}
@@ -1282,10 +1283,11 @@ std::string render_software_find(const SoftwareFindData& d) {
     const bool comp = find_is_components(d.f);
     if (d.caveat) {
         const std::string c = "<div class=\"inv-caveat\">" + esc(*d.caveat) + "</div>";
-        return rows_only ? "<tr><td colspan=\"8\">" + c + "</td></tr>" : c;
+        return rows_only ? "<tr><td colspan=\"8\" class=\"fs-msg\">" + c + "</td></tr>" : c;
     }
     if (!d.rows) // a degraded read: the retry banner, never an empty table
-        return rows_only ? "<tr><td colspan=\"8\">" + find_degrade(d.f) + "</td></tr>"
+        return rows_only ? "<tr><td colspan=\"8\" class=\"fs-msg\">" + find_degrade(d.f) +
+                               "</td></tr>"
                          : find_degrade(d.f);
     if (rows_only)
         return find_body(d);

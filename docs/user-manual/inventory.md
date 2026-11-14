@@ -1007,10 +1007,12 @@ place, **Hardware** and **Software**, each its own page:
     installed applications; **Java**, **Python** and **Node** search the components found
     inside applications (`GET /api/v1/inventory/software/components`), and say plainly that
     a device that has not sent its component list cannot be ruled in or out. The table runs
-    application, then version (newest first on each page), then device; each row shows the
-    OS, install location (or component path and the application folder it sits in), install
-    type, status (current, unconfirmed or disabled), when a report last confirmed it, and
-    **Last synced**, which turns amber after 48 hours. **Load more rows** continues from the
+    application, then version (newest first on each page), then device. An application row
+    shows the OS, install location, install type, status (current, unconfirmed or disabled),
+    when a report last confirmed the install, and **Last synced**. A component row shows the
+    OS, component, version (and where it was read from), path, the application folder it
+    sits in, status and **Last synced**; it has no install type or last-confirmed column.
+    **Last synced** turns amber after 48 hours. **Load more rows** continues from the
     cursor. For component searches the count card also shows how many of the devices were
     not confirmed by their last report, with a link that lists only those; installs searches
     carry no such figure because the model does not return one. An account scoped to

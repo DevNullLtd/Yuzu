@@ -1298,7 +1298,7 @@ TEST_CASE("find software: a bad cursor renders a caveat with status 200", "[inve
     CHECK_FALSE(contains(r->body, "<table"));
     CHECK_FALSE(contains(r->body, "Nothing found"));
     // A Load-more request refused the same way answers inside its own row.
-    CHECK(r->body.starts_with("<tr><td colspan=\"8\">"));
+    CHECK(r->body.starts_with("<tr><td colspan=\"8\" class=\"fs-msg\">"));
     CHECK_FALSE(h.audited("inventory.software.query|success"));
 }
 
