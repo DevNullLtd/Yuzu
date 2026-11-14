@@ -587,6 +587,13 @@ struct FileMechanismTestControls {
     std::chrono::milliseconds backend_retry_base{0};
     std::chrono::milliseconds admission_backoff_seed{0};
     std::chrono::milliseconds traversal_budget{0};
+    /// How often an idle, healthy watch re-opens its directory PATH and compares
+    /// the identity of what it finds with the identity its handle was opened on
+    /// (#5719 item 5: a renamed or replaced parent directory is otherwise silent).
+    /// Production default 5 s. Zero leaves the current value unchanged; a
+    /// shortened value takes effect at the next wake (the control call nudges the
+    /// worker), so a test can hold it long, change the world, then shorten it.
+    std::chrono::milliseconds path_verify_interval{0};
 };
 
 /// Mechanism-internal counters the public SparkMechanismStats does not carry.
@@ -612,6 +619,14 @@ struct FileMechanismDebugCounters {
     std::size_t live_dirs{0};
     std::size_t live_ancestors{0};
     std::size_t retiring{0};
+    /// Directory-identity verification results (#5719 item 5), all-time. `same`:
+    /// the path still names the directory the watch holds. `lost`: it names a
+    /// different directory or nothing (the watch is faulted). `unverifiable`: the
+    /// check could not decide (open refused, identity unavailable, worker threw);
+    /// never a fault.
+    std::uint64_t verify_same{0};
+    std::uint64_t verify_lost{0};
+    std::uint64_t verify_unverifiable{0};
 };
 
 /// Returns true if `mech` is the Windows File mechanism and the controls were

@@ -15569,6 +15569,61 @@ TEST_CASE("File spark (real mechanism): a parent directory held pending-delete b
     engine.stop();
 }
 
+namespace {
+/// Controls every directory-identity test below shares: short retry/grace/sweep
+/// values so a fault is observable inside kDeafBound, plus the verify interval.
+FileMechanismTestControls identity_controls(std::chrono::milliseconds verify_interval) {
+    FileMechanismTestControls ctl;
+    ctl.health_grace = 100ms;
+    ctl.backend_retry_base = 100ms;
+    ctl.sweep_cadence = 20ms;
+    ctl.path_verify_interval = verify_interval;
+    return ctl;
+}
+
+/// Change only the verify interval (every other control keeps its value: a zero
+/// field means "leave unchanged"; no hook is installed by these tests).
+void set_verify_interval(ISparkMechanism& mech, std::chrono::milliseconds interval) {
+    FileMechanismTestControls ctl;
+    ctl.path_verify_interval = interval;
+    REQUIRE(set_file_test_controls_for_test(mech, std::move(ctl)));
+}
+
+std::uint64_t verify_counter(ISparkMechanism& mech, std::uint64_t FileMechanismDebugCounters::*field) {
+    const auto d = file_debug_counters_for_test(mech);
+    REQUIRE(d.has_value());
+    return (*d).*field;
+}
+
+/// After the watched path is repaired: wait for the watch to be healthy with
+/// Notification coverage again AND for every resync fire the mechanism staged to
+/// have been delivered (Fired count >= synthetic_fires, one key), then make one
+/// real change and require it to fire. The baseline is taken only after both, so
+/// a late resync delivery cannot satisfy the final check. Replaces a fixed sleep.
+void expect_fire_after_repair(ISparkMechanism& mech, SparkEngine& engine, Collector& got,
+                              SparkEngine::SubscriptionId sub, const SparkSpec& spec,
+                              const std::filesystem::path& file) {
+    REQUIRE(eventually(
+        [&] {
+            return deaf_coverage(engine, sub) == SparkCoverage::Notification &&
+                   engine.stats().armed_faulted == 0;
+        },
+        kDeafBound));
+    REQUIRE(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(mech);
+            return d.has_value() &&
+                   count_kind(got, spark_key(spec), SparkEventKind::Fired) >= d->synthetic_fires;
+        },
+        kDeafBound));
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    { std::ofstream(file, std::ios::app) << "change-after-repair"; }
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+        kDeafBound));
+}
+} // namespace
+
 TEST_CASE("File spark (real mechanism): a parent directory renamed away faults the watch "
           "inside the bound (#5719 item 5)",
           "[spark][mechanism][windows][5719]") {
@@ -15579,13 +15634,7 @@ TEST_CASE("File spark (real mechanism): a parent directory renamed away faults t
     auto mech = make_file_mechanism();
     ISparkMechanism* raw = mech.get();
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
-    {
-        FileMechanismTestControls ctl;
-        ctl.health_grace = 100ms;
-        ctl.backend_retry_base = 100ms;
-        ctl.sweep_cadence = 20ms;
-        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
-    }
+    REQUIRE(set_file_test_controls_for_test(*raw, identity_controls(50ms)));
     auto c = engine.register_consumer("c", got.handler());
     REQUIRE(c.has_value());
     const auto spec = file_spec(tree.file.string());
@@ -15608,16 +15657,281 @@ TEST_CASE("File spark (real mechanism): a parent directory renamed away faults t
     const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound);
     INFO("coverage after the rename: " << deaf_coverage_text(engine, *sub));
     CHECK(faulted);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 1);
+    // The loss is also a coverage loss, not only a fault bit.
+    REQUIRE(eventually([&] { return deaf_coverage(engine, *sub) == SparkCoverage::None; },
+                       kDeafBound));
 
     // Secondary: after the original path is repaired a change there must fire.
-    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
     std::filesystem::create_directories(tree.parent, ec);
     { std::ofstream(tree.file) << "recreated"; }
-    std::this_thread::sleep_for(100ms);
-    { std::ofstream(tree.file, std::ios::app) << "change-after-repair"; }
-    CHECK(eventually(
-        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+    expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): nothing the renamed directory's stale read reports is "
+          "fired while the watch is faulted (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    // A writer keeps changing a file inside the renamed directory, so the stale read
+    // can have a notification queued when detection cancels it (its completion then
+    // arrives with `ok`, not as an abort). Whatever that read carries describes the
+    // OLD directory under its OLD name: from the Faulted event to the matching
+    // Recovered event no Fired event may be delivered. Probabilistic by construction:
+    // there is no seam that forces the `ok` completion, so a run does not prove that
+    // branch was taken.
+    DeafWatchTree tree("parent_rename_busy");
+    const auto renamed = tree.root / "renamed";
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    REQUIRE(set_file_test_controls_for_test(*raw, identity_controls(50ms)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+
+    std::error_code ec;
+    std::filesystem::rename(tree.parent, renamed, ec);
+    REQUIRE_FALSE(ec);
+    std::atomic<bool> stop_writer{false};
+    std::thread writer([&] {
+        while (!stop_writer.load(std::memory_order_acquire)) {
+            { std::ofstream(renamed / "file.txt", std::ios::app) << "x"; }
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+    struct JoinGuard {
+        std::atomic<bool>& stop;
+        std::thread& t;
+        ~JoinGuard() {
+            stop.store(true, std::memory_order_release);
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{stop_writer, writer};
+
+    REQUIRE(eventually(
+        [&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; }, kDeafBound));
+    REQUIRE(eventually(
+        [&] { return count_kind(got, key, SparkEventKind::Recovered) >= 1; }, kDeafBound));
+    stop_writer.store(true, std::memory_order_release);
+    writer.join();
+
+    std::size_t faulted_at = 0, recovered_at = 0, fired_between = 0;
+    {
+        std::lock_guard lk(got.mu);
+        bool in_fault = false;
+        for (std::size_t i = 0; i < got.events.size(); ++i) {
+            const auto& ev = got.events[i];
+            if (ev.key != key)
+                continue;
+            if (!in_fault && ev.kind == SparkEventKind::Faulted) {
+                in_fault = true;
+                faulted_at = i;
+            } else if (in_fault && ev.kind == SparkEventKind::Recovered) {
+                recovered_at = i;
+                break;
+            } else if (in_fault && ev.kind == SparkEventKind::Fired) {
+                ++fired_between;
+            }
+        }
+    }
+    INFO("Faulted at event " << faulted_at << ", Recovered at event " << recovered_at);
+    CHECK(recovered_at > faulted_at);
+    CHECK(fired_between == 0);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): an idle healthy watch is verified repeatedly and "
+          "neither faults nor stops firing (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("verify_healthy");
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    REQUIRE(set_file_test_controls_for_test(*raw, identity_controls(20ms)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+
+    // Nothing happens to the directory; the verification alone must run, repeatedly
+    // (an idle watch would otherwise wait forever) and always read "same".
+    REQUIRE(eventually(
+        [&] { return verify_counter(*raw, &FileMechanismDebugCounters::verify_same) >= 3; },
         kDeafBound));
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 0);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) == 0);
+    CHECK(engine.stats().armed_faulted == 0);
+    CHECK(deaf_coverage(engine, *sub) == SparkCoverage::Notification);
+
+    // A real write still fires after several verifications.
+    expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
+    CHECK(engine.stats().armed_faulted == 0);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a parent directory replaced by a different directory "
+          "at the same path faults the watch (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("parent_replaced");
+    const auto renamed = tree.root / "renamed";
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    // The check is held off (60 s) while the directory is swapped, so no sample can
+    // observe the absent-path window: this case is the replacement itself, where the
+    // PATH exists throughout and only its identity differs.
+    REQUIRE(set_file_test_controls_for_test(*raw, identity_controls(60'000ms)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0);
+
+    std::error_code ec;
+    std::filesystem::rename(tree.parent, renamed, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::create_directories(tree.parent, ec); // a DIFFERENT directory, same path
+    REQUIRE_FALSE(ec);
+    { std::ofstream(tree.file) << "the replacement"; }
+    REQUIRE(std::filesystem::exists(tree.parent));
+
+    CHECK(engine.stats().armed_faulted == 0); // nothing has looked yet
+    set_verify_interval(*raw, 50ms);
+    const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound);
+    INFO("coverage after the replacement: " << deaf_coverage_text(engine, *sub));
+    CHECK(faulted);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) >= 1);
+
+    // The ordinary retry opens the replacement directory and the watch recovers on it.
+    expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a parent directory renamed away and back between "
+          "two verifications is not a fault (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("rename_and_back");
+    const auto renamed = tree.root / "renamed";
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    // Interval held long: no check can run while the directory is away. (This case
+    // deliberately does not claim a watch can never fault across a rename-and-back:
+    // a check that happened to land inside the gap WOULD correctly report it.)
+    REQUIRE(set_file_test_controls_for_test(*raw, identity_controls(60'000ms)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0);
+    REQUIRE(verify_counter(*raw, &FileMechanismDebugCounters::verify_same) == 0);
+
+    std::error_code ec;
+    std::filesystem::rename(tree.parent, renamed, ec);
+    REQUIRE_FALSE(ec);
+    std::filesystem::rename(renamed, tree.parent, ec);
+    REQUIRE_FALSE(ec);
+
+    set_verify_interval(*raw, 20ms);
+    REQUIRE(eventually(
+        [&] { return verify_counter(*raw, &FileMechanismDebugCounters::verify_same) >= 2; },
+        kDeafBound));
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 0);
+    CHECK(engine.stats().armed_faulted == 0);
+    CHECK(deaf_coverage(engine, *sub) == SparkCoverage::Notification);
+    expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+namespace {
+/// A directory junction (`mklink /J`, no privilege needed) at `link` pointing at
+/// `target`. Only the link is removed on destruction, never the target.
+struct ScratchJunction {
+    std::filesystem::path link;
+    bool created{false};
+    ScratchJunction(std::filesystem::path link_path, const std::filesystem::path& target)
+        : link(std::move(link_path)) {
+        const std::string cmd = "cmd /c \"mklink /J \"" + link.string() + "\" \"" +
+                                target.string() + "\" > nul 2>&1\"";
+        created = std::system(cmd.c_str()) == 0;
+    }
+    ~ScratchJunction() {
+        if (created)
+            ::RemoveDirectoryW(link.c_str());
+    }
+    ScratchJunction(const ScratchJunction&) = delete;
+    ScratchJunction& operator=(const ScratchJunction&) = delete;
+};
+} // namespace
+
+TEST_CASE("File spark (real mechanism): a watched directory reached through a junction faults "
+          "when the junction's target is renamed away (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("junction");
+    const auto renamed = tree.root / "renamed";
+    const auto link = tree.root / "via_junction";
+    ScratchJunction junction(link, tree.parent); // declared after `tree`: removed first
+    REQUIRE(junction.created); // mklink /J unavailable would be a finding, not a skip
+    const auto watched_file = link / "file.txt";
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    REQUIRE(set_file_test_controls_for_test(*raw, identity_controls(50ms)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(watched_file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0);
+    REQUIRE(eventually(
+        [&] { return verify_counter(*raw, &FileMechanismDebugCounters::verify_same) >= 1; },
+        kDeafBound)); // the junction spelling is verifiable (identity read through it)
+
+    std::error_code ec;
+    std::filesystem::rename(tree.parent, renamed, ec); // the junction now dangles
+    REQUIRE_FALSE(ec);
+
+    const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound);
+    INFO("coverage after the junction target was renamed: " << deaf_coverage_text(engine, *sub));
+    CHECK(faulted);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 1);
     engine.disarm(*sub);
     engine.stop();
 }
