@@ -650,7 +650,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 21,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 29> sources{{
+    const std::array<std::span<const CommandCapability>, 30> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
