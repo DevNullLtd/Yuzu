@@ -17,8 +17,12 @@
 > the direction that, for new installations, the opt-in default in Amendment 1 ("opt-in, not
 > default-on") is replaced by on-by-default with customer-controlled switch-off, and that the
 > staged-then-push guardrail under "Operator surfaces" gives way to the server's enablement
-> state and its preview. Existing installations keep their current state. Nothing has changed
-> in the product yet: until the work that follows ADR-3006 lands, this ADR describes what ships.
+> state and its preview. **The default half shipped early, by owner ruling** (PR #6360,
+> 2026-10-23): `arp` and `dns`, like every Echo capture source, are on by default on every OS,
+> and agents upgraded past schema v8 were moved to on once; a source an operator switches off
+> afterwards stays off. Amendment 1's opt-in default no longer describes what ships. The
+> enablement-state and preview half is still pending; until it lands, the staged-then-push
+> guardrail below is how a source is switched off.
 
 ## Context
 

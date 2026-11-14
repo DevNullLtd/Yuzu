@@ -14,9 +14,11 @@
 > the direction that, for new installations, the opt-in default for `netqual` and `netconn` is
 > replaced by on-by-default with customer-controlled switch-off, and that look-back becomes a
 > switchable unit of its own that runs by default for the sources that ship off today.
-> Existing installations keep their current state. Nothing has
-> changed in the product yet: until the work that follows ADR-3006 lands, this ADR describes
-> what ships.
+> **The default half shipped early, by owner ruling** (PR #6360, 2026-10-23): `netqual` and
+> `netconn`, like every Echo capture source, are on by default on every OS, and agents upgraded
+> past schema v8 were moved to on once; a source an operator switches off afterwards stays off.
+> The opt-in default described below no longer describes what ships. The switchable look-back
+> unit is still pending.
 
 ## Context
 
