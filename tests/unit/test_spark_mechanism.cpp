@@ -15447,4 +15447,263 @@ TEST_CASE("File mechanism (direct): a key joining a directory mid-resync-dispatc
     mech->stop();
 }
 
+// ── #5719 item 5 (B1/B2): per-mechanism deaf-watch tests, Windows ───────────
+//
+// Hunted failure: a watch whose backing object was taken away from under it
+// stays armed, reports Healthy and delivers nothing. The oracle is the literal
+// one of docs/spark-flip-gate.md precondition (e): within a bound the
+// mechanism calls fault(), i.e. `engine.stats().armed_faulted == 1`. A watch
+// that merely stops delivering, or whose coverage drops without a fault, is a
+// RED test, not a pass. Delivery after the object is repaired is asserted only
+// as a secondary check.
+//
+// The bound is a liveness bound (spin_until-style), never a timing property.
+// Scratch paths and keys are salted per process (CLAUDE.md #1871); every
+// handle is held by an RAII owner.
+namespace {
+constexpr auto kDeafBound = 8000ms;
+
+/// A salted scratch tree: <root>/watched/file.txt. Removed on destruction.
+/// Declare BEFORE any handle that may pin it, so the handle closes first.
+struct DeafWatchTree {
+    std::filesystem::path root;
+    std::filesystem::path parent;
+    std::filesystem::path file;
+    explicit DeafWatchTree(const char* tag) {
+        root = yuzu::test::unique_temp_path(std::string("yuzu_test_5719_") + tag + "_");
+        parent = root / "watched";
+        file = parent / "file.txt";
+        std::filesystem::create_directories(parent);
+        std::ofstream(file) << "seed";
+    }
+    ~DeafWatchTree() {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
+    DeafWatchTree(const DeafWatchTree&) = delete;
+    DeafWatchTree& operator=(const DeafWatchTree&) = delete;
+};
+
+/// The coverage the mechanism reports for `sub`, or nullopt when not reported.
+std::optional<SparkCoverage> deaf_coverage(SparkEngine& engine, SparkEngine::SubscriptionId sub) {
+    const auto est = engine.subscription_establishment(sub);
+    if (!est.has_value())
+        return std::nullopt;
+    return est->coverage;
+}
+
+/// The reported coverage as text, for failure output.
+std::string deaf_coverage_text(SparkEngine& engine, SparkEngine::SubscriptionId sub) {
+    const auto cov = deaf_coverage(engine, sub);
+    if (!cov.has_value())
+        return "(no establishment report)";
+    switch (*cov) {
+    case SparkCoverage::None:
+        return "None";
+    case SparkCoverage::Notification:
+        return "Notification";
+    case SparkCoverage::Poll:
+        return "Poll";
+    }
+    return "(unknown)";
+}
+} // namespace
+
+TEST_CASE("File spark (real mechanism): a parent directory held pending-delete by a second "
+          "handle faults the watch inside the bound (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("pending_delete");
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.health_grace = 100ms;
+        ctl.backend_retry_base = 100ms;
+        ctl.sweep_cadence = 20ms;
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0); // precondition: healthy before the fault
+
+    // A second handle to the watched directory, opened for DELETE with every
+    // share mode, sets the CLASSIC delete disposition (not POSIX semantics, so
+    // the name survives as delete-pending) and stays open: that handle, plus
+    // the mechanism's own, hold the directory pending-delete.
+    UniqueHandle holder(::CreateFileW(tree.parent.c_str(), DELETE | FILE_LIST_DIRECTORY,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+    REQUIRE(holder.valid());
+    std::error_code ec;
+    REQUIRE(std::filesystem::remove(tree.file, ec)); // the directory must be empty
+    FILE_DISPOSITION_INFO di{};
+    di.DeleteFile = TRUE;
+    REQUIRE(::SetFileInformationByHandle(holder.h, FileDispositionInfo, &di, sizeof(di)) != 0);
+
+    // Oracle: the watch is reported faulted, not left Healthy and silent.
+    const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound);
+    INFO("coverage while the directory is pending-delete: " << deaf_coverage_text(engine, *sub));
+    CHECK(faulted);
+
+    // Repair: release the holder so the delete completes, recreate, write.
+    holder.reset();
+    std::filesystem::create_directories(tree.parent, ec);
+    { std::ofstream(tree.file) << "recreated"; }
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, kDeafBound));
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    std::this_thread::sleep_for(100ms); // let any resync settle, then make one real change
+    { std::ofstream(tree.file, std::ios::app) << "change-after-repair"; }
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+        kDeafBound));
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a parent directory renamed away faults the watch "
+          "inside the bound (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("parent_rename");
+    const auto renamed = tree.root / "renamed";
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.health_grace = 100ms;
+        ctl.backend_retry_base = 100ms;
+        ctl.sweep_cadence = 20ms;
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0); // precondition: healthy before the rename
+
+    // The mechanism's directory handle opens with FILE_SHARE_DELETE, so the
+    // rename succeeds and the handle follows the directory to its new name.
+    std::error_code ec;
+    std::filesystem::rename(tree.parent, renamed, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE_FALSE(std::filesystem::exists(tree.parent));
+
+    // Oracle: the watch no longer covers its path, so it must be reported
+    // faulted rather than left Healthy and silent.
+    const bool faulted = eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound);
+    INFO("coverage after the rename: " << deaf_coverage_text(engine, *sub));
+    CHECK(faulted);
+
+    // Secondary: after the original path is repaired a change there must fire.
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    std::filesystem::create_directories(tree.parent, ec);
+    { std::ofstream(tree.file) << "recreated"; }
+    std::this_thread::sleep_for(100ms);
+    { std::ofstream(tree.file, std::ios::app) << "change-after-repair"; }
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+        kDeafBound));
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing re-probe faults "
+          "the watch inside the bound and recovers (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    // The target's parent directory is absent, so the watch shelters under an
+    // ancestor (the salted root). ancestor_rearm_fail_hook forces that
+    // ancestor's re-arm to fail, which invalidates it and sends the dependent
+    // back to discovery; probe_hook then makes every re-probe fail. A re-arm
+    // failure alone is NOT a fault (the dependent re-probes and re-shelters,
+    // the existing "dead ancestor strips shelter" case), so the failing
+    // re-probe is what makes this scenario a deaf one.
+    DeafWatchTree tree("ancestor_rearm");
+    const auto missing_file = tree.root / "absent_dir" / "file.txt";
+    const std::wstring root_w = tree.root.wstring();
+    std::atomic<bool> fail_rearm{false};
+    std::atomic<bool> fail_probes{false};
+    std::atomic<int> rearm_hits{0};
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.health_grace = 100ms;
+        ctl.backend_retry_base = 100ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.ancestor_rearm_fail_hook = [&](std::wstring_view dir) {
+            if (dir == root_w && fail_rearm.load(std::memory_order_acquire)) {
+                rearm_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.probe_hook = [&](std::wstring_view) {
+            if (fail_probes.load(std::memory_order_acquire))
+                throw std::runtime_error("injected re-probe failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(missing_file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] {
+            const auto d = file_debug_counters_for_test(*raw);
+            return d.has_value() && d->live_ancestors >= 1;
+        },
+        kDeafBound));
+    REQUIRE(engine.stats().armed_faulted == 0); // precondition: sheltered and healthy
+
+    fail_rearm.store(true, std::memory_order_release);
+    fail_probes.store(true, std::memory_order_release);
+    { std::ofstream(tree.root / "unrelated.txt") << "x"; } // a real completion on the ancestor
+    REQUIRE(eventually([&] { return rearm_hits.load(std::memory_order_acquire) >= 1; },
+                       kDeafBound)); // the forced re-arm failure really ran
+
+    // Oracle: the dependent cannot re-establish, so it is faulted.
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, kDeafBound));
+    {
+        // The forced re-arm failure invalidated the ancestor (the failed
+        // reissue path, not an ordinary re-resolve, which would keep it).
+        const auto d = file_debug_counters_for_test(*raw);
+        REQUIRE(d.has_value());
+        CHECK(d->live_ancestors == 0);
+    }
+
+    // Secondary: lift both injections; the watch recovers and the repaired path fires.
+    fail_probes.store(false, std::memory_order_release);
+    fail_rearm.store(false, std::memory_order_release);
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, kDeafBound));
+    std::error_code ec;
+    std::filesystem::create_directories(missing_file.parent_path(), ec);
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    { std::ofstream(missing_file) << "created"; }
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
+        kDeafBound));
+    engine.disarm(*sub);
+    engine.stop();
+}
+
 #endif // _WIN32
