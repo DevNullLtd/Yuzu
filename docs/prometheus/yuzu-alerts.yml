@@ -3202,12 +3202,16 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "A contained device keeps losing its firewall containment"
+          summary: "Contained devices keep losing their firewall containment"
           description: >-
-            QuarantineContainmentReconciler found a confirmed record whose device
-            no longer reports its rules in force three or more times in the last
-            hour (yuzu_server_quarantine_reapply_total{result="drift"}), and
-            re-applied it each time. Something on the host removes the rules,
+            QuarantineContainmentReconciler saw three or more drift observations
+            in the last hour across this server's contained devices
+            (yuzu_server_quarantine_reapply_total{result="drift"}): a confirmed
+            record whose device no longer reports its rules in force, with a
+            re-apply scheduled each time. The counter cannot tell one device
+            drifting three times from three devices drifting once, nor whether
+            the re-apply succeeded; the audit rows below show both. Something on
+            the host removes the rules,
             for example a host firewall manager or a management-tool reload. Each
             cycle can leave the device uncontained for up to 5 minutes (the
             re-verify interval) before the next re-apply, so a device that

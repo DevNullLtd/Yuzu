@@ -804,8 +804,8 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   command was in flight): a failed read writes no row and re-verifies, a release requested in the
   meantime makes it a release, and only a record that still reads active gets one `quarantine.reapply`
   failure row (`drift status=<name>`, counted as `result="drift"`), then the next cycle re-applies
-  through the same chokepoint. `YuzuQuarantineDriftRepeated` fires when that repeats three times in an
-  hour. A device whose live session changes (a reboot) re-verifies via status first, and a
+  through the same chokepoint. `YuzuQuarantineDriftRepeated` fires at three drift rows in an hour across
+  the server's devices (the counter has no device label; the audit rows name each device). A device whose live session changes (a reboot) re-verifies via status first, and a
   record that is replaced (released and re-quarantined while the agent stayed connected) resets to a
   fresh apply. A confirm is checked against the session that was live when the verifying status was
   sent. A restarted server applies first (its in-memory state starts empty), then reads status.
