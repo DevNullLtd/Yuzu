@@ -2192,6 +2192,13 @@ TEST_CASE("REST inventory/software: rows carry purl (null when empty); purl= sel
     CHECK(agent_set(hit) == agent_set(get_lookup(h, "?name=git&version=2.1&ecosystem=deb")));
     CHECK(agent_set(get_lookup(h, "?purl=" + enc(purl_a) + "&agent_id=dev-c")) ==
           std::set<std::string>{"dev-c"}); // composes with the other filters
+    // name + vers + purl + status together: the resolved version set and the purl predicate are
+    // both bound (placeholder numbering), and each narrows the result on its own.
+    const std::string all_four =
+        "?name=git&purl=" + enc(purl_a) + "&status=current&vers=" + enc("vers:generic/");
+    CHECK(agent_set(get_lookup(h, all_four + enc(">=2.0|<2.2"))) ==
+          std::set<std::string>{"dev-a", "dev-c"});
+    CHECK(agent_set(get_lookup(h, all_four + enc(">=2.2"))).empty()); // vers excludes purl_a's 2.1
     // No prefix or case matching: the value is compared byte for byte.
     CHECK(agent_set(get_lookup(h, "?purl=" + enc(purl_a + "x"))).empty());
     // The scheme is compared byte for byte too: an upper-case scheme is not a purl, so it is refused.
@@ -2246,6 +2253,7 @@ TEST_CASE("REST inventory/software: vers: resolves to the same rows and totals a
     seed(store, "dev-b", {{"git", "1.10", "", ""}});
     seed(store, "dev-c", {{"git", "2.0-rc1", "", ""}});
     seed(store, "dev-d", {{"git", "2.0", "", ""}});
+    seed(store, "dev-e", {{"git", "", "", ""}}); // no known version: outside every range
     InvHarness h{&store};
     auto vers_query = [](const std::string& v) { return "?name=git&vers=" + enc(v); };
 
@@ -2260,7 +2268,13 @@ TEST_CASE("REST inventory/software: vers: resolves to the same rows and totals a
     CHECK(agent_set(get_lookup(h, vers_query("vers:semver/>=1.9|<=2.0|!=2.0-rc1"))) ==
           std::set<std::string>{"dev-a", "dev-b", "dev-d"});
     CHECK(agent_set(get_lookup(h, vers_query("vers:npm/1.10"))) == std::set<std::string>{"dev-b"});
-    CHECK(agent_set(get_lookup(h, vers_query("vers:pypi/*"))).size() == 4);
+    CHECK(agent_set(get_lookup(h, vers_query("vers:pypi/*"))) ==
+          std::set<std::string>{"dev-a", "dev-b", "dev-c", "dev-d"}); // not dev-e
+    // A `!=`-only range is every other version that has one: dev-e is outside it as well, and
+    // only a present-empty version= selects it.
+    CHECK(agent_set(get_lookup(h, vers_query("vers:generic/!=2.0"))) ==
+          std::set<std::string>{"dev-a", "dev-b", "dev-c"});
+    CHECK(agent_set(get_lookup(h, "?name=git&version=")) == std::set<std::string>{"dev-e"});
     CHECK(agent_set(get_lookup(h, vers_query("vers:maven/>=5"))).empty()); // empty, not an error
 
     // The audit target records the vers input (log_token folds '=' to '_').
@@ -2285,8 +2299,9 @@ TEST_CASE("REST inventory/software: vers: resolves to the same rows and totals a
           "vers cannot be combined with version, version_min or version_max");
     CHECK(error_message(get_lookup(h, vers_query("vers:generic/>=1") + "&version=1", 400)) ==
           "vers cannot be combined with version, version_min or version_max");
-    CHECK(get_lookup(h, vers_query(std::string("vers:generic/") + std::string(1100, '1')), 400)
-              .contains("error"));
+    CHECK(error_message(get_lookup(
+              h, vers_query(std::string("vers:generic/") + std::string(1100, '1')), 400)) ==
+          "vers too long");
     CHECK(h.audit_log.empty()); // a 400 writes nothing
 }
 

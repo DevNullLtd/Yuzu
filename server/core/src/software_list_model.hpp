@@ -94,7 +94,7 @@ struct VersionFilter {
     std::string vers; ///< the raw `vers` text (fingerprint and audit); the parsed form is `range`
     /// The one range the request asks for: parsed `vers`, or `version_min`/`version_max` as a
     /// generic Range. nullopt = no version-range filter.
-    std::optional<vers::Range> range;
+    std::optional<::yuzu::server::vers::Range> range;
     [[nodiscard]] bool has_range() const { return range.has_value(); }
 };
 

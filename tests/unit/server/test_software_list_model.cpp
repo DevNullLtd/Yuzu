@@ -283,6 +283,15 @@ TEST_CASE("version_min/version_max and the equivalent vers: range resolve to the
     set = resolve_version_range(versions, *all->range);
     REQUIRE(set);
     CHECK(set->size() == 6);
+    // A `!=`-only range is "every other version that has one": the empty version is outside it too
+    // (an unknown version is not asserted to differ from 2.0), so it is only reachable by version=.
+    auto other = parse_list_params(params({{"name", "git"}, {"vers", "vers:generic/!=2.0"}}));
+    REQUIRE(other);
+    set = resolve_version_range(versions, *other->range);
+    REQUIRE(set);
+    std::ranges::sort(*set);
+    CHECK(*set == std::vector<std::string>{"1.0", "1.10", "1.9", "2.0-rc1", "3.1"});
+    CHECK(std::ranges::find(*set, std::string()) == set->end());
 }
 
 TEST_CASE("resolve_version_range: a read that filled the cap is refused, wording neutral",

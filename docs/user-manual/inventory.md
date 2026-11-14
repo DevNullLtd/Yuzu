@@ -444,8 +444,8 @@ database.
   formulae and casks carry one; the other ecosystems have no registered Package-URL type, so
   their `purl` is empty, and so is the Homebrew presence row. The server stores it only from the
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
-  value is indexed, and the store can look up the devices carrying exactly one `purl`; the
-  dashboard and the API do not return it yet.
+  value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
+  installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -836,7 +836,9 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
   turns `totals` off (`totals_omitted: "filters"`). `vers=` is the
   same range as `version_min` / `version_max`, written `vers:<scheme>/<constraint>|...` with
-  comparators `=` `!=` `<` `<=` `>` `>=` (`*` alone matches every version); it needs `name` with
+  comparators `=` `!=` `<` `<=` `>` `>=` (`*` alone matches every version that has one); a row
+  with an empty version is outside every range, `*` and a `!=`-only range included, and is
+  selected with a present-empty `version=`. It needs `name` with
   `match=exact` and is not combined with `version`, `version_min` or `version_max`. The
   schemes `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are accepted and are **all
   compared with the one catalogue comparator**, so a scheme's own edge ordering (Maven
