@@ -37,7 +37,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <expected>
 #include <optional>
 #include <set>
@@ -135,16 +134,6 @@ extern const std::string_view kSoftwareLifecycleSeed;
                                        std::chrono::month{static_cast<unsigned>(v[1])},
                                        std::chrono::day{static_cast<unsigned>(v[2])}}
                .ok();
-}
-
-/// The UTC calendar day of an epoch-seconds instant, as `YYYY-MM-DD`.
-[[nodiscard]] inline std::string lifecycle_date_from_epoch(std::int64_t epoch_secs) {
-    const std::chrono::year_month_day ymd{std::chrono::floor<std::chrono::days>(
-        std::chrono::sys_seconds{std::chrono::seconds{epoch_secs}})};
-    char buf[16];
-    std::snprintf(buf, sizeof buf, "%04d-%02u-%02u", static_cast<int>(ymd.year()),
-                  static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()));
-    return buf;
 }
 
 /// One shipped, external or imported rule: from `date`, versions of `product_key` that start with

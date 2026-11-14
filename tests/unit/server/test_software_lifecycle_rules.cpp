@@ -220,10 +220,6 @@ TEST_CASE("lifecycle: dates are strict calendar dates", "[lifecycle][rules]") {
     CHECK_FALSE(is_lifecycle_date("2023/01/01"));
     CHECK_FALSE(is_lifecycle_date("1969-12-31"));
     CHECK_FALSE(is_lifecycle_date(""));
-    CHECK(lifecycle_date_from_epoch(0) == "1970-01-01");
-    CHECK(lifecycle_date_from_epoch(86399) == "1970-01-01");
-    CHECK(lifecycle_date_from_epoch(86400) == "1970-01-02");
-    CHECK(lifecycle_date_from_epoch(1'763'078'400) == "2025-11-14");
 }
 
 TEST_CASE("lifecycle: keys", "[lifecycle][rules]") {
