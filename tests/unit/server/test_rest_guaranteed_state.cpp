@@ -34,6 +34,7 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dex_api_local.hpp" // ADR-0031 WS-A4: wire the real DexApi seam so the DEX REST cases exercise it
+#include "guardian_order_json.hpp" // UP-14 A5a: the shared rendering of the ordering block
 #include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
 #include "mcp_retry.hpp" // kGuardianCensusDeviceTimeoutMessage/Remedy: the 57014 response wording (#7217)
 #include "rest_api_v1.hpp"
@@ -7020,4 +7021,224 @@ TEST_CASE("REST gs.status: a decommission erases the device's census and pending
         CHECK_FALSE(g["guards"][0]["projection_pending"].get<bool>());
         CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
     }
+}
+
+// ── UP-14 server PR A5a: the stored per-agent ordering state on the fleet rollup and the per-device
+// all-guards read. Stored and counted, not yet compared: nothing here changes a verdict. ──
+namespace {
+
+// One census-bearing event for (agent, rule) through the real store. `pair` set = a paired event.
+// `n` makes the event id and the agent stamp unique, so every call is a first delivery.
+void rest_send_event(RestGsHarness& h, int n, const std::string& agent, const std::string& rule,
+                     std::optional<std::pair<std::int64_t, std::int64_t>> pair = std::nullopt) {
+    GuaranteedStateEventRow e;
+    e.event_id = "ord-" + std::to_string(n);
+    e.rule_id = rule;
+    e.agent_id = agent;
+    e.event_type = "guard.compliant";
+    e.severity = "info";
+    e.timestamp = "2026-06-20T10:00:00Z";
+    e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp) + n * 1'000'000'000LL;
+    if (pair) {
+        e.boot_epoch = pair->first;
+        e.emit_seq = pair->second;
+    }
+    REQUIRE(h.store->insert_event(e).has_value());
+}
+
+std::vector<std::string> rest_id_array(const nlohmann::json& a) {
+    REQUIRE(a.is_array());
+    std::vector<std::string> out;
+    for (const auto& x : a)
+        out.push_back(x.get<std::string>());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("REST gs.status: unordered_agents and unordered_agent_ids report the agents whose latest "
+          "unpaired event is later than their pair clock",
+          "[pg][rest][guaranteed_state][status][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    rest_send_event(h, 1, "U2", "r1");
+    rest_send_event(h, 2, "U1", "r1");
+    rest_send_event(h, 3, "P", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 4, "M", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 5, "M", "r1"); // unpaired after the clock: unordered again
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == 3);
+    CHECK(rest_id_array(d["unordered_agent_ids"]) == std::vector<std::string>{"M", "U1", "U2"});
+    // The note says what the pair is and that nothing compares it yet (reverting the wording must
+    // turn this red).
+    const auto note = d["note"].get<std::string>();
+    CHECK(note.find("unordered_agents counts agents") != std::string::npos);
+    CHECK(note.find("not yet compared") != std::string::npos);
+}
+
+TEST_CASE("REST gs.status: the unordered ids are capped at 50 and the count is exact",
+          "[pg][rest][guaranteed_state][status][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    constexpr int kAgents = 55;
+    for (int i = kAgents - 1; i >= 0; --i)
+        rest_send_event(h, i + 1, std::format("ag{:03}", i), "r1");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == kAgents);
+    const auto ids = rest_id_array(d["unordered_agent_ids"]);
+    REQUIRE(ids.size() == yuzu::server::kUnorderedAgentIdCap);
+    CHECK(ids.front() == "ag000");
+    CHECK(ids.back() == "ag049");
+}
+
+TEST_CASE("REST gs.status: a management-group-confined caller sees only visible unordered agents "
+          "and a count that excludes the hidden ones (AdmitScoped)",
+          "[pg][rest][guaranteed_state][status][ordering][pair][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "VIS").has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "VIS-PAIRED").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    rest_send_event(h, 1, "VIS", "r1");
+    rest_send_event(h, 2, "HIDDEN-1", "r1"); // unordered, but outside carol's scope
+    rest_send_event(h, 3, "HIDDEN-2", "r1");
+    rest_send_event(h, 4, "VIS-PAIRED", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == 1);
+    CHECK(rest_id_array(d["unordered_agent_ids"]) == std::vector<std::string>{"VIS"});
+    // A hidden agent's id is nowhere in the body.
+    CHECK(res->body.find("HIDDEN") == std::string::npos);
+}
+
+TEST_CASE("REST gs.status: a confined caller with zero visible agents gets zero unordered agents "
+          "(INV-2), not the fleet's",
+          "[pg][rest][guaranteed_state][status][ordering][pair][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "EmptyRegion";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "dana", "GsReader"}).has_value());
+    h.session_user = "dana";
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    rest_send_event(h, 1, "WS-1", "r1");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == 0);
+    REQUIRE(d["unordered_agent_ids"].is_array());
+    CHECK(d["unordered_agent_ids"].empty());
+}
+
+TEST_CASE("REST gs.agents/{id}/rules: ordering is the agent's order row, null for an agent with none",
+          "[pg][rest][guaranteed_state][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    rest_send_event(h, 1, "U", "r1");
+    rest_send_event(h, 2, "P", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 3, "M", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 4, "M", "r1");
+
+    const auto data = [&](const char* id) {
+        auto res = h.sink.Get(std::string("/api/v1/guaranteed-state/agents/") + id + "/rules");
+        REQUIRE(res);
+        INFO(res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+
+    SECTION("an unpaired agent is currently unordered") {
+        const auto o = data("U")["ordering"];
+        REQUIRE(o.is_object());
+        CHECK(o["currently_unordered"] == true);
+        CHECK(o["epoch"].is_null());
+        CHECK(o["epoch_recv_ns"].is_null());
+        CHECK(o["unpaired_events"] == 1);
+    }
+    SECTION("a paired agent is not") {
+        const auto o = data("P")["ordering"];
+        REQUIRE(o.is_object());
+        CHECK(o["currently_unordered"] == false);
+        CHECK(o["epoch"] == 5);
+        CHECK(o["emit_seq_hwm"] == 10);
+        CHECK(o["unpaired_recv_ns"].is_null());
+        CHECK(o["unpaired_events"] == 0);
+    }
+    SECTION("a paired agent with a later unpaired event is again") {
+        const auto o = data("M")["ordering"];
+        REQUIRE(o.is_object());
+        CHECK(o["currently_unordered"] == true);
+        CHECK(o["epoch"] == 5);
+        CHECK(o["unpaired_events"] == 1);
+    }
+    SECTION("an agent with no order row has ordering null, the key still present") {
+        const auto d = data("nobody");
+        REQUIRE(d.contains("ordering"));
+        CHECK(d["ordering"].is_null());
+        CHECK(d["guards"].empty());
+    }
+    SECTION("the block is exactly the shared rendering of the store row") {
+        const auto row = h.store->agent_order_for_agent("M");
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        CHECK(data("M")["ordering"] ==
+              nlohmann::json::parse(yuzu::server::render_guardian_agent_order_json(**row)));
+    }
+}
+
+TEST_CASE("REST gs: a failed order read is a 503, never a zero or a null ordering",
+          "[pg][rest][guaranteed_state][status][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    rest_send_event(h, 1, "U", "r1");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    auto fleet = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(fleet);
+    CHECK(fleet->status == 503);
+    CHECK(fleet->body.find("unordered_agents") == std::string::npos);
+    CHECK(nlohmann::json::parse(fleet->body)["error"]["retry_after_ms"] == 5000);
+
+    auto dev = h.sink.Get("/api/v1/guaranteed-state/agents/U/rules");
+    REQUIRE(dev);
+    CHECK(dev->status == 503);
+    CHECK(dev->body.find("\"ordering\"") == std::string::npos);
+    CHECK(nlohmann::json::parse(dev->body)["error"]["retry_after_ms"] == 5000);
 }

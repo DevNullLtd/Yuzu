@@ -109,6 +109,25 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
                           {{"status", std::string(event_insert_status_label(status))}}, buckets);
 }
 
+void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
+                                             const GuaranteedStateStore& store) {
+    // Published only on success: an unanswered read must not read as zero, and a failed one leaves
+    // the last value. The count-only read is bounded and counted on the gauge's own degrade source.
+    // The caller is a bare thread body, so nothing may escape: the handler nests its own
+    // observability (formatting allocates), the pattern of the bridge sweep tick in server.cpp.
+    try {
+        if (const auto unordered = store.unordered_agent_count())
+            metrics.gauge(kGuardianCensusUnorderedAgentsMetric)
+                .set(static_cast<double>(*unordered));
+    } catch (...) {
+        try {
+            spdlog::warn(
+                "guardian census unordered-agents gauge tick failed; keeping the last value");
+        } catch (...) { // NOLINT(bugprone-empty-catch) - nested by design
+        }
+    }
+}
+
 // ── #4666 PR-4: dedicated bounded async logger for the T_server diagnostic line ─────────────
 // See the full design rationale on the declarations in guardian_ingest.hpp. This is
 // deliberately much lighter than agents/core/src/log_handoff.hpp's LogHandoff: one 1024-slot
@@ -252,6 +271,49 @@ std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seco
     return seconds * kNsPerSec + nanos;
 }
 
+WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept {
+    // Exclusive upper bound: below 2^62 the BIGINT sign bit is unreachable.
+    constexpr std::uint64_t kPairLimit = std::uint64_t{1} << 62;
+    if (boot_epoch == 0 && emit_seq == 0)
+        return {};
+    if (boot_epoch == 0 || emit_seq == 0)
+        return {.reject = PairReject::HalfSet};
+    if (boot_epoch >= kPairLimit || emit_seq >= kPairLimit)
+        return {.reject = PairReject::OutOfRange};
+    return {.paired = true,
+            .boot_epoch = static_cast<std::int64_t>(boot_epoch),
+            .emit_seq = static_cast<std::int64_t>(emit_seq)};
+}
+
+std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,
+                                          std::uint64_t emit_seq) {
+    row.boot_epoch.reset();
+    row.emit_seq.reset();
+    const WirePair wire = pair_from_wire(boot_epoch, emit_seq);
+    if (wire.paired) {
+        row.boot_epoch = wire.boot_epoch;
+        row.emit_seq = wire.emit_seq;
+        return std::nullopt;
+    }
+    if (wire.reject == PairReject::None)
+        return std::nullopt; // 0/0: an unpaired sender, not a rejection
+    return wire.reject;
+}
+
+void report_pair_reject(PairReject reject, const GuaranteedStateEventRow& row,
+                        yuzu::MetricsRegistry* metrics) {
+    const char* reason = pair_reject_reason(reject);
+    spdlog::warn("Guardian: withholding the emit-order pair ({}) from agent {} event {}; the "
+                 "event is still stored unpaired",
+                 reason, log_id_token(row.agent_id), log_id_token(row.event_id));
+    if (metrics) {
+        try { // best-effort metric; never propagate onto the ingest thread
+            metrics->counter(kGuardianPairRejectedMetric, {{"reason", reason}}).increment();
+        } catch (...) {
+        }
+    }
+}
+
 void ingest_guardian_response(GuaranteedStateStore& store, const std::string& agent_id,
                               const pb::CommandResponse& resp, BlastRadiusDetector* blast_radius,
                               DexAlertRouter* alert_router, yuzu::MetricsRegistry* metrics) {
@@ -323,6 +385,10 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
             ev.has_timestamp(), ev.timestamp().seconds(), ev.timestamp().nanos());
         ev_row.agent_ns = stamp.value_or(0);
         ev_row.received_ns = recv_wall_ns;
+        // Applied now, reported only after the store accepts the event (below): a redelivery of
+        // the same event must not count or warn again.
+        const std::optional<PairReject> pair_reject =
+            apply_wire_pair(ev_row, ev.boot_epoch(), ev.emit_seq());
         // Enrich severity from the rule store (contract decision 4) — the agent
         // isn't pushed severity. Fall back to the event's own value, then
         // "unknown" for an already-deleted rule.
@@ -366,6 +432,8 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         }
         switch (res.outcome) {
         case EventInsertOutcome::Inserted:
+            if (pair_reject)
+                report_pair_reject(*pair_reject, ev_row, metrics);
             break; // fall through to the observers below
         case EventInsertOutcome::Redelivered:
             // Agent-controlled identifiers are neutralised before they reach any key=value

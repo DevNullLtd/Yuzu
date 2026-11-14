@@ -53331,3 +53331,244 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
         CHECK((*child)->agents_unanswered == 3);
     }
 }
+
+// ── UP-14 server PR A5a: the stored per-agent ordering state on the two MCP twins ──
+// get_guardian_status gains unordered_agents / unordered_agent_ids (scoped by the same
+// require_list_read gate as errored_rules); get_guardian_device_guards gains the `ordering` block.
+// Stored and counted, not yet compared.
+namespace {
+
+void mcp_seed_paired(GuaranteedStateStore& store, const std::string& event_id,
+                     const std::string& agent, const std::string& rule_id, std::int64_t epoch,
+                     std::int64_t seq, const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = event_id;
+    e.rule_id = rule_id;
+    e.agent_id = agent;
+    e.event_type = "guard.compliant";
+    e.severity = "info";
+    e.timestamp = ts;
+    e.agent_ns = yuzu::test::iso8601_to_ns(ts);
+    e.boot_epoch = epoch;
+    e.emit_seq = seq;
+    REQUIRE(store.insert_event(e).has_value());
+}
+
+constexpr const char* kMcpStatusCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":7301,"params":{"name":"get_guardian_status"}})";
+
+std::string mcp_device_guards_call(const std::string& agent) {
+    return R"({"jsonrpc":"2.0","method":"tools/call","id":7302,"params":{"name":"get_guardian_device_guards",)"
+           R"("arguments":{"agent_id":")" +
+           agent + R"("}}})";
+}
+
+} // namespace
+
+TEST_CASE("MCP Guardian: get_guardian_status reports the unordered agents, scoped by the list-read "
+          "gate, with the ids capped",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "U2", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "e2", "U1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_paired(store, "e3", "P", "r1", 5, 10, "2026-06-20T10:01:00Z");
+
+    // The gate's answer is read at call time, so each section sets the scope it wants.
+    std::optional<std::vector<std::string>> scope; // nullopt = the whole fleet
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.list_read_fn_for_test = [&scope](const httplib::Request&, httplib::Response&,
+                                        const std::string&,
+                                        const std::string&) -> yuzu::server::ListReadGate {
+        return {true, scope, std::nullopt};
+    };
+    ts.start("readonly");
+
+    SECTION("the whole fleet") {
+        const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+        CHECK(d["unordered_agents"].get<int>() == 2);
+        CHECK(mcp_string_array(d["unordered_agent_ids"]) == std::vector<std::string>{"U1", "U2"});
+    }
+    SECTION("a confined caller: a hidden unordered agent neither appears nor counts") {
+        scope = std::vector<std::string>{"U1", "P"};
+        const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+        CHECK(d["unordered_agents"].get<int>() == 1);
+        CHECK(mcp_string_array(d["unordered_agent_ids"]) == std::vector<std::string>{"U1"});
+        auto res = ts.call(kMcpStatusCall);
+        REQUIRE(res);
+        CHECK(res->body.find("U2") == std::string::npos);
+    }
+    SECTION("an engaged-empty scope answers zero") {
+        scope = std::vector<std::string>{};
+        const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+        CHECK(d["unordered_agents"].get<int>() == 0);
+        REQUIRE(d["unordered_agent_ids"].is_array());
+        CHECK(d["unordered_agent_ids"].empty());
+    }
+}
+
+TEST_CASE("MCP Guardian: get_guardian_status caps the unordered ids at 50 and keeps the exact count",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    constexpr int kAgents = 55;
+    for (int i = kAgents - 1; i >= 0; --i)
+        mcp_seed_status(store, "e" + std::to_string(i), std::format("ag{:03}", i), "r1",
+                        "guard.compliant", "2026-06-20T10:01:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+    CHECK(d["unordered_agents"].get<int>() == kAgents);
+    const auto ids = mcp_string_array(d["unordered_agent_ids"]);
+    REQUIRE(ids.size() == yuzu::server::kUnorderedAgentIdCap);
+    CHECK(ids.front() == "ag000");
+    CHECK(ids.back() == "ag049");
+}
+
+TEST_CASE("MCP Guardian: get_guardian_device_guards carries the ordering block, equal to the REST "
+          "data, null for an agent with no order row",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "U", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_paired(store, "e2", "P", "r1", 5, 10, "2026-06-20T10:01:00Z");
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    GuardianRestTwin rest(&store, /*bl=*/nullptr);
+
+    const auto url = [](const std::string& id) {
+        return "/api/v1/guaranteed-state/agents/" + id + "/rules";
+    };
+
+    const auto u = mcp_ok_payload(ts, mcp_device_guards_call("U").c_str());
+    REQUIRE(u["ordering"].is_object());
+    CHECK(u["ordering"]["currently_unordered"] == true);
+    CHECK(u["ordering"]["epoch"].is_null());
+    CHECK(u["ordering"]["unpaired_events"] == 1);
+    CHECK(rest_twin_data(rest, url("U").c_str()) == u);
+
+    const auto p = mcp_ok_payload(ts, mcp_device_guards_call("P").c_str());
+    REQUIRE(p["ordering"].is_object());
+    CHECK(p["ordering"]["currently_unordered"] == false);
+    CHECK(p["ordering"]["epoch"] == 5);
+    CHECK(p["ordering"]["emit_seq_hwm"] == 10);
+    CHECK(rest_twin_data(rest, url("P").c_str()) == p);
+
+    const auto none = mcp_ok_payload(ts, mcp_device_guards_call("nobody").c_str());
+    REQUIRE(none.contains("ordering"));
+    CHECK(none["ordering"].is_null());
+    CHECK(rest_twin_data(rest, url("nobody").c_str()) == none);
+}
+
+TEST_CASE("MCP Guardian: a failed order read is a retryable error on both twins, never a zero",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "U", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE")};
+        REQUIRE(r.ok());
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    for (const std::string call : {std::string(kMcpStatusCall), mcp_device_guards_call("U")}) {
+        INFO(call);
+        auto res = ts.call(call);
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(res->body.find("unordered_agents") == std::string::npos);
+        CHECK(res->body.find("\"ordering\"") == std::string::npos);
+    }
+}
+
+TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, required, typed and bounded",
+          "[mcp][integration][guardian][ordering][pair]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7303})");
+    REQUIRE(list);
+    const auto tools = nlohmann::json::parse(list->body)["result"]["tools"];
+    const auto tool = [&](const char* name) -> nlohmann::json {
+        for (const auto& t : tools)
+            if (t["name"] == name)
+                return t;
+        FAIL("no tool " << name);
+        return nlohmann::json{};
+    };
+    const auto required_has = [](const nlohmann::json& schema, const char* k) {
+        for (const auto& r : schema["required"])
+            if (r == k)
+                return true;
+        return false;
+    };
+
+    const auto status = tool("get_guardian_status");
+    const auto& ss = status["outputSchema"];
+    for (const char* k : {"unordered_agents", "unordered_agent_ids"}) {
+        INFO(k);
+        REQUIRE(ss["properties"].contains(k));
+        CHECK(required_has(ss, k));
+    }
+    CHECK(ss["properties"]["unordered_agents"]["type"] == "integer");
+    CHECK(ss["properties"]["unordered_agents"]["minimum"] == 0);
+    const auto& ids = ss["properties"]["unordered_agent_ids"];
+    CHECK(ids["type"] == "array");
+    CHECK(ids["maxItems"] == yuzu::server::kUnorderedAgentIdCap); // bound to the store's cap
+    CHECK(ids["uniqueItems"] == true);
+    CHECK(ids["items"]["type"] == "string");
+    const std::string sdesc = status["description"].get<std::string>();
+    CHECK(sdesc.size() < 4096);
+    CHECK(sdesc.find("unordered_agents") != std::string::npos);
+    CHECK(sdesc.find("not yet compared") != std::string::npos);
+
+    const auto guards = tool("get_guardian_device_guards");
+    const auto& gs = guards["outputSchema"];
+    REQUIRE(gs["properties"].contains("ordering"));
+    CHECK(required_has(gs, "ordering"));
+    const auto& ord = gs["properties"]["ordering"];
+    const auto types = ord["type"].dump();
+    CHECK(types.find("object") != std::string::npos);
+    CHECK(types.find("null") != std::string::npos);
+    for (const char* k : {"epoch", "emit_seq_hwm", "epoch_recv_ns", "retired_epoch",
+                          "unpaired_recv_ns", "currently_unordered", "unpaired_events",
+                          "unpaired_held", "pair_regressions", "pair_stragglers", "pair_recoveries",
+                          "pair_duplicates", "retired_events"}) {
+        INFO(k);
+        CHECK(ord["properties"].contains(k));
+        CHECK(required_has(ord, k));
+    }
+    CHECK(ord["properties"]["currently_unordered"]["type"] == "boolean");
+    CHECK(ord["properties"]["unpaired_events"]["minimum"] == 0);
+    const std::string gdesc = guards["description"].get<std::string>();
+    CHECK(gdesc.size() < 4096);
+    CHECK(gdesc.find("ordering") != std::string::npos);
+    CHECK(gdesc.find("pair_duplicates") != std::string::npos);
+    CHECK(gdesc.find("not yet compared") != std::string::npos);
+}

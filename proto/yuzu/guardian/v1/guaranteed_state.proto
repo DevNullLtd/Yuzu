@@ -132,14 +132,21 @@ message GuaranteedStateEvent {
   string set_id = 22;
   string reflex_id = 23;
 
-  // Agent-asserted event ORDER, for the server's census ordering (UP-14). 0 = unset
-  // on both; a sender sets BOTH or NEITHER. `boot_epoch` identifies the agent process
-  // incarnation (monotonic across restarts of one agent); `emit_seq` is the 1-based
-  // ordinal drawn at the point the agent decided the event's queue order, strictly
-  // increasing within one `boot_epoch`. Compare (boot_epoch, emit_seq) lexicographically.
-  // Both are agent-asserted ordinals, NOT timestamps (boot_epoch is seeded from the
-  // clock but must not be read as one). Neither is compared by the server's
-  // stored_event_matches (redelivery equality is unchanged).
+  // Agent-asserted event ORDER for the server's census (UP-14: a backward wall-clock step
+  // between an older compliant and a newer errored verdict gives the newer one the earlier
+  // timestamp, so a timestamp-ordered census keeps the stale verdict). 0 = unset on both; a
+  // sender sets BOTH or NEITHER; the server treats a half-set or out-of-range pair as unset
+  // and counts it. `boot_epoch` identifies the agent process incarnation, claimed once at boot
+  // as max(persisted + 1, boot unix seconds), below 2^62. It is NOT guaranteed monotonic
+  // across restarts: a lost, corrupt or restored-older persisted row, or an epoch pinned ahead
+  // by a wrong clock, can make a later boot claim a lower or equal epoch, and two processes
+  // can hold the same one. `emit_seq` is the 1-based ordinal drawn where the agent decides
+  // queue order, strictly increasing within one `boot_epoch` of one process. The server
+  // stores the pair on the event and census rows and counts unpaired events per agent; a
+  // comparator that uses it only between two events that both carry a pair, and treats a
+  // lower pair as a regression candidate rather than proof of order, is a later server
+  // change (docs/spark-flip-gate.md, UP-14). Both are ordinals, NOT timestamps, and
+  // NEITHER is compared by stored_event_matches.
   uint64 boot_epoch = 24;
   uint64 emit_seq = 25;
 }

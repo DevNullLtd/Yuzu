@@ -33,7 +33,11 @@ guardian_status_rollup(GuaranteedStateStore& store,
     auto rule_names_result = store.rule_names();
     auto errored_result = store.errored_rule_count(agent_scope);
     auto uncertain_result = store.uncertain_rule_count(agent_scope);
-    if (!rule_names_result || !errored_result || !uncertain_result)
+    // UP-14: the agents whose latest unpaired event is later than their pair clock, under the SAME
+    // agent_scope (applied in SQL by the store, so a hidden agent never appears in the ids or the
+    // count). A failed read degrades the whole rollup like the three above, never a silent zero.
+    auto unordered_result = store.unordered_agents(agent_scope);
+    if (!rule_names_result || !errored_result || !uncertain_result || !unordered_result)
         return std::nullopt;
     GuardianStatusRollup out;
     out.total_rules = static_cast<std::int64_t>(rule_names_result->size());
@@ -41,6 +45,8 @@ guardian_status_rollup(GuaranteedStateStore& store,
     out.drifted_rules = 0;
     out.errored_rules = static_cast<std::int64_t>(*errored_result);
     out.uncertain_rules = static_cast<std::int64_t>(*uncertain_result);
+    out.unordered_agents = unordered_result->count;
+    out.unordered_agent_ids = std::move(unordered_result->ids);
     return out;
 }
 
@@ -121,6 +127,13 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
         set_fault(fault, GuardianReadFault::kTransient);
         return std::nullopt;
     }
+    // The stored emit-order pair state of this device. No row is an answer (nullopt), a failed
+    // read is a transient degrade: never a null `ordering` standing in for "could not read".
+    auto order = store.agent_order_for_agent(agent_id);
+    if (!order) {
+        set_fault(fault, GuardianReadFault::kTransient);
+        return std::nullopt;
+    }
     GuardianDeviceGuardsReport out;
     out.guards.reserve(statuses->size());
     for (const auto& s : *statuses) {
@@ -136,6 +149,7 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
     }
     out.unrepresented_pending_guards = unrepresented->count;
     out.unrepresented_pending_rule_ids = std::move(unrepresented->rule_ids);
+    out.ordering = std::move(*order);
     return out;
 }
 
