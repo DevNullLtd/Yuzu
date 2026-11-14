@@ -1318,3 +1318,137 @@ TEST_CASE("OfflineEndpointStore query_stale_within: concurrent truncated reads e
     CHECK(metrics.counter("yuzu_server_agent_presence_roster_truncated_total").value() ==
           static_cast<double>(kThreads * kReadsEach));
 }
+
+// HA WS-5 #5685 follow-up (plugin-capability visibility, migration v5: `endpoint_plugins`).
+TEST_CASE("OfflineEndpointStore plugin lists (session-keyed and served only for the current "
+          "session and quoted and capped and cascaded and truncation-typed)",
+          "[pg][offline][ha][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+    const auto ttl = std::chrono::hours(1);
+    const auto without = [&](std::string_view plugin) {
+        auto r = store.query_live_ids_without_plugin(ttl, plugin);
+        REQUIRE(r.has_value());
+        return *r;
+    };
+    using Ids = std::vector<std::string>;
+
+    // has-echo, lacks-echo, never-published (unknown), lacks-echo-but-departed.
+    REQUIRE(store.upsert("yuzu_test_pv_has", "h", "linux", 1, 0, "1", "x", "s1"));
+    REQUIRE(store.publish_plugins("yuzu_test_pv_has", "s1", {"echo", "os_info"}));
+    REQUIRE(store.upsert("yuzu_test_pv_lacks", "h", "linux", 1, 0, "1", "x", "s2"));
+    REQUIRE(store.publish_plugins("yuzu_test_pv_lacks", "s2", {"os_info"}));
+    REQUIRE(store.upsert("yuzu_test_pv_unknown", "h", "linux", 1, 0, "1", "x", "s3"));
+    REQUIRE(store.upsert("yuzu_test_pv_gone", "h", "linux", 1, 0, "1", "x", "s4"));
+    REQUIRE(store.publish_plugins("yuzu_test_pv_gone", "s4", {"os_info"}));
+    REQUIRE(store.remove_if_session("yuzu_test_pv_gone", "s4")); // graceful disconnect
+    CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"}); // unknown and departed excluded
+
+    SECTION("a heartbeat that passes no session or list leaves the published list alone") {
+        REQUIRE(store.upsert("yuzu_test_pv_lacks", "", "", 2, 0, "", "", ""));
+        CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"});
+    }
+
+    SECTION("a NEW session with no published list reads as unknown, then republishes") {
+        // The list belongs to the session that reported it: once the row moves to s2b the old
+        // list is not served (fail open), whatever the old list said.
+        REQUIRE(store.upsert("yuzu_test_pv_lacks", "", "", 3, 0, "", "", "s2b"));
+        CHECK(without("echo").empty());
+        REQUIRE(store.publish_plugins("yuzu_test_pv_lacks", "s2b", {"echo"}));
+        CHECK(without("echo").empty()); // the new list HAS echo
+        CHECK(without("os_info") == Ids{"yuzu_test_pv_lacks"});
+    }
+
+    SECTION("arrival clears lists of OTHER sessions only so a restarted agent reads as unknown") {
+        // The endpoint row still names s2 (its session only advances at the NEW session's first
+        // heartbeat), so without the clear a replica would keep judging the agent by s2's list.
+        CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"});
+        CHECK(store.clear_plugins_of_other_sessions("yuzu_test_pv_lacks", "s2b"));
+        CHECK(without("echo").empty()); // unknown now: fails open
+        // The current session's own list is never touched, whichever side lands first.
+        REQUIRE(store.upsert("yuzu_test_pv_cur", "h", "linux", 1, 0, "1", "x", "s7"));
+        REQUIRE(store.publish_plugins("yuzu_test_pv_cur", "s7", {"os_info"}));
+        CHECK(store.clear_plugins_of_other_sessions("yuzu_test_pv_cur", "s7"));
+        const auto still = without("echo");
+        CHECK(std::ranges::find(still, "yuzu_test_pv_cur") != still.end());
+        // Blank ids do nothing.
+        CHECK_FALSE(store.clear_plugins_of_other_sessions("", "s7"));
+        CHECK_FALSE(store.clear_plugins_of_other_sessions("yuzu_test_pv_cur", ""));
+    }
+
+    SECTION("a row older than the ttl is excluded") {
+        exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval "
+                           "'2 hours' WHERE agent_id = 'yuzu_test_pv_lacks'");
+        CHECK(without("echo").empty());
+    }
+
+    SECTION("names are stored as plain text: quotes, braces and NULL are never array syntax") {
+        REQUIRE(store.upsert("yuzu_test_pv_inject", "h", "linux", 1, 0, "1", "x", "s5"));
+        REQUIRE(store.publish_plugins("yuzu_test_pv_inject", "s5",
+                                      {"echo\",\"x", "a}b", "NULL", "os_info"}));
+        const auto lacking_echo = without("echo");
+        CHECK(std::ranges::find(lacking_echo, "yuzu_test_pv_inject") != lacking_echo.end());
+        // "NULL" is an element like any other, so a plugin of that name is present, not absent.
+        const auto lacking_null = without("NULL");
+        CHECK(std::ranges::find(lacking_null, "yuzu_test_pv_inject") == lacking_null.end());
+    }
+
+    SECTION("an empty list, or one of only unusable names, publishes nothing") {
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_lacks", "s2", {}));
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_lacks", "s2", {"", std::string(65, 'x')}));
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_lacks", "", {"echo"}));
+        CHECK(without("echo") == Ids{"yuzu_test_pv_lacks"}); // unchanged
+    }
+
+    SECTION("a list the caps would cut is NOT stored in part: the agent reads as unknown") {
+        // A name left out of a stored partial list would read as ABSENT, and a replica would answer
+        // plugin_not_found for a plugin the agent has. So an over-cap or invalid list publishes
+        // nothing at all.
+        std::vector<std::string> many;
+        for (std::size_t n = 0; n < OfflineEndpointStore::kMaxPublishedPlugins + 40; ++n)
+            many.push_back("p" + std::to_string(n));
+        REQUIRE(store.upsert("yuzu_test_pv_many", "h", "linux", 1, 0, "1", "x", "s6"));
+        const auto listed = [&](std::string_view plugin) {
+            const auto ids = without(plugin);
+            return std::ranges::find(ids, "yuzu_test_pv_many") != ids.end();
+        };
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_many", "s6", many));
+        CHECK_FALSE(listed("p299")); // a stored partial list would LIST the agent here
+        CHECK_FALSE(listed("p0"));
+
+        // Exactly at the cap is stored whole: p255 present, p256 (never in the list) absent.
+        many.resize(OfflineEndpointStore::kMaxPublishedPlugins);
+        REQUIRE(store.publish_plugins("yuzu_test_pv_many", "s6", many));
+        CHECK_FALSE(listed("p255"));
+        CHECK(listed("p256"));
+
+        // One bad name among good ones: nothing is stored (the cap-sized list above stays).
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_many", "s6", {"os_info", "", "echo"}));
+        CHECK_FALSE(store.publish_plugins("yuzu_test_pv_many", "s6",
+                                          {"os_info", std::string(65, 'x')}));
+        CHECK_FALSE(listed("p255")); // unchanged
+        CHECK(listed("echo"));       // still the cap-sized list, which has no echo
+    }
+
+    SECTION("deleting the endpoint (decommission, retention) cascades to its list") {
+        REQUIRE(store.delete_agent("yuzu_test_pv_lacks"));
+        REQUIRE(store.upsert("yuzu_test_pv_lacks", "h", "linux", 1, 0, "1", "x", "s2"));
+        CHECK(without("echo").empty()); // same session id, but the old list is gone: unknown
+    }
+
+    SECTION("a result past kQueryRowCap is Truncated, never a partial set") {
+        exec_sql(db.dsn(),
+                 "INSERT INTO endpoint_state.endpoints (agent_id, last_heartbeat_ms, session_id) "
+                 "SELECT 'cap-' || g, 1, 's-' || g FROM generate_series(1, " +
+                     std::to_string(OfflineEndpointStore::kQueryRowCap + 1) + ") g");
+        exec_sql(db.dsn(), "INSERT INTO endpoint_state.endpoint_plugins "
+                           "SELECT agent_id, session_id, ARRAY['os_info'] "
+                           "FROM endpoint_state.endpoints WHERE agent_id LIKE 'cap-%'");
+        auto r = store.query_live_ids_without_plugin(ttl, "echo");
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PresenceReadError::Truncated);
+    }
+}

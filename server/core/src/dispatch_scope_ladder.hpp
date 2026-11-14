@@ -463,9 +463,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         std::make_shared<yuzu::server::GatewayRouteFallback>(registry, gateway_route_store);
     yuzu::server::ConfinedDispatchSink raw_sink{
         [&registry, &cmd, route_fallback](const std::string& aid) {
-            // A local session ALWAYS wins (route_fallback->prepare() never
-            // even looks up an id with one) — this fallback fires ONLY for a
-            // candidate this replica has no local session for at all.
+            // A session that CAN deliver ALWAYS wins (route_fallback->prepare() never
+            // even looks up an id with one) — this fallback fires only for a candidate
+            // this replica has no local session for at all, or one it holds that has no
+            // delivery path (empty gateway_node and no stream, #5685 hp-1).
             if (auto cluster = route_fallback->cluster_for(aid))
                 return registry.send_via_directory(aid, cmd, *cluster);
             return registry.send_to(aid, cmd);
@@ -498,7 +499,10 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     //
     // COST, ACCEPTED: `ids_missing_plugin` is one locked O(fleet) pass over
     // `agents_` regardless of arm size, so a single-Ids dispatch to one
-    // device pays the same registry walk a fleet broadcast does. Same shape
+    // device pays the same registry walk a fleet broadcast does. It can also
+    // trigger the cached (3 s), single-flight cross-replica plugin read, but
+    // only when the durable presence holds rows beyond this replica's own
+    // sessions, so a single replica never pays that database read. Same shape
     // and same trade as `gate`'s own containment-store read immediately
     // above -- see `make_containment_gate`'s comment for the equivalent
     // "share the one read across arms rather than skip it for small

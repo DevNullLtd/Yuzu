@@ -449,15 +449,19 @@ struct PluginMeta {
 // does not edit in place. Lock-free readers (scope evaluation, the DEX perf
 // provider) depend on this — NONE of them reads `gateway_node`,
 // `gateway_wire_capabilities`, or `gateway_stream_home_id` (verified: their
-// only readers are send_to/send_to_all and agent_registry.cpp's own
-// gateway_stream_home_id() accessor, all under `stream_mu`), which is
-// exactly why those three are NOT in this list. Post-publication writes are
+// readers are send_to/send_to_all, `has_remote_presence`,
+// `lacks_local_delivery_path`/`needs_directory_consult` (#5685 hp-1, via
+// `no_delivery_path`, which only TRY-locks `stream_mu`) and
+// agent_registry.cpp's own gateway_stream_home_id() accessor, all under
+// `stream_mu`), which is exactly why those three are NOT in this list.
+// Post-publication writes are
 // confined to stream/server_context/peer_cert_pem, gateway_node +
 // gateway_wire_capabilities + gateway_stream_home_id (all under stream_mu —
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// comment) and the atomics last_activity_epoch_ms and
+// presence_plugins_published and presence_plugins_retry_after_ms (written by HeartbeatIngestion). `session_id` is ALSO
 // rewritten in place after publication, by AgentRegistry::map_session under
 // AgentRegistry::mu_ (an exception to the identity-field rule above): read
 // it only through session_is()/session_id_of(), never through a
@@ -518,6 +522,14 @@ struct AgentSession {
     /// (`GatewayUpstreamServiceImpl::NotifyStreamStatus`).
     std::string gateway_stream_home_id;
     std::mutex stream_mu;
+
+    /// #5685 follow-up: set once this session's `plugin_names` reached the durable presence row
+    /// (a successful `OfflineEndpointStore::upsert` that carried them), so later heartbeats skip
+    /// re-sending a list that only changes at re-registration (a new session starts false).
+    std::atomic<bool> presence_plugins_published{false};
+    /// steady_clock ms before which a failed publish is not retried (a backoff, so an unhealthy
+    /// store or an unpublishable list costs no database round trip per heartbeat).
+    std::atomic<std::int64_t> presence_plugins_retry_after_ms{0};
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
     // Atomic to avoid acquiring the registry mutex on every stream Read.
@@ -801,6 +813,10 @@ public:
     /// — no caller in `server/core/src/**` references it.
     void expire_presence_cache_for_test();
 
+    /// Test hook: age every cached plugin-capability entry by `by`, so a test can place an entry
+    /// inside or beyond `kMaxStaleServe` without sleeping.
+    void age_plugin_cache_for_test(std::chrono::seconds by);
+
     /// W1.5 / #823: install the device-token store so `register_agent`
     /// revokes any device tokens bound to a previous incarnation of the
     /// same agent_id whenever a re-registration is detected. Optional —
@@ -856,8 +872,10 @@ public:
     int send_to_all(const ClassifiedCommand& cmd);
 
     // WS-4 4.2b Task C: fallback-ONLY queue for an agent this replica has NO
-    // local session for at all (the precondition every caller must have
-    // already established — this method does not itself check `agents_`).
+    // local session for at all — or (#5685 hp-1) one whose local session
+    // `lacks_local_delivery_path` (the precondition every caller must have
+    // already established — this method does not itself check `agents_`,
+    // except to apply the #5294 per-OS kill switch to a local session's OS).
     // The caller (`GatewayRouteFallback`, dispatch_route_fallback.hpp) has
     // already resolved `cluster_id` from a BATCHED GatewayRouteStore
     // directory read. Mirrors `send_to`'s existing gateway_node branch: the
@@ -865,10 +883,10 @@ public:
     // just keyed off a directory-resolved cluster rather than a live
     // session's advertised `gateway_node`. Returns false only on a
     // malformed dispatch tag (the defensive check); queuing itself cannot
-    // fail. NEVER call this for an agent that DOES have a local session —
-    // `send_to` is the sole path for that (this method has no capability
-    // advertisement to check, because there is no session to have
-    // advertised one).
+    // fail. Returns false too when the #5294 kill switch withholds the local
+    // session's OS. NEVER call this for an agent whose local session CAN
+    // deliver — `send_to` is the sole path for that (this method has no
+    // capability advertisement to check).
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
                             const std::string& cluster_id);
 
@@ -980,7 +998,31 @@ public:
     // since genuinely registered locally, this correctly reports "no longer
     // remote" and the fast path (which walks the CURRENT registry) reaches
     // it anyway.
+    //
+    // #5685 hp-1: ALSO true when an id has a local session that
+    // `lacks_local_delivery_path` — `send_to_all` skips such a session, so the
+    // unfiltered fast path would silently drop an agent the directory can reach.
     [[nodiscard]] bool has_remote_presence(const std::vector<std::string>& ids) const;
+
+    /// HA WS-5 #5685 hp-1: true iff this replica holds a session for `agent_id`
+    /// that `send_to` cannot deliver on: an EMPTY `gateway_node` AND no
+    /// Subscribe stream. That is the state a non-owning replica's CONNECTED
+    /// leaves behind (the CONNECTED was handled elsewhere, so the local
+    /// session never learns its placement), and it shadowed the directory
+    /// fallback, which used to consult the store only on a TOTAL local miss.
+    /// It is exactly the state in which `send_to` returns false, so routing
+    /// such an id to the directory can change no outcome that used to succeed:
+    /// a direct agent has a stream, a gateway agent has a `gateway_node`. False
+    /// for an unknown id (that is a plain local miss, handled by the caller).
+    /// Takes `mu_` only to copy the session pointer, then only TRY-locks
+    /// `stream_mu` (never both at once): a held `stream_mu` means a send to the
+    /// session is in flight, so it is reported as HAVING a path. A stalled
+    /// stream write therefore cannot stall a caller of this.
+    [[nodiscard]] bool lacks_local_delivery_path(const std::string& agent_id) const;
+
+    /// What `GatewayRouteFallback::prepare` asks per candidate, in ONE registry lookup: true when
+    /// there is no local session at all, or the session `lacks_local_delivery_path`.
+    [[nodiscard]] bool needs_directory_consult(const std::string& agent_id) const;
 
     // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
     // that all_ids()/evaluate_scope() merge in for ids absent from the local
@@ -999,6 +1041,14 @@ public:
     /// `has_remote_presence`) or it self-deadlocks.
     using PresenceReadFn = std::function<
         std::expected<std::vector<PresenceIdentity>, PresenceReadError>(std::chrono::seconds)>;
+    /// Injectable "live ids whose recorded plugin list lacks `plugin`" read (the
+    /// `query_live_ids_without_plugin` seam). Bound by the store overload of `configure_presence`;
+    /// tests may feed a stub through `configure_presence_plugin_reader`.
+    using PluginMissingReadFn = std::function<
+        std::expected<std::vector<std::string>, PresenceReadError>(std::chrono::seconds,
+                                                                   std::string_view)>;
+    void configure_presence_plugin_reader(PluginMissingReadFn reader,
+                                          std::chrono::seconds ttl = std::chrono::hours{1});
     /// Test-facing overload: assigns the reader AND the TTL it is called with.
     void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
 
@@ -1045,6 +1095,13 @@ public:
     // quarantine/Guardian dispatch; a device that genuinely lacks the plugin
     // answers "plugin not found" itself, which is observable, unlike a
     // server-side withhold.
+    //
+    // #5685 follow-up: ALSO merges ids with NO local session whose durable presence row records a
+    // plugin list lacking `plugin` (`OfflineEndpointStore::query_live_ids_without_plugin`), so a
+    // replica that does not own an agent's session still reports plugin_not_found for it. Local
+    // wins (a local session is judged by its own list, as in `ids_with_os`); an agent with no
+    // recorded list is unknown and fails open; a degraded read fails open too (the cached
+    // failure is served for `kPresenceCacheTtl`, the store counts it).
     std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin,
                                                        std::string_view action) const;
 
@@ -1260,6 +1317,28 @@ private:
         std::vector<PresenceIdentity>{}};
     mutable std::chrono::steady_clock::time_point presence_cache_at_{};
 
+    /// #5685 follow-up (plugin-capability visibility): the cross-replica "live ids whose published
+    /// plugin list lacks `plugin`" read and its per-plugin cache (a success OR a failure, held for
+    /// `kPresenceCacheTtl`). A DEDICATED mutex, never `presence_cache_mu_`: the reader is a
+    /// Postgres query and runs with NO registry lock held (single-flight per plugin through
+    /// `missing_plugin_inflight_`), so it can never stall `live_presence()` or an unrelated
+    /// dispatch. A cached failure is a null pointer (callers fail open). The result is shared, not
+    /// copied, because it can be fleet-sized.
+    using MissingPluginIds = std::shared_ptr<const std::vector<std::string>>;
+    struct MissingPluginCacheEntry {
+        std::chrono::steady_clock::time_point at{};
+        MissingPluginIds ids;
+    };
+    static constexpr std::size_t kMissingPluginCacheMax = 64;
+    /// A refresh in flight lets other callers serve the previous entry only while it is this
+    /// recent; an older one fails open instead.
+    static constexpr std::chrono::seconds kMaxStaleServe{30};
+    mutable std::mutex missing_plugin_mu_;
+    PluginMissingReadFn presence_missing_plugin_reader_;
+    std::chrono::seconds missing_plugin_ttl_{};
+    mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
+    mutable std::unordered_set<std::string> missing_plugin_inflight_;
+
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
     /// read (#4981 PR-1 Finding B). Always acquires `presence_cache_mu_` first, so
@@ -1268,6 +1347,16 @@ private:
     /// single-replica case pays one uncontended mutex acquisition plus the
     /// pointer check, and can never fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
+
+    /// Cached cross-replica "live ids lacking `plugin`" read; null when no reader is wired or the
+    /// read degraded (callers fail open). Takes only `missing_plugin_mu_`, never across the read.
+    MissingPluginIds missing_plugin_from_presence(std::string_view plugin) const;
+
+    /// Row count of the cached live-presence set (refreshing it like `live_presence()` does, but
+    /// without copying it out); 0 when presence is not wired, nullopt on a degraded read.
+    std::optional<std::size_t> presence_row_count() const;
+    /// Refreshes `presence_cache_` when stale. Caller holds `presence_cache_mu_`.
+    void refresh_presence_cache_locked() const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl
     // considers. `LocalOnly` skips the live_presence() call AND the

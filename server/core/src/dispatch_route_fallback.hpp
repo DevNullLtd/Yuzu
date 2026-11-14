@@ -14,9 +14,14 @@
 /// A) into the confined-dispatch arm walk (`dispatch_confined_arms.hpp`) as a
 /// FALLBACK-ONLY consult.
 ///
-/// ACCEPTANCE PROPERTY: this changes ZERO monolith routing outcomes. It fires
+/// ACCEPTANCE PROPERTY: this changes no monolith routing outcome that used to succeed (the
+/// directory read it adds for a session with no delivery path can only turn a failed send
+/// into a delivered one, or a plain not-sent into `route_unreadable` when that read degrades). It fires
 /// ONLY when the existing dispatch resolution finds NO local
-/// `AgentRegistry` session for a target agent (a "local miss") — a
+/// `AgentRegistry` session for a target agent (a "local miss"), or (#5685
+/// hp-1) a local session that has no delivery path at all (empty
+/// `gateway_node` and no stream: `send_to` returns false for it, so no
+/// outcome that used to succeed can change) — a
 /// direct-connected agent NEVER gets a `GatewayRouteStore` row (only the
 /// gateway-service writer path, Tasks A/B, writes rows), so on today's
 /// single-replica monolith a local miss means the agent is genuinely absent
@@ -59,7 +64,10 @@ public:
         std::vector<std::string> missing;
         missing.reserve(candidates.size());
         for (const auto& aid : candidates)
-            if (!registry_.get_session(aid))
+            // #5685 hp-1: a local session `send_to` cannot deliver on (empty
+            // gateway_node, no stream) is treated as a miss, or it shadows the
+            // directory row a different replica published for the same agent.
+            if (registry_.needs_directory_consult(aid))
                 missing.push_back(aid);
         if (missing.empty())
             return false;

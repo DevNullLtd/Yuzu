@@ -439,7 +439,7 @@ from those two settings, not an observed figure. Plan for these requirements:
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
-- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried, and the server's management channel sets no keepalive.
+- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051). Use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried. The server's management channel now sends an HTTP/2 keepalive ping every 30 s, idle or not, and treats the node as down if it is not answered within 10 s (about 40 s to detect a node that stops answering without closing the connection); before this, such a node held every forward to its 300 s deadline. This is expected from the code, with a unit test that the keepalive arguments reach the channel-creation call (the last call into gRPC is checked by inspection), and has not been measured against a real silent-drop fault; a forward that fails this way is retried up to 3 times with the same command id, which the agent's dedup store makes effectively-once. It adds no second address and no failover: surviving a dead node still depends on the one address resolving to a live node. Decision (HA WS-13 slice 13.7, #7062): the supported shape is one name in front of all the gateway nodes, and a list of addresses in `--gateway-command-addr` is deferred until a spike measures it.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
   the sources, the gateway acknowledges proxied heartbeats from its own node-local state
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
@@ -858,11 +858,12 @@ and counts in `yuzu_server_gateway_route_desync_total` under the outcome named, 
 
 | Server WARN line (start) | Outcome | Event | Kind |
 |---|---|---|---|
-| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded and this replica holds no matching local session` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; the same notification is accepted once it reads again |
+| `NotifyStreamStatus: CONNECTED for session ... (agent ...) refused — the directory read degraded; the gateway sends the notice again and it is accepted once the directory reads` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; every CONNECTED is refused while it cannot, and the gateway's resend (#5695) is accepted once it reads again |
 | `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
 | `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
 | `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
 | `NotifyStreamStatus: CONNECTED for agent ... presents session ... that another agent's route already holds (#5683)` | `session_held_by_other_agent` (op `announce_connected`; audit `gateway.session_held_by_other_agent`; alert `YuzuGatewaySessionHeldByOtherAgent`) | CONNECTED | Definitive while the other agent's route holds the session, but the gateway cannot tell it from the others (the answer carries no reason, #6059), so it keeps resending for as long as it holds the session (at the ordinary retry cadence for the first 15 minutes, then in the slow phase at intervals of up to 10 minutes): the WARN and the audit row repeat with each resend, and the alert stays active, until the presenting agent's session ends at the gateway or the other agent's route releases the session id. See [Forged or colliding session ids](#forged-or-colliding-session-ids) |
+| `GatewayRouteStore session lookup: N session id(s) name a different agent in this replica's session map than in the directory; refused and listed for replay` | `agent_mismatch` (op `session_lookup`) | BatchHeartbeat, ProxyInventory | Self-resolving: the id is not acknowledged or ingested and the gateway replays `ProxyRegister`, which decides who holds the id (ProxyInventory refuses the report and logs its own line, `ProxyInventory: session ... names a different agent here than in the route directory; refusing`; the next BatchHeartbeat lists the id for replay). Not alerted. A persistent count means two replicas disagree about a session or the directory was edited by hand |
 
 A failed directory write is answered `true` by this server (the write is
 fail-open); a server change in review (#5961) answers it `UNAVAILABLE` instead,
@@ -3901,8 +3902,8 @@ failures now count toward the shared breaker (see below).
   record a notification"); an older gateway ignores `acknowledged=false` and does
   not retry. The server counts it under
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
-  outcome `connected_unverified` (the directory read failed and this replica
-  holds no matching local session) or `stale_connected_session` (the directory
+  outcome `connected_unverified` (the directory read failed; a CONNECTED is never
+  accepted unverified, whatever this replica holds locally) or `stale_connected_session` (the directory
   row or the local registry names a different session). The same holds for the
   `op="announce_connected"` refusals `session_held_by_other_agent` and the
   affinity pre-check `cluster_affinity_violation`, which answer
@@ -4382,21 +4383,26 @@ that the replica does not hold is neither acknowledged nor listed (so the
 gateway does not re-register in a storm). `ProxyInventory` for a session id the
 directory does not know keeps `received=false` (the agent retries); a local
 hint helps only on a degraded read or for a session that lost a race.
-`NotifyStreamStatus` CONNECTED, when the directory read fails, is accepted only
-if this replica holds the matching local session (the session it registered
-for that agent, which the directory confirmed at `ProxyRegister`), and is
-otherwise rejected (`acknowledged=false`) and counted under
+`NotifyStreamStatus` CONNECTED, when the directory read fails, is always
+rejected (`acknowledged=false`), whatever session this replica holds locally,
+and counted under
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="connected_unverified"}`.
-A delayed CONNECTED for a session this replica has since superseded is counted
-the same way (a successful read counts it as `stale_connected_session`).
+A replica cannot tell from its own state whether another replica has since
+registered the agent again, so it does not guess. A successful read counts a
+delayed CONNECTED for a session this replica has since superseded as
+`stale_connected_session`.
 `yuzu_gw_upstream_notify_dropped_total` does not count a rejected CONNECTED.
 A gateway that includes #5695 counts it in
 `yuzu_gw_upstream_notify_unacknowledged_total{event="connected"}` and sends it
 again after a backoff while it holds the session, so a `connected_unverified`
 rejection is put right once the directory reads again (see "When the server
-does not record a notification"). An older gateway does not retry it: that
-server counter is then the only signal, and an agent whose current session was
-rejected keeps heartbeating but cannot receive commands until it reconnects. When the read succeeds, the local fallback applies only if
+does not record a notification"). Until then the agent keeps heartbeating but
+is not dispatchable from that replica, for the outage plus up to 60 s (the
+gateway's resend backoff cap), or up to 10 minutes once the refusal has lasted
+15 minutes (the gateway's slow phase, "When the server does not record a
+notification"); both are derived from the documented backoff, not measured. An older gateway does not retry it: that
+server counter is then the only signal, and the agent cannot receive commands
+until it reconnects. When the read succeeds, the local fallback applies only if
 the directory row is absent or tombstoned, or the session is one this replica
 recorded as having lost a race; a row with a different session id rejects the
 CONNECTED (`stale_connected_session`). A DISCONNECTED proceeds on the local

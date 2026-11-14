@@ -70,6 +70,15 @@ def problems(name, gate, src):
         out.append(f"{name}: expected exactly one `{call}` (found {n}) (#5678)")
     if re.search(r"(->|\.) ?remove_if_session ?\(", t):
         out.append(f"{name}: raw remove_if_session( call bypasses mirror_departure_to_presence (#5678)")
+    # The ARRIVAL mirror (#5685 follow-up): exactly one call per file, through the helper, never a
+    # raw store call (a replica must not keep judging a restarted agent by its old plugin list).
+    arrival = normalise(f"mirror_arrival_to_presence({STORE_ARG}, agent_id, session_id);")
+    na = t.count(arrival)
+    if na != 1:
+        out.append(f"{name}: expected exactly one `{arrival}` (found {na}) (#5685 follow-up)")
+    if re.search(r"(->|\.) ?clear_plugins_of_other_sessions ?\(", t):
+        out.append(f"{name}: raw clear_plugins_of_other_sessions( call bypasses "
+                   "mirror_arrival_to_presence (#5685 follow-up)")
     return out
 
 
@@ -161,8 +170,11 @@ PRUNE_MUTATIONS.append((re.escape(PRUNE_START), "health_recompute_thread_ = std:
 MUTATIONS = [
     (0, r"mirror_departure_to_presence\(\s*removed_current_session,", "mirror_departure_to_presence(false,",
      "expected exactly one"),
-    (0, r"heartbeat_ingestion_ \? heartbeat_ingestion_->offline_endpoint_store\(\) : nullptr", "nullptr",
-     "expected exactly one"),
+    # Anchored on the DEPARTURE call: the arrival mirror (#5685 follow-up) spells the same store
+    # expression earlier in this file, and `count=1` would otherwise mutate that one instead.
+    (0, r"(mirror_departure_to_presence\(\s*removed_current_session,\s*)"
+        r"heartbeat_ingestion_ \? heartbeat_ingestion_->offline_endpoint_store\(\) : nullptr",
+     r"\g<1>nullptr", "expected exactly one"),
     (0, r"mirror_departure_to_presence\(", "heartbeat_ingestion_->offline_endpoint_store()->remove_if_session(",
      "expected exactly one"),
     (1, r"removed_current_session \|\| store_removed", "removed_current_session",
@@ -172,6 +184,13 @@ MUTATIONS = [
     (1, r"\n(\s*)agent_id, session_id\);", r"\n\g<1>agent_id, session_id);\n"
      r"offline_store.remove_if_session(agent_id, session_id);",
      "raw remove_if_session"),
+    # The arrival mirror: dropping either call, or bypassing the helper, must be caught.
+    (0, r"mirror_arrival_to_presence\(", "(void)(",
+     "expected exactly one"),
+    (1, r"mirror_arrival_to_presence\(", "(void)(",
+     "expected exactly one"),
+    (0, r"mirror_arrival_to_presence\(", "heartbeat_ingestion_->offline_endpoint_store()->clear_plugins_of_other_sessions(",
+     "expected exactly one"),
 ]
 
 
