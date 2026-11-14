@@ -502,8 +502,18 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!v.empty() && (k == "name" || k == "version" || k == "version_min" ||
                                k == "version_max" || k == "status" || k == "cursor"))
                 p.emplace(k, v);
-        if (const auto it = p.find("cursor"); it != p.end())
-            d.f.cursor = it->second; // a refusal below answers inside the Load-more row
+        // The echo of the first value of a key (the one the parsers read): a refusal answers
+        // inside the Load-more row, the retry banner re-asks the same lookup.
+        const auto first_or_empty = [&p](const char* k) {
+            const auto* v = model_detail::first_param(p, k);
+            return v ? *v : std::string{};
+        };
+        d.f.name = first_or_empty("name");
+        d.f.version = first_or_empty("version");
+        d.f.version_min = first_or_empty("version_min");
+        d.f.version_max = first_or_empty("version_max");
+        d.f.status = first_or_empty("status");
+        d.f.cursor = first_or_empty("cursor");
         std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "app";
         if (kind.empty())
             kind = "app";
@@ -522,9 +532,30 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (comp)
             p.emplace("kind", d.f.kind);
 
+        const auto scope_push = swl::scope_ids(gate->scope);
+        // The version-range step both models share (REST has the same): the exact version set, or
+        // nullopt once the reply is written (retry banner on a degraded read, 200 + caveat when the
+        // range cannot be resolved).
+        auto resolve_range = [&](const auto& read_distinct, const auto& rq,
+                                 const std::string& target)
+            -> std::optional<std::vector<std::string>> {
+            const auto distinct = read_distinct();
+            if (!distinct) {
+                (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure", "Inventory",
+                                                target, "version read degraded");
+                reply();
+                return std::nullopt;
+            }
+            auto set = swl::resolve_version_range(*distinct, rq.version_min, rq.version_max);
+            if (!set) {
+                d.caveat = set.error();
+                reply();
+                return std::nullopt;
+            }
+            return std::move(*set);
+        };
         // The parsed request, the audit target and the page read differ per model; everything
         // after the read is shared in `serve`.
-        const auto scope_push = swl::scope_ids(gate->scope);
         auto serve = [&](const auto& read, const auto& query, const std::string& target,
                          bool continuation, auto&& to_row, auto&& read_totals) {
             if (!read) {
@@ -609,29 +640,17 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             auto rq = std::move(*parsed);
             rq.base.query.limit = static_cast<int>(kSoftwareFindPageSize);
-            d.f.name = rq.base.query.name;
-            d.f.version = rq.base.query.version.value_or("");
-            d.f.version_min = rq.version_min;
-            d.f.version_max = rq.version_max;
-            d.f.status = rq.base.query.status;
-            d.f.cursor = rq.base.cursor;
             const std::string target = swl::audit_target(rq);
             if (rq.has_range()) {
-                const auto distinct = deps_.install_versions_fn
-                                          ? deps_.install_versions_fn(rq.base.query.name, scope_push)
-                                          : std::optional<std::vector<std::string>>{};
-                if (!distinct) {
-                    (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure",
-                                                    "Inventory", target, "version read degraded");
-                    reply();
+                auto set = resolve_range(
+                    [&] {
+                        return deps_.install_versions_fn
+                                   ? deps_.install_versions_fn(rq.base.query.name, scope_push)
+                                   : std::optional<std::vector<std::string>>{};
+                    },
+                    rq, target);
+                if (!set)
                     return;
-                }
-                auto set = swl::resolve_version_range(*distinct, rq.version_min, rq.version_max);
-                if (!set) {
-                    d.caveat = set.error();
-                    reply();
-                    return;
-                }
                 rq.base.query.versions = std::move(*set);
             }
             const auto read = swl::read_list_page(
@@ -666,30 +685,18 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         auto rq = std::move(*parsed);
         rq.query.limit = static_cast<int>(kSoftwareFindPageSize);
-        d.f.name = rq.query.name;
-        d.f.version = rq.version.value_or("");
-        d.f.version_min = rq.version_min;
-        d.f.version_max = rq.version_max;
-        d.f.status = rq.query.status;
-        d.f.cursor = rq.cursor;
         const std::string target = swl::audit_target(rq);
         if (rq.has_range()) {
-            const auto distinct = deps_.component_versions_fn
-                                      ? deps_.component_versions_fn(rq.query.kind, rq.query.name,
-                                                                    scope_push)
-                                      : std::optional<std::vector<std::string>>{};
-            if (!distinct) {
-                (void)detail::try_persist_audit(deps_.audit_fn, req, kVerb, "failure", "Inventory",
-                                                target, "version read degraded");
-                reply();
+            auto set = resolve_range(
+                [&] {
+                    return deps_.component_versions_fn
+                               ? deps_.component_versions_fn(rq.query.kind, rq.query.name,
+                                                             scope_push)
+                               : std::optional<std::vector<std::string>>{};
+                },
+                rq, target);
+            if (!set)
                 return;
-            }
-            auto set = swl::resolve_version_range(*distinct, rq.version_min, rq.version_max);
-            if (!set) {
-                d.caveat = set.error();
-                reply();
-                return;
-            }
             rq.query.versions = std::move(*set);
         }
         const auto read = swl::read_components_page(

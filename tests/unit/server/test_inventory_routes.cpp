@@ -1270,6 +1270,17 @@ TEST_CASE("find software: a degraded store renders the retry banner and audits f
     CHECK(h.audited("inventory.software.query|failure"));
     CHECK_FALSE(h.audited("inventory.software.query|success"));
 
+    // Retry re-asks the same lookup: each filter as the parsers read it (the first of a repeated
+    // key), in the order every emitted URL carries them.
+    InvHarness f;
+    f.degrade = true;
+    auto fr = f.sink.Get(std::string(kFind) +
+                         "?name=ExampleApp&name=Other&kind=python&version=1.2&status=unconfirmed");
+    REQUIRE(fr);
+    CHECK(contains(fr->body, "find?name=ExampleApp&amp;kind=python&amp;version=1.2&amp;status="
+                             "unconfirmed"));
+    CHECK_FALSE(contains(fr->body, "Other"));
+
     // A degraded totals read, or a degraded last-poll read, is the same banner: never a table
     // without its count, never a blank last-synced column.
     InvHarness t;
@@ -1409,6 +1420,43 @@ TEST_CASE("find software: a version range resolves against the distinct versions
     CHECK(contains(sr->body, "No count for these filters."));
     CHECK(contains(sr->body, "status: unconfirmed"));
     CHECK(s.count("find_title_totals") == 0);
+}
+
+TEST_CASE("find software: a component range reads the component versions; a degraded or unresolvable "
+          "read answers in the panel",
+          "[inventory][route][find]") {
+    InvHarness h;
+    h.component_rows = {find_component_row("a001", "2.14.1")};
+    h.distinct_versions = {"2.12.0", "2.14.1", "2.15.0"};
+    auto r = h.sink.Get(std::string(kFind) +
+                        "?name=log4j-core&kind=java&version_min=2.13&version_max=2.14.9");
+    REQUIRE(r);
+    REQUIRE(h.last_component_query);
+    REQUIRE(h.last_component_query->versions);
+    CHECK(*h.last_component_query->versions == std::vector<std::string>{"2.14.1"});
+    CHECK(h.count("component_versions") == 1);
+    CHECK(h.count("install_versions") == 0);
+    CHECK_FALSE(h.last_fleet_query);
+
+    // A degraded distinct-version read is the retry banner and a failure audit, with no page read.
+    InvHarness d;
+    d.degrade = true;
+    auto dr = d.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java&version_min=2.13");
+    REQUIRE(dr);
+    CHECK(contains(dr->body, "Inventory store unavailable."));
+    CHECK(d.audited("inventory.software.query|failure"));
+    CHECK_FALSE(d.last_component_query);
+
+    // A distinct-version read cut at the catalogue cap cannot be resolved: a 200 caveat, no page read.
+    InvHarness cut;
+    for (int i = 0; i < kCatalogRowCap; ++i)
+        cut.distinct_versions.push_back("1." + std::to_string(i));
+    auto cr = cut.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java&version_min=1.5");
+    REQUIRE(cr);
+    CHECK(cr->status == 200);
+    CHECK(contains(cr->body, "inv-caveat"));
+    CHECK_FALSE(contains(cr->body, "Inventory store unavailable."));
+    CHECK_FALSE(cut.last_component_query);
 }
 
 TEST_CASE("find software: Load more returns the next rows only, from the cursor, without re-reading "

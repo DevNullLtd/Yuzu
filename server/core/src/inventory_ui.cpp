@@ -741,8 +741,13 @@ std::string find_style() {
 
 bool find_is_components(const SoftwareFindFilters& f) { return f.kind != "app"; }
 
-std::vector<std::pair<std::string, std::string>> find_kv(const SoftwareFindFilters& f) {
-    std::vector<std::pair<std::string, std::string>> kv{{"name", f.name}, {"kind", f.kind}};
+// The panel's filters as query pairs, in the order every emitted URL carries them. `with_kind` is
+// the fragment's chip; the REST application lookup has no `kind` (the catalogue's app/pkg split).
+std::vector<std::pair<std::string, std::string>> find_kv(const SoftwareFindFilters& f,
+                                                         bool with_kind) {
+    std::vector<std::pair<std::string, std::string>> kv{{"name", f.name}};
+    if (with_kind)
+        kv.emplace_back("kind", f.kind);
     if (!f.version.empty())
         kv.emplace_back("version", f.version);
     if (!f.version_min.empty())
@@ -756,7 +761,7 @@ std::vector<std::pair<std::string, std::string>> find_kv(const SoftwareFindFilte
 
 // The fragment URL for these filters (the cursor is never part of it: Load more adds its own).
 std::string find_url(const SoftwareFindFilters& f) {
-    return std::string(kFindFragment) + "?" + query_of(find_kv(f));
+    return std::string(kFindFragment) + "?" + query_of(find_kv(f, true));
 }
 
 // The REST lookup the current filters correspond to: the copy-able call line (`csv` = false) and
@@ -764,17 +769,7 @@ std::string find_url(const SoftwareFindFilters& f) {
 // catalogue's app/pkg split, not the chip).
 std::string find_rest_path(const SoftwareFindFilters& f, bool csv) {
     const bool comp = find_is_components(f);
-    std::vector<std::pair<std::string, std::string>> kv{{"name", f.name}};
-    if (comp)
-        kv.emplace_back("kind", f.kind);
-    if (!f.version.empty())
-        kv.emplace_back("version", f.version);
-    if (!f.version_min.empty())
-        kv.emplace_back("version_min", f.version_min);
-    if (!f.version_max.empty())
-        kv.emplace_back("version_max", f.version_max);
-    if (!f.status.empty())
-        kv.emplace_back("status", f.status);
+    auto kv = find_kv(f, comp);
     if (csv)
         kv.emplace_back("format", "csv");
     else
@@ -951,7 +946,7 @@ std::string find_body(const SoftwareFindData& d) {
         body += "<tr><td colspan=\"8\" class=\"inv-empty\">No devices on this page; more may be in "
                 "later pages. Use the Load button below.</td></tr>";
     if (!d.next_cursor.empty()) {
-        auto kv = find_kv(d.f);
+        auto kv = find_kv(d.f, true);
         kv.emplace_back("cursor", d.next_cursor);
         kv.emplace_back("shown", std::to_string(d.shown_before));
         body += "<tr class=\"inv-more\"><td colspan=\"8\"><button type=\"button\" class=\"inv-btn "

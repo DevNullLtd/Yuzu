@@ -1176,6 +1176,34 @@ TEST_CASE("find software: rows read application, version, device, newest version
     REQUIRE(has(h, "/api/v1/inventory/software?name=Example%20Application&amp;limit=50"));
 }
 
+TEST_CASE("find software: the filters ride every emitted URL in one order; only the fragment and the "
+          "component REST call carry the kind",
+          "[inventory][ui][find]") {
+    SoftwareFindData d = find_data({find_install("a1", "host-0188", "4.2.1")});
+    d.f.kind = "python";
+    d.f.version = "4.2.1";
+    d.f.version_min = "2.0";
+    d.f.version_max = "4.9";
+    d.f.status = "unconfirmed";
+    d.next_cursor = "c2:abc";
+    d.shown_before = 50;
+    const std::string filters = "name=Example%20Application&amp;kind=python&amp;version=4.2.1&amp;"
+                                "version_min=2.0&amp;version_max=4.9&amp;status=unconfirmed";
+    const std::string h = render_software_find(d);
+    REQUIRE(has(h, "/fragments/inventory/software/find?" + filters + "&amp;cursor=c2%3Aabc&amp;shown=50"));
+    REQUIRE(has(h, "/api/v1/inventory/software/components?" + filters + "&amp;limit=50"));
+    REQUIRE(has(h, "/api/v1/inventory/software/components?" + filters + "&amp;format=csv"));
+
+    d.f.kind = "app";
+    const std::string a = render_software_find(d);
+    const std::string app_filters = "name=Example%20Application&amp;version=4.2.1&amp;version_min=2.0&amp;"
+                                    "version_max=4.9&amp;status=unconfirmed";
+    REQUIRE(has(a, "/api/v1/inventory/software?" + app_filters + "&amp;limit=50"));
+    REQUIRE(has(a, "/api/v1/inventory/software?" + app_filters + "&amp;format=csv"));
+    REQUIRE(has(a, "/fragments/inventory/software/find?name=Example%20Application&amp;kind=app&amp;"
+                   "version=4.2.1"));
+}
+
 TEST_CASE("find software: a degraded read renders the retry banner and a refusal a caveat, never an "
           "empty table",
           "[inventory][ui][find]") {
