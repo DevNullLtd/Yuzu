@@ -2470,12 +2470,7 @@ namespace detail {
 /// The chain a jump of ours sits in (a `-D` takes it from the `-S` listing): 1 to 28 token
 /// characters, not starting with `-`.
 [[nodiscard]] constexpr bool helper_from_chain(std::string_view c) noexcept {
-    if (c.empty() || c.size() > 28 || c.front() == '-')
-        return false;
-    for (const char ch : c)
-        if (!is_safe_token_char(ch))
-            return false;
-    return true;
+    return c.size() <= 28 && !c.starts_with('-') && is_safe_token(c);
 }
 
 /// Plain decimal 1 to 65535: no sign, no leading zero.

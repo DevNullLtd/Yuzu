@@ -536,8 +536,7 @@ class InstallerDryRunOnLinux(unittest.TestCase):
         printed = out[out.index(helper_marker) + len(helper_marker) + 1:out.index(sudoers_marker)]
         lines = [l[len("[dry-run]   "):] for l in printed.splitlines() if l.startswith("[dry-run]   ")]
         self.assertEqual("\n".join(lines) + "\n", helper_text())
-        self.assertIn("[dry-run]   $ACCOUNT_NAME" .replace("$ACCOUNT_NAME", "yuzu") +
-                      " ALL=(root) NOPASSWD: /usr/local/sbin/yuzu-fw-helper\n", out)
+        self.assertIn("[dry-run]   yuzu ALL=(root) NOPASSWD: /usr/local/sbin/yuzu-fw-helper\n", out)
         self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables")
 
     def test_no_sudoers_skips_the_helper_too(self):

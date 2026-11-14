@@ -944,7 +944,8 @@ install_fw_helper() {
     fi
 
     log "installing the firewall helper $FW_HELPER_PATH (root:root 0755)"
-    run install -d -m 0755 -o root -g root "$dir"
+    # Create the directory only when missing: never reset a site-customised owner or mode.
+    [[ -d "$dir" ]] || run install -d -m 0755 -o root -g root "$dir"
     # A temporary file in the SAME directory, so the final rename is atomic: sudo never sees a
     # half-written helper, and a failed write leaves the previous helper in place.
     tmp=$(mktemp "$dir/.yuzu-fw-helper.XXXXXX") || { warn "cannot create a temp file in $dir"; return 1; }
