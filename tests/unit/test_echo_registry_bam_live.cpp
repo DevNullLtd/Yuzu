@@ -9,7 +9,7 @@
  *
  * is_elevated() mirrors the helper in test_echo_registry_source.cpp (anonymous namespace there),
  * but holds the token in the HandlePtr owner where the original uses a manual CloseHandle.
- * Sharing one copy is deferred to a follow-up (test_helpers.hpp includes no <windows.h> and is included by
+ * Sharing one copy is deferred to a follow-up (#7490) (test_helpers.hpp includes no <windows.h> and is included by
  * every test TU).
  */
 

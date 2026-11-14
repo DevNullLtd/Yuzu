@@ -1292,11 +1292,11 @@ label still fails loud.
 `Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
 `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
 cannot write `HKLM`) fails instead. The one exception is the Echo bam live case (#6898): a runner account can be refused
-(error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured as an elevated non-SYSTEM
-user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM could write both on that host), and then
-the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (a LOCAL SYSTEM
+(error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured on one test host as an elevated non-SYSTEM
+user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM could write both on that host; the Windows CI leg's own account is not LOCAL SYSTEM and was refused at `bam\State\UserSettings` in CI run 43294719354, #7637), and then
+the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (e.g. a LOCAL SYSTEM
 host), so while the Windows runner's account stays refused CI does not run it (#7637; the missing test of the skip
-decision is #7638). Any other failure of that case still fails the job. The job-level
+decision is #7638). Any other failure of that case still fails the job, including a refusal to open `bam\State` for reading, which has not been measured (#7637). The job-level
 `YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
 `YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
 scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node`, `HKCU\Software` and (for the
@@ -1321,7 +1321,7 @@ with subkeys: delete them first, leaf first, the same way). Never use `Remove-It
 both follow a registry link and can delete its target.
 
 The Echo bam live case (#6898) sets a deny-read DACL for Everyone on its scratch key under `bam\State\UserSettings`,
-so a leaf it left behind (a killed run) refuses `Get-Item`, `Remove-Item` and `reg delete`, which open the key for read
+so a leaf it left behind (a killed run) is expected to refuse `Get-Item`, `Remove-Item` and `reg delete`, which open the key for read
 first. The recipe above still applies: the deny covers read only, so open the key with `DELETE` access and call
 `NtDeleteKey`; its sibling directly under `bam` carries the default DACL.
 

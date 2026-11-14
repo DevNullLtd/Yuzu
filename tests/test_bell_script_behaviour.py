@@ -149,7 +149,7 @@ def main() -> int:
         driver = pathlib.Path(tmp) / "driver.js"
         with open(driver, "w", encoding="utf-8", newline="\n") as f:
             f.write(DRIVER)
-        r = subprocess.run([node, str(driver)], input=js, capture_output=True, text=True, timeout=30)
+        r = subprocess.run([node, str(driver)], input=js, capture_output=True, encoding="utf-8", timeout=30)
     sys.stdout.write(r.stdout + r.stderr)
     return r.returncode
 
