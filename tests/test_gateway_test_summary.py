@@ -384,7 +384,8 @@ class AssertGatewayTests(unittest.TestCase):
                                   capture_output=True, text=True).returncode
 
     def test_verdicts(self):
-        names = ['gateway eunit shard A', 'gateway eunit shard B', 'gateway ct']
+        names = ['gateway eunit shard A', 'gateway eunit shard B', 'gateway eunit shard C',
+                 'gateway ct']
         every = [{'name': n} for n in names] + [{'name': 'x'}]
         self.assertEqual(self._run(every), 0)
         for missing in names:

@@ -26,7 +26,8 @@ import sys
 # The eunit shard names track root meson.build's `_gw_eunit_shards`; adding a
 # shard there means adding its name here (tests/test_gateway_eunit_shards.py
 # fails until the two agree).
-REQUIRED = ("gateway eunit shard A", "gateway eunit shard B", "gateway ct")
+REQUIRED = ("gateway eunit shard A", "gateway eunit shard B", "gateway eunit shard C",
+            "gateway ct")
 
 
 def missing_tests(intro_tests):
