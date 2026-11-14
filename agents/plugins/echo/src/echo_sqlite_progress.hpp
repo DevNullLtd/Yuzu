@@ -4,10 +4,10 @@
 // fold's GC passes and EchoDatabase::execute_user_query so there is one copy of the
 // "interrupt a statement once a deadline has passed" mechanism.
 
-#include <sqlite3.h>
-
 #include <functional>
 #include <utility>
+
+#include <sqlite3.h>
 
 namespace yuzu::echo {
 

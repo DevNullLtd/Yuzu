@@ -10,6 +10,7 @@
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
+#include "echo_sqlite_progress.hpp"
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
@@ -5576,6 +5577,9 @@ TEST_CASE("execute_user_query: a statement past its deadline is an error, not a 
     CHECK(r.error().find("echo_config") == std::string::npos);
 }
 
+// The manual, the upgrade note and the changelog state this value; they change with it.
+static_assert(kUserQueryDeadline == std::chrono::seconds{10});
+
 TEST_CASE("execute_user_query: the same statement succeeds under the default deadline",
           "[echo][store][sandbox][deadline]") {
     auto t = make_test_db();
@@ -5608,6 +5612,51 @@ TEST_CASE("execute_user_query: the row cap still truncates to a successful resul
     auto r = t.db.execute_user_query("SELECT a.key FROM echo_config a, echo_config b", 5);
     REQUIRE(r.has_value());
     CHECK(r->rows.size() == 5);
+}
+
+TEST_CASE("execute_user_query: a step failure after rows is an error, not a short result",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+    // Set last and sorting last, so it is scanned last in rowid order and in key order.
+    REQUIRE(t.db.set_config("zzz_overflow_probe", "v"));
+    // abs() of the smallest 64-bit integer fails at step time with "integer overflow". The
+    // argument depends on the row, so it cannot be evaluated once before the first row.
+    constexpr const char* kFailsOnLastRow =
+        "SELECT abs(-9223372036854775807 - (key = 'zzz_overflow_probe')) FROM echo_config";
+
+    // Control: rows are produced before the failing one, so the failure is reached only
+    // by reading on past them.
+    auto head = t.db.execute_user_query(kFailsOnLastRow, 2);
+    REQUIRE(head.has_value());
+    CHECK(head->rows.size() == 2);
+
+    auto r = t.db.execute_user_query(kFailsOnLastRow);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("integer overflow") != std::string::npos);
+
+    // The connection is unharmed.
+    auto next = t.db.execute_user_query("SELECT COUNT(*) FROM echo_config");
+    REQUIRE(next.has_value());
+}
+
+TEST_CASE("ScopedProgressHandler: leaving the scope clears the handler",
+          "[echo][store][sandbox][deadline]") {
+    yuzu::test::SqliteHandleOwner<sqlite3> owner;
+    REQUIRE(sqlite3_open(":memory:", &owner.db) == SQLITE_OK);
+    // Far above the 1000-step poll interval.
+    constexpr const char* kLongStatement =
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) "
+        "SELECT count(*) FROM c";
+
+    {
+        ScopedProgressHandler guard(owner.db, [] { return true; });
+        // In scope the handler is live (control).
+        CHECK(sqlite3_exec(owner.db, kLongStatement, nullptr, nullptr, nullptr) ==
+              SQLITE_INTERRUPT);
+    }
+    // No second guard is installed: only the destructor can have removed the handler.
+    CHECK(sqlite3_exec(owner.db, kLongStatement, nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
 TEST_CASE("execute_user_query: sandbox rejections keep their errors with a deadline in force",

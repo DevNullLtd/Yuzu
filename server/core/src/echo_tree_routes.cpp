@@ -563,12 +563,16 @@ std::optional<std::string> EchoTreeRoutes::cache_render_detail(const std::string
 
 void EchoTreeRoutes::set_metrics(yuzu::MetricsRegistry* m) {
     metrics_ = m;
-    if (metrics_)
-        metrics_->describe(
-            "yuzu_echo_sources_push_total",
-            "Operator capture-sources pushes by result (pushed / none_applied / "
-            "audit_unavailable / permission_revoked).",
-            "counter");
+    if (!metrics_)
+        return;
+    metrics_->describe("yuzu_echo_sources_push_total",
+                       "Operator capture-sources pushes by result (pushed / none_applied / "
+                       "audit_unavailable / permission_revoked).",
+                       "counter");
+    // Bounded-label counter: seed every result at 0 so the first refusal is an increase()
+    // an alert can see, not the birth of a series (observability-conventions.md, #5177).
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked"})
+        metrics_->counter("yuzu_echo_sources_push_total", {{"result", result}}).increment(0);
 }
 
 void EchoTreeRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,

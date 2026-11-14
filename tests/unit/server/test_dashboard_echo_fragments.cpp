@@ -924,9 +924,12 @@ TEST_CASE("echo page shell: capture-sources frame and hourly process record text
     CHECK(page.find("echoTreeState") == std::string::npos);
     CHECK(page.find("badge-pii") == std::string::npos);
     // #7075: the push's toast is server-authored (HX-Trigger on every answer, a refusal
-    // included); the page must not announce success itself, whatever the status.
-    CHECK(page.find("function pushCapChanges") != std::string::npos);
-    CHECK(page.find("showToast('Pushed '") == std::string::npos);
+    // included); the push function must raise no toast itself, whatever its wording.
+    const auto push_fn = page.find("function pushCapChanges");
+    REQUIRE(push_fn != std::string::npos);
+    const auto push_end = page.find("function filterCap", push_fn);
+    REQUIRE(push_end != std::string::npos);
+    CHECK(page.substr(push_fn, push_end - push_fn).find("showToast") == std::string::npos);
 }
 
 // ── (#1162) Every echo.sql pre-dispatch rejection leaves a `denied` audit row ──

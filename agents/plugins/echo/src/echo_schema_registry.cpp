@@ -589,9 +589,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // bucket keys on hive, key_path, value_name and action and keeps change_count,
         // last_data (the newest value, 512 bytes, readable through echo.sql except under
         // a sensitive value name -- DefaultPassword / AltDefaultPassword -- where it is
-        // the fixed placeholder; see echo_registry_parsers.hpp), last_data_type, last_actor_image and last_ts. The old value, the
-        // writer's pid, `detail` and `source` are decided by the collector and not
-        // stored.
+        // the fixed placeholder; see echo_registry_parsers.hpp), last_data_type,
+        // last_actor_image and last_ts. The old value, the writer's pid, `detail` and
+        // `source` are decided by the collector and not stored.
         // Mechanism: a RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
@@ -951,8 +951,9 @@ bool is_queryable_table(std::string_view real_table_name) {
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
         // with two exceptions: the registry cursor row holds, for about one tick, the
-        // rendered new value of changes whose writer is not settled yet (the placeholder under a sensitive value name) (and the old
-        // value only when the baseline came from an older build), and its
+        // rendered new value of changes whose writer is not settled yet (the placeholder
+        // under a sensitive value name; the old value too, only when the baseline came
+        // from an older build), and its
         // `offline` list holds [sid, ProfileImagePath] (the path names the user) for every
         // logged-off profile.
         // echo_state carries the registry baselines (`registry:<root>`: type, size and

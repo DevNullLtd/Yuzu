@@ -3391,7 +3391,7 @@ TEST_CASE("process baseline: the diff over a decoded baseline matches the diff o
 
 TEST_CASE("process baseline: scrub rewrites a legacy row once and is then a no-op",
           "[echo][aggregator][process-baseline]") {
-    yuzu::test::TempDbFile tmp{std::string_view{"echo-pbscrub-"}};
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pbscrub_"}};
     auto opened = EchoDatabase::open(tmp.path);
     REQUIRE(opened.has_value());
     EchoDatabase db = std::move(*opened);

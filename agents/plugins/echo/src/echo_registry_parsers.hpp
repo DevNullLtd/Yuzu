@@ -758,12 +758,24 @@ inline constexpr std::string_view kRegistryMaskedData = "[REDACTED by Echo]";
 /// DefaultPassword and AltDefaultPassword (ASCII case-insensitive). A CLOSED, name-only list:
 /// it matches under any watched key, so it holds across HKLM, HKU\<sid>, numbered control
 /// sets and offline mounts. Do not extend it by pattern.
+///
+/// No value under the watched `SYSTEM\CurrentControlSet\Control\Lsa` key is listed, on
+/// purpose. By the documented Windows layout that key holds LSA configuration (package lists,
+/// policy flags). LSA secrets and cached logons live under `HKLM\SECURITY` and account
+/// hashes under `HKLM\SAM`, neither of which is in default_registry_scope(); the system key
+/// sits in the class strings of four Lsa subkeys, which the reader never requests (lpClass is
+/// null in RegQueryInfoKeyW and RegEnumKeyExW). This rests on that layout plus our scope and
+/// reader code; it was not probed on a Windows host.
 [[nodiscard]] inline bool is_sensitive_reg_value(std::string_view value_name) {
     const std::string f = fold_value_name(value_name);
     return f == "defaultpassword" || f == "altdefaultpassword";
 }
 
 /// The baseline entry for a sensitive value: the type and nothing derived from the bytes.
+/// Deliberately no size and no hash, although #6634 asked for both: either one lets a reader
+/// of echo_state test guesses of a short password offline. The accepted cost is that a
+/// content-only change to such a value is not detected (an add, a removal and a type change
+/// are).
 [[nodiscard]] inline BaselineEntry masked_baseline_entry(std::uint32_t type) {
     BaselineEntry e;
     e.t = type;
