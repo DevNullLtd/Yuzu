@@ -29,10 +29,6 @@ class MetricsRegistry; // sdk/include/yuzu/metrics.hpp
 
 namespace yuzu::server::software_plugin_health {
 
-/// The seven v3 facet statuses, in response order.
-inline constexpr const char* kStatuses[] = {"full",    "delta",         "constrained", "timeout",
-                                            "oversize", "not_collected", "disabled"};
-
 /// Text before the first '.', or the whole facet when it has none (component_inventory).
 [[nodiscard]] std::string plugin_of(std::string_view facet);
 

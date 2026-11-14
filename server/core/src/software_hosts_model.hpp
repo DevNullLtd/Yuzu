@@ -72,15 +72,11 @@ resolve_host_search(std::string_view q, const Roster& roster, const authz::Visib
 [[nodiscard]] std::expected<std::pair<std::string, std::int64_t>, swc::CursorError>
 decode_hosts_cursor(std::string_view token, std::string_view fp);
 
-/// The query shape `read_scoped_page` drives (agent_id, agent_ids, limit, after, skip); the
-/// reader converts it to the store's SoftwareHostQuery with store_query().
-struct HostsQuery {
+/// The store query plus the members `read_scoped_page` drives (`agent_id`, `after`); store_query()
+/// folds `after` into the store's `after_agent_id`.
+struct HostsQuery : SoftwareHostQuery {
     std::string agent_id; ///< unused (hosts are not filtered to one device here); "" always
-    std::optional<std::vector<std::string>> agent_ids;
-    std::int64_t last_synced_before{0};
-    std::int64_t limit{swc::kCatalogueDefaultLimit};
     std::string after;
-    std::int64_t skip{0};
 };
 
 [[nodiscard]] HostsQuery make_query(const HostsRequest& rq);

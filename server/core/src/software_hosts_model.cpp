@@ -1,13 +1,12 @@
 #include "software_hosts_model.hpp"
 
+#include "ascii_fold.hpp"
 #include "list_keyset.hpp"
 #include "model_param_helpers.hpp"
 #include "software_catalog_rules.hpp"
 
 #include <yuzu/log_token.hpp>
 
-#include <algorithm>
-#include <cctype>
 #include <unordered_set>
 #include <utility>
 
@@ -17,7 +16,7 @@ namespace sc = software_catalog;
 
 namespace {
 
-using model_detail::first_param;
+using model_detail::first_param_or_empty;
 using model_detail::fnv1a_hex16;
 using model_detail::is_lower_hex16;
 using model_detail::length_prefixed;
@@ -28,28 +27,16 @@ using model_detail::valid_text;
 using ::yuzu::server::keyset::b64url_decode;
 using ::yuzu::server::keyset::b64url_encode;
 
-std::string get(const Params& p, const char* k) {
-    const auto* v = first_param(p, k);
-    return v ? *v : std::string{};
-}
-
-std::string lower(std::string_view s) {
-    std::string out(s);
-    std::ranges::transform(out, out.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return out;
-}
-
 } // namespace
 
 // ── Parameters ───────────────────────────────────────────────────────────────
 
 std::expected<HostsRequest, std::string> parse_hosts_params(const Params& p) {
     HostsRequest r;
-    std::string search = get(p, "q");
-    r.cursor = get(p, "cursor");
-    const std::string before = get(p, "last_synced_before");
-    const std::string limit = get(p, "limit");
+    std::string search = first_param_or_empty(p, "q");
+    r.cursor = first_param_or_empty(p, "cursor");
+    const std::string before = first_param_or_empty(p, "last_synced_before");
+    const std::string limit = first_param_or_empty(p, "limit");
     if (auto bad = swc::text_error({&search, &r.cursor, &before}, {}))
         return std::unexpected(*bad);
     r.q = sc::clamp_utf8(search, sc::kSearchMaxBytes);
@@ -74,13 +61,13 @@ std::expected<authz::VisibleSet, std::string>
 resolve_host_search(std::string_view q, const Roster& roster, const authz::VisibleSet& scope) {
     if (q.empty())
         return scope;
-    const std::string needle = lower(q);
+    const std::string needle = ascii_lower(q);
     std::unordered_set<std::string> hits;
     for (const auto& [id, host] : roster) {
         if (!authz::in_scope(scope, id)) // cut to the caller's scope BEFORE matching or counting
             continue;
-        if (lower(host).find(needle) == std::string::npos &&
-            lower(id).find(needle) == std::string::npos)
+        if (ascii_lower(host).find(needle) == std::string::npos &&
+            ascii_lower(id).find(needle) == std::string::npos)
             continue;
         hits.insert(id);
         if (hits.size() > swc::kScopePushdownMaxIds)
@@ -143,17 +130,13 @@ decode_hosts_cursor(std::string_view token, std::string_view fp) {
 HostsQuery make_query(const HostsRequest& rq) {
     HostsQuery q;
     q.last_synced_before = rq.last_synced_before;
-    q.limit = rq.limit;
+    q.limit = static_cast<int>(rq.limit);
     return q;
 }
 
 SoftwareHostQuery store_query(const HostsQuery& q) {
-    SoftwareHostQuery s;
-    s.agent_ids = q.agent_ids;
-    s.last_synced_before = q.last_synced_before;
+    SoftwareHostQuery s = q;
     s.after_agent_id = q.after;
-    s.limit = static_cast<int>(q.limit);
-    s.skip = q.skip;
     return s;
 }
 

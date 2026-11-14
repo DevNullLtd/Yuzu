@@ -128,11 +128,9 @@ read_changes_page(const ChangesReader& read, const ChangesRequest& rq, const aut
 /// `changes` null; a null `catalog` (a confined caller) or one with refreshed_at == 0 renders
 /// `catalogue` null. `omitted` is null when every block is present, else "building" for a never-computed
 /// rollup, else `omitted_reason`
-/// ("scope" | "building"; empty = "building"). `components` is accepted so the route passes the
-/// rollup freshness it already read; it adds no block.
+/// ("scope" | "building"; empty = "building").
 [[nodiscard]] nlohmann::json summary_json(const std::optional<SoftwareSummary>& summary,
                                           const std::optional<CatalogRollupMeta>& catalog,
-                                          const std::optional<ComponentRollupMeta>& components,
                                           std::int64_t as_of, std::string_view omitted_reason);
 
 } // namespace yuzu::server::software_changes

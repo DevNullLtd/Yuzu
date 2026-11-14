@@ -8,11 +8,11 @@
 #include "rest_audit.hpp"
 #include "software_list_model.hpp"
 #include "software_plugin_health_model.hpp"
+#include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
-#include <chrono>
 #include <string_view>
 #include <utility>
 
@@ -45,13 +45,7 @@ struct Ctx {
     SoftwareReadRoutes::Reads reads;
     bool ready{false};
 
-    [[nodiscard]] std::int64_t now() const {
-        if (now_fn)
-            return now_fn();
-        return std::chrono::duration_cast<std::chrono::seconds>(
-                   std::chrono::system_clock::now().time_since_epoch())
-            .count();
-    }
+    [[nodiscard]] std::int64_t now() const { return now_fn ? now_fn() : now_epoch_seconds(); }
     // Display-only: a roster that is not wired or cannot be read leaves the names null.
     [[nodiscard]] swh::Roster roster() const { return hostnames_fn ? hostnames_fn() : swh::Roster{}; }
     // For a decision made FROM the roster (the `q` search): nullopt = the read failed.
@@ -445,8 +439,7 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  const bool audit_ok = audit(*ctx, req, kVerbSummary, "success", target,
                                              std::string("mode=") + mode_name(plan.mode) +
                                                  " cid=" + cid);
-                 respond(res, swg::summary_json(summary, catalog, std::nullopt, as_of, omitted),
-                         audit_ok);
+                 respond(res, swg::summary_json(summary, catalog, as_of, omitted), audit_ok);
              });
 
     // GET /api/v1/inventory/software/plugin-health

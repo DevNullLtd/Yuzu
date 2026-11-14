@@ -6,7 +6,7 @@ namespace yuzu::server::software_plugin_health {
 
 namespace {
 
-std::int64_t count_of(const FacetHealth& f, const char* status) {
+std::int64_t count_of(const FacetHealth& f, const std::string& status) {
     const auto it = f.devices_by_status.find(status);
     return it == f.devices_by_status.end() ? 0 : it->second;
 }
@@ -30,7 +30,8 @@ nlohmann::json plugin_health_json(const std::vector<FacetHealth>& facets,
     for (const auto& f : facets) {
         nlohmann::json devices = nlohmann::json::object();
         std::int64_t total = 0;
-        for (const char* s : kStatuses) {
+        for (const auto st : kV3AllStatuses) {
+            const std::string s(v3_status_name(st));
             devices[s] = count_of(f, s);
             total += count_of(f, s);
         }
@@ -75,7 +76,8 @@ nlohmann::json plugin_health_json(const std::vector<FacetHealth>& facets,
 void publish_facet_health_gauges(yuzu::MetricsRegistry& metrics,
                                  const std::vector<FacetHealth>& facets) {
     for (const auto& f : facets) {
-        for (const char* s : kStatuses) {
+        for (const auto st : kV3AllStatuses) {
+            const std::string s(v3_status_name(st));
             metrics.gauge("yuzu_software_facet_devices", {{"facet", f.facet}, {"status", s}})
                 .set(static_cast<double>(count_of(f, s)));
         }

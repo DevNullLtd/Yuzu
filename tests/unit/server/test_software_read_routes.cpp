@@ -53,7 +53,7 @@ SoftwareHostRow host_row(const std::string& id, std::int64_t last_seen = 1'699'0
     SoftwareHostRow r;
     r.agent_id = id;
     r.last_seen = last_seen;
-    r.facets.push_back({"software.installed", "full", "tok", true, 1'699'000'100, 12, 345, 0});
+    r.facets.push_back({"software.installed", "full", "tok", true, 1'699'000'100, 12, 345});
     return r;
 }
 

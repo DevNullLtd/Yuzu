@@ -317,7 +317,6 @@ struct SoftwareHostFacet {
     std::int64_t last_confirmed_at{0};
     std::int64_t duration_ms{0};
     std::int64_t bytes_read{0};
-    std::int64_t updated_at{0};
 };
 
 /// One reporting device: its `installed_software` receipt time and its facet state rows
@@ -349,7 +348,6 @@ struct SoftwareChangeRow {
     std::string kind; ///< install | remove | upgrade
     std::string name;
     std::string publisher;
-    std::string identity_key;
     std::string instance_key;
     std::string from_version;
     std::string to_version;

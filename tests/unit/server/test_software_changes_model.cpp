@@ -261,7 +261,7 @@ TEST_CASE("summary: null plus a reason, never zero", "[software][changes]") {
     c.total_installs = 20;
     c.total_devices = 5;
 
-    auto j = summary_json(s, c, ComponentRollupMeta{50}, 77, "");
+    auto j = summary_json(s, c, 77, "");
     CHECK(j["devices"]["reporting"] == 5);
     CHECK(j["devices"]["stale"] == 1);
     CHECK(j["changes"]["last_24h"]["upgrade"] == 3);
@@ -272,23 +272,17 @@ TEST_CASE("summary: null plus a reason, never zero", "[software][changes]") {
     CHECK(j["as_of"] == 77);
     CHECK(j["omitted"].is_null());
 
-    // The component rollup is accepted for the route's convenience and adds no block: its absence
-    // alone neither nulls a block nor sets `omitted`.
-    j = summary_json(s, c, std::nullopt, 77, "");
-    CHECK(j["omitted"].is_null());
-    CHECK(j["catalogue"]["titles"] == 9);
-
-    j = summary_json(s, std::nullopt, std::nullopt, 77, "scope");
+    j = summary_json(s, std::nullopt, 77, "scope");
     CHECK(j["catalogue"].is_null());
     CHECK(j["devices"]["reporting"] == 5);
     CHECK(j["omitted"] == "scope");
 
     c.refreshed_at = 0;
-    j = summary_json(s, c, std::nullopt, 77, "scope");
+    j = summary_json(s, c, 77, "scope");
     CHECK(j["catalogue"].is_null());
     CHECK(j["omitted"] == "building");
 
-    j = summary_json(std::nullopt, std::nullopt, std::nullopt, 77, "building");
+    j = summary_json(std::nullopt, std::nullopt, 77, "building");
     CHECK(j["devices"].is_null());
     CHECK(j["changes"].is_null());
     CHECK(j["catalogue"].is_null());

@@ -8,6 +8,7 @@
 #include "software_inventory_store.hpp"
 #include "software_plugin_health_model.hpp"
 #include "software_read_routes.hpp"
+#include "web_utils.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -52,9 +53,7 @@ void SoftwareCatalogRollup::stop() {
 void SoftwareCatalogRollup::refresh_fleet_snapshot() {
     if (!metrics_ && !snapshot_)
         return;
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
+    const auto now = now_epoch_seconds();
     // Both reads are authoritative (nullopt on any degrade): a failure of either keeps the last
     // good snapshot and the last gauge values, rather than publishing half a picture.
     auto facets = store_.facet_health(std::nullopt);

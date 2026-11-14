@@ -11,7 +11,7 @@ namespace swc = software_catalogue;
 
 namespace {
 
-using model_detail::first_param;
+using model_detail::first_param_or_empty;
 using model_detail::fnv1a_hex16;
 using model_detail::is_lower_hex16;
 using model_detail::length_prefixed;
@@ -20,11 +20,6 @@ using model_detail::read_length_prefixed;
 using model_detail::split;
 using ::yuzu::server::keyset::b64url_decode;
 using ::yuzu::server::keyset::b64url_encode;
-
-std::string get(const Params& p, const char* k) {
-    const auto* v = first_param(p, k);
-    return v ? *v : std::string{};
-}
 
 nlohmann::json counts_json(const SoftwareChangeCounts& c) {
     return {{"install", c.install}, {"remove", c.remove}, {"upgrade", c.upgrade}};
@@ -35,11 +30,11 @@ nlohmann::json counts_json(const SoftwareChangeCounts& c) {
 std::expected<ChangesRequest, std::string> parse_changes_params(const Params& p, std::int64_t now) {
     ChangesRequest r;
     SoftwareChangesQuery& q = r.query;
-    q.agent_id = get(p, "agent_id");
-    q.kind = get(p, "kind");
-    r.cursor = get(p, "cursor");
-    const std::string since = get(p, "since");
-    const std::string limit = get(p, "limit");
+    q.agent_id = first_param_or_empty(p, "agent_id");
+    q.kind = first_param_or_empty(p, "kind");
+    r.cursor = first_param_or_empty(p, "cursor");
+    const std::string since = first_param_or_empty(p, "since");
+    const std::string limit = first_param_or_empty(p, "limit");
     if (auto bad = swc::text_error({&q.agent_id, &q.kind, &since, &r.cursor, &limit},
                                    {&q.agent_id, &q.kind, &since, &limit}))
         return std::unexpected(*bad);
@@ -147,7 +142,6 @@ nlohmann::json changes_response_json(const std::vector<SoftwareChangeRow>& rows,
 
 nlohmann::json summary_json(const std::optional<SoftwareSummary>& summary,
                             const std::optional<CatalogRollupMeta>& catalog,
-                            const std::optional<ComponentRollupMeta>& /*components*/,
                             std::int64_t as_of, std::string_view omitted_reason) {
     nlohmann::json out;
     if (summary) {

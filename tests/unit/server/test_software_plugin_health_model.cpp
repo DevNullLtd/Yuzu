@@ -63,10 +63,10 @@ TEST_CASE("publish_facet_health_gauges: all seven statuses, zeros included, no a
     sph::publish_facet_health_gauges(m, {a});
 
     const auto text = m.serialize();
-    for (const char* s : sph::kStatuses) {
+    for (const auto st : kV3AllStatuses) {
         CHECK(text.find(std::string("yuzu_software_facet_devices{facet=\"installed_software.dpkg\","
                                     "status=\"") +
-                        s + "\"}") != std::string::npos);
+                        std::string(v3_status_name(st)) + "\"}") != std::string::npos);
     }
     CHECK(text.find("status=\"timeout\"} 3") != std::string::npos);
     CHECK(text.find("status=\"full\"} 0") != std::string::npos);

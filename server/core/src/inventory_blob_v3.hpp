@@ -88,6 +88,11 @@ enum class V3Status {
     kDisabled,
 };
 
+/// Every status, in response order (the order the facet-health reads report them).
+inline constexpr std::array<V3Status, 7> kV3AllStatuses{
+    V3Status::kFull,     V3Status::kDelta,        V3Status::kConstrained, V3Status::kTimeout,
+    V3Status::kOversize, V3Status::kNotCollected, V3Status::kDisabled};
+
 [[nodiscard]] constexpr std::string_view v3_status_name(V3Status s) noexcept {
     switch (s) {
     case V3Status::kFull:
@@ -109,9 +114,7 @@ enum class V3Status {
 }
 
 [[nodiscard]] constexpr std::optional<V3Status> v3_status_parse(std::string_view s) noexcept {
-    for (const auto st :
-         {V3Status::kFull, V3Status::kDelta, V3Status::kConstrained, V3Status::kTimeout,
-          V3Status::kOversize, V3Status::kNotCollected, V3Status::kDisabled}) {
+    for (const auto st : kV3AllStatuses) {
         if (v3_status_name(st) == s)
             return st;
     }

@@ -4015,7 +4015,6 @@ SoftwareInventoryStore::query_hosts(const SoftwareHostQuery& q) {
             f.last_confirmed_at = result_i64(res, i, 5);
             f.duration_ms = result_i64(res, i, 6);
             f.bytes_read = result_i64(res, i, 7);
-            f.updated_at = result_i64(res, i, 8);
             out.emplace_back(PQgetvalue(res.get(), i, 0), std::move(f));
         }
         return out;
@@ -4024,7 +4023,7 @@ SoftwareInventoryStore::query_hosts(const SoftwareHostQuery& q) {
     auto facets = bounded_query(
         pool_, metrics_, "query_hosts (facets)", facet_samplers,
         "SELECT agent_id, facet, status, token, enabled, last_confirmed_at, duration_ms, "
-        "bytes_read, updated_at FROM software_inventory_store.software_facet_state "
+        "bytes_read FROM software_inventory_store.software_facet_state "
         "WHERE agent_id = ANY($1::text[]) ORDER BY agent_id, facet",
         std::vector<std::string>{pg::to_text_array(page_ids)}, parse_facets);
     if (!facets)
@@ -4058,7 +4057,7 @@ SoftwareInventoryStore::query_changes(const SoftwareChangesQuery& q) {
         limit = kFleetQueryRowCap;
 
     std::string sql =
-        "SELECT change_id, agent_id, facet, kind, name, publisher, identity_key, instance_key, "
+        "SELECT change_id, agent_id, facet, kind, name, publisher, instance_key, "
         "from_version, to_version, observed_at "
         "FROM software_inventory_store.software_changes WHERE observed_at < $1::bigint";
     std::vector<std::string> params{std::to_string(q.stable_before)};
@@ -4109,11 +4108,10 @@ SoftwareInventoryStore::query_changes(const SoftwareChangesQuery& q) {
             row.kind = PQgetvalue(res.get(), i, 3);
             row.name = PQgetvalue(res.get(), i, 4);
             row.publisher = PQgetvalue(res.get(), i, 5);
-            row.identity_key = PQgetvalue(res.get(), i, 6);
-            row.instance_key = PQgetvalue(res.get(), i, 7);
-            row.from_version = PQgetvalue(res.get(), i, 8);
-            row.to_version = PQgetvalue(res.get(), i, 9);
-            row.observed_at = result_i64(res, i, 10);
+            row.instance_key = PQgetvalue(res.get(), i, 6);
+            row.from_version = PQgetvalue(res.get(), i, 7);
+            row.to_version = PQgetvalue(res.get(), i, 8);
+            row.observed_at = result_i64(res, i, 9);
             out.push_back(std::move(row));
         }
         return out;
@@ -4128,9 +4126,6 @@ namespace {
 constexpr std::string_view kFacetMeasuredSql =
     "enabled AND status IN ('full', 'delta', 'constrained', 'timeout', 'oversize')";
 constexpr int kFacetSlowestPerFacet = 10;
-constexpr std::array<V3Status, 7> kV3AllStatuses{
-    V3Status::kFull,    V3Status::kDelta,        V3Status::kConstrained, V3Status::kTimeout,
-    V3Status::kOversize, V3Status::kNotCollected, V3Status::kDisabled};
 } // namespace
 
 std::optional<std::vector<FacetHealth>> SoftwareInventoryStore::facet_health(

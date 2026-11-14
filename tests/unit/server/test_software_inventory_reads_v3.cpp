@@ -278,7 +278,6 @@ TEST_CASE("query_hosts: keyset pages are stable and complete; filters and scope 
         CHECK(a2.facets[1].last_confirmed_at == 7);
         CHECK(a2.facets[1].duration_ms == 40);
         CHECK(a2.facets[1].bytes_read == 400);
-        CHECK(a2.facets[1].updated_at == 9);
         CHECK((*page)[1].facets.empty()); // a-03 has no state row
         REQUIRE((*page)[2].facets.size() == 1);
         CHECK_FALSE((*page)[2].facets[0].enabled);
@@ -352,6 +351,27 @@ TEST_CASE("query_changes: strictly ascending (observed_at, change_id), never at 
         CHECK((*page)[0].kind == "install");
         CHECK((*page)[0].name == "app");
         CHECK((*page)[0].observed_at == 100);
+
+        // add_change leaves publisher, instance_key and the versions empty, so a slipped column
+        // index after the identity_key drop would pass unseen: seed one row with all four distinct.
+        REQUIRE(run_sql(pool,
+                        "INSERT INTO software_inventory_store.software_changes "
+                        "(change_id, agent_id, facet, kind, name, publisher, instance_key, "
+                        " from_version, to_version, observed_at) "
+                        "VALUES (6, 'a-09', 'installed_apps.list_inventory', 'upgrade', 'tool', "
+                        "'acme', 'ik-1', '1.0', '2.0', 120)"));
+        q.agent_id = "a-09";
+        const auto full = store.query_changes(q);
+        REQUIRE(full.has_value());
+        REQUIRE(full->size() == 1);
+        CHECK((*full)[0].change_id == 6);
+        CHECK((*full)[0].kind == "upgrade");
+        CHECK((*full)[0].name == "tool");
+        CHECK((*full)[0].publisher == "acme");
+        CHECK((*full)[0].instance_key == "ik-1");
+        CHECK((*full)[0].from_version == "1.0");
+        CHECK((*full)[0].to_version == "2.0");
+        CHECK((*full)[0].observed_at == 120);
     }
     SECTION("rows sharing one second page in change_id order; a cursor inside the group resumes "
             "at the next change_id") {
