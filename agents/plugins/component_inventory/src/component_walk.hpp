@@ -1,0 +1,273 @@
+/**
+ * component_walk.hpp -- the bounded filesystem walk of the component_inventory plugin, and the
+ * filesystem seam the scan and the OS legs build against.
+ *
+ * Pure header: no OS header, no filesystem library, no I/O of its own. Every directory listing and
+ * every clock read goes through FsOps, so the unit test (tests/unit/test_component_walk.cpp) drives
+ * the walk over an in-memory tree and a fake clock. The walk never opens a file: open_file is
+ * declared here for the scan (which reads sizes, times and bytes from the opened file) and is never
+ * called by walk().
+ *
+ * COMPLETENESS RULE. Nothing that hides rows may read as complete. WalkResult::stop is
+ * Stop::complete only when no cause below occurred.
+ *   Budget causes (budget_entries, budget_time, section_rows) end the walk at once.
+ *   The other causes are recorded and the walk goes on, so an operator still sees what was reachable:
+ *     depth           a directory deeper than max_depth was not listed
+ *     dir_unreadable  a directory could not be listed
+ *     dir_truncated   a listing was cut at max_dir_entries
+ *     anchor_rows     an anchor produced more than max_rows_per_anchor candidates
+ *   The FIRST cause recorded is the one reported.
+ * There are no per-kind depth filters: max_depth is a backstop against pathological nesting, and
+ * reaching it is an incomplete walk, never a silent cut (ADR-0028 Decision 4,
+ * docs/adr/0028-agent-component-inventory-collection.md).
+ *
+ * Excluded directories (system trees that hold no application components) are skipped on both path
+ * separators, case-insensitively. A skip is deliberate and does not make the walk incomplete.
+ * Links, network mounts and other entry types are never listed; each is counted in its own stat.
+ */
+#pragma once
+
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+namespace yuzu::component_inventory {
+
+// ---- filesystem seam (names are binding: the scan and the OS legs are written against them) ----
+
+struct DirEntry {
+    enum class Type { file, dir, link, network_mount, other };
+    std::string name;
+    Type type{Type::other};
+};
+
+struct ListResult {
+    std::vector<DirEntry> entries;
+    bool error{false};     // the directory could not be listed
+    bool truncated{false}; // the listing was cut at the cap the caller passed
+};
+
+struct FileView {
+    std::uint64_t size{0};
+    std::int64_t mtime{0};
+    // nullopt = I/O error; fewer bytes than asked only at end of file.
+    std::function<std::optional<std::string>(std::uint64_t offset, std::size_t len)> read_at;
+    // true while the open file still has the size and time it had when opened.
+    std::function<bool()> unchanged;
+};
+
+struct FsOps {
+    std::function<ListResult(const std::string& dir, std::size_t cap)> list;
+    // nullopt = not opened: a link, not a regular file, refused or gone.
+    std::function<std::optional<FileView>(const std::string& path)> open_file;
+    std::function<std::chrono::steady_clock::time_point()> now;
+};
+
+// ---- policy ----
+
+struct WalkLimits {
+    std::size_t max_entries{400000};
+    std::chrono::seconds max_wall{45}; // the scan turns this into the deadline it passes to walk()
+    std::size_t max_rows_per_anchor{3000};
+    std::size_t max_rows{20000};
+    std::size_t max_depth{32};
+    std::size_t max_dir_entries{50000};
+};
+
+struct Candidate {
+    std::string path;
+    std::string anchor_app; // first path component below the root
+};
+
+struct WalkStats {
+    std::size_t entries{0};
+    std::size_t dirs_listed{0};
+    std::size_t links_skipped{0};
+    std::size_t mounts_skipped{0};
+    std::size_t other_skipped{0};
+};
+
+// archive_unenumerated and archive_changed are set by the scan, never by the walk; the enum lives
+// here so both share one vocabulary.
+enum class Stop {
+    complete,
+    budget_entries,
+    budget_time,
+    anchor_rows,
+    section_rows,
+    depth,
+    dir_unreadable,
+    dir_truncated,
+    archive_unenumerated,
+    archive_changed,
+};
+
+[[nodiscard]] constexpr std::string_view to_token(Stop s) noexcept {
+    switch (s) {
+    case Stop::complete: return "complete";
+    case Stop::budget_entries: return "budget_entries";
+    case Stop::budget_time: return "budget_time";
+    case Stop::anchor_rows: return "anchor_rows";
+    case Stop::section_rows: return "section_rows";
+    case Stop::depth: return "depth";
+    case Stop::dir_unreadable: return "dir_unreadable";
+    case Stop::dir_truncated: return "dir_truncated";
+    case Stop::archive_unenumerated: return "archive_unenumerated";
+    case Stop::archive_changed: return "archive_changed";
+    }
+    return "complete"; // unreachable for a valid enumerator
+}
+
+struct WalkResult {
+    std::vector<Candidate> candidates;
+    WalkStats stats;
+    Stop stop{Stop::complete};
+};
+
+namespace walk_detail {
+
+[[nodiscard]] inline char ascii_lower(char c) noexcept {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+[[nodiscard]] inline bool ends_with_ci(std::string_view s, std::string_view suffix) noexcept {
+    if (s.size() < suffix.size())
+        return false;
+    s.remove_prefix(s.size() - suffix.size());
+    for (std::size_t i = 0; i < suffix.size(); ++i)
+        if (ascii_lower(s[i]) != suffix[i]) // suffix is already lower case
+            return false;
+    return true;
+}
+
+[[nodiscard]] inline bool is_candidate_name(std::string_view n) noexcept {
+    return ends_with_ci(n, ".jar") || ends_with_ci(n, ".war") || ends_with_ci(n, ".ear");
+}
+
+// Both separators are treated alike, so one list covers the Windows and POSIX spellings.
+[[nodiscard]] inline bool is_excluded_dir(std::string_view path) noexcept {
+    static constexpr std::string_view kNames[] = {"/windowsapps", "/windows kits", "/winsxs", "/windows",
+                                                  "/system32",    "/syswow64",     "/system"};
+    std::string norm(path);
+    for (char& c : norm)
+        c = (c == '\\') ? '/' : ascii_lower(c);
+    for (auto n : kNames)
+        if (ends_with_ci(norm, n))
+            return true;
+    return false;
+}
+
+[[nodiscard]] inline std::string join(const std::string& dir, const std::string& name, char sep) {
+    if (!dir.empty() && dir.back() == sep)
+        return dir + name;
+    return dir + sep + name;
+}
+
+} // namespace walk_detail
+
+/**
+ * Walk `roots` breadth-first through `fs`. A root is depth 0. `deadline` is computed once by the
+ * caller (the scan reuses the same instant for its archive reads); it and the entry budget are
+ * checked before every directory is listed, i.e. after the previous one finished, and the entry
+ * budget is also enforced entry by entry so stats.entries never exceeds limits.max_entries.
+ */
+[[nodiscard]] inline WalkResult walk(std::span<const std::string> roots, const WalkLimits& limits,
+                                     const FsOps& fs, char sep,
+                                     std::chrono::steady_clock::time_point deadline) {
+    using Type = DirEntry::Type;
+    WalkResult out;
+
+    // First cause wins; a budget cause additionally ends the walk (the caller returns at once).
+    const auto record = [&out](Stop s) {
+        if (out.stop == Stop::complete)
+            out.stop = s;
+    };
+
+    struct Pending {
+        std::string path;
+        std::size_t depth;
+        std::string anchor; // empty for the root itself
+    };
+
+    for (const auto& root : roots) {
+        std::unordered_map<std::string, std::size_t> anchor_rows; // per root
+        std::deque<Pending> queue;
+        queue.push_back({root, 0, {}});
+
+        while (!queue.empty()) {
+            if (fs.now() >= deadline) {
+                record(Stop::budget_time);
+                return out;
+            }
+            Pending cur = std::move(queue.front());
+            queue.pop_front();
+
+            ListResult listing = fs.list(cur.path, limits.max_dir_entries);
+            if (listing.error) {
+                record(Stop::dir_unreadable);
+                continue;
+            }
+            ++out.stats.dirs_listed;
+            if (listing.truncated || listing.entries.size() > limits.max_dir_entries)
+                record(Stop::dir_truncated);
+            const std::size_t n = std::min(listing.entries.size(), limits.max_dir_entries);
+
+            for (std::size_t i = 0; i < n; ++i) {
+                const DirEntry& e = listing.entries[i];
+                if (e.name.empty() || e.name == "." || e.name == "..")
+                    continue;
+                if (out.stats.entries >= limits.max_entries) {
+                    record(Stop::budget_entries);
+                    return out;
+                }
+                ++out.stats.entries;
+
+                switch (e.type) {
+                case Type::link: ++out.stats.links_skipped; continue;
+                case Type::network_mount: ++out.stats.mounts_skipped; continue;
+                case Type::other: ++out.stats.other_skipped; continue;
+                case Type::dir: {
+                    if (cur.depth + 1 > limits.max_depth) {
+                        record(Stop::depth);
+                        continue;
+                    }
+                    std::string path = walk_detail::join(cur.path, e.name, sep);
+                    if (walk_detail::is_excluded_dir(path))
+                        continue;
+                    queue.push_back({std::move(path), cur.depth + 1, cur.anchor.empty() ? e.name : cur.anchor});
+                    continue;
+                }
+                case Type::file: break;
+                }
+
+                if (!walk_detail::is_candidate_name(e.name))
+                    continue;
+                const std::string& anchor = cur.anchor.empty() ? e.name : cur.anchor;
+                std::size_t& rows = anchor_rows[anchor];
+                if (rows >= limits.max_rows_per_anchor) {
+                    record(Stop::anchor_rows);
+                    continue;
+                }
+                if (out.candidates.size() >= limits.max_rows) {
+                    record(Stop::section_rows);
+                    return out;
+                }
+                ++rows;
+                out.candidates.push_back({walk_detail::join(cur.path, e.name, sep), anchor});
+            }
+        }
+    }
+    return out;
+}
+
+} // namespace yuzu::component_inventory
