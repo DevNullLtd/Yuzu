@@ -1369,12 +1369,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
             count("audit_unavailable");
             return;
         }
-        // Both permissions were admitted before the audit wait, and every dispatch below is
-        // followed by another wait (its outcome row), so they are decided and the caller derived
-        // again before EACH source; the first pass is the re-decision after the `attempted` row.
-        // A grant or session withdrawn in any of those waits sends nothing further and stops the
-        // batch. The hard gate writes its own 403 (an expired session fails at its require_auth);
-        // the soft one answers with the Execute note.
+        // The hard gate writes its own refusal (a 403, or the 401 of its require_auth once the
+        // session is gone); the soft one answers with the Execute note.
         int applied = 0;
         int refused_or_unreached = 0;
         for (std::size_t i = 0; i < kKnown.size(); ++i) {
@@ -1399,11 +1395,10 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                 count("permission_revoked");
                 return;
             }
-            // Review finding (#3133): this route gates only Infrastructure:Read above,
-            // but `echo.configure` is classified Infrastructure:Write — the route relied
-            // on the chokepoint to enforce Write, and the chokepoint only does that when
-            // handed a real, non-system caller. Deriving it here (not a bare Read-only
-            // gate) is the complete fix: an operator who lacks Write is refused by
+            // #3133: the route itself decides only Read and Execute (above, for this source), but
+            // `echo.configure` is classified Infrastructure:Write, and the chokepoint enforces
+            // that only when handed a real, non-system caller. So the caller is derived from the
+            // request here, again for each source: an operator who lacks Write is refused by
             // build_classified_command exactly like every other Write-classified action.
             const auto caller = caller_fn_(req);
             const std::string src{kKnown[i]};

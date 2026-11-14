@@ -2129,6 +2129,7 @@ TEST_CASE("capture-sources push: permissions and caller are decided again before
         auto r = push(h, "process%3Don,tcp%3Doff");
         REQUIRE(r);
         CHECK(r->status == 403);
+        CHECK(r->body.empty()); // the gate's answer stands: the route adds no note of its own
         CHECK(h.dispatch_calls == 1);
         const auto* failure = first_row(h, "failure");
         REQUIRE(failure != nullptr);
@@ -2146,6 +2147,33 @@ TEST_CASE("capture-sources push: permissions and caller are decided again before
         REQUIRE(r);
         CHECK(h.dispatch_calls == 2);
         CHECK(h.last_dispatch_caller.principal == "bob");
+    }
+    SECTION("no agent reached and then Execute withdrawn counts as permission_revoked only") {
+        EchoHarness h;
+        h.dispatch_sent = 0; // the first source is dispatched and reaches no agent
+        h.audit_persists = [&h](const EchoHarness::AuditRow& row) {
+            if (row.result == "no_agents")
+                h.allow_execute = false;
+            return true;
+        };
+        auto r = push(h, "process%3Don,tcp%3Doff");
+        REQUIRE(r);
+        CHECK(h.dispatch_calls == 1);
+        const std::vector<std::string> expected{
+            "audit:echo.sources.configure/attempted", "dispatch",
+            "audit:echo.sources.configure/no_agents", "audit:echo.sources.configure/failure"};
+        CHECK(h.order == expected);
+        const auto* failure = first_row(h, "failure");
+        REQUIRE(failure != nullptr);
+        // The unreached source is in neither `sent=` nor the pairs: its `no_agents` row has it.
+        CHECK(failure->detail == "permission_revoked sent=0 tcp_enabled=false");
+        const auto toast = toast_of(*r);
+        REQUIRE(toast.is_object());
+        CHECK(toast.at("level") == "error");
+        CHECK(toast.at("message").get<std::string>().find("0 of 2") != std::string::npos);
+        CHECK(h.metric(kSourcesPushMetric, "permission_revoked") == 1);
+        for (const char* result : {"pushed", "none_applied", "audit_unavailable"})
+            CHECK(h.metric(kSourcesPushMetric, result) == 0);
     }
 }
 
