@@ -933,10 +933,17 @@ place, **Hardware** and **Software**, each its own page:
   there is no second read to fail: on a deployment with more than one server replica a device
   connected to another replica reads Online, on the list, the per-device record, `GET
   /api/v1/hardware/{id}` and MCP `get_hardware_ci` alike, and the Online/Offline filter, the
-  status sort and the Online and Offline tiles agree with it. Two limits remain: a device that
-  drops without saying goodbye reads Online until the window passes, and a device whose first
-  heartbeat has not recorded a session yet reads Offline on a replica other than the one it
-  is connected to until its next heartbeat.
+  status sort and the Online and Offline tiles agree with it. Limits that remain: a device that
+  drops without saying goodbye reads Online until the window passes; a device that has just
+  connected or reconnected to one replica (its first heartbeat there has not recorded a session
+  yet, at most one heartbeat interval, 30 seconds by default) reads Offline on the other
+  replicas until it does; and a device connected to another replica reads Online but is not
+  reachable from this one, so actions that need a connection to the answering server, such as
+  **Sync now**, stay unavailable on its record (the sync route answers 503, "agent is not
+  connected"). The Hardware list reads the session timeout as currently configured; the
+  registry's own presence read, behind the Home figure, keeps the value the server started
+  with until it is restarted, so the two can differ after a runtime change of
+  `heartbeat_timeout`.
 
   **Click a device** (or visit `/hardware/ci?id=`) for its record — a seven-tab CI
   record, gated per device on `Inventory:Read` for the device's management group
