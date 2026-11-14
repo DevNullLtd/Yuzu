@@ -1350,8 +1350,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         if (!(audit_fn_ && detail::try_persist_audit(audit_fn_, req, "echo.sources.configure",
                                                      "attempted", "Agent", device, pairs))) {
             res.status = 503;
-            if (!res.has_header("Sec-Audit-Failed"))
-                res.set_header("Sec-Audit-Failed", "true");
+            res.set_header("Sec-Audit-Failed", "true");
             push_toast(res, kPushAuditRefusal, "error");
             res.set_content(std::string("<div class=\"echo-tree-note\" data-reason=\"audit_unavailable\">") +
                                 kPushAuditRefusal + "</div>",
@@ -1364,7 +1363,7 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         // one answers with the Execute note.
         const bool read_ok = scoped_perm_fn_(req, res, "Infrastructure", "Read", device);
         const bool exec_ok = read_ok && can_execute(req, device);
-        if (!read_ok || !exec_ok) {
+        if (!exec_ok) {
             (void)detail::emit_behavioral_audit(audit_fn_, req, res, "echo.sources.configure",
                                                 "failure", "Agent", device,
                                                 "permission_revoked " + pairs);

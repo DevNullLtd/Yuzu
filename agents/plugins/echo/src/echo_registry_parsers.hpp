@@ -17,17 +17,12 @@
 //     a Layer-1 change on value name + type + size + time window
 //     (attribute_candidate), never read off an event that named the key.
 //
-// SECRET VALUES. A closed list of value names (is_sensitive_reg_value: Winlogon's
-// DefaultPassword and AltDefaultPassword) is never stored in any form, under ANY watched
-// key (name-only, so it fails closed across HKLM, HKU\<sid>, numbered control sets and
-// offline mounts). For such a name the row's data is the fixed text kRegistryMaskedData with
-// data_size 0, the baseline entry keeps the type only (no size, no hash), and a held
-// candidate in the cursor row is masked the same way. The masking is applied where values
-// are derived (diff_registry_snapshot, baseline_from_read) and enforced again, idempotently,
-// at the three persisted exits (encode_registry_baseline, candidate_to_json,
-// registry_row_from_candidate), so a legacy baseline or cursor cannot carry a secret
-// through. Consequence: a content-only change to a listed value produces no row; add,
-// remove and type change still do. Other secret-bearing values are NOT detected.
+// SECRET VALUES. A value under a sensitive name (is_sensitive_reg_value) is never stored in
+// any form. Masking is applied where values are derived (diff_registry_snapshot,
+// baseline_from_read) and enforced again, idempotently, at the three persisted exits
+// (encode_registry_baseline, candidate_to_json, registry_row_from_candidate), so a legacy
+// baseline or cursor cannot carry a secret through. A content-only change to such a value
+// produces no row. Other secret-bearing values are NOT detected.
 //
 // A change becomes a row only after its attribution is final: a candidate is HELD
 // (persisted in the cursor) until kEtwSettle100ns after its window closed, since an

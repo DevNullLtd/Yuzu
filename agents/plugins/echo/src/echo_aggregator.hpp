@@ -335,20 +335,14 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
  * The `process` snapshot-diff baseline codec (echo_state row `diff_state_key("process")`).
  *
  * The baseline holds pid, ppid, name and user ONLY -- never the command line (#3864).
- * echo_state is readable through echo.sql, and a command line routinely carries
- * credentials (`psql postgresql://user:pw@host`). The process diff keys on pid presence
- * and name alone, so dropping the field changes no diff outcome; the event tables and
- * roll-up tiers likewise store no command line.
+ * echo_state is readable through echo.sql and a command line routinely carries credentials
+ * (`psql postgresql://user:pw@host`); the process diff keys on pid and name, so no diff
+ * outcome changes.
  *
- *   encode  -- JSON array of {pid, ppid, name, user}; no `cmdline` key.
- *   decode  -- tolerant: an empty string yields an empty vector, a parse error keeps what
- *              was parsed, and a `cmdline` key (a row written by an earlier build) is
- *              never read.
- *   scrub   -- rewrites a stored row that still carries a command line (written by an
- *              earlier build) to the clean encoding. Idempotent: true only when it
- *              rewrote the row; false for no row, an unreadable row, an already-clean
- *              row, or a failed write (the last two logged). Run at every start, so a
- *              crash mid-way is retried at the next start.
+ *   decode -- malformed JSON gives an empty vector, a malformed entry keeps the entries
+ *             before it, and a `cmdline` key is never read.
+ *   scrub  -- true only when it rewrote the row; false for no row or an already-clean row,
+ *             and for an unreadable row or a failed write (those two logged).
  */
 [[nodiscard]] std::string encode_process_baseline(const std::vector<yuzu::agent::ProcessInfo>& procs);
 [[nodiscard]] std::vector<yuzu::agent::ProcessInfo> decode_process_baseline(const std::string& s);
