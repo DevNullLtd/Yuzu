@@ -1658,7 +1658,7 @@ jobs:
 
       # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign image (keyless)
         env:
@@ -1841,7 +1841,7 @@ jobs:
 
       # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign image (keyless)
         env:
@@ -2132,7 +2132,7 @@ jobs:
 
       # ── cosign keyless image signing (Sigstore / Fulcio / Rekor) ────
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign image (keyless)
         env:
@@ -2248,7 +2248,7 @@ jobs:
           password: ${{ secrets.GHCR_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
@@ -2442,7 +2442,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign SHA256SUMS (keyless)
         env:
