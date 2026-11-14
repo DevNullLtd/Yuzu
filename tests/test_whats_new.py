@@ -10,9 +10,11 @@ signing, and nothing depends on the clock (commit dates are pinned). Stdlib only
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from datetime import datetime, timedelta, timezone
@@ -58,11 +60,14 @@ class GitCase(unittest.TestCase):
             **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "TZ": "UTC",
+            # No user-level git files (a global ignore or attributes file) change what a commit holds.
+            "HOME": str(self.dir / "home"), "XDG_CONFIG_HOME": str(self.dir / "home"), "USERPROFILE": str(self.dir / "home"),
             # Never discover a repository above the temp directory (TMPDIR may sit inside one).
             "GIT_CEILING_DIRECTORIES": str(Path(self.tmp.name).parent),
             "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid",
         }
+        (self.dir / "home").mkdir()
         self.clock = 0
 
     def tearDown(self):
@@ -177,8 +182,8 @@ class Versions(GitCase):
         self.put(repo, "gateway/rebar.lock", '{"1.3.0", [{<<"cowboy">>, {hex, <<"cowboy">>, <<"2.19.0">>}, 0}]}.\n')
         self.commit(repo, "break formats")
         out = self.ok(repo, "--since", old)
-        self.assertIn("! vcpkg not compared: vcpkg.json is not valid JSON", out)
-        self.assertIn("! rebar_lock not compared", out)
+        self.assertIn("! vcpkg.json not compared: vcpkg.json is not valid JSON", out)
+        self.assertIn("! gateway/rebar.lock not compared", out)
         self.assertNotIn("(removed)", out)
 
     def test_surface_notes(self):
@@ -313,9 +318,14 @@ class Fragments(GitCase):
     def test_grammar_matches_assemble_changelog(self):
         assemble = load(ASSEMBLE, "assemble_changelog_for_parity")
         self.assertEqual(set(WN.SECTION_ORDER), set(assemble.SECTION_KEYS))
-        for name in ("1-a.added.md", "a.b-c_d.fixed.md", "A9.security.md", ".x.added.md", "a b.added.md",
-                     "README.md", "x.bogus.md", "-a.added.md", "a.added.txt", "_a.added.md"):
-            self.assertEqual(bool(WN.FRAGMENT_RE.match(name)), bool(assemble.FRAGMENT_NAME_RE.match(name)), name)
+        names = ["1-a.added.md", "a.b-c_d.fixed.md", "A9.security.md", ".x.added.md", "a b.added.md",
+                 "README.md", "x.bogus.md", "-a.added.md", "a.added.txt", "_a.added.md", "a.Added.md", "a.added.MD",
+                 "a.added.md.md", "a..added.md", "a.added.md ", " a.added.md"]
+        # Every ASCII character in the first, a middle and the last place of the stem, and in each section.
+        for c in map(chr, range(32, 127)):
+            names += [f"{c}a.added.md", f"a{c}b.fixed.md", f"ab{c}.changed.md", f"a.{c}added.md", f"a.added{c}md"]
+        for name in names:
+            self.assertEqual(bool(WN.FRAGMENT_RE.fullmatch(name)), bool(assemble.FRAGMENT_NAME_RE.fullmatch(name)), repr(name))
 
 
 class Base(GitCase):
@@ -827,7 +837,7 @@ class Extractors(GitCase):
     def test_a_pathologically_nested_manifest_is_reported_not_a_traceback(self):
         repo = FakeRepo(files={("n", "vcpkg.json"): "[" * 100000, ("o", "vcpkg.json"): "{}"})
         lines = WN.version_changes(repo, "o", "n")
-        self.assertIn("  ! vcpkg not compared: nested too deeply", lines)
+        self.assertIn("  ! vcpkg.json not compared: nested too deeply", lines)
 
     def test_image_file_variants(self):
         for path, image in (("deploy/docker/Dockerfile", True), ("deploy/docker/Dockerfile.runner", True),
@@ -1058,7 +1068,7 @@ class PromotedFragments(GitCase):
     def promoted(self, name, body, **kw):
         repo = self.init()
         self.seed(repo)
-        old = self.commit(repo, "base", date="2026-10-20T12:00:00+0000") if False else self.git(repo, "rev-parse", "HEAD")
+        old = self.git(repo, "rev-parse", "HEAD")
         self.put(repo, f"changelog.d/{name}", body)
         self.commit(repo, "add")
         promote(repo)
@@ -1132,12 +1142,15 @@ class Robustness(GitCase):
         self.seed(repo)
         sha = self.git(repo, "rev-parse", "HEAD")
         r = WN.Repo(repo)
-        got = r.blobs([f"{sha}:meson.build", f"{sha}:nope.txt", f"{sha}:changelog.d/README.md"])
+        got = r.blobs([f"{sha}:meson.build", f"{sha}:nope.txt", f"{sha}:changelog.d/README.md"], required=False)
         self.assertEqual(got[f"{sha}:nope.txt"], None)
         self.assertEqual(got[f"{sha}:changelog.d/README.md"], "readme\n")
         self.assertIn("project('yuzu'", got[f"{sha}:meson.build"])
         self.assertIsNone(r.show(sha, "nope.txt"))
         self.assertEqual(r.blobs([]), {})
+        with self.assertRaises(WN.GitError) as cm:  # by default a missing object is an error, never "nothing there"
+            r.blobs([f"{sha}:meson.build", f"{sha}:nope.txt"])
+        self.assertIn("nope.txt", str(cm.exception))
 
     def test_an_unexpected_cat_file_reply_is_an_error(self):
         class R(FakeRepo):
@@ -1192,11 +1205,11 @@ class Robustness(GitCase):
     def test_clean_every_boundary(self):
         inside = [0x00, 0x08, 0x0b, 0x0c, 0x0e, 0x1f, 0x7f, 0x80, 0x9f, 0xad, 0x34f, 0x61c, 0x115f, 0x1160, 0x17b4,
                   0x17b5, 0x180b, 0x180d, 0x180e, 0x180f, 0x200b, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064,
-                  0x2066, 0x2069, 0x206a, 0x2800, 0x3164, 0xd800, 0xfe00, 0xfe0f, 0xfeff, 0xffa0,
+                  0x2065, 0xfff0, 0xfff8, 0xe0080, 0xe00ff, 0xe01f0, 0xe0fff, 0x2066, 0x2069, 0x206a, 0x2800, 0x3164, 0xd800, 0xfe00, 0xfe0f, 0xfeff, 0xffa0,
                   0xfff9, 0xfffb, 0xfffc, 0xe0000, 0xe0001, 0xe007f, 0xe0100, 0xe01ef]
         outside = [0x09, 0x0a, 0x20, 0x7e, 0xa0, 0xa1, 0x34e, 0x350, 0x61b, 0x61d, 0x1810, 0x200a, 0x2010, 0x2027,
-                   0x202f, 0x205f, 0x2065, 0x27ff, 0x2801, 0x3163, 0x3165, 0xfdff, 0xfe10, 0xfefe, 0xff00, 0xff9f,
-                   0xfff8, 0xfffd, 0xdffff, 0xe0080, 0xe00ff, 0xe01f0, 0x41, 0xe9, 0x4e2d]
+                   0x202f, 0x205f, 0x27ff, 0x2801, 0x3163, 0x3165, 0xfdff, 0xfe10, 0xfefe, 0xff00, 0xff9f,
+                   0xffef, 0xfffd, 0xdffff, 0xe1000, 0x41, 0xe9, 0x4e2d]
         for cp in inside:
             self.assertEqual(WN.clean(f"a{chr(cp)}b"), "a?b", hex(cp))
         for cp in outside:
@@ -1249,7 +1262,10 @@ class RoundFourPulls(PullHelpers):
             self.assertIsNone(self.base_for(subject), subject)
 
     def test_every_option_that_takes_a_value_has_its_value_skipped(self):
-        for opt in sorted(WN.PULL_VALUE_OPTIONS):
+        # Written out here, not read from the script: a set that loses an entry must fail this test.
+        for opt in ("-s", "--strategy", "-X", "--strategy-option", "-o", "--server-option", "-j", "--jobs", "--depth",
+                    "--deepen", "--cleanup", "--upload-pack", "--shallow-since", "--shallow-exclude",
+                    "--negotiation-tip", "--refmap"):
             self.assertTrue(self.base_for(f"pull {opt} v origin dev: x"), opt)  # `v` is not a repository
             self.assertIsNone(self.base_for(f"pull {opt} v origin fix/foo: x"), opt)
 
@@ -1489,12 +1505,12 @@ class RoundFiveFragments(GitCase):
             def names(self, *args):
                 return ["changelog.d/2-b.added.md"] if args[0] == "diff" else []
 
-            def blobs(self, specs):
+            def blobs(self, specs, required=True):
                 return {s: "- **x.**\n" for s in specs}
 
         saved = WN._rename_pairs
-        WN._rename_pairs = lambda *a: {"changelog.d/2-b.added.md": ("changelog.d/3-c.added.md", 100),
-                                       "changelog.d/3-c.added.md": ("changelog.d/2-b.added.md", 100)}
+        WN._rename_pairs = lambda *a: ({"changelog.d/2-b.added.md": ("changelog.d/3-c.added.md", 100),
+                                        "changelog.d/3-c.added.md": ("changelog.d/2-b.added.md", 100)}, set())
         try:
             self.assertEqual(list(WN.added_fragments(R(), "o", "n")), ["changelog.d/2-b.added.md"])
         finally:
@@ -1528,6 +1544,259 @@ class RoundFiveFragments(GitCase):
         self.put(repo, "meson.build", "project('yuzu', version: '1.0\nINJECTED')\n")
         self.commit(repo, "odd")
         self.assertEqual(WN.meson_version(WN.Repo(repo), "HEAD"), {})
+
+
+class RoundSixFragments(GitCase):
+    """Round-5 re-review: fragment lives, promoted lines edited later, hidden names, forged lines."""
+
+    def promoted_twice(self, first_at_base):
+        repo = self.init()
+        if first_at_base:
+            self.put(repo, "changelog.d/2-a.fixed.md", "- **First text.**\n")
+        old = self.seed(repo)
+        if not first_at_base:
+            self.put(repo, "changelog.d/2-a.fixed.md", "- **First text.**\n")
+            self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release 1")
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Second text.**\n")
+        self.commit(repo, "same name, new change")
+        promote(repo, "1.4.0")
+        self.commit(repo, "release 2")
+        return repo, old
+
+    def test_a_path_promoted_twice_lists_the_second_life_when_the_first_was_the_readers(self):
+        repo, old = self.promoted_twice(True)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Second text", out)
+        self.assertNotIn("First text", out)
+        self.assertIn("Changelog entries added (1)", out)
+
+    def test_a_path_promoted_twice_lists_both_lives_when_neither_was_the_readers(self):
+        repo, old = self.promoted_twice(False)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("First text", out)
+        self.assertIn("Second text", out)
+        self.assertNotIn("Already there", out)
+        self.assertIn("Changelog entries added (2)", out)
+
+    def test_a_name_reused_after_a_rename_and_promoted_lists_both_entries(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/0000-x.fixed.md", "- **X entry.**\n")
+        self.commit(repo, "add")
+        self.git(repo, "mv", "changelog.d/0000-x.fixed.md", "changelog.d/7-x.fixed.md")
+        self.commit(repo, "rename to the PR number")
+        self.put(repo, "changelog.d/0000-x.fixed.md", "- **Y entry other.**\n")
+        self.commit(repo, "the placeholder name again")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("X entry", out)
+        self.assertIn("Y entry other", out)
+
+    def test_a_rename_cycle_then_a_release_still_lists_the_entry_once(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Cycle entry.**\n")
+        self.commit(repo, "add")
+        for src, dst in (("2-a", "3-b"), ("3-b", "2-a"), ("2-a", "3-b")):
+            self.git(repo, "mv", f"changelog.d/{src}.fixed.md", f"changelog.d/{dst}.fixed.md")
+            self.commit(repo, f"{src} to {dst}")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (1)", out)
+        self.assertIn("Cycle entry", out)
+
+    def test_a_promoted_line_polished_after_the_release_is_still_listed(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/7000-x.changed.md", "- **Breaking** change X needs action. Details here.\n")
+        self.put(repo, "changelog.d/7001-y.fixed.md", "- Plain Y.\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.put(repo, "CHANGELOG.md", text.replace("Plain Y.", "Plain Y (see docs).").replace(
+            "Details here.", "Details in the upgrade guide."))
+        self.commit(repo, "polish the release notes")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Breaking", out)
+        self.assertIn("Plain Y", out)
+        self.assertIn("Changelog entries added (2)", out)
+
+    def test_a_rename_into_security_or_removed_is_a_reclassification_and_is_listed(self):
+        repo = self.init()
+        self.put(repo, "changelog.d/3-s.fixed.md", "- **Sec text.**\n")
+        self.put(repo, "changelog.d/4-r.changed.md", "- **Gone text.**\n")
+        old = self.seed(repo)
+        self.git(repo, "mv", "changelog.d/3-s.fixed.md", "changelog.d/3-s.security.md")
+        self.git(repo, "mv", "changelog.d/4-r.changed.md", "changelog.d/4-r.removed.md")
+        self.commit(repo, "reclassify")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Security (1)", out)
+        self.assertIn("Removed (1)", out)
+        self.assertNotIn("Already there", out)
+
+    def test_a_renamed_edited_then_promoted_old_fragment_is_listed_in_its_new_words(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/5-mid.added.md")
+        self.commit(repo, "rename")
+        self.put(repo, "changelog.d/5-mid.added.md", "- **Already there, now reworded.**\n")
+        self.commit(repo, "reword")
+        promote(repo)
+        self.commit(repo, "release")
+        self.assertIn("now reworded", self.ok(repo, "--since", old))
+
+    def test_an_existing_fragment_reworded_and_then_promoted_is_not_listed(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/1-old.added.md", "- **Already there, reworded.**\n")
+        self.commit(repo, "reword")
+        promote(repo)
+        self.commit(repo, "release")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+    def test_a_rename_made_inside_a_merge_commit_is_still_a_rename(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "checkout", "-q", "-b", "side")
+        self.put(repo, "side.txt", "s\n")
+        self.commit(repo, "side")
+        self.git(repo, "checkout", "-q", "dev")
+        self.put(repo, "dev.txt", "d\n")
+        self.commit(repo, "dev")
+        self.git(repo, "merge", "--no-ff", "--no-commit", "side")
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/2-new.added.md")
+        self.commit(repo, "merge with a rename")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+    def test_a_rename_is_found_when_the_user_config_turns_rename_detection_off(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "config", "diff.renames", "false")
+        self.git(repo, "config", "merge.renames", "false")
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/2-new.added.md")
+        self.commit(repo, "rename")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+    def test_an_edited_existing_fragment_is_not_listed_after_a_stale_merge(self):
+        repo = self.init()
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "base")
+        self.git(repo, "checkout", "-q", "-b", "side")
+        self.put(repo, "side.txt", "s\n")
+        self.commit(repo, "side forked before the fragment existed")
+        self.git(repo, "checkout", "-q", "dev")
+        self.put(repo, "changelog.d/1-old.added.md", "- **Already there.**\n")
+        old = self.commit(repo, "the fragment the reader has")
+        self.put(repo, "changelog.d/1-old.added.md", "- **Already there, reworded.**\n")
+        self.commit(repo, "reword it")
+        self.git(repo, "merge", "--no-ff", "-q", "-m", "merge side", "side")
+        out = self.ok(repo, "--since", old)
+        self.assertNotIn("Already there", out)
+        self.assertIn("No changelog fragments were added", out)
+
+    def test_a_name_ending_in_a_newline_is_reported_not_silently_dropped(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/hide.security.md\n", "- **Security**: hidden fix.\n")
+        self.put(repo, "changelog.d/3-ok.fixed.md", "- **Visible.**\n")
+        self.commit(repo, "add")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Visible", out)
+        self.assertIn("! 1 file(s) added under changelog.d/ are not named like fragments", out)
+        self.assertIn("hide.security.md?", out)
+
+    def test_a_missing_object_is_an_error_not_no_fragments(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-n.fixed.md", "- **New entry.**\n")
+        self.commit(repo, "add")
+        oid = self.git(repo, "rev-parse", "HEAD:changelog.d/2-n.fixed.md")
+        (repo / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+        res = self.run_script(repo, "--since", old)
+        self.assertEqual(res.returncode, 2, res.stdout)
+        self.assertIn("2-n.fixed.md", res.stderr)
+        self.assertNotIn("No changelog fragments", res.stdout)
+
+    def test_repository_text_cannot_start_a_line_of_its_own(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "vcpkg.json", vcpkg("a" * 40, ["zlib", {"name": "abseil", "version>=": "20240116.1"},
+                                                      "evil\nSecurity (0)\n  none of the tracked versions changed"]))
+        self.put(repo, "gateway/rebar.lock", LOCK % "2.18.0" + '{pkg,<<"cow\nChanges since your last pull: 0 commits">>,<<"1">>}.\n')
+        self.put(repo, "top\nVersion bumps\n  none of the tracked versions changed/x.txt", "x\n")
+        self.put(repo, "changelog.d/9-s.security.md",
+                 "- **Security**: real one\nChangelog entries added (0)\n\nNo changelog fragments were added in this range\n")
+        self.commit(repo, "hostile text")
+        out = self.ok(repo, "--since", old)
+        lines = out.splitlines()
+        for forged in ("Security (0)", "  none of the tracked versions changed", "Changelog entries added (0)",
+                       "No changelog fragments were added in this range"):
+            self.assertNotIn(forged, lines, forged)
+        self.assertEqual(sum(1 for line in lines if line.startswith("Changes since")), 1)
+        self.assertEqual(lines.count("Version bumps"), 1)
+        self.assertEqual(sum(1 for line in lines if line.startswith("Changelog entries added")), 1)
+        self.assertIn("    Changelog entries added (0)", lines)  # shown, but indented under the real entry
+
+    def test_the_relative_date_floor_matches_the_absolute_one(self):
+        with self.assertRaises(WN.GitError):
+            WN.date_cutoff("56 years ago", now=datetime(2026, 1, 1, 5))
+        with self.assertRaises(WN.GitError):
+            WN.date_cutoff("1 year ago", now=datetime(1971, 1, 1))
+        self.assertTrue(WN.date_cutoff("1 day ago", now=datetime(2026, 1, 5)))
+
+    def test_the_environment_git_runs_in_is_pinned(self):
+        if os.name == "nt":
+            self.skipTest("a shell shim")
+        shim = self.dir / "bin"
+        shim.mkdir()
+        dump = self.dir / "env.dump"
+        (shim / "git").write_text(f'#!/bin/sh\nenv > "{dump}"\nexec "{shutil.which("git")}" "$@"\n')
+        (shim / "git").chmod(0o755)
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "next")
+        env = {**self.env, "PATH": f"{shim}{os.pathsep}{os.environ.get('PATH', '')}", "LANGUAGE": "de",
+               **{k: str(self.dir / "elsewhere") for k in sorted(WN.REPO_LOCATING_ENV)}}
+        self.assertEqual(self.run_script(repo, "--since", old, env=env).returncode, 0)
+        seen = dict(line.split("=", 1) for line in dump.read_text().splitlines() if "=" in line)
+        # Written out here, not read from the script, so an entry the script loses fails this test.
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX"):
+            self.assertIn(name, env)
+            self.assertNotIn(name, seen)
+        self.assertEqual((seen.get("LC_ALL"), seen.get("LANGUAGE")), ("C", "C"))
+
+    def test_a_rename_lasso_that_does_not_include_the_start_does_not_hang(self):
+        class R(FakeRepo):
+            def git(self, *args):
+                return ""
+
+            def names(self, *args):
+                return ["changelog.d/1-x.added.md"] if args[0] == "diff" and "--diff-filter=A" in args else []
+
+            def blobs(self, specs, required=True):
+                return {s: "- **x.**\n" for s in specs}
+
+        saved = WN._rename_pairs
+        pairs = {"changelog.d/1-x.added.md": ("changelog.d/2-y.added.md", 100),
+                 "changelog.d/2-y.added.md": ("changelog.d/3-z.added.md", 100),
+                 "changelog.d/3-z.added.md": ("changelog.d/2-y.added.md", 100)}
+        WN._rename_pairs = lambda *a: (pairs, set())
+        done: list[object] = []
+        worker = threading.Thread(target=lambda: done.append(WN.added_fragments(R(), "o", "n")), daemon=True)
+        try:
+            worker.start()
+            worker.join(10)
+        finally:
+            WN._rename_pairs = saved
+        self.assertFalse(worker.is_alive(), "old_root looped")
+        self.assertEqual(list(done[0]), ["changelog.d/1-x.added.md"])
 
 
 class RoundFourDates(UtcClock, GitCase):

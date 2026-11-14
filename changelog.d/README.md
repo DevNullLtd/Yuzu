@@ -83,21 +83,27 @@ It prints, in this order:
   replaced, reworded or withdrawn inside the range is shown once in its final
   form, or not at all. A fragment that reached its path only through renames
   git saw as identical, from a path you already had, and still has those exact
-  bytes is not new; one renamed and then edited is listed, and so is an
-  identical fragment added in a different commit from the deletion of the
+  bytes is not new (a rename into `security`, `removed` or `deprecated` is a
+  reclassification and is listed); one renamed and then edited is listed, and so
+  is an identical fragment added in a different commit from the deletion of the
   old one. A fragment added after your base and since promoted by a release is
-  shown, under its last path and section, when its first line is one of the lines the range
-  added to `CHANGELOG.md`; one whose changelog line was edited by hand after
-  promotion is not matched and is left out. A path you had, that a release
-  promoted and that was added back with different text, is listed; added back
-  with identical text, it is not. Fragments are read the way `promote` reads them (line endings
-  normalised, outer whitespace dropped).
+  shown, under its last path and section, when its first line is a line a commit
+  in the range added to `CHANGELOG.md`, even if the line was edited by hand after
+  the release; a name a release promoted twice in the range is shown each time.
+  A path you had and edited is not listed, nor is its promotion. A path you had,
+  that a release promoted and that was added back with different text, is
+  listed; added back with identical text, it is not. A fragment you had, moved
+  out of `changelog.d/` and back, is listed again. Fragments are read the way
+  `promote` reads them (line endings normalised, outer whitespace dropped).
+  A file added under `changelog.d/` whose name is not a fragment name is named
+  on a `!` line and is not listed. A `!` line anywhere in the report means that
+  part could not be read or compared; it is never "no change".
 
 "Your last pull" is read from the reflog of the branch you are on: the newest
 `git pull` that names no source or names that branch's upstream (or, when the
 branch has no upstream, the branch itself; `dev:dev` counts as `dev`, `:x` does
-not), or `git merge <upstream>` after a fetch (a merge made with `-s ours`, in either form, took none of the
-upstream and is not counted), and the commit the
+not), or `git merge <upstream>` after a fetch (`git merge -s ours` and `git pull -s ours` take none of the
+upstream and are not counted), and the commit the
 branch was on before it. The `Via` line prints the
 reflog entry used. A pull on another branch is in that branch's reflog, and
 `checkout`, a local `merge`, `reset`, `git pull <other branch>` and a merge of a
@@ -106,21 +112,27 @@ none of them can move the base later. A pull the script does not recognise, such
 as one that stopped on a conflict and was finished by hand, only makes the range
 start earlier, at the pull before it: the range may then include changes you
 already read. A fresh clone, a new branch, a detached `HEAD` or an expired
-reflog has no pull to read, so pass `--since`. After `git pull --rebase` the
-range starts at the common ancestor.
+reflog has no pull to read, so pass `--since`. A `git pull` that finds nothing
+new writes no reflog entry, so the range then still starts at the earlier pull
+that did (the `Base` and `Via` lines show which). After `git pull --rebase` the
+range starts at the common ancestor, so your own local commits, replayed by the
+rebase, and any fragments they add are in it too.
 
 `--since` with a date picks the first commit git finds that was made at or before that
 moment, by commit date (history with skewed commit dates can make that an older or newer commit than
 you meant), in local time. A bare `YYYY-MM-DD` means 00:00 that day;
 `YYYY-MM-DD HH:MM[:SS]` (or with a `T`) is that moment; an absolute date must fall from 3 January
-1970 to 2099 (git reads the first two days of 1970 as "now" east of UTC);
+1970 to 31 December 2099 (git can read a moment on 1 January 1970 as "now" east of UTC, so earlier dates are refused);
 `yesterday` and `N <unit> ago` count back from now (a day is 24 hours). `N` is one to four digits, the unit is lowercase
 (`second`, `minute`, `hour`, `day`, `week`, `month`, `year`, singular or plural)
 and a month or year is a calendar month or year. Anything else is refused,
 because git would read a typo as "now".
 
-The script only reads. Text from fragments and commit messages is printed with
-control characters replaced. Changes that skipped a fragment (rule 3) do not
+The script only reads (in a partial clone, git itself may fetch objects the range
+needs). Text from fragments and commit messages is printed with control characters
+and invisible format characters (zero-width joiners and non-joiners, variation
+selectors, bidi marks) replaced by `?`, so an emoji sequence can show a `?`;
+a fragment's continuation lines are indented. Changes that skipped a fragment (rule 3) do not
 appear in the entries; `git log --first-parent --oneline <base>..HEAD` lists
 every merged PR, with `<base>` the commit the `Base` line prints.
 

@@ -3602,7 +3602,7 @@ test('whats-new script',
   _python3_test,
   args: [files('test_whats_new.py')],
   suite: 'docs',
-  timeout: 60,
+  timeout: 180,
 )
 test('changelog order',
   _python3_test,
