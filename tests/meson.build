@@ -2066,6 +2066,8 @@ if build_server
       'unit/server/test_software_collection_settings_store.cpp',
       # collection-settings REST routes: null-dep shapes (no PG) + [pg][routes] real AuthRoutes gate over ManagementGroupStorePg/RbacStorePg
       'unit/server/test_software_collection_settings_routes.cpp',
+      # SAM-33 read routes (hosts, host detail, change feed, summary, plugin health) over injected store reads: no store, no [pg]
+      'unit/server/test_software_read_routes.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',

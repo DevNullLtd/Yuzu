@@ -17,6 +17,12 @@
 /// recompute slower than the interval simply backs off — no overlap, no pile-up). The
 /// thread borrows the store + pool, so `stop()` (signal + join) MUST run before the
 /// store / pool are torn down (wired in server.cpp `stop()` beside the other join points).
+///
+/// SAM-33: after the two refreshes, and whatever their outcome, the same tick reads the fleet
+/// facet health and headline summary, publishes the `yuzu_software_facet_*` gauges, and swaps an
+/// immutable snapshot into the holder that GET /api/v1/inventory/software/summary and
+/// .../plugin-health serve to a globally admitted caller (software_read_routes.hpp). A failed read
+/// keeps the last good snapshot and is counted (`yuzu_software_fleet_snapshot_total`).
 /// A recompute failure is keep-last-good in the store; the thread logs + counts it and
 /// keeps ticking (an exception escaping a std::thread entry would call std::terminate).
 
@@ -31,6 +37,7 @@ class MetricsRegistry;
 namespace yuzu::server {
 
 class SoftwareInventoryStore;
+class SoftwareFleetSnapshotHolder;
 
 class SoftwareCatalogRollup {
 public:
@@ -42,6 +49,10 @@ public:
 
     SoftwareCatalogRollup(const SoftwareCatalogRollup&) = delete;
     SoftwareCatalogRollup& operator=(const SoftwareCatalogRollup&) = delete;
+
+    /// Where the fleet snapshot is published (borrowed; must outlive the thread). Set before
+    /// start(); null (the default) publishes only the gauges.
+    void set_snapshot_holder(SoftwareFleetSnapshotHolder* holder) noexcept { snapshot_ = holder; }
 
     /// Spawn the background thread (idempotent — a second call is a no-op).
     void start();
@@ -55,10 +66,12 @@ public:
 
 private:
     void run();
+    void refresh_fleet_snapshot();
 
     SoftwareInventoryStore& store_;
     std::chrono::seconds interval_;
     yuzu::MetricsRegistry* metrics_;
+    SoftwareFleetSnapshotHolder* snapshot_{nullptr};
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };
