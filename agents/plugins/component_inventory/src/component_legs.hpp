@@ -66,15 +66,20 @@ using AccessLog = std::function<void(const std::string& path)>;
 /// so the walk lists it, fails, and reports dir_unreadable instead of the root vanishing.
 void drop_unreachable_roots(Targets& t, AccessLog on_access = {});
 
+/// A real mountinfo table runs to tens of megabytes on a container host; past this it is refused.
+inline constexpr std::size_t kMaxMountTable = 256u * 1024 * 1024;
+
 /// Test seam: one read(2) of the mount table. Bytes read, 0 at end of table, or -1 with errno set.
 using ReadChunk = std::function<ssize_t(char* buf, std::size_t len)>;
 
 /// Streams a /proc/<pid>/mountinfo-format table through `read_chunk` and returns the mount points of
 /// the network filesystems in it. nullopt when the table cannot be had in full: a read fails (EINTR is
-/// retried), the table runs past 256 MiB, or one line is longer than 1 MiB. A failure after some of the
-/// table was parsed is nullopt too, never the part read so far: a mount the guard did not see is not
-/// "no mount". Platform-independent (it is also what the tests drive); only Linux feeds it a file.
-[[nodiscard]] std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& read_chunk);
+/// retried), the table runs past `max_total` bytes (kMaxMountTable; a parameter so a test can use a
+/// tiny one), or one line is longer than 1 MiB. A failure after some of the table was parsed is
+/// nullopt too, never the part read so far: a mount the guard did not see is not "no mount".
+/// Platform-independent (it is also what the tests drive); only Linux feeds it a file.
+[[nodiscard]] std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& read_chunk,
+                                                                            std::size_t max_total = kMaxMountTable);
 
 /// Test seam: where scan_targets gets the network mount points. nullopt: the table could not be read.
 using MountTableReader = std::function<std::optional<std::vector<std::string>>()>;

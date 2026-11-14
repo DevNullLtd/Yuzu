@@ -27,7 +27,9 @@
  * however deep it sits. The entry budget bounds the nodes: at most max_entries x (one name + about
  * 64 bytes), about 130 MB at the hostile worst (400,000 names of 255 bytes), a few MB on a real
  * tree. (A queued full path costs up to max_depth x 256 bytes, about 8 KiB, and the same bounds
- * would allow gigabytes.)
+ * would allow gigabytes.) The figure covers the queue and its nodes only: the candidates walk()
+ * returns, and the scan's rows, are bounded by count (max_rows), not bytes, at up to max_rows full
+ * paths of about max_depth x 256 bytes each.
  *
  * Paths are joined with '/': only the POSIX legs ship. No directory is excluded by name (an OSGi
  * container keeps its bundles in <product>/system, so such names are ordinary application directories).
@@ -48,6 +50,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -189,6 +192,8 @@ inline void append(std::string& dir, const std::string& name) {
         std::size_t depth;
         std::size_t anchor; // the depth-1 ancestor's node, kNoNode for the root itself
     };
+    static_assert(std::is_trivially_copyable_v<Pending>,
+                  "a queue slot holds indices only; a queued path brings back the per-entry full-path cost");
 
     for (std::size_t root_index = 0; root_index < roots.size(); ++root_index) {
         std::unordered_map<std::string, std::size_t> anchor_rows; // per root

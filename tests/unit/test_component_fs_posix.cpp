@@ -18,6 +18,8 @@
  * MUTATION NOTES (each assertion below FAILS if the named wiring is removed):
  *  - returning what read_mountinfo_stream has accumulated when a read fails (instead of nullopt) fails
  *    the part-way-failure cases: the scan would plan against a table missing the network mounts.
+ *  - dropping the total-size guard in read_mountinfo_stream (or checking it with >= instead of >) fails the
+ *    boundary case: a table of exactly max_total passes, one byte more is nullopt, never the part read.
  *  - length-checking only the unfinished tail of the stream (not each completed line) fails the
  *    over-limit-line case whose newline arrives in the same read as its last bytes.
  *  - opening a directory by its joined path instead of hop by hop fails the intermediate-link cases
@@ -290,6 +292,18 @@ TEST_CASE("component_legs: a mount-table line over 1 MiB is a failure however it
     SECTION("1 MiB + 1 with no newline at all") {
         CHECK_FALSE(read_mountinfo_stream(serve(std::string(kMiB + 1, 'x'), 64 * 1024)).has_value());
     }
+}
+
+TEST_CASE("component_legs: a mount table past the total ceiling is a failure, never the part read so far",
+          "[runtime][component_inventory][legs]") {
+    // The ceiling is a defaulted parameter so the boundary is tested at the table's own size.
+    const std::string table = kNfsMount + kLocalMount;
+    // The NFS line is parsed before the last read, so a nullopt here also proves the part read so far
+    // is never returned.
+    const auto at = read_mountinfo_stream(serve(table, 7), table.size());
+    REQUIRE(at.has_value());
+    CHECK(*at == std::vector<std::string>{"/opt/share"});
+    CHECK_FALSE(read_mountinfo_stream(serve(table, 7), table.size() - 1).has_value());
 }
 
 TEST_CASE("component_legs: scan_targets over a table that fails part-way yields no roots and touches nothing",

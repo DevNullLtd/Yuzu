@@ -632,7 +632,7 @@ TEST_CASE("scan: row caps are recorded, never silent", "[runtime][component_scan
 }
 
 TEST_CASE("scan: the rows-per-folder quota is per root, so same-named folders under two roots do not share one",
-          "[runtime][component_scan][budget]") {
+          "[runtime][component_scan][budget][component_inventory]") {
     MemTree tree;
     for (const char* root : {"/opt", "/usr/local/lib"})
         for (const char* jar : {"one-1.0.jar", "two-1.0.jar"})
@@ -858,7 +858,7 @@ TEST_CASE("answer: a readable table scans through the factory and carries what t
                             std::to_string(tree.files["/opt/a/lib-1.0.jar"].size()) + "|1700000000|a");
 }
 
-TEST_CASE("answer: a link inside the tree is reported, never a bare supported", "[runtime][component_scan][answer]") {
+TEST_CASE("answer: a link inside the tree is reported, never a bare supported", "[runtime][component_scan][answer][component_inventory]") {
     SECTION("a link to an archive: the archive is not listed and the token says a link was passed over") {
         MemTree tree;
         tree.add_file("/opt/app/lib/real-1.0.jar", build_zip({stored("x", "y")}).bytes);

@@ -179,6 +179,9 @@ struct ArchiveRead {
 /// be this archive's: the sole pom.properties in the directory, or, among several, the one whose <a>
 /// is `artifact` (the outer row's name) when exactly one is. Otherwise no pom is read and the manifest
 /// decides, else the version is unreadable. Directory order is never the tie-break.
+/// Known limit: an archive with no pom of its own that bundles exactly one dependency's reads that
+/// dependency's version. The sole pom is still trusted because a renamed archive (app.jar, ROOT.war)
+/// has no pom named for it, so a name match would send every such archive to the manifest.
 [[nodiscard]] inline ArchiveRead read_archive(const FsOps& fs, const std::string& path, bool want_version,
                                               std::string_view artifact) {
     ArchiveRead r;
@@ -367,7 +370,8 @@ struct ArchiveRead {
 /// A text field as it may cross the plugin ABI: a NUL or a byte outside well-formed UTF-8 becomes '?'
 /// first (the row travels as a C string and is parsed as UTF-8, so a NUL would cut it and a bad byte
 /// would cost the host's whole response), then the pipe/backslash/CR/LF escape. `path` and `anchor_app`
-/// carry file-system and archive-entry bytes verbatim; the other three are already printable ASCII.
+/// carry file-system and archive-entry bytes verbatim; the other three are printable ASCII by
+/// construction and are scrubbed all the same, so the row's safety does not rest on the parsers.
 [[nodiscard]] inline std::string wire_field(std::string_view v) {
     std::string s(v);
     yuzu::shared::scrub_wire_bytes(s);

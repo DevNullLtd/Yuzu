@@ -428,6 +428,10 @@ It reads the archive files themselves in-process; nothing is started or unpacked
 - **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
   `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
   `<archive path>!<entry>`), size, modification time and the application folder it sits under.
+  A `pom` version is read from the archive's only `pom.properties`, or, when it holds several,
+  from the one named for the archive. An archive that has no pom of its own but bundles exactly
+  one dependency's reads that dependency's version, because a renamed archive (`app.jar`) has no
+  pom named for it.
 - **Bounds.** One scan stops at 400,000 directory entries or 45 seconds, reads at most 32
   directory levels, 50,000 entries per directory, 3,000 rows per application folder and 20,000 rows
   in all, and reads at most a 16 MiB archive directory and 64 KiB per version entry.

@@ -1501,6 +1501,12 @@ not listed, and the answer says so (`link_skipped`, below) instead of skipping i
 in-root links, scoped to escapes of the anchored root as Decision 1 describes, is a later change. The
 action runs on demand; the daily sync does not carry it yet.
 
+A `pom` version is read from the archive's only `pom.properties`, or, when it holds several, from the
+one whose artifact segment equals the archive's name (never by directory order). Known limit: an
+archive that has no pom of its own but bundles exactly one dependency's reads that dependency's
+version, and a renamed archive (`app.jar`) has no pom named for it, so a name match would leave it
+without a version; the sole pom is trusted for that reason, and the row says `pom`.
+
 **Bounds as built.** 400,000 directory entries and 45 seconds per scan (one deadline covering the walk,
 the archive reads and the parsing, checked between directories and between archives, so one blocked
 read is not interrupted), 32 directory levels, 50,000 entries per directory listing, 3,000 rows per

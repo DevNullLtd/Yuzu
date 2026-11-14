@@ -69,7 +69,6 @@ namespace {
 constexpr std::size_t kMaxReadAt = 16u * 1024 * 1024; // per read_at call; more is refused, never cut
 constexpr std::size_t kMountChunk = 64 * 1024;
 constexpr std::size_t kMaxMountLine = 1024 * 1024; // a real line is a few KiB; an overlay ~100 KiB
-constexpr std::size_t kMaxMountTable = 256u * 1024 * 1024;
 
 [[nodiscard]] bool within(const std::string& path, const std::string& base) {
     if (base == "/")
@@ -247,7 +246,7 @@ private:
 // A container host's table runs to tens of megabytes, so it is streamed line-wise rather than held
 // whole. A line longer than kMaxMountLine is a failure, not skipped: skipping would hide a mount from
 // the guard. Every completed line is length-checked, not just the unfinished tail.
-std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& read_chunk) {
+std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& read_chunk, std::size_t max_total) {
     std::vector<std::string> out;
     const auto take = [&out](std::string_view lines) {
         for (auto& m : shared::network_mount_points(lines))
@@ -266,7 +265,7 @@ std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& r
         if (n == 0)
             break;
         total += static_cast<std::size_t>(n);
-        if (total > kMaxMountTable)
+        if (total > max_total)
             return std::nullopt;
         pending.append(chunk, 0, static_cast<std::size_t>(n));
         std::size_t start = 0;
