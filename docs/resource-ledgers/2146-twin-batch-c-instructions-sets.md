@@ -2,20 +2,22 @@
 
 New or modified owned resources in `server/core/src/` (`instruction_store.cpp`,
 `instruction_authoring_routes.cpp`, `mcp_instruction_authoring.cpp`, `mcp_server.cpp`,
-`instruction_referrers.{hpp,cpp}`,
-`product_pack_store.cpp`, `policy_store.cpp`, `workflow_engine.cpp`, `server.cpp`) and their unit
-tests, across commits `9d425b09f2` to `09dcec48a2` (fix rounds 6 to 11 added the version-bound delete,
-the pack advisory and the pre-mint reads; the legacy-route and pack-uninstall referrer guards
-they also added are NOT in this split PR, see the scope note below). No file descriptor, `FILE*`,
-socket, `HANDLE`, subprocess, mapped library, temp path, OpenSSL object, BCrypt handle, C string, thread or callback-owned raw pointer is added to
-production code. The owned things are one persisted column, three transaction shapes, a set of
+`instruction_referrers.{hpp,cpp}`, `product_pack_store.cpp`, `policy_store.cpp`,
+`workflow_engine.cpp`, `server.cpp`) and their unit tests, across commits `9d425b09f2` to
+`09dcec48a2`. Fix rounds 6 to 11 added the version-bound delete, the pack advisory and the pre-mint
+reads; the legacy-route and pack-uninstall referrer guards they also added are NOT in this split PR
+(see the scope note below). No file descriptor, `FILE*`, socket, `HANDLE`, subprocess, mapped
+library, temp path, OpenSSL object, BCrypt handle, C string, thread or callback-owned raw pointer is
+added to production code. The owned things are one persisted column, three transaction shapes, a set of
 short read-only pooled leases (each taken and released inside one store method), one shared
 throttle, and some value containers. The test-side resources are listed last.
 
 **Scope note (split PR 1).** This ledger covers the tree of the first PR of the split. The legacy
 `DELETE /api/instructions/{id}` (`instruction_routes.cpp`) and the product-pack uninstall
-(`workflow_routes.cpp`) are unchanged here and do not check referrers; their guards, the pack
-uninstall pre-check reads and their resources are carried by the second PR.
+(`workflow_routes.cpp`) are unchanged here and do not check referrers. Their guards, the pack
+uninstall pre-check reads, the legacy import creator stamp (`stamp_import_creator`) and the other
+legacy-route changes in `instruction_routes.cpp` and `workflow_routes.cpp`, with their resources,
+are carried by the second PR.
 
 ## Resources
 
@@ -168,17 +170,6 @@ uninstall pre-check reads and their resources are carried by the second PR.
 - **Failure cleanup:** RAII only; a `std::bad_alloc` unwinds every container. A SHA-256 provider
   failure returns `std::nullopt` before anything is persisted. Cost is linear in the number of
   arguments (hash lookups, not scans), pinned by a scaling-ratio test.
-
-### `stamp_import_creator` (legacy import)
-- **Site:** `instruction_routes.cpp`, called by `POST /api/instructions/import` before
-  `store->import_definition_json`.
-- **Owner type:** a local `nlohmann::json` parse of the request body and one `std::string` produced
-  by `dump(-1, ' ', false, error_handler_t::replace)`.
-- **Release point:** scope exit; the dumped string is a temporary passed to the store by value.
-- **Transfer:** never; a body that is not depth-safe JSON, not parseable or not an object is
-  returned unchanged.
-- **Failure cleanup:** parsing uses `allow_exceptions=false` and `json_exceeds_depth` runs first;
-  only a `std::bad_alloc` can throw, bounded by the existing 16 MiB request cap.
 
 ### Ownership changes with no resource
 - `Ports::audit` (`mcp_instruction_authoring.hpp`) is a `std::function` that is now left UNSET when
