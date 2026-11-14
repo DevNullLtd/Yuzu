@@ -122,20 +122,12 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
     // The scope is pushed into the store query, so the cap applies to the caller's own
     // records. A null store read is StoreDegraded, never an empty list: a device could
     // still be contained while the caller sees "nothing quarantined".
-    auto visible = quarantine_visible_records(gate.scope, deps->quarantine_list_fn,
-                                              QuarantineVisibleOptions{.max_visible = limit});
-    // #7624: the owed records, read the same way (same scope, the same cap applied to them on
-    // their own), appended after the active ones. `more` is true if either list was cut.
-    if (visible.status == QuarantineReadStatus::Ok && include_owed) {
-        const auto owed = quarantine_visible_records(gate.scope, deps->quarantine_owed_list_fn,
-                                                     QuarantineVisibleOptions{.max_visible = limit});
-        if (owed.status == QuarantineReadStatus::StoreDegraded) {
-            visible.status = QuarantineReadStatus::StoreDegraded;
-        } else {
-            visible.records.insert(visible.records.end(), owed.records.begin(), owed.records.end());
-            visible.more = visible.more || owed.more;
-        }
-    }
+    // #7624: with include=release_owed the owed records are read the same way (same scope, the
+    // same cap applied to them on their own) and follow the active ones; `more` is true if either
+    // list was cut.
+    const auto visible = quarantine_visible_with_owed(
+        gate.scope, deps->quarantine_list_fn, deps->quarantine_owed_list_fn, include_owed,
+        QuarantineVisibleOptions{.max_visible = limit});
     if (visible.status == QuarantineReadStatus::StoreDegraded) {
         const bool audit_ok = ctx.audit("failure", "quarantine list unavailable; store degraded");
         ctx.res.set_content(ctx.a4_error(kInternalError, "Quarantine list unavailable - read failed",

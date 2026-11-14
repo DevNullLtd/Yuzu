@@ -79,12 +79,22 @@ QuarantineContainmentReconciler::entry_for(const std::string& agent_id, const Ag
 }
 
 void QuarantineContainmentReconciler::back_off(const std::string& agent_id, const AgentState& c,
-                                               std::chrono::steady_clock::time_point now_steady) {
+                                               std::chrono::steady_clock::time_point now_steady,
+                                               bool reverify) {
     std::lock_guard<std::mutex> lk(mu_);
     if (auto* st = entry_for(agent_id, c)) {
         st->backoff = next_backoff(st->backoff, max_backoff());
         st->next_eligible_at = now_steady + st->backoff;
+        if (reverify)
+            st->verify_first = true;
     }
+}
+
+void QuarantineContainmentReconciler::erase_if_current(const std::string& agent_id,
+                                                       const AgentState& c) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (entry_for(agent_id, c))
+        state_.erase(agent_id);
 }
 
 void QuarantineContainmentReconciler::seed_metrics(yuzu::MetricsRegistry& metrics) {
@@ -533,11 +543,6 @@ void QuarantineContainmentReconciler::handle_status_reply(
         if (auto* st = entry_for(agent_id, c))
             st->pending = Pending::none;
     }
-    const auto erase_entry = [&] {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (entry_for(agent_id, c))
-            state_.erase(agent_id);
-    };
 
     // #7621: a confirmed record whose re-verify no longer confirms is not called drift on the
     // reply alone. The reply may describe a record that ended or began releasing while the status
@@ -546,17 +551,13 @@ void QuarantineContainmentReconciler::handle_status_reply(
         auto fresh = d_.quarantine_store->get_status(agent_id);
         if (!fresh) {
             // Cannot tell drift from a release: no row, re-verify on the next cycle.
-            back_off(agent_id, c, now_steady);
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (auto* st = entry_for(agent_id, c))
-                    st->verify_first = true;
-            }
+            back_off(agent_id, c, now_steady, /*reverify=*/true);
             count("degraded");
             return;
         }
         if (!fresh->has_value() || fresh->value().id != c.pending_record_id) {
-            erase_entry(); // ended, or superseded by another record: nothing left to judge
+            // Ended, or superseded by another record: nothing left to judge.
+            erase_if_current(agent_id, c);
             return;
         }
         if (fresh->value().release_requested_at != 0) {
@@ -604,19 +605,14 @@ void QuarantineContainmentReconciler::handle_status_reply(
         switch (classify_quarantine_write(res)) {
         case QuarantineWrite::ok:
             audit_event(agent_id, ok_detail, "success", "quarantine.disable");
-            erase_entry();
+            erase_if_current(agent_id, c);
             count("released");
             return;
         case QuarantineWrite::apply_in_flight:
-            back_off(agent_id, c, now_steady);
-            {
-                std::lock_guard<std::mutex> lk(mu_);
-                if (auto* st = entry_for(agent_id, c))
-                    st->verify_first = true;
-            }
+            back_off(agent_id, c, now_steady, /*reverify=*/true);
             return;
         case QuarantineWrite::not_quarantined:
-            erase_entry(); // ended elsewhere first
+            erase_if_current(agent_id, c); // ended elsewhere first
             break;
         case QuarantineWrite::store_error:
             back_off(agent_id, c, now_steady);
@@ -712,7 +708,7 @@ void QuarantineContainmentReconciler::handle_status_reply(
             d_.quarantine_store->mark_endpoint_confirmed(agent_id, c.pending_record_id, now_epoch());
         if (!mark_res) {
             if (classify_quarantine_write(mark_res) == QuarantineWrite::not_quarantined)
-                erase_entry(); // released concurrently — nothing left to confirm
+                erase_if_current(agent_id, c); // released concurrently — nothing left to confirm
             else
                 back_off(agent_id, c, now_steady);
             // The status read DID confirm — that observation is a real fact regardless of whether
@@ -804,23 +800,18 @@ bool QuarantineContainmentReconciler::send_status(const std::string& agent_id,
         count("degraded");
         return false;
     }
-    const auto drop_entry = [&] {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (entry_for(agent_id, c))
-            state_.erase(agent_id);
-    };
     std::int64_t record_id = 0;
     if (c.kind == Kind::owed) {
         // An owed row has no active record: one that shows now means the device was quarantined
         // again, and its new record governs.
         if (status_res->has_value()) {
-            drop_entry();
+            erase_if_current(agent_id, c);
             return false;
         }
         record_id = c.record_id;
     } else {
         if (!status_res->has_value()) {
-            drop_entry(); // released since verify_first was set
+            erase_if_current(agent_id, c); // released since verify_first was set
             return false;
         }
         const auto& row = status_res->value();
@@ -840,7 +831,7 @@ bool QuarantineContainmentReconciler::send_status(const std::string& agent_id,
         // reconciler never actually applied. Bail; the new record re-enters fresh via the normal
         // apply path on the next tick/heartbeat.
         if (c.pending_record_id != 0 && row.id != c.pending_record_id) {
-            drop_entry();
+            erase_if_current(agent_id, c);
             return false;
         }
         record_id = row.id;
@@ -893,21 +884,17 @@ bool QuarantineContainmentReconciler::send_release(const std::string& agent_id,
         count("degraded");
         return false;
     }
-    const auto drop_entry = [&] {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (entry_for(agent_id, c))
-            state_.erase(agent_id);
-    };
     std::int64_t record_id = c.record_id;
     if (c.kind == Kind::owed) {
         if (status_res->has_value() || record_id == 0) {
-            drop_entry();
+            erase_if_current(agent_id, c);
             return false;
         }
     } else {
         if (!status_res->has_value() || status_res->value().release_requested_at == 0 ||
             (record_id != 0 && status_res->value().id != record_id)) {
-            drop_entry(); // not (or no longer) a releasing record: never dispatch a release
+            // Not (or no longer) a releasing record: never dispatch a release.
+            erase_if_current(agent_id, c);
             return false;
         }
         record_id = status_res->value().id;
@@ -977,9 +964,7 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, co
             // Released between the tick snapshot and this call, or the apply claim was refused
             // (the record changed, or another apply is in flight): the entry goes and the next
             // tick re-derives it.
-            std::lock_guard<std::mutex> lk(mu_);
-            if (entry_for(agent_id, c))
-                state_.erase(agent_id);
+            erase_if_current(agent_id, c);
             break;
         }
         case ContainmentReapplyErrorKind::release_pending: {
@@ -1023,9 +1008,7 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, co
             // any) re-enters fresh via the normal apply path on the next tick/heartbeat. The
             // apply claim made the record's generation move, so a release that was waiting on an
             // older observation could not end it on that observation (#7613).
-            std::lock_guard<std::mutex> lk(mu_);
-            if (entry_for(agent_id, c))
-                state_.erase(agent_id);
+            erase_if_current(agent_id, c);
         } else {
             // #3425 governance Gate 3 (cpp-safety, finding C): mirror the confirm branch's backoff
             // escalation — without this, a sustained QuarantineStore write outage re-dispatches a

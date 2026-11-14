@@ -460,9 +460,13 @@ private:
     // pass's result is dropped. The caller holds `mu_`, and the pointer is valid only while it does.
     [[nodiscard]] AgentState* entry_for(const std::string& agent_id, const AgentState& c);
     // Escalates the entry's backoff and holds its next claim until it elapses (dropped when the
-    // entry is no longer the one `c` was copied from).
+    // entry is no longer the one `c` was copied from). `reverify` also sets verify_first under the
+    // same lock, so the next cycle reads status before it dispatches anything.
     void back_off(const std::string& agent_id, const AgentState& c,
-                  std::chrono::steady_clock::time_point now_steady);
+                  std::chrono::steady_clock::time_point now_steady, bool reverify = false);
+    // Erases the entry only while it is still the one `c` was copied from (dropped otherwise).
+    // Takes `mu_` itself: never call it with `mu_` held.
+    void erase_if_current(const std::string& agent_id, const AgentState& c);
     void count(const char* result) const;
     [[nodiscard]] std::chrono::steady_clock::time_point steady_now() const;
     // Stamps yuzu_server_quarantine_reconciler_last_tick_unixtime: tick() reached its end (#7623).

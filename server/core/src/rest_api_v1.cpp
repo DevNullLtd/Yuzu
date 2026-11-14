@@ -7988,39 +7988,26 @@ void RestApiV1::register_routes(
                 include_owed = true;
             }
 
-            // AUTHORITATIVE scoped read, shared with the dashboard fragments
+            // AUTHORITATIVE scoped read, shared with the dashboard fragments and the MCP twin
             // (quarantine_visible.hpp — one copy of the rules): a nullopt store read is a
-            // degraded read, NEVER an empty list (a degraded read must not render as
-            // "not quarantined").
-            auto visible_set = quarantine_visible_records(
+            // degraded read, NEVER an empty list (a degraded read must not render as "not
+            // quarantined"). #7624: with include=release_owed, the records ended by force whose
+            // device still owes a release follow the active ones, through the same gate and scope;
+            // a degraded owed read is the same 503, never a list that silently leaves them out.
+            const auto visible_set = quarantine_visible_with_owed(
                 gate.scope,
                 [quarantine_store](const std::vector<std::string>* ids, std::size_t limit) {
                     return quarantine_store->list_quarantined_in(ids, limit);
-                });
+                },
+                [quarantine_store](const std::vector<std::string>* ids, std::size_t limit) {
+                    return quarantine_store->list_release_owed_in(ids, limit);
+                },
+                include_owed);
             if (visible_set.status == QuarantineReadStatus::StoreDegraded) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
                                 "application/json");
                 return;
-            }
-            // #7624: records ended by force whose device still owes a release, after the active
-            // ones, through the same gate and scope. A degraded owed read is the same 503, never
-            // a list that silently leaves them out.
-            if (include_owed) {
-                const auto owed = quarantine_visible_records(
-                    gate.scope,
-                    [quarantine_store](const std::vector<std::string>* ids, std::size_t limit) {
-                        return quarantine_store->list_release_owed_in(ids, limit);
-                    });
-                if (owed.status == QuarantineReadStatus::StoreDegraded) {
-                    res.status = 503;
-                    res.set_content(
-                        detail::a4_error(res, "quarantine list unavailable — try again"),
-                        "application/json");
-                    return;
-                }
-                visible_set.records.insert(visible_set.records.end(), owed.records.begin(),
-                                           owed.records.end());
             }
             // One builder shared with the MCP twin (quarantine_read_model.hpp): the eight
             // keys in wire order, byte-pinned by test_rest_quarantine_routes.cpp.
