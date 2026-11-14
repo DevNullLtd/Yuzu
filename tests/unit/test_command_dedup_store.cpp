@@ -855,7 +855,7 @@ TEST_CASE("dedup_quarantine: non-empty sidecars travel with the main file, empty
     write_bytes(fs::path(db.string() + "-journal"), "journal bytes");
     write_bytes(fs::path(db.string() + "-shm"), ""); // empty: holds no evidence
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    const auto dest = dq::quarantine_corrupt_db(db, 1234).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234");
     CHECK(read_bytes(*dest) == "main");
@@ -878,7 +878,7 @@ TEST_CASE("dedup_quarantine: a taken name gets a -n suffix and an earlier quaran
     write_bytes(taken, "earlier");
     write_bytes(db, "second");
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    const auto dest = dq::quarantine_corrupt_db(db, 1234).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
     CHECK(read_bytes(taken) == "earlier");
@@ -908,7 +908,7 @@ TEST_CASE("dedup_quarantine: a clock before 1970 still yields a name the pruner 
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto db = dir.path / "command_dedup.db";
     write_bytes(db, "main");
-    const auto dest = dq::quarantine_corrupt_db(db, -5);
+    const auto dest = dq::quarantine_corrupt_db(db, -5).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-0");
     CHECK(dq::parse_quarantine_name("command_dedup.db.corrupt-", dest->filename().string())
@@ -965,6 +965,424 @@ TEST_CASE("dedup_quarantine: prune keeps the newest groups and touches only well
     CHECK(fs::exists(dir.path / "echo.db.corrupt-1"));
 }
 
+namespace sq = yuzu::shared::sqlite_quarantine;
+
+TEST_CASE("dedup_quarantine: a sidecar whose rename fails is copied before the original is removed",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "wal bytes");
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied); // the injected rename failure
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    CHECK(read_bytes(*r.dest) == "main");
+    CHECK(read_bytes(fs::path(r.dest->string() + "-wal")) == "wal bytes"); // preserved by copy
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-wal")));             // original gone
+    // The note replaces the former spdlog::warn: the caller logs it.
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("copied") != std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("dedup_quarantine: a sidecar that is a link and cannot be renamed is removed and never copied through",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // copy_file follows a symlink, so without the no-follow gate a link planted at the sidecar
+    // name would have its TARGET's bytes copied into the quarantine set as evidence.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim bytes");
+    const fs::path wal{db.string() + "-wal"};
+    std::error_code lec;
+    fs::create_symlink(victim, wal, lec);
+    REQUIRE_FALSE(lec);
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied); // the injected rename failure
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    CHECK_FALSE(fs::exists(fs::path(r.dest->string() + "-wal"))); // nothing copied through
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);     // link removed
+    CHECK(read_bytes(victim) == "victim bytes");                              // target untouched
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+}
+#endif
+
+TEST_CASE("dedup_quarantine: a sidecar quarantine name that is taken is never overwritten",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "new wal");
+    write_bytes(fs::path(db.string() + ".corrupt-1234-wal"), "stray older wal");
+
+    const auto r = dq::quarantine_corrupt_db(db, 1234);
+    REQUIRE(r.dest.has_value());
+    CHECK(r.dest->filename().string() == "command_dedup.db.corrupt-1234");
+    CHECK(read_bytes(fs::path(r.dest->string() + "-wal")) == "stray older wal"); // not replaced
+    CHECK_FALSE(fs::exists(fs::path(db.string() + "-wal"))); // the stale original still goes
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("could not preserve") != std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("dedup_quarantine: a dangling symlink at a sidecar name travels into the quarantine set as a link",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // exists() FOLLOWS a link, so a dangling `<db>-wal` read as absent and stayed at the live
+    // name, where the fresh store's SQLite would create its WAL through it.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    std::error_code lec;
+    fs::create_symlink(dir.path / "nowhere.bin", wal, lec);
+    if (lec == std::errc::operation_not_permitted || lec == std::errc::permission_denied)
+        SKIP("cannot create a symlink here: " << lec.message());
+    REQUIRE_FALSE(lec);
+
+    const auto r = dq::quarantine_corrupt_db(db, 5);
+    REQUIRE(r.dest.has_value());
+    CHECK(fs::is_symlink(fs::path(r.dest->string() + "-wal")));                // carried as a link
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);        // nothing at the live name
+    CHECK_FALSE(fs::exists(dir.path / "nowhere.bin"));                         // nothing created through it
+}
+#endif
+
+TEST_CASE("sqlite_quarantine: claim_quarantine_name moves one file and no sidecar",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    write_bytes(fs::path(db.string() + "-wal"), "wal");
+
+    const auto dest = sq::claim_quarantine_name(db, 77, ".planted-");
+    REQUIRE(dest.has_value());
+    CHECK(dest->filename().string() == "x.db.planted-77");
+    CHECK(read_bytes(*dest) == "main");
+    CHECK_FALSE(fs::exists(db));
+    CHECK(read_bytes(fs::path(db.string() + "-wal")) == "wal"); // the sidecar stays put
+    CHECK_FALSE(fs::exists(fs::path(dest->string() + "-wal")));
+}
+
+TEST_CASE("sqlite_quarantine: two claims in the same second never overwrite each other",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "first");
+    const auto a = sq::claim_quarantine_name(db, 5, ".corrupt-");
+    write_bytes(db, "second");
+    const auto b = sq::claim_quarantine_name(db, 5, ".corrupt-");
+    write_bytes(db, "third");
+    const auto c = sq::claim_quarantine_name(db, -9, ".corrupt-"); // clamps to 0
+    REQUIRE((a && b && c));
+    CHECK(a->filename().string() == "x.db.corrupt-5");
+    CHECK(b->filename().string() == "x.db.corrupt-5-1");
+    CHECK(c->filename().string() == "x.db.corrupt-0");
+    CHECK(read_bytes(*a) == "first");
+    CHECK(read_bytes(*b) == "second");
+}
+
+TEST_CASE("sqlite_quarantine: a filesystem without hard links fails the claim closed and names the cause",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    sq::FsOps ops;
+    ops.link = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::operation_not_permitted); // e.g. FAT
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("hard links") != std::string::npos);
+    CHECK(read_bytes(db) == "main"); // untouched, and no rename fallback ran
+    for (const auto& e : fs::directory_iterator(dir.path))
+        CHECK(e.path() == db);
+}
+
+TEST_CASE("sqlite_quarantine: when every quarantine name is taken the claim gives up and the file stays",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The injected link answers "exists" for every name, so the claim must stop after exactly
+    // kMaxClaimAttempts tries (no unbounded loop) and refuse rather than overwrite anything.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "main");
+    int calls = 0;
+    sq::FsOps ops;
+    ops.link = [&calls](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++calls;
+        ec = std::make_error_code(std::errc::file_exists);
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, ops).has_value());
+    CHECK(calls == sq::kMaxClaimAttempts);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("every quarantine name") != std::string::npos);
+    CHECK(read_bytes(db) == "main"); // the original is untouched
+}
+
+TEST_CASE("sqlite_quarantine: a failed drop of the original gives the claim back",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The real link succeeds but the original name cannot be dropped (the injected remove refuses
+    // it, as a read-only directory or a Windows sharing violation would). The claim must be
+    // released, so the file is at ONE name, not two.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto file = dir.path / "x.db";
+    write_bytes(file, "main");
+    fs::path dest = file;
+    dest += ".corrupt-5";
+    sq::FsOps ops;
+    ops.remove = [&](const fs::path& name, std::error_code& ec) {
+        if (name == file)
+            ec = std::make_error_code(std::errc::permission_denied);
+        else
+            fs::remove(name, ec);
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("could not drop") != std::string::npos);
+    CHECK_FALSE(fs::exists(dest));      // the claim was given back
+    CHECK(read_bytes(file) == "main");  // the original is untouched
+    CHECK(fs::hard_link_count(file) == 1);
+}
+
+TEST_CASE("sqlite_quarantine: a claim that cannot be given back is reported as a stray name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // As above, but the undo remove fails too: the caller is told which stray name is left
+    // behind, and both names still refer to the one file (nothing was lost).
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto file = dir.path / "x.db";
+    write_bytes(file, "main");
+    fs::path dest = file;
+    dest += ".corrupt-5";
+    sq::FsOps ops;
+    ops.remove = [](const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 2);
+    CHECK(notes[0].find("could not drop") != std::string::npos);
+    CHECK(notes[1].find("could not release the claim") != std::string::npos);
+    CHECK(notes[1].find("stray name") != std::string::npos);
+    CHECK(read_bytes(dest) == "main"); // the stray name is still there, the same file
+    CHECK(read_bytes(file) == "main"); // the original is untouched
+    CHECK(fs::hard_link_count(file) == 2);
+}
+
+// #1527. The claim is bound to the regular file that was judged, not to a name. The three cases
+// below drive the binding directly: a link already at the name is refused before any link; a
+// link the link step leaves at the claimed name (what Linux link(2) does to a symlink source) is
+// released, its target untouched; and a claim that lands on a DIFFERENT regular file than the one
+// judged (a second recovery put a fresh healthy file at the name, the two-process race) is
+// released and that file left alone. Identity is lstat device+inode, so POSIX only; Windows has
+// the no-follow regular-file checks and no identity (a recorded residual there).
+#ifndef _WIN32
+TEST_CASE("sqlite_quarantine: a symlink at the name is never claimed and its target untouched",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim");
+    const auto victim_mode = fs::status(victim).permissions();
+    const auto file = dir.path / "x.db";
+    std::error_code ec;
+    fs::create_symlink(victim, file, ec);
+    if (ec == std::errc::operation_not_permitted || ec == std::errc::permission_denied)
+        SKIP("cannot create a symlink here: " << ec.message());
+    REQUIRE_FALSE(ec);
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(file, 5, ".corrupt-", &notes).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("not a regular file") != std::string::npos);
+    CHECK(fs::hard_link_count(victim) == 1);
+    CHECK(fs::status(victim).permissions() == victim_mode);
+    CHECK(fs::is_symlink(file));
+    for (const auto& e : fs::directory_iterator(dir.path))
+        CHECK((e.path() == file || e.path() == victim));
+}
+
+TEST_CASE("sqlite_quarantine: a link left at the claimed name is released and its target never secured",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim");
+    std::error_code pec;
+    fs::permissions(victim, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
+    const auto victim_mode = fs::status(victim).permissions();
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    std::error_code planted;
+    sq::FsOps ops;
+    ops.link = [&](const fs::path&, const fs::path& to, std::error_code& lec) {
+        fs::create_symlink(victim, to, planted); // Linux link(2) over a symlink source
+        lec = planted;
+    };
+    const auto r = sq::quarantine_corrupt_db(db, 5, ops);
+    if (planted == std::errc::operation_not_permitted || planted == std::errc::permission_denied)
+        SKIP("cannot create a symlink here: " << planted.message());
+    REQUIRE_FALSE(planted);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("not the file that was judged") != std::string::npos);
+    CHECK(fs::status(victim).permissions() == victim_mode); // secure() never reached it
+    CHECK(read_bytes(db) == "corrupt");                     // the original is untouched
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    CHECK(fs::symlink_status(dest).type() == fs::file_type::not_found); // released
+}
+
+TEST_CASE("sqlite_quarantine: a claim landing on a file other than the one judged is released",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    // A second name keeps the judged inode alive while the seam frees the original name, so the
+    // fresh file below can never be handed the same inode number (ext4 recycles freed inodes).
+    const auto keep = dir.path / "judged.keep";
+    fs::create_hard_link(db, keep);
+    sq::FsOps ops;
+    ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& lec) {
+        // Another recovery finished first: the corrupt file is gone and a fresh one sits at the
+        // name. The real link then claims THAT file.
+        fs::remove(from);
+        write_bytes(from, "fresh healthy rows");
+        fs::create_hard_link(from, to, lec);
+    };
+    const auto r = sq::quarantine_corrupt_db(db, 5, ops, judged);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("not the file that was judged") != std::string::npos);
+    CHECK(read_bytes(db) == "fresh healthy rows"); // the other recovery's file is left alone
+    CHECK(fs::hard_link_count(db) == 1);           // the claim on it was released
+    CHECK(fs::hard_link_count(keep) == 1);         // and nothing was linked to the judged file
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    CHECK_FALSE(fs::exists(dest));
+}
+
+TEST_CASE("sqlite_quarantine: an original replaced after the claim: the judged file is kept under its claimed name and the fresh file keeps its name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    sq::FsOps ops;
+    ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& lec) {
+        // The claim lands on the judged file, then another recovery replaces the original name
+        // with a fresh file before it is dropped: that fresh file must keep its name, and the
+        // claimed name is now the judged file's only name, so it must not be unlinked either.
+        fs::create_hard_link(from, to, lec);
+        fs::remove(from);
+        write_bytes(from, "fresh healthy rows");
+    };
+    const auto r = sq::quarantine_corrupt_db(db, 5, ops, judged);
+    CHECK_FALSE(r.dest.has_value()); // still fail closed: the name holds a file nobody judged
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("kept at") != std::string::npos);
+    CHECK(read_bytes(db) == "fresh healthy rows");
+    CHECK(fs::hard_link_count(db) == 1);
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    CHECK(read_bytes(dest) == "corrupt"); // the evidence survives under its claimed name
+    CHECK(fs::hard_link_count(dest) == 1);
+}
+
+TEST_CASE("sqlite_quarantine: an original removed after the claim leaves the judged file under its claimed name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    sq::FsOps ops;
+    ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& lec) {
+        fs::create_hard_link(from, to, lec);
+        fs::remove(from); // another recovery dropped the name after our claim landed
+    };
+    std::vector<std::string> notes;
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, ops, judged).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("kept at") != std::string::npos);
+    CHECK_FALSE(fs::exists(db));
+    CHECK(read_bytes(dest) == "corrupt");
+    CHECK(fs::hard_link_count(dest) == 1);
+}
+
+TEST_CASE("sqlite_quarantine: a claim that is not the judged file and cannot be released is reported as a stray name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The claim lands on a DIFFERENT regular file (the injected link), so it is released; the
+    // release itself is refused. The caller is told which stray name is left, and the judged
+    // file is untouched at its one name.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto victim = dir.path / "victim.bin";
+    write_bytes(victim, "victim bytes");
+    fs::path dest = db;
+    dest += ".corrupt-5";
+    sq::FsOps ops;
+    ops.link = [&](const fs::path&, const fs::path& to, std::error_code& lec) {
+        fs::create_hard_link(victim, to, lec);
+    };
+    ops.remove = [&](const fs::path& name, std::error_code& ec) {
+        if (name == dest)
+            ec = std::make_error_code(std::errc::permission_denied);
+        else
+            fs::remove(name, ec);
+    };
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, ops).has_value());
+    REQUIRE(notes.size() == 2);
+    CHECK(notes[0].find("not the file that was judged") != std::string::npos);
+    CHECK(notes[1].find("could not release the claim") != std::string::npos);
+    CHECK(notes[1].find("stray name") != std::string::npos);
+    CHECK(read_bytes(dest) == "victim bytes"); // the stray name is left in place
+    CHECK(fs::hard_link_count(victim) == 2);   // as the victim's second name
+    CHECK(read_bytes(db) == "corrupt");        // the judged file is intact at its one name
+    CHECK(fs::hard_link_count(db) == 1);
+}
+
+TEST_CASE("sqlite_quarantine: a name replaced before the claim is refused when the judged identity is given",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "x.db";
+    write_bytes(db, "corrupt");
+    const auto judged = sq::file_identity(db);
+    REQUIRE(judged.has_value());
+    // A second name keeps the judged inode alive across the replacement, so the fresh file can
+    // never be handed the same inode number (ext4 recycles freed inodes) and pass for it.
+    const auto keep = dir.path / "judged.keep";
+    fs::create_hard_link(db, keep);
+    fs::remove(db);
+    write_bytes(db, "fresh healthy rows");
+    std::vector<std::string> notes;
+    CHECK_FALSE(sq::claim_quarantine_name(db, 5, ".corrupt-", &notes, {}, judged).has_value());
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].find("no longer the file that was judged") != std::string::npos);
+    CHECK(read_bytes(db) == "fresh healthy rows");
+    CHECK(fs::hard_link_count(keep) == 1); // no claim was ever linked to the judged file
+    for (const auto& e : fs::directory_iterator(dir.path))
+        CHECK((e.path() == db || e.path() == keep));
+}
+#endif
+
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replaced",
           "[command_dedup][corruption][quarantine_fs]") {
@@ -983,7 +1401,7 @@ TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replac
     REQUIRE_FALSE(ec);
     write_bytes(db, "corrupt");
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
+    const auto dest = dq::quarantine_corrupt_db(db, 1234).dest;
     REQUIRE(dest.has_value());
     CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
     CHECK(fs::is_symlink(wanted));        // untouched
@@ -991,10 +1409,13 @@ TEST_CASE("dedup_quarantine: a dangling symlink on the wanted name is not replac
     CHECK(read_bytes(*dest) == "corrupt");
 }
 
-TEST_CASE("dedup_quarantine: when the hard link fails the rename fallback still moves it aside",
+TEST_CASE("dedup_quarantine: a directory at the database name is refused before any link and nothing moves",
           "[command_dedup][corruption][quarantine_fs]") {
-    // link(2) on a DIRECTORY fails with EPERM (not EEXIST), which is the "hard links are unavailable
-    // here" arm: the fallback must skip a taken name and rename onto the next free one.
+    // Only a regular file is ever claimed: a DIRECTORY is refused by the no-follow regular-file
+    // check before link(2) runs (a directory cannot be hard-linked anyway). There is no
+    // check-then-rename fallback (it could overwrite evidence), so the claim returns nullopt, names
+    // the cause, and the original and the earlier quarantine are untouched. The hard-links-
+    // unavailable arm itself is driven by the injected link above.
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto db = dir.path / "command_dedup.db";
     std::error_code ec;
@@ -1005,12 +1426,12 @@ TEST_CASE("dedup_quarantine: when the hard link fails the rename fallback still 
     taken += ".corrupt-1234";
     write_bytes(taken, "earlier");
 
-    const auto dest = dq::quarantine_corrupt_db(db, 1234);
-    REQUIRE(dest.has_value());
-    CHECK(dest->filename().string() == "command_dedup.db.corrupt-1234-1");
-    CHECK(read_bytes(*dest / "inside.txt") == "payload");
-    CHECK_FALSE(fs::exists(db));
-    CHECK(read_bytes(taken) == "earlier"); // not replaced by the fallback either
+    const auto r = dq::quarantine_corrupt_db(db, 1234);
+    CHECK_FALSE(r.dest.has_value());
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("not a regular file") != std::string::npos);
+    CHECK(read_bytes(db / "inside.txt") == "payload");
+    CHECK(read_bytes(taken) == "earlier");
 }
 
 namespace {

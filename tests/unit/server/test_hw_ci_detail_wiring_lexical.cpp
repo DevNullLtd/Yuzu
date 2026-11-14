@@ -68,7 +68,76 @@ std::string closure_body(const std::string& src) {
     return {};
 }
 
+/// The squeezed body of the lambda that starts at `auto <name>` and whose return type ends with
+/// `ret_end` (everything between its outermost braces). Empty when not found or unbalanced.
+std::string lambda_body(const std::string& src, std::string_view name, std::string_view ret_end) {
+    const std::size_t def = src.find(std::string("auto ") + std::string(name));
+    if (def == std::string::npos)
+        return {};
+    const std::size_t ret = src.find(ret_end, def);
+    if (ret == std::string::npos)
+        return {};
+    const std::size_t open = src.find('{', ret);
+    if (open == std::string::npos)
+        return {};
+    int depth = 0;
+    for (std::size_t i = open; i < src.size(); ++i) {
+        if (src[i] == '{')
+            ++depth;
+        else if (src[i] == '}' && --depth == 0)
+            return squeeze(std::string_view(src).substr(open + 1, i - open - 1));
+    }
+    return {};
+}
+
 } // namespace
+
+// #5712 (issue acceptance criterion 2): `hw_identity_fn` must not depend on the roster scan. A scan
+// of the capped roster reads an enrolled offline device older than the newest 100,000 as "not
+// found" (REST 404), which is the harm this change exists to remove. The unit tests use fake
+// `identity_fn`s and the store test proves `find_within` is exact, so nothing else notices if the
+// closure in server.cpp is rewritten back to a scan: this pin does.
+TEST_CASE("hw_identity_fn wiring (LEXICAL pin, not behaviour): the offline fallback is the exact "
+          "point read, never a roster scan",
+          "[hardware][wiring][lexical][roster_truncated]") {
+    const std::string body =
+        lambda_body(comment_free_source("server.cpp"), "hw_identity_fn", "PresenceReadError>");
+    REQUIRE_FALSE(body.empty());
+
+    // The offline fallback is the point read, named exactly once, with the roster's own window.
+    CHECK(count_occurrences(body, "offline_endpoint_store_->find_within(agent_id,kHardwareRosterWindow)") == 1);
+    // ... and the roster scan is not named anywhere in the closure.
+    CHECK(count_occurrences(body, "query_stale_within(") == 0);
+    CHECK(count_occurrences(body, "offline_endpoint_store_->") == 1);
+    // The live-session short-circuit still comes first, so a connected device needs no store read.
+    const auto live = body.find("registry_.get_session(agent_id)");
+    const auto point = body.find("find_within(");
+    REQUIRE(live != std::string::npos);
+    REQUIRE(point != std::string::npos);
+    CHECK(live < point);
+    // The result goes through the typed mapper that keeps "unknown" distinct from "absent".
+    CHECK(count_occurrences(body, "returnoffline_identity_row(ep,now_ms,inv_human_age);") == 1);
+}
+
+// The roster builder reads the capped roster ONCE and routes the typed read through
+// `apply_roster_read`, the only place the truncation flag reaches `InventoryDevicesResult`. A
+// rewrite that iterated the read directly would drop the flag with every unit test still green.
+TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the roster read feeds "
+          "apply_roster_read",
+          "[hardware][wiring][lexical][roster_truncated]") {
+    const std::string roster_body =
+        lambda_body(comment_free_source("server.cpp"), "build_hw_roster", "-> InventoryDevicesResult");
+    REQUIRE_FALSE(roster_body.empty());
+    const auto read = roster_body.find("offline_endpoint_store_->query_stale_within(kHardwareRosterWindow)");
+    const auto apply = roster_body.find("apply_roster_read(result,eps)");
+    REQUIRE(read != std::string::npos);
+    REQUIRE(apply != std::string::npos);
+    CHECK(read < apply);
+    CHECK(count_occurrences(roster_body, "query_stale_within(") == 1);
+    CHECK(count_occurrences(roster_body, "apply_roster_read(") == 1);
+    // The rows come from the served partial's `.rows`, not from a re-read.
+    CHECK(count_occurrences(roster_body, "eps->rows") >= 1);
+}
 
 TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): one closure feeds REST and MCP",
           "[hardware][wiring][lexical]") {

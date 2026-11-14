@@ -12,6 +12,7 @@
 
 #include "hardware_routes.hpp"
 #include "hardware_section_integrity.hpp"
+#include "offline_endpoint_types.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_forensics_tier_fixture.hpp"
@@ -77,6 +78,7 @@ struct HwHarness {
     bool roster_ci_degraded = false;
     bool roster_tags_degraded = false;
     bool roster_degraded = false; // #5531: the durable roster read failed
+    bool roster_truncated = false; // #5712: the durable roster read was a typed partial
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
@@ -186,6 +188,7 @@ struct HwHarness {
             out.ci_degraded = roster_ci_degraded;
             out.tags_degraded = roster_tags_degraded;
             out.roster_degraded = roster_degraded;
+            out.roster_truncated = roster_truncated;
             return out;
         };
         HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, CiRead ci_read) {
@@ -1053,6 +1056,91 @@ TEST_CASE("route: list fragment — roster failure with a degraded audit store k
     REQUIRE(res->status == 200);
     REQUIRE(contains(res->body, "Hardware roster unavailable"));
     REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+// #5712. A truncated roster is SERVED with a notice, never refused (#5371). Kills: reusing the
+// roster-unavailable arm for a partial (no table); dropping the notice; a notice only on the full
+// page so the first htmx re-render loses it; no notice in the EMPTY-result state (a search that
+// finds nothing proves nothing on a partial roster); KPI tiles shown as exact; no audit marker.
+TEST_CASE("route: list fragment — a truncated roster is served with a lower-bound notice",
+          "[hardware][route][roster_truncated]") {
+    HwHarness h;
+    h.roster_truncated = true;
+    h.roster_rows = {make_row("agent-1", "PARTIAL-HOST", "windows", true)};
+
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(contains(res->body, "<table"));            // served, not refused
+    REQUIRE(contains(res->body, "PARTIAL-HOST"));
+    REQUIRE(contains(res->body, "id=\"hw-roster-truncated\""));
+    REQUIRE(contains(res->body, "Partial list."));
+    REQUIRE(contains(res->body, "100,000"));           // the store's cap, worded
+    REQUIRE_FALSE(contains(res->body, "Hardware roster unavailable"));
+    // Every count tile is a floor, not the fleet: the marker sits in the SAME tile as each label
+    // (a marker applied to only some tiles would leave the others reading as exact).
+    REQUIRE(contains(res->body, "&ge;&nbsp;1</div><div class=\"l\">Total CIs"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;1</div><div class=\"l\">Online"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;0</div><div class=\"l\">Offline"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;0</div><div class=\"l\">Stale"));
+    REQUIRE(contains(res->body, "cannot be paged past this limit"));
+    REQUIRE(h.audits.back() == "inventory.devices|success");
+    REQUIRE(contains(h.audit_details.back(), "roster_truncated=1"));
+
+    // The swap target keeps the notice on every re-render.
+    auto ro = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(ro);
+    REQUIRE(contains(ro->body, "id=\"hw-roster-truncated\""));
+
+    // A search that finds nothing: the notice is there, and it says a miss proves nothing.
+    auto miss = h.sink.Get("/fragments/hardware/list?results_only=1&q=zzz-no-such-host");
+    REQUIRE(miss);
+    REQUIRE(contains(miss->body, "No devices match."));
+    REQUIRE(contains(miss->body, "id=\"hw-roster-truncated\""));
+    REQUIRE(contains(miss->body, "does not prove a device does not exist"));
+}
+
+// Kills: the notice or the audit marker appearing on a complete roster (a permanent false alarm).
+TEST_CASE("route: list fragment — a complete roster carries no partial notice, no floor marker",
+          "[hardware][route][roster_truncated]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "FULL-HOST", "windows", true)};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    REQUIRE_FALSE(contains(res->body, "hw-roster-truncated"));
+    REQUIRE_FALSE(contains(res->body, "&ge;&nbsp;"));
+    REQUIRE_FALSE(contains(h.audit_details.back(), "roster_truncated"));
+}
+
+// Kills: the REST twin dropping the flag/cap, answering 503 for a partial, losing the audit marker,
+// and a complete roster reporting a partial.
+TEST_CASE("route: GET /api/v1/hardware — a truncated roster is 200 with roster_truncated and the cap",
+          "[hardware][route][rest][roster_truncated]") {
+    {
+        HwHarness h;
+        h.roster_truncated = true;
+        h.roster_rows = {make_row("agent-1", "PARTIAL-HOST", "windows", true)};
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["data"]["roster_truncated"] == true);
+        CHECK(body["data"]["roster_cap"] == yuzu::server::kOfflineRosterRowCap);
+        CHECK(body["data"]["ci_degraded"] == false); // a partial is not a degraded read
+        CHECK(body["data"]["count"] == 1);
+        REQUIRE(h.audits.back() == "inventory.devices|success");
+        CHECK(contains(h.audit_details.back(), "roster_truncated=1"));
+    }
+    {
+        HwHarness h;
+        h.roster_rows = {make_row("agent-1", "FULL-HOST", "windows", true)};
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        CHECK(body["data"]["roster_truncated"] == false);
+        CHECK_FALSE(contains(h.audit_details.back(), "roster_truncated"));
+    }
 }
 
 // Kills: dropping the roster_degraded guard in the REST list (200 with an empty data page).

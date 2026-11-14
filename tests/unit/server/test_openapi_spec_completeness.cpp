@@ -2808,13 +2808,23 @@ TEST_CASE("openapi documents: the response status set of the hand-checked operat
         // 200; 400 (apply_dex_score_policy Invalid, IfMatchMalformed); 401 (authenticate_for_
         // session_audit); 403 (perm_fn, cross-site cookie write); 409 (Stale); 428
         // (IfMatchMissing); 503 (WriterBusy, StoreUnavailable, OutcomeUnknown,
-        // AuditUnavailable). 411 and 413 come from the pre-routing cap (kBodyCapTable,
+        // AuditUnavailable). 411, 413 and 415 come from the pre-routing cap (kBodyCapTable,
         // dex_score_policy: 320 KiB, requires_measurable, any method): 411 for a request that
-        // cannot be sized in advance, 413 over the cap.
-        {"/dex/score-policy", "put", {"200", "400", "401", "403", "409", "411", "413", "428", "503"}},
+        // cannot be sized in advance, 413 over the cap, 415 for a Content-Encoding other than
+        // identity (evaluate_body_cap answers it first, on every class). 429 comes from two
+        // pre-routing gates with no per-path exemption, so it is server-wide: the per-source-IP
+        // rate limiter (api_rate_limiter_, write_rate_limited_response) and, for an engine
+        // principal, the per-principal quota gate (apply_engine_quota_gate in server.cpp's
+        // pre-routing handler).
+        {"/dex/score-policy",
+         "put",
+         {"200", "400", "401", "403", "409", "411", "413", "415", "428", "429", "503"}},
         // sink.Delete("/api/v1/dex/score-policy"): the same handler and gates; the body is
-        // ignored, but the any-method cap row still applies, so 411 and 413 are reachable.
-        {"/dex/score-policy", "delete", {"200", "400", "401", "403", "409", "411", "413", "428", "503"}},
+        // ignored, but the any-method cap row still applies, so 411, 413 and 415 are reachable,
+        // and the quota gate is the same.
+        {"/dex/score-policy",
+         "delete",
+         {"200", "400", "401", "403", "409", "411", "413", "415", "428", "429", "503"}},
         // config_routes.cpp, sink.Get("/api/v1/config"): 200; 401 and 403 (perm_fn, which also
         // refuses a service-scoped token); 503 (build_config_view ViewFault).
         {"/config", "get", {"200", "401", "403", "503"}},
@@ -2899,6 +2909,17 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
         const json* desc = find_at(spec, {"paths", "/config/{key}", "put", "description"});
         REQUIRE(desc != nullptr);
         CHECK(desc->get<std::string>().find("refused with a 403 on every key") != std::string::npos);
+        // The step-up wording: mfa_step_up_required is false on the SAML and engine 403s, and the
+        // envelope description says every step-up refusal carries a remediation bar two defensive
+        // fault paths.
+        CHECK(desc->get<std::string>().find(
+                  "adds mfa_step_up_required to meta (false on the 403)") != std::string::npos);
+        const json* envelope_desc =
+            find_at(spec, {"components", "schemas", "A4ErrorEnvelope", "description"});
+        REQUIRE(envelope_desc != nullptr);
+        CHECK(envelope_desc->get<std::string>().find("with a remediation, but never "
+                                                     "retry_after_ms (two defensive fault paths "
+                                                     "differ") != std::string::npos);
 
         // The score-policy PUT and DELETE word the retry rule, the audit refusal (5000), the busy
         // writer (2000) and the replay of an applied write in their own responses; the behaviour
@@ -2912,7 +2933,23 @@ TEST_CASE("openapi documents: the /config and /dex/score-policy error responses 
         };
         for (const char* method : {"put", "delete"}) {
             INFO("score-policy " << method << " response wording");
-            CHECK(response_text(method, "409").find("is answered here too") != std::string::npos);
+            CHECK(response_text(method, "409")
+                      .find("is answered here too, unless the stored policy is again at the "
+                            "revision you sent") != std::string::npos);
+            CHECK(response_text(method, "415").find("Content-Encoding other than identity") !=
+                  std::string::npos);
+            CHECK(response_text(method, "429").find("Server-wide, not specific to this route") !=
+                  std::string::npos);
+            CHECK(response_text(method, "429").find("per-principal quota") != std::string::npos);
+            CHECK(response_text(method, "429").find("refused before routing, so nothing was "
+                                                    "changed") != std::string::npos);
+            CHECK(response_text(method, "429").find("a suggested wait before retrying") !=
+                  std::string::npos);
+            const json* retry_after = find_at(spec, {"paths", "/dex/score-policy", method,
+                                                     "responses", "429", "headers", "Retry-After",
+                                                     "schema", "type"});
+            REQUIRE(retry_after != nullptr);
+            CHECK(*retry_after == "integer");
             const std::string r503 = response_text(method, "503");
             CHECK(r503.find("another score policy write in this process is still running "
                             "(retry_after_ms 2000)") != std::string::npos);

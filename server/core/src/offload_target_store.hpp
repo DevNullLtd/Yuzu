@@ -186,6 +186,12 @@ public:
     /// right up until it finishes (see the file header).
     bool quiesce(std::chrono::milliseconds timeout);
 
+    /// Deliveries queued plus running on the delivery pool, and the most that can be (queue bound
+    /// plus workers). Feed `yuzu_server_delivery_pool_pending` / `_capacity` (store="offload").
+    /// A snapshot, safe from any thread.
+    [[nodiscard]] std::size_t delivery_pool_pending() const;
+    [[nodiscard]] std::size_t delivery_pool_capacity() const noexcept;
+
     /// Create a new offload target. `auth_credential` may be empty (no
     /// credential — `has_credential=false`, dispatch sends no auth header
     /// regardless of `auth_type`); a non-empty credential is
@@ -318,9 +324,9 @@ private:
     bool record_delivery(int64_t target_id, const std::string& event_type, int event_count,
                          const std::string& payload, int status_code, const std::string& error);
 
-    /// Log + count a delivery dropped because delivery_pool_.submit()
-    /// returned false (queue full or the store is quiescing/shutting down).
-    void log_dropped_delivery(const std::string& target_url);
+    /// Log + count a delivery the delivery pool refused at submit, by the reason
+    /// StoreWorkerPool::drop_reason gives (queue_full, or quiescing during shutdown).
+    void log_dropped_delivery(const std::string& target_url, StoreWorkerPool::SubmitResult why);
 
     /// Build the JSON body to POST. For a single event this is the raw
     /// payload_json. For a batched flush, the events are wrapped in a

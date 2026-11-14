@@ -295,7 +295,26 @@ jobs:
       # check-release-artifacts.sh and build-agent-bundle.sh. Mutation-tests
       # itself. Stdlib only.
       - name: Agent-only release lint
+        env:
+          # The runner image ships pwsh and the system PyYAML: require them so
+          # the behavioural server-DLL refusal test cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
         run: python3 -I tests/test_release_agent_only.py
+
+      # Agent-bundle release verification (#7529): build-agent-bundle.sh
+      # verifies SHA256SUMS' cosign signature (exact identity per signing era)
+      # before use and matches each file to its own line. Offline: stub gh and
+      # cosign, asserts cosign's argv; mutation-tests itself. Stdlib only.
+      - name: Agent bundle release verification
+        run: python3 -I tests/test_build_agent_bundle_verify.py
+
+      # The `server` feature option (ADR-0035 ladder step 3): lexical pins on
+      # meson.options and meson.build's guard, with a mutation self-test. The
+      # behavioural half (a real configure for Windows/macOS/Linux targets)
+      # skips here, where meson is not installed, and runs in `meson test
+      # --suite docs`.
+      - name: Server feature option lint
+        run: python3 -I tests/test_server_feature_option.py
 
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
