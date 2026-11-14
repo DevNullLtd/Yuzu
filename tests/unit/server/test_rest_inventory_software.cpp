@@ -2191,7 +2191,9 @@ TEST_CASE("REST inventory/software: rows carry purl (null when empty); purl= sel
           std::set<std::string>{"dev-c"}); // composes with the other filters
     // No prefix or case matching: the value is compared byte for byte.
     CHECK(agent_set(get_lookup(h, "?purl=" + enc(purl_a + "x"))).empty());
-    CHECK(agent_set(get_lookup(h, "?purl=" + enc("PKG" + purl_a.substr(3)))).empty());
+    // The scheme is compared byte for byte too: an upper-case scheme is not a purl, so it is refused.
+    CHECK(error_message(get_lookup(h, "?purl=" + enc("PKG" + purl_a.substr(3)), 400))
+              .find("invalid purl") != std::string::npos);
 
     // A purl filter in the export: the last cell of the row is the purl.
     auto csv = h.sink.Get("/api/v1/inventory/software?format=csv&purl=" + enc(purl_a));
