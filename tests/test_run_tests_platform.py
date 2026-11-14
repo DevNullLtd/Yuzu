@@ -71,7 +71,7 @@ exec bash "$fixture_root/scripts/run-tests.sh" "$2"
 '''
         result = subprocess.run(
             [BASH, "-c", command, "runner-fixture", str(self.root), tier],
-            env=env, capture_output=True, text=True, timeout=10,
+            env=env, capture_output=True, text=True, encoding="utf-8", timeout=10,
         )
         calls = self.root / "calls.log"
         return result, calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
