@@ -8,7 +8,7 @@
  * scripts/ci/check-registry-test-leftovers.ps1 scans under both bam roots.
  *
  * is_elevated() mirrors the helper in test_echo_registry_source.cpp (anonymous namespace there),
- * but holds the token in the HandlePtr owner where the original uses a manual CloseHandle. The
+ * but holds the token in the HandlePtr owner where the original uses a manual CloseHandle.
  * Sharing one copy is deferred to a follow-up (test_helpers.hpp includes no <windows.h> and is included by
  * every test TU).
  */

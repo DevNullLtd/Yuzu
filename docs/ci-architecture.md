@@ -1303,7 +1303,7 @@ scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow64
 #6898 Echo bam-exclusion live case) `HKLM\SYSTEM\CurrentControlSet\Services\bam` and its `State\UserSettings`; the
 local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
 outside the scan.
-Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans (except a `bam` root the runner account is refused at, below) and proves both decisions of
 `scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
 other scope: exit 0 with a `::warning`). A probe under one of the two `bam` roots where the runner account is refused
 is replaced by a check that the script still lists that root, with a `::warning` that also names the runner's identity
