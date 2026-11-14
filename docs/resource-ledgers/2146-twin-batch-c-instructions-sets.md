@@ -79,7 +79,7 @@ are carried by the second PR.
   (`ScheduleEngine*`, `WorkflowEngine*`, `PolicyStore*`) are captured by value in the same lambda.
   `DefinitionReferrerExclusions` is two `std::unordered_set<std::string>` passed by const
   reference per call and not retained.
-- **Release point:** the throttle is freed when the last copy of the closure is destroyed (the four
+- **Release point:** the throttle is freed when the last copy of the closure is destroyed (the two
   consumers' copies and the per-call copy `ports.referrers_fn = definition_referrers_fn_` in
   `mcp_server.cpp`). The raw pointers are never deleted by the function.
 - **Transfer:** the closure is copied (shared throttle), never moved out of its owner. The pointers
@@ -122,8 +122,11 @@ are carried by the second PR.
   `kPackAdvisoryQueryLimit`); the result is a local `std::vector<std::string>` returned by value in
   `std::expected`. `DefinitionPackAdvisoryFn` is a plain `std::function` over a raw non-owning
   `ProductPackStore*` captured by value (borrowed from `ServerImpl`, same lifetime pattern as the
-  referrer closure); `pack_advisory_note` builds one `std::string`.
-- **Release point:** scope exit (lease, `PgResult`, vector, string are RAII).
+  referrer closure) together with one `std::shared_ptr<RefusalLogThrottle>` created in
+  `make_definition_pack_advisory_fn` (60 second window, at most 4 keys, internally mutex-guarded);
+  `pack_advisory_note` builds one `std::string`.
+- **Release point:** scope exit (lease, `PgResult`, vector, string are RAII); the throttle is freed
+  when the last copy of the closure is destroyed (the v1 and MCP consumers' copies).
 - **Transfer:** the note string is returned by value and appended to the delete's audit detail.
 - **Failure cleanup:** the lookup is read BEFORE the delete (beside the pre-image read) so a failure
   cannot lose the outcome row; `pack_advisory_note` wraps the call in `try/catch(...)` and returns
