@@ -29,10 +29,12 @@
 
 #include <httplib.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -102,13 +104,30 @@ struct SoftwareDevicesTable {
 /// Rows per Find software page (the REST call line the panel shows carries the same `limit`).
 inline constexpr std::int64_t kSoftwareFindPageSize = 50;
 
+/// The panel's kind chips, in display order: "app" (Applications) or a component kind. This is
+/// the one closed set: the route refuses any other `kind` before a read and the panel renders one
+/// chip per entry. Native is not offered until its collector ships.
+struct SoftwareFindKind {
+    std::string_view token;
+    std::string_view label;
+};
+inline constexpr std::array<SoftwareFindKind, 4> kSoftwareFindKinds{{{"app", "Applications"},
+                                                                     {"java", "Java"},
+                                                                     {"python", "Python"},
+                                                                     {"node", "Node"}}};
+
 /// The panel's inputs as the route parsed them. `kind` is "app" (Applications) or a component
-/// kind: "java" | "python" | "node".
+/// kind: "java" | "python" | "node" (kSoftwareFindKinds).
 struct SoftwareFindFilters {
     std::string name, kind{"app"}, version, version_min, version_max;
     std::string status;  ///< "" | "unconfirmed" (the "show only these" link)
     std::string cursor;  ///< non-empty = a Load-more page: the rows only
 };
+
+/// True when the filters select a component kind (the components model), not applications.
+[[nodiscard]] inline bool find_is_components(const SoftwareFindFilters& f) {
+    return f.kind != "app";
+}
 
 /// One table row, resolved by the route (hostname, last poll) so the renderer reads nothing.
 struct SoftwareFindRow {
@@ -123,7 +142,7 @@ struct SoftwareFindRow {
     std::string anchor_app;     ///< components: the application folder it sits inside
     std::string install_type;   ///< installs only
     std::string status;         ///< current | unconfirmed | disabled
-    std::int64_t last_confirmed_at{0};     ///< 0 = never
+    std::int64_t last_confirmed_at{0};     ///< installs only (the component table has no such column); 0 = never
     std::optional<std::int64_t> last_synced; ///< server-receipt epoch of the last sync; nullopt = never
 };
 

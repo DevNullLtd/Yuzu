@@ -2,9 +2,9 @@
 //
 // The panel is form- and button-driven and the dashboard CSP has no 'unsafe-eval', so string
 // pins cannot show that a click runs. This loads /software as the UAT admin, searches for a name
-// with the Find button, switches the kind chip to Java (the delegated click handler, fsKind) and
-// back, and fails on any uncaught page error or CSP violation. The searches read only; the stack
-// is left as found.
+// with the Find button, clicks Copy REST call against a clipboard stub, switches the kind chip to
+// Java (the delegated click handler, fsKind) and back, and fails on any uncaught page error or CSP
+// violation. The searches read only; the stack is left as found.
 //
 // What it does NOT prove: the counts or rows (the route tests compare them with the REST lookup
 // through the same model), or that the stack holds any software to find; an empty answer is a pass.
@@ -13,6 +13,7 @@
 //   - an uncaught exception while the page script loads or a handler runs (pageerror)
 //   - a CSP block of an inline or eval'd handler (console "Content Security Policy" error)
 //   - the form or the chips not binding (the results region never changes, or the kind never moves)
+//   - Copy REST call not writing location.origin + the call line it shows
 import puppeteer from 'puppeteer';
 
 const BASE = process.env.YUZU_BASE_URL || 'http://localhost:8080';
@@ -57,6 +58,28 @@ async function main() {
   } catch {
     problems.push('Find did not change the results region');
     console.log('  FAIL  Find did not change the results region');
+  }
+
+  // Copy REST call: the delegated handler writes location.origin + the button's data-fs-copy to the
+  // clipboard. A headless page cannot read the real clipboard, so stub it and capture the write.
+  const copyBtn = await page.$('#fs-results [data-fs-copy]');
+  if (!copyBtn) {
+    problems.push('the results carry no Copy REST call button');
+    console.log('  FAIL  no Copy REST call button in the results');
+  } else {
+    await page.evaluate(() => {
+      window.__fsCopied = null;
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: t => { window.__fsCopied = t; return Promise.resolve(); } },
+      });
+    });
+    const want = await page.evaluate(b => location.origin + b.getAttribute('data-fs-copy'), copyBtn);
+    await copyBtn.click();
+    const got = await page.evaluate(() => window.__fsCopied);
+    const copyOk = got !== null && got === want;
+    console.log(`  ${copyOk ? 'OK' : 'FAIL'}  Copy REST call wrote ${JSON.stringify(got)}`);
+    if (!copyOk) problems.push(`Copy REST call wrote ${JSON.stringify(got)}, expected ${JSON.stringify(want)}`);
   }
 
   // The Java chip: the delegated handler moves the hidden kind and presses the chip, then re-runs the search.

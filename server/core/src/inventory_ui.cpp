@@ -697,15 +697,10 @@ std::string results_region(const SoftwarePageFilters& f, const SoftwarePageData&
 
 constexpr const char* kFindFragment = "/fragments/inventory/software/find";
 
-struct FindKind {
-    std::string_view token;
-    std::string_view label;
-};
-// Native is not offered until its collector ships.
-constexpr std::array<FindKind, 4> kFindKinds{{{"app", "Applications"},
-                                              {"java", "Java"},
-                                              {"python", "Python"},
-                                              {"node", "Node"}}};
+// One sync scope for every control that re-requests #fs-results (the form, "show only these", the
+// status pill's x, Retry): #fs-form is outside every swap, so a later search supersedes a slower
+// earlier request instead of racing it. Load more swaps only its own row and stays unsynced.
+constexpr const char* kFindSync = "hx-sync=\"#fs-form:replace\"";
 
 // Every rule is scoped to an fs-* class, #fs-form or #fs-results, so nothing here restyles the
 // catalogue tables; everything else reuses the page's inv-*, gp-* and pill classes.
@@ -738,8 +733,6 @@ std::string find_style() {
   .fs-next{margin-top:10px;color:var(--ink2)}
 </style>)css";
 }
-
-bool find_is_components(const SoftwareFindFilters& f) { return f.kind != "app"; }
 
 // The panel's filters as query pairs, in the order every emitted URL carries them. `with_kind` is
 // the fragment's chip; the REST application lookup has no `kind` (the catalogue's app/pkg split).
@@ -793,8 +786,8 @@ std::string find_panel(bool confined) {
     h += confined ? "your management groups" : "whole fleet";
     h += "</span></div><form id=\"fs-form\" class=\"inv-pb\" hx-get=\"";
     h += kFindFragment;
-    h += "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" hx-sync=\"this:replace\">"
-         "<input type=\"hidden\" id=\"fs-kind\" name=\"kind\" value=\"app\"><div class=\"inv-filters\">";
+    h += std::string("\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" ") + kFindSync +
+         "><input type=\"hidden\" id=\"fs-kind\" name=\"kind\" value=\"app\"><div class=\"inv-filters\">";
     h += "<div class=\"inv-frow\"><label class=\"lab\" for=\"fs-name\">Package</label>"
          "<input id=\"fs-name\" class=\"inv-search\" type=\"search\" name=\"name\" required "
          "maxlength=\"1024\" autocomplete=\"off\" placeholder=\"Package or application name, e.g. "
@@ -809,7 +802,7 @@ std::string find_panel(bool confined) {
     h += "<span class=\"fs-hint\">(range is inclusive)</span></div>";
     h += "<div class=\"inv-frow\"><span class=\"lab\">Kind</span><div class=\"inv-chips\" "
          "role=\"group\" aria-label=\"Kind\">";
-    for (const auto& k : kFindKinds) {
+    for (const auto& k : kSoftwareFindKinds) {
         h += "<button type=\"button\" class=\"inv-chip\" data-fs-kind=\"" + std::string(k.token) +
              "\" aria-pressed=\"" + (k.token == "app" ? "true" : "false") + "\">" + std::string(k.label) +
              "</button>";
@@ -827,7 +820,19 @@ std::string find_degrade(const SoftwareFindFilters& f) {
            "installed-software store did not answer, so nothing is shown rather than an empty "
            "list that could be mistaken for \"no software\". <button type=\"button\" "
            "class=\"inv-btn\" data-act=\"retry\" hx-get=\"" +
-           esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\">Retry</button></div>";
+           esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" " + kFindSync +
+           ">Retry</button></div>";
+}
+
+// The device's name as a link to its Hardware record; an agent the roster does not name shows its
+// id. Shared by the devices table and the Find software table.
+std::string host_link(const std::string& agent_id, const std::string& hostname) {
+    const bool named = !hostname.empty();
+    return std::string("<a class=\"inv-hostlink") + (named ? "" : " inv-unnamed") +
+           "\" href=\"/hardware/ci?id=" + url_encode(agent_id) + "\" title=\"" +
+           (named ? "Open this device (Hardware &rsaquo; CI view)"
+                  : "No host name on record; opens the device page by agent id") +
+           "\">" + esc(named ? hostname : agent_id) + "</a>";
 }
 
 // The OS cell: the roster's OS string first, else (installs) the ecosystem's OS family.
@@ -864,8 +869,8 @@ std::string find_ago(std::int64_t now, std::int64_t then) {
     return "<span class=\"inv-grey\">" + esc(rel_time(now, then)) + "</span>";
 }
 
-// Last synced: amber past the same 48 h window as the devices table.
-std::string find_synced_cell(std::int64_t now, const std::optional<std::int64_t>& synced) {
+// Last synced: amber past the 48 h window. Shared by the devices table and the Find software table.
+std::string synced_cell(std::int64_t now, const std::optional<std::int64_t>& synced) {
     if (!synced || *synced <= 0)
         return dash();
     if (now - *synced > kStaleSecs)
@@ -885,13 +890,7 @@ std::string find_path_cell(const std::string& path, bool tail) {
 }
 
 std::string find_row_html(const SoftwareFindRow& r, bool comp, std::int64_t now) {
-    const bool named = !r.hostname.empty();
-    std::string h = "<tr><td><a class=\"inv-hostlink";
-    h += named ? "" : " inv-unnamed";
-    h += "\" href=\"/hardware/ci?id=" + url_encode(r.agent_id) + "\" title=\"";
-    h += named ? "Open this device (Hardware &rsaquo; CI view)"
-               : "No host name on record; opens the device page by agent id";
-    h += "\">" + esc(named ? r.hostname : r.agent_id) + "</a></td><td>" + find_os_cell(r) + "</td>";
+    std::string h = "<tr><td>" + host_link(r.agent_id, r.hostname) + "</td><td>" + find_os_cell(r) + "</td>";
     if (comp) {
         h += "<td class=\"inv-mono\">" + esc(r.name) + "</td><td>";
         h += r.version.empty() ? dash() : "<span class=\"inv-mono\">" + esc(r.version) + "</span>";
@@ -911,7 +910,7 @@ std::string find_row_html(const SoftwareFindRow& r, bool comp, std::int64_t now)
              find_status_pill(r.status, false) + "</td><td>" +
              (r.last_confirmed_at > 0 ? find_ago(now, r.last_confirmed_at) : dash()) + "</td>";
     }
-    return h + "<td>" + find_synced_cell(now, r.last_synced) + "</td></tr>";
+    return h + "<td>" + synced_cell(now, r.last_synced) + "</td></tr>";
 }
 
 // The table body for one page: version groups (newest first, the catalogue's own comparator)
@@ -941,8 +940,10 @@ std::string find_body(const SoftwareFindData& d) {
             body += find_row_html(*order[k], comp, d.now_secs);
         i = j;
     }
-    // A wide-scope page can be empty yet non-terminal: never claim "nothing found" then.
-    if (rows.empty())
+    // A wide-scope first page can be empty yet non-terminal: never claim "nothing found" then. The
+    // notice is first-page only (Load more swaps just its own row, so a continuation notice would
+    // pile up) and only where a Load button follows.
+    if (rows.empty() && d.f.cursor.empty() && !d.next_cursor.empty())
         body += "<tr><td colspan=\"8\" class=\"inv-empty\">No devices on this page; more may be in "
                 "later pages. Use the Load button below.</td></tr>";
     if (!d.next_cursor.empty()) {
@@ -955,7 +956,10 @@ std::string find_body(const SoftwareFindData& d) {
                 "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load " +
                 std::to_string(kSoftwareFindPageSize) + " more rows</button><span class=\"inv-cursor\">" +
                 fmt_int(d.shown_before) + " loaded</span></td></tr>";
-    } else if (!rows.empty()) {
+    } else {
+        // A match count that is an exact multiple of the page size ends on an empty continuation,
+        // so every terminal page says so. An empty terminal FIRST page never reaches here
+        // (render_software_find answers find_nothing).
         body += "<tr class=\"inv-more\"><td colspan=\"8\"><span class=\"inv-grey\">All " +
                 fmt_int(d.shown_before) + " matching rows are loaded.</span></td></tr>";
     }
@@ -979,7 +983,8 @@ std::string find_table_head(bool comp) {
 
 // A control that re-runs the search with other filters into #fs-results.
 std::string find_get_attrs(const SoftwareFindFilters& f) {
-    return "hx-get=\"" + esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\"";
+    return "hx-get=\"" + esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" " +
+           kFindSync;
 }
 
 std::string find_cards(const SoftwareFindData& d) {
@@ -1199,8 +1204,8 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
     std::string body;
     for (const auto& r : *t.rows) {
         const auto hn = t.hostnames.find(r.agent_id);
-        const bool named = hn != t.hostnames.end() && !hn->second.empty();
-        const std::string host = named ? hn->second : r.agent_id;
+        const std::string hostname = hn != t.hostnames.end() ? hn->second : std::string{};
+        const std::string host = hostname.empty() ? r.agent_id : hostname;
         const auto fam = eco_family(r.entry.ecosystem);
         // Last synced: a degraded bulk read (no map) is told apart from "never synced" (a plain dash).
         std::string synced = t.last_synced ? dash()
@@ -1209,19 +1214,11 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
                                                  kEm + "</span>";
         if (t.last_synced) {
             const auto it = t.last_synced->find(r.agent_id);
-            if (it != t.last_synced->end() && it->second > 0) {
-                const std::string ago = esc(rel_time(t.now_secs, it->second));
-                synced = t.now_secs - it->second > kStaleSecs
-                             ? "<span class=\"inv-pill stale\" title=\"last sync more than 48h ago\">" + ago + "</span>"
-                             : "<span class=\"inv-grey\">" + ago + "</span>";
-            }
+            if (it != t.last_synced->end() && it->second > 0)
+                synced = synced_cell(t.now_secs, it->second);
         }
-        body += "<tr data-gpf=\"" + grp + "\" data-gpname=\"" + esc(lc(host)) + "\"><td><a class=\"inv-hostlink" +
-                (named ? "" : " inv-unnamed") + "\" href=\"/hardware/ci?id=" + url_encode(r.agent_id) +
-                "\" title=\"" +
-                (named ? "Open this device (Hardware &rsaquo; CI view)"
-                       : "No host name on record; opens the device page by agent id") +
-                "\">" + esc(host) + "</a></td><td>" +
+        body += "<tr data-gpf=\"" + grp + "\" data-gpname=\"" + esc(lc(host)) + "\"><td>" +
+                host_link(r.agent_id, hostname) + "</td><td>" +
                 (fam.empty() ? dash()
                              : std::string("<span class=\"inv-pill ") + family_cls(fam) + "\">" +
                                    family_name(fam) + "</span>") +

@@ -517,13 +517,14 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "app";
         if (kind.empty())
             kind = "app";
-        if (kind != "app" && kind != "java" && kind != "python" && kind != "node") {
-            d.caveat = "Unknown kind.";
+        if (std::ranges::none_of(kSoftwareFindKinds,
+                                 [&](const SoftwareFindKind& k) { return k.token == kind; })) {
+            d.caveat = "Unknown kind."; // refused before any read
             reply();
             return;
         }
         d.f.kind = kind;
-        const bool comp = d.f.kind != "app";
+        const bool comp = find_is_components(d.f);
         if (const auto it = p.find("name"); it == p.end()) {
             d.caveat = "A package name is required.";
             reply();
@@ -716,7 +717,6 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 o.path = r.path;
                 o.anchor_app = r.anchor_app;
                 o.status = std::string(swl::derive_status(r.facet_status, r.facet_enabled));
-                o.last_confirmed_at = r.last_confirmed_at;
                 return o;
             },
             &swl::read_component_totals);

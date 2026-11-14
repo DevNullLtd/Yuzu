@@ -96,6 +96,8 @@ struct InvHarness {
     SoftwareTotals component_totals{9, 4, 1};
     bool totals_degrade = false;
     std::optional<SoftwareComponentQuery> last_component_query;
+    std::optional<std::vector<std::string>> last_app_totals_versions;       // the set the totals read got
+    std::optional<std::vector<std::string>> last_component_totals_versions; // nullopt = the rollup row
     software_catalogue::DevicesReader fleet_reader; // the fleet read the REST lookup is given
     software_list::TotalsReads totals_reads;        // the totals reads the REST lookup is given
 
@@ -233,17 +235,19 @@ struct InvHarness {
                 return std::nullopt;
             return app_totals;
         };
-        totals_reads.version_set_totals = [this](std::string_view, const std::vector<std::string>&)
+        totals_reads.version_set_totals = [this](std::string_view, const std::vector<std::string>& set)
             -> std::optional<SoftwareTotals> {
             calls.push_back("find_version_totals");
+            last_app_totals_versions = set;
             if (degrade || totals_degrade)
                 return std::nullopt;
             return app_totals;
         };
         totals_reads.component_totals = [this](std::string_view, std::string_view,
-                                               const std::optional<std::vector<std::string>>&)
+                                               const std::optional<std::vector<std::string>>& set)
             -> std::optional<SoftwareTotals> {
             calls.push_back("find_component_totals");
+            last_component_totals_versions = set;
             if (degrade || totals_degrade)
                 return std::nullopt;
             return component_totals;
@@ -254,7 +258,10 @@ struct InvHarness {
             if (degrade)
                 return std::nullopt;
             std::vector<SoftwareComponentRow> out;
+            // Honours `after` and `limit` like the store (rows kept in agent_id order, one name).
             for (const auto& r : component_rows) {
+                if (q.after && r.agent_id <= q.after->agent_id)
+                    continue;
                 if (q.agent_ids && std::ranges::find(*q.agent_ids, r.agent_id) == q.agent_ids->end())
                     continue;
                 if (static_cast<int>(out.size()) == q.limit)
@@ -1182,10 +1189,12 @@ std::vector<std::string> table_agents(const std::string& body) {
 
 } // namespace
 
-TEST_CASE("find software: the fragment renders the REST lookup's rows in its order and its totals",
+TEST_CASE("find software: the fragment renders the REST lookup's rows (REST order within each "
+          "version group) and its totals",
           "[inventory][route][find]") {
     InvHarness h;
-    h.fleet_rows = {find_fleet_row("a001", "4.2.1"), find_fleet_row("a002", "4.2.1"),
+    // Mixed versions: the page groups by version, newest first, so its order is not REST's.
+    h.fleet_rows = {find_fleet_row("a001", "4.2.1"), find_fleet_row("a002", "4.1.0"),
                     find_fleet_row("a003", "4.2.1")};
     h.hostnames = {{"a001", "host-0001"}, {"a002", "host-0002"}, {"a003", "host-0003"}};
     h.last_synced = {{"a001", 100}, {"a002", 100}, {"a003", 100}};
@@ -1196,7 +1205,7 @@ TEST_CASE("find software: the fragment renders the REST lookup's rows in its ord
     REQUIRE(r);
     REQUIRE(r->status == 200);
 
-    // The REST handler's own calls with the same query: same rows, same order.
+    // The REST handler's own calls with the same query.
     swl::Params rest_params;
     rest_params.emplace("name", "ExampleApp");
     auto parsed = swl::parse_list_params(rest_params);
@@ -1207,13 +1216,19 @@ TEST_CASE("find software: the fragment renders the REST lookup's rows in its ord
     std::vector<std::string> expect;
     for (const auto& row : rest->rows)
         expect.push_back(row.agent_id);
-    CHECK(expect.size() == 3);
-    CHECK(table_agents(r->body) == expect);
+    CHECK(expect == std::vector<std::string>{"a001", "a002", "a003"});
+    const auto got = table_agents(r->body);
+    CHECK(std::ranges::is_permutation(got, expect)); // the same rows
+    // Version groups, newest first (4.2.1, then 4.1.0); inside a group the REST order holds.
+    CHECK(got == std::vector<std::string>{"a001", "a003", "a002"});
     REQUIRE(h.last_fleet_query);
     CHECK(h.last_fleet_query->name == "ExampleApp");
     CHECK(h.last_fleet_query->limit == kSoftwareFindPageSize);
     CHECK_FALSE(h.last_fleet_query->version.has_value()); // blank inputs are not parameters
     CHECK(contains(r->body, "host-0001"));
+    // The row's own fields reach the body: install location and install type.
+    CHECK(contains(r->body, ">C:\\Program Files\\ExampleApp</span>"));
+    CHECK(contains(r->body, "<td class=\"inv-mono\">installer</td>"));
     CHECK(contains(r->body, "<span class=\"inv-pill lin\">Linux</span>"));
     CHECK(contains(r->body, "<span class=\"inv-pill mac\">macOS</span>"));
 
@@ -1457,6 +1472,106 @@ TEST_CASE("find software: a component range reads the component versions; a degr
     CHECK(contains(cr->body, "inv-caveat"));
     CHECK_FALSE(contains(cr->body, "Inventory store unavailable."));
     CHECK_FALSE(cut.last_component_query);
+}
+
+TEST_CASE("find software: a positive exact version reaches the page read and the totals read",
+          "[inventory][route][find]") {
+    // Installs: the exact version rides the fleet query, and the totals are the live version-set
+    // aggregate (not the title rollup row).
+    InvHarness h;
+    h.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    auto r = h.sink.Get(std::string(kFind) + "?name=ExampleApp&version=4.2.1");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    REQUIRE(h.last_fleet_query);
+    REQUIRE(h.last_fleet_query->version);
+    CHECK(*h.last_fleet_query->version == "4.2.1");
+    CHECK(h.count("find_version_totals") == 1);
+    CHECK(h.count("find_title_totals") == 0);
+    REQUIRE(h.last_app_totals_versions);
+    CHECK(*h.last_app_totals_versions == std::vector<std::string>{"4.2.1"});
+    CHECK(contains(r->body, "matching the exact name and version"));
+    CHECK(contains(r->body, "name=ExampleApp&amp;version=4.2.1"));
+
+    // Components: the version set rides the component query and the live component aggregate.
+    InvHarness c;
+    c.component_rows = {find_component_row("a001", "2.14.1")};
+    auto cr = c.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java&version=2.14.1");
+    REQUIRE(cr);
+    REQUIRE(cr->status == 200);
+    REQUIRE(c.last_component_query);
+    REQUIRE(c.last_component_query->versions);
+    CHECK(*c.last_component_query->versions == std::vector<std::string>{"2.14.1"});
+    CHECK(c.count("find_component_totals") == 1);
+    CHECK(c.count("find_component_meta") == 0); // a version filter is not the rollup row
+    REQUIRE(c.last_component_totals_versions);
+    CHECK(*c.last_component_totals_versions == std::vector<std::string>{"2.14.1"});
+    CHECK(c.count("component_versions") == 0); // no range: no distinct-version read
+}
+
+TEST_CASE("find software: component Load more walks the cursor, reads the totals once and audits "
+          "each continuation",
+          "[inventory][route][find]") {
+    InvHarness h;
+    for (int i = 0; i < 120; ++i)
+        h.component_rows.push_back(find_component_row(dev_id(i), "2.14.1"));
+
+    auto first = h.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java");
+    REQUIRE(first);
+    CHECK(table_agents(first->body).size() == 50);
+    CHECK(contains(first->body, "fs-cards"));
+    CHECK(h.count("find_component_totals") == 1);
+
+    const std::string url2 = next_url(first->body, "fmore");
+    CHECK(contains(url2, "kind=java"));
+    CHECK(contains(url2, "cursor="));
+    CHECK(contains(url2, "shown=50"));
+    auto second = h.sink.Get(url2);
+    REQUIRE(second);
+    CHECK(second->body.starts_with("<tr"));
+    CHECK_FALSE(contains(second->body, "fs-cards"));
+    CHECK_FALSE(contains(second->body, "<table"));
+    const auto ids2 = table_agents(second->body);
+    REQUIRE(ids2.size() == 50);
+    CHECK(ids2.front() == dev_id(50));
+    CHECK(ids2.back() == dev_id(99));
+    CHECK(h.count("find_component_totals") == 1); // not read again
+    CHECK(h.audit_details.back().find("page=continuation") != std::string::npos);
+
+    auto third = h.sink.Get(next_url(second->body, "fmore"));
+    REQUIRE(third);
+    const auto ids3 = table_agents(third->body);
+    REQUIRE(ids3.size() == 20);
+    CHECK(ids3.front() == dev_id(100));
+    CHECK(contains(third->body, "All 120 matching rows are loaded."));
+    CHECK_FALSE(contains(third->body, "data-act=\"fmore\""));
+    CHECK(h.count("find_component_totals") == 1);
+    CHECK(h.audit_details.back().find("page=continuation") != std::string::npos);
+}
+
+TEST_CASE("find software: a match count that is an exact multiple of the page size ends on an empty "
+          "terminal page that says so",
+          "[inventory][route][find]") {
+    InvHarness h;
+    for (int i = 0; i < 100; ++i)
+        h.fleet_rows.push_back(find_fleet_row(dev_id(i), "4.2.1"));
+
+    auto first = h.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(first);
+    CHECK(table_agents(first->body).size() == 50);
+    auto second = h.sink.Get(next_url(first->body, "fmore"));
+    REQUIRE(second);
+    CHECK(table_agents(second->body).size() == 50);
+    // A full page mints a cursor: the store cannot tell it was the last one.
+    CHECK(contains(second->body, "data-act=\"fmore\""));
+
+    auto third = h.sink.Get(next_url(second->body, "fmore"));
+    REQUIRE(third);
+    CHECK(third->status == 200);
+    CHECK(table_agents(third->body).empty());
+    CHECK(contains(third->body, "All 100 matching rows are loaded."));
+    CHECK_FALSE(contains(third->body, "later pages"));
+    CHECK_FALSE(contains(third->body, "data-act=\"fmore\""));
 }
 
 TEST_CASE("find software: Load more returns the next rows only, from the cursor, without re-reading "

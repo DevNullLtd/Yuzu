@@ -12,9 +12,11 @@
 
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // The shared full-page shell /software is served from (guardian_page_ui.cpp, global scope).
@@ -223,16 +225,7 @@ TEST_CASE("software page: search box carries the CSP-safe htmx wiring", "[invent
     // One shared sync scope (a stable container outside every swap) for every control that
     // re-requests the results, so a slow earlier response cannot overwrite a later one.
     REQUIRE(has(h, "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"#sw-filters:replace\""));
-    {
-        // The search box itself never takes a per-element sync scope. The Find form further down
-        // the page carries its own `this:replace` (its results region is a separate swap scope),
-        // so the guard is the search box's own tag, not the whole page.
-        const auto q = h.find("id=\"sw-q\"");
-        REQUIRE(q != std::string::npos);
-        const auto tag_end = h.find('>', q);
-        REQUIRE(tag_end != std::string::npos);
-        REQUIRE(h.substr(q, tag_end - q).find("hx-sync=\"this:replace\"") == std::string::npos);
-    }
+    REQUIRE_FALSE(has(h, "hx-sync=\"this:replace\""));
     REQUIRE(has(h, "<div id=\"sw-filters\""));
     REQUIRE(has(h, "hx-trigger=\"change\" hx-sync=\"#sw-filters:replace\" hx-include=\"#sw-state,#sw-q,#sw-agent\""));
     REQUIRE(has(h, "hx-include=\"#sw-q,#sw-agent\" hx-sync=\"#sw-filters:replace\""));
@@ -1258,6 +1251,102 @@ TEST_CASE("find software: nothing found is a real zero that offers the component
     REQUIRE_FALSE(has(r, "fs-cards"));
     REQUIRE_FALSE(has(r, "<table"));
     REQUIRE(has(r, "All 50 matching rows are loaded."));
+}
+
+TEST_CASE("find software: Last confirmed and Last synced are separate cells in column order; a "
+          "never-confirmed row shows a dash",
+          "[inventory][ui][find]") {
+    auto r = find_install("a1", "host-0188", "4.2.1");
+    r.last_confirmed_at = kNow - 3 * 3600;
+    r.last_synced = kNow - 5 * 3600;
+    const std::string h = render_software_find(find_data({r}));
+    REQUIRE(h.find(">Last confirmed</th>") < h.find(">Last synced</th>"));
+    // status -> Last confirmed (3 h) -> Last synced (5 h): swapping the two columns fails here.
+    REQUIRE(has(h, "<span class=\"pill ok\">current</span></td><td><span class=\"inv-grey\">3h ago</span></td>"
+                   "<td><span class=\"inv-grey\">5h ago</span></td></tr>"));
+    r.last_confirmed_at = 0;
+    const std::string n = render_software_find(find_data({r}));
+    REQUIRE(has(n, "<span class=\"pill ok\">current</span></td><td><span class=\"inv-grey\">\xE2\x80\x94</span></td>"
+                   "<td><span class=\"inv-grey\">5h ago</span></td></tr>"));
+}
+
+TEST_CASE("find software: an empty page is told apart by its cursor, so a Load button is only ever "
+          "pointed at when one is there",
+          "[inventory][ui][find]") {
+    // Empty first page, more behind it: the notice and the button.
+    SoftwareFindData first = find_data({});
+    first.next_cursor = "c2:abc";
+    const std::string f = render_software_find(first);
+    REQUIRE(has(f, "No devices on this page; more may be in later pages."));
+    REQUIRE(has(f, "data-act=\"fmore\""));
+    REQUIRE_FALSE(has(f, "Nothing found"));
+    // Empty continuation, more behind it: the button, and no notice piled up beside it.
+    SoftwareFindData mid = first;
+    mid.f.cursor = "c1:abc";
+    const std::string m = render_software_find(mid);
+    REQUIRE(m.starts_with("<tr"));
+    REQUIRE(has(m, "data-act=\"fmore\""));
+    REQUIRE_FALSE(has(m, "later pages"));
+    // Empty terminal continuation (the count was an exact multiple of the page size): the
+    // completion line, and nothing pointing at a button.
+    SoftwareFindData end = find_data({});
+    end.f.cursor = "c1:abc";
+    end.shown_before = 100;
+    const std::string e = render_software_find(end);
+    REQUIRE(has(e, "All 100 matching rows are loaded."));
+    REQUIRE_FALSE(has(e, "later pages"));
+    REQUIRE_FALSE(has(e, "data-act=\"fmore\""));
+}
+
+namespace {
+/// {controls whose request targets #fs-results, how many of those carry the shared sync scope}.
+std::pair<std::size_t, std::size_t> results_controls(const std::string& h) {
+    const std::string target = "hx-target=\"#fs-results\"";
+    std::size_t all = 0, synced = 0;
+    for (auto p = h.find(target); p != std::string::npos; p = h.find(target, p + 1)) {
+        ++all;
+        const auto tag = h.substr(h.rfind('<', p), h.find('>', p) - h.rfind('<', p));
+        synced += tag.find("hx-sync=\"#fs-form:replace\"") != std::string::npos ? 1 : 0;
+    }
+    return {all, synced};
+}
+} // namespace
+
+TEST_CASE("find software: every control that re-runs the search shares the form's sync scope, so a "
+          "slow earlier response cannot overwrite a newer search",
+          "[inventory][ui][find]") {
+    // The form (the panel on the page).
+    const auto panel = results_controls(full({}, page()));
+    REQUIRE(panel.first == 1);
+    REQUIRE(panel.second == 1);
+    // The status pill's x on a status-filtered result.
+    SoftwareFindData st = find_data({find_install("a1", "host-0188", "4.2.1", "unconfirmed")});
+    st.f.status = "unconfirmed";
+    const auto pill = results_controls(render_software_find(st));
+    REQUIRE(pill.first == 1);
+    REQUIRE(pill.second == 1);
+    // A component result with unconfirmed devices: "show only these", and with a status filter the
+    // pill's x as well.
+    SoftwareFindData comp = find_data({find_install("a1", "host-0188", "2.14.1", "unconfirmed")});
+    comp.f.kind = "java";
+    comp.totals = SoftwareFindTotals{214, 163, 4, std::nullopt};
+    const auto only = results_controls(render_software_find(comp));
+    REQUIRE(only.first == 1);
+    REQUIRE(only.second == 1);
+    comp.f.status = "unconfirmed";
+    const auto both = results_controls(render_software_find(comp));
+    REQUIRE(both.first == 2);
+    REQUIRE(both.second == 2);
+    // Retry on the degraded banner, first page and inside a Load-more row.
+    SoftwareFindData degraded;
+    degraded.f.name = "x";
+    const auto retry = results_controls(render_software_find(degraded));
+    REQUIRE(retry.first == 1);
+    REQUIRE(retry.second == 1);
+    degraded.f.cursor = "cur";
+    const auto in_row = results_controls(render_software_find(degraded));
+    REQUIRE(in_row.first == 1);
+    REQUIRE(in_row.second == 1);
 }
 
 TEST_CASE("find software: the per-device software tab gains Install type and Location columns",
