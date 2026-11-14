@@ -1,9 +1,11 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -567,8 +569,18 @@ private:
 
 /// Name lookups currently outstanding in the pool the OIDC egress path owns (cap
 /// `net::kMaxInFlightLookups`). A lookup that has timed out for its caller still holds its slot
-/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. Fed only on POSIX
-/// builds (the pool is not used elsewhere), so it always reads 0 on other builds.
+/// until the resolver returns. Feeds `yuzu_server_oidc_resolver_in_flight`. The pool is used only
+/// on POSIX builds, so it is non-zero only there.
 [[nodiscard]] int oidc_resolver_in_flight();
+
+/// The pool's slot count. Feeds `yuzu_server_oidc_resolver_pool_capacity`.
+[[nodiscard]] int oidc_resolver_pool_capacity();
+
+/// How many lookups through the pool ended in each `net::ResolveStatus`, in enumerator order (five
+/// members; oidc_provider.cpp asserts the length against `net::kResolveStatusCount`, which this
+/// header cannot name because bounded_resolver.hpp stays out of it). Feeds
+/// `yuzu_server_oidc_resolver_lookups_total`. A lookup that goes through the test-resolver seam
+/// does not use the pool and is not counted.
+[[nodiscard]] std::array<std::uint64_t, 5> oidc_resolver_outcome_counts();
 
 } // namespace yuzu::server::oidc

@@ -1455,6 +1455,63 @@ TEST_CASE("OIDC resolver: the default OIDC pool serves lookups and is separate f
     CHECK(oidc_resolver_in_flight() == 0);
 }
 
+TEST_CASE("OIDC resolver: every lookup through the OIDC pool is counted once, by outcome",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    const auto counted = [&](net::ResolveStatus status) {
+        return pool->outcome_counts()[static_cast<std::size_t>(status)];
+    };
+    CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{0, 0, 0, 0, 0});
+
+    {
+        auto st = std::make_shared<LookupState>(); // answers with an address
+        BoundedLookupGuard guard(make_lookup(st), pool);
+        REQUIRE(vet_name("ok.test").has_value());
+        REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    }
+    {
+        auto st = std::make_shared<LookupState>();
+        st->other_status = net::ResolveStatus::kNotFound;
+        BoundedLookupGuard guard(make_lookup(st), pool);
+        const auto pins = vet_name("gone.test");
+        REQUIRE_FALSE(pins.has_value());
+        CHECK(pins.error() == kUnresolved);
+        REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    }
+    {
+        auto st = std::make_shared<LookupState>();
+        st->other_status = net::ResolveStatus::kTemporary;
+        BoundedLookupGuard guard(make_lookup(st), pool);
+        REQUIRE_FALSE(vet_name("flaky.test").has_value());
+        REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    }
+    CHECK(counted(net::ResolveStatus::kOk) == 1);
+    CHECK(counted(net::ResolveStatus::kNotFound) == 1);
+    CHECK(counted(net::ResolveStatus::kTemporary) == 1);
+    CHECK(counted(net::ResolveStatus::kTimeout) == 0);
+    CHECK(counted(net::ResolveStatus::kBusy) == 0);
+
+    // A lookup that outlasts its bound is a timeout for its caller; while it still holds the one
+    // slot, a second lookup is refused. The late finish of the held lookup is not counted again.
+    {
+        auto st = std::make_shared<LookupState>();
+        BoundedLookupGuard guard(make_lookup(st), pool);
+        VetThread holder(st->gate, "slow.a.test", 1000);
+        REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+        const auto refused = vet_name("other.test");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == kBusyReason);
+        // Release the held lookup only after its caller gave up at the 1 s bound.
+        REQUIRE(wait_for([&] { return counted(net::ResolveStatus::kTimeout) == 1; }));
+        holder.finish();
+        REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    }
+    CHECK(counted(net::ResolveStatus::kTimeout) == 1);
+    CHECK(counted(net::ResolveStatus::kBusy) == 1);
+    CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{1, 1, 1, 1, 1});
+}
+
 TEST_CASE("OIDC resolver: a failed or busy NAT64 probe changes nothing in the learned prefixes",
           "[oidc][oidc_egress][oidc_resolver][oidc_nat64]") {
     Nat64CacheReset cache;

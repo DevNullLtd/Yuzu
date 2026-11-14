@@ -2658,6 +2658,17 @@ int oidc_resolver_in_flight() {
     return oidc_resolver_pool_ref()->in_flight.load();
 }
 
+int oidc_resolver_pool_capacity() {
+    return oidc_resolver_pool_ref()->cap;
+}
+
+static_assert(net::kResolveStatusCount == 5,
+              "oidc_resolver_outcome_counts() in oidc_provider.hpp is declared with five members");
+
+std::array<std::uint64_t, 5> oidc_resolver_outcome_counts() {
+    return oidc_resolver_pool_ref()->outcome_counts();
+}
+
 void OidcProvider::clear_nat64_discovery_cache_for_test() {
     auto& cache = nat64_discovery_cache();
     std::lock_guard lock(cache.mu);

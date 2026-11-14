@@ -11,8 +11,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <condition_variable>
 #include <future>
 #include <memory>
@@ -170,6 +173,89 @@ TEST_CASE("bounded resolver: exact statuses through the same path", "[bounded_re
     const auto lit = net::bounded_resolve("127.0.0.1", 5s);
     REQUIRE(lit.status == net::ResolveStatus::kOk);
     CHECK(lit.addresses.front() == "127.0.0.1");
+}
+
+TEST_CASE("bounded resolver: every call is counted exactly once, by the status it returns",
+          "[bounded_resolver]") {
+    namespace net = yuzu::server::net;
+    using namespace std::chrono_literals;
+    static_assert(net::kResolveStatusCount == 5);
+    // The label of each status is non-empty and distinct: it is the closed `outcome` label set.
+    for (std::size_t i = 0; i < net::kResolveStatusCount; ++i) {
+        const std::string a = net::resolve_status_label(static_cast<net::ResolveStatus>(i));
+        CHECK_FALSE(a.empty());
+        CHECK(a != "unknown");
+        for (std::size_t j = i + 1; j < net::kResolveStatusCount; ++j)
+            CHECK(a != net::resolve_status_label(static_cast<net::ResolveStatus>(j)));
+    }
+    CHECK(std::string(net::resolve_status_label(net::ResolveStatus::kOk)) == "ok");
+    CHECK(std::string(net::resolve_status_label(net::ResolveStatus::kNotFound)) == "not_found");
+    CHECK(std::string(net::resolve_status_label(net::ResolveStatus::kTemporary)) == "temporary");
+    CHECK(std::string(net::resolve_status_label(net::ResolveStatus::kTimeout)) == "timeout");
+    CHECK(std::string(net::resolve_status_label(net::ResolveStatus::kBusy)) == "busy");
+
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    const auto at = [&](net::ResolveStatus st) {
+        return pool->outcome_counts()[static_cast<std::size_t>(st)];
+    };
+    CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{0, 0, 0, 0, 0});
+
+    const net::LookupFn ok = [](const std::string&) -> net::ResolveResult {
+        return {net::ResolveStatus::kOk, {"192.0.2.1"}};
+    };
+    const net::LookupFn nf = [](const std::string&) -> net::ResolveResult {
+        return {net::ResolveStatus::kNotFound, {}};
+    };
+    const net::LookupFn temp = [](const std::string&) -> net::ResolveResult {
+        return {net::ResolveStatus::kTemporary, {}};
+    };
+    const auto drain = [&] {
+        for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
+            std::this_thread::sleep_for(10ms);
+        return pool->in_flight.load() == 0;
+    };
+
+    CHECK(net::bounded_resolve("x", 5s, ok, pool).status == net::ResolveStatus::kOk);
+    REQUIRE(drain());
+    CHECK(net::bounded_resolve("x", 5s, nf, pool).status == net::ResolveStatus::kNotFound);
+    REQUIRE(drain());
+    CHECK(net::bounded_resolve("x", 5s, temp, pool).status == net::ResolveStatus::kTemporary);
+    REQUIRE(drain());
+
+    // A held lookup: it times out for its caller (counted once), a second call is refused (busy).
+    auto latch = std::make_shared<Latch>();
+    const net::LookupFn blocked = [latch](const std::string&) -> net::ResolveResult {
+        latch->wait();
+        return {net::ResolveStatus::kOk, {"192.0.2.1"}};
+    };
+    CHECK(net::bounded_resolve("x", 1ms, blocked, pool).status == net::ResolveStatus::kTimeout);
+    CHECK(net::bounded_resolve("x", 1ms, blocked, pool).status == net::ResolveStatus::kBusy);
+    CHECK(net::bounded_resolve("x", 1ms, blocked, pool).status == net::ResolveStatus::kBusy);
+
+    CHECK(at(net::ResolveStatus::kOk) == 1);
+    CHECK(at(net::ResolveStatus::kNotFound) == 1);
+    CHECK(at(net::ResolveStatus::kTemporary) == 1);
+    CHECK(at(net::ResolveStatus::kTimeout) == 1);
+    CHECK(at(net::ResolveStatus::kBusy) == 2);
+
+    // The held lookup finishing later adds nothing: its call was already counted as a timeout.
+    latch->release();
+    REQUIRE(drain());
+    CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{1, 1, 1, 1, 2});
+}
+
+TEST_CASE("bounded resolver: a lookup that throws is counted as temporary", "[bounded_resolver]") {
+    namespace net = yuzu::server::net;
+    using namespace std::chrono_literals;
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    const net::LookupFn boom = [](const std::string&) -> net::ResolveResult {
+        throw std::runtime_error("resolver blew up");
+    };
+    CHECK(net::bounded_resolve("x", 5s, boom, pool).status == net::ResolveStatus::kTemporary);
+    CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{0, 0, 1, 0, 0});
+    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
+        std::this_thread::sleep_for(10ms);
+    CHECK(pool->in_flight.load() == 0);
 }
 
 TEST_CASE("resolver error codes: only NXDOMAIN / NODATA are an ANSWER, everything else a failure",

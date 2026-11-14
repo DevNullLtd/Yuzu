@@ -65,9 +65,12 @@
 
 #include "resolver_errors.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -93,6 +96,29 @@ struct ResolveResult {
 
 using LookupFn = std::function<ResolveResult(const std::string& host)>;
 
+/// The five outcomes a call can have, one per `ResolveStatus` member. The count is tied to the last
+/// enumerator, so a new status cannot be added without widening the per-outcome counters.
+inline constexpr std::size_t kResolveStatusCount = 5;
+static_assert(static_cast<std::size_t>(ResolveStatus::kBusy) + 1 == kResolveStatusCount,
+              "a new ResolveStatus needs a slot in ResolverPool::outcomes and a label");
+
+/// The metric label of a status: the closed outcome set of `resolver_pool_metrics.hpp`.
+[[nodiscard]] constexpr const char* resolve_status_label(ResolveStatus s) noexcept {
+    switch (s) {
+    case ResolveStatus::kOk:
+        return "ok";
+    case ResolveStatus::kNotFound:
+        return "not_found";
+    case ResolveStatus::kTemporary:
+        return "temporary";
+    case ResolveStatus::kTimeout:
+        return "timeout";
+    case ResolveStatus::kBusy:
+        return "busy";
+    }
+    return "unknown";
+}
+
 inline constexpr int kMaxInFlightLookups = 16;
 
 struct ResolverPool;
@@ -102,7 +128,22 @@ struct ResolverPool;
 struct ResolverPool {
     std::atomic<int> in_flight{0};
     int cap{kMaxInFlightLookups};
+    /// How many calls ended in each status, indexed by `ResolveStatus`. Written only by
+    /// `note_outcome`, which `bounded_resolve` calls exactly once per call.
+    std::array<std::atomic<std::uint64_t>, kResolveStatusCount> outcomes{};
     explicit ResolverPool(int c = kMaxInFlightLookups) : cap(c) {}
+
+    void note_outcome(ResolveStatus s) noexcept {
+        outcomes[static_cast<std::size_t>(s)].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// A snapshot of the per-status counts, in `ResolveStatus` order.
+    [[nodiscard]] std::array<std::uint64_t, kResolveStatusCount> outcome_counts() const noexcept {
+        std::array<std::uint64_t, kResolveStatusCount> out{};
+        for (std::size_t i = 0; i < kResolveStatusCount; ++i)
+            out[i] = outcomes[i].load(std::memory_order_relaxed);
+        return out;
+    }
 };
 
 namespace detail {
@@ -171,15 +212,12 @@ inline ResolveResult system_lookup(const std::string& host) {
     return detail::process_pool()->in_flight.load();
 }
 
-/// Resolve `host`, waiting at most `timeout`. Never blocks the caller past the bound, never
-/// touches caller-owned memory from another thread. `lookup` (default: the system resolver) and
-/// `pool` (default: the process pool) are injectable for tests.
-[[nodiscard]] inline ResolveResult bounded_resolve(const std::string& host,
-                                                   std::chrono::milliseconds timeout,
-                                                   LookupFn lookup = {},
-                                                   std::shared_ptr<ResolverPool> pool = {}) {
-    if (!pool)
-        pool = detail::process_pool();
+namespace detail {
+
+/// The resolve itself, on an already-chosen pool. Callers count its status (see `bounded_resolve`).
+inline ResolveResult bounded_resolve_impl(const std::string& host,
+                                          std::chrono::milliseconds timeout, LookupFn lookup,
+                                          const std::shared_ptr<ResolverPool>& pool) {
     if (!lookup)
         lookup = &detail::system_lookup;
     // Admit by compare-exchange so the counter only ever moves up when a slot is free: a refused
@@ -216,6 +254,24 @@ inline ResolveResult system_lookup(const std::string& host) {
     if (!state->cv.wait_for(lk, timeout, [&] { return state->done; }))
         return {ResolveStatus::kTimeout, {}};
     return std::move(state->result);
+}
+
+} // namespace detail
+
+/// Resolve `host`, waiting at most `timeout`. Never blocks the caller past the bound, never
+/// touches caller-owned memory from another thread. `lookup` (default: the system resolver) and
+/// `pool` (default: the process pool) are injectable for tests. Every call is counted once in
+/// `pool->outcomes`, by the status it returns: a `kTimeout` is counted when the caller stops
+/// waiting, not again when the lookup later finishes.
+[[nodiscard]] inline ResolveResult bounded_resolve(const std::string& host,
+                                                   std::chrono::milliseconds timeout,
+                                                   LookupFn lookup = {},
+                                                   std::shared_ptr<ResolverPool> pool = {}) {
+    if (!pool)
+        pool = detail::process_pool();
+    ResolveResult result = detail::bounded_resolve_impl(host, timeout, std::move(lookup), pool);
+    pool->note_outcome(result.status);
+    return result;
 }
 
 } // namespace yuzu::server::net
