@@ -1596,6 +1596,33 @@ TEST_CASE("revocation source: a name lookup that times out is a retryable 503, t
     CHECK(fx.store.list()->empty());
 }
 
+TEST_CASE("revocation source: a name lookup refused because the pool is at its cap counts dns_busy",
+          "[revocation_source][pg]") {
+    // The reason string is what the sample alert YuzuCrlSourceResolverBusy selects on, so a typo or
+    // a reorder of the mapping from the resolver's busy status must turn a case red.
+    std::vector<std::string> degrades;
+    Fx fx(rstest::fake_env(rstest::default_dns(), {.dns_busy = {"busy.example.com"}, .degrades = &degrades}));
+    fx.admin(false);
+    auto b = rstest::valid_body();
+    b["crl_urls"] = json::array({rstest::url_entry("http://busy.example.com/a.crl", {"public"})});
+    auto r = fx.rest_post(b);
+    REQUIRE(r->status == 503);
+    CHECK(data_of(*r)["error"]["retry_after_ms"] == 5000);
+    CHECK(degrades == std::vector<std::string>{"dns_busy"});
+    CHECK(fx.store.list()->empty());
+    // Over MCP too: a retryable error, nothing registered, counted once more.
+    auto bm = rstest::valid_body("Other CA");
+    bm["crl_urls"] = json::array({rstest::url_entry("http://busy.example.com/a.crl", {"public"})});
+    auto m = fx.h.mcp_call_tool_approved(kRegister, bm);
+    CHECK(mcp_error_code(*m) == yuzu::server::mcp::kInternalError);
+    CHECK(fx.store.list()->empty());
+    CHECK(degrades == std::vector<std::string>{"dns_busy", "dns_busy"});
+    // Control: a host not in the busy set still registers, with no further count.
+    auto ok = fx.rest_post(rstest::valid_body("Third CA"));
+    CHECK(ok->status == 201);
+    CHECK(degrades.size() == 2);
+}
+
 TEST_CASE("revocation source: the own-address set is computed once per request",
           "[revocation_source][pg]") {
     int calls = 0;
