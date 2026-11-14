@@ -3072,17 +3072,31 @@ Resolution order inside the script:
    bumping the label again. Docker Linux path only. Probe output and the
    decision: pending — filled by the push that applies or declines it.
 
-   **Clone-strategy A/B knob (2026-11-10, pending measurement).** Every
+   **Clone-strategy knob (2026-11-10; measured and wired 2026-11-14).** Every
    template-cloned `[pg]` case runs `CREATE DATABASE ... TEMPLATE ...`
    (`PostgresTestDb`, `tests/unit/test_helpers.hpp`). Setting
    `YUZU_TEST_PG_CLONE_STRATEGY` to `wal_log` or `file_copy` (any case) appends
    `STRATEGY WAL_LOG` or `STRATEGY FILE_COPY` to that statement; unset leaves the
    SQL unchanged (the server default, `WAL_LOG` on PostgreSQL 15+), and any other
-   value fails the fixture with a message naming the variable. No CI job sets it.
-   It exists so the two strategies can be compared on the pg step's wall time,
-   on the same terms as the tmpfs experiment above (two same-SHA samples, kept
-   only on a gain); if `FILE_COPY` wins, wiring it into CI is a separate change.
-   Result: pending. Contract: `docs/testing/unit-test-conventions.md`.
+   value fails the fixture with a message naming the variable. Measured on Big
+   Tam in two runs of draft PR #7701, each running the `server-pg` suite four
+   times in one job (default, file_copy, file_copy, default) so that load drift
+   hits both strategies alike:
+
+   | Run | default (wall / serial) | file_copy (wall / serial) | default (wall / serial) |
+   |---|---|---|---|
+   | 1 | 751 s / 2633 s | 739 s / 2625 s, 711 s / 2499 s | 807 s / 2850 s |
+   | 2 | 927 s / 3303 s | 869 s / 3133 s, 870 s / 3136 s | not finished (step timeout) |
+
+   Every default pass was slower than both file_copy passes of its run: about
+   6-7% wall and 5-6% serial. Run 2 was on a busier box (all of its numbers
+   about 20% higher), so compare within a run, not across. Result: the Linux
+   test step's `pg_half` exports `YUZU_TEST_PG_CLONE_STRATEGY=file_copy` for
+   both `pg_mode`s (a value leaking in from the runner is warned about and
+   overridden; `tests/shell/test_linux_concurrent_step.sh` pins both). The
+   checkpoint `FILE_COPY` forces stays inside the job's own per-runner
+   Postgres container. No other workflow sets it. Revert: delete that one
+   `export`. Contract: `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.

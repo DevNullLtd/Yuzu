@@ -283,7 +283,7 @@ inline const char* pg_admin_dsn_env() {
     return (v != nullptr && v[0] != '\0') ? v : nullptr;
 }
 
-/// Measurement-only A/B knob for the template clone (PostgresTestDb's
+/// Clone-strategy knob for the template clone (PostgresTestDb's
 /// `CREATE DATABASE ... TEMPLATE`): YUZU_TEST_PG_CLONE_STRATEGY selects the
 /// PostgreSQL 15+ `STRATEGY` clause. Pure parse of the raw env value:
 ///   - nullptr or ""                    -> ok, empty clause (SQL byte-identical
@@ -294,8 +294,9 @@ inline const char* pg_admin_dsn_env() {
 ///                                         variable and the accepted values.
 /// An invalid value fails the fixture (PostgresTestDb::error(), surfaced by the
 /// YUZU_REQUIRE_PG_DB* macros' REQUIRE) rather than being silently ignored, so
-/// a typo can never produce a "measurement" of the default strategy.
-/// No CI job sets it today (docs/testing/unit-test-conventions.md).
+/// a typo can never silently run the default strategy instead.
+/// The Linux CI test step's pg half sets it to file_copy; nothing else does
+/// (docs/testing/unit-test-conventions.md).
 struct PgCloneStrategy {
     bool ok = true;
     std::string clause; ///< appended verbatim after the TEMPLATE clause
@@ -709,7 +710,7 @@ private:
         std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
         if (tpl_name != nullptr) {
             create += " TEMPLATE \"" + *tpl_name + "\"";
-            // A/B knob (measurement only): unset -> no clause, SQL unchanged.
+            // Clone-strategy knob: unset -> no clause, SQL unchanged.
             const PgCloneStrategy strategy =
                 parse_pg_clone_strategy(std::getenv("YUZU_TEST_PG_CLONE_STRATEGY"));
             if (!strategy.ok) {
