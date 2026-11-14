@@ -10,6 +10,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <exception>
 #include <utility>
 
@@ -18,10 +19,12 @@ namespace yuzu::server {
 SoftwareNormalizationJob::SoftwareNormalizationJob(SoftwareTitleDimension& dimension,
                                                    std::chrono::seconds interval,
                                                    yuzu::MetricsRegistry* metrics,
-                                                   TickObserver on_tick)
+                                                   TickObserver on_tick,
+                                                   std::chrono::milliseconds stop_poll)
     : dimension_(dimension),
       interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600} : interval),
-      metrics_(metrics), on_tick_(std::move(on_tick)) {
+      metrics_(metrics), on_tick_(std::move(on_tick)),
+      stop_poll_(stop_poll <= std::chrono::milliseconds{0} ? kNormalizationStopPoll : stop_poll) {
     // Seeded BEFORE the first tick: a lazily created error counter would first appear at 1,
     // an increase the Failing rule cannot see, and the Stale rule needs the timestamp series
     // to exist (it guards `> 0`; a never-successful job is the Failing rule's case).
@@ -107,9 +110,12 @@ void SoftwareNormalizationJob::run() {
     auto wait = interval_;
     while (!stop_.load(std::memory_order_acquire)) {
         if (!first) {
-            const long steps = (wait.count() + 4) / 5;
-            for (long i = 0; i < steps && !stop_.load(std::memory_order_acquire); ++i)
-                std::this_thread::sleep_for(std::chrono::seconds{5});
+            // stop_poll_ steps (5 s in production), rounded up as the former (wait + 4) / 5 was.
+            const auto steps =
+                (std::chrono::milliseconds{wait} + stop_poll_ - std::chrono::milliseconds{1}) /
+                stop_poll_;
+            for (std::int64_t i = 0; i < steps && !stop_.load(std::memory_order_acquire); ++i)
+                std::this_thread::sleep_for(stop_poll_);
             if (stop_.load(std::memory_order_acquire))
                 break;
         }
