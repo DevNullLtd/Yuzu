@@ -41,6 +41,11 @@ namespace yuzu::server {
 /// its cap, or the candidate source had not been filled yet.
 inline constexpr std::chrono::seconds kBacklogRearm{60};
 
+/// The step the idle wait between ticks sleeps in, re-checking the stop flag after each step:
+/// the longest a `stop()` waits on a parked thread. Production uses this value; the constructor
+/// takes another only so a test need not wait out a 5 s step per `stop()`.
+inline constexpr std::chrono::milliseconds kNormalizationStopPoll{5000};
+
 /// The wait before the next tick: the short floor only for a capped or source-pending tick
 /// (never longer than the configured interval), otherwise `interval`.
 [[nodiscard]] constexpr std::chrono::seconds rearm_interval(const TickResult& r,
@@ -56,9 +61,12 @@ public:
     using TickObserver = std::function<void(const TickResult&)>;
 
     /// `dimension` is borrowed (must outlive this). `interval` is the
-    /// completion-to-start spacing; non-positive falls back to one hour.
+    /// completion-to-start spacing; non-positive falls back to one hour. `stop_poll` is the
+    /// idle-wait step (`kNormalizationStopPoll`; non-positive falls back to it), a test seam
+    /// like `on_tick`: production passes neither.
     SoftwareNormalizationJob(SoftwareTitleDimension& dimension, std::chrono::seconds interval,
-                             yuzu::MetricsRegistry* metrics = nullptr, TickObserver on_tick = {});
+                             yuzu::MetricsRegistry* metrics = nullptr, TickObserver on_tick = {},
+                             std::chrono::milliseconds stop_poll = kNormalizationStopPoll);
     ~SoftwareNormalizationJob();
 
     SoftwareNormalizationJob(const SoftwareNormalizationJob&) = delete;
@@ -84,6 +92,7 @@ private:
     std::chrono::seconds interval_;
     yuzu::MetricsRegistry* metrics_;
     TickObserver on_tick_;
+    std::chrono::milliseconds stop_poll_;
     std::atomic<bool> stop_{false};
     /// `source_pending` of the last tick that neither errored nor was cancelled: the memory
     /// that lets `tick_once` log a repeated wait once. Touched only by `tick_once`.

@@ -105,6 +105,8 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_execute_ports.hpp"  // #2146: shared core of the instruction-definition execute twins
+#include "instruction_referrers.hpp" // make_definition_referrers_fn (UP-6)
+#include "instruction_authoring_routes.hpp" // v1 definition + instruction-set authoring twins (#2146 batch C)
 #include "instruction_execute_routes.hpp" // POST /api/v1/instructions/{id}/execute
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp"
@@ -319,6 +321,7 @@
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "legacy_sqlite_probe.hpp"
+#include "delivery_pool_metrics.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
@@ -1735,7 +1738,8 @@ public:
         metrics_.describe(yuzu::server::kEventEmitFailedMetric,
                           "Legacy-equivalent platform events (execution.created, "
                           "execution.completed, command.dispatched, instruction.executed, "
-                          "approval.created, workflow.executed) that the v1 REST and MCP twins "
+                          "approval.created, workflow.executed, instruction.created, "
+                          "instruction.updated, instruction.deleted) that the v1 REST and MCP twins "
                           "tried to publish "
                           "after a successful effect and whose emit hook THREW (a payload "
                           "serialisation or hook defect). NOT an analytics-drop signal: the "
@@ -2835,17 +2839,13 @@ public:
                           "Number of obs_types currently routed to alerts", "gauge");
         // #3261 governance hardening (Gate 8 consistency-auditor) - the same
         // parity gap DexAlertRouter's family above had before its own
-        // describe() calls were added: without this, these six counters
+        // describe() calls were added: without this, these counters
         // emit no HELP/TYPE line and stay entirely absent until first
         // incremented.
         metrics_.describe("yuzu_server_webhook_delivery_success_total",
                           "Webhook deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_webhook_delivery_failed_total",
                           "Webhook deliveries that failed (connection error, non-2xx, exception)",
-                          "counter");
-        metrics_.describe("yuzu_server_webhook_delivery_dropped_total",
-                          "Webhook deliveries dropped because the delivery worker pool's queue "
-                          "was full or the store was quiescing",
                           "counter");
         // ADR-0057 (gov Gate 3 sre): these three joined the family above but
         // were missing describe()/pre-seed, the same HC-1-class parity gap
@@ -2870,15 +2870,14 @@ public:
                           "Offload-target deliveries that failed (connection error, non-2xx, "
                           "exception, or a tampered non-http(s) URL)",
                           "counter");
-        metrics_.describe("yuzu_server_offload_delivery_dropped_total",
-                          "Offload-target deliveries dropped because the delivery worker pool's "
-                          "queue was full or the store was quiescing",
-                          "counter");
-        // Pre-seed all six to 0 (adversarial-review round 2, Kimi+Codex
+        // The two drop counters (closed `reason` set) and the delivery pool gauges are described
+        // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
+        yuzu::server::register_delivery_pool_metrics(metrics_);
+        // Pre-seed each of these to 0 (adversarial-review round 2, Kimi+Codex
         // both independently confirmed) - describe() alone only writes
         // HELP/TYPE metadata (MetricsRegistry::describe()), it does not
         // create a series; counter(name) with no labels does. Each of
-        // these six is a no-label counter, so it has exactly one known
+        // these is a no-label counter, so it has exactly one known
         // "label combination" - itself - and the same bounded-label
         // pre-seed rule applies (docs/observability-conventions.md
         // "Bounded-label counters are pre-seeded to 0 at startup"),
@@ -2892,17 +2891,15 @@ public:
         // alerting can't distinguish "not wired" from "no deliveries yet".
         for (const char* name : {"yuzu_server_webhook_delivery_success_total",
                                  "yuzu_server_webhook_delivery_failed_total",
-                                 "yuzu_server_webhook_delivery_dropped_total",
                                  "yuzu_server_webhook_delivery_secret_unavailable_total",
                                  "yuzu_server_webhook_fire_event_degraded_total",
                                  "yuzu_server_webhook_delivery_log_failed_total",
                                  "yuzu_server_offload_delivery_success_total",
-                                 "yuzu_server_offload_delivery_failed_total",
-                                 "yuzu_server_offload_delivery_dropped_total"}) {
+                                 "yuzu_server_offload_delivery_failed_total"}) {
             metrics_.counter(name);
         }
         // ADR-0059 (OffloadTargetStore Postgres migration) — two new counters
-        // this migration adds, same pre-seed rule as the six above.
+        // this migration adds, same pre-seed rule as the counters above.
         metrics_.describe("yuzu_server_offload_delivery_credential_unavailable_total",
                           "Offload-target deliveries skipped because the target's credential "
                           "failed to decrypt (ADR-0010 fail-closed - never fired unsigned)",
@@ -4370,14 +4367,18 @@ public:
                           "counter");
         metrics_.describe(
             "yuzu_server_guardian_census_proj_failures_total",
-            "Compliance-census (guardian_agent_rule_status) writes that failed "
+            "Compliance-census (guardian_agent_rule_status) writes, and the per-agent "
+            "emit-order step that runs before each first-delivery write, that failed "
             "for a reason other than the rule not existing. The failure of a single "
             "event does not discard it: it stays stored with pending census "
             "evidence, and the pair keeps its previous state "
-            "until a redelivery of that event repairs it or a later event for the pair arrives. A "
+            "until a redelivery of that event repairs the census row or a later event for the "
+            "pair arrives. A repair runs no order step, so an event whose first delivery failed "
+            "that step never reaches the agent's order clock. A "
             "repair that fails is counted here again. >0 means the census may be "
             "stale; the server log line 'census upsert failed' names the agent "
-            "and rule. A write refused because the rule is not defined on this "
+            "and rule (the order step logs 'agent order step failed' with the agent and event). "
+            "A write refused because the rule is not defined on this "
             "server (the census foreign key, SQLSTATE 23503) is a normal "
             "outcome and is not counted; a failure to retire the evidence of "
             "such an event is an ingest error.",
@@ -4392,8 +4393,13 @@ public:
                           "rule is gone (not a fault); failed is a fault that leaves pending "
                           "evidence, except for source batch, whose failure rolls back the whole batch "
                           "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); abandoned aborted the "
-                          "transaction (counted again as an ingest error). Counted when the "
+                          "..._census_proj_failures_total); a failed per-agent emit-order step is "
+                          "also counted failed (on a first delivery the census write is then "
+                          "skipped); abandoned aborted the "
+                          "transaction (counted again as an ingest error); it includes a failed "
+                          "control statement of the emit-order step's savepoint and, on a first "
+                          "delivery, a failed write of the pending evidence after a failed order "
+                          "step. Counted when the "
                           "projection returns, before the transaction commits. Resets on server "
                           "restart.",
                           "counter");
@@ -4409,12 +4415,34 @@ public:
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
+        metrics_.describe(detail::kGuardianPairRejectedMetric,
+                          "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
+                          "withheld at ingest, by reason. half_set: exactly one of the two was "
+                          "set. out_of_range: a set pair had a value of 2^62 or more. The event "
+                          "is still stored, unpaired, and its verdict decision is unaffected (the "
+                          "census row's stored pair becomes NULL when that unpaired verdict is applied); "
+                          "this is not a refusal. "
+                          "Counted once per withheld pair: a redelivery of the same event does "
+                          "not count again. Resets on server restart.",
+                          "counter");
+        for (const char* reason : detail::kGuardianPairRejectReasons)
+            metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
-                          "write failed and no redelivery has repaired it. Not updated while "
+                          "write, or the per-agent emit-order step before it, failed and no "
+                          "redelivery has repaired it. Not updated while "
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
+                          "gauge");
+        metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
+                          "Agents whose latest accepted unpaired census-bearing event is later than "
+                          "the time their pair clock last advanced (an agent that never sent a "
+                          "pair counts; accepted means accepted for ordering). The pair is stored "
+                          "and counted, not yet compared: "
+                          "no verdict depends on it. Not updated while the store cannot answer, "
+                          "and absent until the first answered read. Per-agent detail is the "
+                          "ordering field of the per-device all-guards read.",
                           "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
@@ -4424,15 +4452,18 @@ public:
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
+        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count and the
+        // request-path unordered_agents read behind the status rollup, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
         // rather than fan out empty/stale data); "guardian_census" (#5690) is the
-        // census pending-evidence COUNT read only (the gauge keeps its last value);
+        // census GAUGE reads only (the pending-evidence count and the unordered-agents count;
+        // each gauge keeps its last value);
         // "guardian_census_device" (#7217) is the per-device unrepresented-pending
-        // reads behind the device-compliance and all-guards routes (fail-hard: REST
-        // 503 / MCP error), and is the only source with the extra reason
-        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
-        // retry usually fails identically). Pre-seeded below (same closed
+        // read and the per-device emit-order read behind the device-compliance and
+        // all-guards routes (fail-hard: REST 503 / MCP error), and is the only source with the
+        // extra reason "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog
+        // symptom whose retry usually fails identically; only the unrepresented-pending read
+        // sets a statement timeout, the order read does not). Pre-seeded below (same closed
         // {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
         // is meaningful before the first degrade ever fires.
@@ -4444,11 +4475,14 @@ public:
                           "in-flight budget, plus statement_timeout for a guardian_census_device "
                           "read that exceeded its time budget) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
-                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "served; guardian_rules = authoritative rule/status reads, including "
+                          "the request-path unordered-agents read, fail-hard, "
                           "push/reconcile aborts rather than fans out empty; guardian_census = "
-                          "the census pending-evidence count read, whose gauge keeps its last "
+                          "the census gauge reads (the pending-evidence count and the "
+                          "unordered-agents count), whose gauges keep their last "
                           "value; guardian_census_device = the per-device unrepresented-pending "
-                          "reads, fail-hard, the device request is refused and a statement_timeout "
+                          "and emit-order reads, fail-hard, the device request is refused and a "
+                          "statement_timeout "
                           "most likely means a large retained pending backlog, which a retry usually "
                           "does not clear). "
                           "A sampled warn accompanies each new degrade episode.",
@@ -9853,6 +9887,21 @@ public:
                 // The OIDC egress resolver pool, from the same tick.
                 metrics_.gauge("yuzu_server_oidc_resolver_in_flight")
                     .set(static_cast<double>(::yuzu::server::oidc::oidc_resolver_in_flight()));
+                // Webhook and offload delivery pool backlog, from the same tick. A store that is
+                // not open reads 0 (never a stale value).
+                {
+                    const bool webhook_open = webhook_store_ && webhook_store_->is_open();
+                    yuzu::server::publish_delivery_pool(
+                        metrics_, "webhook", webhook_open,
+                        webhook_open ? webhook_store_->delivery_pool_pending() : 0,
+                        webhook_open ? webhook_store_->delivery_pool_capacity() : 0);
+                    const bool offload_open =
+                        offload_target_store_ && offload_target_store_->is_open();
+                    yuzu::server::publish_delivery_pool(
+                        metrics_, "offload", offload_open,
+                        offload_open ? offload_target_store_->delivery_pool_pending() : 0,
+                        offload_open ? offload_target_store_->delivery_pool_capacity() : 0);
+                }
                 // Workflow run table size: one catalog row, 250 ms to lease plus a 250 ms
                 // statement (roughly 250 ms plus connect_timeout_s if the pool must open a
                 // connection), noexcept (a failed sample keeps the previous gauge values).
@@ -10459,6 +10508,9 @@ public:
                     if (auto pending = guaranteed_state_store_->pending_projection_count_checked())
                         metrics_.gauge("yuzu_server_guardian_census_pending_events")
                             .set(static_cast<double>(*pending));
+                    // Same posture: the unordered-agents count is published only when read.
+                    detail::publish_guardian_census_unordered_gauge(metrics_,
+                                                                    *guaranteed_state_store_);
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
@@ -17608,6 +17660,16 @@ private:
                              .nvd_sync = nvd_sync_.get(),
                          });
 
+        // UP-6: ONE referrer lookup and ONE advisory pack lookup, built here (their stores are
+        // members constructed in the ctor, long before this) and handed to every consumer: the v1
+        // DELETE twin and MCP delete_definition, so neither can disagree about what blocks a
+        // delete. The lookups hold raw store pointers, the same lifetime the route lambdas'
+        // other store pointers already rely on.
+        DefinitionReferrersFn definition_referrers_fn = make_definition_referrers_fn(
+            schedule_engine_.get(), workflow_engine_.get(), policy_store_.get());
+        DefinitionPackAdvisoryFn definition_pack_advisory_fn =
+            make_definition_pack_advisory_fn(product_pack_store_.get());
+
         // #2542 PR-7: the 13-route Instruction Definitions + Instruction
         // Sets API cluster, extracted onto the same inline_sink seam.
         yuzu::server::instruction::register_instruction_routes(
@@ -23328,6 +23390,36 @@ private:
                 instr_exec_sink, std::move(instr_exec_deps));
         }
 
+        // #2146 batch C: the v1 REST twins of the legacy instruction-definition and
+        // instruction-set authoring routes. Same store, same permission gate and same audit sink
+        // as the legacy cluster above; audit-first on every write.
+        {
+            // UP-6: the SAME referrer lookup built above is shared here and with the MCP
+            // delete_definition (wired into mcp_server_ below).
+            yuzu::server::instruction_authoring::RouteDeps authoring_deps;
+            authoring_deps.perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                            const std::string& securable_type,
+                                            const std::string& operation) {
+                return require_permission(req, res, securable_type, operation);
+            };
+            authoring_deps.audit_fn = [this](const httplib::Request& req, const std::string& action,
+                                             const std::string& result,
+                                             const std::string& target_type,
+                                             const std::string& target_id,
+                                             const std::string& detail) -> bool {
+                return audit_log(req, action, result, target_type, target_id, detail);
+            };
+            authoring_deps.resolve_session_fn = resolve_session_fn;
+            authoring_deps.emit_event_fn = emit_event_fn;
+            authoring_deps.store = instruction_store_.get();
+            authoring_deps.referrers_fn = definition_referrers_fn;
+            authoring_deps.pack_advisory_fn = definition_pack_advisory_fn;
+            authoring_deps.metrics = &metrics_;
+            HttplibRouteSink authoring_sink{*web_server_};
+            yuzu::server::instruction_authoring::register_instruction_authoring_routes(
+                authoring_sink, std::move(authoring_deps));
+        }
+
         // -- Register MCP server routes ----------------------------------------
 
         if (cfg_.mcp_disable) {
@@ -23431,6 +23523,9 @@ private:
             // Legacy-equivalent events for cancel_execution, record_execution_rerun and
             // execute_instruction_definition (event_emit.hpp).
             mcp_server_->set_emit_event_fn(emit_event_fn);
+            // UP-6: the SAME referrer lookup the v1 DELETE twin uses (authoring_deps above).
+            mcp_server_->set_definition_referrers_fn(definition_referrers_fn);
+            mcp_server_->set_definition_pack_advisory_fn(definition_pack_advisory_fn);
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

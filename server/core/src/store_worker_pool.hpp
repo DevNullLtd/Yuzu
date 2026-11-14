@@ -60,6 +60,7 @@ public:
         : max_queue_(max_queue) {
         num_threads = std::max<std::size_t>(num_threads, 1);
         num_threads = std::min<std::size_t>(num_threads, 16);
+        capacity_ = max_queue_ + num_threads; // written before any worker starts, never again
         workers_.reserve(num_threads);
         YUZU_ASSERT_BACKGROUND_JOB("store_worker_pool.worker_loop"); // WS-10 ReplicaSafe (per-replica drain)
         // EXCEPTION-SAFE CONSTRUCTION (gov Gate 8 architect). std::thread's
@@ -101,22 +102,50 @@ public:
     StoreWorkerPool(const StoreWorkerPool&) = delete;
     StoreWorkerPool& operator=(const StoreWorkerPool&) = delete;
 
-    /// Enqueue a task. Returns false (task NOT queued) if the pool has
-    /// already been quiesced, or if the bounded queue is full - the caller
-    /// must log and drop rather than fall back to an unbounded spawn.
-    bool submit(std::function<void()> task) {
+    /// Why a task was not queued. The two causes need different responses (a full queue is a
+    /// backlog an operator can act on; a closed pool is shutdown), so the drop counters split
+    /// them by `drop_reason()`.
+    enum class SubmitResult { kQueued, kQueueFull, kClosed };
+
+    /// Closed `reason` label values for a delivery dropped at submit. Call it only with a refusal
+    /// (kQueueFull or kClosed); kQueued is not a drop and has no reason.
+    [[nodiscard]] static constexpr const char* drop_reason(SubmitResult r) noexcept {
+        return r == SubmitResult::kClosed ? "quiescing" : "queue_full";
+    }
+
+    /// Enqueue a task and say why it was not queued. The task is NOT queued unless kQueued; the
+    /// caller must log and drop rather than fall back to an unbounded spawn.
+    [[nodiscard]] SubmitResult try_submit(std::function<void()> task) {
         {
             std::lock_guard lock(mu_);
             if (closed_ || stop_)
-                return false;
+                return SubmitResult::kClosed;
             if (tasks_.size() >= max_queue_)
-                return false;
+                return SubmitResult::kQueueFull;
             tasks_.push(std::move(task));
             ++pending_;
         }
         cv_.notify_one();
-        return true;
+        return SubmitResult::kQueued;
     }
+
+    /// Enqueue a task. Returns false (task NOT queued) if the pool has
+    /// already been quiesced, or if the bounded queue is full - the caller
+    /// must log and drop rather than fall back to an unbounded spawn.
+    bool submit(std::function<void()> task) {
+        return try_submit(std::move(task)) == SubmitResult::kQueued;
+    }
+
+    /// Tasks queued plus tasks currently executing. A snapshot: it can change before the caller
+    /// reads it.
+    [[nodiscard]] std::size_t pending() const {
+        std::lock_guard lock(mu_);
+        return pending_;
+    }
+
+    /// The most `pending()` can reach: the queue bound plus one task per worker. Fixed at
+    /// construction.
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
     /// Stop accepting new work and wait up to `timeout` for the queue to
     /// drain AND every in-flight task to finish. Returns true if fully
@@ -215,10 +244,11 @@ private:
 
     std::vector<std::thread> workers_;
     std::queue<std::function<void()>> tasks_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::condition_variable cv_;      // producer -> worker: new task / stop
     std::condition_variable idle_cv_; // worker -> quiesce(): pending_ reached 0
     std::size_t max_queue_;
+    std::size_t capacity_{0}; // max_queue_ + worker count; immutable once the workers start
     std::size_t pending_{0}; // queued + currently-executing tasks
     bool stop_{false};       // destructor-path: stop workers unconditionally
     bool closed_{false};     // quiesce()-path: reject new submissions

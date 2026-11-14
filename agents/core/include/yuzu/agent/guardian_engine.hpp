@@ -40,6 +40,7 @@
 #include <yuzu/agent/kv_store.hpp> // kKvStoreStopBusyTimeout (#5604)
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
 #include <yuzu/agent/guardian_preserved_tally.hpp> // #4415: per-full_sync skipped-rule record
+#include <yuzu/agent/guardian_rebuild_tally.hpp> // #5719: per-full_sync rebuild-reason record
 #include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
 namespace yuzu::agent {
@@ -884,6 +885,18 @@ public:
         post_attach_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY (#5719): records `why` as the cause a full_sync's scoped detach forced for
+    /// `rule_id`, exactly as apply_rules does from detach_rules_except's return. Takes NO lock:
+    /// call it only from a hook that already runs under mtx_ on the apply thread
+    /// (set_post_attach_hook_for_test). It exists to reach the engine's decision to consult that
+    /// record only when attach_rule reported a reason, which no runtime state a Rig can build
+    /// pairs with a forced entry. No production caller.
+    /// `key` is the spark key the forced entry was recorded against (empty matches nothing).
+    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id,
+                                                GuardianRebuildReason why, std::string key = {}) {
+        forced_rebuilds_[rule_id] = ForcedRebuildEntry{std::move(key), why};
+    }
+
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
     /// see that member's own doc comment for the exact firing point and its
     /// same-thread-relock CONTRACT. Set-then-use: arm this on the thread that
@@ -941,6 +954,11 @@ public:
     /// emission, not observed via spdlog, for the same cross-image reason as the accessors above.
     /// Locked, returned by value. No production caller.
     [[nodiscard]] std::string last_full_sync_preserved_line_for_test() const;
+
+    /// TEST-ONLY (#5719): the exact `Guardian: full_sync rebuilt N rule(s) ...` line the most
+    /// recent full_sync apply_rules emitted (empty before the first). Same contract as
+    /// last_full_sync_preserved_line_for_test(). Locked, returned by value. No production caller.
+    [[nodiscard]] std::string last_full_sync_rebuild_line_for_test() const;
 
     /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
     /// attempt ended up with — empty if never armed as file-hash-equals, the
@@ -1473,6 +1491,20 @@ private:
     GuardianPreservedTally preserved_tally_;
     /// TEST-ONLY (see last_full_sync_preserved_line_for_test); empty = none emitted yet.
     std::string last_full_sync_preserved_line_for_test_;
+    /// #5719: why each rule the current apply_rules rebuilt was rebuilt (mtx_-guarded; reset at the
+    /// start of each apply_rules' rule loop).
+    GuardianRebuildTally rebuild_tally_;
+    /// #5719: rule_id -> the cause a full_sync's scoped detach forced, with the spark key whose
+    /// fault it records (mtx_-guarded; cleared at the top of every apply_rules; installed from
+    /// detach_rules_except's return on a full_sync). The cause is applied only when the rule's
+    /// attach targets that same key: a rule retargeted to another key is a first attach there.
+    struct ForcedRebuildEntry {
+        std::string key;
+        GuardianRebuildReason why{GuardianRebuildReason::None};
+    };
+    std::unordered_map<std::string, ForcedRebuildEntry> forced_rebuilds_;
+    /// TEST-ONLY (see last_full_sync_rebuild_line_for_test); empty = none emitted yet.
+    std::string last_full_sync_rebuild_line_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;
