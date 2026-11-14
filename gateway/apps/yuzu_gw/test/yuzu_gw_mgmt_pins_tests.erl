@@ -96,10 +96,32 @@ cleanup(#{certs := Certs, saved := Saved, prev := Prev}) ->
     yuzu_gw_authz_tests:cleanup_certs(Certs),
     ok.
 
-%% Every case needs the minted certificates; without openssl the case is a
-%% no-op here and yuzu_gw_authz_tests' canary reports the missing tool.
+%% An instantiated pin test must execute its body. Do not depend on another
+%% module's TLS canary: that module may be absent from this shard or probe.
 with_certs(#{certs := #{} = Certs}, Fun) -> Fun(Certs);
-with_certs(_, _Fun) -> ok.
+with_certs(#{certs := {error, Why}}, _Fun) ->
+    error({tls_test_certificates_unavailable, Why}).
+
+with_certs_unavailable_test() ->
+    ?assertError({tls_test_certificates_unavailable, openssl_missing},
+                 with_certs(#{certs => {error, openssl_missing}},
+                            fun(_) -> error(unexpected_test_body) end)).
+
+with_certs_invokes_body_once_test() ->
+    Certs = #{ca => fixture_ca},
+    Ref = make_ref(),
+    Self = self(),
+    ?assertEqual(body_result,
+                 with_certs(#{certs => Certs}, fun(Actual) ->
+                     Self ! {Ref, Actual},
+                     body_result
+                 end)),
+    receive {Ref, Received} -> ?assertEqual(Certs, Received)
+    after 0 -> error(test_body_not_invoked)
+    end,
+    receive {Ref, _} -> error(test_body_invoked_twice)
+    after 0 -> ok
+    end.
 
 stop_watcher() ->
     case whereis(yuzu_gw_mgmt_pins) of

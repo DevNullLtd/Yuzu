@@ -1130,8 +1130,10 @@ tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gco
 invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
 Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
 `tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
-scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
-and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
+scenarios only, `CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25` (bash, python3 with sqlite3, procps
+and findutils, all on the hosted image). CH-6/CH-25 check performance parser,
+requested-scale and evidence-write verdicts; the coverage fixtures stub disk space
+as well as `ps`, `find` and `ln`, so host capacity cannot change the expected result. The
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
@@ -2835,6 +2837,44 @@ priority; each of the three is separable.
 *Samples.* To be recorded here after the change's own runs.
 
 ### Persistent runner-local test history
+
+The local `/test` recorder now uses schema v4. `test_gates` remains the latest
+observation for each run/gate, while `test_gate_attempts` appends every recorded
+write in the same transaction. An observation is not necessarily a fresh test
+execution: repeated reporting also creates an entry. `--latest` shows repeated
+gate history and JSON exports include `gate_attempts`. Migration preserves each
+surviving v3 gate with an unknown recording time; it cannot reconstruct results
+already overwritten by older clients.
+
+Finalization keeps earlier gate FAIL/WARN evidence, treats unfinished gates or
+an empty run as ABORTED, and reports an all-skipped run as SKIP. An explicit
+`run-finish --status` can worsen the result but cannot improve it; its floor
+survives refinalization and late gate observations. A late observation reopens
+the run until it is finalized again. Manual run IDs keep their original source
+identity and start time; writes from another revision require a new run ID.
+The recorder still cannot detect a required gate that was never recorded: a
+declared execution plan is future work. Metrics/timings still replace values,
+and preserving a log path does not preserve overwritten log bytes.
+
+The gateway's Meson, local, `/test` and release EUnit entrypoints share strict
+summary grading: nonzero exits, cancellation, failed summaries and zero executed
+tests fail. The old `cancel-tolerant` CLI spelling remains a strict compatibility
+alias. The wrapper retains its deadline after output EOF and shares one budget
+across retries/backoff, leaving separate bounded cleanup headroom. This does not
+yet establish a complete per-case execution inventory.
+
+The Instructions gate requires terminal SUCCESS from every agent counted in an
+untargeted dispatch's `agents_reached`, reads response pages, validates command
+and agent identities, and rejects any failure or malformed/incomplete evidence.
+Earlier RUNNING chunks are allowed when that agent has terminal success. The
+opt-in destructive/forensic path retains its separate stricter grading. These
+checks establish reported execution success, not action-specific postconditions.
+
+The performance gate remains measure-only: thresholds are not enforced. A failed
+requested perf/scale process, missing metrics from either requested suite, or a
+failed evidence write cannot produce PASS. Workflow shell tests select actual
+YAML `jobs.*.steps` entries using the already-required PyYAML dependency; missing
+or ambiguous selectors and step-shaped text inside script literals are refused.
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
 checkout. Big Tam stores it below that agent's registered tool cache at

@@ -25,9 +25,9 @@
 #   - Loadavg pre/post: recorded so a noisy sample is identifiable post-hoc.
 #   - Metric parse + DB write: every parsed metric becomes a `perf_*` row
 #     under the run.
-#   - Always exits PASS when measurement completed; WARN only when tooling
-#     prevented measurement (rebar3/erl missing, CT compile broken, parser
-#     drift detected). Never FAILs on a metric value.
+#   - PASS requires zero exits and metrics from every requested suite. A failed
+#     suite or missing metrics is WARN with exit 2, even when another suite
+#     produced measurements. Never FAILs on a metric value.
 #
 # Required arguments:
 #   --run-id ID       — /test run ID (DB foreign key)
@@ -151,7 +151,10 @@ write_gate() {
         --status "$status" \
         --duration "$duration" \
         --log "perf.log" \
-        --notes "$notes"
+        --notes "$notes" || {
+            echo "perf-gate: ERROR could not record $status gate result" >&2
+            exit 2
+        }
 }
 
 write_metric() {
@@ -160,7 +163,11 @@ write_metric() {
         --run-id "$RUN_ID" \
         --name "$name" \
         --value "$value" \
-        --unit "$unit"
+        --unit "$unit" || {
+            echo "perf-gate: ERROR could not record metric $name" >&2
+            write_gate WARN 0 "could not record metric $name; measurement evidence incomplete"
+            exit 2
+        }
 }
 
 # ── Activate Erlang ─────────────────────────────────────────────────────
@@ -257,9 +264,10 @@ echo "perf-gate: rebar3 ct exit=$CT_RC" | tee -a "$GATE_LOG"
 # recorded (the full set is in the suite's JSON files under the CT log dir).
 
 SCALE_LOG_RAW="$LOG_DIR/scale-suite.log"
+# A reused run ID must not import an earlier optional suite's measurements.
+: > "$SCALE_LOG_RAW"
 SCALE_RC=0
 if [[ "$SCALE_AGENTS" =~ ^[0-9]+$ ]] && (( SCALE_AGENTS > 0 )); then
-    : > "$SCALE_LOG_RAW"
     echo "perf-gate: running yuzu_gw_scale_SUITE (agents=$SCALE_AGENTS)" | tee -a "$GATE_LOG"
     (
         cd "$YUZU_ROOT/gateway"
@@ -349,7 +357,8 @@ parse_scale_metrics() {
     done < "$log"
 }
 
-PARSED="$(parse_metrics "$PERF_LOG_RAW")"
+PERF_PARSED="$(parse_metrics "$PERF_LOG_RAW")"
+PARSED="$PERF_PARSED"
 SCALE_PARSED="$(parse_scale_metrics "$SCALE_LOG_RAW")"
 if [[ -n "$SCALE_PARSED" ]]; then
     PARSED="$(printf "%s\n%s" "$PARSED" "$SCALE_PARSED" | sed '/^$/d')"
@@ -359,20 +368,20 @@ if [[ -n "$PARSED" ]]; then
     METRIC_COUNT=$(echo "$PARSED" | grep -c "=")
 fi
 
-# Tooling failure → WARN, surface what we got. Anything else → record and PASS.
+# Execution validity is separate from the measure-only performance policy.
 
-if [[ $CT_RC -gt 1 ]]; then
+if [[ $CT_RC -gt 1 || $SCALE_RC -gt 1 ]]; then
     GATE_DUR=$(( $(date +%s) - GATE_START ))
-    write_gate WARN "$GATE_DUR" "CT tooling failure (rebar3 exit=$CT_RC) — compile/toolchain broken, see perf-suite.log"
+    write_gate WARN "$GATE_DUR" "CT tooling failure (perf exit=$CT_RC, scale exit=$SCALE_RC) — see perf-suite.log and scale-suite.log"
     exit 2
 fi
 
-# CT exit=1 means a perf-suite assertion fired (e.g. a hard-coded latency
+# CT exit=1 means a suite assertion fired (e.g. a hard-coded latency
 # limit inside the suite). We still record any metrics that did parse,
-# emit a WARN noting the suite assertion, and exit cleanly. Treating it
+# emit a WARN noting the suite assertion, and exit 2. Treating it
 # as PASS would hide a real signal; treating it as FAIL would re-introduce
 # the gating behaviour we just removed.
-if [[ $CT_RC -eq 1 ]]; then
+if [[ $CT_RC -eq 1 || $SCALE_RC -eq 1 ]]; then
     if [[ -n "$PARSED" ]]; then
         echo "perf-gate: recording $METRIC_COUNT metrics (CT assertion fired):" | tee -a "$GATE_LOG"
         echo "$PARSED" | sed 's/^/  /' | tee -a "$GATE_LOG"
@@ -387,14 +396,20 @@ if [[ $CT_RC -eq 1 ]]; then
         done <<< "$PARSED"
     fi
     GATE_DUR=$(( $(date +%s) - GATE_START ))
-    write_gate WARN "$GATE_DUR" "CT suite asserted (rebar3 exit=$CT_RC) — see perf-suite.log; metrics recorded"
+    write_gate WARN "$GATE_DUR" "CT suite asserted (perf exit=$CT_RC, scale exit=$SCALE_RC) — see perf-suite.log and scale-suite.log; metrics recorded"
     exit 2
 fi
 
 # CT succeeded but parser extracted nothing → drift signal worth surfacing.
-if [[ -z "$PARSED" ]]; then
+if [[ -z "$PERF_PARSED" ]]; then
     GATE_DUR=$(( $(date +%s) - GATE_START ))
     write_gate WARN "$GATE_DUR" "CT PASS but 0 metrics parsed — yuzu_gw_perf_SUITE ct:pal format changed? see perf-suite.log"
+    exit 2
+fi
+
+if [[ "$SCALE_AGENTS" =~ ^[0-9]+$ ]] && (( SCALE_AGENTS > 0 )) && [[ -z "$SCALE_PARSED" ]]; then
+    GATE_DUR=$(( $(date +%s) - GATE_START ))
+    write_gate WARN "$GATE_DUR" "scale CT PASS but 0 metrics parsed — see scale-suite.log"
     exit 2
 fi
 

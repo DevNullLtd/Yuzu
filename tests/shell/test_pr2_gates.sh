@@ -23,6 +23,7 @@
 #   CH-22: coverage-gate refuses a non-Linux host (#6187)
 #   CH-23: option parsing, baseline types, gcovr search path, host-override marker, interrupts
 #   CH-24: a failed stale-counter purge is inconclusive
+#   CH-25: requested perf/scale execution and metrics must both be complete
 #
 # Usage:
 #   bash tests/shell/test_pr2_gates.sh             # run all scenarios
@@ -82,8 +83,24 @@ cat > "$MOCKBIN/rebar3" <<'EOF'
 #!/usr/bin/env bash
 # Mock rebar3 — prints scripted output from YUZU_MOCK_CT_OUTPUT
 # and exits with YUZU_MOCK_CT_RC.
+if [[ " $* " == *" --suite yuzu_gw_scale_SUITE "* ]]; then
+    printf '%s\n' "${YUZU_MOCK_SCALE_OUTPUT:-}"
+    exit "${YUZU_MOCK_SCALE_RC:-0}"
+fi
 printf '%s\n' "${YUZU_MOCK_CT_OUTPUT:-}"
 exit "${YUZU_MOCK_CT_RC:-0}"
+EOF
+
+# Darwin host facts are fixture inputs, not a prerequisite for a mocked CT run
+# (sysctl can be unavailable in a sandbox). No real host settings are changed.
+cat > "$MOCKBIN/sysctl" <<'EOF'
+#!/usr/bin/env bash
+case "$*" in
+    '-n vm.loadavg') echo '{ 1.0 1.0 1.0 }' ;;
+    '-n machdep.cpu.brand_string') echo 'fixture CPU' ;;
+    '-n hw.memsize') echo 8589934592 ;;
+    *) exit 1 ;;
+esac
 EOF
 
 chmod +x "$MOCKBIN"/*
@@ -317,7 +334,7 @@ Registratiun: 5000 ops in 613 ms (8157 op/s)
 Heartbit queue: 20000 ops in 83 ms (240964 op/s)
 All 9 tests passed." \
     bash "$YUZU_ROOT/scripts/test/perf-gate.sh" \
-        --run-id "$run_id" >/dev/null 2>&1 || true
+        --run-id "$run_id" --allow-busy >/dev/null 2>&1 || true
 
     local status notes
     status=$(db_gate_status "$run_id" "Perf")
@@ -881,7 +898,14 @@ if [[ -n "\${YUZU_MOCK_LN_RACE:-}" ]]; then
 fi
 exec /bin/ln "\$@"
 EOF
-    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find" "$FK_BIN/ln"
+    # Fixed available space makes the low-disk/decimal tests independent of
+    # the host filesystem (large disks exceeded CH-21's former threshold).
+    cat > "$FK_BIN/df" <<'EOF'
+#!/usr/bin/env bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'fixture 2097152 1048576 1048576 50%% /fixture\n'
+EOF
+    chmod +x "$FK_BIN/meson" "$FK_BIN/gcovr" "$FK_BIN/ps" "$FK_BIN/find" "$FK_BIN/ln" "$FK_BIN/df"
     FK_SAVED_PATH="$PATH"; export PATH="$FK_BIN:$PATH"
     printf '{"branch_percent":60.0,"line_percent":70.0,"slack_pp":0.5}' > "$CHAOS_ROOT/$tag-baseline.json"
     FK_BASE="$CHAOS_ROOT/$tag-baseline.json"
@@ -2204,8 +2228,68 @@ scenario_CH_24() {
     export PATH="$FK_SAVED_PATH"
 }
 
+scenario_CH_25() {
+    echo ""
+    echo "=== CH-25: requested perf/scale work cannot disappear into PASS ==="
+    init_db || { bad "CH-25" "db init failed"; return; }
+    local perf="Registration: 5000 ops in 613 ms (8157 ops/sec)"
+    local scale="SCALE_METRIC scale_steady_stop_ms_n10=12"
+    local kind run_id ct_rc scale_rc perf_output scale_output expected rc status notes
+    for kind in success scale_assert scale_tooling scale_empty perf_empty; do
+        run_id="ch25-$kind"
+        start_run "$run_id"
+        ct_rc=0; scale_rc=0; perf_output="$perf"; scale_output="$scale"; expected=WARN
+        case "$kind" in
+            success) expected=PASS ;;
+            scale_assert) scale_rc=1 ;;
+            scale_tooling) scale_rc=2 ;;
+            scale_empty) scale_output="All tests passed." ;;
+            perf_empty) perf_output="All tests passed." ;;
+        esac
+        rc=0
+        YUZU_MOCK_CT_RC="$ct_rc" YUZU_MOCK_CT_OUTPUT="$perf_output" \
+        YUZU_MOCK_SCALE_RC="$scale_rc" YUZU_MOCK_SCALE_OUTPUT="$scale_output" \
+            bash "$YUZU_ROOT/scripts/test/perf-gate.sh" --run-id "$run_id" \
+            --scale-agents 10 --allow-busy >"$CHAOS_ROOT/$run_id.log" 2>&1 || rc=$?
+        status=$(db_gate_status "$run_id" Perf)
+        notes=$(db_gate_notes "$run_id" Perf)
+        if [[ "$status" == "$expected" ]] && \
+           { [[ "$expected" == PASS && "$rc" == 0 ]] || [[ "$expected" == WARN && "$rc" == 2 ]]; }; then
+            ok "CH-25: $kind -> $status (exit $rc)"
+        else
+            bad "CH-25" "$kind: expected $expected, got $status (exit $rc): $notes"
+            tail -8 "$CHAOS_ROOT/$run_id.log"
+        fi
+    done
+
+    # Exercise persistence errors in the actual recorder, not just mocked exits.
+    for kind in metric gate; do
+        run_id="ch25-db-$kind"
+        start_run "$run_id"
+        python3 - "$YUZU_TEST_DB" "$run_id" "$kind" <<'PY'
+import sqlite3, sys
+table = {"metric": "test_metrics", "gate": "test_gates"}[sys.argv[3]]
+with sqlite3.connect(sys.argv[1]) as db:
+    # The identifiers and run IDs come only from this fixed test matrix.
+    db.execute(f"CREATE TRIGGER refuse_{sys.argv[3]} BEFORE INSERT ON {table} "
+               f"WHEN NEW.run_id='{sys.argv[2]}' BEGIN SELECT RAISE(ABORT, 'fixture failure'); END")
+PY
+        rc=0
+        YUZU_MOCK_CT_RC=0 YUZU_MOCK_CT_OUTPUT="$perf" \
+            bash "$YUZU_ROOT/scripts/test/perf-gate.sh" --run-id "$run_id" \
+            --allow-busy >"$CHAOS_ROOT/$run_id.log" 2>&1 || rc=$?
+        status=$(db_gate_status "$run_id" Perf)
+        if [[ "$rc" == 2 && "$status" != PASS ]] && \
+           grep -q "ERROR could not record" "$CHAOS_ROOT/$run_id.log"; then
+            ok "CH-25: failed $kind persistence -> exit 2, no PASS"
+        else
+            bad "CH-25" "failed $kind persistence: exit=$rc status=$status"
+        fi
+    done
+}
+
 # ── Scenario dispatch ───────────────────────────────────────────────────
-SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23 CH-24)
+SCENARIOS=(CH-2 CH-3 CH-4 CH-6 CH-8 CH-15 CH-16 CH-17 CH-18 CH-19 CH-20 CH-21 CH-22 CH-23 CH-24 CH-25)
 
 # CH-1 (clean-log + workflow-failure → FAIL) requires a live gh CLI mock
 # which is more involved — defer to a dedicated PR2.1 harness pass once
@@ -2233,6 +2317,7 @@ for s in "${SCENARIOS[@]}"; do
         CH-22) scenario_CH_22 ;;
         CH-23) scenario_CH_23 ;;
         CH-24) scenario_CH_24 ;;
+        CH-25) scenario_CH_25 ;;
         *)     echo "unknown scenario: $s" >&2; exit 2 ;;
     esac
 done

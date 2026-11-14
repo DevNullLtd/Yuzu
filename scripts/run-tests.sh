@@ -42,6 +42,9 @@ pass()   { PASS=$((PASS + 1)); echo "  ✓ $1"; }
 fail()   { FAIL=$((FAIL + 1)); echo "  ✗ $1"; }
 skip()   { SKIP=$((SKIP + 1)); echo "  ⊘ $1 (skipped)"; }
 
+# Native server targets are available only on Linux (ADR-0035).
+server_supported() { [[ "$(uname -s)" == "Linux" ]]; }
+
 # ── Tier 1: C++ Unit Tests ──────────────────────────────────────────
 run_checks() {
     banner "STATIC CHECKS"
@@ -63,24 +66,34 @@ run_cpp_unit() {
 
     # Compile tests
     echo "  Building test executables..."
-    if ! meson compile -C "$BUILDDIR" yuzu_agent_tests yuzu_server_tests 2>&1 | tail -5; then
+    local targets=(yuzu_agent_tests)
+    if server_supported; then
+        targets+=(yuzu_server_tests)
+    fi
+    if ! meson compile -C "$BUILDDIR" "${targets[@]}" 2>&1 | tail -5; then
         fail "C++ test compilation failed"
         return
     fi
 
+    # Bind fixture discovery to this build, including when the caller exports
+    # MESON_BUILD_ROOT for an unrelated checkout.
     # Run agent tests
     echo ""
     echo "  Running agent unit tests..."
-    if "$BUILDDIR/tests/yuzu_agent_tests" --reporter compact 2>&1; then
+    if MESON_BUILD_ROOT="$BUILDDIR" "$BUILDDIR/tests/yuzu_agent_tests" --reporter compact 2>&1; then
         pass "Agent unit tests"
     else
         fail "Agent unit tests"
     fi
 
     # Run server tests
+    if ! server_supported; then
+        skip "Server unit tests (native server is Linux-only, ADR-0035)"
+        return
+    fi
     echo ""
     echo "  Running server unit tests..."
-    if "$BUILDDIR/tests/yuzu_server_tests" --reporter compact 2>&1; then
+    if MESON_BUILD_ROOT="$BUILDDIR" "$BUILDDIR/tests/yuzu_server_tests" --reporter compact 2>&1; then
         pass "Server unit tests"
     else
         fail "Server unit tests"
@@ -135,12 +148,9 @@ run_erlang_unit() {
     fi
 
     echo "  Running EUnit tests..."
-    # eunit-gate.sh wraps rebar3 eunit so the script's exit code reflects
-    # the EUnit summary (Failed: N), not rebar3's process-exit-on-cancel
-    # behavior. Cancellations come from EUnit discovering non-test helper
-    # modules and from order-dependent registry_tests flakes — they're
-    # not regressions worth gating on. See scripts/test/eunit-gate.sh for
-    # the full rationale (#1005).
+    # eunit-gate.sh requires successful process exit and a nonempty passing
+    # summary. Cancellation means incomplete execution and fails this gate,
+    # even when all cases that actually ran passed.
     if bash "$PROJECT_ROOT/scripts/test/eunit-gate.sh" 2>&1 | tail -20; then
         pass "Erlang EUnit tests"
     else
@@ -226,6 +236,11 @@ run_erlang_perf() {
 # ── Tier 5: Full-Stack Integration Tests ────────────────────────────
 run_integration() {
     banner "FULL-STACK INTEGRATION TESTS"
+
+    if ! server_supported; then
+        skip "Full-stack integration test (native server is Linux-only, ADR-0035)"
+        return
+    fi
 
     if [[ ! -x "$SCRIPT_DIR/integration-test.sh" ]]; then
         fail "integration-test.sh not found"

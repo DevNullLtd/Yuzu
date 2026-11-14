@@ -5,6 +5,8 @@ Loaded by `quality-engineer` on any change under `tests/unit/`.
 The "Shell and source-text gates" section also covers `test()` registrations in `tests/meson.build`, the `tests/test_*.py` source-text gates and `tests/shell/`.
 
 Companion: `docs/testing/integration-tests.md` covers the shell/E2E stack-bring-up layer.
+The opt-in obligation registry and evidence capture are described in
+[`contract-evidence.md`](contract-evidence.md).
 The authoritative statement of each helper's contract is its own doc comment at the source;
 this doc is the index and carries the rules that live nowhere else.
 
@@ -27,14 +29,36 @@ For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use 
 ## Exception-safe test cleanup — `ScopeExit`
 
 `yuzu::test::ScopeExit` (`tests/unit/test_helpers.hpp`) is a generic RAII cleanup
-that runs on ANY scope exit, including exception unwind from a failing
-`REQUIRE`/`CHECK` — declare it after whatever it releases/reads so it destructs
+that runs on ANY scope exit, including a failing `REQUIRE` or an exception from
+tested code — declare it after whatever it releases/reads so it destructs
 FIRST (reverse declaration order); its callback must not throw, since it can run
 mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
-(releasing parked pool workers before `~ThreadPool` joins them) and
-`test_guardian_outbox_send_executor.cpp` (#4223 — releasing a detached worker
-parked on a test-owned gate pointer before the pointer's stack storage can be
-destroyed). Promoted from `test_thread_pool.cpp` once a second file needed it.
+(releasing parked pool workers before `~ThreadPool` joins them). Promoted from
+`test_thread_pool.cpp` once a second file needed it.
+
+A bounded drain is not a lifetime guarantee for a detached worker. In
+`test_guardian_outbox_send_executor.cpp`, each stalled callback owns its gate
+through `shared_ptr`; fixture destruction releases the gate even during assertion
+unwind, and the callback keeps it alive until the worker exits. The SSE saturation
+fixture similarly releases held streams and joins every client before destroying
+the server, including partial construction and exception paths.
+
+## Fixture observations must detect the wrong behavior
+
+A fixture needs an observable result from the code under test. For example,
+`test_rest_sessions.cpp` distinguishes a missing session from an authenticated
+session with an empty username so the defensive handler actually runs;
+`test_power_health_parsers.cpp` records the requested power-plan GUID and derives
+read-back state from that argument. A fixed successful read-back could hide a
+wrong command. `KvProbe` in `test_guardian_spark_reapply_skip_engine.cpp` requires
+`SQLITE_DONE` after reading all rows: a database error cannot mean "no writes".
+
+For an assertion repair, preserve a failing baseline or a deliberate faulty copy
+alongside the passing run when practical. Record the source revision and dirty
+patch, exact command and filter, toolchain, prerequisite state, exit status,
+case/assertion/skip counts, and raw native reports. Identify extracted harnesses
+separately from registered test runs. A passing helper probe does not establish
+ADR conformance for its consumers, and a skipped prerequisite is not a pass.
 
 ## Agent-side journal storage tests — `FakeJournalStore`
 

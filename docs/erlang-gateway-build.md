@@ -177,6 +177,25 @@ Erlang/OTP 28.4 or later 28.x is the only supported toolchain for the gateway te
 override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
 
+**Diagnosing a failed Meson gateway test.** The wrapper preserves rebar3's
+nonzero exit status; it does not map Erlang failures to 42. It also rejects
+cancellation, failed summaries and zero/missing execution even if the child
+exits zero. Meson's console error display shows only a tail of large output,
+so the wrapper appends a bounded native failure excerpt and the observed test
+summary to stderr. The excerpt helps locate the failure; it never decides
+the verdict. A cancelled generator can leave test bodies unexecuted even when
+EUnit reports zero failures or skips.
+
+Both EUnit and Common Test registrations set `YUZU_GATEWAY_TEST_LOG_DIR` to
+`<build dir>/meson-logs`. On failure the wrapper saves the complete captured
+output of the final rebar3 attempt in a unique `yuzu_test_gateway_*.log` there
+and prints its path. Existing CI failure artifacts include this directory.
+Direct wrapper invocations default to `<REBAR_BASE_DIR>/test-logs` (or
+`gateway/_build/test-logs`); the environment variable can select another
+directory. Files are never overwritten by later attempts. Earlier dependency
+fetch retries still appear in the full Meson stdout log. If saving a diagnostic
+fails, the wrapper reports that error and retains the original failure status.
+
 **Meson runs the EUnit suite as three shards: `gateway eunit shard A`, `B`
 and `C`.** Each is `scripts/test_gateway.py gateway eunit --shard K/3` with its
 own `REBAR_BASE_DIR` (`gateway/_build_eunit_1` to `_build_eunit_3`), a 540s
