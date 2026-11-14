@@ -587,8 +587,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // changes under a curated persistence/policy watch list (HKLM and each
         // profile hive, loaded or not). Roll-up tiers only, no raw capture table: a
         // bucket keys on hive, key_path, value_name and action and keeps change_count,
-        // last_data (the newest value, 512 bytes, UNMASKED and readable through
-        // echo.sql), last_data_type, last_actor_image and last_ts. The old value, the
+        // last_data (the newest value, 512 bytes, readable through echo.sql except under
+        // a sensitive value name -- DefaultPassword / AltDefaultPassword -- where it is
+        // the fixed placeholder; see echo_registry_parsers.hpp), last_data_type, last_actor_image and last_ts. The old value, the
         // writer's pid, `detail` and `source` are decided by the collector and not
         // stored.
         // Mechanism: a RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
@@ -950,13 +951,14 @@ bool is_queryable_table(std::string_view real_table_name) {
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
         // with two exceptions: the registry cursor row holds, for about one tick, the
-        // rendered new value of changes whose writer is not settled yet (and the old
+        // rendered new value of changes whose writer is not settled yet (the placeholder under a sensitive value name) (and the old
         // value only when the baseline came from an older build), and its
         // `offline` list holds [sid, ProfileImagePath] (the path names the user) for every
         // logged-off profile.
         // echo_state carries the registry baselines (`registry:<root>`: type, size and
-        // a hash per value; an older build also wrote a rendered prefix), readable here
-        // consistently with the registry tiers' own unmasked last_data;
+        // a hash per value, the type only under a sensitive value name; an older build
+        // also wrote a rendered prefix), readable here. The `process` baseline holds
+        // pid, ppid, name and user, never a command line;
         // purge_source("registry") erases the tiers, the cursor row and
         // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"echo_state", "echo_config", "echo_cursor"};

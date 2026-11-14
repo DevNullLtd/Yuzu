@@ -49,6 +49,7 @@
 /// #4027 ledger row for the recorded `exception:` reasoning. Revisit once Batch C
 /// lands a `/run` twin that mints pcmd/tcmd/hcmd (and a token) directly over the API.
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include "authz_gates.hpp"     // yuzu::server::authz::FleetReadGate (#4027 fix round — CDX-P1-01/K4)
@@ -197,6 +198,11 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// Counts the capture-sources push by outcome (`yuzu_echo_sources_push_total{result}`:
+    /// pushed / none_applied / audit_unavailable / permission_revoked). Post-registration
+    /// setter like set_fleet_read_fn; every use is guarded, so an unset registry counts nothing.
+    void set_metrics(yuzu::MetricsRegistry* m);
+
     /// External colleague review on PR #4143 (Doomgoose, BLOCKING, confirmed
     /// against ADR-0017 INV-4/INV-7 by direct source inspection): the two REST
     /// device-picker twins' PREVIOUS design intersected `fleet_read_fn_`'s
@@ -327,6 +333,7 @@ private:
     ResponsesFn responses_fn_;
     AuditFn audit_fn_;
     CallerFn caller_fn_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     std::mutex cache_mu_;
     std::unordered_map<std::string, ReconEntry> cache_;

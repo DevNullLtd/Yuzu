@@ -5547,3 +5547,79 @@ TEST_CASE("EchoDatabase: purge_source reports a dictionary sweep that did not fi
     CHECK(t.db.get_config("dict_gc_starved_total", "0") == "1");
     CHECK(first_cell(t.db, "SELECT COUNT(*) FROM echo_dict WHERE text = 'purged.exe'") == "0");
 }
+
+// =============================================================================
+// execute_user_query: statement deadline (#1161)
+// =============================================================================
+
+namespace {
+// ~200 config rows: a self cross join is 40k row pairs, far above the 1000-VM-step poll
+// interval, so a deadline that has already passed interrupts it deterministically.
+constexpr const char* kCrossJoinCount = "SELECT COUNT(*) FROM echo_config a, echo_config b";
+
+void seed_config_rows(EchoDatabase& db) {
+    for (int i = 0; i < 200; ++i)
+        REQUIRE(db.set_config("deadline_probe_" + std::to_string(i), "v"));
+}
+} // namespace
+
+TEST_CASE("execute_user_query: a statement past its deadline is an error, not a short result",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    // A zero deadline has already passed at the first poll: no clock dependence.
+    auto r = t.db.execute_user_query(kCrossJoinCount, 10000, std::chrono::milliseconds{0});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("statement deadline") != std::string::npos);
+    // The SQL text is never echoed back in the error.
+    CHECK(r.error().find("echo_config") == std::string::npos);
+}
+
+TEST_CASE("execute_user_query: the same statement succeeds under the default deadline",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    auto r = t.db.execute_user_query(kCrossJoinCount);
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(std::stoll(r->rows[0][0]) >= 40000);
+}
+
+TEST_CASE("execute_user_query: a deadline hit leaves the connection usable",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    REQUIRE_FALSE(
+        t.db.execute_user_query(kCrossJoinCount, 10000, std::chrono::milliseconds{0}).has_value());
+    // Handler cleared and query_mu_ released: an ordinary query on the same handle works.
+    auto next = t.db.execute_user_query("SELECT COUNT(*) FROM echo_config");
+    REQUIRE(next.has_value());
+    CHECK(std::stoll(next->rows[0][0]) >= 200);
+}
+
+TEST_CASE("execute_user_query: the row cap still truncates to a successful result",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    seed_config_rows(t.db);
+
+    auto r = t.db.execute_user_query("SELECT a.key FROM echo_config a, echo_config b", 5);
+    REQUIRE(r.has_value());
+    CHECK(r->rows.size() == 5);
+}
+
+TEST_CASE("execute_user_query: sandbox rejections keep their errors with a deadline in force",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    const std::chrono::milliseconds dl{5000};
+
+    auto denied = t.db.execute_user_query("INSERT INTO echo_config VALUES('k','v')", 10000, dl);
+    REQUIRE_FALSE(denied.has_value());
+    CHECK(denied.error().find("not permitted") != std::string::npos);
+
+    auto multi = t.db.execute_user_query("SELECT 1; SELECT 2", 10000, dl);
+    REQUIRE_FALSE(multi.has_value());
+    CHECK(multi.error().find("single-statement") != std::string::npos);
+}

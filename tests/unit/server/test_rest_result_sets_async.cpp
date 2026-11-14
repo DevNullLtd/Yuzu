@@ -5538,3 +5538,128 @@ TEST_CASE("POST /api/v1/result-sets: a NUL in the name, source_kind or parent_id
             CHECK(a.result != "denied");
     }
 }
+
+// ── (#1162) A refused echo SQL leaves a `result_set.create` / `denied` row ─────────────────────
+//
+// The three SQL refusals on from-echo-query and re-eval (missing, over the 100 KiB cap, over a raw
+// capture table) are audited with a fixed reason token and source_kind; the SQL text is never part
+// of the detail. A body that is not JSON still writes no row.
+
+namespace {
+
+// The `result_set.create` / `denied` rows an AsyncHarness has recorded.
+std::vector<AsyncHarness::AuditCall> denied_rows(const AsyncHarness& h) {
+    std::vector<AsyncHarness::AuditCall> out;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "denied")
+            out.push_back(a);
+    return out;
+}
+
+// A stored echo_query set whose payload is `payload` verbatim (a shape an earlier release could
+// have written, which the create-time checks would now refuse).
+std::string seed_echo_payload(AsyncHarness& h, const nlohmann::json& payload) {
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "stored";
+    cr.source_kind = std::string(source_kind::kEchoQuery);
+    cr.source_payload = payload.dump();
+    auto r = h.store->create_materialized(cr, {"dev-1"});
+    REQUIRE(r.has_value());
+    return r->id;
+}
+
+} // namespace
+
+TEST_CASE("from-echo-query: each SQL refusal writes one denied row with its reason and no SQL text",
+          "[pg][result_set][async][echo][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+
+    SECTION("sql missing") {
+        h.post("/api/v1/result-sets/from-echo-query", nlohmann::json::object().dump(), status);
+        CHECK(status == 400);
+        const auto rows = denied_rows(h);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "reason=sql_missing source_kind=echo_query");
+    }
+    SECTION("sql over 100 KiB") {
+        h.post("/api/v1/result-sets/from-echo-query",
+               nlohmann::json{{"sql", std::string(100001, 'x')}}.dump(), status);
+        CHECK(status == 400);
+        const auto rows = denied_rows(h);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "reason=sql_too_large source_kind=echo_query");
+        CHECK(rows[0].detail.find("xxxx") == std::string::npos);
+    }
+    SECTION("sql over a raw capture table") {
+        h.post("/api/v1/result-sets/from-echo-query",
+               nlohmann::json{{"sql", "SELECT pid FROM $Process_Live"}}.dump(), status);
+        CHECK(status == 400);
+        const auto rows = denied_rows(h);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].detail == "reason=stale_source source_kind=echo_query");
+        CHECK(rows[0].detail.find("Process_Live") == std::string::npos);
+    }
+    SECTION("a dropped row: the same 400, flagged Sec-Audit-Failed") {
+        h.audit_ok = false;
+        h.post("/api/v1/result-sets/from-echo-query", nlohmann::json::object().dump(), status);
+        CHECK(status == 400);
+        CHECK(h.last_sec_audit_failed == "true");
+        CHECK(denied_rows(h).size() == 1);
+    }
+    SECTION("a body that is not JSON still writes no row") {
+        h.post("/api/v1/result-sets/from-echo-query", "not json", status);
+        CHECK(status == 400);
+        CHECK(h.audits.empty());
+    }
+    CHECK(h.calls.empty()); // nothing is dispatched on any refusal
+}
+
+TEST_CASE("re-eval: each SQL refusal on a stored echo_query set writes one denied row",
+          "[pg][result_set][async][reeval][echo][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    std::string id;
+    std::string reason;
+
+    SECTION("no sql stored") {
+        id = seed_echo_payload(h, nlohmann::json::object());
+        reason = "sql_missing";
+    }
+    SECTION("sql over 100 KiB stored") {
+        id = seed_echo_payload(h, nlohmann::json{{"sql", std::string(100001, 'x')}});
+        reason = "sql_too_large";
+    }
+    SECTION("sql over a raw capture table stored") {
+        id = seed_echo_query(h, "SELECT pid FROM $Process_Live");
+        reason = "stale_source";
+    }
+    h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+    CHECK(status == 400);
+    const auto rows = denied_rows(h);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail == "reason=" + reason + " source_kind=echo_query");
+    CHECK(rows[0].detail.find("xxxx") == std::string::npos);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("re-eval: a dropped denied row keeps the 400 and flags Sec-Audit-Failed",
+          "[pg][result_set][async][reeval][echo][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const auto id = seed_echo_query(h, "SELECT pid FROM $Process_Live");
+    h.audit_ok = false;
+    int status = 0;
+    h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+    CHECK(status == 400);
+    CHECK(h.last_sec_audit_failed == "true");
+}
