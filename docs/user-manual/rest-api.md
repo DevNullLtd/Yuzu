@@ -8994,6 +8994,143 @@ Any other top-level key is a `400`. `version` is the SHA-256 of the stored docum
 
 **Stored copies.** Each save also adds a row to the store's own change history (the newest 200 rows per group, readable with SQL only). That history is a capped, secondary copy: the audit log is the record of who changed what and when. The document's `updated_by` and each history row carry the writer's user name; they are kept with the document, which no route deletes, including once its group is deleted.
 
+#### `GET /api/v1/inventory/software/hosts`
+
+Lists the devices that have reported installed software, with the state of each collector (facet) on each one: whether the last report was a full or delta section, timed out, hit a size limit, was switched off, or was never collected. Devices are ordered by `agent_id`.
+
+**Permission and scope:** `Inventory:Read` through `require_fleet_read` as the sole gate. Rows are confined to the caller's management groups and service tag on every page; a device outside the scope takes no part in the search or in any count. `devices_omitted` counts devices dropped by the scope post-filter. Every served page is audited as `inventory.software.hosts` (see [audit-log.md](audit-log.md)).
+
+**Query parameters:** `q` (case-insensitive literal substring over hostname and agent id, clamped to 128 bytes; applied to the caller's devices only), `last_synced_before` (a non-negative epoch: keeps devices whose last accepted report is older than that), `limit` (default 100, max 1000), `cursor`. Repeated parameters keep the first value.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "hosts": [
+      {"agent_id": "agent-001", "hostname": "build-01", "last_seen": 1767225600,
+       "facets": [
+         {"facet": "installed_apps.list_inventory", "status": "full", "row_status": "current",
+          "token": "", "enabled": true, "last_confirmed_at": 1767225600,
+          "duration_ms": 412, "bytes_read": 18304},
+         {"facet": "runtimes.list_inventory", "status": "timeout", "row_status": "unconfirmed",
+          "token": "busy", "enabled": true, "last_confirmed_at": null,
+          "duration_ms": 30000, "bytes_read": 0}
+       ]}
+    ],
+    "count": 1,
+    "next_cursor": null,
+    "devices_omitted": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- `last_seen` is the server's receipt time of the device's last accepted installed-software report (epoch seconds).
+- `hostname` is `null` when the device roster does not know the device.
+- Per facet: `status` is the last reported collection status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or `disabled`); `row_status` is the status the software list shows for rows of that facet (`current`, `unconfirmed` or `disabled`); `token` is the short reason code the collector reported (empty when none); `last_confirmed_at` is `null` until the facet has been confirmed; `duration_ms` and `bytes_read` are the last collection's cost.
+- A device with no facet state yet has `facets: []`.
+
+**Errors:** `400` for a malformed parameter, a refused cursor, or a `q` that matches more than 10,000 of the caller's devices (narrow it); `401`; `403`; `503` (store or device roster unavailable, or the read degraded) with `retry_after_ms`, **never an empty 200**: a search that cannot consult the roster is refused rather than answered empty.
+
+#### `GET /api/v1/inventory/software/hosts/{agent_id}`
+
+One device: its collector state and a page of its installed software.
+
+**Permission and scope:** as the hosts list. The `404` rule: an `agent_id` the caller's scope excludes, one that cannot be a stored agent id, and one that has never reported all answer the same `404` (`software host not found`) with the same body, so the status does not reveal whether a device outside the caller's scope exists. The out-of-scope case is audited as `denied`; a device that has not reported is audited as `success` with `found=false`. Audited as `inventory.software.host`.
+
+**Query parameters:** `limit` (default 100, max 1000) and `cursor`, which page the device's software. No other parameter is read.
+
+**Response (200):** `{"data": {"host": {...}, "software": [...], "count", "next_cursor"}}`. `host` has the shape of one entry of the hosts list. `software` rows have the shape of the rows of `GET /api/v1/inventory/software` for this one device; `count` and `next_cursor` describe that page.
+
+**Errors:** `400` (malformed `limit` or `cursor`), `401`, `403`, `404` as above, `503` with `retry_after_ms` (host, installs or last-poll read degraded), never an empty 200.
+
+#### `GET /api/v1/inventory/software/changes`
+
+The install-change feed: one row per install, removal or upgrade of a package that a device's report revealed, in the order the changes were recorded.
+
+**Permission and scope:** as the hosts list; rows are confined to the caller's scope on every page. Audited as `inventory.software.changes`, on every page, continuation pages tagged.
+
+**Query parameters:** `since` (a non-negative epoch: keeps changes stamped at or after it), `agent_id` (exact), `kind` (`install`, `remove` or `upgrade`; anything else is `400`), `limit` (default 100, max 1000), `cursor`. A cursor is bound to `since`, `agent_id` and `kind`; reuse with another set is refused.
+
+**Response (200):** `{"data": {"changes": [...], "count", "next_cursor", "devices_omitted", "stable_before"}}`. Each change carries `change_id`, `agent_id`, `hostname` (`null` if unknown), `facet`, `kind`, `name`, `publisher`, `from_version`, `to_version`, `instance_key` and `observed_at` (epoch seconds).
+
+**Settle window.** A change is published only once it is more than 60 seconds old: `stable_before` in the response is the horizon applied to that request (now minus 60 seconds), and every row on the page has `observed_at` below it. A change stamped in the last minute appears on a later request.
+
+**Order and paging.** Rows are ordered by `(observed_at, change_id)`, and the cursor is that pair taken from the last row of the page, so a page never skips or repeats a row that was visible when it was read. `observed_at` is the clock of the server that wrote the row and `change_id` is assigned at insert, so ordering by `change_id` alone could step over a lower id that becomes visible later. The cursor is not tied to `stable_before`: it stays valid on the next request.
+
+**Lateness contract.** The 60-second window is the contract and there is no watermark. A row that commits more than 60 seconds after its own `observed_at` (a slow writer, or a clock behind the others) can land behind a cursor that has already passed its position, and a consumer walking forward on that cursor will not see it. To recover, re-read from an earlier `since` and de-duplicate on `change_id`: `change_id` is unique, so a row seen twice is the same row. A consumer that must not miss a change re-reads a trailing overlap of at least the lateness it is willing to tolerate on every poll. Nothing counts late rows today; that is tracked by #7766.
+
+**Errors:** `400` (malformed `since`, `limit` or `cursor`, invalid `kind`), `401`, `403`, `503` with `retry_after_ms`, never an empty 200.
+
+#### `GET /api/v1/inventory/software/summary`
+
+The headline numbers for installed-software collection: devices reporting and stale, install, removal and upgrade counts over the last 24 hours and 7 days, and the size of the software catalogue. No parameters.
+
+**Permission and scope:** as the hosts list. How it is served depends on the caller's scope:
+
+- An unconfined caller reads the fleet snapshot, which the server recomputes about hourly (`as_of` is when it was computed). The catalogue block is the fleet catalogue's own figure and is given to unconfined callers only.
+- A caller confined to up to 10,000 devices gets the figures for those devices, computed on the request (`as_of` is the request time), with `catalogue` `null` and `omitted` `scope`.
+- A caller confined to more than 10,000 devices gets `devices`, `changes` and `catalogue` `null` and `omitted` `scope`.
+
+Audited as `inventory.software.summary`.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "devices": {"reporting": 1200, "stale": 14},
+    "changes": {"last_24h": {"install": 31, "remove": 9, "upgrade": 120},
+                "last_7d": {"install": 190, "remove": 66, "upgrade": 804}},
+    "catalogue": {"titles": 4180, "installs": 98211, "devices": 1190},
+    "as_of": 1767225600,
+    "omitted": null
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`devices_stale` counts reporting devices whose last report is more than 48 hours old; the 24-hour counts are part of the 7-day counts.
+
+**Null plus omitted.** A block that cannot be given is `null`, never a zero, and `omitted` says why: `scope` (the caller's scope does not allow it) or `building` (the figure has not been computed yet, for example just after a restart before the first snapshot or before the first catalogue refresh). `omitted` is `null` when every block is present. A client must read `null` as "not available", not as "none".
+
+**Errors:** `401`, `403`, `503` with `retry_after_ms` (a live read or the catalogue metadata read degraded), never an empty 200.
+
+#### `GET /api/v1/inventory/software/plugin-health`
+
+Collection health per facet across the fleet: how many devices are in each status, what share are timing out or failing, how long collection takes and how much it reads, and the ten slowest devices. This is the page behind the `YuzuSoftwareFacetTimeoutShareHigh` and `YuzuSoftwareFacetFailingShareHigh` alerts (see [Inventory](inventory.md#software-facet-timeout-share)). No parameters.
+
+**Permission and scope:** as the summary: an unconfined caller reads the fleet snapshot (hourly), a caller confined to up to 10,000 devices gets figures for those devices computed on the request, and a wider confinement gets `facets` `null` with `omitted` `scope`. Before the first snapshot exists `facets` is `null` with `omitted` `building`. Audited as `inventory.software.plugin_health`.
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "facets": [
+      {"facet": "runtimes.list_inventory", "plugin": "runtimes",
+       "devices": {"full": 900, "delta": 120, "constrained": 3, "timeout": 61, "oversize": 0,
+                   "not_collected": 40, "disabled": 5},
+       "collecting": 1084, "timeout_share": 0.0563, "failing_share": 0.059,
+       "disabled_share": 0.0043, "not_collected_share": 0.0343,
+       "duration_ms": {"p50": 380, "p95": 2900, "max": 30000},
+       "bytes_read": {"p50": 9100, "p95": 52000, "max": 410000},
+       "slowest": [{"agent_id": "agent-017", "hostname": "db-02", "duration_ms": 30000}]}
+    ],
+    "as_of": 1767225600,
+    "omitted": null
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+- `collecting` counts devices whose facet is `full`, `delta`, `constrained`, `timeout` or `oversize`; `timeout_share` is `timeout` over `collecting`, and `failing_share` is `constrained`, `timeout` and `oversize` over `collecting`. `disabled_share` and `not_collected_share` are over all devices reporting the facet. A share is `null` when its denominator is `0`.
+- `duration_ms` and `bytes_read` are percentiles over the devices that actually collected (a disabled or not-collected device contributes nothing, so its zeros do not pull them down). `slowest` lists up to ten of those devices by duration; `hostname` is `null` if unknown.
+- `plugin` is the part of the facet name before the first `.`.
+
+**Errors:** `401`, `403`, `503` with `retry_after_ms`, never an empty 200.
+
 #### `GET /api/v1/inventory/software/collection-settings`
 
 Every stored document and the built-in fleet default. The answer is `data.fleet_default` (24 hours, 01:00 to 05:00, machine-local zone, every collector on, `priority` 0, and a `version`) and `data.documents[]` (one object per stored document, in the shape the per-group `GET` returns). `fleet_default.version` is an effective-settings version (the hash a device's effective settings carry, below), not a document version. Gated by `ManagementGroup:Read` (see Authority above). A document whose group has been deleted is neither listed nor used by the resolver; it counts toward the cap below. More than 20,000 documents, or a stored row that fails the read rule (a `version` that is not 64 lowercase hex included), is a `503` with no `retry_after_ms` and a remediation saying operator action is required, never a truncated list. The read fails closed on purpose: documents are written only through the validating `PUT`, so a row that fails the read rule means the table has been damaged out of band, and one such row makes this list and every device's effective-settings read answer `503` until the row is repaired or removed. The server log names the group (`found a corrupt row for group <id>`).
