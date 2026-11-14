@@ -8116,3 +8116,79 @@ groups:
             evidence. Look for
             the gate warning in the server log; a persistent error means
             cookie-session requests are failing for every operator.
+
+  - name: yuzu-delivery
+    # Webhook and offload-target delivery backlog. Each store hands deliveries to its own
+    # bounded worker pool; a delivery that arrives when the pool's queue is full is dropped and
+    # counted (yuzu_server_webhook_delivery_dropped_total / yuzu_server_offload_delivery_dropped_total,
+    # reason = queue_full | quiescing, both members zero-seeded at boot).
+    #
+    # Only reason="queue_full" is alerted: a "quiescing" drop is a delivery refused while the
+    # server is shutting down, which is not an incident. The firing rules use a rate over 5m held
+    # for 10m, so a single dropped delivery never pages; a backlog that keeps refusing does.
+    # YuzuDeliveryPoolBacklogHigh is the early signal (pending against capacity, both published
+    # on the server's 15 s maintenance tick). 80% of capacity leaves 52 deliveries of headroom, so a
+    # fast backlog can reach the first drop before its 5 minutes have passed.
+    #
+    # Known blind spot: a short burst of drops that ends within the 5 minute rate window never
+    # satisfies the 10 minute hold, and a pool that drains within 5 minutes never satisfies the
+    # ratio rule. The counter and one server log warning per drop are the record of such a burst.
+    #
+    # These rules read counters and gauges only. They say that deliveries are backing up on this
+    # server, not why; the description names where to look.
+    rules:
+      - alert: YuzuWebhookDeliveriesDropped
+        expr: |
+          sum by (instance) (
+            rate(yuzu_server_webhook_delivery_dropped_total{reason="queue_full"}[5m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook deliveries are being dropped because the delivery queue is full"
+          description: >-
+            yuzu_server_webhook_delivery_dropped_total{reason="queue_full"} has been
+            increasing on {{ $labels.instance }} for 10 minutes: the webhook delivery
+            queue is full and new deliveries are refused (the event is not retried).
+            Check yuzu_server_delivery_pool_pending{store="webhook"} against
+            yuzu_server_delivery_pool_capacity{store="webhook"}, then the failing or slow
+            targets with GET /api/webhooks/{id}/deliveries. Drops with
+            reason="quiescing" are a shutdown and are not counted here.
+
+      - alert: YuzuOffloadDeliveriesDropped
+        expr: |
+          sum by (instance) (
+            rate(yuzu_server_offload_delivery_dropped_total{reason="queue_full"}[5m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Offload-target deliveries are being dropped because the delivery queue is full"
+          description: >-
+            yuzu_server_offload_delivery_dropped_total{reason="queue_full"} has been
+            increasing on {{ $labels.instance }} for 10 minutes: the offload-target
+            delivery queue is full and new deliveries are refused (the event is not
+            retried). Check yuzu_server_delivery_pool_pending{store="offload"} against
+            yuzu_server_delivery_pool_capacity{store="offload"}, then the failing or slow
+            targets with GET /api/v1/offload-targets/{id}/deliveries. Drops with reason="quiescing" are
+            a shutdown and are not counted here.
+
+      - alert: YuzuDeliveryPoolBacklogHigh
+        expr: |
+          yuzu_server_delivery_pool_pending / yuzu_server_delivery_pool_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A webhook or offload delivery pool is above 80% of its capacity"
+          description: >-
+            yuzu_server_delivery_pool_pending is above 80% of
+            yuzu_server_delivery_pool_capacity for the {{ $labels.store }} store on
+            {{ $labels.instance }} for 5 minutes. Pending counts queued plus running
+            deliveries; at 100% the next delivery is dropped (see
+            YuzuWebhookDeliveriesDropped and YuzuOffloadDeliveriesDropped). Check the
+            store's failing or slow targets first. Both gauges are sampled on the server's
+            maintenance tick (about every 15 seconds), so a burst shorter than that can be
+            missed; the 5 minute window is deliberate.
