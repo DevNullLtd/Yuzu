@@ -29,7 +29,8 @@ counted, so none of them can move the base later. A pull this script does not re
 (one stopped by a conflict and finished by hand, say) only makes the range start earlier.
 The reflog is local and expires: a fresh clone has none, so pass --since.
 
-Read-only: it runs `git` queries and writes nothing. All repository-sourced text
+Read-only: it runs `git` queries and changes no ref, index or file (in a partial clone, git itself may
+fetch objects the range needs). All repository-sourced text
 is printed with control characters replaced. Stdlib only.
 """
 
@@ -73,9 +74,13 @@ REBASE_STEP_RE = re.compile(r"^(pull|rebase)\b[^:]*\((start|pick|finish|continue
 # hyphen, word joiner, tag characters, BOM), surrogate, line and paragraph separator, plus a few
 # invisible code points Unicode files elsewhere (variation selectors, fillers, combining grapheme
 # joiner, object replacement).
+# Variables that point git at some other repository (a hook exports them); the --repo directory
+# decides which repository is read.
+REPO_LOCATING_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX"}
 HIDDEN_CATEGORIES = {"Cc", "Cf", "Cs", "Zl", "Zp"}
 HIDDEN_EXTRA_RE = re.compile(
-    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180d\u2800\u3164\ufe00-\ufe0f\uffa0\ufffc"
+    "[\u034f\u115f\u1160\u17b4\u17b5\u180b-\u180f\u2800\u3164\ufe00-\ufe0f\uffa0\ufffc"
     "\U000e0000-\U000e007f\U000e0100-\U000e01ef]"
 )
 
@@ -111,7 +116,8 @@ class Repo:
             proc = subprocess.run(["git", "-c", "core.quotepath=off", "-c", "color.ui=false",
                                    "-c", "log.showSignature=false", "-c", "i18n.logOutputEncoding=UTF-8", *args],
                                   cwd=self.root, capture_output=True, input=stdin.encode() if stdin is not None else None,
-                                  env={**os.environ, "LC_ALL": "C", "LANGUAGE": "C"})
+                                  env={**{k: v for k, v in os.environ.items() if k not in REPO_LOCATING_ENV},
+                                       "LC_ALL": "C", "LANGUAGE": "C"})
         except FileNotFoundError as exc:
             if not self.root.is_dir():
                 raise GitError(f"{self.root} is not a directory") from exc
@@ -211,9 +217,10 @@ def last_pull_base(repo: Repo) -> tuple[str, str]:
 
     def is_pull(subject: str) -> bool:
         head, _, message = subject.partition(": ")  # git writes "<action and arguments>: <message>"
+        if "'ours' strategy" in message:
+            return False  # `-s ours` records the merge but takes none of the upstream's content
         if head.startswith("merge "):
-            # A merge of exactly the upstream, and one that took its content (`-s ours` does not).
-            return bool(upstream) and head[len("merge "):] == upstream and "'ours' strategy" not in message
+            return bool(upstream) and head[len("merge "):] == upstream  # a merge of exactly the upstream
         if not (head == "pull" or head.startswith("pull ")):
             return False
         head = STEP_MARK_RE.sub("", head)
@@ -272,7 +279,10 @@ def _minus_months(moment: datetime, months: int) -> datetime:
 def _back(now: datetime, delta: timedelta) -> datetime:
     """`now` minus an elapsed duration: absolute time, so a daylight-saving change inside the span
     counts as the hour it is (naive wall-clock subtraction would be an hour out)."""
-    return (now.astimezone() - delta).astimezone().replace(tzinfo=None)
+    try:
+        return (now.astimezone() - delta).astimezone().replace(tzinfo=None)
+    except (OSError, OverflowError, ValueError) as exc:  # before the epoch (Windows), or out of range
+        raise GitError("that date is before 1970, earlier than any commit") from exc
 
 
 def date_cutoff(since: str, now: datetime | None = None) -> str:
@@ -294,12 +304,15 @@ def date_cutoff(since: str, now: datetime | None = None) -> str:
         text = since.replace("T", " ")
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
             try:
-                datetime.strptime(text, fmt)
+                parsed = datetime.strptime(text, fmt)
                 break
             except ValueError:
                 continue
         else:
             raise GitError(f"--since {since!r} is not a real calendar date or time")
+        if parsed < datetime(1970, 1, 3):
+            # East of UTC the first days of 1970 are a negative timestamp, which git reads as "now".
+            raise GitError(f"--since {since!r} is earlier than any commit")
         # git fills a missing time of day with the current clock time; a bare date means its start.
         return since if m.group("time") else since + " 00:00:00"
     now = now or datetime.now()
@@ -348,7 +361,7 @@ def resolve_base(repo: Repo, since: str | None, head: str) -> tuple[str, str, st
 
 def meson_version(repo: Repo, ref: str) -> dict[str, str]:
     text = repo.show(ref, "meson.build") or ""
-    m = re.search(r"\bversion:\s*'([^']+)'", text)
+    m = re.search(r"\bversion:\s*'([^'\n]+)'", text)
     return {"project version (meson.build)": m.group(1)} if m else {}
 
 
@@ -521,40 +534,81 @@ def bullets(body: str) -> list[str]:
     return ["\n".join(b).rstrip() for b in items]
 
 
+def _rename_pairs(repo: Repo, old: str, new: str) -> dict[str, tuple[str, int]]:
+    """{destination: (source, similarity)} for every fragment rename a commit in old..new made.
+
+    Read from the history, not the net diff: a net diff pairs a deletion in one commit with an
+    unrelated addition in another when their bytes match, and then a genuinely new fragment would
+    read as a rename of the deleted one.
+    """
+    out = repo.git("log", "-m", "-z", "-M", "--diff-filter=R", "--name-status", "--format=",
+                   f"{old}..{new}", "--", FRAGMENT_DIR + "/")
+    toks = [t.lstrip("\n") for t in out.split("\x00")]
+    pairs: dict[str, tuple[str, int]] = {}
+    i = 0
+    while i + 2 < len(toks) and toks[i][:1] == "R":
+        score = int(toks[i][1:] or 0) if toks[i][1:].isdigit() else 0
+        src, dst = toks[i + 1], toks[i + 2]
+        if dst not in pairs or score > pairs[dst][1]:
+            pairs[dst] = (src, score)
+        i += 3
+    return pairs
+
+
 def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
     """{path: body} for the fragments this range adds.
 
-    A fragment counts when it exists at `new` and did not at `old` (the net diff, so a rename,
-    rewording or revert inside the range cannot list one change twice or list a withdrawn one; a
-    fragment renamed UNCHANGED from a path that existed at `old` is not an add: `-M100%`, because a
-    lower similarity threshold would also hide a new fragment that resembles a deleted one), or when a release
-    promoted it inside the range: it was added after `old`, is gone at `new`, and its last body's
-    first line is a line this range added to CHANGELOG.md.
+    A fragment counts when it exists at `new` and did not at `old` (the net diff, so a rewording
+    or revert inside the range cannot list one change twice or list a withdrawn one). A fragment
+    that only reached `new` through commits that each renamed it UNCHANGED (git's 100% similarity)
+    from a path that existed at `old` is not an add: the reader already has that entry. A deletion
+    in one commit and a byte-identical addition in another is not a rename, so that addition counts.
+
+    A fragment a release promoted inside the range counts too: it was added after `old`, is gone
+    at `new`, and its last body's first line is a line this range added to CHANGELOG.md. A path
+    that existed at `old`, was deleted and added back with different text counts as added.
     """
     pathspec = FRAGMENT_DIR + "/"
-    net = [p for p in repo.names("diff", "-z", "-M100%", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
+    net = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
            if _fragment_path_ok(p)]
-    found: dict[str, str] = {}
-    for spec, body in repo.blobs([f"{new}:{p}" for p in net]).items():
-        if body is not None:
-            found[spec.split(":", 1)[1]] = body
-
     # -m so adds made inside merge commits are seen too. A fragment that already existed at `old`
     # can show up here (a merge diffs against its side parent), so each is checked against both ends.
-    ever = [p for p in dict.fromkeys(repo.names("log", "-m", "-z", "-M100%", "--diff-filter=A", "--name-only",
+    ever = [p for p in dict.fromkeys(repo.names("log", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only",
                                                 "--format=", f"{old}..{new}", "--", pathspec))
-            if _fragment_path_ok(p) and p not in found]
-    if not ever:
-        return found
+            if _fragment_path_ok(p)]
+    changed = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=M", "--name-only", old, new, "--", pathspec)
+               if _fragment_path_ok(p) and p in ever]
+    if not (net or ever or changed):
+        return {}
     tree_old = set(lines_of(repo.git("ls-tree", "-r", "--name-only", old, "--", pathspec)))
     tree_new = set(lines_of(repo.git("ls-tree", "-r", "--name-only", new, "--", pathspec)))
+    renames = _rename_pairs(repo, old, new) if (net or ever) else {}
+
+    def old_root(path: str) -> str | None:
+        """The path at `old` that `path` reached by renames git saw as 100% identical, if any."""
+        seen = {path}
+        while True:
+            pair = renames.get(path)
+            if pair is None or pair[1] != 100 or pair[0] in seen:
+                return None
+            path = pair[0]
+            if path in tree_old:
+                return path
+            seen.add(path)
+
+    # A fragment that is byte-for-byte what a renamed-from path held at `old` is the entry the reader
+    # already has; one reworded after the rename is not.
+    roots = {p: r for p in net if (r := old_root(p)) is not None}
+    old_bodies = repo.blobs([f"{old}:{r}" for r in set(roots.values())])
+    found: dict[str, str] = {}
+    for spec, body in repo.blobs([f"{new}:{p}" for p in net]).items():
+        path = spec.split(":", 1)[1]
+        if body is not None and not (path in roots and old_bodies.get(f"{old}:{roots[path]}") == body):
+            found[path] = body
+
     gone = [p for p in ever if p not in tree_old and p not in tree_new]
-    if not gone:
+    if not (gone or changed):
         return found
-    changelog_added = {
-        line[1:].rstrip() for line in lines_of(repo.git("diff", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", old, new, "--", "CHANGELOG.md"))
-        if line.startswith("+") and not line.startswith("+++")
-    }
     # The newest deleting commit of each path, in one pass.
     deleter: dict[str, str] = {}
     for block in repo.git("log", "--no-renames", "--diff-filter=D", "--name-only", "--format=%x00%H",
@@ -563,10 +617,30 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
         for p in paths:
             if p:
                 deleter.setdefault(p, sha)
+    # A path that existed at `old`, was deleted in the range and is back with different text.
+    readded = [p for p in changed if p in deleter and p not in found]
+    for spec, body in repo.blobs([f"{new}:{p}" for p in readded]).items():
+        if body is not None:
+            found[spec.split(":", 1)[1]] = body
+
+    # A renamed fragment is represented by the path it ended at, so one that was renamed on is
+    # never a candidate itself (else a rename plus an edit lists it twice, or under two sections).
+    renamed_on = {src for src, _ in renames.values()}
+    gone = [p for p in gone if p not in renamed_on]
+    if not gone:
+        return found
+    changelog_added = {
+        line[1:].rstrip() for line in lines_of(repo.git("diff", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", old, new, "--", "CHANGELOG.md"))
+        if line.startswith("+") and not line.startswith("+++")
+    }
     specs = {p: f"{deleter[p]}^:{p}" for p in gone if p in deleter}
     bodies = repo.blobs(list(specs.values()))
+    gone_roots = {p: r for p in specs if (r := old_root(p)) is not None}
+    gone_old = repo.blobs([f"{old}:{r}" for r in set(gone_roots.values())])
     for path, spec in specs.items():
         body = bodies.get(spec)
+        if path in gone_roots and gone_old.get(f"{old}:{gone_roots[path]}") == body:
+            continue  # promoted unchanged since the rename: the reader had it at `old`
         first = bullets(body)[:1] if body else []
         line = first[0].split("\n")[0].rstrip() if first else ""
         if line and line in changelog_added:

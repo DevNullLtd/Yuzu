@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -53,7 +54,8 @@ class GitCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_whatsnew_")
         self.dir = Path(self.tmp.name)
         self.env = {
-            **os.environ,
+            # No inherited GIT_* variable (a hook exports GIT_DIR and GIT_INDEX_FILE) may point git elsewhere.
+            **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
             "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
             "TZ": "UTC",
             # Never discover a repository above the temp directory (TMPDIR may sit inside one).
@@ -944,16 +946,16 @@ def promote(repo, version="1.3.0"):
         check=True, capture_output=True, text=True)
 
 
-class PullArguments(GitCase):
-    def reflog_repo(self, *lines, remote="origin", merge="refs/heads/dev", upstream="origin/dev"):
+class PullHelpers(GitCase):
+    def reflog_repo(self, *lines, remote="origin", merge="refs/heads/dev", upstream="origin/dev", branch="dev"):
         shas = ["%040x" % (i + 1) for i in range(len(lines))]
         reflog = "".join(f"{sha}\t{subject}\n" for sha, subject in zip(shas, lines))
 
         class R(FakeRepo):
             def _run(self, *args, **kw):
-                out = {"symbolic-ref": "refs/heads/dev\n", "rev-parse": upstream + "\n", "reflog": reflog}.get(args[0], "")
+                out = {"symbolic-ref": f"refs/heads/{branch}\n", "rev-parse": upstream + "\n", "reflog": reflog}.get(args[0], "")
                 if args[0] == "config":
-                    out = {"branch.dev.remote": remote, "branch.dev.merge": merge}.get(args[1], "") + "\n"
+                    out = {f"branch.{branch}.remote": remote, f"branch.{branch}.merge": merge}.get(args[1], "") + "\n"
                 return subprocess.CompletedProcess(args, 0, out, "")
         return R(), shas
 
@@ -964,6 +966,8 @@ class PullArguments(GitCase):
         except WN.GitError:
             return None
 
+
+class PullArguments(PullHelpers):
     def test_which_pull_subjects_count(self):
         counts = ["pull: Fast-forward", "pull -q: Fast-forward", "pull --rebase (finish): returning to refs/heads/dev",
                   "pull -q origin dev: Fast-forward", "pull origin dev: Merge made", "pull --ff-only origin: Fast-forward",
@@ -1143,8 +1147,11 @@ class Robustness(GitCase):
             R().blobs(["abc:x"])
 
     def test_show_reports_a_real_read_failure(self):
-        with self.assertRaises(WN.GitError):  # not a repository: git fails for a reason other than an absent path
-            WN.Repo(self.dir).show("HEAD", "meson.build")
+        # Not a repository: git fails for a reason other than an absent path. The ceiling keeps git
+        # from finding a repository above the temp directory (this runs in-process, not through self.env).
+        with mock.patch.dict(os.environ, {"GIT_CEILING_DIRECTORIES": str(self.dir.parent)}):
+            with self.assertRaises(WN.GitError):
+                WN.Repo(self.dir).show("HEAD", "meson.build")
 
     def test_sha_grammar(self):
         for good in ("a" * 40, "0" * 64):
@@ -1184,10 +1191,10 @@ class Robustness(GitCase):
 
     def test_clean_every_boundary(self):
         inside = [0x00, 0x08, 0x0b, 0x0c, 0x0e, 0x1f, 0x7f, 0x80, 0x9f, 0xad, 0x34f, 0x61c, 0x115f, 0x1160, 0x17b4,
-                  0x17b5, 0x180b, 0x180d, 0x180e, 0x200b, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064,
+                  0x17b5, 0x180b, 0x180d, 0x180e, 0x180f, 0x200b, 0x200f, 0x2028, 0x2029, 0x202a, 0x202e, 0x2060, 0x2064,
                   0x2066, 0x2069, 0x206a, 0x2800, 0x3164, 0xd800, 0xfe00, 0xfe0f, 0xfeff, 0xffa0,
                   0xfff9, 0xfffb, 0xfffc, 0xe0000, 0xe0001, 0xe007f, 0xe0100, 0xe01ef]
-        outside = [0x09, 0x0a, 0x20, 0x7e, 0xa0, 0xa1, 0x34e, 0x350, 0x61b, 0x61d, 0x180f, 0x200a, 0x2010, 0x2027,
+        outside = [0x09, 0x0a, 0x20, 0x7e, 0xa0, 0xa1, 0x34e, 0x350, 0x61b, 0x61d, 0x1810, 0x200a, 0x2010, 0x2027,
                    0x202f, 0x205f, 0x2065, 0x27ff, 0x2801, 0x3163, 0x3165, 0xfdff, 0xfe10, 0xfefe, 0xff00, 0xff9f,
                    0xfff8, 0xfffd, 0xdffff, 0xe0080, 0xe00ff, 0xe01f0, 0x41, 0xe9, 0x4e2d]
         for cp in inside:
@@ -1226,7 +1233,7 @@ class RelativeDatesEndToEnd(GitCase):
         self.assertNotIn("Long ago", out)
 
 
-class RoundFourPulls(PullArguments):
+class RoundFourPulls(PullHelpers):
     def test_pull_subjects_that_must_not_count_and_must(self):
         refuses = ["pull origin :zz: Fast-forward", "pull origin 'fix(finish)': x", "pull origin fix(start): x",
                    "merge origin/dev: Merge made by the 'ours' strategy.", "merge dev: x", "merge origin: x",
@@ -1240,6 +1247,21 @@ class RoundFourPulls(PullArguments):
             self.assertTrue(self.base_for(subject), subject)
         for subject in refuses:
             self.assertIsNone(self.base_for(subject), subject)
+
+    def test_every_option_that_takes_a_value_has_its_value_skipped(self):
+        for opt in sorted(WN.PULL_VALUE_OPTIONS):
+            self.assertTrue(self.base_for(f"pull {opt} v origin dev: x"), opt)  # `v` is not a repository
+            self.assertIsNone(self.base_for(f"pull {opt} v origin fix/foo: x"), opt)
+
+    def test_a_pull_that_kept_none_of_the_upstream_is_not_a_pull(self):
+        self.assertIsNone(self.base_for("pull -s ours origin dev: Merge made by the 'ours' strategy."))
+        self.assertTrue(self.base_for("pull -s ours origin dev: Fast-forward"))
+
+    def test_a_step_marker_needs_whitespace_before_it(self):
+        # A branch that is literally named `dev(finish)` is not a step marker on `dev`.
+        kw = dict(branch="dev(finish)", merge="refs/heads/dev(finish)", upstream="origin/dev(finish)")
+        self.assertTrue(self.base_for("pull origin dev(finish): Fast-forward", **kw))
+        self.assertTrue(self.base_for("pull origin dev(finish) (finish): x", **kw))
 
     def test_a_local_branch_with_a_different_name_than_its_upstream(self):
         upstream, local = self.make_clone()
@@ -1309,6 +1331,9 @@ class RoundFourFragments(GitCase):
         self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/2-moved.added.md")
         self.commit(repo, "move unchanged")
         self.assertNotIn("Already there", self.ok(repo, "--since", old))
+        self.put(repo, "changelog.d/2-moved.added.md", "- **Already there, reworded.**\n")
+        self.commit(repo, "then reword it")
+        self.assertIn("Already there, reworded", self.ok(repo, "--since", old))
 
     def test_a_nul_in_a_promoted_fragment_does_not_hide_it(self):
         repo = self.init()
@@ -1340,14 +1365,16 @@ class RoundFourFragments(GitCase):
     def test_a_non_utf8_commit_subject_is_replaced_not_a_traceback(self):
         repo = self.init()
         old = self.seed(repo)
+        self.git(repo, "config", "i18n.commitEncoding", "ISO-8859-1")  # the repo stores latin-1 subjects
         self.put(repo, "x.txt", "x\n")
         self.git(repo, "add", "-A")
-        subprocess.run(["git", "-c", "commit.gpgsign=false", "-c", "i18n.commitEncoding=ISO-8859-1", "commit", "-q",
-                        "-F", "-"], cwd=repo, env=self.env, input="build(deps): bump caf\xe9\n".encode("latin-1"),
-                       check=True, capture_output=True)
+        subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-F", "-"], cwd=repo, env=self.env,
+                       input="build(deps): bump caf\xe9\n".encode("latin-1"), check=True, capture_output=True)
         res = self.run_script(repo, "--since", old)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertNotIn("Traceback", res.stderr)
+        # Without the pinned i18n.logOutputEncoding git would hand back the stored latin-1 bytes.
+        self.assertIn("bump caf\u00e9", res.stdout)
 
     def test_a_broken_pipe_is_quiet(self):
         repo = self.init()
@@ -1372,6 +1399,137 @@ class RoundFourFragments(GitCase):
             R().blobs(["abc:x"])
 
 
+class RoundFiveFragments(GitCase):
+    """Fragment lifecycles a net diff cannot tell apart: rename vs delete-and-add, rename then edit."""
+
+    def delete(self, repo, rel):
+        (repo / rel).unlink()
+
+    def test_a_new_fragment_identical_to_one_a_release_promoted_is_listed(self):
+        repo = self.init()
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Bump flaky timeout.**\n")
+        old = self.seed(repo)
+        promote(repo)
+        self.commit(repo, "release")
+        self.put(repo, "changelog.d/9-b.fixed.md", "- **Bump flaky timeout.**\n")
+        self.commit(repo, "the same words, a new change")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (1)", out)
+        self.assertIn("Bump flaky timeout", out)
+
+    def test_a_deletion_and_an_identical_addition_in_separate_commits_is_not_a_rename(self):
+        repo = self.init()
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Same text.**\n")
+        old = self.seed(repo)
+        self.delete(repo, "changelog.d/2-a.fixed.md")
+        self.commit(repo, "withdraw")
+        self.put(repo, "changelog.d/3-b.fixed.md", "- **Same text.**\n")
+        self.commit(repo, "re-land under another name")
+        self.assertIn("Same text", self.ok(repo, "--since", old))
+
+    def test_a_path_promoted_and_added_back_with_new_text_is_listed(self):
+        repo = self.init()
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **First text.**\n")
+        old = self.seed(repo)
+        promote(repo)
+        self.commit(repo, "release")
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Second text.**\n")
+        self.commit(repo, "same name, new change")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Second text", out)
+        self.assertNotIn("First text", out)
+
+    def test_added_renamed_edited_then_promoted_is_listed_once(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Early title.** details\n")
+        self.commit(repo, "add")
+        self.git(repo, "mv", "changelog.d/2-a.added.md", "changelog.d/7-b.added.md")
+        self.commit(repo, "rename to the PR number")
+        self.put(repo, "changelog.d/7-b.added.md", "- **Final title.** details\n")
+        self.commit(repo, "reword")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Final title", out)
+        self.assertNotIn("Early title", out)
+        self.assertIn("Changelog entries added (1)", out)
+
+    def test_a_rename_that_changes_the_section_then_promoted_shows_the_final_section(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-y.added.md", "- **Moved section.**\n")
+        self.commit(repo, "add")
+        self.git(repo, "mv", "changelog.d/2-y.added.md", "changelog.d/2-y.fixed.md")
+        self.commit(repo, "it was a fix")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Fixed (1)", out)
+        self.assertNotIn("Added (", out)
+        self.assertEqual(out.count("Moved section"), 1)
+
+    def test_an_old_fragment_renamed_twice_unchanged_is_not_new_even_when_promoted(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.git(repo, "mv", "changelog.d/1-old.added.md", "changelog.d/5-mid.added.md")
+        self.commit(repo, "first rename")
+        self.git(repo, "mv", "changelog.d/5-mid.added.md", "changelog.d/8-last.added.md")
+        self.commit(repo, "second rename")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+        promote(repo)
+        self.commit(repo, "release")
+        self.assertNotIn("Already there", self.ok(repo, "--since", old))
+
+    def test_a_rename_chain_cycle_does_not_hang(self):
+        class R(FakeRepo):
+            def git(self, *args):
+                return "changelog.d/1-a.added.md\n" if args[0] == "ls-tree" else ""
+
+            def names(self, *args):
+                return ["changelog.d/2-b.added.md"] if args[0] == "diff" else []
+
+            def blobs(self, specs):
+                return {s: "- **x.**\n" for s in specs}
+
+        saved = WN._rename_pairs
+        WN._rename_pairs = lambda *a: {"changelog.d/2-b.added.md": ("changelog.d/3-c.added.md", 100),
+                                       "changelog.d/3-c.added.md": ("changelog.d/2-b.added.md", 100)}
+        try:
+            self.assertEqual(list(WN.added_fragments(R(), "o", "n")), ["changelog.d/2-b.added.md"])
+        finally:
+            WN._rename_pairs = saved
+
+    def test_an_inherited_git_dir_does_not_redirect_the_script(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Right repo.**\n")
+        self.commit(repo, "add")
+        other = self.init("other")
+        self.seed(other)
+        env = {**self.env, "GIT_DIR": str(other / ".git")}
+        res = self.run_script(repo, "--since", old, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Right repo", res.stdout)
+
+    def test_the_suite_environment_carries_no_git_variable_but_its_own(self):
+        own = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM", "GIT_CEILING_DIRECTORIES",
+               "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+        with mock.patch.dict(os.environ, {"GIT_DIR": "/nonexistent"}):
+            case = GitCase("setUp")
+            case.setUp()
+            try:
+                self.assertEqual({k for k in case.env if k.startswith("GIT_")}, own)
+            finally:
+                case.tearDown()
+
+    def test_a_meson_version_cannot_span_lines(self):
+        repo = self.init()
+        self.put(repo, "meson.build", "project('yuzu', version: '1.0\nINJECTED')\n")
+        self.commit(repo, "odd")
+        self.assertEqual(WN.meson_version(WN.Repo(repo), "HEAD"), {})
+
+
 class RoundFourDates(UtcClock, GitCase):
     def test_month_end_leap_and_boundary_arithmetic(self):
         self.assertEqual(WN.date_cutoff("1 month ago", datetime(2026, 5, 31, 9, 0, 0)), "2026-04-30 09:00:00")
@@ -1394,7 +1552,18 @@ class RoundFourDates(UtcClock, GitCase):
             with self.assertRaises(WN.GitError, msg=bad):
                 WN.date_cutoff(bad)
         self.assertEqual(WN.date_cutoff("2099-12-31"), "2099-12-31 00:00:00")
-        self.assertEqual(WN.date_cutoff("1970-01-01"), "1970-01-01 00:00:00")
+        self.assertEqual(WN.date_cutoff("1970-01-03"), "1970-01-03 00:00:00")
+        # East of UTC git reads the first two days of 1970 (a negative timestamp) as "now".
+        for early in ("1970-01-01", "1970-01-02 23:59", "1970-01-01T00:00:00"):
+            with self.assertRaises(WN.GitError, msg=early):
+                WN.date_cutoff(early)
+
+    def test_a_relative_date_before_the_epoch_is_a_clean_error_even_if_the_os_cannot_convert_it(self):
+        class Boom(datetime):
+            def astimezone(self, *a):
+                raise OSError("Invalid argument")  # what Windows raises for a pre-1970 local time
+        with self.assertRaises(WN.GitError):
+            WN.date_cutoff("3000 weeks ago", Boom(2026, 11, 13, 16, 0, 0))
 
 
 class RoundFourDst(GitCase):
