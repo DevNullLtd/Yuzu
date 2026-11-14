@@ -97,6 +97,9 @@ def check_local_evidence(test_db, root: Path, failures: list[str]) -> None:
         ("failed", [("suite", "FAIL")], "FAIL"),
         ("recovered", [("suite", "FAIL"), ("suite", "PASS")], "FAIL"),
         ("warning-retry", [("suite", "WARN"), ("suite", "PASS")], "WARN"),
+        ("aborted-retry", [("suite", "ABORTED"), ("suite", "PASS")], "ABORTED"),
+        ("aborted-warning", [("suite", "ABORTED"), ("suite", "WARN")], "ABORTED"),
+        ("aborted-failure", [("suite", "ABORTED"), ("suite", "FAIL")], "FAIL"),
         ("completed", [("suite", "RUNNING"), ("suite", "PASS")], "PASS"),
         ("failed-incomplete", [("build", "FAIL"), ("suite", "RUNNING")], "FAIL"),
     ]
@@ -332,7 +335,7 @@ def check_local_evidence(test_db, root: Path, failures: list[str]) -> None:
         with patch.object(test_db, "_git_oneshot", return_value=current):
             for args in (metric_args, timing_args, gate_args):
                 _, diagnostic = command(*args, expected_rc=2)
-                check("Use a new --run-id" in diagnostic,
+                check(("Use a new --run-id" if current else "Restore git HEAD") in diagnostic,
                       f"revision refusal lacked recovery instruction: {diagnostic}", failures)
                 check(snapshot_manual() == before,
                       f"refused {args[0]} mutated earlier evidence", failures)

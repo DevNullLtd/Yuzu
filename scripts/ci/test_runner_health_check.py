@@ -763,6 +763,30 @@ class WorkflowWiringTests(unittest.TestCase):
             platform,
         )
 
+    def test_contract_pilots_execute_and_upload_portable_evidence(self) -> None:
+        linux = self.job("ci.yml", "linux")
+        self.assertNotIn("-Dbuild_contract_tests", linux.split("- name: Contract migration evidence", 1)[0])
+        capture = linux.split("- name: Contract migration evidence", 1)[1].split("- name: Upload contract migration evidence", 1)[0]
+        self.assertIn("if: matrix.compiler == 'gcc-15' && matrix.build_type == 'debug'", capture)
+        self.assertIn("YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots", capture)
+        self.assertIn("YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy", capture)
+        self.assertIn("bash scripts/ci/with-test-slot.sh 3 --", capture)
+        self.assertIn("CONTRACT_BUILD: build-linux-contracts-gcc15-debug", capture)
+        self.assertIn('-Dbuild_contract_tests=true', capture)
+        self.assertIn('-Dcmake_prefix_path=', capture)
+        self.assertIn('-Dpkg_config_path=', capture)
+        self.assertIn('--build-dir "$CONTRACT_BUILD"', capture)
+        self.assertIn("scripts/test/contract-evidence.py run", capture)
+        self.assertNotIn("--only", capture)  # Every registered pilot must execute.
+        self.assertIn("|| rc=$?", capture)
+        self.assertIn("scripts/test/contract-evidence.py bundle", capture)
+        self.assertIn('exit "$rc"', capture)
+        upload = linux.split("- name: Upload contract migration evidence", 1)[1].split("- name:", 1)[0]
+        self.assertIn("success() || failure()", upload)
+        self.assertIn("steps.contract_evidence.outcome", upload)
+        self.assertIn("${{ github.run_attempt }}.zip", upload)
+        self.assertNotIn("--include-sensitive", capture)
+
     def test_duration_summary_follows_every_flake_retry_test_step(self) -> None:
         """meson overwrites testlog.json on each invocation, so the summary runs
         once per flake-retry Test step, against that step's own build dir."""

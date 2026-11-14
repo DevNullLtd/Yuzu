@@ -103,6 +103,33 @@ class RegistryTests(unittest.TestCase):
             self.load([])
 
 
+class SnapshotTests(unittest.TestCase):
+    def test_patch_captures_only_declared_inputs_but_identity_sees_other_changes(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_contract_snapshot_") as temporary:
+            root = Path(temporary).resolve()
+            for name in ("tests/contracts/pilots.json", "scripts/test/contract-evidence.py",
+                         "scripts/test/test_db.py", "scripts/erlang_toolchain.py", "meson.build",
+                         "meson.options", "tests/meson.build", "owner.cpp", "decision.md", "unrelated.txt"):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("baseline\n", encoding="utf-8")
+            for command in (["git", "init", "-q"], ["git", "add", "."],
+                            ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                             "-c", "commit.gpgsign=false", "commit", "-qm", "fixture baseline"]):
+                subprocess.run(command, cwd=root, check=True, capture_output=True)
+            (root / "owner.cpp").write_text("changed contract implementation\n", encoding="utf-8")
+            (root / "unrelated.txt").write_text("unrelated private material\n", encoding="utf-8")
+            with patch.object(evidence, "ROOT", root):
+                first, captured = evidence.snapshot([contract()])
+                (root / "unrelated.txt").write_text("another private change\n", encoding="utf-8")
+                second, recaptured = evidence.snapshot([contract()])
+            self.assertIn(b"changed contract implementation", captured)
+            self.assertNotIn(b"unrelated", captured)
+            self.assertEqual(captured, recaptured)
+            self.assertNotEqual(first["diff_sha256"], second["diff_sha256"])
+            self.assertEqual(first["captured_diff_sha256"], hashlib.sha256(captured).hexdigest())
+
+
 class CatchVerdictTests(unittest.TestCase):
     def qualify(self, tree, code=0):
         return evidence.catch_verdict(ET.tostring(tree, encoding="unicode"), contract(), code)
@@ -546,11 +573,13 @@ class BundleTests(unittest.TestCase):
         self.capture.mkdir()
         self.destination = self.root / "capture.zip"
         (self.capture / "native.log").write_bytes(b"observed native result\n")
+        (self.capture / "meson-native.txt").write_bytes(b"sanitized native result\n")
         (self.capture / "private").mkdir()
         (self.capture / "private/cache.log").write_bytes(b"private cache bytes\n")
         self.manifest = {
             "status": "PASS",
-            "artifact_sha256": {"native.log": evidence.sha(self.capture / "native.log")},
+            "artifact_sha256": {name: evidence.sha(self.capture / name)
+                                for name in ("native.log", "meson-native.txt")},
         }
         self.write_manifest()
 
@@ -568,10 +597,34 @@ class BundleTests(unittest.TestCase):
         if os.name != "nt":
             self.assertEqual(self.destination.stat().st_mode & 0o777, 0o600)
         with zipfile.ZipFile(self.destination) as archive:
-            self.assertEqual(set(archive.namelist()), {"manifest.json", "native.log"})
-            self.assertEqual(archive.read("native.log"), b"observed native result\n")
-            self.assertEqual(archive.read("manifest.json"),
-                             (self.capture / "manifest.json").read_bytes())
+            self.assertEqual(set(archive.namelist()), {"manifest.json", "meson-native.txt"})
+            self.assertEqual(archive.read("meson-native.txt"), b"sanitized native result\n")
+            exported = json.loads(archive.read("manifest.json"))
+            self.assertEqual(exported["artifact_sha256"], {
+                "meson-native.txt": evidence.sha(self.capture / "meson-native.txt")})
+            self.assertEqual(exported["omitted_artifact_sha256"], {
+                "native.log": evidence.sha(self.capture / "native.log")})
+            self.assertEqual(exported["source_manifest_sha256"], evidence.sha(self.capture / "manifest.json"))
+
+    def test_raw_output_source_and_diagnostics_do_not_enter_portable_archive(self):
+        secret = "yuzu_test_private_9281"
+        for name in ("native.log", "source.patch", "test-runs.db", "source/input.cpp"):
+            path = self.capture / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(secret, encoding="utf-8")
+            self.manifest["artifact_sha256"][name] = evidence.sha(path)
+        self.manifest.update(error=secret, history_error=secret,
+                             meson_selection=[{"env": {"TOKEN": secret}}],
+                             steps=[{"command": [secret], "exit_code": 7, "seconds": 1.0}])
+        self.write_manifest()
+        self.assertEqual(self.bundle(), 0)
+        with zipfile.ZipFile(self.destination) as archive:
+            for name in archive.namelist():
+                self.assertNotIn(secret.encode(), archive.read(name), name)
+            exported = json.loads(archive.read("manifest.json"))
+            self.assertEqual(exported["steps"], [{"exit_code": 7, "seconds": 1.0}])
+        # The diagnosis/reproduction input has not been destructively sanitized.
+        self.assertEqual((self.capture / "source.patch").read_text(), secret)
 
     def test_hash_mismatch_refuses_bundle_without_creating_archive(self):
         (self.capture / "native.log").write_bytes(b"changed after qualification\n")
@@ -709,7 +762,7 @@ class ChildLifetimeTests(unittest.TestCase):
                 f"test('owned-case',py,args:[{','.join(quoted(arg) for arg in args)}],timeout:120)\n")
             env = {key: os.environ[key] for key in ("PATH", "HOME", "TMPDIR", "LANG") if key in os.environ}
             setup = subprocess.run([meson, "setup", str(root / "build"), str(root)],
-                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+                                   env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=5)
             self.assertEqual(setup.returncode, 0, setup.stdout.decode(errors="replace"))
             command = [meson, "test", "-C", str(root / "build"), "--no-rebuild"]
             timeout = 5 if mode == "timeout" else 30
@@ -739,7 +792,7 @@ class ChildLifetimeTests(unittest.TestCase):
                 self.assertEqual(os.getpgid(owned["adapter"]), owned["adapter"])
                 if mode == "interrupt":
                     os.kill(child.pid, signal.SIGINT)
-                self.assertEqual(child.wait(timeout=12), 0)
+                self.assertEqual(child.wait(timeout=8), 0)
                 expected = "TimeoutExpired" if mode == "timeout" else "KeyboardInterrupt"
                 self.assertEqual((root / "outcome").read_text(), expected)
                 for pid in owned.values():
@@ -757,7 +810,7 @@ class ChildLifetimeTests(unittest.TestCase):
                             os.killpg(pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
-                child.wait(timeout=5)
+                child.wait(timeout=2)
 
     def test_closed_output_does_not_end_deadline_and_timed_out_child_is_reaped(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_contract_child_") as temporary:

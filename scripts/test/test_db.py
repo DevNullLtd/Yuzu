@@ -26,7 +26,7 @@ Schema invariants (preserve against future regression):
   - test_gates holds the latest result for (run_id, gate_name). Every gate
     write also appends to test_gate_attempts in the same transaction. A repeat
     write is another observation, not necessarily another test execution.
-    Earlier FAIL/WARN observations remain part of the run verdict.
+    Earlier FAIL/ABORTED/WARN observations remain part of the run verdict.
 
 The stable CLI remains the bash wrappers; the cross-platform CI recorder calls
 this module's CLI directly because Windows cannot rely on a bash wrapper.
@@ -572,7 +572,7 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
     with connect() as conn:
         _ensure_schema_initialized(conn)
         # Hold the writer lock through the verdict update. Counts describe
-        # effective gates: prior FAIL/WARN evidence survives a later PASS,
+        # effective gates: prior FAIL/ABORTED/WARN evidence survives a later PASS,
         # while an ordinary RUNNING -> PASS transition completes the gate.
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
@@ -583,9 +583,10 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
             print(f"test_db: run {args.run_id} not found", file=sys.stderr)
             return 1
         counts: dict[str, int] = {}
-        for status, failed, warned in conn.execute(
+        for status, failed, aborted, warned in conn.execute(
             """
-            SELECT g.status, MAX(a.status='FAIL'), MAX(a.status='WARN')
+            SELECT g.status, MAX(a.status='FAIL'), MAX(a.status='ABORTED'),
+                   MAX(a.status='WARN')
             FROM test_gates g LEFT JOIN test_gate_attempts a
               ON a.run_id=g.run_id AND a.gate_name=g.gate_name
             WHERE g.run_id=? GROUP BY g.gate_name, g.status
@@ -594,7 +595,7 @@ def cmd_run_finish(args: argparse.Namespace) -> int:
         ):
             effective = (
                 "FAIL" if failed else
-                "ABORTED" if status not in {"PASS", "FAIL", "WARN", "SKIP"} else
+                "ABORTED" if aborted or status not in {"PASS", "FAIL", "WARN", "SKIP"} else
                 "WARN" if warned else status
             )
             counts[effective] = counts.get(effective, 0) + 1
@@ -670,7 +671,12 @@ def _ensure_schema_initialized(conn: sqlite3.Connection) -> None:
 
 
 def _check_manual_revision(run_id: str, recorded: str, current: str) -> None:
-    if current == "unknown" or recorded != current:
+    if current == "unknown":
+        raise RunIdentityError(
+            f"cannot verify the source revision for manual run {display_run_id(run_id)}. "
+            "Restore git HEAD before recording more evidence; the database is unchanged."
+        )
+    if recorded != current:
         raise RunIdentityError(
             f"manual run {display_run_id(run_id)} belongs to commit {recorded}; "
             f"current commit is {current}. Use a new --run-id for this capture."
@@ -730,8 +736,7 @@ def _ensure_run_exists(conn: sqlite3.Connection, run_id: str) -> None:
         # Stub row freshly created. Visible signal so a /test pipeline
         # whose run-start failed silently doesn't ship a green-looking
         # run with mode='manual' rows. Operator-capture paths
-        # (--run-id manual) will see this on first call per DB and
-        # never again.
+        # see this on the first write for each fresh capture identity.
         run_id_safe = display_run_id(run_id)
         print(
             f"test_db: vivified stub test_runs row for run_id={run_id_safe} "

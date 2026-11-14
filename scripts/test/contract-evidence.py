@@ -5,7 +5,6 @@ This is an evidence collector around native tests, not an ADR correctness score.
 `case` is Meson's Catch2 adapter: required pilots cannot pass by skipping.
 """
 import argparse
-import contextlib
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -25,6 +24,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 REGISTRY = ROOT / 'tests/contracts/pilots.json'
+sys.path.insert(0, str(ROOT / 'scripts'))
+from erlang_toolchain import kill_tree, uninterrupted_cleanup, termination_interrupt  # noqa: E402
 
 
 def sha(path):
@@ -115,25 +116,6 @@ def catch_verdict(report, row, returncode):
     return {'cases': 1, 'assertions': int(assertions.get('successes')), 'seed': tree.get('rng-seed')}
 
 
-@contextlib.contextmanager
-def uninterrupted_cleanup():
-    """A repeated cancellation cannot bypass the bounded child kill/reap."""
-    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
-    try:
-        for sig in handlers:
-            signal.signal(sig, signal.SIG_IGN)
-        yield
-    finally:
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-
-
-def termination_interrupt(_signum, _frame):
-    # Meson cancels a test with SIGTERM. Enter the same owned-child cleanup as
-    # Ctrl-C instead of letting the adapter die with its detached child alive.
-    raise KeyboardInterrupt('SIGTERM')
-
-
 def bounded(command, cwd, env, log, timeout, cancel_grace=0):
     """File-backed output; the deadline covers process exit even after output EOF."""
     start = time.monotonic()
@@ -146,34 +128,22 @@ def bounded(command, cwd, env, log, timeout, cancel_grace=0):
             code = process.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             with uninterrupted_cleanup():
-                if os.name == 'nt':
+                if cancel_grace and os.name != 'nt':
+                    # Meson's tests have separate sessions. Let its SIGTERM handler
+                    # cancel the adapters, which reap their own native children.
                     try:
-                        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
-                                       stdout=output, stderr=subprocess.STDOUT, timeout=10)
-                    finally:
-                        if process.poll() is None:
-                            process.kill()
-                        process.wait(timeout=10)
-                else:
-                    if cancel_grace:
-                        # Meson gives each test a separate session. Let Meson's
-                        # SIGTERM handler cancel ALL tests and let their adapters
-                        # reap native children before forcing the Meson root down.
-                        try:
-                            os.killpg(process.pid, signal.SIGTERM)
-                            process.wait(timeout=cancel_grace)
-                        except ProcessLookupError:
-                            pass
-                        except (subprocess.TimeoutExpired, KeyboardInterrupt):
-                            output.write(b'Graceful runner cancellation did not complete; descendant cleanup is unconfirmed.\n')
-                            output.flush()
-                    # A gracefully exited runner has already been reaped; do
-                    # not signal its former group id after relinquishing it.
-                    if not cancel_grace or process.poll() is None:
-                        try:
-                            os.killpg(process.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.wait(timeout=cancel_grace)
+                    except ProcessLookupError:
+                        pass
+                    except subprocess.TimeoutExpired:
+                        output.write(b'Graceful runner cancellation did not complete; descendant cleanup is unconfirmed.\n')
+                        output.flush()
+                # Never signal a former process group after a graceful reap.
+                if not cancel_grace or process.poll() is None or os.name == 'nt':
+                    if not kill_tree(process, timeout=5):
+                        output.write(b'Process-tree kill did not confirm descendant cleanup.\n')
+                        output.flush()
                 process.wait(timeout=10)
             raise
     return {'command': command, 'exit_code': code, 'seconds': time.monotonic()-start,
@@ -207,14 +177,20 @@ def run_case(args, rows):
 
 def snapshot(rows):
     inputs = {'tests/contracts/pilots.json', 'scripts/test/contract-evidence.py',
-              'scripts/test/test_db.py', 'meson.build', 'meson.options', 'tests/meson.build'}
+              'scripts/test/test_db.py', 'scripts/erlang_toolchain.py',
+              'meson.build', 'meson.options', 'tests/meson.build'}
     for row in rows:
         inputs.update(row['inputs'])
         inputs.add(row['authority']['path'])
     diff = subprocess.check_output(['git', 'diff', 'HEAD', '--binary'], cwd=ROOT, timeout=15)
-    return {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True, timeout=15).strip(),
+    captured_diff = subprocess.check_output(
+        ['git', 'diff', 'HEAD', '--binary', '--', *sorted(inputs)], cwd=ROOT, timeout=15)
+    return {'commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True,
+                                              encoding='utf-8', timeout=15).strip(),
             'diff_sha256': hashlib.sha256(diff).hexdigest(),
-            'inputs': {p: sha(source_path(ROOT, p)) for p in sorted(inputs)}}, diff
+            'captured_diff_sha256': hashlib.sha256(captured_diff).hexdigest(),
+            'patch_scope': 'registered inputs only; whole working-tree diff is hashed, not copied',
+            'inputs': {p: sha(source_path(ROOT, p)) for p in sorted(inputs)}}, captured_diff
 
 
 def qualify_meson(records, rows):
@@ -437,9 +413,27 @@ def bundle(directory, destination):
         if ('private' in Path(relative).parts or
                 'private' in path.relative_to(directory.resolve()).parts or sha(path) != expected):
             raise ValueError(f'Artifact changed or private: {relative}')
+    # Raw native output, source snapshots/patches, history databases and build
+    # configuration can contain credentials or application data. Only the
+    # sanitized Meson reports cross the portable-export boundary. Retain every
+    # omitted hash so this is visibly a projection, not a complete raw capture.
+    portable = {name: digest for name, digest in files.items()
+                if name in ('meson-native.json', 'meson-native.txt', 'meson-native.junit.xml')}
+    public = {key: manifest[key] for key in (
+        'schema_version', 'run_id', 'status', 'started_at', 'finished_at', 'platform',
+        'planned_contracts', 'source', 'results', 'binary_sha256', 'prerequisites',
+        'raw_meson_sha256') if key in manifest}
+    public['steps'] = [{key: step[key] for key in ('exit_code', 'seconds', 'log') if key in step}
+                       for step in manifest.get('steps', [])]
+    public.update(artifact_sha256=portable,
+                  omitted_artifact_sha256={name: digest for name, digest in files.items()
+                                           if name not in portable},
+                  source_manifest_sha256=sha(directory/'manifest.json'),
+                  export_scope='sanitized Meson reports and result metadata; raw capture retained locally')
     with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
         with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
-            for relative in ['manifest.json', *files]:
+            archive.writestr('manifest.json', json.dumps(public, indent=2) + '\n')
+            for relative in portable:
                 archive.write(directory/relative, relative)
     print(f'Bundle: {destination}')
     return 0

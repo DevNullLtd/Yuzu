@@ -955,13 +955,15 @@ def row_in_flight(r: Any) -> bool:
     return _int_status(r) == 0
 
 
-def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
+def grade_targeted(responses: list, target: str = "", *, strict_running: bool = False) -> tuple[str, bool, bool]:
     """(why it is a fail, any row running, any row unrecognised).
 
     The wire row is {id, instruction_id, agent_id, timestamp, status, output, error_detail} with
     an integer status 0-4. A row that is not an object, has any other status, or names an agent
     other than the target is UNRECOGNISED: something is not as the runner assumes, so the caller
     stops the run. A row with no agent_id is tolerated. A legacy `rc` can only add a failure.
+    Broadcast history also validates RUNNING rows (strict_running), whose terminal
+    rows may arrive beside them rather than replace them.
     """
     problems: list[str] = []
     running = False
@@ -978,13 +980,14 @@ def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
             continue
         if row_in_flight(r):
             running = True
-            continue
+            if not strict_running:
+                continue
         reasons: list[str] = []
         s = _int_status(r)
         if s is None or not 0 <= s <= 4:
             reasons.append(f"unrecognised status {clip(r.get('status'), 40)!r}")
             odd = True
-        elif s != 1:
+        elif s not in (0, 1):
             reasons.append(STATUS_NAMES[s])
         rc = r.get("rc", r.get("return_code", 0))
         if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
@@ -1069,20 +1072,11 @@ def _broadcast_verdict(rows: list, command_id: str, expected: int) -> tuple[str,
             return "response instruction_id does not match the dispatched command", 0
         agents.add(agent)
         status = _int_status(r)
-        if status not in STATUS_NAMES:
-            return f"unrecognised status {clip(r.get('status'), 40)!r}", 0
-        detail = r.get("error_detail")
-        if not isinstance(detail, str):
-            return f"unrecognised error_detail {clip(detail, 40)!r}", 0
-        if detail:
-            return f"{clip(agent, 64)}: error_detail={clip(detail)!r}", 0
-        rc = r.get("rc", r.get("return_code", 0))
-        if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
-            return f"{clip(agent, 64)}: rc={rc}", 0
-        if status in (2, 3, 4):
-            return f"{clip(agent, 64)}: {STATUS_NAMES[status]}", 0
         if status == 1:
             completed.add(agent)
+    reason, _, _ = grade_targeted(rows, strict_running=True)
+    if reason:
+        return reason, 0
     if len(agents) > expected:
         return "response agent count exceeds dispatch agents_reached", 0
     return "", len(completed)

@@ -14,8 +14,9 @@
 #                         updated JSON in the same change that earned the new
 #                         baseline. Exits PASS after capture.
 #
-# Required arguments:
-#   --run-id ID       — /test run ID (DB foreign key)
+# Run identity:
+#   --run-id ID       — /test run ID (DB foreign key); required except in capture
+#                       mode, which generates a fresh manual ID when omitted
 #
 # Optional arguments:
 #   --build-dir DIR   — coverage build directory (default: build-linux-coverage)
@@ -109,10 +110,10 @@ MIN_FREE_KB="${YUZU_COVERAGE_MIN_FREE_KB:-262144}"
 
 usage() {
     cat <<EOF
-usage: $0 --run-id ID [options]
+usage: $0 [--run-id ID] [options]
 
-Required:
-  --run-id ID
+Run identity:
+  --run-id ID            required unless --capture-baselines generates a fresh ID
 
 Optional:
   --build-dir DIR        (default: build-linux-coverage)
@@ -148,6 +149,12 @@ done
 # comparison could not parse here, not after a 20 minute run.
 [[ "$SLACK_PP" =~ ^[0-9]{1,6}([.][0-9]{1,6})?$ ]] && awk -v s="$SLACK_PP" 'BEGIN { exit !(s <= 50) }' || { echo "coverage-gate: --slack-pp must be a plain number from 0 to 50, got '${SLACK_PP//[^[:print:]]/?}'" >&2; exit 2; }
 
+if [[ -z "$RUN_ID" && "$CAPTURE" == 1 ]]; then
+    RUN_ID=$(python3 -c 'import uuid; print("manual-" + uuid.uuid4().hex)') || {
+        echo "coverage-gate: could not generate a capture run ID" >&2
+        exit 2
+    }
+fi
 if [[ -z "$RUN_ID" ]]; then
     echo "coverage-gate: --run-id required" >&2
     exit 2
@@ -952,7 +959,7 @@ if [[ $CAPTURE -eq 1 ]]; then
     # rewrite the git-tracked baseline (the exit code and the file state must agree).
     if (( DB_WRITE_FAILED )); then
         GATE_DUR=$(( $(date +%s) - GATE_START ))
-        NOTE="refused --capture-baselines: a DB write failed earlier in this run, so the run's record is incomplete; re-run once the test-runs DB is healthy"
+        NOTE="refused --capture-baselines: evidence recording failed earlier, so the run's record is incomplete; inspect the recorder error above (including run-ID/revision conflicts) and retry with a fresh run ID after correcting its cause"
         echo "coverage-gate: $NOTE" | tee -a "$GATE_LOG"
         write_gate FAIL "$GATE_DUR" "$NOTE"
         exit 1
@@ -1009,7 +1016,8 @@ baseline = {
     "__doc": (
         "Locked branch coverage baseline enforced by "
         "scripts/test/coverage-gate.sh. Regenerate with "
-        "'bash scripts/test/coverage-gate.sh --run-id manual --capture-baselines' "
+        "'bash scripts/test/coverage-gate.sh --capture-baselines' "
+        "(a fresh run ID is generated for each capture), "
         "then commit this file alongside the change that earned the new baseline. "
         "Hardware fingerprint deliberately omitted — line-level coverage is "
         "compiler-deterministic, unlike perf timings."

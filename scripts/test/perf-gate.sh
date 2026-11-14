@@ -391,6 +391,8 @@ if [[ $CT_RC -eq 1 || $SCALE_RC -eq 1 ]]; then
                 *_ops_sec)      write_metric "perf_$name" "$value" "ops/sec" ;;
                 *_ms_per_agent) write_metric "perf_$name" "$value" "ms/agent" ;;
                 *_ms)           write_metric "perf_$name" "$value" "ms" ;;
+                *_ms_n[0-9]*|*_ms_p[0-9]*_n[0-9]*) write_metric "perf_$name" "$value" "ms" ;;
+                *_bytes_n[0-9]*) write_metric "perf_$name" "$value" "bytes" ;;
                 *)              write_metric "perf_$name" "$value" "" ;;
             esac
         done <<< "$PARSED"

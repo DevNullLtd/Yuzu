@@ -73,6 +73,11 @@ import threading
 import time
 from pathlib import Path
 
+# Meson consumes UTF-8 logs, including native-tool diagnostics which may need
+# replacement characters. A Windows console code page must not reject the tee.
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gateway_epmd  # noqa: E402
 from erlang_toolchain import base_env, kill_tree, rebar3_prefix, windows_stdio_isolation  # noqa: E402
@@ -302,6 +307,8 @@ def _run_streamed(args, deadline_secs):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     # Null stdin + a private console on Windows (erlang_toolchain hazard 3);

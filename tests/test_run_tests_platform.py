@@ -19,9 +19,17 @@ class RunnerPlatform(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(prefix="yuzu_test_runner_")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        for directory in ("scripts", "bin", "build/tests"):
+        for directory in ("scripts", "bin", "build/tests", "gateway"):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / "scripts/run-tests.sh", self.root / "scripts/run-tests.sh")
+        shutil.copyfile(ROOT / "scripts/gateway_test_summary.py", self.root / "scripts/gateway_test_summary.py")
+        self.executable("bin/rebar3", '''
+printf 'rebar3' >> "$YUZU_TEST_CALLS"
+printf ' <%s>' "$@" >> "$YUZU_TEST_CALLS"
+printf '\\n' >> "$YUZU_TEST_CALLS"
+printf '%s\\n' "$YUZU_TEST_CT_OUTPUT"
+exit "${YUZU_TEST_CT_EXIT:-0}"
+''')
         self.executable("bin/uname", 'printf "%s\\n" "$YUZU_TEST_PLATFORM"\n')
         self.executable("bin/meson", '''
 printf 'meson' >> "$YUZU_TEST_CALLS"
@@ -66,12 +74,13 @@ fixture_root=$1
 if command -v cygpath >/dev/null 2>&1; then fixture_root=$(cygpath -u "$fixture_root"); fi
 export PATH="$fixture_root/bin:$PATH"
 export YUZU_BUILDDIR="$fixture_root/build"
+export TMPDIR="$fixture_root"
 export YUZU_TEST_CALLS="$fixture_root/calls.log"
 exec bash "$fixture_root/scripts/run-tests.sh" "$2"
 '''
         result = subprocess.run(
             [BASH, "-c", command, "runner-fixture", str(self.root), tier],
-            env=env, capture_output=True, text=True, encoding="utf-8", timeout=10,
+            env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
         )
         calls = self.root / "calls.log"
         return result, calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
@@ -144,6 +153,32 @@ exec bash "$fixture_root/scripts/run-tests.sh" "$2"
         result, calls = self.run_tier("Linux", "integration", YUZU_TEST_INTEGRATION_EXIT="8")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(calls, ["integration <--agents> <2>"])
+
+    def test_common_test_requires_nonempty_complete_execution(self):
+        for output, code in (("All 0 tests passed.", "0"),
+                             ("no terminal summary", "0"),
+                             ("Failed 1 tests. Passed 2 tests.", "0"),
+                             ("All 2 tests passed.", "7"),
+                             ("All 2 tests passed.\nOne or more tests were cancelled.", "0")):
+            with self.subTest(output=output, code=code):
+                result, _ = self.run_tier("Darwin", "erlang-ct",
+                                          YUZU_TEST_CT_OUTPUT=output, YUZU_TEST_CT_EXIT=code)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("Failed:  4", result.stdout)
+                self.assertIn("Passed:  0", result.stdout)
+
+    def test_common_test_runs_all_four_suites(self):
+        result, calls = self.run_tier("Darwin", "erlang-ct", YUZU_TEST_CT_OUTPUT="All 2 tests passed.")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 4)
+        for suite in ("e2e", "integration", "metrics_e2e", "prometheus"):
+            self.assertTrue(any(f"<--suite=yuzu_gw_{suite}_SUITE>" in call for call in calls), calls)
+        self.assertIn("Passed:  4", result.stdout)
+
+    def test_performance_tier_rejects_empty_execution(self):
+        result, _ = self.run_tier("Darwin", "erlang-perf", YUZU_TEST_CT_OUTPUT="All 0 tests passed.")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Failed:  1", result.stdout)
 
 
 if __name__ == "__main__":

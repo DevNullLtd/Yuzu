@@ -8,7 +8,6 @@ This wrapper is for local process contracts: it starts no distribution/epmd.
 """
 
 import argparse
-import contextlib
 import hashlib
 import json
 import os
@@ -22,29 +21,11 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from erlang_toolchain import (  # noqa: E402
     base_env, kill_tree, otp_version, rebar3_prefix, windows_stdio_isolation,
+    uninterrupted_cleanup, termination_interrupt,
 )
 from gateway_test_summary import executed_count, strict_verdict  # noqa: E402
 
 DEADLINE_SECONDS = 300
-
-
-@contextlib.contextmanager
-def uninterrupted_cleanup():
-    """A repeated cancellation cannot bypass the bounded child kill/reap."""
-    handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
-    try:
-        for sig in handlers:
-            signal.signal(sig, signal.SIG_IGN)
-        yield
-    finally:
-        for sig, handler in handlers.items():
-            signal.signal(sig, handler)
-
-
-def termination_interrupt(_signum, _frame):
-    # Meson's timeout/cancellation uses SIGTERM. Route it through run()'s
-    # existing child-tree cleanup rather than abandoning the Erlang session.
-    raise KeyboardInterrupt('SIGTERM')
 
 
 def run(command, gateway, env, deadline, log=None):

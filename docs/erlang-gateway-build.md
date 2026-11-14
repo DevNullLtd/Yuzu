@@ -18,7 +18,19 @@ bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl i
 
 `apps/yuzu_gw/test/ct` includes `yuzu_gw_scale_SUITE`, which starts the gateway, a fake server and a load generator as separate nodes and runs 500 simulated agents through seven scenarios (about 1 min of the CT run with the PR #5695 fixes); see `docs/testing/gateway-scale-tests.md` for the 5,000 and 25,000 sizes and the `gate` group.
 
-**TLS test legs and `YUZU_REQUIRE_TLS_TESTS`.** The TLS legs of seven modules mint throwaway certificates with the `openssl` CLI in a `0700` directory under `/tmp` or `$TMPDIR`: `yuzu_gw_heartbeat_conn_rpc_tests`, `yuzu_gw_authz_tests`, `yuzu_gw_authz_rpc_tests`, `yuzu_gw_mtls_tests`, `yuzu_grpc_client_tls_tests`, `yuzu_grpc_wire_tests` and `yuzu_grpc_origin_wire_tests`. By default an unavailable or failing `openssl` makes the TLS legs of those modules contribute no tests and print `SKIPPED <module>: openssl certificates unavailable: ...` on the console, so a run without `openssl` can still report all tests passed. Set `YUZU_REQUIRE_TLS_TESTS=1` in the environment to turn that skip into a failing test in all seven (`yuzu_gw_authz_tests:certs_unavailable/2` implements the switch and every module calls it). Use it on any machine that is expected to have `openssl`. It is optional and unset by default; the `linux` job of `ci.yml` sets it, and no other workflow or job does.
+**TLS test legs and `YUZU_REQUIRE_TLS_TESTS`.** Gateway TLS fixtures mint
+throwaway certificates with the `openssl` CLI in a private `0700` directory.
+The shared `yuzu_gw_authz_tests` fixture selects the first nonempty `TMPDIR`,
+`TEMP` or `TMP`, falling back to Erlang's user-cache directory for `yuzu_test`.
+An unavailable or failing `openssl` makes its consumers call
+`yuzu_gw_authz_tests:certs_unavailable/2`: by default they contribute no TLS tests
+and print `SKIPPED <module>: openssl certificates unavailable: ...`.
+`YUZU_REQUIRE_TLS_TESTS=1` instead produces a failing test. This includes the
+management-pin watcher and TLS-file diagnostics as well as the authentication,
+identity, CRL-source and wire suites; a successful test count never represents a
+missing-certificate test body as executed. Set the variable on machines expected
+to provide `openssl`. The `linux` job of `ci.yml` requires it; local users must
+opt in explicitly.
 
 **Proto codegen drift (`check-proto-codegen.sh`).** The gateway carries its own gpb-generated `apps/yuzu_gw/src/*_pb.erl` (separate from the server's protoc output). gpb modules are self-contained: change a `.proto` field but forget to regenerate and the gateway silently drops that field in transit (the PR5 enrollment-CSR field-drop bug). The guard regenerates with rebar.config's own pinned `gpb_opts` (read via `file:consult`, so it cannot drift from the build) into a temp dir and byte-diffs against the committed modules. It runs after `rebar3 compile` (needs `_build/gpb`) and is wired into the release workflow's gateway job. gpb is version-pinned (4.21.7) + `target_erlang_version` fixed, so the output is deterministic. To fix a drift failure: regenerate the modules and commit them.
 
@@ -178,8 +190,8 @@ override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
 
 **Diagnosing a failed Meson gateway test.** The wrapper preserves rebar3's
-nonzero exit status; it does not map Erlang failures to 42. It also rejects
-cancellation, failed summaries and zero/missing execution even if the child
+native nonzero exit status (including 42 when rebar3 itself returns it). It
+also rejects cancellation, failed summaries and zero/missing execution even if the child
 exits zero. Meson's console error display shows only a tail of large output,
 so the wrapper appends a bounded native failure excerpt and the observed test
 summary to stderr. The excerpt helps locate the failure; it never decides

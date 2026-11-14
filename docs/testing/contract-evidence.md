@@ -11,21 +11,23 @@ only its recorded obligation, source state, binaries and environment.
 
 ## Run
 
-Use the canonical build directory and an exclusively owned worktree. Follow
-`docs/build-guide.md` to configure dependencies, and build with tests enabled.
-The pilot registrations are opt-in; existing default suites retain their selection.
+Use an exclusively owned worktree and a dedicated per-OS contract build directory.
+Follow `docs/build-guide.md` for dependency provisioning (and `docs/windows-build.md`
+for the MSVC environment on Windows). Keep contract options out of the canonical
+development build directory: changing them there can silently change later test
+selection. Registrations are opt-in for local development; Linux debug CI enables
+and captures all six pilots, then retains the portable bundle for 30 days.
 
 ```sh
-meson setup --reconfigure build-linux
-meson configure build-linux -Dbuild_tests=true -Dbuild_agent=true \
-  -Dserver=enabled -Dbuild_contract_tests=true
+./scripts/setup.sh --builddir build-linux-contracts --tests -- \
+  -Dbuild_agent=true -Dserver=enabled -Dbuild_contract_tests=true
 # Set YUZU_TEST_POSTGRES_DSN to an isolated disposable PostgreSQL service.
 # Never put credentials into the command line or a committed registry.
 python3 scripts/test/contract-evidence.py run \
-  --build-dir build-linux --output /tmp/yuzu_test_contract_run_001
+  --build-dir build-linux-contracts --output /tmp/yuzu_test_contract_run_001
 ```
 
-All six contracts require Linux: the server and its PostgreSQL tests are
+Running the complete six-contract plan requires Linux: the server and its PostgreSQL tests are
 Linux-only under [ADR-0035](../adr/0035-server-is-linux-only-windows-is-agent-only.md).
 `build_tests=true`, `build_agent=true`, `server=enabled` and the gateway toolchain
 are required. Missing registration is an error, not a smaller successful plan.
@@ -36,9 +38,9 @@ On macOS or Windows (MSYS2 bash), select the four plugin/gateway contracts
 explicitly and leave the server disabled:
 
 ```sh
-contract_build=build-macos  # Use build-windows on Windows.
-meson configure "$contract_build" -Dbuild_tests=true -Dbuild_agent=true \
-  -Dserver=disabled -Dbuild_contract_tests=true
+contract_build=build-macos-contracts  # Use build-windows-contracts on Windows.
+./scripts/setup.sh --builddir "$contract_build" --tests -- \
+  -Dbuild_agent=true -Dserver=disabled -Dbuild_contract_tests=true
 python3 scripts/test/contract-evidence.py run \
   --build-dir "$contract_build" --output /tmp/yuzu_test_contract_subset_001 \
   --only plugin.loader.reserved-name.reject \
@@ -74,7 +76,7 @@ Direct Meson use is also possible:
 
 ```sh
 # REBAR_BASE_DIR must name a separate caller-owned gateway build directory.
-meson test -C build-linux --suite contracts --print-errorlogs
+meson test -C build-linux-contracts --suite contracts --print-errorlogs
 ```
 
 The PostgreSQL contracts require their DSN, plugin contracts require their
@@ -108,9 +110,13 @@ percentage of assertions passed is a percentage of architectural correctness.
 
 Every invocation requires a **new output directory** and receives a unique run
 ID. Reusing an output directory fails before overwriting anything. The manifest
-contains the selected obligations, source commit and dirty patch hash, relevant
-input snapshots/hashes, compiler/build configuration, binary hashes, exact
-commands, native results, prerequisite presence and artifact hashes. Per-case
+contains the selected obligations, source commit and whole working-tree diff hash,
+registered input snapshots/hashes, compiler/build configuration, binary hashes,
+exact commands, native results, prerequisite presence and artifact hashes.
+`source.patch` captures only the registered inputs; its separate hash and scope
+are recorded explicitly. Unrelated tracked edits affect the whole-tree identity
+but their contents are not copied. Untracked files are not represented by a Git
+diff; registered inputs are independently copied and hashed. Per-case
 Catch2 XML or EUnit logs remain alongside portable Meson JSON/text/JUnit reports.
 Meson includes inherited environment values in its native reports: originals
 stay under `private/meson-raw`, with hashes in the manifest. Portable copies omit
@@ -135,13 +141,22 @@ python3 scripts/test/contract-evidence.py bundle \
   /tmp/yuzu_test_contract_run_001 /tmp/yuzu_test_contract_run_001.zip
 ```
 
-Bundling verifies artifact hashes, refuses overwrite, and creates a private
-archive. It excludes `private/`, including build caches and original Meson
-reports. Output directories are private, and environment values are not dumped
-into the manifest. **Native output may still contain sensitive
-application output:** review them before exporting. Keep release manifests,
-source patches, sensitivity evidence and important failure bundles in the
-team's durable artifact store. A temporary local path alone is not retention.
+Bundling verifies every recorded artifact hash, refuses overwrite, and creates a
+private archive containing only the sanitized Meson reports and result metadata.
+The exported manifest lists hashes of the omitted artifacts and the original
+manifest, so a portable projection cannot masquerade as a complete raw capture.
+Raw native logs/reports, source snapshots/patches, command arguments, free-text
+errors, build configuration and history databases remain in the private local
+capture. They are excluded because they may contain credentials or application
+data, even when the Meson reports have been sanitized. The bundle preserves
+statuses, timings, selectors and source/binary hashes; use the retained local
+capture for full reproduction and raw failure diagnostics.
+
+Credential redaction in the portable Meson reports covers known sensitive
+environment values, not arbitrary application secrets. Review even a portable
+bundle before exporting. Retain raw captures separately in an access-controlled
+durable artifact store when they are needed beyond CI's 30-day portable-bundle
+retention. A temporary local path alone is not retention.
 
 ## Migrate the next test
 
@@ -171,8 +186,10 @@ per-contract native report. Distinguish prerequisites, assertion failure, timeou
 teardown and recording failure. Reproduce the recorded filter/generator and seed
 against the recorded source and build. Preserve the first attempt before retrying.
 
-Current limits: the pilots have native migration evidence on macOS; Linux and
-Windows qualification remains work to execute. The registry does not yet cover
+Current limits: each native result qualifies only its recorded source and
+platform. Linux runs the complete plan; macOS/Windows can qualify the four
+plugin/gateway contracts, never the Linux-only server contracts. Historical
+qualification does not qualify later commits. The registry does not yet cover
 all ADRs, all stores, all gateway lifecycle boundaries or all plugin names. It
 does not establish performance, coverage or flake-rate baselines, and Dialyzer's
 production success typing is not runtime protocol proof.

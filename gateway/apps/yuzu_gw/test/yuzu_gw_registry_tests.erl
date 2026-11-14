@@ -89,12 +89,14 @@ owner_down_setup() ->
         undefined -> undefined;
         Ref -> {Ref, atomics:get(Ref, 1)}
     end,
-    {Registry, Owned} = case whereis(yuzu_gw_registry) of
-        undefined ->
-            {ok, Pid} = yuzu_gw_registry:start_link(),
-            {Pid, true};
-        Pid -> {Pid, false}
-    end,
+    PreviousRegistry = whereis(yuzu_gw_registry),
+    ok = yuzu_gw_test_registry:ensure(),
+    Registry = whereis(yuzu_gw_registry),
+    %% ensure/0 waits out stale ETS owners and replaces leaked mock processes.
+    %% Only stop a replacement linked to this fixture: another concurrent
+    %% setup may have won the shared helper's start race.
+    {links, Links} = process_info(Registry, links),
+    Owned = Registry =/= PreviousRegistry andalso lists:member(self(), Links),
     Salt = integer_to_binary(erlang:unique_integer([positive, monotonic])),
     #{registry => Registry, owned => Owned, saved => Saved, stamp => Stamp,
       actors => [spawn_dummy(), spawn_dummy(), spawn_dummy()],

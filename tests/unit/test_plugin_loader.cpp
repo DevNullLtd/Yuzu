@@ -43,31 +43,7 @@ constexpr const char* kPluginExt = ".dylib";
 constexpr const char* kPluginExt = ".so";
 #endif
 
-// Locate a fixture plugin shared library (`<base_name><ext>`) built by
-// tests/meson.build — e.g. "reserved_name_fixture_plugin" (#453) or
-// "invalid_name_fixture_plugin" (#822). Returns empty path if not found —
-// tests that require the fixture should SKIP rather than FAIL to keep
-// cross-compile / restricted-CI scenarios quiet.
-fs::path find_fixture_plugin(std::string_view base_name) {
-    const std::string lib_name = std::string{base_name} + kPluginExt;
-
-    std::vector<fs::path> candidates;
-    if (auto* build_root = std::getenv("MESON_BUILD_ROOT")) {
-        candidates.emplace_back(fs::path{build_root} / "tests" / lib_name);
-    }
-    // Meson launches tests with CWD=build root; tests/ sits alongside the exe.
-    candidates.emplace_back(fs::path{"tests"} / lib_name);
-    candidates.emplace_back(fs::path{"."} / lib_name);
-
-    for (const auto& p : candidates) {
-        std::error_code ec;
-        if (fs::exists(p, ec) && !ec)
-            return fs::absolute(p, ec);
-    }
-    return {};
-}
-
-// Required contract fixtures are Meson link_depends of yuzu_agent_tests. An
+// Fixture libraries are Meson link_depends of yuzu_agent_tests on every host. An
 // explicit build root is authoritative; otherwise use the executable's own
 // directory. Never recover a missing fixture from an unrelated working tree.
 fs::path require_fixture_plugin(std::string_view base_name) {
@@ -484,23 +460,18 @@ TEST_CASE("PluginLoader rejects a second file declaring an already-loaded name",
 
 TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
           "[plugin_loader][name_validation]") {
-    auto fixture = find_fixture_plugin("invalid_name_fixture_plugin");
-    if (fixture.empty()) {
-        WARN("invalid_name_fixture_plugin not found — skipping behavioral scan test");
-        SUCCEED();
-        return;
-    }
+    const auto fixture = require_fixture_plugin("invalid_name_fixture_plugin");
 
     // Scan an isolated copy so the result reflects only this fixture (mirrors
     // the reserved-name behavioral test above).
-    auto tmp = yuzu::test::unique_temp_path("yuzu_test_invalid_name_plugin_");
-    fs::create_directories(tmp);
-    auto staged = tmp / fixture.filename();
+    yuzu::test::TempDir tmp{"yuzu_test_invalid_name_plugin_"};
+    fs::create_directories(tmp.path);
+    const auto staged = tmp.path / fixture.filename();
     std::error_code ec;
     fs::copy_file(fixture, staged, fs::copy_options::overwrite_existing, ec);
     REQUIRE_FALSE(ec);
 
-    auto result = yuzu::agent::PluginLoader::scan(tmp);
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path);
 
     // A malformed name must not yield a loaded plugin...
     REQUIRE(result.loaded.empty());
@@ -512,18 +483,11 @@ TEST_CASE("PluginLoader rejects a plugin declaring an invalid name",
     const auto& err = result.errors.front();
     REQUIRE(err.path == staged.string());
     REQUIRE(err.reason == yuzu::agent::kInvalidNameReason);
-
-    fs::remove_all(tmp);
 }
 
 TEST_CASE("PluginLoader rejects a stale plugin declaring the retired pre-rename name",
           "[plugin_loader][retired_name]") {
-    auto fixture = find_fixture_plugin("retired_name_fixture_plugin");
-    if (fixture.empty()) {
-        WARN("retired_name_fixture_plugin not found - skipping behavioral scan test");
-        SUCCEED();
-        return;
-    }
+    const auto fixture = require_fixture_plugin("retired_name_fixture_plugin");
 
     // Scan an isolated copy so the result reflects only this fixture. `tmp` is declared before
     // `result`, so the dlopen handle is released before the directory is removed.

@@ -28,6 +28,16 @@ pins_test_() ->
     {foreach,
      fun setup/0,
      fun cleanup/1,
+     [fun(F) -> pin_case(F, Generate) end || Generate <- pin_cases()]}.
+
+%% Make the prerequisite decision while instantiating the test. Returning []
+%% from inside a test body would count an unexecuted assertion as a pass.
+pin_case(#{certs := {error, Why}}, _Generate) ->
+    yuzu_gw_authz_tests:certs_unavailable("yuzu_gw_mgmt_pins_tests", Why);
+pin_case(Fixture, Generate) ->
+    Generate(Fixture).
+
+pin_cases() ->
      [fun(F) -> {"the per-stream check does no file I/O",
                  fun() -> stream_check_does_no_file_io(F) end} end,
       fun(F) -> {"a check before anything was published fails closed, without a crash",
@@ -63,7 +73,7 @@ pins_test_() ->
       fun(F) -> {"a malformed pin list publishes nothing and does not crash the refresh",
                  fun() -> malformed_config_publishes_nothing(F) end} end,
       fun(F) -> {"a different key of the same size, written with the same mtime, replaces the pin",
-                 fun() -> same_size_same_mtime_rotation_swaps_the_pin(F) end} end]}.
+                 fun() -> same_size_same_mtime_rotation_swaps_the_pin(F) end} end].
 
 %%%-------------------------------------------------------------------
 %%% Fixture
@@ -101,6 +111,24 @@ cleanup(#{certs := Certs, saved := Saved, prev := Prev}) ->
 with_certs(#{certs := #{} = Certs}, Fun) -> Fun(Certs);
 with_certs(#{certs := {error, Why}}, _Fun) ->
     error({tls_test_certificates_unavailable, Why}).
+
+missing_certificates_policy_test() ->
+    Previous = os:getenv("YUZU_REQUIRE_TLS_TESTS"),
+    Missing = #{certs => {error, openssl_missing}},
+    NeverInstantiate = fun(_) -> error(unexpected_test_instantiation) end,
+    try
+        os:unsetenv("YUZU_REQUIRE_TLS_TESTS"),
+        ?assertEqual([], pin_case(Missing, NeverInstantiate)),
+        os:putenv("YUZU_REQUIRE_TLS_TESTS", "1"),
+        [{_, RequiredFailure}] = pin_case(Missing, NeverInstantiate),
+        ?assertError({tls_test_certificates_unavailable, openssl_missing},
+                     RequiredFailure())
+    after
+        case Previous of
+            false -> os:unsetenv("YUZU_REQUIRE_TLS_TESTS");
+            Value -> os:putenv("YUZU_REQUIRE_TLS_TESTS", Value)
+        end
+    end.
 
 with_certs_unavailable_test() ->
     ?assertError({tls_test_certificates_unavailable, openssl_missing},

@@ -1130,10 +1130,11 @@ tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gco
 invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
 Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
 `tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
-scenarios only, `CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25` (bash, python3 with sqlite3, procps
+scenarios only, `CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25 CH-26` (bash, python3 with sqlite3, procps
 and findutils, all on the hosted image). CH-6/CH-25 check performance parser,
-requested-scale and evidence-write verdicts; the coverage fixtures stub disk space
-as well as `ps`, `find` and `ln`, so host capacity cannot change the expected result. The
+requested-scale and evidence-write verdicts. CH-26 captures coverage at two real
+Git revisions and again at the same revision, retaining distinct evidence identities.
+The coverage fixtures stub disk space as well as `ps`, `find` and `ln`, so host capacity cannot change the expected result. The
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
@@ -2836,6 +2837,19 @@ delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
 priority; each of the three is separable.
 *Samples.* To be recorded here after the change's own runs.
 
+### Contract migration evidence
+
+The Linux gcc-15 debug leg enables `build_contract_tests` in the dedicated
+`build-linux-contracts-gcc15-debug` directory and runs all six registered
+migration pilots after the regular suites, under the same three-slot
+Big Tam admission limit and with two collector jobs. PostgreSQL contracts use
+the job's test database; gateway and plugin contracts retain their native
+reports. The collector's default portable bundle is uploaded after success or
+failure with the GitHub run ID and attempt in its artifact name, retained for
+30 days. Raw local inputs are excluded from that upload. A failed contract
+fails the step; its evidence does not replace the regular suite verdicts.
+See `docs/testing/contract-evidence.md` for the obligations and bundle format.
+
 ### Persistent runner-local test history
 
 The local `/test` recorder now uses schema v4. `test_gates` remains the latest
@@ -2846,12 +2860,28 @@ gate history and JSON exports include `gate_attempts`. Migration preserves each
 surviving v3 gate with an unknown recording time; it cannot reconstruct results
 already overwritten by older clients.
 
-Finalization keeps earlier gate FAIL/WARN evidence, treats unfinished gates or
+**Compatibility and rollback:** schema v4 is a one-way local test-history
+migration, not a product database migration. Older v3 recorders reject v4;
+older `/test` preflight checks fail, and nonblocking CI telemetry may warn and
+skip recording. Before the first upgrade, take a consistent SQLite backup
+(using SQLite's backup API or `.backup`, not a lone copy of a live WAL-mode
+file). When switching to an older checkout, set `YUZU_TEST_DB` to a separate
+v3 database. To restore pre-upgrade history instead, stop its writers, retain
+the v4 database and its logs separately, and restore the pre-upgrade backup;
+there is no in-place downgrade or automatic merge of later v4 observations.
+The newer recorder can still read and migrate the retained v3 history.
+
+Finalization keeps earlier gate FAIL/ABORTED/WARN evidence, treats unfinished gates or
 an empty run as ABORTED, and reports an all-skipped run as SKIP. An explicit
 `run-finish --status` can worsen the result but cannot improve it; its floor
 survives refinalization and late gate observations. A late observation reopens
 the run until it is finalized again. Manual run IDs keep their original source
 identity and start time; writes from another revision require a new run ID.
+An ABORTED observation remains ABORTED after a later PASS; an ordinary
+RUNNING → PASS transition completes the gate. For hand-run coverage captures,
+`bash scripts/test/coverage-gate.sh --capture-baselines` generates a fresh
+`manual-<UUID>` when `--run-id` is omitted. This preserves separate captures on
+the same revision as well as across revisions.
 The recorder still cannot detect a required gate that was never recorded: a
 declared execution plan is future work. Metrics/timings still replace values,
 and preserving a log path does not preserve overwritten log bytes.
@@ -2886,7 +2916,7 @@ deliberately per-agent rather than per-host: telemetry must not introduce a
 shared SQLite writer lock between the four jobs whose contention it measures.
 
 The Linux and Windows jobs in `ci.yml` call `scripts/ci/ci-telemetry.py` near
-job start and from an `always()` finalizer. Schema v3 records GitHub run attempt,
+job start and from an `always()` finalizer. Schema v4 retains the v3 GitHub run attempt,
 job/platform/runner, commit/branch/event, conclusion and wall time, ccache ratio,
 each Meson test entry's result/duration/timeout, and any listed flake recovered
 by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
@@ -3037,8 +3067,8 @@ Which contexts are required is a repository ruleset setting ("Protect Main",
 
 The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
-false at the test-file level: nine entries pin OS-specific behaviour inside the
-test file or script itself, not behind a meson guard. Those nine carry the
+false at the test-file level: platform entries pin OS-specific behaviour inside
+the test file or script itself, not behind a meson guard. Twelve entries now carry the
 `platform` suite instead, which every leg runs (except where an entry is not
 registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
 agent-only (the `server` option is off for a non-Linux target), so a `build_server`-gated entry runs on Linux only):
@@ -3048,6 +3078,9 @@ agent-only (the `server` option is off for a non-Linux target), so a `build_serv
 | `gateway build wrapper` | the Windows-only taskkill case and win32 branches in `tests/test_build_gateway.py`; its POSIX stdio and Ctrl-C behaviour must also keep running on Linux |
 | `gateway OTP pin resolution` | pins the `erl.exe` resolution that `scripts/erlang_toolchain.py` branches on for win32 (`tests/test_erlang_toolchain_otp.py`) |
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
+| `gateway wrapper guard selftest` | exercises the real wrapper subprocess, native exit/status handling and diagnostic captures on each OS, including Windows pipe decoding |
+| `contract evidence selftest` | exercises subprocess deadlines, child cleanup and native-path evidence handling; Windows task-tree termination and POSIX signals need separate observations |
+| `local test runner platform selftest` | drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |

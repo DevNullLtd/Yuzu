@@ -249,6 +249,7 @@ class FailureDiagnostics(unittest.TestCase):
             with open(child, 'w', encoding='utf-8') as stream:
                 stream.write(
                     'import sys\n'
+                    'sys.stdout.buffer.write(b"native diagnostic: \\xe2\\x95\\x90\\xff\\n")\n'
                     'print("*** test generator fixture:broken_test_/0 failed ***", flush=True)\n'
                     'print("**in function crypto:sign/5\\n**error:original_otp_reason", '
                     'file=sys.stderr, flush=True)\n'
@@ -284,16 +285,21 @@ class FailureDiagnostics(unittest.TestCase):
             env = os.environ.copy()
             for name in ('MESON_BUILD_ROOT', 'REBAR_BASE_DIR', 'YUZU_GATEWAY_TEST_LOG_DIR'):
                 env.pop(name, None)
+            env['PYTHONIOENCODING'] = 'cp1252'
             build = os.path.join(directory, 'build')
+            # This whole selftest has a 30 s Meson budget. Bound the two
+            # nested children to at most half of it together; they compile no
+            # targets and each fake test exits immediately.
             setup = subprocess.run(['meson', 'setup', build, directory], env=env,
-                                   capture_output=True, text=True, timeout=15)
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             run = subprocess.run(['meson', 'test', '-C', build, '--no-rebuild',
                                   '--print-errorlogs', '--num-processes', '1'], env=env,
-                                 capture_output=True, text=True, timeout=25)
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
             self.assertNotEqual(run.returncode, 0)
             console = run.stdout + run.stderr
             self.assertIn('original_otp_reason', console)
+            self.assertIn('native diagnostic:', console)
             self.assertIn('fixture:broken_test_/0', console)
             self.assertIn('Full gateway output:', console)
             with open(os.path.join(build, 'meson-logs', 'testlog.json'), encoding='utf-8') as stream:
@@ -302,6 +308,7 @@ class FailureDiagnostics(unittest.TestCase):
             logs = glob.glob(os.path.join(build, 'meson-logs', 'yuzu_test_gateway_*.log'))
             self.assertEqual(len(logs), 2)
             self.assertTrue(all(_read(path).count('later passing output') == 400 for path in logs))
+            self.assertTrue(all('native diagnostic: \u2550\ufffd' in _read(path) for path in logs))
 
 
 class WrapperDeadline(unittest.TestCase):
@@ -322,6 +329,19 @@ class WrapperDeadline(unittest.TestCase):
         namespace.update(overrides)
         return namespace
 
+    def test_stream_replaces_invalid_utf8_without_losing_the_summary(self):
+        # rebar3's output can include bytes from native tools. One bad byte
+        # must neither kill the reader nor discard the later terminal result.
+        ns = self.functions(gateway_dir=ROOT, env=os.environ.copy(),
+                            windows_stdio_isolation=lambda: {})
+        child = [sys.executable, '-c',
+                 'import os; os.write(1, b"diagnostic: \\xe2\\x95\\x90\\xff\\nAll 2 tests passed.\\n")']
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc, output = ns['_run_streamed'](child, 5)
+        self.assertEqual(rc, 0)
+        self.assertIn('diagnostic: \u2550\ufffd', output)
+        self.assertIn('All 2 tests passed.', output)
+
     def test_output_eof_does_not_end_the_process_deadline(self):
         # Real EOF while the child stays alive: previously the timed reader
         # exited and proc.wait() then waited forever. The child has its own
@@ -330,7 +350,7 @@ class WrapperDeadline(unittest.TestCase):
             [sys.executable, '-c',
              'import os,time; print("before EOF",flush=True); '
              'os.close(1); os.close(2); time.sleep(5)'],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         try:
             started = time.monotonic()
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
@@ -349,7 +369,7 @@ class WrapperDeadline(unittest.TestCase):
     def test_eof_from_a_successfully_exited_child_still_passes(self):
         with subprocess.Popen([sys.executable, '-c', 'print("All 2 tests passed.")'],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              text=True) as proc:
+                              text=True, encoding="utf-8", errors="replace") as proc:
             with redirect_stdout(io.StringIO()):
                 rc, output = self.functions()['_stream_until_exit'](proc, 5)
             self.assertEqual(rc, 0)
@@ -357,7 +377,7 @@ class WrapperDeadline(unittest.TestCase):
 
     def test_exit_zero_during_deadline_cleanup_does_not_turn_green(self):
         proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(0.3)'],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         try:
             # Simulate the child naturally finishing while diagnostics run,
             # before the kill reaches it. Its final status is genuinely 0.
@@ -449,9 +469,9 @@ class StrictEUnitVerdict(unittest.TestCase):
                 with open(log, 'w', encoding='utf-8') as f:
                     f.write(text)
                 p = subprocess.run([sys.executable, script, 'cancel-tolerant', rc, log, '--github'],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
                 self.assertEqual(p.returncode, want, p.stdout + p.stderr)
-            p = subprocess.run([sys.executable, script], capture_output=True, text=True)
+            p = subprocess.run([sys.executable, script], capture_output=True, text=True, encoding="utf-8", errors="replace")
             self.assertEqual(p.returncode, 2)
 
     def test_shell_gates_use_this_parser(self):
@@ -489,10 +509,10 @@ class StrictEUnitVerdict(unittest.TestCase):
                 with open(log, 'w', encoding='utf-8') as f:
                     f.write(text)
                 p = subprocess.run([sys.executable, script, 'strict', 'ct', rc, log],
-                                   capture_output=True, text=True)
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
                 self.assertEqual(p.returncode, want, text + p.stdout + p.stderr)
             p = subprocess.run([sys.executable, script, 'strict', 'ct', '0'],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
             self.assertEqual(p.returncode, 2)
 
 
@@ -533,7 +553,7 @@ class LocalRunnerBehaviour(unittest.TestCase):
                        STUB_CT_OUT=ct[0], STUB_CT_RC=str(ct[1]),
                        STUB_EUNIT_OUT=eunit[0], STUB_EUNIT_RC=str(eunit[1]))
             p = subprocess.run(['bash', self.RUNNER] + args, env=env,
-                               capture_output=True, text=True, timeout=120)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
             return p.returncode, p.stdout + p.stderr
 
     def test_ct_verdict_comes_from_the_summary(self):
@@ -661,7 +681,7 @@ class AssertGatewayTests(unittest.TestCase):
                 with open(os.path.join(d, 'meson-info', 'intro-tests.json'), 'w', encoding='utf-8') as f:
                     json.dump(tests, f)
             return subprocess.run([sys.executable, self.SCRIPT, d],
-                                  capture_output=True, text=True).returncode
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace").returncode
 
     def test_verdicts(self):
         names = ['gateway eunit shard A', 'gateway eunit shard B', 'gateway eunit shard C',

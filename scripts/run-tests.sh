@@ -159,78 +159,53 @@ run_erlang_unit() {
     cd "$PROJECT_ROOT"
 }
 
+# A successful rebar exit alone does not establish that CT executed anything.
+# Keep a unique full transcript on failure; judge the entire capture before
+# displaying its tail so diagnostics cannot become the execution evidence.
+run_ct_suite() {
+    local label="$1" suite="$2" capture rc
+    shift 2
+    if ! capture=$(mktemp "${TMPDIR:-/tmp}/yuzu_test_ct_gate.XXXXXX"); then
+        fail "$label (cannot capture output)"
+        return
+    fi
+    if (cd "$GATEWAY_DIR" && rebar3 ct --dir apps/yuzu_gw/test/ct --suite="$suite" "$@") >"$capture" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    tail -10 "$capture"
+    if python3 "$SCRIPT_DIR/gateway_test_summary.py" strict "$suite" "$rc" "$capture"; then
+        rm -f "$capture"
+        pass "$label"
+    else
+        echo "  Full Common Test output: $capture"
+        fail "$label"
+    fi
+}
+
 # ── Tier 3: Erlang Common Test Suites ───────────────────────────────
 run_erlang_ct() {
     banner "ERLANG COMMON TEST SUITES"
-
     if ! command -v rebar3 &>/dev/null; then
         skip "rebar3 not found"
         return
     fi
-
-    cd "$GATEWAY_DIR"
-
-    # #1005: CT *_SUITE.erl files live in test/ct/ (separate from
-    # *_tests.erl in test/) so EUnit's dir-scan no longer discovers
-    # them and emits "tests were cancelled" trailers that fail the gate.
-    CT_DIR="apps/yuzu_gw/test/ct"
-
-    # E2E suite
-    echo "  Running e2e suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_e2e_SUITE 2>&1 | tail -10; then
-        pass "Gateway E2E suite"
-    else
-        fail "Gateway E2E suite"
-    fi
-
-    # Integration suite
-    echo ""
-    echo "  Running integration suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_integration_SUITE 2>&1 | tail -10; then
-        pass "Gateway integration suite"
-    else
-        fail "Gateway integration suite"
-    fi
-
-    # Metrics E2E suite
-    echo ""
-    echo "  Running metrics E2E suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_metrics_e2e_SUITE 2>&1 | tail -10; then
-        pass "Gateway metrics E2E suite"
-    else
-        fail "Gateway metrics E2E suite"
-    fi
-
-    # Prometheus endpoint suite
-    echo ""
-    echo "  Running Prometheus endpoint suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_prometheus_SUITE 2>&1 | tail -10; then
-        pass "Gateway Prometheus endpoint suite"
-    else
-        fail "Gateway Prometheus endpoint suite"
-    fi
-
-    cd "$PROJECT_ROOT"
+    run_ct_suite "Gateway E2E suite" yuzu_gw_e2e_SUITE
+    run_ct_suite "Gateway integration suite" yuzu_gw_integration_SUITE
+    run_ct_suite "Gateway metrics E2E suite" yuzu_gw_metrics_e2e_SUITE
+    run_ct_suite "Gateway Prometheus endpoint suite" yuzu_gw_prometheus_SUITE
 }
 
 # ── Tier 4: Erlang Performance Tests ───────────────────────────────
 run_erlang_perf() {
     banner "ERLANG PERFORMANCE TESTS"
-
     if ! command -v rebar3 &>/dev/null; then
         skip "rebar3 not found"
         return
     fi
-
-    cd "$GATEWAY_DIR"
-    echo "  Running performance suite (this may take several minutes)..."
     echo "  Configure with: YUZU_PERF_AGENTS=N YUZU_PERF_HEARTBEATS=N"
-    if rebar3 ct --suite=yuzu_gw_perf_SUITE --verbose 2>&1 | tail -30; then
-        pass "Gateway performance tests"
-    else
-        fail "Gateway performance tests"
-    fi
-    cd "$PROJECT_ROOT"
+    run_ct_suite "Gateway performance tests" yuzu_gw_perf_SUITE --verbose
 }
 
 # ── Tier 5: Full-Stack Integration Tests ────────────────────────────
