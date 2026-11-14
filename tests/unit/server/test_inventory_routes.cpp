@@ -88,6 +88,17 @@ struct InvHarness {
     std::optional<SoftwareFleetQuery> last_fleet_query; // /software/devices
     std::vector<std::string> last_synced_ids;
 
+    // Find software panel fixtures.
+    std::vector<SoftwareComponentRow> component_rows;
+    std::vector<std::string> distinct_versions;           // installs and components alike
+    std::unordered_map<std::string, std::string> host_os; // the roster's OS strings
+    SoftwareTotals app_totals{40, 12, 0};
+    SoftwareTotals component_totals{9, 4, 1};
+    bool totals_degrade = false;
+    std::optional<SoftwareComponentQuery> last_component_query;
+    software_catalogue::DevicesReader fleet_reader; // the fleet read the REST lookup is given
+    software_list::TotalsReads totals_reads;        // the totals reads the REST lookup is given
+
     int count(const std::string& what) const {
         return static_cast<int>(std::ranges::count(calls, what));
     }
@@ -203,6 +214,71 @@ struct InvHarness {
                 return std::nullopt;
             return last_synced;
         };
+        fleet_reader = fleet;
+        totals_reads.catalog_meta = [this]() -> std::optional<CatalogRollupMeta> {
+            calls.push_back("find_meta");
+            if (degrade)
+                return std::nullopt;
+            return CatalogRollupMeta{refreshed_at, 1, 5};
+        };
+        totals_reads.component_meta = [this]() -> std::optional<ComponentRollupMeta> {
+            calls.push_back("find_component_meta");
+            if (degrade)
+                return std::nullopt;
+            return ComponentRollupMeta{refreshed_at};
+        };
+        totals_reads.title_totals = [this](std::string_view) -> std::optional<SoftwareTotals> {
+            calls.push_back("find_title_totals");
+            if (degrade || totals_degrade)
+                return std::nullopt;
+            return app_totals;
+        };
+        totals_reads.version_set_totals = [this](std::string_view, const std::vector<std::string>&)
+            -> std::optional<SoftwareTotals> {
+            calls.push_back("find_version_totals");
+            if (degrade || totals_degrade)
+                return std::nullopt;
+            return app_totals;
+        };
+        totals_reads.component_totals = [this](std::string_view, std::string_view,
+                                               const std::optional<std::vector<std::string>>&)
+            -> std::optional<SoftwareTotals> {
+            calls.push_back("find_component_totals");
+            if (degrade || totals_degrade)
+                return std::nullopt;
+            return component_totals;
+        };
+        auto components_fn = [this](const SoftwareComponentQuery& q)
+            -> std::optional<std::vector<SoftwareComponentRow>> {
+            last_component_query = q;
+            if (degrade)
+                return std::nullopt;
+            std::vector<SoftwareComponentRow> out;
+            for (const auto& r : component_rows) {
+                if (q.agent_ids && std::ranges::find(*q.agent_ids, r.agent_id) == q.agent_ids->end())
+                    continue;
+                if (static_cast<int>(out.size()) == q.limit)
+                    break;
+                out.push_back(r);
+            }
+            return out;
+        };
+        auto install_versions_fn = [this](const std::string&, const std::optional<std::vector<std::string>>&)
+            -> std::optional<std::vector<std::string>> {
+            calls.push_back("install_versions");
+            if (degrade)
+                return std::nullopt;
+            return distinct_versions;
+        };
+        auto component_versions_fn = [this](const std::string&, const std::string&,
+                                            const std::optional<std::vector<std::string>>&)
+            -> std::optional<std::vector<std::string>> {
+            calls.push_back("component_versions");
+            if (degrade)
+                return std::nullopt;
+            return distinct_versions;
+        };
+        auto host_os_fn = [this]() { return host_os; };
         InventoryRoutes::FleetReadFn fleet_read_fn = fleet_read;
         if (!wire_fleet_read)
             fleet_read_fn = InventoryRoutes::FleetReadFn{};
@@ -217,7 +293,12 @@ struct InvHarness {
                                                            .connected_fn = connected,
                                                            .hostnames_fn = hostnames_fn,
                                                            .last_synced_fn = last_synced_fn,
-                                                           .audit_fn = audit});
+                                                           .audit_fn = audit,
+                                                           .components_fn = components_fn,
+                                                           .install_versions_fn = install_versions_fn,
+                                                           .component_versions_fn = component_versions_fn,
+                                                           .totals_reads = totals_reads,
+                                                           .host_os_fn = host_os_fn});
     }
 
     bool audited(const std::string& what) const {
@@ -1054,4 +1135,331 @@ TEST_CASE("software routes: a well-formed or empty limit reads the store without
         CHECK_FALSE(contains(dev->body, "invalid limit"));
         CHECK(h.last_fleet_query.has_value());
     }
+}
+
+// ───────────────────── Find software (SAM-18) ──────────────────────────────────
+
+namespace {
+
+namespace swl = yuzu::server::software_list;
+
+const char* kFind = "/fragments/inventory/software/find";
+
+SoftwareFleetRow find_fleet_row(std::string agent, std::string ver) {
+    auto r = fleet_row(std::move(agent), "ExampleApp", std::move(ver));
+    r.facet_status = "full";
+    r.entry.install_location = "C:\\Program Files\\ExampleApp";
+    r.entry.install_type = "installer";
+    r.last_confirmed_at = 900;
+    return r;
+}
+
+SoftwareComponentRow find_component_row(std::string agent, std::string ver) {
+    SoftwareComponentRow r;
+    r.agent_id = std::move(agent);
+    r.kind = "java";
+    r.path_hash = r.agent_id;
+    r.name = "log4j-core";
+    r.version = std::move(ver);
+    r.version_source = "pom.properties";
+    r.path = "/opt/example/lib/log4j-core.jar";
+    r.anchor_app = "/opt/example";
+    r.facet_status = "full";
+    r.last_confirmed_at = 900;
+    return r;
+}
+
+/// The device ids of the table, in page order (the hostname link carries the agent id).
+std::vector<std::string> table_agents(const std::string& body) {
+    std::vector<std::string> out;
+    const std::string key = "href=\"/hardware/ci?id=";
+    for (auto p = body.find(key); p != std::string::npos; p = body.find(key, p + 1)) {
+        const auto s = p + key.size();
+        out.push_back(body.substr(s, body.find('"', s) - s));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("find software: the fragment renders the REST lookup's rows in its order and its totals",
+          "[inventory][route][find]") {
+    InvHarness h;
+    h.fleet_rows = {find_fleet_row("a001", "4.2.1"), find_fleet_row("a002", "4.2.1"),
+                    find_fleet_row("a003", "4.2.1")};
+    h.hostnames = {{"a001", "host-0001"}, {"a002", "host-0002"}, {"a003", "host-0003"}};
+    h.last_synced = {{"a001", 100}, {"a002", 100}, {"a003", 100}};
+    h.app_totals = SoftwareTotals{1284, 1207, 0};
+    h.host_os = {{"a001", "windows"}, {"a002", "linux"}, {"a003", "darwin"}};
+
+    auto r = h.sink.Get(std::string(kFind) + "?name=ExampleApp&kind=app");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+
+    // The REST handler's own calls with the same query: same rows, same order.
+    swl::Params rest_params;
+    rest_params.emplace("name", "ExampleApp");
+    auto parsed = swl::parse_list_params(rest_params);
+    REQUIRE(parsed);
+    parsed->base.query.limit = static_cast<int>(kSoftwareFindPageSize);
+    const auto rest = swl::read_list_page(h.fleet_reader, *parsed, h.scope);
+    REQUIRE(rest);
+    std::vector<std::string> expect;
+    for (const auto& row : rest->rows)
+        expect.push_back(row.agent_id);
+    CHECK(expect.size() == 3);
+    CHECK(table_agents(r->body) == expect);
+    REQUIRE(h.last_fleet_query);
+    CHECK(h.last_fleet_query->name == "ExampleApp");
+    CHECK(h.last_fleet_query->limit == kSoftwareFindPageSize);
+    CHECK_FALSE(h.last_fleet_query->version.has_value()); // blank inputs are not parameters
+    CHECK(contains(r->body, "host-0001"));
+    CHECK(contains(r->body, "<span class=\"inv-pill lin\">Linux</span>"));
+    CHECK(contains(r->body, "<span class=\"inv-pill mac\">macOS</span>"));
+
+    // The card is the REST totals block for that query.
+    const auto totals = swl::read_application_totals(h.totals_reads, parsed->base.query);
+    REQUIRE(totals.status == swl::TotalsStatus::kServed);
+    CHECK(totals.totals.devices == 1207);
+    CHECK(contains(r->body, "<div class=\"h\">Devices</div><div class=\"big\">1,207</div>"));
+    CHECK(contains(r->body, "<div class=\"h\">Installs</div><div class=\"big\">1,284</div>"));
+    CHECK(h.audited("inventory.software.query|success"));
+    CHECK_FALSE(h.audited("inventory.software.query|denied"));
+}
+
+TEST_CASE("find software: a service-scoped token is denied before any read", "[inventory][route][find]") {
+    InvHarness h;
+    h.service_scoped = true;
+    h.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    auto r = h.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK_FALSE(h.last_fleet_query);
+    CHECK_FALSE(h.last_component_query);
+    CHECK(h.calls.empty());
+    CHECK(h.audited("inventory.software.query|denied"));
+    CHECK_FALSE(contains(r->body, "host-"));
+
+    // No fleet-read gate wired: 503, nothing read.
+    InvHarness unwired(false);
+    auto u = unwired.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(u);
+    CHECK(u->status == 503);
+    CHECK_FALSE(unwired.last_fleet_query);
+
+    // A caller refused by the gate reads nothing.
+    InvHarness refused;
+    refused.allow_fleet_read = false;
+    auto f = refused.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(f);
+    CHECK(f->status == 403);
+    CHECK_FALSE(refused.last_fleet_query);
+}
+
+TEST_CASE("find software: a degraded store renders the retry banner and audits failure",
+          "[inventory][route][find]") {
+    InvHarness h;
+    h.degrade = true;
+    auto r = h.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(contains(r->body, "Inventory store unavailable."));
+    CHECK(contains(r->body, "data-act=\"retry\""));
+    CHECK_FALSE(contains(r->body, "Nothing found"));
+    CHECK_FALSE(contains(r->body, "<table"));
+    CHECK(h.audited("inventory.software.query|failure"));
+    CHECK_FALSE(h.audited("inventory.software.query|success"));
+
+    // A degraded totals read, or a degraded last-poll read, is the same banner: never a table
+    // without its count, never a blank last-synced column.
+    InvHarness t;
+    t.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    t.totals_degrade = true;
+    auto tr = t.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(tr);
+    CHECK(contains(tr->body, "Inventory store unavailable."));
+    CHECK(t.audited("inventory.software.query|failure"));
+    InvHarness s;
+    s.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    s.last_synced_degrade = true;
+    auto sr = s.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(sr);
+    CHECK(contains(sr->body, "Inventory store unavailable."));
+    CHECK_FALSE(contains(sr->body, "<table"));
+}
+
+TEST_CASE("find software: a bad cursor renders a caveat with status 200", "[inventory][route][find]") {
+    InvHarness h;
+    h.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    auto r = h.sink.Get(std::string(kFind) + "?name=ExampleApp&cursor=zzz");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(contains(r->body, "inv-caveat"));
+    CHECK_FALSE(contains(r->body, "<table"));
+    CHECK_FALSE(contains(r->body, "Nothing found"));
+    // A Load-more request refused the same way answers inside its own row.
+    CHECK(r->body.starts_with("<tr><td colspan=\"8\">"));
+    CHECK_FALSE(h.audited("inventory.software.query|success"));
+}
+
+TEST_CASE("find software: kind=java reads the components model with the kind pushed down",
+          "[inventory][route][find]") {
+    InvHarness h;
+    h.component_rows = {find_component_row("a001", "2.14.1"), find_component_row("a002", "2.13.3")};
+    h.hostnames = {{"a001", "host-0001"}, {"a002", "host-0002"}};
+    h.component_totals = SoftwareTotals{214, 163, 4};
+    auto r = h.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java");
+    REQUIRE(r);
+    REQUIRE(r->status == 200);
+    REQUIRE(h.last_component_query);
+    CHECK(h.last_component_query->kind == "java");
+    CHECK(h.last_component_query->name == "log4j-core");
+    CHECK(h.last_component_query->limit == kSoftwareFindPageSize);
+    CHECK_FALSE(h.last_fleet_query); // the installs model is not read
+    CHECK(h.count("find_component_totals") == 1);
+    CHECK(contains(r->body, "<div class=\"h\">Components</div><div class=\"big\">214</div>"));
+    CHECK(contains(r->body, "<div class=\"h\">Devices</div><div class=\"big\">163</div>"));
+    CHECK(contains(r->body, "<div class=\"big\">4 devices</div>")); // unconfirmed, apart
+    CHECK(contains(r->body, "pom.properties"));
+    CHECK(contains(r->body, "Coverage."));
+    CHECK(contains(r->body, "/api/v1/inventory/software/components?name=log4j-core&amp;kind=java"));
+
+    // The same call REST makes for the same query.
+    swl::Params rest_params;
+    rest_params.emplace("name", "log4j-core");
+    rest_params.emplace("kind", "java");
+    auto parsed = swl::parse_components_params(rest_params);
+    REQUIRE(parsed);
+    const auto totals = swl::read_component_totals(h.totals_reads, parsed->query);
+    REQUIRE(totals.status == swl::TotalsStatus::kServed);
+    CHECK(totals.totals.devices == 163);
+
+    // python and node push their own kind down; anything else is refused before a read.
+    InvHarness py;
+    (void)py.sink.Get(std::string(kFind) + "?name=requests&kind=python");
+    REQUIRE(py.last_component_query);
+    CHECK(py.last_component_query->kind == "python");
+    InvHarness bad;
+    auto b = bad.sink.Get(std::string(kFind) + "?name=x&kind=native");
+    REQUIRE(b);
+    CHECK(contains(b->body, "Unknown kind."));
+    CHECK_FALSE(bad.last_fleet_query);
+    CHECK_FALSE(bad.last_component_query);
+    CHECK(bad.calls.empty());
+}
+
+TEST_CASE("find software: a confined caller gets rows on its devices and no fleet count",
+          "[inventory][route][find]") {
+    InvHarness h;
+    h.scope = ids({"a001"});
+    h.fleet_rows = {find_fleet_row("a001", "4.2.1"), find_fleet_row("a002", "4.2.1")};
+    auto r = h.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(table_agents(r->body) == std::vector<std::string>{"a001"});
+    CHECK(contains(r->body, "Fleet totals are not shown to an account scoped to management groups"));
+    CHECK_FALSE(contains(r->body, "fs-cards"));
+    CHECK(h.count("find_title_totals") == 0);
+    CHECK(h.count("find_meta") == 0);
+    REQUIRE(h.last_fleet_query);
+    REQUIRE(h.last_fleet_query->agent_ids);
+    CHECK(*h.last_fleet_query->agent_ids == std::vector<std::string>{"a001"});
+}
+
+TEST_CASE("find software: a version range resolves against the distinct versions and a status "
+          "filter drops the count",
+          "[inventory][route][find]") {
+    InvHarness h;
+    h.fleet_rows = {find_fleet_row("a001", "2.1")};
+    h.distinct_versions = {"1.0", "2.1", "2.4", "3.0"};
+    auto r = h.sink.Get(std::string(kFind) +
+                        "?name=ExampleApp&kind=app&version=&version_min=2.0&version_max=2.5");
+    REQUIRE(r);
+    REQUIRE(h.last_fleet_query);
+    REQUIRE(h.last_fleet_query->versions);
+    CHECK(*h.last_fleet_query->versions == std::vector<std::string>{"2.1", "2.4"});
+    CHECK_FALSE(h.last_fleet_query->version.has_value());
+    CHECK(h.count("install_versions") == 1);
+    CHECK(h.count("find_version_totals") == 1); // a range reads the live version-set totals
+    CHECK(contains(r->body, "version_min=2.0&amp;version_max=2.5"));
+
+    // A range with an exact version is refused by the shared parser, in a caveat.
+    InvHarness both;
+    auto c = both.sink.Get(std::string(kFind) + "?name=ExampleApp&version=1&version_min=2");
+    REQUIRE(c);
+    CHECK(c->status == 200);
+    CHECK(contains(c->body, "inv-caveat"));
+    CHECK_FALSE(both.last_fleet_query);
+
+    // A degraded distinct-version read is the retry banner and a failure audit.
+    InvHarness d;
+    d.degrade = true;
+    auto dr = d.sink.Get(std::string(kFind) + "?name=ExampleApp&version_min=2");
+    REQUIRE(dr);
+    CHECK(contains(dr->body, "Inventory store unavailable."));
+    CHECK(d.audited("inventory.software.query|failure"));
+
+    // The "show only these" link: a status filter is pushed down and the count is not shown.
+    InvHarness s;
+    s.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    auto sr = s.sink.Get(std::string(kFind) + "?name=ExampleApp&status=unconfirmed");
+    REQUIRE(sr);
+    REQUIRE(s.last_fleet_query);
+    CHECK(s.last_fleet_query->status == "unconfirmed");
+    CHECK(contains(sr->body, "No count for these filters."));
+    CHECK(contains(sr->body, "status: unconfirmed"));
+    CHECK(s.count("find_title_totals") == 0);
+}
+
+TEST_CASE("find software: Load more returns the next rows only, from the cursor, without re-reading "
+          "the totals",
+          "[inventory][route][find]") {
+    InvHarness h;
+    for (int i = 0; i < 120; ++i)
+        h.fleet_rows.push_back(find_fleet_row(dev_id(i), "4.2.1"));
+
+    auto first = h.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(first);
+    CHECK(table_agents(first->body).size() == 50);
+    CHECK(contains(first->body, "fs-cards"));
+    CHECK(h.count("find_title_totals") == 1);
+
+    const std::string url2 = next_url(first->body, "fmore");
+    CHECK(contains(url2, "cursor="));
+    CHECK(contains(url2, "shown=50"));
+    auto second = h.sink.Get(url2);
+    REQUIRE(second);
+    CHECK(second->body.starts_with("<tr"));
+    CHECK_FALSE(contains(second->body, "fs-cards"));
+    CHECK_FALSE(contains(second->body, "<table"));
+    const auto ids2 = table_agents(second->body);
+    REQUIRE(ids2.size() == 50);
+    CHECK(ids2.front() == dev_id(50));
+    CHECK(h.count("find_title_totals") == 1); // not read again
+    CHECK(h.audit_details.back().find("page=continuation") != std::string::npos);
+
+    auto third = h.sink.Get(next_url(second->body, "fmore"));
+    REQUIRE(third);
+    CHECK(table_agents(third->body).size() == 20);
+    CHECK(contains(third->body, "All 120 matching rows are loaded."));
+    CHECK_FALSE(contains(third->body, "data-act=\"fmore\""));
+}
+
+TEST_CASE("find software: an empty answer is a real zero and a missing name asks for one",
+          "[inventory][route][find]") {
+    InvHarness h; // no rows, totals zero
+    h.app_totals = SoftwareTotals{0, 0, 0};
+    auto r = h.sink.Get(std::string(kFind) + "?name=Nothing");
+    REQUIRE(r);
+    CHECK(contains(r->body, "Nothing found."));
+    CHECK(contains(r->body, "Search Java components for Nothing"));
+    CHECK_FALSE(contains(r->body, "Inventory store unavailable."));
+    CHECK(h.audited("inventory.software.query|success"));
+
+    InvHarness n;
+    auto m = n.sink.Get(std::string(kFind) + "?name=&kind=app");
+    REQUIRE(m);
+    CHECK(contains(m->body, "A package name is required."));
+    CHECK_FALSE(n.last_fleet_query);
+    CHECK(n.audits.empty());
 }

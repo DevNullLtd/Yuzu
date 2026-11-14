@@ -24,6 +24,7 @@
 #include "authz_gates.hpp"             // authz::FleetReadGate (the Software fragments' SOLE gate)
 #include "inventory_types.hpp"       // InventoryDeviceRow / InventoryDevicesResult (store-free)
 #include "software_catalogue_model.hpp" // KpiFigures (the page does no arithmetic of its own)
+#include "software_list_model.hpp"      // TotalsReads (the Find software panel reads the REST lookup's model)
 #include "software_inventory_store.hpp" // SoftwareCatalogRow / SoftwareVersionCount / SoftwareEntry / SoftwareFleetRow / *Query
 
 #include <httplib.h>
@@ -93,6 +94,64 @@ struct SoftwareDevicesTable {
     bool scoped{false};                ///< confined caller: no `of M`, management-group note
     std::int64_t now_secs{0};
 };
+
+// -- Find software panel (SAM-18): one searchable answer to "how many, on which devices, how
+// fresh" through the SAME model the REST lookups (`GET /api/v1/inventory/software[/components]`)
+// call, so the card equals the REST `totals` and the rows are the REST rows.
+
+/// Rows per Find software page (the REST call line the panel shows carries the same `limit`).
+inline constexpr std::int64_t kSoftwareFindPageSize = 50;
+
+/// The panel's inputs as the route parsed them. `kind` is "app" (Applications) or a component
+/// kind: "java" | "python" | "node".
+struct SoftwareFindFilters {
+    std::string name, kind{"app"}, version, version_min, version_max;
+    std::string status;  ///< "" | "unconfirmed" (the "show only these" link)
+    std::string cursor;  ///< non-empty = a Load-more page: the rows only
+};
+
+/// One table row, resolved by the route (hostname, last poll) so the renderer reads nothing.
+struct SoftwareFindRow {
+    std::string agent_id;
+    std::string hostname;  ///< "" = the roster does not know the device
+    std::string os;        ///< the roster's OS string; "" = unknown
+    std::string ecosystem; ///< installs only: the OS-family fallback when the roster has no OS
+    std::string name;
+    std::string version;
+    std::string version_source; ///< components: where the version was read from
+    std::string path;           ///< installs: install location; components: the component path
+    std::string anchor_app;     ///< components: the application folder it sits inside
+    std::string install_type;   ///< installs only
+    std::string status;         ///< current | unconfirmed | disabled
+    std::int64_t last_confirmed_at{0};     ///< 0 = never
+    std::optional<std::int64_t> last_synced; ///< server-receipt epoch of the last sync; nullopt = never
+};
+
+/// The REST `totals` block as the panel shows it. `devices_unconfirmed` is served for components
+/// only (the model does not return it for installs).
+struct SoftwareFindTotals {
+    std::int64_t rows{0};
+    std::int64_t devices{0};
+    std::int64_t devices_unconfirmed{0};
+    std::optional<std::int64_t> as_of; ///< rollup refresh epoch; nullopt = computed live
+};
+
+struct SoftwareFindData {
+    SoftwareFindFilters f;
+    /// nullopt = STORE DEGRADE: the retry banner, never an empty table.
+    std::optional<std::vector<SoftwareFindRow>> rows;
+    std::optional<SoftwareFindTotals> totals;
+    std::string totals_omitted; ///< when !totals: "scope" | "filters" | "building"
+    std::string next_cursor;    ///< non-empty = more rows follow
+    std::int64_t shown_before{0}; ///< rows on the page(s) loaded so far, this one included
+    bool confined{false};         ///< management-group-confined caller: no fleet count
+    std::int64_t now_secs{0};
+    std::optional<std::string> caveat; ///< parse/cursor refusal: shown instead of a table (200)
+};
+
+/// The fragment `/fragments/inventory/software/find` swaps into `#fs-results`; a Load-more
+/// request (`f.cursor` non-empty) returns the next `<tr>` rows instead.
+[[nodiscard]] std::string render_software_find(const SoftwareFindData& d);
 
 [[nodiscard]] std::string render_software_page(const SoftwarePageFilters& f,
                                                const SoftwarePageData& d, SoftwarePageMode mode);
@@ -174,6 +233,20 @@ public:
     /// (every row shows its agent_id).
     using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
 
+    /// Find software panel reads (the REST lookups' own store calls, injected so the route is
+    /// unit-testable). Each returns nullopt on a store degrade.
+    using ComponentsFn = std::function<std::optional<std::vector<SoftwareComponentRow>>(
+        const SoftwareComponentQuery&)>;
+    /// Live distinct versions of one installed title / component over the caller's scope
+    /// (`software_list::scope_ids`), the input of a version range.
+    using InstallVersionsFn = std::function<std::optional<std::vector<std::string>>(
+        const std::string& name, const std::optional<std::vector<std::string>>& agent_ids)>;
+    using ComponentVersionsFn = std::function<std::optional<std::vector<std::string>>(
+        const std::string& kind, const std::string& name,
+        const std::optional<std::vector<std::string>>& agent_ids)>;
+    /// agent_id -> OS string from the device roster (one read per page); empty = OS unknown.
+    using HostOsFn = std::function<std::unordered_map<std::string, std::string>()>;
+
     /// Everything the routes need, by name. The Software fragments use `fleet_read_fn` as
     /// their ONLY gate.
     struct Deps {
@@ -189,6 +262,12 @@ public:
         HostnamesFn hostnames_fn;
         LastSyncedFn last_synced_fn;
         AuditFn audit_fn;
+        // Find software panel (SAM-18).
+        ComponentsFn components_fn;
+        InstallVersionsFn install_versions_fn;
+        ComponentVersionsFn component_versions_fn;
+        software_list::TotalsReads totals_reads;
+        HostOsFn host_os_fn;
     };
 
     void register_routes(httplib::Server& svr, Deps deps);

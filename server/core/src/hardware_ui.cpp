@@ -890,14 +890,17 @@ std::string render_hardware_software_lens(const std::string& agent_id,
                     "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
                     "data-gpf=\"hwsw\"></div>";
     h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
-         "<th>Install date</th><th>Signature</th><th>Ecosystem</th></tr></thead><tbody>";
+         "<th>Install date</th><th>Signature</th><th>Ecosystem</th><th>Install type</th>"
+         "<th>Location</th></tr></thead><tbody>";
     for (const auto& e : *software) {
         const std::string searchable = lc(e.name + " " + e.version + " " + e.publisher);
         h += "<tr data-gpf=\"hwsw\" data-gpname=\"" + esc(searchable) + "\"><td class=\"hw-name\">" +
              esc(e.name) + "</td><td class=\"hw-mono\">" + ci_disp(e.version) +
              "</td><td>" + ci_disp(e.publisher) + "</td><td class=\"hw-mono\">" +
              ci_disp(e.install_date) + "</td><td>" + ci_disp(e.signature_status) +
-             "</td><td>" + ci_disp(e.ecosystem) + "</td></tr>";
+             "</td><td>" + ci_disp(e.ecosystem) + "</td><td class=\"hw-mono\">" +
+             ci_disp(e.install_type) + "</td><td class=\"hw-mono\" title=\"" + esc(e.install_location) +
+             "\">" + ci_disp(e.install_location) + "</td></tr>";
     }
     h += "</tbody></table></div>";
     if (truncated)

@@ -941,7 +941,7 @@ place, **Hardware** and **Software**, each its own page:
     for it (see `inventory.sync.request` in [Audit log](audit-log.md)).
   - **Installed software** — the same per-device software list as before (audited
     `inventory.device.software`), now with its own filter box and, for the first time,
-    rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
+    rendered **Signature**, **Ecosystem**, **Install type** and **Location** columns (Location is a dash where the collector reports no single folder). Carries the same **Sync now**
     affordance, scoped to the `installed_software` source.
   - **Tags and properties** — inline add/remove via the existing tag routes. Add is
     shown when a `Tag:Write` probe passes for the device; Remove needs its own
@@ -997,6 +997,26 @@ place, **Hardware** and **Software**, each its own page:
   catalogue model that the REST and MCP twins (`GET /api/v1/inventory/software/catalogue`,
   `query_software_catalogue`) share, so the page, the API and the agent tools cannot
   disagree.
+  - **Find software** (the first block on the page). Type a package name and press **Find**
+    to see how many installs and devices carry it, where, and how fresh the data is. The
+    search runs the same model as `GET /api/v1/inventory/software`, so the counts equal that
+    route's `totals` and the table rows are its rows, with the REST call shown under the
+    box (copy it into a script) and **Export CSV** pointing at the same route with
+    `format=csv`. Name matching is exact. Add an exact version, or a from/to range (inclusive,
+    in the catalogue's version order), to narrow it. The **Applications** chip searches
+    installed applications; **Java**, **Python** and **Node** search the components found
+    inside applications (`GET /api/v1/inventory/software/components`), and say plainly that
+    a device that has not sent its component list cannot be ruled in or out. The table runs
+    application, then version (newest first on each page), then device; each row shows the
+    OS, install location (or component path and the application folder it sits in), install
+    type, status (current, unconfirmed or disabled), when a report last confirmed it, and
+    **Last synced**, which turns amber after 48 hours. **Load more rows** continues from the
+    cursor. For component searches the count card also shows how many of the devices were
+    not confirmed by their last report, with a link that lists only those; installs searches
+    carry no such figure because the model does not return one. An account scoped to
+    management groups gets the rows on its own devices and no fleet count (a count of part
+    of the fleet could be read as the whole), and a store that does not answer shows a retry
+    banner, never an empty table. Every search is audited as `inventory.software.query`.
   - **Metrics strip.** Inventory coverage (devices reporting software, devices connected
     now, devices not seen in 48 hours), Titles and publishers, Installs with a
     Windows/macOS/Linux bar and the average per device, Stay current (installs on their

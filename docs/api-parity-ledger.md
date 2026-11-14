@@ -188,6 +188,8 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **New REST route with its MCP twin pending (SAM-17).** `GET /api/v1/inventory/software/components` (components found inside applications: instances, devices, last poll, status) is a REST v1 capability whose MCP twin is built by SAM-21. The ledger keys no row on it: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (it is in `paths`). The pending twin is recorded here so it is not silent, and in the same 2026-11-09 ADR-1005 exception entry (revisit by 2026-12-31).
 
+**Find software panel (SAM-18).** `GET /fragments/inventory/software/find` (the Find software panel on `/software`) runs the model of `GET /api/v1/inventory/software` call for call, so the row is `twinned` on that route and `query_installed_software` like the devices fragment, and carries the same lookup-field asymmetry recorded above. Its Java, Python and Node chips answer from `GET /api/v1/inventory/software/components` (no ledger row; MCP twin pending, above). The panel adds no REST or MCP route.
+
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
 **Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused, sees only the error toast "MFA step-up required" (no prompt) and must re-authenticate.
@@ -210,7 +212,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 24 | 14 | 10 |
-| inventory | 4 | 4 | 0 |
+| inventory | 5 | 5 | 0 |
 | dex | 31 | 22 | 9 |
 | guardian | 18 | 10 | 8 |
 | echo | 12 | 3 | 9 |
@@ -233,7 +235,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 31 | 51 |
-| **Total** | **351** | **147** | **204** |
+| **Total** | **352** | **148** | **204** |
 
 Registered `/api/vN/*` routes: 287. OpenAPI `paths` entries: 286. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 220.
 

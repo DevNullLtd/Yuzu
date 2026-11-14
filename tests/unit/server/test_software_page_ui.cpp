@@ -4,6 +4,7 @@
 /// escaping / htmx-attribute / CSP guards that protect the page. The route behaviour (gate,
 /// scope, cursors, audit) lives in test_inventory_routes.cpp.
 
+#include "hardware_routes.hpp" // render_hardware_software_lens (the per-device tab columns)
 #include "inventory_routes.hpp"
 #include "software_catalog_rules.hpp" // software_catalog::kEcosystemFamilies
 
@@ -963,4 +964,278 @@ TEST_CASE("software page: the device pointer names the Hardware route in full", 
     SoftwarePageData d = page();
     d.confined = true;
     REQUIRE(has(full({}, d), "Hardware \xE2\x86\x92 Installed software \xE2\x86\x92 Open in Software"));
+}
+
+// ───────────────────── Find software panel (SAM-18) ────────────────────────────
+
+namespace {
+
+SoftwareFindRow find_install(std::string agent, std::string host, std::string ver,
+                             std::string status = "current") {
+    SoftwareFindRow r;
+    r.agent_id = std::move(agent);
+    r.hostname = std::move(host);
+    r.os = "windows";
+    r.name = "Example Application";
+    r.version = std::move(ver);
+    r.path = "C:\\Program Files\\Example Application";
+    r.install_type = "installer";
+    r.status = std::move(status);
+    r.last_confirmed_at = kNow - 3 * 3600;
+    r.last_synced = kNow - 3 * 3600;
+    return r;
+}
+
+SoftwareFindData find_data(std::vector<SoftwareFindRow> rows) {
+    SoftwareFindData d;
+    d.f.name = "Example Application";
+    d.now_secs = kNow;
+    d.shown_before = static_cast<std::int64_t>(rows.size());
+    d.rows = std::move(rows);
+    d.totals = SoftwareFindTotals{1284, 1207, 0, kNow - 1380};
+    return d;
+}
+
+} // namespace
+
+TEST_CASE("find software: the count card shows installs and devices to a global caller and no "
+          "fleet figure to a confined one",
+          "[inventory][ui][find]") {
+    const std::string g = render_software_find(find_data({find_install("a1", "host-0188", "4.2.1")}));
+    REQUIRE(has(g, "<div class=\"h\">Installs</div><div class=\"big\">1,284</div>"));
+    REQUIRE(has(g, "<div class=\"h\">Devices</div><div class=\"big\">1,207</div>"));
+    REQUIRE(has(g, "Counts as of 23m ago (hourly rollup)."));
+    REQUIRE_FALSE(has(g, "Fleet totals are not shown"));
+
+    SoftwareFindData c = find_data({find_install("a1", "host-0188", "4.2.1")});
+    c.confined = true;
+    c.totals.reset();
+    c.totals_omitted = "scope";
+    const std::string h = render_software_find(c);
+    REQUIRE_FALSE(has(h, "class=\"fs-cards\""));
+    REQUIRE_FALSE(has(h, "1,284"));
+    REQUIRE(has(h, "Fleet totals are not shown to an account scoped to management groups"));
+    REQUIRE(has(h, "rows on devices in your groups"));
+
+    // The other two reasons the model gives for no count.
+    SoftwareFindData f = find_data({find_install("a1", "host-0188", "4.2.1")});
+    f.totals.reset();
+    f.totals_omitted = "filters";
+    REQUIRE(has(render_software_find(f), "No count for these filters."));
+    f.totals_omitted = "building";
+    REQUIRE(has(render_software_find(f), "Counts are still being built."));
+}
+
+TEST_CASE("find software: unconfirmed devices sit apart from the count cards", "[inventory][ui][find]") {
+    SoftwareFindData d = find_data({find_install("a1", "host-0188", "2.14.1", "unconfirmed")});
+    d.f.kind = "java";
+    d.f.name = "log4j-core";
+    d.totals = SoftwareFindTotals{214, 163, 4, std::nullopt};
+    const std::string h = render_software_find(d);
+    // The dashed box is a sibling of the card strip, not a tile inside it.
+    REQUIRE(has(h, "than one copy</div></div></div><div class=\"fs-apart\" role=\"note\">"));
+    REQUIRE(has(h, "<div class=\"big\">4 devices</div>"));
+    REQUIRE(has(h, "status=unconfirmed"));
+    REQUIRE(has(h, "<span class=\"pill warn\""));
+    REQUIRE(has(h, "Counts are computed live when you search."));
+    // No unconfirmed devices (or an installs search, which the model gives no such figure for): no box.
+    d.totals->devices_unconfirmed = 0;
+    REQUIRE_FALSE(has(render_software_find(d), "fs-apart"));
+    d.f.kind = "app";
+    d.totals->devices_unconfirmed = 4;
+    REQUIRE_FALSE(has(render_software_find(d), "fs-apart"));
+}
+
+TEST_CASE("find software: the stale pill appears past 48 h and not before", "[inventory][ui][find]") {
+    auto row = [](std::int64_t synced) {
+        auto r = find_install("a1", "host-0188", "4.2.1");
+        r.last_synced = synced;
+        return r;
+    };
+    REQUIRE(has(render_software_find(find_data({row(kNow - 49 * 3600)})), "inv-pill stale"));
+    REQUIRE_FALSE(has(render_software_find(find_data({row(kNow - 47 * 3600)})), "inv-pill stale"));
+    // Exactly 48 h is not past the window; a device that never synced shows a dash, not a pill.
+    REQUIRE_FALSE(has(render_software_find(find_data({row(kNow - 48 * 3600)})), "inv-pill stale"));
+    auto never = find_install("a1", "host-0188", "4.2.1");
+    never.last_synced.reset();
+    REQUIRE_FALSE(has(render_software_find(find_data({never})), "inv-pill stale"));
+}
+
+TEST_CASE("find software: every dynamic value is HTML-escaped", "[inventory][ui][find]") {
+    auto r = find_install("a\"><img src=x>", "<b>host</b>", "1.0<script>");
+    r.path = "C:\\<i>dir</i>";
+    r.install_type = "<u>t</u>";
+    r.os = "<s>os</s>";
+    SoftwareFindData d = find_data({r});
+    d.f.name = "<script>alert(1)</script>";
+    d.f.version = "\"><x>";
+    d.f.status = "unconfirmed";
+    const std::string h = render_software_find(d);
+    for (const char* raw : {"<script>", "<img", "<b>host", "<i>dir", "<u>t", "<s>os", "<x>"})
+        REQUIRE_FALSE(has(h, raw));
+    REQUIRE(has(h, "&lt;b&gt;host&lt;/b&gt;"));
+    REQUIRE(has(h, "1.0&lt;script&gt;"));
+    // The same for a component row and the nothing-found text.
+    SoftwareFindData c = find_data({r});
+    c.f.kind = "java";
+    c.rows->front().anchor_app = "<a>anchor</a>";
+    c.rows->front().version_source = "<p>src</p>";
+    REQUIRE_FALSE(has(render_software_find(c), "<a>anchor"));
+    REQUIRE_FALSE(has(render_software_find(c), "<p>src"));
+    SoftwareFindData none = find_data({});
+    none.f.name = "<script>alert(1)</script>";
+    REQUIRE_FALSE(has(render_software_find(none), "<script>"));
+    SoftwareFindData cav = find_data({});
+    cav.caveat = "<script>x</script>";
+    REQUIRE_FALSE(has(render_software_find(cav), "<script>"));
+}
+
+TEST_CASE("find software: no hx-on attribute and no inline event handler in any output",
+          "[inventory][ui][find]") {
+    SoftwareFindData comp = find_data({find_install("a1", "host-0188", "2.14.1")});
+    comp.f.kind = "java";
+    comp.totals = SoftwareFindTotals{214, 163, 4, std::nullopt};
+    comp.next_cursor = "cur";
+    SoftwareFindData more = find_data({find_install("a1", "host-0188", "4.2.1")});
+    more.f.cursor = "cur";
+    more.next_cursor = "cur2";
+    SoftwareFindData degraded;
+    degraded.f.name = "x";
+    const std::vector<std::string> outs{
+        render_software_find(find_data({find_install("a1", "host-0188", "4.2.1")})),
+        render_software_find(find_data({})),
+        render_software_find(comp),
+        render_software_find(more),
+        render_software_find(degraded),
+        full({}, page()),
+    };
+    for (const auto& h : outs) {
+        REQUIRE_FALSE(has(h, "hx-on"));
+        for (const char* handler : {" onclick=", " oninput=", " onchange=", " onsubmit=", " onkeyup="})
+            if (&h != &outs.back()) // the page shell keeps its established inline calls
+                REQUIRE_FALSE(has(h, handler));
+    }
+    // The panel's own shell (inside the Full page) adds none either.
+    const std::string shell = full({}, page());
+    const auto panel = shell.substr(shell.find("id=\"fs-panel\""),
+                                    shell.find("id=\"fs-results\"") - shell.find("id=\"fs-panel\""));
+    REQUIRE_FALSE(has(panel, "onclick="));
+    REQUIRE_FALSE(has(panel, "hx-on"));
+    // The chips and the copy button work through the one delegated listener.
+    const std::string sc = software_page_script();
+    REQUIRE(has(sc, "function fsKind(t)"));
+    REQUIRE(has(sc, "closest('[data-fs-kind],[data-fs-copy]')"));
+    REQUIRE(sc.size() < 15000);
+}
+
+TEST_CASE("find software: the panel is the first block of the page, with Applications, Java, "
+          "Python and Node chips and no Native chip",
+          "[inventory][ui][find]") {
+    const std::string h = full({}, page());
+    REQUIRE(has(h, "id=\"fs-panel\""));
+    REQUIRE(h.find("id=\"fs-panel\"") < h.find("id=\"sw-kpis\""));
+    REQUIRE(has(h, "hx-get=\"/fragments/inventory/software/find\""));
+    REQUIRE(has(h, "hx-target=\"#fs-results\""));
+    REQUIRE(has(h, "Scope: whole fleet"));
+    for (const char* chip : {"data-fs-kind=\"app\" aria-pressed=\"true\">Applications<",
+                             "data-fs-kind=\"java\" aria-pressed=\"false\">Java<",
+                             "data-fs-kind=\"python\" aria-pressed=\"false\">Python<",
+                             "data-fs-kind=\"node\" aria-pressed=\"false\">Node<"})
+        REQUIRE(has(h, chip));
+    REQUIRE_FALSE(has(h, "Native"));
+    SoftwarePageData c = page();
+    c.confined = true;
+    REQUIRE(has(full({}, c), "Scope: your management groups"));
+    REQUIRE(full({}, c).find("id=\"fs-panel\"") != std::string::npos);
+}
+
+TEST_CASE("find software: rows read application, version, device, newest version first",
+          "[inventory][ui][find]") {
+    const std::string h = render_software_find(find_data({find_install("a1", "host-0001", "4.2.0"),
+                                                          find_install("a2", "host-0002", "4.2.1"),
+                                                          find_install("a3", "host-0003", "4.2.1")}));
+    const auto at = [&](const std::string& s) { return h.find(s); };
+    REQUIRE(at("<span class=\"inv-mono\">4.2.1</span> <span class=\"inv-grey\">&middot; 2 installs "
+               "on this page") < at("host-0001"));
+    REQUIRE(at("host-0002") < at("host-0003")); // read order kept inside a version
+    REQUIRE(at("host-0003") < at("<span class=\"inv-mono\">4.2.0</span>"));
+    REQUIRE(at("/hardware/ci?id=a2") != std::string::npos);
+    REQUIRE(has(h, "<th scope=\"col\">Install type</th>"));
+    REQUIRE(has(h, ">Last confirmed</th>"));
+    REQUIRE(has(h, "download=\"software-installs.csv\""));
+    REQUIRE(has(h, "/api/v1/inventory/software?name=Example%20Application&amp;format=csv"));
+    REQUIRE(has(h, "/api/v1/inventory/software?name=Example%20Application&amp;limit=50"));
+}
+
+TEST_CASE("find software: a degraded read renders the retry banner and a refusal a caveat, never an "
+          "empty table",
+          "[inventory][ui][find]") {
+    SoftwareFindData d;
+    d.f.name = "Example Application";
+    const std::string h = render_software_find(d); // rows nullopt
+    REQUIRE(has(h, "Inventory store unavailable."));
+    REQUIRE(has(h, "data-act=\"retry\" hx-get=\"/fragments/inventory/software/find?name=Example%20Application"));
+    REQUIRE_FALSE(has(h, "Nothing found"));
+    REQUIRE_FALSE(has(h, "<table"));
+    SoftwareFindData cav;
+    cav.caveat = "that cursor was issued for another filter set";
+    const std::string c = render_software_find(cav);
+    REQUIRE(has(c, "inv-caveat"));
+    REQUIRE_FALSE(has(c, "<table"));
+    // A Load-more page degrades inside its own row.
+    SoftwareFindData more = d;
+    more.f.cursor = "cur";
+    REQUIRE(render_software_find(more).starts_with("<tr><td colspan=\"8\">"));
+}
+
+TEST_CASE("find software: nothing found is a real zero that offers the component search; Load more "
+          "carries the filters and the cursor",
+          "[inventory][ui][find]") {
+    const std::string none = render_software_find(find_data({}));
+    REQUIRE(has(none, "Nothing found."));
+    REQUIRE(has(none, "data-fs-kind=\"java\">Search Java components for Example Application<"));
+    REQUIRE_FALSE(has(none, "<table"));
+    SoftwareFindData comp = find_data({});
+    comp.f.kind = "java";
+    const std::string cn = render_software_find(comp);
+    REQUIRE(has(cn, "Nothing found."));
+    REQUIRE(has(cn, "Coverage."));
+    REQUIRE_FALSE(has(cn, "Search Java components"));
+
+    SoftwareFindData d = find_data({find_install("a1", "host-0188", "4.2.1")});
+    d.f.version_min = "2.0";
+    d.f.version_max = "4.9";
+    d.next_cursor = "c2:abc";
+    d.shown_before = 50;
+    const std::string h = render_software_find(d);
+    REQUIRE(has(h, "data-act=\"fmore\" hx-get=\"/fragments/inventory/software/find?name=Example%20Application"
+                   "&amp;kind=app&amp;version_min=2.0&amp;version_max=4.9&amp;cursor=c2%3Aabc&amp;shown=50\""));
+    REQUIRE(has(h, "hx-target=\"closest tr\""));
+    REQUIRE(has(h, "Load 50 more rows"));
+    // The next page is rows only: no cards, no table frame.
+    SoftwareFindData page2 = d;
+    page2.f.cursor = "c2:abc";
+    page2.next_cursor.clear();
+    const std::string r = render_software_find(page2);
+    REQUIRE(r.starts_with("<tr"));
+    REQUIRE_FALSE(has(r, "fs-cards"));
+    REQUIRE_FALSE(has(r, "<table"));
+    REQUIRE(has(r, "All 50 matching rows are loaded."));
+}
+
+TEST_CASE("find software: the per-device software tab gains Install type and Location columns",
+          "[inventory][ui][find]") {
+    SoftwareEntry e;
+    e.name = "Example Application";
+    e.version = "4.2.1";
+    e.install_type = "installer";
+    e.install_location = "C:\\<b>Apps</b>";
+    SoftwareEntry bare;
+    bare.name = "Example Runtime";
+    const std::string h = render_hardware_software_lens("a1", std::vector<SoftwareEntry>{e, bare},
+                                                         false, true, {}, kNow);
+    REQUIRE(has(h, "<th>Ecosystem</th><th>Install type</th><th>Location</th></tr>"));
+    REQUIRE(has(h, "<td class=\"hw-mono\">installer</td>"));
+    REQUIRE(has(h, "title=\"C:\\&lt;b&gt;Apps&lt;/b&gt;\""));
+    REQUIRE_FALSE(has(h, "<b>Apps"));
 }
