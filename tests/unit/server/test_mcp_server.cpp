@@ -33,6 +33,7 @@
 #include "api_token_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError for classify_fn_for_test
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting / kDestructive*Message
+#include "quarantine_reapply.hpp" // kWhitelistTooLongMessage (the shared whitelist-limit message)
 #include "reserved_definition_id.hpp" // #3685: kMcpDefinitionPrefix, for the pre-seeded-ticket test
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
@@ -33926,7 +33927,13 @@ TEST_CASE("MCP quarantine_device refuses a 513-character whitelist and names the
     const auto minted = nlohmann::json::parse(mint->body);
     REQUIRE(minted.contains("error"));
     std::string text = mint->body;
+    // The input schema's maxLength mirrors the limit, so it normally refuses first and names it
+    // in its own words; the handler's check (the one shared message) is the backstop after the
+    // approval ticket.
+    std::string expected_message =
+        "string exceeds maxLength " + std::to_string(yuzu::server::kQuarantineWhitelistMaxLen) + " (bytes)";
     if (minted["error"]["code"] == yuzu::server::mcp::kApprovalRequired) {
+        expected_message = std::string(yuzu::server::kWhitelistTooLongMessage);
         // The input schema did not stop it: the handler's own check does, after the ticket.
         const std::string approval_id = minted["error"]["data"]["approval_id"].get<std::string>();
         REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
@@ -33937,8 +33944,9 @@ TEST_CASE("MCP quarantine_device refuses a 513-character whitelist and names the
         text = recall->body;
         CHECK(nlohmann::json::parse(text)["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     }
-    // Either way the caller is told the limit, and no record was written.
-    CHECK(text.find("512") != std::string::npos);
+    // Either way the caller is told the limit, in the whole message of the refusal that fired, and
+    // no record was written.
+    CHECK(text.find(expected_message) != std::string::npos);
     auto st = quar.get_status("agent-long");
     REQUIRE(st.has_value());
     CHECK_FALSE(st->has_value());

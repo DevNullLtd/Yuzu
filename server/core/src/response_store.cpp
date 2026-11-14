@@ -889,12 +889,14 @@ bool ResponseStore::shorten_ttl(const std::string& instruction_id, const std::st
     if (!lease)
         return false;
     const std::string expires = std::to_string(now_epoch() + static_cast<int64_t>(keep.count()));
-    // Never raises an earlier expiry: only a row with no expiry (0 = kept forever) or a later
-    // one is moved.
+    // Only SHORTENS a lifetime. A row with an earlier expiry keeps it, and a row with no expiry
+    // (0 = kept forever, a server set to keep responses forever) is left alone: the operator's
+    // retention choice outranks this reconciler's wish to tidy its own replies. (The reaper takes
+    // only `ttl_expires_at > 0`, so giving such a row an expiry would delete it.)
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE response_store.responses SET ttl_expires_at = $1::bigint WHERE instruction_id = $2 "
-        "AND agent_id = $3 AND (ttl_expires_at = 0 OR ttl_expires_at > $1::bigint)",
+        "AND agent_id = $3 AND ttl_expires_at > $1::bigint",
         std::vector<std::string>{expires, instruction_id, agent_id});
     return res.status() == PGRES_COMMAND_OK;
 }

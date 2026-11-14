@@ -20,8 +20,12 @@ firewall plugin's own names.
 """
 import os
 import re
+import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 THIS = "tests/test_legacy_quarantine_plugin_removed_lexical.py"
@@ -73,7 +77,10 @@ ALLOW_FILES = {
 # today are exempt (the new section naming what was removed, and the older sections that are
 # history); a line under any other `## ` heading, or before the first one, is scanned like any
 # other file. A heading is matched by its leading text, so an edit to the end of a title does not
-# silently drop the exemption.
+# silently drop the exemption. An entry is a `## ` heading, which covers everything up to the next
+# `## ` heading (its `### ` subsections included), or a `### ` heading, which covers that
+# subsection only: "## Upgrade notes by release" is where every release's notes land, so it is
+# exempt by the one subsection that names the plugin, never as a whole.
 ALLOW_SECTIONS = {
     "docs/user-manual/upgrading.md": (
         "## \u26a0\ufe0f Breaking: device containment is the firewall plugin's four actions",
@@ -84,7 +91,7 @@ ALLOW_SECTIONS = {
         "## \u26a0\ufe0f Behaviour change: quarantine containment now covers IPv6, and reports honestly",
         "## \u26a0\ufe0f Behaviour change: quarantine is now enforced at instruction dispatch",
         "## \u26a0\ufe0f Behaviour change: raw dispatch now enforces InstructionDefinition approval governance",
-        "## Upgrade notes by release",
+        "### `quarantine` plugin: reporting is now more conservative",
     ),
 }
 
@@ -95,18 +102,30 @@ def allowlisted(rel):
     return rel in ALLOW_FILES or rel.startswith(ALLOW_PREFIXES)
 
 
+def heading_level(line):
+    """2 for a `## ` heading, 3 for a `### ` heading, else 0."""
+    m = re.match(r"(##|###) ", line)
+    return len(m.group(1)) if m else 0
+
+
 def outside_allowed_sections(text, prefixes):
-    """`text` with every line under an allowed `## ` heading blanked, so the scan sees only the
-    rest. The heading line itself belongs to its section. A `## ` inside a fenced code block is not
-    a heading. Line numbers are kept."""
+    """`text` with every line under an allowed heading blanked, so the scan sees only the rest. An
+    allowed `## ` heading covers its `### ` subsections too; an allowed `### ` heading covers that
+    subsection only, ending at the next `## ` or `### ` heading. The heading line itself belongs to
+    its section. A heading inside a fenced code block is not a heading. Line numbers are kept."""
     out = []
     allowed = False
+    allowed_level = 0
     fenced = False
     for line in text.splitlines():
         if line.lstrip().startswith("```"):
             fenced = not fenced
-        elif not fenced and line.startswith("## "):
-            allowed = line.startswith(prefixes)
+        elif not fenced:
+            level = heading_level(line)
+            if level == 2:
+                allowed, allowed_level = line.startswith(prefixes), 2
+            elif level == 3 and not (allowed and allowed_level == 2):
+                allowed, allowed_level = line.startswith(prefixes), 3
         out.append("" if allowed else line)
     return "\n".join(out)
 
@@ -155,22 +174,6 @@ def read_text(rel):
     return raw.decode("utf-8", "replace")
 
 
-# The nine argv shapes the agent's sudoers grants for each iptables tool (#7634); the single
-# statement of them in C++ is iptables_argv_in_sudo_shape.
-IPT_TOOLS = ("/usr/sbin/iptables", "/usr/sbin/ip6tables")
-IPT_SHAPES = (
-    "-S",
-    "-N yuzu-fwq-*",
-    "-A yuzu-fwq-*",
-    "-I INPUT 1 -j yuzu-fwq-*",
-    "-I OUTPUT 1 -j yuzu-fwq-*",
-    "-I FORWARD 1 -j yuzu-fwq-*",
-    "-D * -j yuzu-fwq-*",
-    "-F yuzu-fwq-*",
-    "-X yuzu-fwq-*",
-)
-
-
 class LegacyQuarantinePluginRemoved(unittest.TestCase):
     def test_the_plugin_and_its_definition_file_do_not_exist(self):
         for rel in ("agents/plugins/quarantine", "content/definitions/quarantine.yaml",
@@ -204,37 +207,343 @@ class LegacyQuarantinePluginRemoved(unittest.TestCase):
         self.assertEqual(bare_pfctl, [], "a bare /sbin/pfctl grant would make the narrowed pf lines cosmetic")
         helpers = [g for g in grants if re.search(r"(?:ip6?tables)-(?:save|restore)", g)]
         self.assertEqual(helpers, [], "no caller of iptables-save/-restore remains; do not grant them")
-        # #7634: iptables and ip6tables are no longer granted bare either; each has the nine shapes.
-        bare_ipt = [g for g in grants if re.search(r"NOPASSWD:\s*/usr/sbin/ip6?tables\s*$", g)]
-        self.assertEqual(bare_ipt, [], "a bare iptables or ip6tables grant would make the shape lines cosmetic")
-        ipt_grants = [g for g in grants if re.search(r"NOPASSWD:\s*/usr/sbin/ip6?tables\b", g)]
-        want = ["$ACCOUNT_NAME ALL=(root) NOPASSWD: %s %s" % (tool, shape)
-                for tool in IPT_TOOLS for shape in IPT_SHAPES]
-        self.assertEqual(sorted(ipt_grants), sorted(want),
-                         "the iptables / ip6tables grants must be exactly the eighteen shape lines")
 
-    def test_the_iptables_grants_and_the_agents_shape_predicate_name_the_same_tokens(self):
-        """Lockstep (#7634): scripts/install-agent-user.sh is written from the shapes that
-        iptables_argv_in_sudo_shape accepts. Every fixed token of the grants is spelled in the
-        predicate, and every token the predicate spells is in the grants, so neither can move
-        alone."""
-        header = read_text("agents/plugins/firewall/src/firewall_quarantine_parsers.hpp")
-        self.assertIsNotNone(header)
-        start = header.find("inline bool iptables_argv_in_sudo_shape(")
-        self.assertGreater(start, 0, "iptables_argv_in_sudo_shape is gone from the parsers header")
-        end = header.find("\n}\n", start)
-        body = header[start:end]
-        spelled = set(re.findall(r'"([^"]*)"', body))
-        granted = {t for shape in IPT_SHAPES for t in shape.split()
-                   if t != "*" and not t.startswith("yuzu-fwq-")}
-        self.assertEqual(spelled, granted)
-        # The tool paths and the chain prefix are named through their constants.
-        self.assertIn("kIptablesPath", body)
-        self.assertIn("kIp6tablesPath", body)
-        self.assertIn("ipt_chain_gen(", body)
-        self.assertIn('kIptablesPath = "/usr/sbin/iptables"', header)
-        self.assertIn('kIp6tablesPath = "/usr/sbin/ip6tables"', header)
-        self.assertRegex(header, r'kIptablesChainPrefix\s*=\s*"yuzu-fwq-"')
+
+HELPER_RE = re.compile(r"cat <<'YUZU_FW_HELPER'\n(.*?)\nYUZU_FW_HELPER\n", re.S)
+HEADER = "agents/plugins/firewall/src/firewall_quarantine_parsers.hpp"
+INSTALLER = "scripts/install-agent-user.sh"
+
+
+def helper_text():
+    """The firewall helper exactly as the installer writes it (a quoted heredoc: nothing in it is
+    expanded by the installer)."""
+    text = read_text(INSTALLER)
+    m = HELPER_RE.search(text or "")
+    if not m:
+        raise AssertionError("the installer no longer carries the firewall helper heredoc")
+    return m.group(1) + "\n"
+
+
+def installer_helper_path():
+    m = re.search(r'^FW_HELPER_PATH="([^"]+)"$', read_text(INSTALLER) or "", re.M)
+    return m.group(1) if m else None
+
+
+def header_helper_path():
+    m = re.search(r'kFwHelperPath\s*=\s*"([^"]+)"', read_text(HEADER) or "")
+    return m.group(1) if m else None
+
+
+class IptablesHelperGrant(unittest.TestCase):
+    """The agent account has no iptables grant at all: one root-owned helper, named with no
+    argument and no wildcard, takes the iptables / ip6tables work (#7634). The C++ twin of the
+    helper's grammar is iptables_helper_argv in the parsers header."""
+
+    def grant_lines(self):
+        text = read_text(INSTALLER)
+        self.assertIsNotNone(text)
+        return [l.strip() for l in text.splitlines() if "NOPASSWD:" in l and not l.lstrip().startswith("#")]
+
+    def test_the_sudoers_text_grants_no_iptables_binary_of_any_kind(self):
+        bad = [g for g in self.grant_lines() if re.search(r"ip6?tables", g)]
+        self.assertEqual(bad, [], "no grant may name iptables, ip6tables, -save or -restore; the helper is the grant")
+
+    def test_the_helper_line_has_no_argument_and_no_wildcard(self):
+        lines = [g for g in self.grant_lines() if "FW_HELPER_PATH" in g]
+        self.assertEqual(lines, ["$ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH"])
+        self.assertNotIn("*", lines[0])
+
+    def test_the_helper_path_is_the_same_string_in_the_installer_and_the_header(self):
+        path = installer_helper_path()
+        self.assertEqual(path, "/usr/local/sbin/yuzu-fw-helper")
+        self.assertEqual(header_helper_path(), path)
+
+    def test_no_sudoers_line_other_than_the_helper_follows_the_helper_path_with_text(self):
+        for g in self.grant_lines():
+            self.assertNotRegex(g, r"yuzu-fw-helper\S*\s+\S", g)
+
+    def test_the_helper_is_installed_before_the_sudoers_file_and_removed_and_checked(self):
+        text = read_text(INSTALLER)
+        dispatch = text[text.index('case "$ACTION" in'):]
+        self.assertLess(dispatch.index("install_fw_helper ||"), dispatch.index("install_sudoers"))
+        self.assertIn("remove_fw_helper", dispatch)
+        check = text[text.index("check_install() {"):text.index("# ── action dispatch")]
+        self.assertIn("check_fw_helper ||", check)
+        body = text[text.index("install_fw_helper() {"):text.index("remove_fw_helper() {")]
+        self.assertIn("SKIP_SUDOERS", body)               # --no-sudoers skips it
+        self.assertIn('"$PLATFORM" != "linux"', body)      # Linux only
+        for step in ("mktemp", "chown root:root", "chmod 0755", "sh -n", "mv -f"):
+            self.assertIn(step, body)                      # temp file beside it, rename into place
+
+    def test_the_helper_text_has_no_eval_no_shell_no_command_substitution(self):
+        code = "\n".join(l for l in helper_text().splitlines() if not l.lstrip().startswith("#"))
+        for needle in ("eval", "sh -c", "bash -c", "$(", "`", "$((", "source ", ". /"):
+            self.assertNotIn(needle, code)
+        self.assertTrue(helper_text().startswith("#!/bin/sh\n"))
+        self.assertIn("\nset -u\n", helper_text())
+
+
+def available_shells():
+    found = []
+    for name in ("sh", "dash", "bash"):
+        path = shutil.which(name)
+        if path and os.path.realpath(path) not in [os.path.realpath(f) for f in found]:
+            found.append(path)
+    return found
+
+
+def run_all(argvs):
+    """Run each argv, a few at a time (a process per case is what costs here): the results, in order."""
+    def one(argv):
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(one, argvs))
+
+
+# The helper's accepted argument lists, each with the family it is run for. The C++ twin of this
+# list, and of the adversarial one below, is the iptables_helper_argv group in
+# tests/unit/test_firewall_quarantine_parsers.cpp; the two grammars move together.
+HELPER_ACCEPTED = [
+    ("iptables", ["-S"]),
+    ("ip6tables", ["-S"]),
+    ("iptables", ["-N", "yuzu-fwq-1"]),
+    ("ip6tables", ["-N", "yuzu-fwq-12-f"]),
+    ("iptables", ["-N", "yuzu-fwq-2147483647"]),
+    ("iptables", ["-N", "yuzu-fwq-0000000001"]),
+    ("iptables", ["-F", "yuzu-fwq-7"]),
+    ("ip6tables", ["-X", "yuzu-fwq-7-f"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-j", "DROP"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4-f", "-j", "DROP"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-i", "lo", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-o", "lo", "-j", "ACCEPT"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4", "-p", "icmpv6", "--icmpv6-type", "133", "-j", "ACCEPT"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4", "-p", "icmpv6", "--icmpv6-type", "136", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-p", "udp", "--sport", "68", "--dport", "67", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-d", "203.0.113.53", "-p", "udp", "--dport", "53", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-s", "198.51.100.7", "-p", "tcp", "--sport", "50051",
+                  "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-s", "198.51.100.7", "-p", "tcp", "--sport", "50051",
+                  "--tcp-flags", "RST", "RST", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-s", "10.0.0.5", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-d", "10.0.0.7", "-p", "tcp", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-d", "10.1.0.0/16", "-p", "udp", "--dport", "53", "-j", "ACCEPT"]),
+    ("iptables", ["-A", "yuzu-fwq-4", "-s", "10.0.0.0/32", "-p", "tcp", "--dport", "65535", "-j", "ACCEPT"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4", "-d", "2001:db8::/32", "-p", "tcp", "--dport", "443", "-j", "ACCEPT"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4", "-s", "2001:4860:4860::8888", "-p", "udp", "--sport", "53", "-j", "ACCEPT"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4", "-s", "::", "-p", "tcp", "--sport", "1", "--dport", "2",
+                   "--tcp-flags", "RST", "RST", "-j", "ACCEPT"]),
+    ("ip6tables", ["-A", "yuzu-fwq-4", "-d", "2001:db8::/128", "-p", "udp", "-j", "ACCEPT"]),
+    ("iptables", ["-I", "INPUT", "1", "-j", "yuzu-fwq-3"]),
+    ("ip6tables", ["-I", "OUTPUT", "1", "-j", "yuzu-fwq-3"]),
+    ("iptables", ["-I", "FORWARD", "1", "-j", "yuzu-fwq-3-f"]),
+    ("iptables", ["-D", "INPUT", "-j", "yuzu-fwq-2"]),
+    ("ip6tables", ["-D", "DOCKER-USER", "-j", "yuzu-fwq-2-f"]),
+    ("iptables", ["-D", "a" * 28, "-j", "yuzu-fwq-2"]),
+]
+
+_ADV = [
+    # a tail after a complete rule: split into tokens and glued onto one
+    ["-A", "yuzu-fwq-1", "-j", "DROP", "-t", "raw"],
+    ["-A", "yuzu-fwq-1", "-j", "DROP", "--modprobe=/x"],
+    ["-A", "yuzu-fwq-1", "-j", "DROP", "-m", "comment", "--comment", "x"],
+    ["-A", "yuzu-fwq-1", "-j", "DROP", "-w"],
+    # the same in front of the shape or between its tokens
+    ["-t", "raw", "-A", "yuzu-fwq-1", "-j", "DROP"],
+    ["--modprobe=/x", "-A", "yuzu-fwq-1", "-j", "DROP"],
+    ["-A", "yuzu-fwq-1", "--modprobe", "/x", "-j", "DROP"],
+    ["-A", "yuzu-fwq-1", "-m", "comment", "--comment", "x", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "--modprobe=/x", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "-j", "ACCEPT", "-t", "raw"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "-j", "ACCEPT", "--dport", "22"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "--sport", "22", "-j", "ACCEPT"],
+    # a rule that is not one of the plan's
+    ["-A", "yuzu-fwq-1", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-j", "REJECT"],
+    ["-A", "yuzu-fwq-1", "-j", "DROP", "-j", "DROP"],
+    ["-A", "yuzu-fwq-1", "-j"],
+    ["-A", "yuzu-fwq-1"],
+    ["-A", "yuzu-fwq-1", "-i", "eth0", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-i", "lo", "-o", "lo", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "icmp", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "all", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "6", "-j", "ACCEPT"],
+    # a chain that is not ours
+    ["-A", "INPUT", "-j", "DROP"],
+    ["-A", "yuzu-fwq-1x", "-j", "DROP"],
+    ["-A", "yuzu-fwq-", "-j", "DROP"],
+    ["-A", "xyuzu-fwq-1", "-j", "DROP"],
+    ["-N", "DOCKER"],
+    ["-N", "yuzu-fwq-"],
+    ["-N", "yuzu-fwq--f"],
+    ["-N", "yuzu-fwq-1-f-f"],
+    ["-N", "yuzu-fwq-1x"],
+    ["-N", "yuzu-fwq-2147483648"],
+    ["-N", "yuzu-fwq-12345678901"],
+    ["-N", "yuzu-fwq- 1"],
+    ["-N", "yuzu-fwq-+1"],
+    ["-N", "yuzu-fwq-1", "extra"],
+    ["-F"],
+    ["-F", "INPUT"],
+    ["-X", "DOCKER"],
+    ["-X"],
+    # ports
+    *[["-A", "yuzu-fwq-1", "-p", "tcp", "--dport", port, "-j", "ACCEPT"]
+      for port in ("0", "65536", "-1", "+22", "022", "", "22 ", " 22", "2e1", "0x16", "99999", "123456")],
+    *[["-A", "yuzu-fwq-1", "-p", "udp", "--sport", port, "-j", "ACCEPT"] for port in ("0", "65536", "-1")],
+    # addresses
+    *[["-A", "yuzu-fwq-1", "-s", addr, "-p", "tcp", "-j", "ACCEPT"]
+      for addr in ("evil.example.com", "localhost", "-1.2.3.4", "--modprobe=/x", "10.0.0", "10.0.0.0.0",
+                   "10..0.1", ".10.0.1", "10.0.0.", "10.0.0.1/33", "10.0.0.1/", "/24", "10.0.0.1/-1",
+                   "10.0.0.1/24/1", "10.0.0.1/0024", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
+                   "fe80:1", "g::1", "10.0.0.1 ", "0x0a.0.0.1", "10.0.0.1,10.0.0.2", "::ffff:1.2.3.4",
+                   "!10.0.0.1", "10.0.0.1/ 8", "", "1" * 44)],
+    ["-A", "yuzu-fwq-1", "-s", "10.0.0.1", "-d", "10.0.0.2", "-p", "tcp", "-j", "ACCEPT"],
+    # neighbour discovery
+    *[["-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", t, "-j", "ACCEPT"]
+      for t in ("132", "137", "0", "13", "1333", "13x", "", "-133", "+133")],
+    ["-A", "yuzu-fwq-1", "-s", "fe80::1", "-p", "icmpv6", "--icmpv6-type", "135", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "135", "--dport", "1", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "icmpv6", "-j", "ACCEPT"],
+    # tcp flags
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "SYN", "SYN", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK", "RST", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK,RST", "ACK", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK", "-j", "ACCEPT"],
+    ["-A", "yuzu-fwq-1", "-p", "udp", "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"],
+    # the jump insert
+    ["-I", "INPUT", "2", "-j", "yuzu-fwq-1"],
+    ["-I", "INPUT", "0", "-j", "yuzu-fwq-1"],
+    ["-I", "INPUT", "1", "-j", "ACCEPT"],
+    ["-I", "INPUT", "1", "-j", "DOCKER"],
+    ["-I", "yuzu-fwq-1", "1", "-j", "yuzu-fwq-1"],
+    ["-I", "PREROUTING", "1", "-j", "yuzu-fwq-1"],
+    ["-I", "input", "1", "-j", "yuzu-fwq-1"],
+    ["-I", "INPUT", "1", "-j", "yuzu-fwq-1", "-m", "comment"],
+    ["-I", "INPUT", "-j", "yuzu-fwq-1"],
+    # the jump delete
+    ["-D", "--modprobe=/x", "-j", "yuzu-fwq-1"],
+    ["-D", "-t", "-j", "yuzu-fwq-1"],
+    ["-D", "a" * 29, "-j", "yuzu-fwq-1"],
+    ["-D", "IN PUT", "-j", "yuzu-fwq-1"],
+    ["-D", "INPUT;", "-j", "yuzu-fwq-1"],
+    ["-D", "IN\nPUT", "-j", "yuzu-fwq-1"],
+    ["-D", "", "-j", "yuzu-fwq-1"],
+    ["-D", "INPUT", "-j", "ACCEPT"],
+    ["-D", "INPUT", "1"],
+    ["-D", "INPUT", "-j", "yuzu-fwq-1", "extra"],
+    # other operations and extra tokens on a one-token shape
+    *[[op] for op in ("-P", "-L", "-R", "-C", "-E", "-Z", "-V", "-h", "--help", "--list", "-S1", "-s")],
+    ["-P", "INPUT", "ACCEPT"],
+    ["-S", "INPUT"],
+    ["-S", "-t", "raw"],
+]
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
+class IptablesHelperRuns(unittest.TestCase):
+    """The helper text, run with its two exec targets replaced by a stub that prints the argument
+    list it was handed. Every accepted shape reproduces its exact argument list on both tools;
+    every adversarial one exits non-zero having run nothing. Run under each POSIX shell found
+    (sh, dash, bash): the helper must not depend on a bash extension."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_")
+        d = cls.tmp.name
+        text = helper_text()
+        for tool in ("/usr/sbin/iptables", "/usr/sbin/ip6tables"):
+            assert text.count(tool) == 1, "the helper must name %s exactly once, as its exec target" % tool
+        cls.stubs = {}
+        for fam, target in (("iptables", "/usr/sbin/iptables"), ("ip6tables", "/usr/sbin/ip6tables")):
+            stub = os.path.join(d, "stub-" + fam)
+            with open(stub, "w") as f:
+                # One argument per line, behind the tool's own name.
+                f.write("#!/bin/sh\nprintf 'RAN %s\\n' \"${0##*/}\"\nfor a; do printf '%s\\n' \"$a\"; done\n")
+            os.chmod(stub, 0o755)
+            cls.stubs[fam] = stub
+            text = text.replace(target, stub)
+        cls.path = os.path.join(d, "yuzu-fw-helper")
+        with open(cls.path, "w") as f:
+            f.write(text)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_the_helper_passes_a_syntax_check_under_every_shell(self):
+        for shell in available_shells():
+            r = subprocess.run([shell, "-n", self.path], capture_output=True, text=True, timeout=30)
+            self.assertEqual((r.returncode, r.stderr), (0, ""), shell)
+
+    def test_every_accepted_shape_runs_the_tool_with_exactly_its_own_argument_list(self):
+        self.assertEqual({family for family, _ in HELPER_ACCEPTED}, {"iptables", "ip6tables"})
+        for shell in available_shells():
+            results = run_all([[shell, self.path, family] + tokens for family, tokens in HELPER_ACCEPTED])
+            for (family, tokens), r in zip(HELPER_ACCEPTED, results):
+                want = "RAN stub-%s\n" % family + "".join(t + "\n" for t in tokens)
+                self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), (shell, family, tokens))
+
+    def test_every_adversarial_argument_list_exits_non_zero_having_run_nothing(self):
+        self.assertGreater(len(_ADV), 100)
+        for shell in available_shells():
+            for fam in ("iptables", "ip6tables"):
+                results = run_all([[shell, self.path, fam] + tokens for tokens in _ADV])
+                for tokens, r in zip(_ADV, results):
+                    self.assertNotEqual(r.returncode, 0, (shell, fam, tokens))
+                    self.assertEqual(r.stdout, "", (shell, fam, tokens, "the tool ran"))
+
+    def test_other_tools_and_families_and_a_bare_call_are_refused(self):
+        bad = ([], ["iptables"], ["ip6tables"], ["iptables-save", "-S"], ["/usr/sbin/iptables", "-S"],
+               ["nft", "-S"], ["IPTABLES", "-S"], ["", "-S"], ["iptables", ""], ["iptables", "-S", ""])
+        for shell in available_shells():
+            for argv, r in zip(bad, run_all([[shell, self.path] + list(a) for a in bad])):
+                self.assertNotEqual(r.returncode, 0, (shell, argv))
+                self.assertEqual(r.stdout, "", (shell, argv))
+
+    def test_the_environment_cannot_change_what_runs(self):
+        env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent")
+        for shell in available_shells():
+            r = subprocess.run([shell, self.path, "iptables", "-N", "yuzu-fwq-1"], capture_output=True,
+                               text=True, timeout=30, env=env)
+            self.assertEqual((r.returncode, r.stdout), (0, "RAN stub-iptables\n-N\nyuzu-fwq-1\n"), shell)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
+class InstallerDryRunOnLinux(unittest.TestCase):
+    """The installer's Linux branch, under `--dry-run` with a `uname` that says Linux (a dry run
+    only prints): the helper is written BEFORE the sudoers file, is the text the heredoc holds,
+    and `--no-sudoers` skips both."""
+
+    def dry_run(self, *extra):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_") as d:
+            shim = os.path.join(d, "uname")
+            with open(shim, "w") as f:
+                f.write('#!/bin/sh\ncase "$1" in -s) echo Linux ;; *) /usr/bin/uname "$@" ;; esac\n')
+            os.chmod(shim, 0o755)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
+            r = subprocess.run(["bash", os.path.join(REPO, INSTALLER), "--dry-run", *extra],
+                               capture_output=True, text=True, timeout=60, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout
+
+    def test_the_helper_is_printed_before_the_sudoers_file_and_is_the_heredoc_text(self):
+        out = self.dry_run()
+        helper_marker = "[dry-run] would write the following to /usr/local/sbin/yuzu-fw-helper (root:root 0755):"
+        sudoers_marker = "[dry-run] would write the following to /etc/sudoers.d/yuzu-agent:"
+        self.assertIn(helper_marker, out)
+        self.assertIn(sudoers_marker, out)
+        self.assertLess(out.index(helper_marker), out.index(sudoers_marker))
+        printed = out[out.index(helper_marker) + len(helper_marker) + 1:out.index(sudoers_marker)]
+        lines = [l[len("[dry-run]   "):] for l in printed.splitlines() if l.startswith("[dry-run]   ")]
+        self.assertEqual("\n".join(lines) + "\n", helper_text())
+        self.assertIn("[dry-run]   $ACCOUNT_NAME" .replace("$ACCOUNT_NAME", "yuzu") +
+                      " ALL=(root) NOPASSWD: /usr/local/sbin/yuzu-fw-helper\n", out)
+        self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables")
+
+    def test_no_sudoers_skips_the_helper_too(self):
+        out = self.dry_run("--no-sudoers")
+        self.assertNotIn("yuzu-fw-helper", out)
+        self.assertNotIn("/etc/sudoers.d/yuzu-agent:", out)
 
 
 class PatternSelfTest(unittest.TestCase):
@@ -316,10 +625,40 @@ class SectionAllowlistSelfTest(unittest.TestCase):
         text = "## Another section\n```\n" + self.ALLOWED + "\n```\n" + self.HIT + "\n"
         self.assertNotEqual(self.scan(text), [])
 
+    # QE-4: "## Upgrade notes by release" is where every release's notes land, so it is exempt by
+    # the one `### ` subsection that names the plugin, never as a whole.
+    PARENT = "## Upgrade notes by release"
+    SUB = "### `quarantine` plugin: reporting is now more conservative (Wave-2 argv migration)"
+
+    def test_a_hit_under_the_one_allowed_subsection_is_quiet(self):
+        text = self.PARENT + "\n\n### Another release\n\nintro\n\n" + self.SUB + "\n" + self.HIT + "\n"
+        self.assertEqual(self.scan(text), [])
+
+    def test_the_same_hit_under_another_subsection_of_that_section_is_reported(self):
+        self.assertNotEqual(self.scan(self.PARENT + "\n### vNEXT: something new\n" + self.HIT + "\n"), [])
+
+    def test_a_hit_directly_under_the_parent_heading_is_reported(self):
+        self.assertNotEqual(self.scan(self.PARENT + "\n" + self.HIT + "\n"), [])
+
+    def test_a_subsection_exemption_ends_at_the_next_subsection(self):
+        text = self.PARENT + "\n" + self.SUB + "\n" + self.HIT + "\n### The next release\n" + self.HIT + "\n"
+        self.assertEqual(len(self.scan(text)), len(hits_in(self.HIT)))
+
+    def test_a_subsection_exemption_ends_at_the_next_section(self):
+        text = self.PARENT + "\n" + self.SUB + "\n" + self.HIT + "\n## Another section\n" + self.HIT + "\n"
+        self.assertEqual(len(self.scan(text)), len(hits_in(self.HIT)))
+
+    def test_a_subsection_of_an_allowed_section_stays_exempt(self):
+        self.assertEqual(self.scan(self.ALLOWED + "\n### A child\n" + self.HIT + "\n"), [])
+
+    def test_a_subsection_heading_inside_a_code_fence_does_not_open_a_section(self):
+        text = self.PARENT + "\n```\n" + self.SUB + "\n```\n" + self.HIT + "\n"
+        self.assertNotEqual(self.scan(text), [])
+
     def test_the_nine_sections_exist_in_the_file_today(self):
         text = read_text("docs/user-manual/upgrading.md")
         self.assertIsNotNone(text)
-        headings = [l for l in text.splitlines() if l.startswith("## ")]
+        headings = [l for l in text.splitlines() if heading_level(l)]
         for prefix in self.PREFIXES:
             self.assertTrue(any(h.startswith(prefix) for h in headings),
                             "no upgrading.md heading starts with: " + prefix)

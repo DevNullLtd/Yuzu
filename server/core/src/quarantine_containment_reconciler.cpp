@@ -352,11 +352,15 @@ void QuarantineContainmentReconciler::tick() {
         }
     }
     {
-        // The heartbeat fast path's view (#7619). Swapped in AFTER mu_ is released: the two
-        // mutexes are never held together.
-        std::lock_guard<std::mutex> lk(cache_mu_);
-        unconfirmed_cache_ =
-            std::unordered_set<std::string>(to_reconcile.begin(), to_reconcile.end());
+        // The heartbeat fast path's view (#7619). Built first and swapped in AFTER mu_ is
+        // released: the two mutexes are never held together, and cache_mu_ (taken by every
+        // heartbeat) is held for a swap, not for building a set of every unconfirmed device. The
+        // old set is freed outside it.
+        std::unordered_set<std::string> unconfirmed(to_reconcile.begin(), to_reconcile.end());
+        {
+            std::lock_guard<std::mutex> lk(cache_mu_);
+            unconfirmed_cache_.swap(unconfirmed);
+        }
     }
 
     // Per-replica view — never sum() this series across server instances,
@@ -441,17 +445,25 @@ std::size_t QuarantineContainmentReconciler::drain_heartbeat_due() {
         std::lock_guard<std::mutex> lk(cache_mu_);
         due.swap(heartbeat_due_);
     }
+    // A pass is bounded in TIME as well as in dispatches (UP-3). A degraded store read returns
+    // false after up to a store read timeout and is not a dispatch, so with the pool stalled a
+    // count alone lets one pass cost a timeout per marked device and holds the next tick off.
+    // Counting every attempt instead would break the fair-cap rule (reconcile_one's note: a
+    // skip-only device must not use up the budget). The budget is checked before each device, so
+    // a device already started finishes.
+    const auto deadline = steady_now() + kDrainTimeBudget;
     std::size_t dispatched = 0;
-    for (auto it = due.begin(); it != due.end(); ++it) {
+    while (!due.empty()) {
         if (d_.should_stop && d_.should_stop())
             break; // shutting down: a device still marked is reconciled by the next heartbeat
-        if (dispatched >= kMaxDispatchesPerTick) {
-            // Same per-pass bound as tick(): the rest stay marked for the next drain.
+        if (dispatched >= kMaxDispatchesPerTick || steady_now() >= deadline) {
+            // The pass is spent: the rest stay marked for the next drain.
             std::lock_guard<std::mutex> lk(cache_mu_);
-            heartbeat_due_.insert(std::make_move_iterator(it), std::make_move_iterator(due.end()));
+            heartbeat_due_.merge(due);
             break;
         }
-        if (reconcile_one(*it, "heartbeat"))
+        const auto agent = due.extract(due.begin());
+        if (reconcile_one(agent.value(), "heartbeat"))
             ++dispatched;
     }
     return dispatched;

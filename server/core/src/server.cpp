@@ -18563,7 +18563,9 @@ private:
         // silently drop it). It only MARKS the device due (#7619): no store
         // read and no dispatch on the heartbeat ingest path. The reconciler
         // thread below drains the marks every second and runs the periodic
-        // tick every 20th pass. AgentRegistry::send_to drops offline agents
+        // tick once 20 s have passed since the last one (elapsed time, not a
+        // pass count: a slow drain must not stretch the tick).
+        // AgentRegistry::send_to drops offline agents
         // silently, so a tick against a still-offline device costs one cheap
         // skip and catches a device that reconnected between heartbeats (same
         // shape as PreflightRunner's re-dispatch-on-reconnect loop).
@@ -18580,15 +18582,19 @@ private:
             // ponytail: one reconciler thread does all reconcile I/O, so a mass quarantine is
             // worked through here at kMaxDispatchesPerTick per pass; shard by agent if that
             // ceiling is ever reached.
-            constexpr int kTickEvery = 20; // passes of 1 s
-            int pass = 0;
+            constexpr auto kTickEvery = std::chrono::seconds{20};
+            auto last_tick = std::chrono::steady_clock::now();
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 std::this_thread::sleep_for(std::chrono::seconds{1});
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
-                const bool tick_pass = ++pass >= kTickEvery;
+                // Tick once 20 s have passed since the last tick, otherwise drain: a pass is 1 s
+                // of sleep plus the drain, so counting passes would stretch the tick under a
+                // slow drain.
+                const auto now = std::chrono::steady_clock::now();
+                const bool tick_pass = now - last_tick >= kTickEvery;
                 if (tick_pass)
-                    pass = 0;
+                    last_tick = now;
                 if (quarantine_reconciler_) {
                     // tick() touches PG and gRPC dispatch — either can throw;
                     // an escaping exception would std::terminate the whole

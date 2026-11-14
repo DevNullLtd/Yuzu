@@ -234,7 +234,7 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "effectively-once holds via the stable command_id + agent dedup, but the leader gate keeps a "
      "second replica from redundantly re-driving"},
 
-    // ---- quarantine_reconcile_thread_ (20s tick) ----
+    // ---- quarantine_reconcile_thread_ (1 s heartbeat drain and 20 s tick, one job class) ----
     {"quarantine_reconciler.tick", "quarantine_reconcile_thread_",
      BackgroundJobClass::FencedLeaderOnly,
      "side-effecting containment re-dispatch (WS-3 3.2; confirm WS-4/5 stream-locality "

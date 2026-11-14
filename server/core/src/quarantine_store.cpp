@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -293,7 +294,7 @@ namespace {
 struct GuardedUpdate {
     const char* op;        // the calling method's name; appears in the store-error text
     std::string set_sql;   // the SET list
-    const char* where_sql; // appended after "agent_id = $1 AND id = $2::bigint AND "
+    std::string where_sql; // appended after "agent_id = $1 AND id = $2::bigint AND "
     std::vector<std::string> extra;
     // When set and the UPDATE touched no row: a SELECT on the same lease WHERE agent_id = $1 AND
     // id = $2 AND <held_where>. A row there means the record is still in the state the caller wants
@@ -343,12 +344,29 @@ std::expected<void, std::string> guarded_record_update(pg::PgPool& pool, bool op
                                                                 : kQuarantineNotQuarantined));
 }
 
-// The generation and claim terms of a confirmed end ($5 is the fence, $6 the claim cutoff).
-constexpr const char* kFencedActiveWhere = "status = 'active' AND apply_gen = $5::bigint AND "
-                                           "(apply_claimed_at = 0 OR apply_claimed_at < $6::bigint)";
-constexpr const char* kFencedOwedWhere = "status = 'released' AND device_release_owed_at <> 0 AND "
-                                         "apply_gen = $3::bigint AND (apply_claimed_at = 0 OR "
-                                         "apply_claimed_at < $4::bigint)";
+// The apply claim, read and written on the DATABASE clock (#7613, UP-1). `apply_claimed_at` is
+// stamped with kClaimStampSql and "no claim is live" is no_live_claim_sql(), the ONE statement of
+// it, used by claim_apply, apply_fence_token and both fenced ends. A claim is held by one replica
+// and judged by another, so neither side may use its own wall clock: a replica whose clock steps
+// forward would read a live claim as expired (a token issued, an end accepted, mid-apply) and one
+// that steps back would keep a dead claim live. The TTL is written into the text from the
+// constant, not bound.
+constexpr const char* kClaimStampSql = "EXTRACT(EPOCH FROM now())::bigint";
+const std::string& no_live_claim_sql() {
+    static const std::string sql =
+        std::format("(apply_claimed_at = 0 OR apply_claimed_at < {} - {})", kClaimStampSql,
+                    kApplyClaimTtlSecs);
+    return sql;
+}
+
+// The generation and claim terms of a confirmed end ($5 / $3 is the fence).
+std::string fenced_active_where() {
+    return "status = 'active' AND apply_gen = $5::bigint AND " + no_live_claim_sql();
+}
+std::string fenced_owed_where() {
+    return "status = 'released' AND device_release_owed_at <> 0 AND apply_gen = $3::bigint AND " +
+           no_live_claim_sql();
+}
 } // namespace
 
 std::expected<void, std::string>
@@ -361,19 +379,20 @@ QuarantineStore::mark_released(const std::string& agent_id, std::int64_t record_
         // The operator's own word, resting on no observation of the device: no fence, no claim
         // check, both apply columns left as they are.
         return guarded_record_update(pool_, open_, agent_id, record_id,
-                                     {"mark_released", set_sql, "status = 'active'",
-                                      {std::to_string(now), std::to_string(now)}});
+                                     {.op = "mark_released",
+                                      .set_sql = set_sql,
+                                      .where_sql = "status = 'active'",
+                                      .extra = {std::to_string(now), std::to_string(now)}});
     }
     if (!fence) // fail closed, no round trip: nothing proves the answer followed every apply
         return std::unexpected(std::string(kQuarantineApplyInFlight));
     return guarded_record_update(
         pool_, open_, agent_id, record_id,
-        {"mark_released",
-         set_sql,
-         kFencedActiveWhere,
-         {std::to_string(now), "0", std::to_string(*fence),
-          std::to_string(now - kApplyClaimTtlSecs)},
-         "status = 'active'"});
+        {.op = "mark_released",
+         .set_sql = set_sql,
+         .where_sql = fenced_active_where(),
+         .extra = {std::to_string(now), "0", std::to_string(*fence)},
+         .held_where = "status = 'active'"});
 }
 
 std::expected<void, std::string>
@@ -383,27 +402,31 @@ QuarantineStore::clear_release_owed(const std::string& agent_id, std::int64_t re
         return std::unexpected(std::string(kQuarantineApplyInFlight));
     return guarded_record_update(
         pool_, open_, agent_id, record_id,
-        {"clear_release_owed",
-         "device_release_owed_at = 0",
-         kFencedOwedWhere,
-         {std::to_string(*fence), std::to_string(now_secs() - kApplyClaimTtlSecs)},
-         "status = 'released' AND device_release_owed_at <> 0"});
+        {.op = "clear_release_owed",
+         .set_sql = "device_release_owed_at = 0",
+         .where_sql = fenced_owed_where(),
+         .extra = {std::to_string(*fence)},
+         .held_where = "status = 'released' AND device_release_owed_at <> 0"});
 }
 
 std::expected<void, std::string>
 QuarantineStore::mark_endpoint_applied(const std::string& agent_id, std::int64_t record_id,
                                        std::int64_t at) {
     return guarded_record_update(pool_, open_, agent_id, record_id,
-                                 {"mark_endpoint_applied", "last_applied_at = $3::bigint",
-                                  "status = 'active'", {std::to_string(at)}});
+                                 {.op = "mark_endpoint_applied",
+                                  .set_sql = "last_applied_at = $3::bigint",
+                                  .where_sql = "status = 'active'",
+                                  .extra = {std::to_string(at)}});
 }
 
 std::expected<void, std::string>
 QuarantineStore::mark_endpoint_confirmed(const std::string& agent_id, std::int64_t record_id,
                                          std::int64_t at) {
     return guarded_record_update(pool_, open_, agent_id, record_id,
-                                 {"mark_endpoint_confirmed", "last_confirmed_at = $3::bigint",
-                                  "status = 'active'", {std::to_string(at)}});
+                                 {.op = "mark_endpoint_confirmed",
+                                  .set_sql = "last_confirmed_at = $3::bigint",
+                                  .where_sql = "status = 'active'",
+                                  .extra = {std::to_string(at)}});
 }
 
 std::expected<std::int64_t, std::string>
@@ -418,16 +441,18 @@ QuarantineStore::claim_apply(const std::string& agent_id, std::int64_t record_id
                                "database unavailable — try again");
 
     // One guarded UPDATE: the generation moves and the claim is stamped together, and only while
-    // the record is active, no release was asked for, and no other claim is live.
-    const std::int64_t now = now_secs();
+    // the record is active, no release was asked for, and no other claim is live. The stamp and
+    // the liveness test are both the database's clock (see no_live_claim_sql).
+    const std::string claim_sql =
+        std::string("UPDATE quarantine_store.quarantine_records SET apply_gen = apply_gen + 1, "
+                    "apply_claimed_at = ") +
+        kClaimStampSql +
+        " WHERE agent_id = $1 AND id = $2::bigint AND status = 'active' AND "
+        "release_requested_at = 0 AND " +
+        no_live_claim_sql() + " RETURNING apply_gen";
     pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE quarantine_store.quarantine_records SET apply_gen = apply_gen + 1, "
-        "apply_claimed_at = $3::bigint WHERE agent_id = $1 AND id = $2::bigint AND status = "
-        "'active' AND release_requested_at = 0 AND (apply_claimed_at = 0 OR apply_claimed_at < "
-        "$4::bigint) RETURNING apply_gen",
-        std::vector<std::string>{sanitize_pg_text(agent_id), std::to_string(record_id),
-                                 std::to_string(now), std::to_string(now - kApplyClaimTtlSecs)});
+        lease.get(), claim_sql.c_str(),
+        std::vector<std::string>{sanitize_pg_text(agent_id), std::to_string(record_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) + "claim_apply failed: " +
                                PQerrorMessage(lease.get()));
@@ -473,12 +498,13 @@ QuarantineStore::apply_fence_token(const std::string& agent_id, std::int64_t rec
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
                                "database unavailable — try again");
 
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
+    const std::string token_sql =
         "SELECT apply_gen FROM quarantine_store.quarantine_records WHERE agent_id = $1 AND id = "
-        "$2::bigint AND (apply_claimed_at = 0 OR apply_claimed_at < $3::bigint)",
-        std::vector<std::string>{sanitize_pg_text(agent_id), std::to_string(record_id),
-                                 std::to_string(now_secs() - kApplyClaimTtlSecs)});
+        "$2::bigint AND " +
+        no_live_claim_sql();
+    pg::PgResult res = pg::exec_params(
+        lease.get(), token_sql.c_str(),
+        std::vector<std::string>{sanitize_pg_text(agent_id), std::to_string(record_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string(kQuarantineDbErrorPrefix) +
                                "apply_fence_token failed: " + PQerrorMessage(lease.get()));

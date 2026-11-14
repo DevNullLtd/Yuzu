@@ -17,6 +17,16 @@ namespace {
 
 constexpr std::size_t kMaxTokenLen = 45;
 
+/// Runs `fn` when the enclosing scope is left by any route: a return, or an exception of any
+/// type (redispatch_stored_containment's dispatch callback is caller-supplied code). `fn` must not
+/// throw (a destructor that throws during unwinding terminates). The shape of the guard in
+/// api_token_store.cpp; one local variable per use, never copied or moved.
+template <typename F> struct ScopeExit {
+    F fn;
+    ~ScopeExit() { fn(); }
+};
+template <typename F> ScopeExit(F) -> ScopeExit<F>;
+
 /// The agent's `is_safe_ip` charset (`[0-9a-fA-F.:]`, <=45 chars): the first line of defence before
 /// the literal reaches the mapper's real check.
 bool safe_token_charset(std::string_view tok) {
@@ -190,18 +200,27 @@ redispatch_stored_containment(QuarantineStore& store, const std::string& agent_i
             ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, gen.error()});
     }
 
+    // Drop our own claim on EVERY exit, including an exception that is not a std::exception thrown
+    // out of dispatch_fn (the catch below takes only std::exception; anything else passes through
+    // and would otherwise leave the claim live for kApplyClaimTtlSecs). The generation the claim
+    // moved outlives it (see the header). A failed release leaves the claim to expire after
+    // kApplyClaimTtlSecs, which only delays a confirmed end; the guard's body cannot throw.
+    ScopeExit release_claim{[&]() noexcept {
+        try {
+            if (auto rel = store.release_apply_claim(agent_id, out_record.id, *gen); !rel)
+                spdlog::warn("redispatch_stored_containment: could not release the apply claim "
+                             "for record {}: {}",
+                             out_record.id, rel.error());
+        } catch (...) {
+        }
+    }};
+
     ContainmentReapplyResult result;
     try {
         std::tie(result.command_id, result.agents_reached) = dispatch_fn(*params);
     } catch (const std::exception&) {
         result.dispatch_threw = true;
     }
-    // Always drop our own claim; the generation it moved outlives it (see the header). A failed
-    // release leaves the claim to expire after kApplyClaimTtlSecs, which only delays a confirmed end.
-    if (auto rel = store.release_apply_claim(agent_id, out_record.id, *gen); !rel)
-        spdlog::warn("redispatch_stored_containment: could not release the apply claim for record "
-                     "{}: {}",
-                     out_record.id, rel.error());
     return result;
 }
 

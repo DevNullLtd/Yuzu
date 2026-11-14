@@ -3245,9 +3245,12 @@ groups:
             leader-only (#4119): a non-leader replica does not tick and its
             gauge stays at its boot value, so judging each instance would page
             on every follower; the rule fires only when no replica of the job
-            has ticked. A tick that threw does not move the gauge. Look at the
-            server log for "quarantine_reconciler: tick threw" and for a thread
-            blocked on a Postgres pool acquire or a gateway dispatch.
+            has ticked. A tick that threw does not move the gauge. First check
+            that the clocks of the server and of Prometheus agree: the rule
+            compares the two, so a skew of more than five minutes fires it with
+            a healthy reconciler. Then look at the server log for
+            "quarantine_reconciler: tick threw" and for a thread blocked on a
+            Postgres pool acquire or a gateway dispatch.
 
       - alert: YuzuDispatchTargetRejected
         expr: |

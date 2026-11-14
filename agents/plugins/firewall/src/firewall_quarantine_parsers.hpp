@@ -17,9 +17,11 @@
  * between any two runner calls.
  *
  * THIS FILE IS THE PRIVILEGE BOUNDARY. The sudoers lines that let the agent
- * run nft / iptables / pfctl narrow the argv SHAPE but cannot confine it (sudo
- * globs match concatenated args; `nft -f` and `pfctl -a ... -f` execute
- * agent-generated file content). What actually confines the privileged call is
+ * run nft / pfctl narrow the argv SHAPE but cannot confine it (sudo globs match
+ * concatenated args; `nft -f` and `pfctl -a ... -f` execute agent-generated file
+ * content). iptables and ip6tables are not granted to the agent at all: it may
+ * run only the root-owned helper (kFwHelperPath), whose argument grammar
+ * iptables_helper_argv states and the helper enforces itself. What actually confines the privileged call is
  * that every token reaching an argv or a ruleset line is built here from a
  * typed, validated value and then re-checked against a strict charset
  * (is_safe_token: no whitespace, `;`, quote, `$`, backtick, `|`, `&`, `#`, `\` or
@@ -2448,37 +2450,173 @@ struct IptablesListing {
     return out;
 }
 
-/// Whether `a` is one of the argv shapes the agent's sudoers grants for iptables / ip6tables
-/// (`scripts/install-agent-user.sh`, #7634) and nothing else. This is the SINGLE statement of those
-/// shapes: the sudoers lines are hand-written to match it, `tests/test_legacy_quarantine_plugin_removed_lexical.py`
-/// checks the two against each other, and a unit test feeds it every argv the plans above build.
-///   {tool, -S}                           list
-///   {tool, -N, ours}                     create a generation chain
-///   {tool, -A, ours, ...}                append a rule to a generation chain
-///   {tool, -I, INPUT|OUTPUT|FORWARD, 1, -j, ours}   insert the jump at the head
-///   {tool, -D, <chain>, -j, ours}        remove a jump (any chain: the plan takes it from the listing)
-///   {tool, -F, ours} / {tool, -X, ours}  flush / delete a generation chain
-/// where `tool` is `kIptablesPath` or `kIp6tablesPath` and `ours` is a `yuzu-fwq-<gen>[-f]` chain.
-/// Anything else (-P, a bare -F, -A on a built-in chain, -t nat, another tool) is outside the shape.
-/// This narrows the argv; it does not confine the tool (a sudo glob spans arguments): the control is
-/// that the plugin builds every argv from validated tokens.
-[[nodiscard]] inline bool iptables_argv_in_sudo_shape(const Argv& a) {
-    if (a.size() < 2 || (a[0] != kIptablesPath && a[0] != kIp6tablesPath))
+/// The root-owned helper the sudoers file grants in place of iptables and ip6tables (#7634):
+/// `scripts/install-agent-user.sh` writes it (root:root 0755, Linux only) and names this path in
+/// sudoers with no argument and no wildcard. The agent never runs the tools themselves.
+inline constexpr std::string_view kFwHelperPath = "/usr/local/sbin/yuzu-fw-helper";
+
+namespace detail {
+
+/// `yuzu-fwq-<generation>[-f]`: the generation is 1 to 10 digits and at most 0x7fffffff.
+[[nodiscard]] inline bool helper_ours(std::string_view c) {
+    if (!c.starts_with(kIptablesChainPrefix))
         return false;
-    const auto ours = [](const std::string& chain) { return ipt_chain_gen(chain).has_value(); };
-    const std::string& op = a[1];
+    auto gen = c.substr(kIptablesChainPrefix.size());
+    if (gen.ends_with("-f"))
+        gen.remove_suffix(2);
+    return is_digits(gen, 1, 10) && parse_uint(gen, 0x7fffffff).has_value();
+}
+
+/// The chain a jump of ours sits in (a `-D` takes it from the `-S` listing): 1 to 28 token
+/// characters, not starting with `-`.
+[[nodiscard]] constexpr bool helper_from_chain(std::string_view c) noexcept {
+    if (c.empty() || c.size() > 28 || c.front() == '-')
+        return false;
+    for (const char ch : c)
+        if (!is_safe_token_char(ch))
+            return false;
+    return true;
+}
+
+/// Plain decimal 1 to 65535: no sign, no leading zero.
+[[nodiscard]] inline bool helper_port(std::string_view p) {
+    return is_digits(p, 1, 5) && p.front() != '0' && parse_uint(p, 65535).has_value();
+}
+
+/// An IPv4 literal (digits, exactly three dots, no empty part) or an IPv6 literal (lower-case hex
+/// and colons, two or more colons, no `:::`), then an optional `/<1 to 3 digits>` not above 32 or
+/// 128; at most 43 characters in all. Deliberately a charset-and-shape check, not a parse: the
+/// tool rejects what is not an address, and no name can pass for one.
+[[nodiscard]] inline bool helper_addr(std::string_view t) {
+    if (t.size() > 43)
+        return false;
+    auto addr = t;
+    std::string_view prefix;
+    bool has_prefix = false;
+    if (const auto slash = t.find('/'); slash != std::string_view::npos) {
+        addr = t.substr(0, slash);
+        prefix = t.substr(slash + 1);
+        has_prefix = true;
+        if (!is_digits(prefix, 1, 3))
+            return false;
+    }
+    const auto colons = static_cast<std::size_t>(std::count(addr.begin(), addr.end(), ':'));
+    std::int64_t limit = 0;
+    if (colons >= 2) {
+        if (addr.find_first_not_of("0123456789abcdef:") != std::string_view::npos ||
+            addr.find(":::") != std::string_view::npos)
+            return false;
+        limit = 128;
+    } else if (colons == 1) {
+        return false;
+    } else {
+        if (addr.find_first_not_of("0123456789.") != std::string_view::npos || addr.empty() ||
+            addr.front() == '.' || addr.back() == '.' || addr.find("..") != std::string_view::npos ||
+            std::count(addr.begin(), addr.end(), '.') != 3)
+            return false;
+        limit = 32;
+    }
+    return !has_prefix || parse_uint(prefix, limit).has_value();
+}
+
+/// The tokens of an `-A <ours>` rule: one of `-j DROP`, `-i lo -j ACCEPT`, `-o lo -j ACCEPT`,
+/// `-p icmpv6 --icmpv6-type 133..136 -j ACCEPT`, or
+/// `[-s|-d <addr>] -p tcp|udp [--sport <p>] [--dport <p>] [--tcp-flags ACK ACK|RST RST] -j ACCEPT`
+/// (the flags only with tcp): exactly what iptables_build_plan emits.
+[[nodiscard]] inline bool helper_rule(const Argv& a, std::size_t first) {
+    const std::size_t n = a.size() - first;
+    const auto at = [&](std::size_t i) -> std::string_view { return a[first + i]; };
+    if (n < 2)
+        return false;
+    if (at(0) == "-j")
+        return n == 2 && at(1) == "DROP";
+    if (at(0) == "-i" || at(0) == "-o")
+        return n == 4 && at(1) == "lo" && at(2) == "-j" && at(3) == "ACCEPT";
+    std::size_t i = 0;
+    bool has_addr = false;
+    if (at(0) == "-s" || at(0) == "-d") {
+        if (!helper_addr(at(1)))
+            return false;
+        has_addr = true;
+        i = 2;
+    }
+    if (n < i + 4 || at(i) != "-p")
+        return false;
+    const auto proto = at(i + 1);
+    if (proto == "icmpv6") {
+        const auto type = at(i + 3);
+        return !has_addr && n == 6 && at(i + 2) == "--icmpv6-type" &&
+               (type == "133" || type == "134" || type == "135" || type == "136") &&
+               at(i + 4) == "-j" && at(i + 5) == "ACCEPT";
+    }
+    if (proto != "tcp" && proto != "udp")
+        return false;
+    i += 2;
+    for (const std::string_view opt : {"--sport", "--dport"}) {
+        if (i + 1 < n && at(i) == opt) {
+            if (!helper_port(at(i + 1)))
+                return false;
+            i += 2;
+        }
+    }
+    if (i + 2 < n && at(i) == "--tcp-flags") {
+        if (proto != "tcp" || at(i + 1) != at(i + 2) || (at(i + 1) != "ACK" && at(i + 1) != "RST"))
+            return false;
+        i += 3;
+    }
+    return n == i + 2 && at(i) == "-j" && at(i + 1) == "ACCEPT";
+}
+
+} // namespace detail
+
+/// The argv that runs one iptables / ip6tables plan command through the root-owned helper
+/// (`<helper> iptables|ip6tables <the plan's tokens after the tool>`), or nothing when the plan argv
+/// is not one of the shapes the helper accepts. This is the SINGLE statement of those shapes on the
+/// agent side; the helper (scripts/install-agent-user.sh) enforces the same grammar itself, and
+/// tests/test_legacy_quarantine_plugin_removed_lexical.py runs it against the same cases.
+///   {tool, -S}                                      list
+///   {tool, -N, ours}                                create a generation chain
+///   {tool, -A, ours, rule...}                       append a rule (helper_rule) to a generation chain
+///   {tool, -I, INPUT|OUTPUT|FORWARD, 1, -j, ours}   insert the jump at the head
+///   {tool, -D, chain, -j, ours}                     remove a jump (the chain comes from the listing)
+///   {tool, -F, ours} / {tool, -X, ours}             flush / delete a generation chain
+/// where `tool` is `kIptablesPath` or `kIp6tablesPath` and `ours` is a `yuzu-fwq-<gen>[-f]` chain.
+/// Anything else (-P, a bare -F, -A on a built-in chain, -t raw, -m, an option glued to a value,
+/// another tool) yields nothing. Every call of the iptables leg goes through here; a refusal is
+/// `unsafe_argv` and nothing is spawned.
+[[nodiscard]] inline std::optional<Argv> iptables_helper_argv(const Argv& plan) {
+    if (plan.size() < 2)
+        return std::nullopt;
+    std::string_view family;
+    if (plan[0] == kIptablesPath)
+        family = "iptables";
+    else if (plan[0] == kIp6tablesPath)
+        family = "ip6tables";
+    else
+        return std::nullopt;
+    const std::string& op = plan[1];
+    const std::size_t n = plan.size();
+    bool ok = false;
     if (op == "-S")
-        return a.size() == 2;
-    if (op == "-N" || op == "-F" || op == "-X")
-        return a.size() == 3 && ours(a[2]);
-    if (op == "-A")
-        return a.size() >= 3 && ours(a[2]);
-    if (op == "-I")
-        return a.size() == 6 && (a[2] == "INPUT" || a[2] == "OUTPUT" || a[2] == "FORWARD") &&
-               a[3] == "1" && a[4] == "-j" && ours(a[5]);
-    if (op == "-D")
-        return a.size() == 5 && a[3] == "-j" && ours(a[4]);
-    return false;
+        ok = n == 2;
+    else if (op == "-N" || op == "-F" || op == "-X")
+        ok = n == 3 && detail::helper_ours(plan[2]);
+    else if (op == "-A")
+        ok = n >= 5 && detail::helper_ours(plan[2]) && detail::helper_rule(plan, 3);
+    else if (op == "-I")
+        ok = n == 6 && (plan[2] == "INPUT" || plan[2] == "OUTPUT" || plan[2] == "FORWARD") &&
+             plan[3] == "1" && plan[4] == "-j" && detail::helper_ours(plan[5]);
+    else if (op == "-D")
+        ok = n == 5 && detail::helper_from_chain(plan[2]) && plan[3] == "-j" &&
+             detail::helper_ours(plan[4]);
+    if (!ok)
+        return std::nullopt;
+    Argv out;
+    out.reserve(n + 1);
+    out.emplace_back(kFwHelperPath);
+    out.emplace_back(family);
+    out.insert(out.end(), plan.begin() + 1, plan.end());
+    return out;
 }
 
 /// Insert the new generation's jumps. The caller removes the old generation
@@ -3016,6 +3154,18 @@ public:
         }
         return run(argv);
     }
+    /// An iptables / ip6tables command, given as the plan argv the builders above emit. It runs
+    /// only as the root-owned helper's argv (iptables_helper_argv): a plan argv outside the
+    /// helper's grammar is `unsafe_argv` and nothing is spawned. The grammar is stricter than
+    /// is_safe_token, so the charset check call() makes is not repeated.
+    [[nodiscard]] std::optional<ToolResult> call_iptables(const Argv& plan) {
+        auto helper = iptables_helper_argv(plan);
+        if (!helper) {
+            reason_ = "unsafe_argv";
+            return std::nullopt;
+        }
+        return run(*helper);
+    }
     /// A command whose LAST token is a staged file: that one token is checked with
     /// is_safe_staged_path (a space in the data directory is fine), every other with
     /// the strict charset.
@@ -3205,7 +3355,7 @@ public:
         detail::Exec ex(run_, dl);
         std::uint32_t max_gen = 0;
         for (auto& f : fams) {
-            const auto r = ex.call({std::string{f.tool}, "-S"});
+            const auto r = ex.call_iptables({std::string{f.tool}, "-S"});
             if (!r)
                 return StepResult::fail(ex.reason());
             if (!r->ok())
@@ -3220,7 +3370,7 @@ public:
         auto run_all = [&](const std::vector<Argv>& plan, std::string& why,
                            std::string& detail_out) {
             for (const auto& a : plan) {
-                const auto r = ex.call(a);
+                const auto r = ex.call_iptables(a);
                 if (!r) {
                     why = ex.reason();
                     return false;
@@ -3250,7 +3400,7 @@ public:
                     plan.push_back({std::string{f.tool}, "-X", c});
                 }
                 for (const auto& a : plan)
-                    (void)cx.call(a);
+                    (void)cx.call_iptables(a);
             }
         };
 
@@ -3272,7 +3422,7 @@ public:
         // is tidying, so a failure here is a note, not a failed update.
         for (const auto& f : fams) {
             for (const auto& a : iptables_remove_plan(f.tool, f.before, eff)) {
-                const auto r = ex.call(a);
+                const auto r = ex.call_iptables(a);
                 if (!r || !r->ok()) {
                     ok.notes.emplace_back("old_generation_left=1");
                     break;
@@ -3292,7 +3442,7 @@ public:
         for (int pass = 0; pass < 2; ++pass) {
             bool clean = true;
             for (const auto tool : tools) {
-                const auto r = ex.call({std::string{tool}, "-S"});
+                const auto r = ex.call_iptables({std::string{tool}, "-S"});
                 if (!r)
                     return StepResult::fail(ex.reason());
                 if (!r->ok()) {
@@ -3307,7 +3457,7 @@ public:
                     continue;
                 clean = false;
                 for (const auto& a : iptables_remove_plan(tool, listing, 0)) {
-                    const auto c = ex.call(a);
+                    const auto c = ex.call_iptables(a);
                     if (!c && ex.reason() == "deadline_exceeded")
                         return StepResult::fail(ex.reason());
                 }
@@ -3329,7 +3479,7 @@ public:
             tools.push_back(kIp6tablesPath);
         bool all = true;
         for (const auto tool : tools) {
-            const auto r = ex.call({std::string{tool}, "-S"});
+            const auto r = ex.call_iptables({std::string{tool}, "-S"});
             if (!r || !r->ok())
                 return st;
             const auto l = parse_iptables_listing(r->output);

@@ -82,8 +82,10 @@ inline constexpr std::string_view kQuarantineNotQuarantined{"device is not quara
 inline constexpr std::string_view kQuarantineApplyInFlight{
     "an apply is in flight or followed this observation"};
 
-/// A claim older than this is ignored (a crashed or stalled holder). Compared by timestamp at
-/// every read and write, never swept, so a dead holder needs no cleanup.
+/// A claim older than this is ignored (a crashed or stalled holder). Measured on the DATABASE
+/// clock, in SQL, at every read and write (never a replica's wall clock, which a step would turn
+/// a live claim into an expired one or the reverse), and never swept, so a dead holder needs no
+/// cleanup.
 inline constexpr std::int64_t kApplyClaimTtlSecs = 120;
 
 /// Maps a guarded write's result onto the pure decision code's enum. Anything that is neither
@@ -202,7 +204,8 @@ public:
     // record presents it. An apply claimed after the token read moves the generation, so the end
     // is refused; an apply claimed before it had left the server before the observing command
     // was sent, so the observing command is queued behind it. A crashed holder's claim is never
-    // cleared by anyone: it stops counting `kApplyClaimTtlSecs` after it was stamped.
+    // cleared by anyone: it stops counting `kApplyClaimTtlSecs` after it was stamped, both the
+    // stamp and the test being the database's clock (one SQL statement of it, in the store).
 
     /// Claim an apply for `record_id`: `apply_gen + 1` and the claim stamp, in one guarded UPDATE.
     /// Returns the generation the caller now owns (pass it to `release_apply_claim`).

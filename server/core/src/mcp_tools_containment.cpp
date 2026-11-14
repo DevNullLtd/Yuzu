@@ -21,6 +21,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -61,16 +62,14 @@ bool parse_limit(const nlohmann::json& args, std::size_t& limit) {
 }
 
 // Strict-typed include: absent selects the active records only; the one accepted value is
-// "release_owed" (#7624). Anything else, a non-string included, is refused. Returns false on a
-// bad value.
-bool parse_include(const nlohmann::json& args, bool& include_owed) {
-    include_owed = false;
+// "release_owed" (#7624). Anything else, a non-string included, is refused. Returns nullopt on a
+// bad value, otherwise whether the owed records were asked for.
+std::optional<bool> parse_include(const nlohmann::json& args) {
     const auto it = args.find("include");
     if (it == args.end())
-        return true;
-    if (!it->is_string() || it->get<std::string>() != "release_owed")
         return false;
-    include_owed = true;
+    if (!it->is_string() || it->get<std::string>() != "release_owed")
+        return std::nullopt;
     return true;
 }
 
@@ -103,8 +102,8 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
         return;
     }
 
-    bool include_owed = false;
-    if (!parse_include(ctx.args, include_owed)) {
+    const auto include = parse_include(ctx.args);
+    if (!include) {
         const bool audit_ok = ctx.audit("denied", "invalid arguments: include");
         ctx.res.set_content(
             ctx.a4_error(kInvalidParams, "include must be release_owed",
@@ -112,6 +111,7 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
             "application/json");
         return;
     }
+    const bool include_owed = *include;
     if (include_owed && !deps->quarantine_owed_list_fn) {
         answer_unwired(ctx, "service unavailable", "dependency unwired; failing closed", {},
                        "list_quarantined_devices: quarantine_owed_list_fn unwired - misconfigured "

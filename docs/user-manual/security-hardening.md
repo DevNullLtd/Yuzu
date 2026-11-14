@@ -825,6 +825,7 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   `forced_release_sent` row per 15 minutes. The bookkeeping that remembers a session's release is in
   memory: a server restart sends the release once more (and writes the `forced_release_*` rows again),
   which is harmless because a release is idempotent on the device.
+- **What the server keeps as evidence.** The reconciler's re-verify replies are working data, kept 24 hours (or forever on a server set to keep responses forever). What lasts is the record's `last_confirmed_at` stamp, which every confirming re-verify moves, the audit rows written on each change (`CONFIRMED`, `drift`, the release rows, `forced_release_unconfirmed`) and the counters; no reply is kept as proof that re-verify kept running. The lasting evidence for a parked owed release is its `forced_release_unconfirmed status=<name>` row, not the reply.
 - **Audit.** `quarantine.reapply` (`principal: system`): `record_id=<id> command_id=<id>
   trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`, `allow_set_not_applied ...`. `quarantine.disable`: the release
   rows described in the audit log reference. `record_id` is the internal `QuarantineRecord::id`, so a
@@ -850,7 +851,9 @@ contained with no record naming it. Two parts close that:
 - Every stored-record apply (the reconciler's and the MCP `quarantine_device` retry's) first **claims** the
   record, which moves a durable apply generation, and drops the claim when its dispatch returns. A
   dispatch that returned is not a delivery (a gateway only queues the command), so the generation, not
-  the claim, is what outlives it.
+  the claim, is what outlives it. A claim stops counting 120 seconds after it was stamped, and both the
+  stamp and that test use the database's clock, so a server whose own clock steps cannot make a live
+  claim read as expired or a dead one as live.
 - Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
   answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
   write that ends the record presents it. The store refuses the end when an apply was claimed since

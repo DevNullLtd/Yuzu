@@ -832,7 +832,7 @@ TEST_CASE("ResponseStore: shorten_ttl lowers ttl_expires_at for that command and
     CHECK(store.shorten_ttl("cmd-none", "agent-1", std::chrono::hours(24)));
 }
 
-TEST_CASE("ResponseStore: shorten_ttl sets an expiry on a row kept forever (retention 0)",
+TEST_CASE("ResponseStore: shorten_ttl leaves a row kept forever (retention 0) alone",
           "[pg][response_store][shorten_ttl]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -848,11 +848,13 @@ TEST_CASE("ResponseStore: shorten_ttl sets an expiry on a row kept forever (rete
     REQUIRE(rows->size() == 1);
     CHECK(rows->front().ttl_expires_at == 0); // never expires
 
+    // A server set to keep responses forever keeps these too: the call succeeds and changes nothing,
+    // so the reaper (which takes only ttl_expires_at > 0) never sees the row.
     REQUIRE(store.shorten_ttl("cmd-forever", "agent-1", std::chrono::hours(24)));
     rows = store.query("cmd-forever", kAllRows, ResponseQuery{.agent_id = "agent-1"});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
-    CHECK(rows->front().ttl_expires_at > static_cast<std::int64_t>(std::time(nullptr)));
+    CHECK(rows->front().ttl_expires_at == 0);
 }
 
 // ============================================================================

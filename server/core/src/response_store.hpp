@@ -357,12 +357,14 @@ public:
 
     /// Shortens the lifetime of the rows stored for `instruction_id` from `agent_id` so they expire
     /// `keep` from now: one UPDATE of `ttl_expires_at` to the store's own clock (the source
-    /// `compute_ttl_epoch` uses) plus `keep`, only where the row has no expiry (0) or a later one,
-    /// so it never extends a lifetime. For the quarantine reconciler's recurring status replies,
-    /// which would otherwise accumulate at the default retention (#7627). Bounded acquire; returns
-    /// false on any failure (the rows then keep the lifetime they had). Not a read.
-    bool shorten_ttl(const std::string& instruction_id, const std::string& agent_id,
-                     std::chrono::seconds keep);
+    /// `compute_ttl_epoch` uses) plus `keep`, only where the row has a LATER expiry, so it never
+    /// extends a lifetime and never gives a row kept forever (`ttl_expires_at = 0`, a server set to
+    /// keep responses forever) an expiry: such a row is left alone. For the quarantine
+    /// reconciler's recurring status replies, which would otherwise accumulate at the default
+    /// retention (#7627). Bounded acquire; returns false on any failure (the rows then keep the
+    /// lifetime they had). Not a read.
+    [[nodiscard]] bool shorten_ttl(const std::string& instruction_id, const std::string& agent_id,
+                                   std::chrono::seconds keep);
 
     // -- Reads: the Forensics tier (#4990) -------------------------------------------------------
     //

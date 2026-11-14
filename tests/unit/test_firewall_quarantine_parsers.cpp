@@ -299,15 +299,25 @@ struct IptWorld {
         return done(1);
     }
 
+    /// The iptables leg runs the tools ONLY through the root-owned helper (#7634), as
+    /// `<helper> iptables|ip6tables <the plan's tokens>`. The runner checks that for every call,
+    /// then hands the world the plan argv the helper stands for, so `log` and the assertions on
+    /// the order of the calls read as the plan.
     Runner runner() {
         return [this](const Argv& a, std::chrono::milliseconds) {
             ++crash.calls;
-            log.push_back(a);
+            REQUIRE(a.size() >= 3);
+            REQUIRE(a[0] == kFwHelperPath);
+            REQUIRE((a[1] == "iptables" || a[1] == "ip6tables"));
+            Argv plan{std::string{a[1] == "iptables" ? kIptablesPath : kIp6tablesPath}};
+            plan.insert(plan.end(), a.begin() + 2, a.end());
+            REQUIRE(iptables_helper_argv(plan) == a);
+            log.push_back(plan);
             if (clock)
                 clock->advance(per_call);
             if (crash.calls == crash.crash_at && !crash.after_effect)
                 throw CrashSim{};
-            auto r = effect(a);
+            auto r = effect(plan);
             if (crash.calls == crash.crash_at && crash.after_effect)
                 throw CrashSim{};
             return r;
@@ -1406,15 +1416,26 @@ TEST_CASE("iptables listing and removal plan", "[agent][firewall_quarantine]") {
     CHECK(iptables_remove_plan(kIptablesPath, l, 0).size() == 4 + 8);
 }
 
-// ── The sudoers shapes (#7634) ──────────────────────────────────────────────
+// ── The root-owned helper's argument grammar (#7634) ───────────────────────
 
-TEST_CASE("every iptables argv the plugin can build is inside the shapes the sudoers file grants",
+namespace {
+
+/// The argv the helper runs for a plan argv: `<helper> iptables|ip6tables <tokens after the tool>`.
+Argv via_helper(std::string_view family, const Argv& plan) {
+    Argv out{std::string{kFwHelperPath}, std::string{family}};
+    out.insert(out.end(), plan.begin() + 1, plan.end());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("every iptables argv the plugin can build maps to the root-owned helper's argv",
           "[agent][firewall_quarantine][sudoers]") {
     // The plans the leg runs, for both tools and both families: TCP reply rules, neighbour
-    // discovery, loopback, DHCP and a rule set that is empty of operator exceptions.
+    // discovery, loopback, DHCP, a rule set with host, prefix and port-less exceptions.
     const auto set = make_set({"203.0.113.53", "2001:4860:4860::8888"},
                               {ex("10.0.0.5:22/tcp/in"), ex("[2001:db8::]/32:443/out"),
-                               ex("10.0.0.6:443/tcp/out")});
+                               ex("10.0.0.6:443/tcp/out"), ex("10.0.0.7"), ex("10.1.0.0/16:53/udp/out")});
     std::vector<Argv> argvs;
     for (const auto& [tool, v6] : {std::pair{kIptablesPath, false}, std::pair{kIp6tablesPath, true}}) {
         for (const auto& a : iptables_build_plan(set, tool, 7, v6))
@@ -1424,7 +1445,7 @@ TEST_CASE("every iptables argv the plugin can build is inside the shapes the sud
         argvs.push_back(Argv{std::string{tool}, "-S"});
     }
     // Removal over a listing that includes a jump from a chain that is not a built-in (the plan
-    // takes the chain from the listing), generation 2 kept out.
+    // takes the chain from the listing), generation 2 kept out, and the leg's own rollback argv.
     const auto listing = parse_iptables_listing(
         "-P INPUT ACCEPT\n-N yuzu-fwq-2\n-N yuzu-fwq-2-f\n-N yuzu-fwq-3\n-N yuzu-fwq-3-f\n-N DOCKER\n"
         "-A INPUT -j yuzu-fwq-3\n-A INPUT -j yuzu-fwq-2\n-A OUTPUT -j yuzu-fwq-3\n"
@@ -1434,50 +1455,199 @@ TEST_CASE("every iptables argv the plugin can build is inside the shapes the sud
             argvs.push_back(a);
         for (const auto& a : iptables_remove_plan(tool, listing, 0))
             argvs.push_back(a);
+        for (const char* b : {"INPUT", "OUTPUT"})
+            argvs.push_back(Argv{std::string{tool}, "-D", b, "-j", "yuzu-fwq-9"});
+        argvs.push_back(Argv{std::string{tool}, "-D", "FORWARD", "-j", "yuzu-fwq-9-f"});
     }
-    REQUIRE(argvs.size() > 40);
+    REQUIRE(argvs.size() > 60);
     for (const auto& a : argvs) {
         CAPTURE(join(a));
-        CHECK(iptables_argv_in_sudo_shape(a));
+        const auto h = iptables_helper_argv(a);
+        REQUIRE(h.has_value());
+        CHECK(*h == via_helper(a[0] == kIptablesPath ? "iptables" : "ip6tables", a));
+        CHECK(all_tokens_safe(*h));
     }
+    // ...and the exact helper argv of one of each shape
+    const std::string h = std::string{kFwHelperPath};
+    CHECK(*iptables_helper_argv({"/usr/sbin/iptables", "-S"}) == Argv{h, "iptables", "-S"});
+    CHECK(*iptables_helper_argv({"/usr/sbin/ip6tables", "-N", "yuzu-fwq-12"}) ==
+          Argv{h, "ip6tables", "-N", "yuzu-fwq-12"});
+    CHECK(*iptables_helper_argv({"/usr/sbin/iptables", "-A", "yuzu-fwq-4", "-d", "10.0.0.5", "-p", "tcp",
+                                 "--sport", "22", "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"}) ==
+          Argv{h, "iptables", "-A", "yuzu-fwq-4", "-d", "10.0.0.5", "-p", "tcp", "--sport", "22",
+               "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"});
+    CHECK(*iptables_helper_argv({"/usr/sbin/iptables", "-I", "FORWARD", "1", "-j", "yuzu-fwq-4-f"}) ==
+          Argv{h, "iptables", "-I", "FORWARD", "1", "-j", "yuzu-fwq-4-f"});
 }
 
-TEST_CASE("iptables_argv_in_sudo_shape: anything outside the granted shapes is refused",
+TEST_CASE("iptables_helper_argv: the grammar's edges that are inside",
           "[agent][firewall_quarantine][sudoers]") {
     const std::string t4{kIptablesPath};
     const std::string t6{kIp6tablesPath};
-    const auto in_shape = [](Argv a) { return iptables_argv_in_sudo_shape(a); };
-    // the nine shapes, spelled out once
-    CHECK(in_shape({t4, "-S"}));
-    CHECK(in_shape({t6, "-N", "yuzu-fwq-12"}));
-    CHECK(in_shape({t4, "-A", "yuzu-fwq-12-f", "-j", "DROP"}));
-    CHECK(in_shape({t4, "-I", "FORWARD", "1", "-j", "yuzu-fwq-12-f"}));
-    CHECK(in_shape({t4, "-D", "DOCKER", "-j", "yuzu-fwq-12"}));
-    CHECK(in_shape({t4, "-F", "yuzu-fwq-12"}));
-    CHECK(in_shape({t4, "-X", "yuzu-fwq-12-f"}));
-    // not granted: a policy change, a bare flush, a rule on a built-in chain, another table, a
-    // position other than 1, a jump to a chain that is not ours, extra tokens on a one-token shape
-    CHECK_FALSE(in_shape({t4, "-P", "INPUT", "ACCEPT"}));
-    CHECK_FALSE(in_shape({t4, "-F"}));
-    CHECK_FALSE(in_shape({t4, "-F", "INPUT"}));
-    CHECK_FALSE(in_shape({t4, "-X", "DOCKER"}));
-    CHECK_FALSE(in_shape({t4, "-A", "INPUT", "-j", "ACCEPT"}));
-    CHECK_FALSE(in_shape({t4, "-A", "INPUT", "-j", "yuzu-fwq-1"}));
-    CHECK_FALSE(in_shape({t4, "-t", "nat", "-A", "yuzu-fwq-1", "-j", "DROP"}));
-    CHECK_FALSE(in_shape({t4, "-I", "INPUT", "2", "-j", "yuzu-fwq-1"}));
-    CHECK_FALSE(in_shape({t4, "-I", "INPUT", "1", "-j", "ACCEPT"}));
-    CHECK_FALSE(in_shape({t4, "-I", "yuzu-fwq-1", "1", "-j", "yuzu-fwq-1"}));
-    CHECK_FALSE(in_shape({t4, "-D", "INPUT", "-j", "ACCEPT"}));
-    CHECK_FALSE(in_shape({t4, "-D", "INPUT", "1"}));
-    CHECK_FALSE(in_shape({t4, "-S", "INPUT"}));
-    CHECK_FALSE(in_shape({t4, "-N", "yuzu-fwq-1", "extra"}));
-    CHECK_FALSE(in_shape({t4, "-N", "yuzu-fwq-"}));      // no generation
-    CHECK_FALSE(in_shape({t4, "-N", "yuzu-fwq-1x"}));
+    const auto in = [](Argv a) { return iptables_helper_argv(a).has_value(); };
+    CHECK(in({t4, "-N", "yuzu-fwq-2147483647"}));        // the largest generation
+    CHECK(in({t4, "-N", "yuzu-fwq-0000000001-f"}));      // leading zeros: ipt_chain_gen takes them too
+    CHECK(in({t4, "-D", "DOCKER-USER", "-j", "yuzu-fwq-3"}));
+    CHECK(in({t4, "-D", std::string(28, 'a'), "-j", "yuzu-fwq-3"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "65535", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-s", "10.0.0.0/32", "-p", "udp", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-d", "2001:db8::/128", "-p", "tcp", "--sport", "1", "--dport", "2",
+              "--tcp-flags", "RST", "RST", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-s", "::", "-p", "udp", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "133", "-j", "ACCEPT"}));
+    CHECK(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "136", "-j", "ACCEPT"}));
+    CHECK(in({t4, "-A", "yuzu-fwq-1", "-o", "lo", "-j", "ACCEPT"}));
+}
+
+TEST_CASE("iptables_helper_argv: anything outside the granted shapes is refused",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string t4{kIptablesPath};
+    const std::string t6{kIp6tablesPath};
+    const auto in = [](Argv a) { return iptables_helper_argv(a).has_value(); };
+    const Argv a_drop{t4, "-A", "yuzu-fwq-1", "-j", "DROP"};
+    REQUIRE(in(a_drop)); // the base the tails below extend
+
+    // A tail after a complete rule, split into tokens and glued onto one: an option of the tool
+    // that loads a program, selects another table, or adds a match the plugin never builds.
+    for (const char* tail : {"-t", "raw", "--modprobe=/x", "--modprobe", "-m", "comment", "--comment",
+                             "-g", "-c", "-w", "--wait", "-4", "-6", "--table=raw", "-v"}) {
+        CAPTURE(tail);
+        auto a = a_drop;
+        a.emplace_back(tail);
+        CHECK_FALSE(in(a));
+    }
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "-t", "raw"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "--modprobe=/x"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "-m", "comment", "--comment", "x"}));
+    // ...and the same in front of the shape, or between its tokens
+    CHECK_FALSE(in({t4, "-t", "raw", "-A", "yuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "--modprobe=/x", "-A", "yuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "--modprobe", "/x", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-m", "comment", "--comment", "x", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "--modprobe=/x", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "-j", "ACCEPT", "-t", "raw"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "-j", "ACCEPT", "--dport", "22"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", "22", "--sport", "22", "-j", "ACCEPT"}));
+    // a rule that is not one of the plan's: a target other than DROP / ACCEPT, an accept-all, no match
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "REJECT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j", "DROP", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-j"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-i", "eth0", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-i", "lo", "-o", "lo", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "icmp", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "all", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "6", "-j", "ACCEPT"}));
+    // a chain that is not ours, on every shape that names one
+    CHECK_FALSE(in({t4, "-A", "INPUT", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1x", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-A", "xyuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in({t4, "-N", "DOCKER"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq--f"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-1-f-f"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-1x"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-2147483648"}));   // past the largest generation
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-12345678901"}));  // eleven digits
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq- 1"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-+1"}));
+    CHECK_FALSE(in({t4, "-N", "yuzu-fwq-1", "extra"}));
+    CHECK_FALSE(in({t4, "-F"}));
+    CHECK_FALSE(in({t4, "-F", "INPUT"}));
+    CHECK_FALSE(in({t4, "-X", "DOCKER"}));
+    CHECK_FALSE(in({t4, "-X"}));
+    // ports: zero, past the top, signed, leading zero, empty, glued with a space
+    for (const char* port : {"0", "65536", "-1", "+22", "022", "", "22 ", " 22", "2e1", "0x16", "99999", "123456"}) {
+        CAPTURE(port);
+        CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--dport", port, "-j", "ACCEPT"}));
+        CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "udp", "--sport", port, "-j", "ACCEPT"}));
+    }
+    // addresses: a name, an option, a prefix out of range, a malformed literal
+    for (const char* addr : {"evil.example.com", "localhost", "-1.2.3.4", "--modprobe=/x", "10.0.0", "10.0.0.0.0",
+                             "10..0.1", ".10.0.1", "10.0.0.", "10.0.0.1/33", "10.0.0.1/", "/24", "10.0.0.1/-1",
+                             "10.0.0.1/24/1", "10.0.0.1/0024", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
+                             "fe80:1", "g::1", "10.0.0.1 ", "0x0a.0.0.1", "10.0.0.1,10.0.0.2",
+                             "::ffff:1.2.3.4", "!10.0.0.1", "10.0.0.1/ 8", ""}) {
+        CAPTURE(addr);
+        CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-s", addr, "-p", "tcp", "-j", "ACCEPT"}));
+        CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-d", addr, "-p", "udp", "--dport", "53", "-j", "ACCEPT"}));
+    }
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-s", std::string(44, '1'), "-p", "tcp", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-s", "10.0.0.1", "-d", "10.0.0.2", "-p", "tcp", "-j", "ACCEPT"}));
+    // neighbour discovery: 133..136 only, no address, nothing after
+    for (const char* type : {"132", "137", "0", "13", "1333", "13x", "", "-133", "+133"}) {
+        CAPTURE(type);
+        CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", type, "-j", "ACCEPT"}));
+    }
+    CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-s", "fe80::1", "-p", "icmpv6", "--icmpv6-type", "135", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "--icmpv6-type", "135", "--dport", "1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t6, "-A", "yuzu-fwq-1", "-p", "icmpv6", "-j", "ACCEPT"}));
+    // tcp flags: the two the plan builds, tcp only
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "SYN", "SYN", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK", "RST", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK,RST", "ACK", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "tcp", "--tcp-flags", "ACK", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-A", "yuzu-fwq-1", "-p", "udp", "--tcp-flags", "ACK", "ACK", "-j", "ACCEPT"}));
+    // the jump insert: only the three built-in chains, only position 1, only a jump to ours
+    CHECK_FALSE(in({t4, "-I", "INPUT", "2", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "0", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "1", "-j", "DOCKER"}));
+    CHECK_FALSE(in({t4, "-I", "yuzu-fwq-1", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "PREROUTING", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "input", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "1", "-j", "yuzu-fwq-1", "-m", "comment"}));
+    CHECK_FALSE(in({t4, "-I", "INPUT", "-j", "yuzu-fwq-1"}));
+    // the jump delete: a plain chain name, never an option; only a jump to ours
+    CHECK_FALSE(in({t4, "-D", "--modprobe=/x", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "-t", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", std::string(29, 'a'), "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "IN PUT", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT;", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT", "-j", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT", "1"}));
+    CHECK_FALSE(in({t4, "-D", "INPUT", "-j", "yuzu-fwq-1", "extra"}));
+    // other operations, extra tokens on a one-token shape
+    for (const char* op : {"-P", "-L", "-R", "-C", "-E", "-Z", "-V", "-h", "--help", "--list", "-S1", "-s"})
+        CHECK_FALSE(in({t4, op}));
+    CHECK_FALSE(in({t4, "-P", "INPUT", "ACCEPT"}));
+    CHECK_FALSE(in({t4, "-S", "INPUT"}));
+    CHECK_FALSE(in({t4, "-S", "-t", "raw"}));
     // another tool, an empty argv, and a bare tool
-    CHECK_FALSE(in_shape({"/sbin/iptables", "-S"}));
-    CHECK_FALSE(in_shape({"/usr/sbin/iptables-save", "-S"}));
-    CHECK_FALSE(in_shape({}));
-    CHECK_FALSE(in_shape({t4}));
+    for (const char* tool : {"/sbin/iptables", "/usr/sbin/iptables-save", "/usr/sbin/iptables-restore",
+                             "/usr/sbin/ip6tables-save", "iptables", "/usr/sbin/nft", "/usr/sbin/iptables ",
+                             "/usr/sbin/iptables-nft", "/usr/local/sbin/yuzu-fw-helper"})
+        CHECK_FALSE(in({tool, "-S"}));
+    CHECK_FALSE(in({}));
+    CHECK_FALSE(in({t4}));
+}
+
+TEST_CASE("the iptables leg refuses a plan argv outside the helper's grammar, with nothing spawned",
+          "[agent][firewall_quarantine][sudoers]") {
+    int ran = 0;
+    const Runner run = [&](const Argv&, std::chrono::milliseconds) {
+        ++ran;
+        return done(0);
+    };
+    Deadline dl;
+    detail::Exec ex(run, dl);
+    CHECK_FALSE(ex.call_iptables({"/usr/sbin/iptables", "-A", "yuzu-fwq-1", "-j", "DROP", "-t", "raw"}));
+    CHECK(ex.reason() == "unsafe_argv");
+    CHECK_FALSE(ex.call_iptables({"/usr/sbin/iptables", "-F", "INPUT"}));
+    CHECK_FALSE(ex.call_iptables({"/usr/sbin/nft", "list", "table", "inet", "yuzu_quarantine"}));
+    CHECK(ran == 0);
+    // an argv inside the grammar runs, as the helper's argv and nothing else
+    Argv seen;
+    const Runner record = [&](const Argv& a, std::chrono::milliseconds) {
+        seen = a;
+        return done(0);
+    };
+    detail::Exec ok(record, dl);
+    REQUIRE(ok.call_iptables({"/usr/sbin/ip6tables", "-X", "yuzu-fwq-3-f"}));
+    CHECK(seen == Argv{std::string{kFwHelperPath}, "ip6tables", "-X", "yuzu-fwq-3-f"});
 }
 
 TEST_CASE("iptables worst case stays inside the operation budget as counted calls",

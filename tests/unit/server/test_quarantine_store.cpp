@@ -1099,6 +1099,60 @@ TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is
     CHECK(**ended == 2);
 }
 
+namespace {
+// Stamp the record's claim `age_secs` old on the DATABASE clock, the clock the store judges it by.
+void stamp_claim_age(const std::string& dsn, std::int64_t id, std::int64_t age_secs) {
+    exec_sql(dsn, "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = "
+                  "EXTRACT(EPOCH FROM now())::bigint - " +
+                      std::to_string(age_secs) + " WHERE id = " + std::to_string(id));
+}
+} // namespace
+
+TEST_CASE("QuarantineStore: the 120 s claim window is the database's clock, at the claim, the token "
+          "read and both fenced ends: 119 s old is live, 121 s old is expired",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The device-confirmed end and claim_apply and the token read, on an active record.
+    REQUIRE(store.quarantine_device("agent-c1", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-c1")->id;
+    stamp_claim_age(db.dsn(), id, kApplyClaimTtlSecs - 1);
+    CHECK_FALSE(store.claim_apply("agent-c1", id).has_value());
+    const auto live_token = store.apply_fence_token("agent-c1", id);
+    REQUIRE(live_token.has_value());
+    CHECK_FALSE(live_token->has_value()); // empty: nothing may be read as settled
+    const auto live_end = store.mark_released("agent-c1", id, ReleaseEnd::device_confirmed, 0);
+    REQUIRE_FALSE(live_end.has_value());
+    CHECK(classify_quarantine_write(live_end) == QuarantineWrite::apply_in_flight);
+
+    stamp_claim_age(db.dsn(), id, kApplyClaimTtlSecs + 1);
+    const auto expired_token = store.apply_fence_token("agent-c1", id);
+    REQUIRE(expired_token.has_value());
+    REQUIRE(expired_token->has_value());
+    CHECK(**expired_token == 0);
+    const auto taken = store.claim_apply("agent-c1", id);
+    REQUIRE(taken.has_value());
+    CHECK(*taken == 1);
+    stamp_claim_age(db.dsn(), id, kApplyClaimTtlSecs + 1); // the taken claim ages out as well
+    REQUIRE(store.mark_released("agent-c1", id, ReleaseEnd::device_confirmed, *taken).has_value());
+
+    // The owed-release clear, on a record a forced end left owed.
+    REQUIRE(store.quarantine_device("agent-c2", "admin", "reason", "").has_value());
+    const auto owed_id = active_row(store, "agent-c2")->id;
+    REQUIRE(store.mark_released("agent-c2", owed_id, ReleaseEnd::forced).has_value());
+    stamp_claim_age(db.dsn(), owed_id, kApplyClaimTtlSecs - 1);
+    const auto live_clear = store.clear_release_owed("agent-c2", owed_id, 0);
+    REQUIRE_FALSE(live_clear.has_value());
+    CHECK(classify_quarantine_write(live_clear) == QuarantineWrite::apply_in_flight);
+    CHECK(owed_contains(store, "agent-c2"));
+    stamp_claim_age(db.dsn(), owed_id, kApplyClaimTtlSecs + 1);
+    REQUIRE(store.clear_release_owed("agent-c2", owed_id, 0).has_value());
+    CHECK_FALSE(owed_contains(store, "agent-c2"));
+}
+
 TEST_CASE("QuarantineStore: a confirmed end needs the generation it observed against: refused with no "
           "fence, under a live claim, and after a later apply; a forced end ignores both",
           "[pg][quarantine][apply_fence]") {

@@ -1838,6 +1838,40 @@ TEST_CASE("REST DELETE /api/v1/quarantine: a device that answers inactive while 
     CHECK(pending->detail.find("fence_unread=1") == std::string::npos);
 }
 
+TEST_CASE("REST DELETE /api/v1/quarantine: when the apply fence token cannot be read, a device that "
+          "answers inactive does not end the record: 202, still releasing, and the pending row says "
+          "fence_unread=1",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    // Fail ONLY the token read: its WHERE compares apply_claimed_at with 0 and with the database
+    // clock, which stops type-checking once the column is text. request_release and the release
+    // dispatch never touch the column. A failed read treated as a token (generation 0, say) would
+    // present it to the confirming mark, so the note on the pending row is what tells the two apart.
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                        "ALTER COLUMN apply_claimed_at DROP DEFAULT, "
+                        "ALTER COLUMN apply_claimed_at TYPE text USING apply_claimed_at::text");
+    REQUIRE_FALSE(h.quarantine_store.apply_fence_token("agent-B", 1).has_value()); // the read is degraded
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["released"] == false);
+    CHECK(body["data"]["state"] == "releasing");
+    CHECK(find_audit(h, "success") == nullptr);
+    const auto* pending = find_audit(h, "pending");
+    REQUIRE(pending != nullptr);
+    CHECK(pending->detail.find("state=releasing") == 0);
+    CHECK(pending->detail.ends_with(" fence_unread=1"));
+    CHECK(pending->detail.find("apply_in_flight=1") == std::string::npos);
+    // the release itself went out, and the record is still there, releasing
+    CHECK(h.dispatch_calls.size() == 1);
+    const auto record = h.quarantine_store.get_status("agent-B");
+    REQUIRE(record.has_value());
+    REQUIRE(record->has_value());
+    CHECK((*record)->status == "releasing"); // listed, and keeping the dispatch refusal
+    CHECK((*record)->release_requested_at != 0);
+}
+
 // ── #7628: the enable and disable rows name the same record ───────────────────
 
 TEST_CASE("REST POST then DELETE /api/v1/quarantine: the record_id on the quarantine.enable success row "

@@ -37,7 +37,13 @@
 #       that need raw sockets, ptrace, or ip-route management can do
 #       so without an extra sudo round-trip:
 #         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
-# 6.  (Optional) On both platforms, prints a verifying summary that the
+# 6.  (Linux only) Installs /usr/local/sbin/yuzu-fw-helper (root:root 0755), the
+#       one program the sudoers file lets the agent account run as root for
+#       iptables and ip6tables. It is written from a quoted heredoc below,
+#       to a temporary file in the same directory and renamed into place,
+#       and it goes in BEFORE the sudoers file that names it. See the
+#       helper's own header for the argument shapes it accepts.
+# 7.  (Optional) On both platforms, prints a verifying summary that the
 #       operator can spot-check.
 #
 # WHAT THIS SCRIPT DOES NOT DO
@@ -61,10 +67,20 @@
 # update the privilege list and re-run), but only after passing
 # `visudo -cf`.
 #
+# UPGRADES
+# ────────
+# A host provisioned by an earlier copy of this script has no helper and its
+# sudoers file still carries the earlier iptables lines. Re-run this script
+# (with the agent upgrade) on every host whose containment falls back to
+# iptables: it installs the helper and replaces the sudoers file. Until it
+# has run, sudo refuses the helper and the iptables-fallback containment
+# actions fail on that host.
+#
 # UNINSTALL
 # ─────────
 # Pass --uninstall to reverse:
 #   - removes /etc/sudoers.d/yuzu-agent
+#   - removes /usr/local/sbin/yuzu-fw-helper (Linux)
 #   - removes the agent's filesystem hierarchy (logs are preserved
 #     under /var/log/yuzu-agent.removed-<timestamp>/ for forensics)
 #   - deletes the user account
@@ -78,19 +94,22 @@
 #                    executing any of them. Use this first.
 #   --check          Verify the install is correct (user exists with
 #                    expected attributes, sudoers file present + valid,
-#                    state dirs exist with correct ownership). Exits
-#                    non-zero on any drift.
-#   --uninstall      Remove the user, sudoers file, and state dirs.
+#                    the Linux firewall helper present with the expected
+#                    owner, mode and content, state dirs exist with
+#                    correct ownership). Exits non-zero on any drift.
+#   --uninstall      Remove the user, sudoers file, firewall helper, and
+#                    state dirs.
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
 #   --binary-path P  Override the path to the agent binary for setcap.
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
 #                    On macOS this is a no-op (no setcap equivalent).
-#   --no-sudoers     Skip the sudoers file install. Useful in test
-#                    environments where you don't want any privilege
-#                    grants; the agent will still run but the firewall
-#                    containment actions and other privileged plugins will fail at dispatch
+#   --no-sudoers     Skip the sudoers file install and the Linux firewall
+#                    helper it names. Useful in test environments where
+#                    you don't want any privilege grants; the agent will
+#                    still run but the firewall containment actions and
+#                    other privileged plugins will fail at dispatch
 #                    time (which the test ladder catches).
 #   --no-setcap      Skip the setcap step on Linux. Useful if you set
 #                    capabilities via a packaging tool (.deb postinst,
@@ -117,6 +136,11 @@ ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
+
+# The root-owned helper the Linux sudoers file names for iptables / ip6tables. The same string is
+# kFwHelperPath in agents/plugins/firewall/src/firewall_quarantine_parsers.hpp;
+# tests/test_legacy_quarantine_plugin_removed_lexical.py checks the two against each other.
+FW_HELPER_PATH="/usr/local/sbin/yuzu-fw-helper"
 
 # ── platform detection ───────────────────────────────────────────────────────
 # We support exactly two platforms in this script: macOS and Linux. The
@@ -486,34 +510,19 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/security delete-certificate -t /Libr
 EOF
     else  # linux
         cat <<EOF
-# firewall plugin — iptables / ip6tables, the containment fallback when nft is absent. These
-# lines NARROW the argv shape to the nine the plugin builds (list, and create / append / insert
-# the jump / remove the jump / flush / delete on its own yuzu-fwq-* generation chains); they do
-# not confine the tool: a sudo glob matches concatenated args, so the -A line also admits
-# whatever follows the chain name. The confinement is the firewall plugin's token validation
-# (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp, iptables_argv_in_sudo_shape is the
-# one statement of these shapes). There is no bare iptables or ip6tables grant. Sudo regular
-# expressions would pin them tighter but need sudo 1.9.10, and the hosts that fall back to
-# iptables ship older ones.
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -S
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -N yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -A yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT 1 -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -I OUTPUT 1 -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -I FORWARD 1 -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -D * -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -F yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -X yuzu-fwq-*
-
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -S
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -N yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -A yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -I INPUT 1 -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -I OUTPUT 1 -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -I FORWARD 1 -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -D * -j yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -F yuzu-fwq-*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -X yuzu-fwq-*
+# firewall plugin — iptables / ip6tables, the containment fallback when nft is absent. The agent
+# account may run exactly one program as root for them: the helper the installer wrote to
+# $FW_HELPER_PATH (root:root 0755). This line names the helper with no argument and no wildcard;
+# the helper takes the tokens of one fixed argument shape (list, or create / append / insert the
+# jump / remove the jump / flush / delete on a yuzu-fwq-* generation chain), validates every
+# variable token itself, and runs /usr/sbin/iptables or /usr/sbin/ip6tables with an argument list
+# it builds from its own literals plus the validated values. It never passes the caller's
+# arguments on, and anything outside the shapes exits non-zero having run nothing. There is no
+# iptables, ip6tables, iptables-save or iptables-restore grant. A sudo regular expression could pin
+# the arguments in this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04
+# and earlier and Debian 11 do not ship. A host provisioned before the helper existed has none of
+# this until the installer is re-run.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). These lines NARROW
 # the argv shape; they do not confine nft: sudo globs match concatenated args, and the file
@@ -596,12 +605,395 @@ remove_sudoers() {
     fi
 }
 
+# ── Linux firewall helper ───────────────────────────────────────────────────
+#
+# The sudoers file names ONE program for iptables / ip6tables: $FW_HELPER_PATH. It is a POSIX sh
+# script, written from the quoted heredoc below (nothing in it is expanded by this script). The
+# installer is standalone and has no build output to copy, so the text lives here, and --check
+# compares the installed file with it byte for byte.
+#
+# Contract (the C++ twin is iptables_helper_argv in
+# agents/plugins/firewall/src/firewall_quarantine_parsers.hpp; the two grammars move together and
+# tests/test_legacy_quarantine_plugin_removed_lexical.py runs this text against the same cases):
+#   - it matches the token count and every fixed token with `case`, validates every variable
+#     token, and then execs the tool with an argument list it builds from its own literals plus the
+#     validated values. No token ever reaches a shell parser: no eval, no `sh -c`, no arithmetic on a
+#     token before its digit check, no environment read.
+#   - anything else exits 64 having run nothing.
+# Installed root:root 0755, written to a temporary file in the same directory and renamed into
+# place, and always BEFORE the sudoers file that names it. Linux only.
+
+generate_fw_helper_content() {
+    cat <<'YUZU_FW_HELPER'
+#!/bin/sh
+# yuzu-fw-helper: the one program the Yuzu agent account may run as root to change iptables and
+# ip6tables. Installed by scripts/install-agent-user.sh (Linux only), root:root 0755, and named in
+# /etc/sudoers.d/yuzu-agent with no argument and no wildcard. Do not edit by hand: the installer's
+# --check compares this file with its own text.
+#
+# Usage: yuzu-fw-helper iptables|ip6tables <tokens>
+# <tokens> are exactly those of one of these shapes (<ours> is a yuzu-fwq-<generation>[-f] chain,
+# the generation 1 to 10 digits and at most 2147483647):
+#   -S
+#   -N <ours>
+#   -A <ours> <rule>
+#   -I INPUT|OUTPUT|FORWARD 1 -j <ours>
+#   -D <chain> -j <ours>           (<chain>: 1 to 28 of letters, digits . : / _ -, not starting with -)
+#   -F <ours>
+#   -X <ours>
+# and <rule> is one of:
+#   -j DROP
+#   -i lo -j ACCEPT
+#   -o lo -j ACCEPT
+#   -p icmpv6 --icmpv6-type 133|134|135|136 -j ACCEPT
+#   [-s|-d <address>[/<prefix>]] -p tcp|udp [--sport <port>] [--dport <port>]
+#       [--tcp-flags ACK ACK|RST RST (tcp only)] -j ACCEPT
+# <address> is an IPv4 literal (digits, exactly three dots) or an IPv6 literal (lower-case hex and
+# colons, two or more colons), at most 43 characters with its prefix; <port> is 1 to 65535 in
+# plain decimal.
+#
+# The caller's arguments are never passed on. Each branch below matches the token count and the
+# fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
+# own literals plus the validated values. Anything else exits 64, having run nothing.
+
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+IPT=/usr/sbin/iptables
+IP6T=/usr/sbin/ip6tables
+
+refuse() {
+    printf 'yuzu-fw-helper: refused\n' >&2
+    exit 64
+}
+
+# tok_is TOKEN LITERAL: the token is exactly the literal (a quoted case pattern is not a glob).
+tok_is() {
+    case $1 in
+        "$2") return 0 ;;
+    esac
+    return 1
+}
+
+all_digits() {
+    case $1 in
+        '' | *[!0123456789]*) return 1 ;;
+    esac
+    return 0
+}
+
+# is_ours TOKEN: yuzu-fwq-<generation>[-f].
+is_ours() {
+    case $1 in
+        yuzu-fwq-*) ;;
+        *) return 1 ;;
+    esac
+    gen=${1#yuzu-fwq-}
+    gen=${gen%-f}
+    all_digits "$gen" || return 1
+    case ${#gen} in
+        1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9) return 0 ;;
+        10) [ "$gen" -le 2147483647 ] ;;
+        *) return 1 ;;
+    esac
+}
+
+# is_from_chain TOKEN: the chain a jump of ours sits in.
+is_from_chain() {
+    case $1 in
+        '' | -* | *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._:/-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 28 ]
+}
+
+# is_port TOKEN: plain decimal 1 to 65535.
+is_port() {
+    case $1 in
+        '' | 0* | *[!0123456789]*) return 1 ;;
+    esac
+    case ${#1} in
+        1 | 2 | 3 | 4) return 0 ;;
+        5) [ "$1" -le 65535 ] ;;
+        *) return 1 ;;
+    esac
+}
+
+# is_addr TOKEN: an IPv4 or IPv6 literal with an optional /prefix.
+is_addr() {
+    [ "${#1}" -le 43 ] || return 1
+    addr_part=$1
+    pre=
+    case $1 in
+        */*)
+            addr_part=${1%%/*}
+            pre=${1#*/}
+            all_digits "$pre" || return 1
+            [ "${#pre}" -le 3 ] || return 1
+            ;;
+    esac
+    case $addr_part in
+        *:*:*)
+            case $addr_part in
+                *[!0123456789abcdef:]* | *:::*) return 1 ;;
+            esac
+            lim=128
+            ;;
+        *:*) return 1 ;;
+        *[!0123456789.]* | .* | *. | *..* | *.*.*.*.*) return 1 ;;
+        *.*.*.*) lim=32 ;;
+        *) return 1 ;;
+    esac
+    [ -z "$pre" ] || [ "$pre" -le "$lim" ]
+}
+
+# parse_l4 TOKENS: [-s|-d ADDR] -p tcp|udp [--sport P] [--dport P] [--tcp-flags F F] -j ACCEPT, or the
+# icmpv6 form. Sets r_*; the caller rebuilds the argument list from them.
+parse_l4() {
+    case $1 in
+        -s | -d)
+            [ $# -ge 2 ] || return 1
+            is_addr "$2" || return 1
+            r_aopt=$1
+            r_addr=$2
+            shift 2
+            ;;
+    esac
+    [ $# -ge 4 ] || return 1
+    tok_is "$1" -p || return 1
+    case $2 in
+        tcp) r_proto=tcp ;;
+        udp) r_proto=udp ;;
+        icmpv6)
+            [ -z "$r_aopt" ] || return 1
+            [ $# -eq 6 ] || return 1
+            tok_is "$3" --icmpv6-type || return 1
+            case $4 in
+                133) r_type=133 ;;
+                134) r_type=134 ;;
+                135) r_type=135 ;;
+                136) r_type=136 ;;
+                *) return 1 ;;
+            esac
+            tok_is "$5" -j || return 1
+            tok_is "$6" ACCEPT || return 1
+            r_kind=icmp6
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+    shift 2
+    if [ $# -ge 2 ] && tok_is "$1" --sport; then
+        is_port "$2" || return 1
+        r_sport=$2
+        shift 2
+    fi
+    if [ $# -ge 2 ] && tok_is "$1" --dport; then
+        is_port "$2" || return 1
+        r_dport=$2
+        shift 2
+    fi
+    if [ $# -ge 3 ] && tok_is "$1" --tcp-flags; then
+        tok_is "$r_proto" tcp || return 1
+        if tok_is "$2" ACK && tok_is "$3" ACK; then
+            r_flags=ACK
+        elif tok_is "$2" RST && tok_is "$3" RST; then
+            r_flags=RST
+        else
+            return 1
+        fi
+        shift 3
+    fi
+    [ $# -eq 2 ] || return 1
+    tok_is "$1" -j || return 1
+    tok_is "$2" ACCEPT || return 1
+    r_kind=l4
+    return 0
+}
+
+# parse_rule TOKENS: the rule of an -A.
+parse_rule() {
+    r_kind=
+    r_type=
+    r_aopt=
+    r_addr=
+    r_proto=
+    r_sport=
+    r_dport=
+    r_flags=
+    [ $# -ge 2 ] || return 1
+    case $1 in
+        -j)
+            [ $# -eq 2 ] || return 1
+            tok_is "$2" DROP || return 1
+            r_kind=drop
+            ;;
+        -i | -o)
+            [ $# -eq 4 ] || return 1
+            tok_is "$2" lo || return 1
+            tok_is "$3" -j || return 1
+            tok_is "$4" ACCEPT || return 1
+            case $1 in
+                -i) r_kind=lo_in ;;
+                *) r_kind=lo_out ;;
+            esac
+            ;;
+        -s | -d | -p) parse_l4 "$@" || return 1 ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+[ $# -ge 2 ] || refuse
+case $1 in
+    iptables) tool=$IPT ;;
+    ip6tables) tool=$IP6T ;;
+    *) refuse ;;
+esac
+op=$2
+shift 2
+
+case $op in
+    -S)
+        [ $# -eq 0 ] || refuse
+        exec "$tool" -S
+        ;;
+    -N)
+        [ $# -eq 1 ] || refuse
+        is_ours "$1" || refuse
+        exec "$tool" -N "$1"
+        ;;
+    -F)
+        [ $# -eq 1 ] || refuse
+        is_ours "$1" || refuse
+        exec "$tool" -F "$1"
+        ;;
+    -X)
+        [ $# -eq 1 ] || refuse
+        is_ours "$1" || refuse
+        exec "$tool" -X "$1"
+        ;;
+    -I)
+        [ $# -eq 4 ] || refuse
+        tok_is "$2" 1 || refuse
+        tok_is "$3" -j || refuse
+        is_ours "$4" || refuse
+        case $1 in
+            INPUT) exec "$tool" -I INPUT 1 -j "$4" ;;
+            OUTPUT) exec "$tool" -I OUTPUT 1 -j "$4" ;;
+            FORWARD) exec "$tool" -I FORWARD 1 -j "$4" ;;
+            *) refuse ;;
+        esac
+        ;;
+    -D)
+        [ $# -eq 3 ] || refuse
+        is_from_chain "$1" || refuse
+        tok_is "$2" -j || refuse
+        is_ours "$3" || refuse
+        exec "$tool" -D "$1" -j "$3"
+        ;;
+    -A)
+        [ $# -ge 3 ] || refuse
+        is_ours "$1" || refuse
+        chain=$1
+        shift
+        parse_rule "$@" || refuse
+        # Rebuild the argument list from literals and the validated values. The "$@" at the exec
+        # below is this list, not the caller's.
+        set -- -A "$chain"
+        case $r_kind in
+            drop) set -- "$@" -j DROP ;;
+            lo_in) set -- "$@" -i lo -j ACCEPT ;;
+            lo_out) set -- "$@" -o lo -j ACCEPT ;;
+            icmp6) set -- "$@" -p icmpv6 --icmpv6-type "$r_type" -j ACCEPT ;;
+            l4)
+                case $r_aopt in
+                    -s) set -- "$@" -s "$r_addr" ;;
+                    -d) set -- "$@" -d "$r_addr" ;;
+                esac
+                case $r_proto in
+                    tcp) set -- "$@" -p tcp ;;
+                    udp) set -- "$@" -p udp ;;
+                esac
+                [ -z "$r_sport" ] || set -- "$@" --sport "$r_sport"
+                [ -z "$r_dport" ] || set -- "$@" --dport "$r_dport"
+                case $r_flags in
+                    ACK) set -- "$@" --tcp-flags ACK ACK ;;
+                    RST) set -- "$@" --tcp-flags RST RST ;;
+                esac
+                set -- "$@" -j ACCEPT
+                ;;
+            *) refuse ;;
+        esac
+        exec "$tool" "$@"
+        ;;
+    *) refuse ;;
+esac
+YUZU_FW_HELPER
+}
+
+install_fw_helper() {
+    if [[ "$PLATFORM" != "linux" || "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
+
+    local dir tmp
+    dir=$(dirname "$FW_HELPER_PATH")
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[dry-run] would write the following to $FW_HELPER_PATH (root:root 0755):"
+        generate_fw_helper_content | sed 's/^/[dry-run]   /'
+        return 0
+    fi
+
+    log "installing the firewall helper $FW_HELPER_PATH (root:root 0755)"
+    run install -d -m 0755 -o root -g root "$dir"
+    # A temporary file in the SAME directory, so the final rename is atomic: sudo never sees a
+    # half-written helper, and a failed write leaves the previous helper in place.
+    tmp=$(mktemp "$dir/.yuzu-fw-helper.XXXXXX") || { warn "cannot create a temp file in $dir"; return 1; }
+    if ! generate_fw_helper_content > "$tmp" \
+        || ! chown root:root "$tmp" \
+        || ! chmod 0755 "$tmp" \
+        || ! sh -n "$tmp" \
+        || ! mv -f "$tmp" "$FW_HELPER_PATH"; then
+        rm -f "$tmp"
+        warn "could not install $FW_HELPER_PATH"
+        return 1
+    fi
+}
+
+remove_fw_helper() {
+    if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
+    if [[ -e "$FW_HELPER_PATH" ]]; then
+        log "removing $FW_HELPER_PATH"
+        run rm -f "$FW_HELPER_PATH"
+    fi
+}
+
+# check_fw_helper — Linux only: the helper is present, root:root 0755 and byte-identical to this
+# script's text. Returns non-zero on any drift.
+check_fw_helper() {
+    if [[ ! -f "$FW_HELPER_PATH" ]]; then
+        warn "$FW_HELPER_PATH is missing (re-run this installer)"
+        return 1
+    fi
+    local owner_mode
+    owner_mode=$(stat -c '%U:%G %a' "$FW_HELPER_PATH" 2>/dev/null || true)
+    if [[ "$owner_mode" != "root:root 755" ]]; then
+        warn "$FW_HELPER_PATH is ${owner_mode:-unreadable}, expected root:root 755"
+        return 1
+    fi
+    if ! generate_fw_helper_content | cmp -s - "$FW_HELPER_PATH"; then
+        warn "$FW_HELPER_PATH differs from this installer's text (re-run this installer)"
+        return 1
+    fi
+    log "$FW_HELPER_PATH present, root:root 0755, content current"
+    return 0
+}
+
 # ── linux capabilities ──────────────────────────────────────────────────────
 # Capabilities granted to the agent binary directly. These avoid a
 # sudo round-trip for syscalls the agent makes itself (raw sockets,
 # routing-table writes, ptrace). They do NOT transfer through execve,
-# so plugins that shell out to /usr/sbin/iptables still need the
-# sudoers entry above — capabilities cover only the agent's own
+# so plugins that shell out to iptables still need the sudoers entry
+# for the firewall helper above — capabilities cover only the agent's own
 # syscalls, not its child processes.
 #
 # +eip means the capability is in the binary's effective, inheritable,
@@ -683,7 +1075,12 @@ check_install() {
         fi
     fi
 
-    # 4. capabilities (Linux only)
+    # 4. the firewall helper the Linux sudoers file names: owner, mode and content
+    if [[ "$PLATFORM" == "linux" && "$SKIP_SUDOERS" -eq 0 ]]; then
+        check_fw_helper || ((errs++))
+    fi
+
+    # 5. capabilities (Linux only)
     if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 0 && -f "$BINARY_PATH" ]]; then
         if command -v getcap >/dev/null 2>&1; then
             local caps
@@ -725,8 +1122,16 @@ case "$ACTION" in
             fi
         fi
         create_state_dirs
+        # The helper goes in BEFORE the sudoers file that names it. A failed helper does not hold
+        # the sudoers file back (replacing it is what drops the earlier iptables lines); it fails
+        # the run at the end instead.
+        fw_helper_rc=0
+        install_fw_helper || fw_helper_rc=1
         install_sudoers
         apply_setcap
+        if [[ "$fw_helper_rc" -ne 0 ]]; then
+            fail "the firewall helper was not installed; iptables containment will fail on this host until it is"
+        fi
         log "install complete. Verify with: $0 --check"
         ;;
 
@@ -738,6 +1143,7 @@ case "$ACTION" in
         require_root
         log "uninstalling Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
         remove_sudoers
+        remove_fw_helper
         remove_state_dirs
         if [[ "$PLATFORM" == "macos" ]]; then
             macos_delete_user

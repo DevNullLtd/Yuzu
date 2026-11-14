@@ -4762,6 +4762,17 @@ test('removed containment plugin lexical gate',
   timeout: 30,
 )
 
+# Two quarantine facts no behavioural test can fail on: the apply claim is stamped and tested on the
+# database clock (quarantine_store.cpp never binds a replica clock reading into it), and server.cpp
+# seeds the reconciler's metric families at boot exactly once. Source-text only; carries its own
+# in-memory mutation self-test.
+test('quarantine wiring lexical gate',
+  _python3_test,
+  args: [files('test_quarantine_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # The Windows package-sources upgrade note states the fresh-deployment contract (routed
 # Forensics clause 8): its opening sentence is present and the in-place-upgrade phrasing is absent.
 test('upgrade notes contract',

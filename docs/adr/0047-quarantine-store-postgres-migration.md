@@ -529,6 +529,10 @@ edited). v5 adds no index. The store's indexes are the primary key, `idx_quarant
 - `apply_gen`: the number of applies ever claimed for the record.
 - `apply_claimed_at`: when an apply's dispatch started and has not yet returned; 0 = none. A claim older
   than 120 seconds (`kApplyClaimTtlSecs`) is ignored by comparison, so a crashed holder needs no cleanup.
+  The 120 seconds are measured on the database's clock, not a replica's: the claim is stamped with
+  `EXTRACT(EPOCH FROM now())` and every test of it (the claim, the token read, both fenced ends) uses
+  one SQL statement of "no live claim" written against `now()` with the TTL in its text. A replica
+  whose own clock steps cannot make a live claim read expired, or a dead one live.
 
 **The fence rule (#7613).** A record ends on the device's `inactive` answer. An apply that reaches the
 device after the observation behind that answer would leave a contained device with no record and
@@ -580,4 +584,5 @@ acts within a second (#7619), so reconcile work is single-threaded and every wri
 checked (#7620, #7645). The owed-release bookkeeping stays in memory: a restart sends one more release
 and one more `forced_release_*` row, which is harmless because a release is idempotent on the device
 (#7626). The reconciler's status replies are kept 24 hours unless they changed what the server holds
-(#7627). The `list_release_owed_in` read takes the caller's scope and limit in the query (#7624).
+(#7627); on a server set to keep responses forever they are kept like every other response (a row kept
+forever is never given an expiry). The `list_release_owed_in` read takes the caller's scope and limit in the query (#7624).

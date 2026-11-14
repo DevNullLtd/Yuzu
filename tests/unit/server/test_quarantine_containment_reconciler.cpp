@@ -2205,6 +2205,8 @@ TEST_CASE("reconciler (firewall): a record that was never confirmed and stays un
     rig.reply("status|active_unproven", "status|degraded|policy_not_blocking");
     rig.run(10);
     CHECK(rig.rows_with("quarantine.reapply", "drift") == 0);
+    CHECK(rig.counter("drift") == 0);
+    CHECK(rig.counter("unconfirmed") >= 1); // an ordinary unconfirmed read, never drift
     CHECK(rig.active()->last_confirmed_at == 0);
     CHECK(rig.active()->status == "active");
 }
@@ -2956,7 +2958,8 @@ TEST_CASE("reconciler (firewall): a real drift counts result=drift once and resu
     CHECK(rig.counter("drift") == 1);
     CHECK(rig.counter("unconfirmed") == 0);
     CHECK(rig.rows_with("quarantine.reapply", "drift status=unconfirmed") == 1);
-    // an ordinary unconfirmed read on a never-confirmed record still counts unconfirmed
+    // (an ordinary unconfirmed read on a never-confirmed record counts unconfirmed and no drift:
+    // the next case)
 }
 
 // ── #7623: the last-tick gauge ───────────────────────────────────────────────
@@ -3141,6 +3144,30 @@ TEST_CASE("reconciler (firewall): one failed owed read between ticks keeps the o
     rig.run(16);
     CHECK(rig.count_sent("firewall.release") == 1); // the entry survived, so the session's release stands
     CHECK(rig.owed().size() == 1);
+}
+
+// ── #7613: a token read that fails is never a token ───────────────────────────
+
+TEST_CASE("reconciler (firewall): when the apply fence token cannot be read the status command is not "
+          "sent and the pass counts degraded",
+          "[pg][quarantine][reconciler][fence]") {
+    RECON_RIG(rig);
+    rig.quarantine();
+    rig.reply("status|active_unproven", "status|active");
+    rig.step(); // the apply goes out
+    REQUIRE(rig.sent() == (std::vector<std::string>{"firewall.quarantine"}));
+    // Fail ONLY the token read: its WHERE compares apply_claimed_at with 0 and with the database
+    // clock, which stops type-checking once the column is text. The apply's own claim is over, and
+    // the rest of the reconciler's reads and writes never touch the column. A failed read treated
+    // as a token would send the status command all the same.
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                        "ALTER COLUMN apply_claimed_at DROP DEFAULT, "
+                        "ALTER COLUMN apply_claimed_at TYPE text USING apply_claimed_at::text");
+    const double degraded = rig.counter("degraded");
+    rig.run(4); // the apply's reply is read; every attempt to move on to the status read fails closed
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine"}));
+    CHECK(rig.counter("degraded") >= degraded + 1);
+    CHECK(rig.active()->last_confirmed_at == 0);
 }
 
 // ── #7613: the apply fence through the reconciler ─────────────────────────────
@@ -3382,6 +3409,55 @@ TEST_CASE("QuarantineContainmentReconciler: a heartbeat drain dispatches at most
     CHECK(dispatch.calls.size() == 51);
 }
 
+TEST_CASE("QuarantineContainmentReconciler: a heartbeat drain stops starting devices once its time budget "
+          "has passed, and the next drain takes the rest",
+          "[pg][quarantine][reconciler][heartbeat]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 2}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    const std::vector<std::string> ids{"agent-1", "agent-2"};
+    for (const auto& id : ids)
+        REQUIRE(qstore.quarantine_device(id, "admin", "malware", "").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    MockDispatch dispatch;
+    FakeSteady steady;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .steady_now_fn = steady.fn(),
+    });
+    reconciler.tick(); // both offline: the entries and the cache exist, nothing sent
+    REQUIRE(dispatch.calls.empty());
+    for (const auto& id : ids)
+        REQUIRE(registry.register_agent(make_info(id)).has_value());
+    for (const auto& id : ids)
+        reconciler.notify_agent_heartbeat(id);
+
+    // The first device's dispatch takes longer than a pass's time budget (kDrainTimeBudget, 2 s, a
+    // private constant): the store or the pool is slow.
+    dispatch.on_dispatch = [&] { steady.advance(std::chrono::seconds(10)); };
+    CHECK(reconciler.drain_heartbeat_due() == 1);
+    CHECK(dispatch.calls.size() == 1); // the second device was not started in this pass...
+    CHECK(reconciler.drain_heartbeat_due() == 1);
+    CHECK(dispatch.calls.size() == 2); // ...and was taken, still marked, by the next one
+    std::set<std::string> reached;
+    for (const auto& call : dispatch.calls) {
+        REQUIRE(call.agent_ids.size() == 1);
+        reached.insert(call.agent_ids.front());
+    }
+    CHECK(reached == std::set<std::string>(ids.begin(), ids.end())); // each device once
+    CHECK(reconciler.drain_heartbeat_due() == 0);
+}
+
 TEST_CASE("redispatch_stored_containment claims the apply: the token is empty inside the dispatch, the new "
           "generation after it, and another apply's live claim means nothing is dispatched",
           "[pg][quarantine][reconciler][fence]") {
@@ -3439,4 +3515,26 @@ TEST_CASE("redispatch_stored_containment claims the apply: the token is empty in
     auto settled = qstore.apply_fence_token("agent-1", id);
     REQUIRE(settled.has_value());
     CHECK(settled->has_value()); // no claim left behind
+
+    // CH-2: an exception that is NOT a std::exception passes through the call (only std::exception
+    // is caught), and the claim is still dropped by the scope guard: the token reads again and a
+    // second claim succeeds. Without the guard the claim stays live for kApplyClaimTtlSecs.
+    bool escaped = false;
+    try {
+        (void)redispatch_stored_containment(
+            qstore, "agent-1",
+            [&](const std::unordered_map<std::string, std::string>&) -> std::pair<std::string, int> {
+                throw 42;
+            },
+            stored);
+    } catch (int) {
+        escaped = true;
+    }
+    CHECK(escaped);
+    auto after_int = qstore.apply_fence_token("agent-1", id);
+    REQUIRE(after_int.has_value());
+    REQUIRE(after_int->has_value()); // a live claim would make the token empty
+    auto reclaim = qstore.claim_apply("agent-1", id);
+    REQUIRE(reclaim.has_value()); // and would refuse this one
+    REQUIRE(qstore.release_apply_claim("agent-1", id, *reclaim).has_value());
 }

@@ -322,8 +322,11 @@ public:
     /// Does the reconcile work for the devices `notify_agent_heartbeat` marked since the last call
     /// (the set is moved out and cleared first), through the same `reconcile_one` and per-agent
     /// claim as `tick()`. Called every second by the reconciler thread. Checks `Deps::should_stop`
-    /// once per device and stops after `kMaxDispatchesPerTick` dispatch attempts (the rest stay
-    /// marked). Returns the number of dispatch attempts.
+    /// once per device and stops after `kMaxDispatchesPerTick` dispatch attempts or once
+    /// `kDrainTimeBudget` has passed since it started, whichever comes first (the rest stay
+    /// marked). The time bound is what holds when the store stalls: a degraded read is not a
+    /// dispatch attempt and costs up to a store read timeout per device. Returns the number of
+    /// dispatch attempts.
     std::size_t drain_heartbeat_due();
 
     /// #3425 governance correction round (cpp-safety SHOULD + unhappy-path
@@ -429,6 +432,9 @@ private:
     static constexpr std::chrono::milliseconds kVerifyGrace{15'000};
     static constexpr std::chrono::milliseconds kReverifyInterval{300'000};
     static constexpr std::size_t kMaxDispatchesPerTick = 50;
+    // One drain pass stops starting devices after this long: about one store read timeout (the
+    // store's own 2 s), so a stalled pool costs the thread one timeout, not one per marked device.
+    static constexpr std::chrono::milliseconds kDrainTimeBudget{2'000};
 
     // Returns true iff a dispatch_fn call was actually attempted this call
     // (regardless of its outcome) — the fair-cap signal tick() uses
