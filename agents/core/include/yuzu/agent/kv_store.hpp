@@ -152,8 +152,17 @@ public:
     /** Delete a key. Returns true on success (even if key did not exist). */
     bool del(std::string_view plugin, std::string_view key);
 
-    /** Check if a key exists. Returns true if present. */
+    /** Check if a key exists. Returns true if present. A store that cannot answer (closed
+     *  handle, prepare or step failure incl. SQLITE_BUSY) reads as false: this fail-OPEN
+     *  form is for callers that can live with that. A caller for whom "cannot tell" must not
+     *  read as "absent" uses exists_checked(). */
     bool exists(std::string_view plugin, std::string_view key);
+
+    /** Tri-state exists: true / false when the store answered, std::nullopt when it could not
+     *  (closed handle, prepare failure, or a step that is neither a row nor done -- SQLITE_BUSY
+     *  after the busy budget included). This is what the plugin C ABI's
+     *  yuzu_ctx_storage_exists maps to its documented negative-on-error return. */
+    [[nodiscard]] std::optional<bool> exists_checked(std::string_view plugin, std::string_view key);
 
     /** List all keys for a plugin matching the given prefix. */
     std::vector<std::string> list(std::string_view plugin, std::string_view prefix);

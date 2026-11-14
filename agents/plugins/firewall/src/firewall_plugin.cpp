@@ -4,6 +4,12 @@
  * Actions:
  *   "state" — Return firewall state per profile/backend.
  *   "rules" — List firewall rules (summary).
+ *   "quarantine", "release", "quarantine_status", "quarantine_allow" —
+ *       device containment (PRQ.1): a Windows Firewall rule group + per-profile
+ *       default-block, an own nftables table (iptables fallback) on Linux, a pf
+ *       sub-anchor with an enable token on macOS (docs/quarantine-macos-pf-
+ *       anchor-design.md). All decisions live in firewall_quarantine_parsers.hpp;
+ *       the shell at the end of this file only wires the OS mechanisms to it.
  *
  * Output is pipe-delimited via write_output().
  *
@@ -37,11 +43,21 @@
 #include <yuzu/plugin.hpp>
 
 #include "firewall_parsers.hpp"
+#include "firewall_quarantine_parsers.hpp"
 
 #include <yuzu/agent/subprocess_runner.hpp>
 
+#include <spdlog/spdlog.h> // one line per containment state change / non-OK outcome (SRE)
+
+#include <quarantine_serialization.hpp> // MutationGate; PRQ.2 relocates it to agents/shared
+
+#include <algorithm>
 #include <chrono>
+#include <cstring>
+#include <deque>
 #include <format>
+#include <fstream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -64,11 +80,31 @@
 #include <win_str.hpp> // yuzu::win::from_wide
 #endif
 
+#include <icmp_probe.hpp> // tri-state TCP connect probe for verify-after-apply
+#ifndef _WIN32
+#include <sudo_argv.hpp> // canonical `sudo -n --` wrapper for the Linux/macOS legs
+#endif
+
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
 #include <systemd/sd-bus.h>
 #endif
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <cerrno>
+#endif
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#endif
+
 #if defined(__linux__)
+#include <sys/prctl.h> // PR_GET_NO_NEW_PRIVS: the packaged unit's NoNewPrivileges
+
 #include <yuzu/agent/scoped_fd.hpp>
 
 #include <cerrno>
@@ -1487,6 +1523,1512 @@ void do_rules_linux(yuzu::CommandContext& ctx) {
 
 #endif // platform dispatch
 
+// ── Containment shell (PRQ.1) ───────────────────────────────────────────────
+//
+// firewall_quarantine_parsers.hpp holds every decision; this section only wires
+// the OS mechanisms to its injected seam: the durable record (plugin KV), the
+// command runner (sudo + run_bounded_subprocess), the staged ruleset file, the
+// TCP probe, and the per-OS Leg. Nothing here decides anything a unit test could
+// pin.
+
+namespace fq = yuzu::firewall::quarantine;
+
+/// One in-flight mutating action at a time (quarantine / release /
+/// quarantine_allow). `quarantine_status` never takes it: a read must not queue
+/// behind a multi-step mutation. Same shape and budget as the legacy plugin's
+/// gate (quarantine_serialization.hpp has the rationale for 2 s).
+constexpr std::chrono::milliseconds kQuarantineLockWait{2000};
+yuzu::quarantine::MutationGate g_quarantine_gate{kQuarantineLockWait};
+
+[[nodiscard]] std::int64_t epoch_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+[[nodiscard]] std::string config_value(YuzuPluginContext* raw, std::string_view key) {
+    if (!raw)
+        return {};
+    return std::string{yuzu::PluginContext{raw}.get_config(key)};
+}
+
+/// A KV key's presence as the C ABI reports it (0 present, 1 absent, negative on
+/// error): a fault is `unknown`, never "absent" -- every caller that would act on an
+/// absent record or image (start a fresh generation-1 record, skip a re-apply, treat
+/// a restore image as missing) must refuse or fail instead.
+[[nodiscard]] fq::KvPresence kv_presence(YuzuPluginContext* raw, const std::string& key) {
+    return fq::kv_presence(yuzu_ctx_storage_exists(raw, key.c_str()));
+}
+
+/// The durable record, in the plugin's KV namespace. A failed write is reported
+/// (save() == false), never swallowed: the driver refuses to mutate without one.
+class KvStateStore final : public fq::StateStore {
+public:
+    explicit KvStateStore(YuzuPluginContext* raw) : raw_(raw) {}
+
+    fq::StateLoad load() override {
+        fq::StateLoad l;
+        if (!raw_)
+            return l;
+        const std::string key{fq::kStateKey};
+        const auto presence = kv_presence(raw_, key);
+        if (presence == fq::KvPresence::absent)
+            return l;
+        if (presence != fq::KvPresence::present) {
+            l.kind = fq::StateLoad::Kind::unreadable; // a store fault: never "no record"
+            return l;
+        }
+        const auto parsed = fq::parse_state(yuzu::PluginContext{raw_}.storage_get(key));
+        if (!parsed) {
+            l.kind = fq::StateLoad::Kind::unreadable;
+            return l;
+        }
+        l.kind = fq::StateLoad::Kind::ok;
+        l.state = *parsed;
+        return l;
+    }
+
+    bool save(const fq::QuarantineState& s) override {
+        return raw_ && yuzu::PluginContext{raw_}.storage_set(fq::kStateKey, fq::serialize_state(s));
+    }
+
+    bool erase() override {
+        if (!raw_)
+            return true;
+        const std::string key{fq::kStateKey};
+        const auto presence = kv_presence(raw_, key);
+        if (presence == fq::KvPresence::absent)
+            return true;
+        if (presence == fq::KvPresence::unknown)
+            return false; // cannot tell whether the record is gone: not erased
+        return yuzu::PluginContext{raw_}.storage_delete(key);
+    }
+
+private:
+    YuzuPluginContext* raw_;
+};
+
+/// One TCP connect, mapped onto the tri-state the verify decision needs. A
+/// refusal (RST) is positive proof the packet arrived, so it is NOT folded into
+/// `timeout`. Only ever handed an IP literal the core validated.
+[[nodiscard]] fq::ProbeOutcome tcp_probe(const std::string& ip, int port,
+                                         std::chrono::milliseconds timeout) {
+#ifdef _WIN32
+    struct Wsa {
+        WSADATA data{};
+        bool ok;
+        Wsa() : ok(WSAStartup(MAKEWORD(2, 2), &data) == 0) {}
+        ~Wsa() {
+            if (ok)
+                WSACleanup();
+        }
+        Wsa(const Wsa&) = delete;
+        Wsa& operator=(const Wsa&) = delete;
+    } wsa;
+    if (!wsa.ok)
+        return fq::ProbeOutcome::timeout;
+#endif
+    auto dst = yuzu::shared::resolve_first(ip, AF_UNSPEC);
+    if (!dst)
+        return fq::ProbeOutcome::timeout;
+    yuzu::shared::set_port(*dst, port);
+    const auto r = yuzu::shared::tcp_sample(*dst, static_cast<int>(timeout.count()));
+    if (r.rtt_ms)
+        return fq::ProbeOutcome::connected;
+    if (r.refused)
+        return fq::ProbeOutcome::refused;
+    return fq::ProbeOutcome::timeout;
+}
+
+#ifndef _WIN32
+
+/// Runs argv under the canonical `sudo -n --` form (a no-op for root). stderr is
+/// merged: the core reads "No such file or directory" from it to treat an
+/// already-absent table as a clean release, and quotes a first line of it in
+/// failure notes. The one spawn site of the containment legs: sink-manifest
+/// IDs firewall/sudo_runner#1..#18, one per argv shape the legs hand it
+/// (docs/agent-spawn-sink-manifest.md).
+[[maybe_unused]] fq::Runner sudo_runner() {
+    return [](const fq::Argv& argv, std::chrono::milliseconds budget) {
+        auto res = run_bounded_subprocess(
+            yuzu::shared::sudo_wrap(argv),
+            SubprocessOptions{.deadline = budget, .merge_stderr = true});
+        fq::ToolResult t;
+        t.ran = res.tool_ran;
+        t.exit_code = res.exit_code;
+        t.timed_out = res.timed_out;
+        t.truncated = res.output_truncated;
+        t.output = std::move(res.output);
+        return t;
+    };
+}
+
+/// The agent-private directory a ruleset is staged in: `<agent.data_dir>/
+/// firewall-staging`, mode 0700 and owned by the agent. The privileged `nft -f` /
+/// `pfctl -f` reads the file after it is written, so a world-writable temp dir
+/// would let another local user swap the content in between. An existing
+/// directory is trusted only when it is a real directory (not a link) owned by
+/// us with no group/other access. Empty when `agent.data_dir` is unset or the
+/// directory cannot be made safe: the apply is then refused, never staged in /tmp.
+[[maybe_unused]] std::string private_staging_dir(YuzuPluginContext* raw) {
+    const auto data_dir = config_value(raw, "agent.data_dir");
+    if (data_dir.empty())
+        return {};
+    const std::string dir = data_dir + "/firewall-staging";
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST)
+        return {};
+    struct stat st{};
+    if (::lstat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != ::geteuid() ||
+        (st.st_mode & 077) != 0)
+        return {};
+    return dir;
+}
+
+/// Writes a ruleset into a secure temporary file (mkstemps: O_CREAT|O_EXCL, 0600)
+/// in the private staging directory; it is removed when the returned handle drops,
+/// after the privileged load has finished with it.
+[[maybe_unused]] fq::Stage temp_file_stage(YuzuPluginContext* raw) {
+    return [raw](std::string_view stem, std::string_view suffix,
+                 std::string_view contents) -> std::optional<fq::StagedFile> {
+        const auto dir = private_staging_dir(raw);
+        if (dir.empty())
+            return std::nullopt;
+        auto tmp = yuzu::TempFile::create(stem, suffix, dir);
+        if (!tmp)
+            return std::nullopt;
+        {
+            std::ofstream f(tmp->path(), std::ios::binary | std::ios::trunc);
+            if (!f)
+                return std::nullopt;
+            f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+            f.flush();
+            if (!f)
+                return std::nullopt;
+        }
+        auto holder = std::make_shared<yuzu::TempFile>(std::move(*tmp));
+        return fq::StagedFile{holder->path(), holder, dir};
+    };
+}
+
+[[nodiscard]] std::string read_small_file(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return {};
+    std::string buf(64 * 1024, '\0');
+    f.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+    buf.resize(static_cast<std::size_t>(f.gcount()));
+    return buf;
+}
+
+/// The host's DNS resolvers, read at quarantine time. A loopback stub
+/// (systemd-resolved's 127.0.0.53) is followed one hop to the real upstream list
+/// so the stub can still forward. On macOS /etc/resolv.conf is configd's own
+/// list of the primary resolvers (scoped per-interface resolvers in
+/// `scutil --dns` are not read).
+[[nodiscard]] std::vector<std::string> host_resolvers() {
+    return fq::resolver_chain(read_small_file("/etc/resolv.conf"),
+                              read_small_file("/run/systemd/resolve/resolv.conf"));
+}
+
+#endif // !_WIN32
+
+// ── Linux leg wiring ────────────────────────────────────────────────────────
+#if defined(__linux__)
+
+/// Our table over netlink (rung 1). nullopt when the dump is refused -- the
+/// unprivileged agent has no CAP_NET_ADMIN (docs/agent-privilege-model.md), so
+/// that is the usual case and the core falls back to `sudo nft list table`.
+[[nodiscard]] std::optional<fq::NftTableListing> read_quarantine_table_netlink() {
+    const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
+    auto sock = open_nft_socket(remaining_ms(deadline));
+    if (!sock)
+        return std::nullopt;
+    std::vector<std::byte> buf;
+    const auto res = nft_dump(sock->get(), nft::kNftMsgGetchain, buf, deadline);
+    if (res.status != yuzu::firewall::NftDumpStatus::ok)
+        return std::nullopt;
+    fq::NftTableListing l;
+    for (const auto& c : yuzu::firewall::parse_nft_chains(buf)) {
+        if (c.family != nft::kNfprotoInet || c.table != fq::kNftTable)
+            continue;
+        l.found = true;
+        l.chains.push_back({c.name,
+                            c.is_base_chain ? yuzu::firewall::nft_hook_name(c.hooknum) : std::string{},
+                            c.is_base_chain ? yuzu::firewall::nft_policy_name(c.policy)
+                                            : std::string{}});
+    }
+    return l;
+}
+
+/// Does this host have an IPv6 stack that could carry traffic? Three answers:
+/// yes (/proc/net/if_inet6 exists, or disable_ipv6 reads 0), no (if_inet6 is
+/// absent and disable_ipv6 reads 1: the host turned IPv6 off), and nullopt when
+/// neither can be read. The
+/// last is NOT "no": the module may simply not be loaded yet (a socket load
+/// pulls it in) and an unreadable answer must never be read as "IPv4 is the whole
+/// host" (iptables_v6_plan refuses on it when ip6tables is also missing).
+[[nodiscard]] std::optional<bool> ipv6_stack_present() {
+    if (::access("/proc/net/if_inet6", F_OK) == 0)
+        return true;
+    std::ifstream f("/proc/sys/net/ipv6/conf/all/disable_ipv6");
+    int disabled = 0;
+    if (!(f >> disabled))
+        return std::nullopt;
+    return disabled == 0;
+}
+
+/// The Linux leg for `hint` (the backend recorded in the state, so release and
+/// update use what applied), or the best available one for a fresh quarantine:
+/// nft when `/usr/sbin/nft` exists, else iptables. nullptr: no tool at all.
+[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind hint,
+                                                bool for_apply) {
+    const bool has_nft = ::access("/usr/sbin/nft", X_OK) == 0;
+    const bool has_ipt = ::access("/usr/sbin/iptables", X_OK) == 0;
+    fq::BackendKind use = hint;
+    if (use != fq::BackendKind::nft && use != fq::BackendKind::iptables)
+        use = has_nft ? fq::BackendKind::nft
+                      : (has_ipt ? fq::BackendKind::iptables : fq::BackendKind::none);
+    if (use == fq::BackendKind::nft)
+        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw),
+                                            read_quarantine_table_netlink);
+    if (use == fq::BackendKind::iptables) {
+        // Apply decides IPv6 from the tool AND the stack (iptables_v6_plan refuses a
+        // host that may route IPv6 with no ip6tables to cover it); release and
+        // status cover v6 wherever the tool exists, so a chain built earlier is
+        // never orphaned.
+        const bool has_ip6 = ::access("/usr/sbin/ip6tables", X_OK) == 0;
+        const auto mode = for_apply ? fq::iptables_v6_plan(has_ip6, ipv6_stack_present())
+                                    : (has_ip6 ? fq::V6Mode::cover : fq::V6Mode::v4_only);
+        return std::make_unique<fq::IptablesLeg>(sudo_runner(), mode);
+    }
+    return nullptr;
+}
+
+#endif // __linux__
+
+// ── Windows leg (rung 1, INetFwPolicy2 COM) ─────────────────────────────────
+#ifdef _WIN32
+
+constexpr NET_FW_PROFILE_TYPE2 kQuarantineProfiles[] = {
+    NET_FW_PROFILE2_DOMAIN, NET_FW_PROFILE2_PRIVATE, NET_FW_PROFILE2_PUBLIC};
+// The local policy store per profile, same order (StandardProfile is the Private profile).
+// The store that `put_Default*Action` writes and `Get-NetFirewallProfile -PolicyStore
+// PersistentStore` reads; a missing value there is "not configured".
+constexpr const wchar_t* kLocalProfileKeys[] = {
+    L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\DomainProfile",
+    L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\StandardProfile",
+    L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\PublicProfile"};
+static_assert(std::size(kLocalProfileKeys) == std::size(kQuarantineProfiles));
+// The prior-policy image is indexed by the same profile position.
+static_assert(std::tuple_size_v<fq::WinPriorPolicy> == std::size(kQuarantineProfiles));
+static_assert(std::tuple_size_v<fq::WinSwitchReading> == std::size(kQuarantineProfiles));
+
+/// A BSTR out-param owner (the shared BStr type only builds by allocating).
+struct OwnedBstr {
+    BSTR b = nullptr;
+    OwnedBstr() = default;
+    OwnedBstr(const OwnedBstr&) = delete;
+    OwnedBstr& operator=(const OwnedBstr&) = delete;
+    ~OwnedBstr() {
+        if (b)
+            SysFreeString(b);
+    }
+    [[nodiscard]] std::string str() const {
+        return b ? yuzu::win::from_wide(b, static_cast<int>(SysStringLen(b))) : std::string{};
+    }
+};
+
+[[nodiscard]] std::string rule_name_of(INetFwRule& r) {
+    OwnedBstr b;
+    r.get_Name(&b.b);
+    return b.str();
+}
+[[nodiscard]] std::string rule_group_of(INetFwRule& r) {
+    OwnedBstr b;
+    r.get_Grouping(&b.b);
+    return b.str();
+}
+[[nodiscard]] bool rule_enabled(INetFwRule& r) {
+    VARIANT_BOOL e = VARIANT_FALSE;
+    return r.get_Enabled(&e) == S_OK && e != VARIANT_FALSE;
+}
+
+/// One BSTR property of a rule (ports, application, service); empty when it is unset
+/// or cannot be read -- the same on the disable and the release side.
+[[nodiscard]] std::string rule_text_of(INetFwRule& r, HRESULT (STDMETHODCALLTYPE INetFwRule::*get)(BSTR*)) {
+    OwnedBstr b;
+    return (r.*get)(&b.b) == S_OK ? b.str() : std::string{};
+}
+
+/// Name, group, enabled state and every property the rule key carries (direction,
+/// profile mask, protocol, ports, application, service, action): what the disable list
+/// and the release match on (fq::win_rule_key). Two rules differing only in addresses,
+/// interface types or edge traversal share a key and are re-enabled together (README
+/// caveat 3). A property that cannot be read keeps its default (0, -1 or empty) on BOTH
+/// the disable and the release side, so a rule is still matched consistently.
+[[nodiscard]] fq::WinRuleInfo rule_info_of(INetFwRule& r) {
+    fq::WinRuleInfo info;
+    info.name = rule_name_of(r);
+    info.group = rule_group_of(r);
+    info.enabled = rule_enabled(r);
+    NET_FW_RULE_DIRECTION dir = NET_FW_RULE_DIR_MAX;
+    if (r.get_Direction(&dir) == S_OK)
+        info.direction = static_cast<int>(dir);
+    long profiles = 0;
+    if (r.get_Profiles(&profiles) == S_OK)
+        info.profiles = static_cast<int>(profiles);
+    long protocol = 0;
+    if (r.get_Protocol(&protocol) == S_OK)
+        info.protocol = static_cast<int>(protocol);
+    NET_FW_ACTION action = NET_FW_ACTION_MAX;
+    if (r.get_Action(&action) == S_OK)
+        info.action = static_cast<int>(action);
+    info.local_ports = rule_text_of(r, &INetFwRule::get_LocalPorts);
+    info.remote_ports = rule_text_of(r, &INetFwRule::get_RemotePorts);
+    info.application = rule_text_of(r, &INetFwRule::get_ApplicationName);
+    info.service = rule_text_of(r, &INetFwRule::get_ServiceName);
+    return info;
+}
+
+/// Visits every rule. Returns false when the enumeration itself failed part-way,
+/// or the deadline expired (checked every 256 rules; a single COM call cannot be
+/// cancelled, #1391): the caller must not treat a partial pass as the whole
+/// ruleset, and `dl.expired()` tells the two apart. `fn` returns false to stop
+/// early, which is a clean exit.
+template <class Fn>
+[[nodiscard]] bool for_each_rule(INetFwRules& rules, fq::Deadline& dl, Fn&& fn) {
+    ComPtr<IUnknown> unk;
+    if (FAILED(rules.get__NewEnum(unk.put())) || !unk)
+        return false;
+    ComPtr<IEnumVARIANT> ev;
+    if (FAILED(unk->QueryInterface(__uuidof(IEnumVARIANT), reinterpret_cast<void**>(ev.put()))) ||
+        !ev)
+        return false;
+    std::size_t seen = 0;
+    for (;;) {
+        VARIANT v;
+        VariantInit(&v);
+        ULONG fetched = 0;
+        // S_FALSE with fetched == 0 is end-of-enumeration, never "another rule".
+        const HRESULT hr = ev->Next(1, &v, &fetched);
+        if (FAILED(hr)) {
+            VariantClear(&v);
+            return false;
+        }
+        if (fetched == 0) {
+            VariantClear(&v);
+            return true;
+        }
+        ComPtr<INetFwRule> rule;
+        if (v.vt == VT_DISPATCH && v.pdispVal &&
+            SUCCEEDED(v.pdispVal->QueryInterface(__uuidof(INetFwRule),
+                                                 reinterpret_cast<void**>(rule.put()))) &&
+            rule) {
+            VariantClear(&v);
+            if (++seen % 256 == 0 && dl.expired())
+                return false;
+            if (!fn(*rule.get()))
+                return true;
+        } else {
+            VariantClear(&v);
+        }
+    }
+}
+
+/// A pass that returned false: the deadline stopped it, or the enumeration broke.
+[[nodiscard]] fq::StepResult enum_fail(const fq::Deadline& dl) {
+    return fq::StepResult::fail(dl.expired() ? "deadline_exceeded" : "rule_enumeration_failed");
+}
+
+[[nodiscard]] std::string hr_token(const char* what, HRESULT hr) {
+    return std::format("{}:0x{:08x}", what, static_cast<std::uint32_t>(hr));
+}
+
+[[nodiscard]] fq::WinAction to_win_action(NET_FW_ACTION a) {
+    return a == NET_FW_ACTION_ALLOW ? fq::WinAction::allow : fq::WinAction::block;
+}
+
+class WinLeg final : public fq::Leg {
+public:
+    explicit WinLeg(YuzuPluginContext* raw) : raw_(raw) {}
+
+    [[nodiscard]] fq::BackendKind kind() const override { return fq::BackendKind::windows; }
+
+    /// Refuse while the legacy plugin's rules (`YuzuQuarantine_*`) are present.
+    /// An unreadable ruleset does not block here: the apply that follows reads
+    /// the same ruleset and fails loudly if it truly cannot.
+    [[nodiscard]] std::optional<std::string> preflight(fq::Deadline& dl) override {
+        ComInit com;
+        ComPtr<INetFwPolicy2> policy;
+        ComPtr<INetFwRules> rules;
+        if (!com.ok() || FAILED(get_fw_policy(policy)) || FAILED(policy->get_Rules(rules.put())) ||
+            !rules)
+            return std::nullopt;
+        bool legacy = false;
+        (void)for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+            if (fq::is_legacy_marker(rule_name_of(r))) {
+                legacy = true;
+                return false;
+            }
+            return true;
+        });
+        if (legacy)
+            return std::string{"legacy_quarantine_active"};
+        // A profile whose firewall is switched off (or cannot be read) would make every
+        // rule below inert, and a profile Group Policy or MDM controls (any of the three)
+        // ignores local rules and defaults altogether (`gpo_override:<Profile>`): refuse
+        // before anything is touched.
+        if (auto why = fq::win_firewall_switch_token(read_verdict(*policy.get())); !why.empty())
+            return why;
+        return std::nullopt;
+    }
+
+    [[nodiscard]] fq::StepResult apply(const fq::AllowSet& next, std::uint32_t gen, std::uint32_t,
+                                       fq::OsPayload& os, fq::Deadline& dl,
+                                       const fq::PersistOs&) override {
+        ComInit com;
+        if (!com.ok())
+            return fq::StepResult::fail("com_init");
+        ComPtr<INetFwPolicy2> policy;
+        ComPtr<INetFwRules> rules;
+        HRESULT hr = get_fw_policy(policy);
+        if (FAILED(hr))
+            return fq::StepResult::fail(hr_token("policy2_create", hr));
+        hr = policy->get_Rules(rules.put());
+        if (FAILED(hr) || !rules)
+            return fq::StepResult::fail(hr_token("rules_create", hr));
+        yuzu::PluginContext pc{raw_};
+
+        // 0. The master switch and the Group Policy / MDM override, per profile. An init
+        //    re-apply and an update do not pass through preflight, and nothing has
+        //    been written yet.
+        if (const auto why = fq::win_firewall_switch_token(read_verdict(*policy.get()));
+            !why.empty())
+            return fq::StepResult::fail(why);
+
+        // 1. Read the ruleset once: legacy markers, our group, what to disable.
+        std::vector<fq::WinRuleInfo> infos;
+        bool legacy = false;
+        if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+                fq::WinRuleInfo info = rule_info_of(r);
+                legacy = legacy || fq::is_legacy_marker(info.name);
+                infos.push_back(std::move(info));
+                return true;
+            }))
+            return enum_fail(dl);
+        if (dl.expired())
+            return fq::StepResult::fail("deadline_exceeded");
+        if (legacy)
+            return fq::StepResult::fail("legacy_quarantine_active");
+        std::vector<std::string> ours;
+        for (const auto& i : infos)
+            if (fq::is_our_win_rule(i.name, i.group))
+                ours.push_back(i.name);
+
+        // 2. Capture the prior profile policy, write-once, BEFORE any write.
+        fq::WinPriorPolicy prior{};
+        // get_Default*Action returns the EFFECTIVE value, so whether a LOCAL value exists is
+        // read from the local store: absent = not configured (a release deletes instead of
+        // pinning), unreadable = unknown (the image is refused, never guessed).
+        for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
+            const auto capture = [&](const wchar_t* name, bool inbound) {
+                const auto local = read_policy_dword(kLocalProfileKeys[i], name);
+                if (!local.readable)
+                    return fq::WinAction::unknown;
+                if (!local.value)
+                    return fq::WinAction::not_configured;
+                NET_FW_ACTION act = NET_FW_ACTION_BLOCK;
+                const HRESULT hr = inbound ? policy->get_DefaultInboundAction(kQuarantineProfiles[i], &act)
+                                           : policy->get_DefaultOutboundAction(kQuarantineProfiles[i], &act);
+                // S_FALSE passes SUCCEEDED() but means "not found": only S_OK is a reading.
+                return hr == S_OK ? to_win_action(act) : fq::WinAction::unknown;
+            };
+            prior[i].in = capture(L"DefaultInboundAction", true);
+            prior[i].out = capture(L"DefaultOutboundAction", false);
+        }
+        const std::string prior_key{fq::kWinPriorPolicyKey};
+        // A KV fault is not "no image": storing the quarantine policy over the real
+        // one would make the release restore a block.
+        const auto image_presence = kv_presence(raw_, prior_key);
+        if (image_presence == fq::KvPresence::unknown)
+            return fq::StepResult::fail("storage_unreadable");
+        const bool image_exists = image_presence == fq::KvPresence::present;
+        switch (fq::decide_prior_store(image_exists, !ours.empty(), prior)) {
+        case fq::PriorStore::keep_existing:
+            break;
+        case fq::PriorStore::refuse_incomplete:
+            return fq::StepResult::fail("prior_policy_unreadable");
+        case fq::PriorStore::refuse_unrestorable:
+            return fq::StepResult::fail("prior_policy_unrestorable");
+        case fq::PriorStore::store:
+            if (!pc.storage_set(prior_key, fq::serialize_prior_policy(prior)))
+                return fq::StepResult::fail("prior_policy_not_persisted");
+            break;
+        }
+
+        // 3. The disable list, stored BEFORE the first rule is touched: a crash
+        //    after disabling must not strand rules nobody remembers. The first
+        //    apply writes it; later applies only ever add keys (a rule created
+        //    or re-enabled during the quarantine is disabled too). A key carries every
+        //    property fq::win_rule_key names, so a disabled twin that differs only by
+        //    protocol, ports, program, service or action is never switched on by the
+        //    release; a twin differing only in addresses, interfaces or edge traversal
+        //    shares the key (README caveat 3). Each key also records, from this same
+        //    snapshot, whether its name, direction and profile had exactly one carrier
+        //    (on or off) right now: only such a key may be found again by identity at
+        //    release (fq::win_rules_to_disable).
+        const auto to_disable = fq::win_rules_to_disable(infos);
+        const std::string list_key{fq::kWinDisabledRulesKey};
+        const auto list_presence = kv_presence(raw_, list_key);
+        if (list_presence == fq::KvPresence::unknown)
+            return fq::StepResult::fail("storage_unreadable");
+        const bool list_exists = list_presence == fq::KvPresence::present;
+        std::vector<fq::WinListedRule> stored;
+        if (list_exists) {
+            const auto parsed = fq::parse_disabled_rules(pc.storage_get(list_key));
+            if (!parsed)
+                return fq::StepResult::fail("disabled_list_unreadable");
+            stored = *parsed;
+        }
+        const auto merged = fq::win_merge_disabled_list(std::move(stored), to_disable, list_exists);
+        if (merged.over_cap)
+            return fq::StepResult::fail("too_many_rules");
+        if (merged.grew && !pc.storage_set(list_key, fq::serialize_disabled_rules(merged.list)))
+            return fq::StepResult::fail("disabled_list_not_persisted");
+
+        // 4. Our rules for this generation: add what is missing FIRST.
+        const auto specs = fq::win_rule_specs(next, gen);
+        const auto plan = fq::win_update_plan(ours, specs);
+        std::vector<std::string> added;
+        // Until step 6 completes, EVERY exit (a failure return or an exception)
+        // takes this generation's own new rules back out: an update must not leave
+        // its looser rules live beside the previous generation's record (an initial
+        // apply is removed whole by the driver anyway, and the removal is
+        // idempotent). No exit can forget it, there is no call to delete. The
+        // destructor swallows everything: a COM call must not throw while unwinding.
+        struct UndoAdded {
+            INetFwRules& rules;
+            const std::vector<std::string>& names;
+            bool committed = false;
+            ~UndoAdded() {
+                if (committed)
+                    return;
+                try {
+                    fq::Deadline cleanup(fq::kVerifyBudget); // its own budget: undo must not be starved
+                    (void)remove_rules_by_name(rules, names, cleanup);
+                } catch (...) {
+                }
+            }
+        } undo{*rules.get(), added};
+        for (const auto& spec : plan.add) {
+            if (dl.expired())
+                return fq::StepResult::fail("deadline_exceeded");
+            const HRESULT ah = add_rule(*rules.get(), spec);
+            if (ah != S_OK) // S_FALSE passes SUCCEEDED() but is not "added"
+                return fq::StepResult::fail(hr_token("rule_add_failed", ah));
+            added.push_back(spec.name);
+        }
+
+        // 5. Disable every other enabled rule: an Allow RULE beats a profile
+        //    default-block, so leaving them on would leave the host reachable.
+        //    A rule the policy store refuses (GPO) is counted and reported.
+        std::uint32_t refused = 0;
+        if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+                if (!rule_enabled(r))
+                    return true;
+                const auto name = rule_name_of(r);
+                if (fq::is_our_win_rule(name, rule_group_of(r)))
+                    return true;
+                if (r.put_Enabled(VARIANT_FALSE) != S_OK)
+                    ++refused;
+                return true;
+            }))
+            return enum_fail(dl);
+        if (dl.expired())
+            return fq::StepResult::fail("deadline_exceeded");
+
+        // 6. Default-block, per profile, inbound and outbound.
+        for (const auto profile : kQuarantineProfiles) {
+            hr = policy->put_DefaultInboundAction(profile, NET_FW_ACTION_BLOCK);
+            if (hr != S_OK)
+                return fq::StepResult::fail(hr_token("default_inbound_failed", hr));
+            hr = policy->put_DefaultOutboundAction(profile, NET_FW_ACTION_BLOCK);
+            if (hr != S_OK)
+                return fq::StepResult::fail(hr_token("default_outbound_failed", hr));
+        }
+        undo.committed = true; // this generation is in force; nothing below can fail the update
+
+        // 7. Remove the stale generation's rules LAST. One that will not go is
+        //    not a failed update (this generation is in force) but it IS a live
+        //    allowance the record no longer lists -- an Allow rule outranks the
+        //    default block -- so it is counted from a fresh read, persisted and
+        //    reported PARTIAL, like a rule the policy store refused to disable.
+        fq::StepResult ok = fq::StepResult::success();
+        std::size_t stale_left = 0;
+        if (!plan.remove.empty()) {
+            const int failed = remove_rules_by_name(*rules.get(), plan.remove, dl);
+            const auto after = collect_our_rule_names(*rules.get(), dl);
+            stale_left = after ? fq::win_update_plan(*after, specs).remove.size()
+                               : static_cast<std::size_t>(failed);
+        }
+        os.stale_rules_left = static_cast<std::uint32_t>(stale_left);
+        if (stale_left > 0) {
+            ok.partial = true;
+            ok.notes.push_back(std::format("stale_rules_left={}", stale_left));
+        }
+
+        os.rules_not_disabled = refused;
+        if (refused > 0) {
+            ok.partial = true;
+            ok.notes.push_back(std::format("rules_not_disabled={}", refused));
+        }
+        return ok;
+    }
+
+    [[nodiscard]] fq::StepResult remove(fq::OsPayload& os, fq::Deadline& dl) override {
+        ComInit com;
+        if (!com.ok())
+            return fq::StepResult::fail("com_init");
+        ComPtr<INetFwPolicy2> policy;
+        ComPtr<INetFwRules> rules;
+        HRESULT hr = get_fw_policy(policy);
+        if (FAILED(hr))
+            return fq::StepResult::fail(hr_token("policy2_create", hr));
+        hr = policy->get_Rules(rules.put());
+        if (FAILED(hr) || !rules)
+            return fq::StepResult::fail(hr_token("rules_create", hr));
+        yuzu::PluginContext pc{raw_};
+        fq::StepResult result = fq::StepResult::success();
+        fq::WinReleaseTally tally;
+
+        // Release WIDENS first and removes our rules LAST, so connectivity is never
+        // narrower than the quarantine at any point of the release (the reply to
+        // this very command travels the control channel our rules keep open).
+        // Every loop below checks the operation deadline between rules: a single COM
+        // call cannot be cancelled (#1391), so the bound is between calls only.
+        // 1. Which of our rules exist (needed to decide the policy fallback below).
+        const auto ours_at_start = collect_our_rule_names(*rules.get(), dl);
+        if (!ours_at_start)
+            return enum_fail(dl);
+        // 2. Re-enable what quarantine disabled. The matching is one pure decision
+        //    (fq::win_release_plan): the whole rule key first (fq::win_rule_key), so a
+        //    rule that was OFF before, or a twin differing only by protocol, ports,
+        //    program, service or action, stays off (a twin differing only in addresses,
+        //    interfaces or edge traversal shares the key and comes back with it, README
+        //    caveat 3). A listed rule someone EDITED during the quarantine carries a
+        //    different key; it falls back to name, direction and profile only when the key
+        //    was flagged at disable time as the only carrier of them AND exactly one rule in
+        //    total carries them now: switched off it is switched on, already on it is
+        //    counted (`rules_accounted_enabled`). In every other case it is reported
+        //    `rules_unmatched` and nothing is switched on for it (the release still
+        //    completes): not flagged at disable (a sibling shared its name, direction and
+        //    profile, so a rename or re-profile of the rule would leave that sibling looking
+        //    like it), no carrier or more than one now, or the only carrier already claimed
+        //    by another listed rule. Every rule is read once and the switched-off ones are
+        //    held, so the decision and the re-enable see the same ruleset.
+        const std::string list_key{fq::kWinDisabledRulesKey};
+        const auto list_presence = kv_presence(raw_, list_key);
+        const bool list_exists = list_presence == fq::KvPresence::present;
+        if (list_presence == fq::KvPresence::unknown) {
+            tally.reenable_unread = true; // cannot tell whether a list exists: not clean
+            result.notes.emplace_back("storage_unreadable=1");
+        } else if (list_exists) {
+            const auto parsed = fq::parse_disabled_rules(pc.storage_get(list_key));
+            if (!parsed) {
+                result.notes.emplace_back("disabled_list_unreadable=1");
+            } else if (!parsed->empty()) {
+                std::vector<fq::WinRuleInfo> seen;
+                std::deque<ComPtr<INetFwRule>> held; // parallel to `seen`; set for a switched-off rule
+                if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+                        auto info = rule_info_of(r);
+                        held.emplace_back();
+                        if (!info.enabled) {
+                            r.AddRef();
+                            *held.back().put() = &r;
+                        }
+                        seen.push_back(std::move(info));
+                        return true;
+                    })) {
+                    if (dl.expired())
+                        return fq::StepResult::fail("deadline_exceeded");
+                    tally.reenable_unread = true; // a partial pass decides nothing: retried
+                } else {
+                    const auto plan = fq::win_release_plan(*parsed, seen);
+                    for (const auto i : plan.reenable)
+                        if (!held[i] || held[i]->put_Enabled(VARIANT_TRUE) != S_OK)
+                            ++tally.not_reenabled;
+                    tally.reenabled_by_identity = plan.by_identity;
+                    tally.accounted_enabled = plan.accounted_enabled;
+                    tally.unmatched = plan.unmatched;
+                    // The names are the agent's own record of what the release could not
+                    // account for (the reply carries the count only).
+                    for (std::size_t n = 0; n < plan.unmatched_keys.size() && n < 8; ++n)
+                        spdlog::warn("firewall: release found no unique rule for disabled rule '{}'",
+                                     fq::detail::sanitize_text(
+                                         fq::win_key_identity(plan.unmatched_keys[n])));
+                }
+            }
+        }
+
+        // 3. Restore the captured profile policy. With no image, fall back to
+        //    Windows' own default ONLY if we actually removed our rules: a second
+        //    release on an untouched host must not rewrite a hardened policy.
+        const std::string prior_key{fq::kWinPriorPolicyKey};
+        const auto image_presence = kv_presence(raw_, prior_key);
+        const bool image_exists = image_presence == fq::KvPresence::present;
+        std::optional<fq::WinPriorPolicy> prior;
+        if (image_exists)
+            prior = fq::parse_prior_policy(pc.storage_get(prior_key));
+        const auto image_step = fq::prior_image_step(image_presence, prior.has_value());
+        if (image_step == fq::PriorImageStep::unknown_presence) {
+            // Neither the image nor its absence is known: restoring Windows' default
+            // over a hardened policy would be a guess, and so would skipping the restore.
+            ++tally.policy_restore_failed;
+            result.notes.emplace_back("storage_unreadable=1");
+        } else if (image_step == fq::PriorImageStep::unreadable_image) {
+            // The image exists but cannot be trusted (old format, malformed, failed read):
+            // the same guess, so refuse before any default setter and keep the allowances.
+            ++tally.policy_restore_failed;
+            result.notes.emplace_back("prior_policy_unreadable=1");
+        } else if (prior || !ours_at_start->empty()) {
+            for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
+                if (!restore_default(*policy.get(), i, L"DefaultInboundAction", prior, true) ||
+                    !restore_default(*policy.get(), i, L"DefaultOutboundAction", prior, false)) {
+                    ++tally.policy_restore_failed;
+                    result.notes.emplace_back(
+                        std::format("policy_restore_failed={}", fq::kWinProfileLabels[i]));
+                }
+            }
+            if (!prior)
+                result.notes.emplace_back("prior_policy_unavailable=1");
+        }
+        // A default action that is not back (or could not be read) still BLOCKS, and our
+        // allowances are the only thing keeping the control channel and DNS open: deleting
+        // them now would strand the host block/block with no way back (the repair tick
+        // skips a `releasing` record). Stop here with them in place; the record stays
+        // `releasing` and the next release or start retries, which is safe because step 2
+        // only re-enables listed rules that are still disabled and step 3 is idempotent.
+        if (tally.policy_restore_failed > 0)
+            return release_incomplete(fq::win_release_decision(tally), result.notes);
+
+        // 4. Our rules, by group, until none is left (Remove(name) takes one rule
+        //    per call, and a rule added concurrently by a racing apply must not
+        //    survive a release).
+        for (int pass = 0; pass < 3; ++pass) {
+            const auto ours = collect_our_rule_names(*rules.get(), dl);
+            if (!ours)
+                return enum_fail(dl);
+            if (ours->empty())
+                break;
+            (void)remove_rules_by_name(*rules.get(), *ours, dl);
+            if (dl.expired())
+                return fq::StepResult::fail("deadline_exceeded");
+        }
+        {
+            const auto left = collect_our_rule_names(*rules.get(), dl);
+            if (!left)
+                return enum_fail(dl);
+            tally.our_rules_left = !left->empty();
+        }
+
+        // 5. Keys go only after a clean release; otherwise the record stays
+        //    `releasing` and the next start finishes the job from them. A key that
+        //    will not delete is NOT clean either: a surviving restore image or
+        //    disabled list would be reused by the next quarantine and its release
+        //    would put an old policy back and re-enable rules disabled since.
+        auto decision = fq::win_release_decision(tally);
+        if (!decision.incomplete) {
+            if (list_exists && !pc.storage_delete(list_key))
+                tally.images_not_deleted = true;
+            if (image_exists && !pc.storage_delete(prior_key))
+                tally.images_not_deleted = true;
+            decision = fq::win_release_decision(tally);
+        }
+        if (decision.incomplete)
+            return release_incomplete(std::move(decision), result.notes);
+        os.rules_not_disabled = 0;
+        os.stale_rules_left = 0;
+        result.notes.insert(result.notes.end(), decision.notes.begin(), decision.notes.end());
+        result.partial = decision.partial;
+        return result;
+    }
+
+    [[nodiscard]] fq::LegStatus read_status(const fq::OsPayload&, fq::Deadline& dl) override {
+        fq::LegStatus st;
+        ComInit com;
+        ComPtr<INetFwPolicy2> policy;
+        ComPtr<INetFwRules> rules;
+        if (!com.ok() || FAILED(get_fw_policy(policy)) || FAILED(policy->get_Rules(rules.put())) ||
+            !rules)
+            return st;
+        bool group = false, legacy = false;
+        if (!for_each_rule(*rules.get(), dl, [&](INetFwRule& r) {
+                const auto name = rule_name_of(r);
+                group = group || rule_group_of(r) == fq::kWinGroup;
+                legacy = legacy || fq::is_legacy_marker(name);
+                return true;
+            }))
+            return st; // unreadable (or out of time): never a guess
+        const auto sw = read_verdict(*policy.get());
+        bool all_block = true;
+        for (const auto profile : kQuarantineProfiles) {
+            NET_FW_ACTION in = NET_FW_ACTION_ALLOW, out = NET_FW_ACTION_ALLOW;
+            const HRESULT hi = policy->get_DefaultInboundAction(profile, &in);
+            const HRESULT ho = policy->get_DefaultOutboundAction(profile, &out);
+            if (hi != S_OK || ho != S_OK)
+                return st; // unreadable, never a guess
+            all_block = all_block && in == NET_FW_ACTION_BLOCK && out == NET_FW_ACTION_BLOCK;
+        }
+        if (legacy)
+            st.notes.emplace_back("legacy_quarantine_rules_present=1");
+        if (!group && all_block)
+            st.notes.emplace_back("rules_missing=1"); // block/block with no rules of ours
+        // A switched-off profile, an unreadable switch or policy store and a profile Group
+        // Policy controls (`gpo_override`: local rules and defaults take no effect, whatever
+        // get_Default*Action says, so a policy that arrived mid-quarantine reads
+        // not_enforcing here and a re-apply cannot help) all settle the status.
+        if (fq::win_switch_status(sw, st))
+            return st;
+        st.state = (group && all_block) ? fq::OsState::enforcing : fq::OsState::not_enforcing;
+        if (st.state == fq::OsState::not_enforcing)
+            st.reason = "policy_not_blocking";
+        return st;
+    }
+
+private:
+    /// LocalPolicyModifyState == GP_OVERRIDE: the firewall is controlled by Group
+    /// Policy, so a rule or default written here takes no effect. Only a definite S_OK
+    /// reading says yes. It describes the CURRENT profile only, so it is the second
+    /// signal: read_gpo is the one that sees a profile the host is not on right now.
+    [[nodiscard]] static bool policy_overridden(INetFwPolicy2& policy) {
+        NET_FW_MODIFY_STATE state = NET_FW_MODIFY_STATE_OK;
+        return policy.get_LocalPolicyModifyState(&state) == S_OK &&
+               state == NET_FW_MODIFY_STATE_GP_OVERRIDE;
+    }
+
+    /// Puts one default-action slot back: deletes the local value when the slot had none
+    /// before (ERROR_FILE_NOT_FOUND = already gone), else writes the explicit action.
+    [[nodiscard]] static bool restore_default(INetFwPolicy2& policy, std::size_t i, const wchar_t* name,
+                                       const std::optional<fq::WinPriorPolicy>& prior,
+                                       bool inbound) {
+        const auto op = fq::win_release_slot_op(prior, i, inbound);
+        if (op == fq::WinSlotOp::delete_local) {
+            // The running firewall service holds our block in memory and may not reread a
+            // registry delete, so first put the OS default back through the API (inbound
+            // block, outbound allow: what "not configured" resolves to), then remove the
+            // local value so the store reads not configured again.
+            const NET_FW_ACTION os_default = inbound ? NET_FW_ACTION_BLOCK : NET_FW_ACTION_ALLOW;
+            if ((inbound ? policy.put_DefaultInboundAction(kQuarantineProfiles[i], os_default)
+                         : policy.put_DefaultOutboundAction(kQuarantineProfiles[i], os_default)) != S_OK)
+                return false;
+            const LONG rc = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, kLocalProfileKeys[i], name);
+            return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+        }
+        const NET_FW_ACTION act =
+            op == fq::WinSlotOp::write_allow ? NET_FW_ACTION_ALLOW : NET_FW_ACTION_BLOCK;
+        return (inbound ? policy.put_DefaultInboundAction(kQuarantineProfiles[i], act)
+                        : policy.put_DefaultOutboundAction(kQuarantineProfiles[i], act)) == S_OK;
+    }
+
+    /// One policy-store DWORD. `readable` is false for any failure but "not there": a
+    /// missing key or value (ERROR_FILE_NOT_FOUND) means no policy, anything else (access
+    /// denied, a value of the wrong type) is a reading we do not have.
+    struct PolicyDword {
+        bool readable = false;
+        std::optional<std::uint32_t> value;
+    };
+    [[nodiscard]] static PolicyDword read_policy_dword(const wchar_t* key, const wchar_t* name) {
+        DWORD v = 0, size = sizeof(v);
+        const LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, key, name, RRF_RT_REG_DWORD, nullptr, &v, &size);
+        if (rc == ERROR_SUCCESS)
+            return {true, static_cast<std::uint32_t>(v)};
+        return {rc == ERROR_FILE_NOT_FOUND, std::nullopt};
+    }
+
+    /// One policy store's verdict on one profile: the three DWORDs the pure rule
+    /// (win_gpo_profile_overridden) decides on; nullopt when any of them could not be read.
+    [[nodiscard]] static std::optional<bool> read_policy_store(const wchar_t* key) {
+        const auto merge = read_policy_dword(key, L"AllowLocalPolicyMerge");
+        const auto in = read_policy_dword(key, L"DefaultInboundAction");
+        const auto out = read_policy_dword(key, L"DefaultOutboundAction");
+        if (!merge.readable || !in.readable || !out.readable)
+            return std::nullopt;
+        return fq::win_gpo_profile_overridden({merge.value, in.value, out.value});
+    }
+
+    /// The policy stores per profile, in kQuarantineProfiles order: Group Policy, and the MDM
+    /// store the Firewall CSP writes (the same three values; MDM-managed hosts keep their
+    /// policy there, not under Policies). The pure fold (win_policy_stores_overridden) joins
+    /// the two. nullopt = a store could not be read; ERROR_FILE_NOT_FOUND on either key is
+    /// "no policy there". The MDM path below is UNVERIFIED on a host (taken from the Firewall
+    /// CSP's documented storage); gate 4 on kingsley confirms it.
+    [[nodiscard]] static fq::WinGpoReading read_gpo() {
+        static constexpr const wchar_t* kGroupPolicyKeys[] = {
+            L"SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\DomainProfile",
+            L"SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\PrivateProfile",
+            L"SOFTWARE\\Policies\\Microsoft\\WindowsFirewall\\PublicProfile"};
+        static constexpr const wchar_t* kMdmKeys[] = {
+            L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\DomainProfile",
+            L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\PrivateProfile",
+            L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\Mdm\\PublicProfile"};
+        static_assert(std::size(kGroupPolicyKeys) == std::size(kQuarantineProfiles));
+        static_assert(std::size(kMdmKeys) == std::size(kQuarantineProfiles));
+        fq::WinGpoReading r{};
+        for (std::size_t i = 0; i < std::size(kGroupPolicyKeys); ++i)
+            r[i] = fq::win_policy_stores_overridden(read_policy_store(kGroupPolicyKeys[i]),
+                                                    read_policy_store(kMdmKeys[i]));
+        return r;
+    }
+
+    /// The master switch per profile, through classify_fw_hr: only S_OK is a
+    /// reading, so S_FALSE and every error stay nullopt (never a guess).
+    [[nodiscard]] static fq::WinSwitchReading read_switch(INetFwPolicy2& policy) {
+        fq::WinSwitchReading r{};
+        for (std::size_t i = 0; i < std::size(kQuarantineProfiles); ++i) {
+            VARIANT_BOOL on = VARIANT_FALSE;
+            if (classify_fw_hr(policy.get_FirewallEnabled(kQuarantineProfiles[i], &on)) ==
+                FwHrResult::Ok)
+                r[i] = on != VARIANT_FALSE;
+        }
+        return r;
+    }
+
+    /// The master switch and the policy override (per profile, plus the COM state)
+    /// as ONE verdict: the single pure decision (fq::win_firewall_switch_verdict) that
+    /// preflight, apply step 0 and read_status all route through, so the three can never
+    /// disagree.
+    [[nodiscard]] static fq::WinSwitchVerdict read_verdict(INetFwPolicy2& policy) {
+        return fq::win_firewall_switch_verdict(read_switch(policy), read_gpo(), policy_overridden(policy));
+    }
+
+    /// `release_incomplete`: what a release that could not finish reports, with the
+    /// decision's notes first and the step notes after.
+    [[nodiscard]] static fq::StepResult release_incomplete(fq::WinReleaseDecision decision,
+                                                           const std::vector<std::string>& step_notes) {
+        auto r = fq::StepResult::fail("release_incomplete");
+        r.notes = std::move(decision.notes);
+        r.notes.insert(r.notes.end(), step_notes.begin(), step_notes.end());
+        return r;
+    }
+
+    /// The names of the rules that are ours (group or prefix); nullopt when the
+    /// enumeration itself failed part-way.
+    [[nodiscard]] static std::optional<std::vector<std::string>> collect_our_rule_names(
+        INetFwRules& rules, fq::Deadline& dl) {
+        std::vector<std::string> out;
+        if (!for_each_rule(rules, dl, [&](INetFwRule& r) {
+                auto name = rule_name_of(r);
+                if (fq::is_our_win_rule(name, rule_group_of(r)))
+                    out.push_back(std::move(name));
+                return true;
+            }))
+            return std::nullopt;
+        return out;
+    }
+
+    /// Removes each named rule from the store; returns how many removals failed.
+    [[nodiscard]] static int remove_rules_by_name(INetFwRules& rules,
+                                                  const std::vector<std::string>& names,
+                                                  fq::Deadline& dl) {
+        int failed = 0;
+        std::size_t i = 0;
+        for (const auto& n : names) {
+            if (++i % 64 == 0 && dl.expired()) { // the rest are left, counted as failed
+                failed += static_cast<int>(names.size() - i + 1);
+                break;
+            }
+            yuzu::shared::win::BStr b{yuzu::win::to_wide(n)};
+            if (!b || rules.Remove(b.get()) != S_OK)
+                ++failed;
+        }
+        return failed;
+    }
+
+    [[nodiscard]] static HRESULT add_rule(INetFwRules& rules, const fq::WinRuleSpec& spec) {
+        ComPtr<INetFwRule> rule;
+        HRESULT hr = CoCreateInstance(__uuidof(NetFwRule), nullptr, CLSCTX_INPROC_SERVER,
+                                      __uuidof(INetFwRule), reinterpret_cast<void**>(rule.put()));
+        if (FAILED(hr) || !rule)
+            return FAILED(hr) ? hr : E_POINTER;
+        using yuzu::shared::win::BStr;
+        BStr name{yuzu::win::to_wide(spec.name)};
+        BStr group{yuzu::win::to_wide(fq::kWinGroup)};
+        BStr desc{std::wstring{L"Yuzu Firewall quarantine allowance"}};
+        if (!name || !group || !desc)
+            return E_OUTOFMEMORY;
+        if (FAILED(hr = rule->put_Name(name.get())) ||
+            FAILED(hr = rule->put_Description(desc.get())) ||
+            FAILED(hr = rule->put_Grouping(group.get())) ||
+            FAILED(hr = rule->put_Direction(spec.dir == fq::Dir::in ? NET_FW_RULE_DIR_IN
+                                                                    : NET_FW_RULE_DIR_OUT)) ||
+            FAILED(hr = rule->put_Action(NET_FW_ACTION_ALLOW)) ||
+            FAILED(hr = rule->put_Protocol(spec.protocol)))
+            return hr;
+        // An empty value leaves the property at its default (any).
+        auto put_str = [](const std::string& v, auto&& put) -> HRESULT {
+            if (v.empty())
+                return S_OK;
+            BStr b{yuzu::win::to_wide(v)};
+            if (!b)
+                return E_OUTOFMEMORY;
+            return put(b.get());
+        };
+        if (FAILED(hr = put_str(spec.remote_addrs,
+                                [&](BSTR b) { return rule->put_RemoteAddresses(b); })) ||
+            FAILED(hr = put_str(spec.local_ports, [&](BSTR b) { return rule->put_LocalPorts(b); })) ||
+            FAILED(hr = put_str(spec.remote_ports,
+                                [&](BSTR b) { return rule->put_RemotePorts(b); })) ||
+            FAILED(hr = put_str(spec.icmp_types,
+                                [&](BSTR b) { return rule->put_IcmpTypesAndCodes(b); })) ||
+            FAILED(hr = put_str(spec.service_name,
+                                [&](BSTR b) { return rule->put_ServiceName(b); })) ||
+            FAILED(hr = rule->put_Profiles(NET_FW_PROFILE2_ALL)) ||
+            FAILED(hr = rule->put_Enabled(VARIANT_TRUE)))
+            return hr;
+        return rules.Add(rule.get());
+    }
+
+    YuzuPluginContext* raw_;
+};
+
+/// The DNS servers of every adapter that is up (GetAdaptersAddresses), the Windows
+/// twin of /etc/resolv.conf. The site-local `fec0:0:0:ffff::` placeholders
+/// Windows lists when an adapter has no IPv6 DNS are not real resolvers.
+[[nodiscard]] std::vector<std::string> host_resolvers() {
+    std::vector<std::string> out;
+    ULONG size = 16 * 1024;
+    std::vector<unsigned char> buf(size);
+    const ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME;
+    auto* addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+    ULONG rc = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &size);
+    if (rc == ERROR_BUFFER_OVERFLOW) {
+        buf.resize(size);
+        addrs = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data());
+        rc = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, addrs, &size);
+    }
+    if (rc != NO_ERROR)
+        return out;
+    for (auto* a = addrs; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp)
+            continue;
+        for (auto* d = a->FirstDnsServerAddress; d; d = d->Next) {
+            char text[64]{};
+            const auto* sa = d->Address.lpSockaddr;
+            if (!sa)
+                continue;
+            if (sa->sa_family == AF_INET) {
+                const auto* in = reinterpret_cast<const sockaddr_in*>(sa);
+                if (!InetNtopA(AF_INET, const_cast<IN_ADDR*>(&in->sin_addr), text, sizeof(text)))
+                    continue;
+            } else if (sa->sa_family == AF_INET6) {
+                const auto* in6 = reinterpret_cast<const sockaddr_in6*>(sa);
+                // fec0:0:0:ffff::N placeholder: the first 8 bytes (fec0:0:0:ffff); a real
+                // site-local resolver elsewhere in fec0::/10 is kept.
+                static constexpr unsigned char kPlaceholder[8] = {0xfe, 0xc0, 0, 0, 0, 0, 0xff, 0xff};
+                if (std::memcmp(in6->sin6_addr.s6_addr, kPlaceholder, sizeof(kPlaceholder)) == 0)
+                    continue;
+                if (!InetNtopA(AF_INET6, const_cast<IN6_ADDR*>(&in6->sin6_addr), text, sizeof(text)))
+                    continue;
+            } else {
+                continue;
+            }
+            out.emplace_back(text);
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind, bool) {
+    return std::make_unique<WinLeg>(raw);
+}
+
+#endif // _WIN32
+
+// ── macOS leg (rung 2, sudo pfctl over the pf sub-anchor) ───────────────────
+#if defined(__APPLE__)
+
+/// The current boot's identity, `kern.boottime` as "<sec>.<usec>", read in-process
+/// (no spawn, so no sudoers line or PATH to trust). pf's enable references reset
+/// at reboot, so a token is only meaningful for the boot that issued it.
+[[nodiscard]] std::optional<std::string> kern_boot_time() {
+    struct timeval tv{};
+    size_t len = sizeof(tv);
+    if (::sysctlbyname("kern.boottime", &tv, &len, nullptr, 0) != 0 || len != sizeof(tv) ||
+        tv.tv_sec <= 0)
+        return std::nullopt;
+    return std::format("{}.{}", static_cast<long long>(tv.tv_sec), static_cast<long long>(tv.tv_usec));
+}
+
+/// macOS has one backend (pf), so the hint and for_apply carry nothing: release
+/// and status use the same leg that applied.
+[[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind, bool) {
+    return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time);
+}
+
+#endif // __APPLE__
+
+// ── Action handlers (all OSes) ──────────────────────────────────────────────
+
+/// One log line per containment state change (info) and per non-OK outcome (warn),
+/// `degraded|exception` at error: a boot re-apply that failed, a TTL release that ended
+/// partial, an unattended repair and an `uncontained after reboot` host otherwise show
+/// nothing until someone polls. The line carries the outcome's notes, so an expiry
+/// release reads `firewall: release -> inactive ttl_expired=1`, the only record of it
+/// until the server records them. What is logged, and at which level, is
+/// fq::log_level (pure, unit-tested); this maps it onto spdlog. The core logs nothing.
+void log_outcome(std::string_view action, const fq::Outcome& o) {
+    switch (fq::log_level(action, o)) {
+    case fq::LogLevel::none:
+        return;
+    case fq::LogLevel::info:
+        spdlog::info("{}", fq::log_line(action, o));
+        return;
+    case fq::LogLevel::warn:
+        spdlog::warn("{}", fq::log_line(action, o));
+        return;
+    case fq::LogLevel::error:
+        spdlog::error("{}", fq::log_line(action, o));
+        return;
+    }
+}
+
+void emit(yuzu::CommandContext& ctx, const fq::Outcome& o, std::string_view action = "containment") {
+    log_outcome(action, o);
+    for (const auto& row : fq::render_rows(o))
+        ctx.write_output(row);
+    const auto rk = fq::result_kind(o);
+    const auto status = rk.kind == fq::ResultKind::Kind::ok ? YUZU_RESULT_STATUS_OK
+                        : rk.kind == fq::ResultKind::Kind::unavailable
+                            ? YUZU_RESULT_STATUS_UNAVAILABLE
+                            : YUZU_RESULT_STATUS_CONSTRAINED;
+    ctx.set_result_status(status,
+                          rk.partial ? YUZU_RESULT_COMPLETENESS_PARTIAL
+                                     : YUZU_RESULT_COMPLETENESS_FULL,
+                          rk.provenance);
+}
+
+int emit_refusal(yuzu::CommandContext& ctx, std::string reason, std::string_view action = "containment") {
+    const auto o = fq::refused(std::move(reason));
+    emit(ctx, o, action);
+    return o.rc();
+}
+
+int emit_busy(yuzu::CommandContext& ctx) {
+    fq::Outcome o;
+    o.status = "busy";
+    emit(ctx, o, "containment");
+    return o.rc();
+}
+
+/// The OS leg plus the durable record, built per call. The leg follows the
+/// backend the record says applied (a host that gained or lost nft since must
+/// still release what it applied); a fresh quarantine picks the best available.
+struct Containment {
+    YuzuPluginContext* raw;
+    KvStateStore store;
+    std::unique_ptr<fq::Leg> leg;
+    Containment(YuzuPluginContext* raw_, bool for_apply) : raw(raw_), store(raw_) {
+        const auto l = store.load();
+        leg = make_leg(raw_, l.kind == fq::StateLoad::Kind::ok ? l.state.backend : fq::BackendKind::none,
+                       for_apply);
+    }
+    /// `live_peer`: the verification proves the address the agent's control channel
+    /// really uses (`agent.server_peer`, published by agents/core from the stream the
+    /// server answered on) instead of scanning the allow set. Agent start passes false:
+    /// no Register has happened yet, so no peer is known and the listed scan is the proof.
+    [[nodiscard]] fq::Env env(bool live_peer = true) {
+        return fq::Env{*leg, store, tcp_probe, epoch_now,
+                       live_peer ? fq::parse_live_peer(config_value(raw, "agent.server_peer"))
+                                 : std::nullopt};
+    }
+};
+
+/// The agent's trigger engine, reached through the plugin context. The decision
+/// itself (fq::settle_triggers: the time limit's trigger and the repair self-check) is
+/// in the core.
+class ContextTriggers final : public fq::TriggerRegistry {
+public:
+    explicit ContextTriggers(YuzuPluginContext* raw) : ctx_{raw} {}
+    bool register_trigger(std::string_view id, std::string_view type,
+                          std::string_view config_json) override {
+        return ctx_.register_trigger(id, type, config_json);
+    }
+    bool unregister_trigger(std::string_view id) override { return ctx_.unregister_trigger(id); }
+
+private:
+    yuzu::PluginContext ctx_;
+};
+
+void settle_triggers(fq::Outcome& o, YuzuPluginContext* raw) {
+    if (!raw)
+        return;
+    ContextTriggers triggers{raw};
+    KvStateStore store{raw}; // a failed registration is recorded as residue on the record
+    fq::settle_triggers(o, triggers, store);
+}
+
+/// What a throw out of a containment action answers: `degraded|exception`
+/// (CONSTRAINED, PARTIAL, rc 1), never `refused` -- a throw can follow the
+/// `applying` record and part of the mutation, and consumers key on the provenance
+/// (`firewall:refused` means nothing changed). The stored record, when it loads, is
+/// attached so settle_triggers still registers the triggers of an `applying`
+/// record. Every step is its own guard: this runs inside the one catch at the plugin
+/// seam and must never throw across the ABI.
+int emit_exception(yuzu::CommandContext& ctx, YuzuPluginContext* raw) {
+    try {
+        fq::StateLoad loaded;
+        try {
+            loaded = KvStateStore{raw}.load();
+        } catch (...) {
+        }
+        auto o = fq::exception_outcome(loaded);
+        try {
+            settle_triggers(o, raw);
+        } catch (...) {
+        }
+        emit(ctx, o, "containment");
+        return o.rc();
+    } catch (...) {
+        try {
+            ctx.write_output("status|degraded|exception");
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "firewall:degraded");
+        } catch (...) {
+        }
+        return 1;
+    }
+}
+
+/// Linux: the packaged unit (User=yuzu-agent, NoNewPrivileges=true, no sudoers
+/// grant) cannot elevate, so a mutating containment action is refused cleanly
+/// `privilege_unavailable` before any record or tool call (the decision is
+/// fq::linux_privilege_refusal; only the two OS reads are here). Never refused
+/// elsewhere.
+[[nodiscard]] std::optional<std::string_view> privilege_refusal() {
+#if defined(__linux__)
+    return fq::linux_privilege_refusal(::geteuid() == 0,
+                                       ::prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0));
+#else
+    return std::nullopt;
+#endif
+}
+
+/// The ONE place the mutation gate is taken. Every mutating action runs through
+/// here and answers `busy` when it cannot get in; `quarantine_status` never does.
+template <class Body> int gated(yuzu::CommandContext& ctx, Body&& body) {
+    auto guard = g_quarantine_gate.try_enter();
+    if (!guard)
+        return emit_busy(ctx);
+    return body();
+}
+
+/// The unattended self-check (`firewall.quarantine` with `repair=1`, dispatched by the
+/// repair trigger every 60 s). Runs inside the same MutationGate as every mutating
+/// action (busy answers, never waits). Reads the record and, at most, re-applies the
+/// STORED set of an `active` record the host stopped enforcing (fq::repair); no allow
+/// set is built and no other parameter is read.
+int do_repair(yuzu::CommandContext& ctx, YuzuPluginContext* raw) {
+    if (const auto why = privilege_refusal())
+        return emit_refusal(ctx, std::string{*why}, "repair");
+    Containment containment(raw, /*for_apply=*/false);
+    fq::Outcome o;
+    if (!containment.leg) {
+        // No firewall tool: nothing of ours is in force unless a record says it is, and
+        // a store that cannot answer is still never read as "no record".
+        o.notes.emplace_back("repair_tick=1");
+        switch (containment.store.load().kind) {
+        case fq::StateLoad::Kind::absent:
+            o.status = "inactive";
+            o.notes.emplace_back("nothing_to_repair=1");
+            break;
+        case fq::StateLoad::Kind::unreadable:
+            o.status = "degraded";
+            o.reason = "state_unreadable";
+            break;
+        case fq::StateLoad::Kind::ok:
+            o.status = "degraded";
+            o.reason = "os_unreadable";
+            break;
+        }
+    } else {
+        auto env = containment.env();
+        fq::Deadline dl;
+        o = fq::repair(env, dl);
+    }
+    settle_triggers(o, raw);
+    emit(ctx, o, "repair");
+    return o.rc();
+}
+
+int do_quarantine(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
+    // The repair trigger's dispatch (its config carries `repair=1` and nothing else). The
+    // plugin cannot tell that trigger from an operator's dispatch, so a `repair=1` that also
+    // names a containment parameter is refused rather than answered as a repair: an operator
+    // who meant to contain must not read `inactive nothing_to_repair`. A bare `repair=1`
+    // is routed before anything else is read (it never builds an allow set or starts a record).
+    if (params.get("repair") == "1") {
+        if (params.has("ttl_seconds") || params.has("exceptions") || params.has("probe_target"))
+            return emit_refusal(ctx, "repair_with_containment_parameters", "quarantine");
+        return do_repair(ctx, raw);
+    }
+    const auto ttl = fq::parse_ttl_param(params.get("ttl_seconds"));
+    if (!ttl)
+        return emit_refusal(ctx, ttl.error(), "quarantine");
+    const auto exceptions = fq::parse_exceptions_csv(params.get("exceptions"));
+    if (!exceptions)
+        return emit_refusal(ctx, "exceptions_invalid:" + exceptions.error(), "quarantine");
+    // The packaged Linux unit cannot elevate: refuse before any record exists,
+    // rather than write `applying` and fail every tool call after it.
+    if (const auto why = privilege_refusal())
+        return emit_refusal(ctx, std::string{*why}, "quarantine");
+
+    Containment containment(raw, /*for_apply=*/true);
+    if (!containment.leg)
+        return emit_refusal(ctx, "unsupported_platform");
+#ifndef _WIN32
+    // The nft and pf legs hand a staged file to a privileged tool: no private
+    // directory to stage it in, no apply (and nothing has been touched yet).
+    if ((containment.leg->kind() == fq::BackendKind::nft ||
+         containment.leg->kind() == fq::BackendKind::pf) &&
+        private_staging_dir(raw).empty())
+        return emit_refusal(ctx, "staging_unavailable");
+#endif
+
+    // The start-resolved set was read ONCE at agent start and the live peer is the
+    // address agents/core published from the stream the server answered on (never
+    // resolved here: the host being contained must not choose which address survives
+    // its own containment, #3429). The live peer leads the set, so a server that moved
+    // since start is allowed, and it is what the verification connects to.
+    auto allow = fq::build_allow_set(config_value(raw, "agent.server_address_resolved"),
+                                     config_value(raw, "agent.server_address"), host_resolvers(),
+                                     *exceptions, config_value(raw, "agent.server_peer"));
+    if (!allow)
+        return emit_refusal(ctx, allow.error());
+
+    fq::ApplyRequest req;
+    req.allow = *allow;
+    req.probe_target = std::string{params.get("probe_target")};
+    req.ttl_seconds = *ttl;
+    auto env = containment.env();
+    fq::Deadline dl;
+    auto o = fq::apply_and_verify(env, req, dl);
+    o.notes.insert(o.notes.end(), allow->notes.begin(), allow->notes.end());
+    settle_triggers(o, raw);
+    emit(ctx, o, "quarantine");
+    return o.rc();
+}
+
+int do_release(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
+    fq::ReleaseRequest req;
+    const auto due = params.get("if_ttl_expired");
+    req.if_ttl_expired = due == "1" || due == "true";
+    if (const auto why = privilege_refusal())
+        return emit_refusal(ctx, std::string{*why}, "release");
+
+    Containment containment(raw, /*for_apply=*/false);
+    if (!containment.leg) {
+        // No firewall tool and no record of one: nothing of ours can be in force.
+        fq::Outcome o;
+        if (containment.store.load().kind == fq::StateLoad::Kind::absent) {
+            o.status = "inactive";
+            o.notes.emplace_back("no_firewall_tool=1");
+            emit(ctx, o);
+            return 0;
+        }
+        return emit_refusal(ctx, "unsupported_platform");
+    }
+    auto env = containment.env();
+    fq::Deadline dl;
+    auto o = fq::release(env, req, dl);
+    settle_triggers(o, raw);
+    emit(ctx, o, "release");
+    return o.rc();
+}
+
+int do_quarantine_allow(yuzu::CommandContext& ctx, yuzu::Params params, YuzuPluginContext* raw) {
+    const auto op = params.get("op");
+    if (op != "add" && op != "remove")
+        return emit_refusal(ctx, "op_invalid");
+    const auto exceptions = fq::parse_exceptions_csv(params.get("exceptions"));
+    if (!exceptions)
+        return emit_refusal(ctx, "exceptions_invalid:" + exceptions.error());
+    if (exceptions->empty())
+        return emit_refusal(ctx, "exceptions_required");
+    if (const auto why = privilege_refusal())
+        return emit_refusal(ctx, std::string{*why}, "quarantine_allow");
+
+    Containment containment(raw, /*for_apply=*/true);
+    if (!containment.leg) {
+        // A record with no tool to read it through is the same answer release and
+        // status give; no record at all is "not active".
+        return emit_refusal(ctx, containment.store.load().kind == fq::StateLoad::Kind::absent
+                                     ? "not_active"
+                                     : "unsupported_platform");
+    }
+    auto env = containment.env();
+    fq::Deadline dl;
+    auto o = fq::update(env, op == "add", *exceptions, dl);
+    emit(ctx, o, "quarantine_allow");
+    return o.rc();
+}
+
+int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
+                         const std::string& init_note) {
+    Containment containment(raw, /*for_apply=*/false);
+    fq::Outcome o;
+    if (!containment.leg) {
+        if (containment.store.load().kind == fq::StateLoad::Kind::absent) {
+            o.status = "inactive";
+            o.notes.emplace_back("no_firewall_tool=1");
+        } else {
+            o.status = "degraded";
+            o.reason = "os_unreadable";
+        }
+    } else {
+        auto env = containment.env();
+        fq::Deadline dl;
+        o = fq::report_status(env, dl);
+    }
+    // The start-time note describes a containment that is still in force; once the
+    // host is inactive (a release since) it is history, not status.
+    if (!init_note.empty() && o.status != "inactive")
+        o.notes.push_back("init_recovery=" + init_note);
+    emit(ctx, o, "quarantine_status");
+    return 0;
+}
+
+/// Agent start: complete an interrupted operation, re-apply a stored containment
+/// the OS no longer enforces (a reboot), re-register the TTL trigger. Bounded
+/// BETWEEN calls by the apply deadline (60 s) plus the verification budget (10 s);
+/// a single COM call that never returns is not bounded (#1391); never throws;
+/// never rolls back or releases.
+[[nodiscard]] std::string recover_containment_at_start(YuzuPluginContext* raw) {
+    try {
+        KvStateStore probe_store(raw);
+        const auto l = probe_store.load();
+        if (l.kind == fq::StateLoad::Kind::absent)
+            return {};
+        Containment containment(raw, /*for_apply=*/true);
+        if (!containment.leg)
+            return "no_firewall_tool";
+        auto env = containment.env(/*live_peer=*/false); // no Register yet: no live peer is known
+        fq::Deadline dl;
+        auto o = fq::recover_at_init(env, dl);
+        settle_triggers(o, raw);
+        log_outcome("start recovery", o);
+        // `status[:reason][,note...]`: a cause that is only a note (a failed state
+        // flush, an unregistered TTL trigger) must survive into init_recovery.
+        auto summary = o.reason.empty() ? o.status : o.status + ":" + o.reason;
+        for (const auto& n : o.notes)
+            summary += "," + n;
+        return summary;
+    } catch (...) {
+        spdlog::error("firewall: start recovery threw; the stored containment was not re-checked");
+        return "exception";
+    }
+}
+
+
 // ── ABI4 capability declarations (#2204) ────────────────────────────────
 //
 // Windows: entirely native, zero subprocesses — INetFwPolicy2 COM (rung 1).
@@ -1494,8 +3036,10 @@ void do_rules_linux(yuzu::CommandContext& ctx) {
 // before the migration. Linux: firewalld and nftables are both native rung 1
 // (bounded sd-bus / bounded NETLINK_NETFILTER); ufw/iptables are
 // run_bounded_subprocess argv (rung 2), the fallback once neither native
-// backend is reachable. Neither action mutates firewall state — this plugin
-// exposes status/listing only.
+// backend is reachable. `state` and `rules` never mutate firewall state. The
+// four containment actions below do: Windows over COM (rung 1), Linux over
+// `sudo nft -f` / iptables argv (rung 2, with the status read rung 1 -> 2),
+// macOS over `sudo pfctl` (rung 2): an own sub-anchor plus a pf enable reference.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "state",
@@ -1521,6 +3065,96 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "INetFwPolicy2 COM (INetFwRules enumeration)", nullptr},
     },
+    {
+        /* .action      = */ "quarantine",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "sudo nft -f of an own inet table applied as one transaction (policy-drop chains); "
+         "iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent",
+         "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
+         "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges; "
+         "contains the host's own IP traffic and traffic the host routes (L2-bridged guests and "
+         "macvlan/ipvlan containers are not contained); a ttl_seconds limit rides the host "
+         "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
+         "agent only"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "sudo pfctl: own sub-anchor com.apple/000.yuzu_quarantine loaded with -a -f (the main ruleset "
+         "is never loaded), a pf enable reference (-E), one global pf state flush (-F states)",
+         "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before "
+         "000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf "
+         "connection once and release does not restore them; a ttl_seconds limit rides the host "
+         "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
+         "agent only"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "INetFwPolicy2 COM rule group + per-profile default-block; other enabled rules "
+         "disabled for the duration",
+         "rules the policy store refuses to disable (GPO) leave the result partial; a host where "
+         "Group Policy or MDM controls any of the three profiles (a policy-set default action, or "
+         "local rules that do not merge; also LocalPolicyModifyState GP_OVERRIDE) is refused "
+         "gpo_override:<Profile> and changes nothing (a rule or default written locally takes no "
+         "effect there; a policy that sets block/block itself is refused too), and reads "
+         "degraded|gpo_override if the policy arrives mid-quarantine; contains "
+         "the host's own IP traffic and traffic the host "
+         "routes (Hyper-V external-switch guests are not contained); a ttl_seconds limit rides the host "
+         "wall clock (NTP is blocked while contained) and its expiry release is logged on the "
+         "agent only"},
+    },
+    {
+        /* .action      = */ "release",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2, "sudo nft delete table / iptables chain removal",
+         "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
+         "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "sudo pfctl: empty own anchor (-F rules, -F nat), release the enable token (-X)",
+         "connections cut by the apply-time state flush are not restored; a token pf no longer "
+         "knows is noted, not an error"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "INetFwPolicy2 COM rule-group removal, prior-policy restore, disabled rules re-enabled",
+         "a rule edited during the quarantine is re-found by name, direction and profile when that "
+         "is unambiguous, else the release completes partial|rules_unmatched (record erased, "
+         "nothing of ours left); a rule the policy store will not re-enable is noted "
+         "rules_not_reenabled"},
+    },
+    {
+        /* .action      = */ "quarantine_status",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "own nftables table over NETLINK_NETFILTER (rung 1), else sudo nft list table (rung 2); "
+         "iptables chain jumps via argv",
+         "netlink needs CAP_NET_ADMIN, which the unprivileged agent lacks: the sudo read is "
+         "the usual path, and on the packaged systemd unit (NoNewPrivileges, no sudoers) it fails, "
+         "so a host with a stored record reads degraded; needs the installer's sudoers grant on a "
+         "unit without NoNewPrivileges"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "sudo pfctl reads: info, main-ruleset anchor reference, own anchor rules, sibling anchors "
+         "under com.apple, enable references",
+         "read-only; a disabled pf, a dangling anchor or an earlier sibling reads degraded"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "INetFwPolicy2 COM rule group presence + per-profile default actions", nullptr},
+    },
+    {
+        /* .action      = */ "quarantine_allow",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "atomic nft reload / iptables build-then-swap of a new generation",
+         "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
+         "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "sudo pfctl: atomic reload of the own sub-anchor (-a -f), then a global pf state flush",
+         "each update flushes every pf state once, so connections not covered by an allowance are "
+         "cut and not restored"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "INetFwPolicy2 COM: new generation's rules added first, stale ones removed last", nullptr},
+    },
 };
 
 } // namespace
@@ -1528,13 +3162,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class FirewallPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "firewall"; }
-    std::string_view version() const noexcept override { return "0.6.0"; }
+    std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Firewall status and rule listing";
+        return "Firewall status, rule listing and device containment";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"state", "rules", nullptr};
+        static const char* acts[] = {"state",      "rules",         "quarantine",
+                                     "release",    "quarantine_status", "quarantine_allow",
+                                     nullptr};
         return acts;
     }
 
@@ -1545,11 +3181,21 @@ public:
         return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+    // The containment record and the Windows restore images live in plugin KV,
+    // which only a PluginContext reaches, so the raw handle is cached here (the
+    // ABI documents this use; the host owns the context and outlives the plugin).
+    // init() runs after the KV store opens and before Register, which is what lets
+    // an interrupted operation be finished, and a stored containment re-applied,
+    // before the agent connects.
+    yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        ctx_ = ctx.raw();
+        init_note_ = recover_containment_at_start(ctx_);
+        return {};
+    }
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
-                yuzu::Params /*params*/) override {
+                yuzu::Params params) override {
 
         if (action == "state") {
 #ifdef _WIN32
@@ -1577,9 +3223,36 @@ public:
             return 0;
         }
 
+        if (action == "quarantine" || action == "release" || action == "quarantine_status" ||
+            action == "quarantine_allow") {
+            return execute_containment(ctx, action, params);
+        }
+
         ctx.write_output(std::format("unknown action: {}", action));
         return 1;
     }
+
+private:
+    // One try/catch at the plugin seam: an exception must never cross the ABI. A
+    // throw mid-apply leaves the `applying` record the next start (or `release`)
+    // finishes -- the host is never left with unrecorded rules.
+    int execute_containment(yuzu::CommandContext& ctx, std::string_view action,
+                            yuzu::Params params) {
+        try {
+            if (action == "quarantine")
+                return gated(ctx, [&] { return do_quarantine(ctx, params, ctx_); });
+            if (action == "release")
+                return gated(ctx, [&] { return do_release(ctx, params, ctx_); });
+            if (action == "quarantine_allow")
+                return gated(ctx, [&] { return do_quarantine_allow(ctx, params, ctx_); });
+            return do_quarantine_status(ctx, ctx_, init_note_); // a read: never gated
+        } catch (...) {
+            return emit_exception(ctx, ctx_);
+        }
+    }
+
+    YuzuPluginContext* ctx_ = nullptr;
+    std::string init_note_;
 };
 
 YUZU_PLUGIN_EXPORT(FirewallPlugin)

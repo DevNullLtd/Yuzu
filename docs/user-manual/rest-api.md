@@ -2290,7 +2290,7 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
-> protective action (the quarantine plugin's four actions and `__guard__.push_rules`); see
+> protective action (the quarantine plugin's four actions, the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
 > `reason` is a top-level key on the error object, not part of the A4
@@ -11119,7 +11119,8 @@ narrow the all-OS layer but never widen it, and within the OS layer an `action@o
 }
 ```
 
-For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`
+For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`,
+the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
 and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
 while dispatch still goes ahead (see
 [Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
@@ -13075,7 +13076,7 @@ marked cancelled), `agents_reached: 0` and the withheld counts in the `error` ob
 | 7 | `kill_switched_os` | `403` | `null` | Every target runs an OS for which the action is switched off. |
 | 8 | `no_agents_reached` | `503` | `5000` | Every target was unreachable. |
 
-A protective action (the quarantine control actions and `__guard__.push_rules`) never yields
+A protective action (the quarantine and firewall control actions and `__guard__.push_rules`) never yields
 `os_gate_unreadable`, `plugin_not_found` or `kill_switched_os`. Refusals in the targeting family
 increment `yuzu_server_dispatch_target_rejected_total{route="command_v1"}`.
 

@@ -256,12 +256,18 @@ TEST_CASE("capability catalogue: every securable and operation is one rbac_store
 /// explicit allowlist so a NEW Destructive+Reversible row still fails loudly
 /// and has to be justified here, which is the property the original assertion
 /// was really providing.
-constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kReversibleDestructive{{
+constexpr std::array<std::pair<std::string_view, std::string_view>, 2> kReversibleDestructive{{
     {"power_health.set_power_plan",
      "switching the active Windows power scheme is undone by setting the previous scheme back; "
      "the action captures and emits previous_guid precisely so the operator can. It is "
      "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
      "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
+    {"firewall.quarantine",
+     "undo of the rules and the enable state on all three legs: release restores the captured "
+     "Windows profile policy and re-enables every rule quarantine disabled, deletes the nft "
+     "table / iptables chain, and empties the pf anchor and releases its enable token. The "
+     "macOS state flush at apply time is one-way (connections are not restored). Destructive "
+     "only for the destructive-targeting gate."},
 }};
 // `printing.clear_queue` is deliberately NOT allowlisted here: it is
 // Destructive+Irreversible. Cancelling a job has no compensating Yuzu
@@ -312,6 +318,64 @@ TEST_CASE("capability catalogue: system_hardening.posture pins its exact classif
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK_FALSE(row.system_reserved);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for the four `firewall` containment actions (PRQ.1). Literals, not derived
+/// from the fragment, so a change to any of the seven classification fields fails here; the
+/// allowlist above and the Destructive-count tests pin only the Reversible class of
+/// `quarantine` and an aggregate. Checked on the fragment AND as the composed registry
+/// classifies it. `quarantine` is the one Destructive row (explicit targets, no broadcast);
+/// `release` and `quarantine_allow` mutate and are each other's undo; `quarantine_status`
+/// only reads and carries no execute gate.
+TEST_CASE("capability catalogue: firewall containment rows pin their exact classification",
+          "[server][dispatch][capability]") {
+    struct Expect {
+        std::string_view action;
+        DispatchClass dispatch_class;
+        Mutability mutability;
+        authz::Operation operation;
+        authz::RiskTier risk_tier;
+        ExecuteGate execute_gate;
+    };
+    const Expect expected[] = {
+        {"quarantine", DispatchClass::Destructive, Mutability::Reversible,
+         authz::Operation::Execute, authz::RiskTier::Critical, ExecuteGate::AdminOrApproval},
+        {"release", DispatchClass::Mutating, Mutability::Reversible, authz::Operation::Execute,
+         authz::RiskTier::High, ExecuteGate::AdminOrApproval},
+        {"quarantine_allow", DispatchClass::Mutating, Mutability::Reversible,
+         authz::Operation::Execute, authz::RiskTier::High, ExecuteGate::AdminOrApproval},
+        {"quarantine_status", DispatchClass::ReadOnly, Mutability::None, authz::Operation::Read,
+         authz::RiskTier::Low, ExecuteGate::None},
+    };
+    const auto check_row = [](const CommandCapability& r, const Expect& e) {
+        CHECK(r.plugin == "firewall");
+        CHECK(r.action == e.action);
+        CHECK(r.dispatch_class == e.dispatch_class);
+        CHECK(r.mutability == e.mutability);
+        CHECK(r.securable == "Security");
+        CHECK(r.operation == e.operation);
+        CHECK(r.risk_tier == e.risk_tier);
+        CHECK_FALSE(r.system_reserved);
+        CHECK(r.execute_gate == e.execute_gate);
+    };
+
+    const auto rows = capdecls::plugin_action_catalogue_c();
+    auto registry = build_registry(all_labeled_sources());
+    for (const auto& e : expected) {
+        INFO("action=" << e.action);
+        const auto it = std::find_if(rows.begin(), rows.end(), [&](const CommandCapability& r) {
+            return r.plugin == "firewall" && r.action == e.action;
+        });
+        REQUIRE(it != rows.end());
+        check_row(*it, e);
+        const auto classified = registry.classify("firewall", e.action);
+        REQUIRE(classified.has_value());
+        check_row(*classified, e);
+    }
+    // the fragment's firewall rows are exactly `state`, `rules` and these four: a fifth action
+    // lands with its own classification decision, not by default
+    CHECK(std::count_if(rows.begin(), rows.end(),
+                        [](const CommandCapability& r) { return r.plugin == "firewall"; }) == 6);
 }
 
 /// Exact-row pin for `autoruns` (P15 Arbiter action). Both its actions are

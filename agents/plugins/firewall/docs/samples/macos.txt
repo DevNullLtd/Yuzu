@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 8ef7b004fc8a
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-09 · euid 501 · leg-hash a0eaca353541
 == action=state
 backend|appfirewall
 state|disabled
@@ -18,3 +18,14 @@ app|/usr/sbin/smbd|allow
 ruleset|unknown
 [result_status] UNDECLARED / UNKNOWN / 
 
+== action=quarantine
+[not captured] Destructive/Reversible: not executed on a live host (it contains the host: pf's whole state table is flushed once and every connection the allow set does not cover is cut; run on a disposable macOS VM, see the PR)
+
+== action=release
+[not captured] Mutating/Reversible: not executed on a live host (lifts a containment; needs one in force)
+
+== action=quarantine_status
+[not captured] agent-context: the containment record lives in the plugin KV store, which plugin-capture does not provide
+
+== action=quarantine_allow
+[not captured] Mutating/Reversible: not executed on a live host (changes the allow set of a containment in force)

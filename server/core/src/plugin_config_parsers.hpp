@@ -229,8 +229,10 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
 /// action (`yuzu/protective_actions.hpp`): an action-level row for a protective
 /// pair, or a plugin-level row for a plugin that owns protective actions. Such
 /// a row never stops the protective actions and still gates any non-protective
-/// action the plugin declares (none today: `quarantine` declares exactly the
-/// four protective actions and `__guard__` dispatches only `push_rules`). The
+/// action the plugin declares (`quarantine` declares exactly its four protective
+/// actions and `__guard__` dispatches only `push_rules`; `firewall` declares four
+/// protective containment actions beside its ordinary ones, which a plugin-level
+/// row still gates). The
 /// write surfaces use it to label the audit evidence so a stored OFF row is
 /// never read as proof of a stop. One list: both predicates come from the
 /// shared header.
@@ -253,7 +255,8 @@ inline constexpr std::size_t kListRowCap = 5000;
 
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
-/// but never gating dispatch), plus `, reason="<text>"` when the operator gave
+/// but never gating the protective actions; a plugin-level `firewall` row still
+/// gates that plugin's ordinary actions), plus `, reason="<text>"` when the operator gave
 /// one. The reason survives on the live row only until the next flip, so without
 /// it here the audit trail cannot answer "why was this switched off". It is
 /// already validated (<= 512 bytes, no control characters but tab) by

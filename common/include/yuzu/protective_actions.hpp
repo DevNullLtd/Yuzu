@@ -6,11 +6,15 @@
 // refuse, because refusing one strands a contained device or a containment
 // rule push.
 //
-// The set is the quarantine plugin's own four actions plus the Guardian rule
-// push (`__guard__.push_rules`). It is CLOSED: widening it is a security
-// decision (see the quarantine row of .claude/routed-concerns.md), never a
-// drive-by edit. Lives in common/include so agent code can include the same
-// list the server dispatch chokepoint uses.
+// The set is the quarantine plugin's own four actions, the firewall plugin's
+// own four containment actions, plus the Guardian rule push
+// (`__guard__.push_rules`). It is CLOSED: widening it is a security decision
+// (see the quarantine row of .claude/routed-concerns.md), never a drive-by
+// edit. The firewall four were added because `firewall.release` is the way
+// out of a firewall containment, and a kill switch, per-OS withhold or
+// degraded plugin-config read must not be able to refuse it. Lives in
+// common/include so agent code can include the same list the server
+// dispatch chokepoint uses.
 //
 // Pure: no I/O, no store or wire types, so it stays inside the
 // common/include firewall and tests bind it directly.
@@ -89,11 +93,41 @@ namespace detail {
     return false;
 }
 
-/// The full protective set: the quarantine control actions plus the Guardian
-/// rule push `__guard__.push_rules` (a contained device must keep receiving
-/// the rules that make containment meaningful). Case-insensitive.
+/// The firewall plugin's own containment actions: a CLOSED four-action set,
+/// keyed on the (plugin, ACTION) pair like `is_quarantine_control_plugin`
+/// (the plugin declares exactly these four in its action table in
+/// `agents/plugins/firewall/src/firewall_plugin.cpp`; a fifth action gets no
+/// exemption). All four are here for the same reason the legacy four are:
+/// `release` is the way out of a containment, `quarantine` on an already
+/// contained host is the re-apply and generation-update path, `quarantine_allow`
+/// repairs a contained host's exceptions, and `quarantine_status` is read-only
+/// and answering it for a contained host is the point. Refusing any of them
+/// strands a contained device. Case-insensitive.
+///
+/// This is NOT the containment-gate exemption: `is_quarantine_control_plugin`
+/// (used by `dispatch_confined_arms.hpp`) stays the legacy plugin's set until
+/// the server's live containment path moves to the firewall plugin (#7437).
+/// The legacy plugin and its set stay here: its removal, and re-keying this predicate
+/// to the firewall four alone, is a separate follow-up change.
+[[nodiscard]] inline bool is_firewall_control_plugin(std::string_view plugin,
+                                                     std::string_view action) {
+    using detail::iequals;
+    if (!iequals(plugin, "firewall"))
+        return false;
+    for (const auto allowed : {std::string_view{"quarantine"}, std::string_view{"release"},
+                               std::string_view{"quarantine_status"},
+                               std::string_view{"quarantine_allow"}}) {
+        if (iequals(action, allowed))
+            return true;
+    }
+    return false;
+}
+
+/// The full protective set: the quarantine and firewall control actions plus
+/// the Guardian rule push `__guard__.push_rules` (a contained device must keep
+/// receiving the rules that make containment meaningful). Case-insensitive.
 [[nodiscard]] inline bool is_protective_action(std::string_view plugin, std::string_view action) {
-    if (is_quarantine_control_plugin(plugin, action))
+    if (is_quarantine_control_plugin(plugin, action) || is_firewall_control_plugin(plugin, action))
         return true;
     using detail::iequals;
     return iequals(plugin, "__guard__") && iequals(action, "push_rules");
@@ -106,7 +140,8 @@ namespace detail {
 /// two drift.
 [[nodiscard]] inline bool plugin_owns_protective_actions(std::string_view plugin) {
     using detail::iequals;
-    return iequals(plugin, "quarantine") || iequals(plugin, "__guard__");
+    return iequals(plugin, "quarantine") || iequals(plugin, "firewall") ||
+           iequals(plugin, "__guard__");
 }
 
 } // namespace yuzu::protective

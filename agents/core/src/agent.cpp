@@ -22,6 +22,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/agent/reconnect_backoff.hpp>
+#include <yuzu/agent/server_address_parsers.hpp>
 #include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
@@ -95,6 +96,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -283,6 +285,14 @@ struct PluginContextImpl {
     KvStore* kv_store{nullptr};             // non-owning; lifetime managed by AgentImpl
     TriggerEngine* trigger_engine{nullptr}; // non-owning; lifetime managed by AgentImpl
     std::string plugin_name;                // set per-plugin during init/execute for KV namespacing
+    // "agent.server_peer": the literal address of the peer the latest successful Register
+    // answered on (grpc_peer_literal of ClientContext::peer()), or nullptr before the first
+    // Register / when the peer is not a usable literal. It is NOT in `config` on purpose:
+    // that map is unsynchronised and yuzu_ctx_get_config hands out raw pointers into it, so a
+    // reconnect-time write would race a plugin's read. The pointer always names an interned,
+    // immortal string (AgentImpl::publish_server_peer), so a read is race-free with no lock.
+    // Written only by the Register thread, read by yuzu_ctx_get_config.
+    std::atomic<const char*> server_peer{nullptr};
 };
 
 // Per-command output is buffered and flushed in a single gRPC Write instead of
@@ -616,6 +626,10 @@ YUZU_EXPORT const char* yuzu_ctx_get_config(YuzuPluginContext* ctx, const char* 
     if (!ctx || !key)
         return nullptr;
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
+    // The live control peer is the one key answered from an atomic, not from `config`
+    // (see PluginContextImpl::server_peer): nullptr until a Register has published it.
+    if (std::strcmp(key, "agent.server_peer") == 0)
+        return impl->server_peer.load(std::memory_order_acquire);
     auto it = impl->config.find(key);
     if (it == impl->config.end())
         return nullptr;
@@ -671,7 +685,14 @@ YUZU_EXPORT int yuzu_ctx_storage_exists(YuzuPluginContext* ctx, const char* key)
     auto* impl = reinterpret_cast<PluginContextImpl*>(ctx);
     if (!impl->kv_store || impl->plugin_name.empty())
         return -2;
-    return impl->kv_store->exists(impl->plugin_name, key) ? 0 : 1;
+    // 0 present, 1 absent, negative on error (plugin.h): a store that could not answer
+    // (closed handle, SQLITE_BUSY after the busy budget, a failed prepare) is -3, never
+    // "absent" -- a plugin that treats absent as "nothing to recover" would otherwise
+    // act on a fault as if it were the answer.
+    const auto present = impl->kv_store->exists_checked(impl->plugin_name, key);
+    if (!present)
+        return -3;
+    return *present ? 0 : 1;
 }
 
 YUZU_EXPORT const char* yuzu_ctx_storage_list(YuzuPluginContext* ctx, const char* prefix) {
@@ -731,7 +752,10 @@ YUZU_EXPORT int yuzu_register_trigger(YuzuPluginContext* ctx, const char* trigge
             // parse_trigger_config already logged the specific reason.
             return -3;
         }
-        impl->trigger_engine->register_trigger(std::move(*cfg));
+        // False = the engine's trigger table is full and nothing was registered; the
+        // caller must hear it (plugin.h: non-zero on failure), not read a silent 0.
+        if (!impl->trigger_engine->register_trigger(std::move(*cfg)))
+            return -5;
         return 0;
     } catch (const std::exception& e) {
         spdlog::error("yuzu_register_trigger('{}'): threw: {}", trigger_id, e.what());
@@ -2192,6 +2216,11 @@ public:
                                               .count();
                 plugin_ctx_.config["agent.session_id"] = session_id_;
                 plugin_ctx_.config["agent.connected_since"] = std::to_string(connected_since_ms);
+                // The peer THIS Register answered on (the server, or the gateway that fronts
+                // it), published to the plugins as "agent.server_peer": the address the
+                // control channel really uses, which can differ from the one resolved once at
+                // start (a server that moved since). See publish_server_peer.
+                publish_server_peer(ctx.peer());
 
                 // Measure Register RPC latency
                 auto register_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -4621,6 +4650,46 @@ private:
             sync_thread_.join();
         update_thread_.join();
     }
+
+    /// Publish the live control peer to every plugin context as "agent.server_peer".
+    ///
+    /// TRUST RULE (#3429 round 4, kept): the value is produced here, by agents/core, from
+    /// the stream the server actually answered on (certificate-authenticated when
+    /// tls_enabled); a plugin never resolves a name and admits only a literal published
+    /// here. It is the address the agent reaches the server on RIGHT NOW, not a name the
+    /// host being contained could re-point (the firewall containment reads it at
+    /// quarantine time, so a server that moved after agent start is allowed, not the dead
+    /// address resolved at boot).
+    ///
+    /// A peer that is not a usable literal (grpc_peer_literal: empty), or a 17th distinct
+    /// one, publishes NOTHING (nullptr), so a plugin falls back to the start-resolved set
+    /// rather than keep a stale address. The strings are interned in an append-only,
+    /// capped set and never freed: yuzu_ctx_get_config hands the raw pointer to plugin
+    /// code, so what it names must outlive every possible reader.
+    void publish_server_peer(const std::string& grpc_peer) {
+        const auto literal = yuzu::agent::grpc_peer_literal(grpc_peer);
+        const char* interned = nullptr;
+        if (!literal.empty()) {
+            std::lock_guard lk(peer_intern_mu_);
+            for (const auto& known : peer_interned_)
+                if (*known == literal)
+                    interned = known->c_str();
+            if (!interned && peer_interned_.size() < kMaxInternedPeers) {
+                peer_interned_.push_back(std::make_unique<const std::string>(literal));
+                interned = peer_interned_.back()->c_str();
+            }
+        }
+        if (!literal.empty() && !interned)
+            spdlog::warn("server peer {}: more than {} distinct peers seen, not published to plugins",
+                         literal, kMaxInternedPeers);
+        plugin_ctx_.server_peer.store(interned, std::memory_order_release);
+        for (auto& [name, pctx] : per_plugin_ctx_)
+            pctx->server_peer.store(interned, std::memory_order_release);
+    }
+
+    static constexpr std::size_t kMaxInternedPeers = 16;
+    std::mutex peer_intern_mu_;
+    std::vector<std::unique_ptr<const std::string>> peer_interned_; // append-only, never freed
 
     // The teardown barrier for the installed-software collector. Its actions run on bounded
     // DETACHED workers (agents/shared/bounded_wait.hpp): a caller that gave up at the time limit

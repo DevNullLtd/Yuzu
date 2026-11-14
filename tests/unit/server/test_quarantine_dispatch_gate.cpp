@@ -42,6 +42,7 @@
 
 #include "dispatch_confined_arms.hpp"
 #include "dispatch_scope_ladder.hpp"
+#include <yuzu/protective_actions.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -619,6 +620,25 @@ TEST_CASE("compose_containment_gate: ONLY the quarantine control plugin is exemp
                                                  snap, now);
     CHECK_FALSE(exempt.gate.enforced);
     CHECK(exempt.outcome == "exempt_control_plugin");
+}
+
+// The firewall plugin's four containment actions are PROTECTIVE (never refused by an enablement
+// gate) but are deliberately NOT exempt from the containment gate until the live containment
+// path moves to the firewall plugin (#7437): this pins the split so neither change flips it
+// silently.
+TEST_CASE("compose_containment_gate: the firewall containment actions are not (yet) exempt",
+          "[dispatch][quarantine][server][protective]") {
+    using namespace yuzu::server;
+    const auto now = std::chrono::steady_clock::now();
+    std::unordered_set<std::string> quarantined{"dev-A"};
+    for (const char* action : {"quarantine", "release", "quarantine_status", "quarantine_allow"}) {
+        INFO(action);
+        QuarantineSnapshot snap;
+        const auto d = compose_containment_gate("firewall", action, false, std::optional{quarantined}, snap, now);
+        CHECK(d.gate.enforced);
+        CHECK(d.gate.quarantined.contains("dev-A"));
+        CHECK(yuzu::protective::is_protective_action("firewall", action));
+    }
 }
 
 TEST_CASE("compose_containment_gate: the exemption does not consult the store",

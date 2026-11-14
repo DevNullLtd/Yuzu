@@ -529,6 +529,13 @@ Because the degraded mode is fail-open, an agent can run for a long time without
 
 The `quarantine` agent plugin isolates compromised or suspicious devices by blocking all network traffic except the Yuzu server connection. This allows continued management while preventing lateral movement.
 
+The `firewall` plugin has its own containment actions (`quarantine`, `release`, `quarantine_status`,
+`quarantine_allow`). No kill switch, per-OS withhold or degraded plugin-config read refuses them, but
+the server's containment gate still names the `quarantine` plugin only: while the quarantine store has
+been unreadable for more than a minute it refuses every non-exempt dispatch, whichever device it names,
+including those four, until the store answers again (see "Behaviour change: protective actions exempt
+from plugin enablement" in [Upgrading](upgrading.md)).
+
 ### Quarantining a Device
 
 Execute the `quarantine` action from the `quarantine` plugin:
