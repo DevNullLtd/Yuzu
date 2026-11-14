@@ -126,7 +126,8 @@ are carried by the second PR.
   `make_definition_pack_advisory_fn` (60 second window, at most 4 keys, internally mutex-guarded);
   `pack_advisory_note` builds one `std::string`.
 - **Release point:** scope exit (lease, `PgResult`, vector, string are RAII); the throttle is freed
-  when the last copy of the closure is destroyed (the v1 and MCP consumers' copies).
+  when the last copy of the closure is destroyed (the v1 and MCP consumers' copies and the per-call
+  copy `ports.pack_advisory_fn = definition_pack_advisory_fn_` in `mcp_server.cpp`).
 - **Transfer:** the note string is returned by value and appended to the delete's audit detail.
 - **Failure cleanup:** the lookup is read BEFORE the delete (beside the pre-image read) so a failure
   cannot lose the outcome row; `pack_advisory_note` wraps the call in `try/catch(...)` and returns
