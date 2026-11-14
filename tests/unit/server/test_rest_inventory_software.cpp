@@ -44,6 +44,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
+#include "purl_compose.hpp"
 #include "software_catalogue_model.hpp"
 #include "software_inventory_store.hpp"
 #include "software_list_model.hpp"
@@ -1464,7 +1465,7 @@ TEST_CASE("REST inventory/software: exports — csv; truncation; json; bad forma
     CHECK(csv->status == 200);
     CHECK(csv->get_header_value("Content-Type").find("text/csv") == 0);
     CHECK(csv->get_header_value("Content-Disposition").find("software-installs.csv") != std::string::npos);
-    CHECK(csv->body.starts_with(std::string(software_list::kListCsvHeader) + "\n")); // 22 columns
+    CHECK(csv->body.starts_with(std::string(software_list::kListCsvHeader) + "\n")); // 23 columns
     CHECK(csv->get_header_value("X-Result-Truncated-By-Cap").empty());
 
     // An uncapped export carries neither the continuation header nor the trailer.
@@ -1736,7 +1737,10 @@ TEST_CASE("REST inventory/software: the lookup row schema is typed in the OpenAP
         if (!base.contains(k))
             added.insert(k);
     CHECK(properties == added);
-    CHECK(added.size() == 8);
+    CHECK(added.size() == 9);
+    CHECK(properties.contains("purl"));
+    // purl is nullable and required, like the other lookup keys that can be absent.
+    CHECK(extra["properties"]["purl"]["nullable"] == true);
     // The page carries the totals block and its omission reason.
     const auto& data = schemas["InstalledSoftwarePage"]["properties"]["data"];
     CHECK(data["properties"]["totals"]["nullable"] == true);
@@ -1748,8 +1752,13 @@ TEST_CASE("REST inventory/software: the lookup row schema is typed in the OpenAP
     std::set<std::string> params;
     for (const auto& p : spec["paths"]["/inventory/software"]["get"]["parameters"])
         params.insert(p["name"].get<std::string>());
-    for (const char* k : {"match", "version_min", "version_max", "status"})
+    for (const char* k : {"match", "version_min", "version_max", "vers", "purl", "status"})
         CHECK(params.contains(k));
+    std::set<std::string> component_params;
+    for (const auto& p : spec["paths"]["/inventory/software/components"]["get"]["parameters"])
+        component_params.insert(p["name"].get<std::string>());
+    CHECK(component_params.contains("vers"));
+    CHECK_FALSE(component_params.contains("purl")); // components have no purl column
 }
 
 TEST_CASE("REST inventory/software: lookup rows carry hostname, last_seen, status and install fields",
@@ -2108,6 +2117,172 @@ TEST_CASE("REST inventory/software: a failed version read for a range is a 503 w
     CHECK(body.at("error").at("retry_after_ms") == 5000);
     CHECK(h.audit_log.size() == 1);
     CHECK(count_audit(h, "inventory.software.query", "failure") == 1);
+}
+
+namespace {
+
+// A v3 row that carries a purl: the vendor namespace (distro_id) is required for a deb.
+SoftwareEntry purl_entry(const std::string& name, const std::string& version) {
+    auto e = lookup_entry(name, version);
+    e.distro_id = "debian";
+    return e;
+}
+
+std::set<std::string> agent_set(const nlohmann::json& body) {
+    std::set<std::string> out;
+    for (const auto& r : body.at("data").at("software"))
+        out.insert(r["agent_id"].get<std::string>());
+    return out;
+}
+
+// Percent-encode a query value as a client does (everything but unreserved and ':' '/').
+std::string enc(const std::string& v) {
+    std::string out;
+    for (const unsigned char c : v) {
+        if (std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == ':' || c == '/')
+            out += static_cast<char>(c);
+        else {
+            constexpr char kHex[] = "0123456789ABCDEF";
+            out += '%';
+            out += kHex[c >> 4];
+            out += kHex[c & 0x0f];
+        }
+    }
+    return out;
+}
+
+std::string error_message(const nlohmann::json& body) {
+    return body.at("error").at("message").get<std::string>();
+}
+
+} // namespace
+
+TEST_CASE("REST inventory/software: rows carry purl (null when empty); purl= selects exactly those rows; totals say filters",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const auto a = purl_entry("git", "2.1");
+    const auto b = purl_entry("git", "2.2");
+    const std::string purl_a = compose_purl(a);
+    REQUIRE_FALSE(purl_a.empty());
+    seed_v3(store, "dev-a", V3Status::kFull, {a});
+    seed_v3(store, "dev-b", V3Status::kFull, {b});
+    seed_v3(store, "dev-c", V3Status::kFull, {a});
+    seed(store, "dev-v2", {{"git", "2.1", "", ""}}); // a v2 row stores no purl
+    InvHarness h{&store};
+
+    std::map<std::string, nlohmann::json> by_agent;
+    for (const auto& r : get_lookup(h, "?name=git").at("data").at("software"))
+        by_agent[r["agent_id"].get<std::string>()] = r["purl"];
+    CHECK(by_agent.at("dev-a") == purl_a);
+    CHECK(by_agent.at("dev-b") == compose_purl(b));
+    CHECK(by_agent.at("dev-v2").is_null()); // never ""
+
+    const auto hit = get_lookup(h, "?purl=" + enc(purl_a));
+    CHECK(agent_set(hit) == std::set<std::string>{"dev-a", "dev-c"});
+    CHECK(hit.at("data").at("totals").is_null());
+    CHECK(hit.at("data").at("totals_omitted") == "filters");
+    // The purl lookup answers the same rows as the equivalent name + version query.
+    CHECK(agent_set(hit) == agent_set(get_lookup(h, "?name=git&version=2.1&ecosystem=deb")));
+    CHECK(agent_set(get_lookup(h, "?purl=" + enc(purl_a) + "&agent_id=dev-c")) ==
+          std::set<std::string>{"dev-c"}); // composes with the other filters
+    // No prefix or case matching: the value is compared byte for byte.
+    CHECK(agent_set(get_lookup(h, "?purl=" + enc(purl_a + "x"))).empty());
+    CHECK(agent_set(get_lookup(h, "?purl=" + enc("PKG" + purl_a.substr(3)))).empty());
+
+    // A purl filter in the export: the last cell of the row is the purl.
+    auto csv = h.sink.Get("/api/v1/inventory/software?format=csv&purl=" + enc(purl_a));
+    REQUIRE(csv);
+    CHECK(csv->status == 200);
+    CHECK(csv->body.find("," + purl_a + "\n") != std::string::npos);
+
+    // Malformed purl: a 400 that writes no audit row.
+    h.audit_log.clear();
+    const auto bad = get_lookup(h, "?purl=" + enc("deb/debian/git"), 400);
+    CHECK(error_message(bad) == "invalid purl (expected pkg:...)");
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST inventory/software: a confined caller's purl query is filtered to its scope",
+          "[pg][rest][inventory_software][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const auto e = purl_entry("git", "2.1");
+    seed_v3(store, "dev-a", V3Status::kFull, {e});
+    seed_v3(store, "dev-b", V3Status::kFull, {e});
+    InvHarness h{&store};
+    const std::string q = "?purl=" + enc(compose_purl(e));
+    CHECK(agent_set(get_lookup(h, q)) == std::set<std::string>{"dev-a", "dev-b"});
+
+    h.fleet_scope = std::unordered_set<std::string>{"dev-a"};
+    const auto confined = get_lookup(h, q);
+    CHECK(agent_set(confined) == std::set<std::string>{"dev-a"});
+    CHECK(confined.at("data").at("devices_omitted") == 0); // scope pushed into the SQL
+    CHECK(confined.at("data").at("totals_omitted") == "scope");
+
+    h.fleet_scope = std::unordered_set<std::string>{}; // present-empty: deny-all, no rows
+    CHECK(agent_set(get_lookup(h, q)).empty());
+}
+
+TEST_CASE("REST inventory/software: vers: resolves to the same rows and totals as version_min/version_max; bad vers is a 400",
+          "[pg][rest][inventory_software]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed(store, "dev-a", {{"git", "1.9", "", ""}});
+    seed(store, "dev-b", {{"git", "1.10", "", ""}});
+    seed(store, "dev-c", {{"git", "2.0-rc1", "", ""}});
+    seed(store, "dev-d", {{"git", "2.0", "", ""}});
+    InvHarness h{&store};
+    auto vers_query = [](const std::string& v) { return "?name=git&vers=" + enc(v); };
+
+    const auto by_vers = get_lookup(h, vers_query("vers:generic/>=1.9|<=2.0-rc1"));
+    const auto by_bounds = get_lookup(h, "?name=git&version_min=1.9&version_max=2.0-rc1");
+    CHECK(agent_set(by_vers) == std::set<std::string>{"dev-a", "dev-b", "dev-c"});
+    CHECK(agent_set(by_vers) == agent_set(by_bounds));
+    CHECK(by_vers.at("data").at("totals") == by_bounds.at("data").at("totals"));
+    // Several intervals, a hole, a point, and every version.
+    CHECK(agent_set(get_lookup(h, vers_query("vers:generic/<=1.9|>=2.0"))) ==
+          std::set<std::string>{"dev-a", "dev-d"});
+    CHECK(agent_set(get_lookup(h, vers_query("vers:semver/>=1.9|<=2.0|!=2.0-rc1"))) ==
+          std::set<std::string>{"dev-a", "dev-b", "dev-d"});
+    CHECK(agent_set(get_lookup(h, vers_query("vers:npm/1.10"))) == std::set<std::string>{"dev-b"});
+    CHECK(agent_set(get_lookup(h, vers_query("vers:pypi/*"))).size() == 4);
+    CHECK(agent_set(get_lookup(h, vers_query("vers:maven/>=5"))).empty()); // empty, not an error
+
+    // The audit target records the vers input (log_token folds '=' to '_').
+    h.audit_log.clear();
+    get_lookup(h, vers_query("vers:generic/>=1.9|<=2.0"));
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().target_id == "name=git;vers=vers:generic/>_1.9|<_2.0");
+
+    h.audit_log.clear();
+    CHECK(error_message(get_lookup(h, vers_query("vers:deb/>=1.0"), 400)) ==
+          "vers scheme deb is not supported yet");
+    CHECK(error_message(get_lookup(h, vers_query("vers:rpm/>=1.0"), 400)) ==
+          "vers scheme rpm is not supported yet");
+    CHECK(error_message(get_lookup(h, vers_query("vers:nope/>=1.0"), 400)) == "unknown vers scheme");
+    CHECK(error_message(get_lookup(h, vers_query("vers:generic/1.0|1.0.0"), 400)) ==
+          "vers constraints are not a valid interval list");
+    CHECK(error_message(get_lookup(h, vers_query("vers:generic/>=1|>=2"), 400)) ==
+          "vers constraints are not a valid interval list");
+    CHECK(error_message(get_lookup(h, "?vers=" + enc("vers:generic/>=1"), 400)) ==
+          "vers requires name with match=exact");
+    CHECK(error_message(get_lookup(h, vers_query("vers:generic/>=1") + "&version_min=1", 400)) ==
+          "vers cannot be combined with version, version_min or version_max");
+    CHECK(error_message(get_lookup(h, vers_query("vers:generic/>=1") + "&version=1", 400)) ==
+          "vers cannot be combined with version, version_min or version_max");
+    CHECK(get_lookup(h, vers_query(std::string("vers:generic/") + std::string(1100, '1')), 400)
+              .contains("error"));
+    CHECK(h.audit_log.empty()); // a 400 writes nothing
 }
 
 TEST_CASE("REST inventory/software: the audit target carries the lookup filters",

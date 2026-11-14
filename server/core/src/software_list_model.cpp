@@ -45,6 +45,8 @@ void tail(std::string& out, std::string_view key, const std::string& v) {
     }
 }
 
+constexpr std::size_t kPurlMaxBytes = 1024;
+
 std::string_view match_name(NameMatch m) {
     return m == NameMatch::kExact ? "exact" : m == NameMatch::kPrefix ? "prefix" : "contains";
 }
@@ -55,6 +57,8 @@ struct CommonFilters {
     std::string status;
     std::string version_min;
     std::string version_max;
+    std::string vers;
+    std::optional<vers::Range> range; // parsed `vers`, else version_min/version_max
 };
 
 std::expected<CommonFilters, std::string> parse_common(const Params& p) {
@@ -78,22 +82,42 @@ std::expected<CommonFilters, std::string> parse_common(const Params& p) {
         return std::unexpected("invalid parameter encoding");
     if (c.version_min.size() > swc::kNameMaxBytes || c.version_max.size() > swc::kNameMaxBytes)
         return std::unexpected("parameter too long");
+    c.vers = get(p, "vers");
+    if (!valid_text(c.vers))
+        return std::unexpected("invalid parameter encoding");
+    if (!c.vers.empty()) {
+        // One evaluator for every range: the text is normalised under the lookup's comparator here,
+        // so an invalid interval list is a 400 at the trust boundary.
+        auto parsed = vers::parse(c.vers);
+        if (!parsed)
+            return std::unexpected(parsed.error());
+        if (auto ok = vers::normalize(*parsed, sc::catalog_version_compare); !ok)
+            return std::unexpected(ok.error());
+        c.range = std::move(*parsed);
+    } else if (!c.version_min.empty() || !c.version_max.empty()) {
+        c.range = vers::from_bounds(c.version_min, c.version_max);
+    }
     return c;
 }
 
 // The version-filter rule: version_min / version_max need `name` with match=exact (a range of
 // "any title" or of a title pattern has no single comparator order); a bare exact `version` is a
 // plain equality predicate as it always was and needs no name. The exact form cannot be mixed
-// with a range.
+// with a range, and `vers` is the alternative spelling of version_min/version_max, never both.
 std::optional<std::string> version_rule_error(bool has_version, const CommonFilters& c,
                                               const std::string& name) {
-    const bool has_range = !c.version_min.empty() || !c.version_max.empty();
+    const bool has_bounds = !c.version_min.empty() || !c.version_max.empty();
+    const bool has_vers = !c.vers.empty();
     if (c.match != NameMatch::kExact && name.empty())
         return std::string("match requires name");
-    if (has_range && (name.empty() || c.match != NameMatch::kExact))
+    if (has_bounds && (name.empty() || c.match != NameMatch::kExact))
         return std::string("version_min and version_max require name with match=exact");
-    if (has_version && has_range)
+    if (has_vers && (name.empty() || c.match != NameMatch::kExact))
+        return std::string("vers requires name with match=exact");
+    if (has_version && has_bounds)
         return std::string("version cannot be combined with version_min or version_max");
+    if (has_vers && (has_version || has_bounds))
+        return std::string("vers cannot be combined with version, version_min or version_max");
     return std::nullopt;
 }
 
@@ -121,12 +145,25 @@ std::expected<ListRequest, std::string> parse_list_params(const Params& p) {
     if (const auto bad =
             version_rule_error(base->query.version.has_value(), *common, base->query.name))
         return std::unexpected(*bad);
+    // purl: matched by byte equality with the stored canonical purl; only the scheme prefix is
+    // validated here (the same text bounds as every other filter), a value no row carries just
+    // matches nothing.
+    std::string purl = get(p, "purl");
+    if (!valid_text(purl))
+        return std::unexpected("invalid parameter encoding");
+    if (purl.size() > kPurlMaxBytes)
+        return std::unexpected("parameter too long");
+    if (!purl.empty() && !purl.starts_with("pkg:"))
+        return std::unexpected("invalid purl (expected pkg:...)");
     ListRequest r;
     r.base = std::move(*base);
+    r.base.query.purl = std::move(purl);
     r.base.query.match = common->match;
     r.base.query.status = common->status;
     r.version_min = std::move(common->version_min);
     r.version_max = std::move(common->version_max);
+    r.vers = std::move(common->vers);
+    r.range = std::move(common->range);
     return r;
 }
 
@@ -161,6 +198,8 @@ std::expected<ComponentsRequest, std::string> parse_components_params(const Para
         return std::unexpected(*bad);
     r.version_min = std::move(common->version_min);
     r.version_max = std::move(common->version_max);
+    r.vers = std::move(common->vers);
+    r.range = std::move(common->range);
     if (r.version)
         q.versions = std::vector<std::string>{*r.version};
     const bool export_mode = !r.format.empty();
@@ -175,19 +214,15 @@ std::expected<ComponentsRequest, std::string> parse_components_params(const Para
 // ── Version range ────────────────────────────────────────────────────────────
 
 std::expected<std::vector<std::string>, std::string>
-resolve_version_range(const std::vector<std::string>& distinct_versions, std::string_view version_min,
-                      std::string_view version_max) {
+resolve_version_range(const std::vector<std::string>& distinct_versions, const vers::Range& range) {
     if (distinct_versions.size() >= static_cast<std::size_t>(kCatalogRowCap))
         return std::unexpected(std::string(kRangeNotResolvable));
     std::vector<std::string> out;
     for (const auto& v : distinct_versions) {
         if (v.empty())
             continue; // no known version: never inside a bounded range
-        if (!version_min.empty() && sc::catalog_version_compare(v, version_min) < 0)
-            continue;
-        if (!version_max.empty() && sc::catalog_version_compare(v, version_max) > 0)
-            continue;
-        out.push_back(v);
+        if (vers::contains(range, v, sc::catalog_version_compare))
+            out.push_back(v);
     }
     return out;
 }
@@ -202,10 +237,10 @@ std::optional<std::vector<std::string>> scope_ids(const authz::VisibleSet& scope
 
 std::string list_fingerprint(const ListRequest& rq) {
     std::string fp = swc::devices_fingerprint(rq.base.query);
-    if (!rq.has_range())
+    if (!rq.has_range() && rq.base.query.purl.empty())
         return fp; // byte-identical to the pre-range fingerprint
     fp += '\x1e';
-    fp += length_prefixed({&rq.version_min, &rq.version_max});
+    fp += length_prefixed({&rq.version_min, &rq.version_max, &rq.vers, &rq.base.query.purl});
     return fnv1a_hex16(fp);
 }
 
@@ -216,7 +251,7 @@ std::string components_fingerprint(const ComponentsRequest& rq) {
     return fnv1a_hex16(std::string(1, rq.version ? '1' : '0') +
                        length_prefixed({&q.kind, &q.name, &match, &q.agent_id, &q.q, &q.status,
                                         rq.version ? &*rq.version : &kNone, &rq.version_min,
-                                        &rq.version_max}));
+                                        &rq.version_max, &rq.vers}));
 }
 
 std::string audit_target(const ListRequest& rq) {
@@ -227,6 +262,8 @@ std::string audit_target(const ListRequest& rq) {
     tail(out, "status", q.status);
     tail(out, "version_min", rq.version_min);
     tail(out, "version_max", rq.version_max);
+    tail(out, "vers", rq.vers);
+    tail(out, "purl", q.purl);
     return out;
 }
 
@@ -245,6 +282,7 @@ std::string audit_target(const ComponentsRequest& rq) {
         out += ";version=" + ::yuzu::log_token(*rq.version);
     tail(out, "version_min", rq.version_min);
     tail(out, "version_max", rq.version_max);
+    tail(out, "vers", rq.vers);
     tail(out, "q", q.q);
     tail(out, "status", q.status);
     return out;
@@ -327,7 +365,8 @@ TotalsDecision totals_decision(bool admit_all, const SoftwareFleetQuery& q) {
         return {false, kOmittedScope};
     const bool exact_name = !q.name.empty() && q.match == NameMatch::kExact;
     const bool other = !q.agent_id.empty() || !q.q.empty() || !q.status.empty() ||
-                       !q.ecosystem.empty() || !q.source.empty() || !q.kind.empty();
+                       !q.ecosystem.empty() || !q.source.empty() || !q.kind.empty() ||
+                       !q.purl.empty();
     return exact_name && !other ? TotalsDecision{true, {}}
                                 : TotalsDecision{false, kOmittedFilters};
 }
@@ -472,6 +511,7 @@ nlohmann::json list_row_json(const SoftwareFleetRow& r, const DeviceFacts& facts
     j["install_scope"] = e.install_scope;
     j["install_location"] = e.install_location;
     j["instance_key"] = e.instance_key;
+    j["purl"] = e.purl.empty() ? nlohmann::json(nullptr) : nlohmann::json(e.purl);
     return j;
 }
 
@@ -540,7 +580,7 @@ std::string list_csv(const std::vector<SoftwareFleetRow>& rows, const DeviceFact
                          epoch_text(last_seen_of(facts, r.agent_id)),
                          std::string(derive_status(r.facet_status, r.facet_enabled)),
                          epoch_text(r.last_confirmed_at), e.install_type, e.install_scope,
-                         e.install_location, e.instance_key});
+                         e.install_location, e.instance_key, e.purl});
     }
     return out;
 }

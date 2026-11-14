@@ -798,6 +798,13 @@ curl -H "Authorization: Bearer $TOKEN" \
 # The same for a component bundled inside applications (empty until agents report components):
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software/components?name=log4j-core&version_min=2.0&version_max=2.14.1"
+# The same range as a vers: string (percent-encoded: >= is %3E%3D, | is %7C, < is %3C), which can
+# also express several intervals and exclusions. Rows come back identical to version_min/version_max:
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&vers=vers:generic/%3E%3D3.0.0%7C%3C%3D3.0.6"
+# Who runs exactly this package? Search by Package URL (the canonical form, matched exactly):
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?purl=pkg:deb/debian/openssl@3.0.11-1?arch=amd64"
 # Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
 curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
@@ -806,20 +813,33 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
   `ecosystem`, `source` (exact), `match` (`exact`, `prefix` or `contains` for `name`),
-  `version_min` / `version_max` (inclusive version range), `status`, `limit` (max 1000; 10000
+  `version_min` / `version_max` (inclusive version range), `vers` (the same range as a
+  `vers:<scheme>/...` string), `purl` (exact Package URL), `status`, `limit` (max 1000; 10000
   with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
   `agent_id` for a fleet-wide scan. The full parameter and error tables are in
   [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
   `cursor` is REST-only (the MCP tool takes only those).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
-  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 22 fields: the 14
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
   release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
   ecosystem does not store them (see the availability matrix above); `source` is the
   `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
-  `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
-  `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
+  `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
+  `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
+  tool's rows keep the 14 package fields until its twin catches up.
+- **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
+  purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`);
+  it needs no `name`, and it turns `totals` off (`totals_omitted: "filters"`). `vers=` is the
+  same range as `version_min` / `version_max`, written `vers:<scheme>/<constraint>|...` with
+  comparators `=` `!=` `<` `<=` `>` `>=` (`*` alone matches every version); it needs `name` with
+  `match=exact` and is not combined with `version`, `version_min` or `version_max`. The
+  schemes `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are accepted and are **all
+  compared with the one catalogue comparator**, so a scheme's own edge ordering (Maven
+  qualifiers, PyPI post and dev releases, written epochs) can differ from the scheme's rules;
+  `deb` and `rpm` are refused by name and any other scheme is a `400`. The components route
+  takes `vers` too; it has no `purl`.
 - **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
   (install rows and distinct devices); a management-group-confined caller gets its rows and
   `totals: null` with `totals_omitted: "scope"`: **null means not shown, never zero**. The

@@ -1770,6 +1770,40 @@ Two recorded limits of the writer: component records are still normalised inside
 drops that call), and the agent tests' server oracle is a test-local copy of the server recipe (the agent
 tests cannot link the store), so the server's golden vectors stay the cross-pin and both change together.
 
+### 2026-11-14 — the lookup read surface: purl, and `vers:` ranges (SAM-43)
+
+**Decision.** The REST lookup reads return and filter by the row's Package URL, and both lookup
+routes accept a `vers:` range. No schema change: the `purl` column and its partial index
+`installed_software_purl_idx` landed in schema v10 with the v3 apply path.
+
+- **purl on the installs route.** Rows carry `purl` (`null` when the stored value is empty: a
+  v2-reported row, or an ecosystem with no registered purl type) and the CSV export gains a 23rd
+  column, `purl`. `purl=` is a byte-equality filter on the stored canonical value (no prefix, no
+  case folding; it must start `pkg:`), emitted as `purl = $n AND purl <> ''` so the partial index
+  qualifies for every plan; the `agent_ids` scope push-down still applies, so a confined caller
+  gets complete pages. A purl filter makes `totals_omitted` read `filters`. The components table
+  has no purl column, so the components route takes `vers` only.
+- **One range evaluator.** `vers_range.hpp` (pure) parses `vers:<scheme>/<constraints>`, sorts the
+  constraints under the comparator, refuses a duplicate version or two lower or two upper bounds
+  in a row, and applies the VERS containment algorithm. `version_min` / `version_max` are read as
+  `vers:generic/>=min|<=max`, so every range reaches the live distinct-version read through the
+  same `resolve_version_range`, with the kCatalogRowCap refusal and the empty-version rule
+  unchanged. `vers` needs `name` with `match=exact` and cannot be combined with `version`,
+  `version_min` or `version_max`.
+- **Schemes.** `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are evaluated, all under
+  the one catalogue comparator (`catalog_version_compare`), which is a recorded approximation:
+  a scheme's own ordering at the edges (Maven qualifiers, PyPI post and dev releases, written
+  epochs) can differ. `deb` and `rpm` are refused by name as not supported yet, any other scheme
+  is unknown; both are a `400`, never an unbounded match. The text is bounded (1024 bytes, 32
+  constraints, scheme `[a-z0-9.+-]{1,32}`), carries no control byte or space, and an error never
+  echoes the input.
+- **The CVE matcher shares only the interval core.** `nvd_version_in_range`'s bounded branch calls
+  `vers::in_interval` once for the inclusive pair and once for the exclusive pair under
+  `nvd_version_compare`; results are identical (pinned by `test_nvd.cpp`). The matcher's
+  comparator, its epoch stripping and its CPE `exact` rule are untouched.
+- **Parity.** REST ships before the MCP tool; the gap is recorded in `docs/api-parity-ledger.md`
+  and tracked by #7749, which rides with #7396.
+
 ## Routed-concern invariants
 
 Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
