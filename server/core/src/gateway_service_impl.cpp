@@ -2305,7 +2305,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // HA WS-5 #5685 follow-up: the arrival mirror. This runs on whichever replica receives the
         // CONNECTED (it need not own the session), and drops plugin lists other sessions of this
         // agent published: hygiene, since a plugin-absence verdict is confirmed against the
-        // directory row and no longer depends on this write. It runs BEFORE announce_connected, so a CONNECTED the durable write then refuses has still
+        // directory row and no longer depends on this write. It runs BEFORE
+        // announce_connected, so a CONNECTED the durable write then refuses has still
         // cleared them (fail-open only: the agent reads as unknown). It is skipped for a session
         // recorded as having LOST its register_fresh epoch race: the durable row belongs to a
         // NEWER session, and this session's id would make `session_id <> $2` delete THAT

@@ -363,6 +363,7 @@
 ///     eventually wins per the anti-replay fence) still announces the
 ///     matching `cluster_id` and self-heals the row.
 
+#include "offline_endpoint_types.hpp" // PluginAbsence: the (agent, session) claim of confirm_sessions
 #include "pg/pg_migration_runner.hpp"
 
 #include <cstdint>
@@ -782,6 +783,19 @@ public:
     /// `RoutableRoute` for the `routable` computation.
     [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
     lookup_routes(std::span<const std::string> agent_ids);
+
+    /// Which (agent, session) claims the directory still confirms (#5685 follow-up, plugin
+    /// visibility): the ids whose ROUTABLE row (`session_id IS NOT NULL AND lease_until >= now()
+    /// AND cluster_id IS NOT NULL`, the same predicate as `lookup_routes`' `routable`, on the DB
+    /// clock) names EXACTLY the claimed session. An agent with no row, a tombstone, an expired or
+    /// unplaced row, or a different session is simply absent from the result. ONE statement
+    /// (`unnest` of two parallel text arrays joined to the primary key) on one lease bounded by
+    /// `kReadTimeout`, returning only the matches, so a fleet-sized claim list neither builds a
+    /// full `RouteRow` per agent nor returns the unmatched ones. Empty claims return empty with no
+    /// lease. A failure is a typed error (the caller fails open). Logged at debug only: the
+    /// caller counts the outcome per dispatch (`yuzu_server_plugin_absence_confirm_total`).
+    [[nodiscard]] std::expected<std::vector<std::string>, GatewayRouteStoreError>
+    confirm_sessions(std::span<const PluginAbsence> claims);
 
     /// Batched SESSION-keyed read (WS-5, #4246 #3): every row whose
     /// `session_id` is in `session_ids`. Empty ids and ids longer than 64

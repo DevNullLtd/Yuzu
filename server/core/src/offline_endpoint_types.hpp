@@ -10,8 +10,11 @@
 
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
+#include <span>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -49,6 +52,13 @@ struct PluginAbsence {
     std::string agent_id;
     std::string session_id;
 };
+
+/// Confirmation of plugin-absence claims against the agent's route-directory row: given
+/// (agent, session) claims, the ids whose routable `agent_routes` row still names that session, or
+/// `nullopt` for a degraded read (callers fail open). Built by `make_route_session_confirmer`
+/// (plugin_absence_confirmation.hpp) and injected into `AgentRegistry`.
+using RouteSessionConfirmFn =
+    std::function<std::optional<std::unordered_set<std::string>>(std::span<const PluginAbsence>)>;
 
 /// The typed failure surface of the presence reads `query_live_ids`, `query_stale_within` and
 /// `find_within` (#4981 PR-1, Finding B;

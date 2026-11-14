@@ -124,6 +124,7 @@
 #include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
+#include "plugin_absence_confirmation.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -6617,19 +6618,7 @@ public:
             // it unset, so no cross-replica absence is ever withheld (fail open).
             registry_.configure_route_session_reader(
                 gateway_route_store_ && gateway_route_store_->is_open()
-                    ? detail::AgentRegistry::RouteSessionReadFn{[rs = gateway_route_store_.get()](
-                                                            std::span<const std::string> ids)
-                          -> std::optional<std::unordered_map<std::string, std::string>> {
-                          auto rows = rs->lookup_routes(ids);
-                          if (!rows)
-                              return std::nullopt;
-                          std::unordered_map<std::string, std::string> out;
-                          out.reserve(rows->size());
-                          for (const auto& r : *rows)
-                              if (r.routable && r.route.session_id)
-                                  out.emplace(r.route.agent_id, *r.route.session_id);
-                          return out;
-                      }}
+                    ? make_route_session_confirmer(*gateway_route_store_)
                     : detail::AgentRegistry::RouteSessionReadFn{});
 
             // #5513: reconcile admission outcomes and duration. The counter family is bounded

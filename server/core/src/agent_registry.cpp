@@ -1756,6 +1756,19 @@ void AgentRegistry::configure_presence_plugin_reader(PluginMissingReadFn reader,
 }
 
 void AgentRegistry::configure_route_session_reader(RouteSessionReadFn reader) {
+    if (reader) {
+        // Closed outcome set, seeded so absent()-based alerting stays meaningful before the first
+        // dispatch (docs/observability-conventions.md).
+        metrics_.describe("yuzu_server_plugin_absence_confirm_total",
+                          "Cross-replica plugin-absence candidates by directory confirmation "
+                          "outcome: withheld (the directory row still names the session that "
+                          "published the list), not_confirmed (no routable row, or a newer "
+                          "session), degraded (the confirmation read failed, nothing withheld), "
+                          "unwired (no confirmation reader, nothing withheld)",
+                          "counter");
+        for (const char* o : {"withheld", "not_confirmed", "degraded", "unwired"})
+            (void)metrics_.counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", o}});
+    }
     std::lock_guard lock(missing_plugin_mu_);
     route_session_reader_ = std::move(reader);
 }
@@ -1913,25 +1926,38 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
         std::lock_guard lock(missing_plugin_mu_);
         route_reader = route_session_reader_;
     }
-    if (!route_reader)
+    const auto count = [this](const char* outcome, std::size_t n) {
+        if (n > 0)
+            metrics_.counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", outcome}})
+                .increment(static_cast<double>(n));
+    };
+    if (!route_reader) {
+        count("unwired", remote_only.size());
         return missing;
-    std::vector<std::string> ids;
-    ids.reserve(remote_only.size());
+    }
+    std::vector<PluginAbsence> claims;
+    claims.reserve(remote_only.size());
     for (const auto* a : remote_only)
-        ids.push_back(a->agent_id);
-    std::optional<std::unordered_map<std::string, std::string>> current;
+        claims.push_back(*a);
+    std::optional<std::unordered_set<std::string>> confirmed;
     try {
-        current = route_reader(ids);
+        confirmed = route_reader(claims);
     } catch (...) {
         // A throwing confirmation read is a degraded one: fail open.
     }
-    if (!current)
+    if (!confirmed) {
+        count("degraded", remote_only.size());
         return missing;
-    for (const auto* a : remote_only) {
-        const auto it = current->find(a->agent_id);
-        if (it != current->end() && it->second == a->session_id)
-            missing.insert(a->agent_id);
     }
+    std::size_t withheld = 0;
+    for (const auto* a : remote_only) {
+        if (confirmed->contains(a->agent_id)) {
+            missing.insert(a->agent_id);
+            ++withheld;
+        }
+    }
+    count("withheld", withheld);
+    count("not_confirmed", remote_only.size() - withheld);
     return missing;
 }
 

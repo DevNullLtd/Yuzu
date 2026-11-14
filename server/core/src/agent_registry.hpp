@@ -1049,15 +1049,14 @@ public:
                                                                      std::string_view)>;
     void configure_presence_plugin_reader(PluginMissingReadFn reader,
                                           std::chrono::seconds ttl = std::chrono::hours{1});
-    /// Injectable CONFIRMATION read for a plugin-absence verdict (#5685 follow-up): for the given
-    /// agent ids, the session id each one's ROUTABLE directory row (`agent_routes`) currently
-    /// names; an agent with no row, a tombstone, an expired lease or an unplaced row is simply
-    /// absent from the map. `nullopt` is a degraded read. Bound by `server.cpp` to
-    /// `GatewayRouteStore::lookup_routes`. It runs with NO registry lock held and must not call
-    /// back into the registry. Unset (or degraded) means no cross-replica absence is ever
-    /// withheld: fail open.
-    using RouteSessionReadFn = std::function<
-        std::optional<std::unordered_map<std::string, std::string>>(std::span<const std::string>)>;
+    /// Injectable CONFIRMATION read for a plugin-absence verdict (#5685 follow-up): given the
+    /// (agent, session) claims of the candidates, the ids whose ROUTABLE directory row
+    /// (`agent_routes`) still names that session; `nullopt` is a degraded read. Production binds
+    /// `make_route_session_confirmer(GatewayRouteStore&)` (plugin_absence_confirmation.hpp) in
+    /// `server.cpp`. It runs with NO registry lock held and must not call back into the registry.
+    /// Unset (or degraded) means no cross-replica absence is ever withheld: fail open. Counted on
+    /// `yuzu_server_plugin_absence_confirm_total{outcome}` (seeded here).
+    using RouteSessionReadFn = RouteSessionConfirmFn;
     void configure_route_session_reader(RouteSessionReadFn reader);
     /// Test-facing overload: assigns the reader AND the TTL it is called with.
     void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);

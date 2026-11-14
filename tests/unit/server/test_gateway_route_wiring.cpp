@@ -45,6 +45,7 @@
 #include "heartbeat_ingestion.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "plugin_absence_confirmation.hpp"
 #include "pg/pg_raii.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -64,6 +65,8 @@
 #include <functional>
 #include <memory>
 #include <set>
+#include <utility>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -3114,10 +3117,24 @@ TEST_CASE("WS-5 NotifyStreamStatus: a CONNECTED on a non-owning replica drops th
     CHECK(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) == r->end()); // unknown now: fails open
 }
 
-// #5685 follow-up: the confirmation against the REAL directory. The agent restarts (a second
-// ProxyRegister mints a new session and rewrites its directory row) and nothing else has happened:
-// no CONNECTED, no heartbeat, so no arrival mirror has run and the old session's published list is
-// still stored. A replica that does not own the session must nevertheless stop judging by it.
+// #5685 follow-up: the confirmation against the REAL directory, through the PRODUCTION factory
+// (`make_route_session_confirmer`, the one server.cpp wires). The owner's heartbeat ingestion is not
+// set, so no arrival mirror runs and every older list stays stored: each outcome below comes from
+// the directory confirmation and from nothing else.
+namespace {
+void connect_session(BatchHbFixture& f, const std::string& agent, const std::string& session) {
+    gw::StreamStatusNotification up;
+    up.set_agent_id(agent);
+    up.set_session_id(session);
+    up.set_event(gw::StreamStatusNotification::CONNECTED);
+    up.set_cluster_id("cluster-a");
+    up.set_gateway_node("node-a");
+    gw::StreamStatusAck ack;
+    REQUIRE(f.svc.NotifyStreamStatus(/*context=*/nullptr, &up, &ack).ok());
+    REQUIRE(ack.acknowledged());
+}
+} // namespace
+
 TEST_CASE("WS-5 plugin visibility: a re-registration stops the previous session's list "
           "withholding the agent before any heartbeat or arrival mirror",
           "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
@@ -3127,51 +3144,110 @@ TEST_CASE("WS-5 plugin visibility: a re-registration stops the previous session'
     yuzu::server::OfflineEndpointStore offline{owner.pool};
     REQUIRE(offline.is_open());
     other.registry.configure_presence(&offline, std::chrono::hours(1));
-    auto& store = owner.store;
     other.registry.configure_route_session_reader(
-        [&store](std::span<const std::string> ids)
-            -> std::optional<std::unordered_map<std::string, std::string>> {
-            auto rows = store.lookup_routes(ids);
-            if (!rows)
-                return std::nullopt;
-            std::unordered_map<std::string, std::string> out;
-            for (const auto& r : *rows)
-                if (r.routable && r.route.session_id)
-                    out.emplace(r.route.agent_id, *r.route.session_id);
-            return out;
-        });
+        yuzu::server::make_route_session_confirmer(owner.store));
+    const auto withheld_ids = [&] {
+        other.registry.expire_presence_cache_for_test(); // re-read the candidate list each time
+        return other.registry.ids_missing_plugin("echo", "sql");
+    };
+    using Ids = std::unordered_set<std::string>;
 
     const std::string agent = "yuzu_test_ws5_conf_real";
     const std::string old_session = owner.register_live(agent);
-    {
-        gw::StreamStatusNotification up;
-        up.set_agent_id(agent);
-        up.set_session_id(old_session);
-        up.set_event(gw::StreamStatusNotification::CONNECTED);
-        up.set_cluster_id("cluster-a");
-        up.set_gateway_node("node-a");
-        gw::StreamStatusAck ack;
-        REQUIRE(owner.svc.NotifyStreamStatus(/*context=*/nullptr, &up, &ack).ok());
-        REQUIRE(ack.acknowledged());
-    }
+    connect_session(owner, agent, old_session);
     REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", old_session));
     REQUIRE(offline.publish_plugins(agent, old_session, {"os_info"}));
 
     // Before the restart the list is the truth: the agent lacks "echo" and is withheld.
-    CHECK(other.registry.ids_missing_plugin("echo", "sql") ==
-          std::unordered_set<std::string>{agent});
+    CHECK(withheld_ids() == Ids{agent});
 
-    // The restart: a new session is registered. No CONNECTED, no heartbeat, no arrival mirror.
+    // The restart: a new session registers. Its row is unplaced (unroutable) and names it.
     const std::string new_session = owner.register_live(agent);
     REQUIRE(new_session != old_session);
     {
-        // Prove the old list is STILL stored and still the endpoint's current-session list, so the
-        // outcome below comes from the directory confirmation and from nothing else.
+        // The old list is STILL stored and still the endpoint row's current-session list.
         auto r = offline.query_live_ids_without_plugin(std::chrono::hours(1), "echo");
         REQUIRE(r.has_value());
         REQUIRE(std::ranges::find(*r, agent, &yuzu::server::PluginAbsence::agent_id) != r->end());
     }
-    CHECK(other.registry.ids_missing_plugin("echo", "sql").empty());
+    CHECK(withheld_ids().empty());
+
+    // The new session's stream is established: the row is now ROUTABLE and names the NEW session.
+    // Only the session comparison can exclude the agent here (the routable predicate passes).
+    connect_session(owner, agent, new_session);
+    CHECK(withheld_ids().empty());
+
+    // The same session, once the new session's own list is published: withheld, because the
+    // routable row names the session that published the list...
+    REQUIRE(offline.upsert(agent, "h", "linux", 1, 0, "1", "x", new_session));
+    REQUIRE(offline.publish_plugins(agent, new_session, {"os_info"}));
+    CHECK(withheld_ids() == Ids{agent});
+    // ...until its lease expires: the row still names the same session but is no longer routable,
+    // so only the routable predicate (the lease, on the DB clock) can exclude the agent now.
+    raw_exec(db.dsn(), "UPDATE gateway_route_store.agent_routes SET lease_until = now() - "
+                       "interval '1 hour' WHERE agent_id = 'yuzu_test_ws5_conf_real'");
+    CHECK(withheld_ids().empty());
+}
+
+TEST_CASE("WS-5 plugin visibility: the directory confirms each agent on its own row, and a "
+          "direct agent with no row is never withheld",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    NonOwningReplica other(owner.auth_mgr, owner.store);
+    yuzu::server::OfflineEndpointStore offline{owner.pool};
+    REQUIRE(offline.is_open());
+    other.registry.configure_presence(&offline, std::chrono::hours(1));
+    other.registry.configure_route_session_reader(
+        yuzu::server::make_route_session_confirmer(owner.store));
+
+    const std::string kept = "yuzu_test_ws5_conf_kept";
+    const std::string moved = "yuzu_test_ws5_conf_moved";
+    const std::string direct = "yuzu_test_ws5_conf_direct";
+    const std::string kept_session = owner.register_live(kept);
+    connect_session(owner, kept, kept_session);
+    const std::string moved_old = owner.register_live(moved);
+    connect_session(owner, moved, moved_old);
+    for (const auto& [id, session] :
+         {std::pair{kept, kept_session}, std::pair{moved, moved_old},
+          std::pair{direct, std::string{"direct-session"}}}) {
+        REQUIRE(offline.upsert(id, "h", "linux", 1, 0, "1", "x", session));
+        REQUIRE(offline.publish_plugins(id, session, {"os_info"}));
+    }
+    // `moved` restarts and is placed on its new session; `direct` has presence but no route row.
+    const std::string moved_new = owner.register_live(moved);
+    connect_session(owner, moved, moved_new);
+
+    CHECK(other.registry.ids_missing_plugin("echo", "sql") ==
+          std::unordered_set<std::string>{kept});
+    // A protective action is never withheld on inventory grounds, whatever the directory says.
+    CHECK(other.registry.ids_missing_plugin("quarantine", "quarantine").empty());
+}
+
+// An older session can be written back into a row only after the row was tombstoned (or deleted):
+// `reclaim_tombstoned_session` is guarded on `session_id IS NULL`. Pin what that leaves behind. The
+// reclaimed row names the OLD session but carries no placement (`deregister` NULLed it and reclaim
+// does not set one), so it is unroutable and the confirmation does not withhold on it.
+TEST_CASE("WS-5 plugin visibility: a reclaimed older session leaves an unplaced row that does not "
+          "withhold",
+          "[pg][gateway_route_wiring][ws5][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    BatchHbFixture owner(db.dsn());
+    const std::string agent = "yuzu_test_ws5_conf_reclaim";
+    const std::string old_session = owner.register_live(agent);
+    connect_session(owner, agent, old_session);
+    const std::string new_session = owner.register_live(agent);
+    connect_session(owner, agent, new_session);
+    // The new session's stream ends: its row is tombstoned.
+    REQUIRE(owner.store.deregister(agent, new_session, /*stream_home_id=*/"").has_value());
+    // A late replay of the OLD session reclaims the tombstoned row.
+    auto reclaimed = owner.store.reclaim_tombstoned_session(agent, old_session, 90);
+    REQUIRE(reclaimed.has_value());
+    CHECK(*reclaimed == yuzu::server::ReclaimOutcome::adopted);
+    auto confirmed = owner.store.confirm_sessions(
+        std::vector<yuzu::server::PluginAbsence>{{agent, old_session}});
+    REQUIRE(confirmed.has_value());
+    CHECK(confirmed->empty()); // names the old session, but unplaced: not routable
 }
 
 // A session that LOST its register_fresh epoch race belongs to an older connection; the durable row

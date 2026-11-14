@@ -28,6 +28,14 @@ of an `if (... && tick % kSoftwareLedgerPruneEveryNTicks == 1)`. Each cadence co
 `== 1 || true` fail) in a head with no `||`, so a dead `(void)(cond);` ahead of an ungated call, or a
 call moved out of the block, fails too.
 
+Plus the plugin-absence confirmation wiring (#5685 follow-up): in server.cpp the registry's confirmation
+reader must be bound exactly once, to `make_route_session_confirmer(*gateway_route_store_)` behind a
+`gateway_route_store_ && gateway_route_store_->is_open()` guard, and unwired exactly once with
+`configure_route_session_reader({})` BEFORE `gateway_route_store_.reset()`. No unit test drives
+`server.cpp`'s start/stop, so dropping the binding (every cross-replica withhold silently fails open),
+replacing the production factory with a hand-copied lambda, or unwiring after the store is destroyed
+would leave every other test green.
+
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
 comment text cannot satisfy or break a check. The self-test applies in-memory mutations (dropped
 gate, `(false, nullptr, ...)` substitution, raw call) and requires problems() to be non-empty on
@@ -95,6 +103,43 @@ PRUNES = (
 )
 PRUNE_START = "preflight_runner_thread_ = std::thread("
 PRUNE_END = '"Pre-flight runner thread stopped"'
+
+
+CONFIRM_BIND = normalise("registry_.configure_route_session_reader(gateway_route_store_ && "
+                         "gateway_route_store_->is_open() ? make_route_session_confirmer("
+                         "*gateway_route_store_) : detail::AgentRegistry::RouteSessionReadFn{});")
+CONFIRM_UNWIRE = normalise("registry_.configure_route_session_reader({});")
+STORE_RESET = normalise("gateway_route_store_.reset();")
+
+
+def confirm_problems(src):
+    """One bind (the production factory, guarded), one unwire, the unwire before the store reset."""
+    t = normalise(src)
+    out = []
+    if t.count(CONFIRM_BIND) != 1:
+        out.append(f"server.cpp: expected exactly one `{CONFIRM_BIND}` (found {t.count(CONFIRM_BIND)}) "
+                   "(#5685 follow-up)")
+    if t.count("configure_route_session_reader(") != 2:
+        out.append("server.cpp: expected exactly two configure_route_session_reader( calls, the "
+                   "binding and the unwire (#5685 follow-up)")
+    if t.count(CONFIRM_UNWIRE) != 1:
+        out.append(f"server.cpp: expected exactly one `{CONFIRM_UNWIRE}` (found {t.count(CONFIRM_UNWIRE)}) "
+                   "(#5685 follow-up)")
+    elif t.count(STORE_RESET) != 1 or not t.index(CONFIRM_UNWIRE) < t.index(STORE_RESET):
+        out.append("server.cpp: the confirmation reader must be unwired BEFORE the one "
+                   "`gateway_route_store_.reset();` (#5685 follow-up)")
+    return out
+
+
+# (pattern, replacement) mutations of server.cpp; each must make confirm_problems() non-empty.
+CONFIRM_MUTATIONS = [
+    (re.escape("make_route_session_confirmer(*gateway_route_store_)"),
+     "[](auto) { return std::nullopt; }"),                                   # hand-copied reader
+    (r"registry_\.configure_route_session_reader\(\s*gateway_route_store_ &&", "(void)(gateway_route_store_ &&"),
+    (r"gateway_route_store_ && gateway_route_store_->is_open\(\)", "true"),  # unguarded
+    (re.escape("registry_.configure_route_session_reader({}); "), "(void)0; "),  # no unwire
+    (r"(registry_\.configure_route_session_reader\(\{\}\);[^\n]*\n)", r""),  # unwire deleted
+]
 
 
 def block_end(text, open_idx):
@@ -201,6 +246,7 @@ class PresenceDepartureWiringLexical(unittest.TestCase):
     def test_source_is_clean(self):
         p = [m for n, g, s in self.raw for m in problems(n, g, s)]
         p += prune_problems((SRC / "server.cpp").read_text(encoding="utf-8"))
+        p += confirm_problems((SRC / "server.cpp").read_text(encoding="utf-8"))
         for m in p:
             print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
         self.assertEqual(p, [])
@@ -222,6 +268,24 @@ class PresenceDepartureWiringLexical(unittest.TestCase):
                 mutated, n = re.subn(pat, repl, src, count=1)
                 self.assertGreaterEqual(n, 1, "mutation changed nothing (stale pattern)")
                 self.assertTrue(prune_problems(mutated), "mutation was NOT detected by the gate")
+
+    def test_confirmation_mutations_are_caught(self):
+        src = (SRC / "server.cpp").read_text(encoding="utf-8")
+        for i, (pat, repl) in enumerate(CONFIRM_MUTATIONS, 1):
+            with self.subTest(mutation=i, pattern=pat):
+                mutated, n = re.subn(pat, repl, src, count=1)
+                self.assertGreaterEqual(n, 1, "mutation changed nothing (stale pattern)")
+                self.assertTrue(confirm_problems(mutated), "mutation was NOT detected by the gate")
+        # Unwiring AFTER the store is destroyed: move the reset ahead of the unwire.
+        mutated = src.replace("gateway_route_store_.reset();", "gateway_route_store_.reset();", 1)
+        i_unwire = mutated.index("registry_.configure_route_session_reader({});")
+        i_reset = mutated.index("gateway_route_store_.reset();")
+        self.assertLess(i_unwire, i_reset, "precondition: unwire precedes reset")
+        swapped = mutated.replace("registry_.configure_route_session_reader({});",
+                                  "(void)0;", 1).replace(
+            "gateway_route_store_.reset();",
+            "gateway_route_store_.reset();\n        registry_.configure_route_session_reader({});", 1)
+        self.assertTrue(confirm_problems(swapped), "an unwire after the reset was NOT detected")
 
 
 if __name__ == "__main__":

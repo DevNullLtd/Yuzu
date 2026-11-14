@@ -1013,6 +1013,47 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
     return out;
 }
 
+std::expected<std::vector<std::string>, GatewayRouteStoreError>
+GatewayRouteStore::confirm_sessions(std::span<const PluginAbsence> claims) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    if (claims.empty())
+        return std::vector<std::string>{};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::debug("GatewayRouteStore::confirm_sessions: lease timeout, degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    std::vector<std::string_view> agents;
+    std::vector<std::string_view> sessions;
+    agents.reserve(claims.size());
+    sessions.reserve(claims.size());
+    for (const PluginAbsence& c : claims) {
+        agents.emplace_back(c.agent_id);
+        sessions.emplace_back(c.session_id);
+    }
+    // The routable predicate is lookup_routes' own, in SQL, on the DB clock (#3715). Matching on
+    // `r.session_id = t.session_id` also rejects a NULL session. Returns only the matches.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT r.agent_id FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
+        "JOIN gateway_route_store.agent_routes r "
+        "  ON r.agent_id = t.agent_id AND r.session_id = t.session_id "
+        "WHERE r.lease_until >= now() AND r.cluster_id IS NOT NULL",
+        std::vector<std::string>{pg::to_text_array(agents), pg::to_text_array(sessions)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("GatewayRouteStore::confirm_sessions: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    const int n = PQntuples(res.get());
+    std::vector<std::string> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.emplace_back(PQgetvalue(res.get(), i, 0));
+    return out;
+}
+
 std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
 GatewayRouteStore::lookup_by_sessions(std::span<const std::string> session_ids) {
     if (!open_)

@@ -462,16 +462,15 @@ TEST_CASE("HA WS-5: ids_missing_plugin merges the published plugin list for ids 
     std::unordered_map<std::string, std::string> routes;
     bool confirm_stub_ids = false; // stub readers below name ids no test row backs: confirm as "S"
     r2.configure_route_session_reader(
-        [&](std::span<const std::string> ids)
-            -> std::optional<std::unordered_map<std::string, std::string>> {
-            std::unordered_map<std::string, std::string> m;
-            for (const auto& id : ids) {
-                if (const auto it = routes.find(id); it != routes.end())
-                    m.emplace(id, it->second);
-                else if (confirm_stub_ids)
-                    m.emplace(id, "S");
+        [&](std::span<const yuzu::server::PluginAbsence> claims)
+            -> std::optional<std::unordered_set<std::string>> {
+            std::unordered_set<std::string> confirmed;
+            for (const auto& c : claims) {
+                const auto it = routes.find(c.agent_id);
+                if (it != routes.end() ? it->second == c.session_id : confirm_stub_ids)
+                    confirmed.insert(c.agent_id);
             }
-            return m;
+            return confirmed;
         });
     const auto absences = [](std::vector<std::string> ids) {
         std::vector<yuzu::server::PluginAbsence> v;
@@ -721,67 +720,158 @@ TEST_CASE("HA WS-5: a cross-replica plugin absence is withheld only while the di
     std::atomic<int> directory_reads{0};
     bool throw_on_read = false;
     r2.configure_route_session_reader(
-        [&](std::span<const std::string> ids)
-            -> std::optional<std::unordered_map<std::string, std::string>> {
+        [&](std::span<const yuzu::server::PluginAbsence> claims)
+            -> std::optional<std::unordered_set<std::string>> {
             ++directory_reads;
             if (throw_on_read)
                 throw std::runtime_error("boom");
             if (!directory)
                 return std::nullopt;
-            std::unordered_map<std::string, std::string> m;
-            for (const auto& id : ids)
-                if (const auto it = directory->find(id); it != directory->end())
-                    m.emplace(*it);
-            return m;
+            std::unordered_set<std::string> confirmed;
+            for (const auto& c : claims)
+                if (const auto it = directory->find(c.agent_id);
+                    it != directory->end() && it->second == c.session_id)
+                    confirmed.insert(c.agent_id);
+            return confirmed;
         });
+    const auto outcome = [&](const char* o) {
+        return metrics
+            .counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", o}})
+            .value();
+    };
     const std::unordered_set<std::string> withheld{agent};
     const std::unordered_set<std::string> none{};
 
     SECTION("the row still names the publishing session: withheld (the feature is intact)") {
-        directory = {{agent, "s-old"}};
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-old"}};
         CHECK(r2.ids_missing_plugin("echo", "sql") == withheld);
+        CHECK(outcome("withheld") == 1.0);
+        CHECK(outcome("not_confirmed") == 0.0);
     }
 
     SECTION("the agent re-registered (row names a newer session) and has not heartbeated: sent") {
-        directory = {{agent, "s-new"}};
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-new"}};
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        CHECK(outcome("not_confirmed") == 1.0);
+        CHECK(outcome("withheld") == 0.0);
+    }
+
+    SECTION("each candidate is judged on its own row: one confirms, one does not") {
+        REQUIRE(store.upsert("yuzu_test_pm_conf2", "h", "linux", 1, 0, "1", "x", "s2-old"));
+        REQUIRE(store.publish_plugins("yuzu_test_pm_conf2", "s2-old", {"os_info"}));
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-old"}, {"yuzu_test_pm_conf2", "s2-new"}};
+        CHECK(r2.ids_missing_plugin("echo", "sql") == withheld);
+        CHECK(outcome("withheld") == 1.0);
+        CHECK(outcome("not_confirmed") == 1.0);
     }
 
     SECTION("no row (a direct agent), or an unroutable row (absent from the confirmation): sent") {
         directory = std::unordered_map<std::string, std::string>{};
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        CHECK(outcome("not_confirmed") == 1.0);
     }
 
     SECTION("a degraded or throwing confirmation read fails OPEN") {
         directory = std::nullopt;
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
-        directory = {{agent, "s-old"}};
+        CHECK(outcome("degraded") == 1.0);
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-old"}};
         throw_on_read = true;
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        CHECK(outcome("degraded") == 2.0);
     }
 
     SECTION("no confirmation reader wired: nothing cross-replica is ever withheld") {
         r2.configure_route_session_reader({});
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
+        CHECK(outcome("unwired") == 1.0);
     }
 
     SECTION("the confirmation is read per dispatch, never cached with the candidate list") {
-        directory = {{agent, "s-old"}};
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-old"}};
         CHECK(r2.ids_missing_plugin("echo", "sql") == withheld);
         // The agent re-registers INSIDE the candidate cache's TTL: the very next dispatch sends.
-        directory = {{agent, "s-new"}};
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-new"}};
         CHECK(r2.ids_missing_plugin("echo", "sql") == none);
         CHECK(directory_reads.load() == 2);
     }
 
     SECTION("a local session still wins and no confirmation is needed for it") {
-        directory = {{agent, "s-old"}};
+        directory = std::unordered_map<std::string, std::string>{{agent, "s-old"}};
         auto info = make_agent_info(agent, "linux", "h");
         info.add_plugins()->set_name("os_info"); // this replica's own session lacks "echo" too
         (void)r2.register_agent(info);
         CHECK(r2.ids_missing_plugin("echo", "sql") == withheld); // judged locally
         CHECK(directory_reads.load() == 0);
     }
+}
+
+// The confirmation reader is unwired at server stop while dispatch threads may still be inside
+// `ids_missing_plugin`. The registry copies the std::function under its mutex and calls the copy
+// with no lock held, so a reconfigure racing a call is a data-race-free swap (a TSan target).
+TEST_CASE("ids_missing_plugin tolerates the confirmation reader being rewired concurrently",
+          "[server][ha][presence][plugin_visibility]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    registry.configure_presence(
+        [](std::chrono::seconds)
+            -> std::expected<std::vector<yuzu::server::PresenceIdentity>, yuzu::server::PresenceReadError> {
+            return std::vector<yuzu::server::PresenceIdentity>{yuzu::server::PresenceIdentity{.agent_id = "yuzu_test_cc_a"},
+                                                  yuzu::server::PresenceIdentity{.agent_id = "yuzu_test_cc_b"}};
+        },
+        std::chrono::hours(1));
+    registry.configure_presence_plugin_reader(
+        [](std::chrono::seconds, std::string_view)
+            -> std::expected<std::vector<yuzu::server::PluginAbsence>, yuzu::server::PresenceReadError> {
+            return std::vector<yuzu::server::PluginAbsence>{{"yuzu_test_cc_a", "S"},
+                                                              {"yuzu_test_cc_b", "S"}};
+        });
+    const auto confirm_all = [](std::span<const yuzu::server::PluginAbsence> claims)
+        -> std::optional<std::unordered_set<std::string>> {
+        std::unordered_set<std::string> ids;
+        for (const auto& c : claims)
+            ids.insert(c.agent_id);
+        return ids;
+    };
+    registry.configure_route_session_reader(confirm_all);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> calls{0};
+    std::vector<std::thread> readers;
+    // Joins on every exit, including a failed REQUIRE (a joinable thread destroyed by the unwind
+    // would std::terminate the whole binary).
+    struct Joiner {
+        std::atomic<bool>& stop;
+        std::vector<std::thread>& threads;
+        ~Joiner() {
+            stop = true;
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+    } joiner{stop, readers};
+    for (int i = 0; i < 4; ++i)
+        readers.emplace_back([&] {
+            while (!stop.load()) {
+                const auto missing = registry.ids_missing_plugin("echo", "sql");
+                // Either rewired state is a valid answer: confirmed (both) or unwired (none).
+                if (missing.size() != 0 && missing.size() != 2)
+                    stop = true; // surfaced by the CHECK below
+                ++calls;
+            }
+        });
+    for (int i = 0; i < 2000; ++i) {
+        registry.configure_route_session_reader(i % 2 == 0 ? yuzu::server::RouteSessionConfirmFn{} : yuzu::server::RouteSessionConfirmFn{confirm_all});
+        std::this_thread::yield();
+    }
+    stop = true;
+    for (auto& t : readers)
+        t.join();
+    CHECK(calls.load() > 0);
+    registry.configure_route_session_reader(confirm_all);
+    registry.expire_presence_cache_for_test();
+    CHECK(registry.ids_missing_plugin("echo", "sql").size() == 2);
 }
 
 // A held `stream_mu` means a send to that session is in flight: it must read as HAVING a path and
