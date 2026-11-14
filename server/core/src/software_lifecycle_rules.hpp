@@ -204,6 +204,18 @@ namespace lifecycle_detail {
     return std::nullopt;
 }
 
+/// First defect of a lookup (product key and installed version), or nullopt. The version may be
+/// empty: only a rule with an empty prefix matches it.
+[[nodiscard]] inline std::optional<std::string>
+validate_lifecycle_lookup(std::string_view product_key, std::string_view version) {
+    using lifecycle_detail::text_ok;
+    if (product_key.empty() || !text_ok(product_key))
+        return "product_key is empty, too long or not printable text";
+    if (!text_ok(version))
+        return "version is too long or not printable text";
+    return std::nullopt;
+}
+
 /// Parse a rule file. `#` lines and blank lines are skipped; the first other line must be
 /// `kLifecycleCsvHeader`; fields are plain comma-separated text (no quoting, so no field holds a
 /// comma). The whole file is refused on the first defect: over 256 KiB, over 5000 rows, a field

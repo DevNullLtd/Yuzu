@@ -415,10 +415,8 @@ SoftwareLifecycleStore::evaluate_batch(const std::vector<LifecycleLookup>& looku
         return std::unexpected(Error{Kind::InvalidInput, "today is not a calendar date"});
     std::set<std::string> distinct_keys;
     for (const auto& l : lookups) {
-        if (l.product_key.empty() || !lifecycle_detail::text_ok(l.product_key) ||
-            !lifecycle_detail::text_ok(l.version))
-            return std::unexpected(
-                Error{Kind::InvalidInput, "a lookup key or version is empty, too long or not text"});
+        if (const auto bad = validate_lifecycle_lookup(l.product_key, l.version))
+            return std::unexpected(Error{Kind::InvalidInput, "a lookup is invalid: " + *bad});
         distinct_keys.insert(l.product_key);
     }
     if (lookups.empty())

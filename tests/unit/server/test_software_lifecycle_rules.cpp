@@ -6,9 +6,11 @@
  */
 
 #include "software_lifecycle_rules.hpp"
+#include "software_normalization_pack.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -319,4 +321,26 @@ TEST_CASE("lifecycle csv: the embedded seed parses and every row names its polic
         CHECK_FALSE(r.source_ref.empty());
         CHECK((r.product_key.starts_with("product:") || r.product_key.starts_with("os:")));
     }
+}
+
+TEST_CASE("lifecycle csv: every seed product key is a canonical key of the alias pack",
+          "[lifecycle][rules][csv][seed]") {
+    // A mistyped key never matches any product, so its rows would sit in the table unused and
+    // every version of that product would read unknown. The pack is where product keys are minted.
+    const auto pack = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(pack.has_value());
+    std::set<std::string> canonical;
+    for (const auto& row : pack->rows)
+        canonical.insert(product_lifecycle_key(row.norm_key));
+    const auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed, LifecycleSource::shipped);
+    REQUIRE(seed.has_value());
+    std::size_t product_rows = 0;
+    for (const auto& r : *seed) {
+        if (!r.product_key.starts_with("product:"))
+            continue;
+        ++product_rows;
+        INFO(r.product_key << " " << r.version_prefix);
+        CHECK(canonical.contains(r.product_key));
+    }
+    CHECK(product_rows > 0); // the loop above must not pass by finding nothing to check
 }

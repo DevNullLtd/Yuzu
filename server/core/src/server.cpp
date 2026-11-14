@@ -8591,7 +8591,7 @@ public:
         // product registry (ADR-0012 s1): the seed is build-embedded, so a parse failure is a
         // defective build and a load failure is a database fault; either refuses the boot, and a
         // newer binary's seed replaces the stored shipped rules in one transaction. No reader
-        // exists yet (SAM-24).
+        // exists yet (SAM-24); /readyz alone borrows it.
         if (pg_pool_ && !startup_failed_) {
             software_lifecycle_store_ = std::make_unique<SoftwareLifecycleStore>(*pg_pool_);
             if (!software_lifecycle_store_->is_open()) {
@@ -11792,7 +11792,8 @@ public:
         // SAM-34 collection settings store: its routes capture it and are served only until
         // web_server_->stop(); drop it ahead of the pool with the other born-on-PG stores.
         software_collection_settings_store_.reset();
-        // SAM-23 lifecycle store: no reader yet, nothing borrows it; drop it ahead of the pool.
+        // SAM-23 lifecycle store: only /readyz borrows it (HealthRoutes deps), and that server is
+        // stopped above; drop it ahead of the pool.
         software_lifecycle_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
@@ -17641,6 +17642,7 @@ private:
                              .product_registry_store = product_registry_store_.get(),
                              .software_collection_settings_store =
                                  software_collection_settings_store_.get(),
+                             .software_lifecycle_store = software_lifecycle_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
@@ -25091,7 +25093,7 @@ private:
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
     std::unique_ptr<SoftwareCollectionSettingsStore> software_collection_settings_store_;
     // SAM-23 software lifecycle rules + host-declared facts. Declared after pg_pool_ so it
-    // destructs before the pool; no route or job reads it yet.
+    // destructs before the pool; no route or job reads it yet (only /readyz borrows it).
     std::unique_ptr<SoftwareLifecycleStore> software_lifecycle_store_;
     // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
     // resets them explicitly before the stores and pool.

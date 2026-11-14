@@ -27,6 +27,17 @@
 ///     outage returns false (logged, counted on the `write_degrade` counter) and the next report
 ///     repeats the fact.
 ///
+/// Log levels (the counters are exact; the counted log lines are sampled: the first degrade and
+/// every 100th after it):
+///   - `warn`: the reads and `upsert_declared` degrades (closed store, pool timeout, query
+///     error). The caller already gets an explicit nullopt / Unavailable / false, a retry can
+///     succeed, and the next host report repeats the fact, so the line only records that it
+///     happened.
+///   - `error`: `corrupt_row` and `row_cap`. The stored data itself is wrong or over its bound, no
+///     retry repairs it, and an operator has to act.
+///   - `error`: a `replace_rules` transaction failure. It refuses the boot (the seed load is
+///     fail-closed), so it is the line an operator reads to learn why the server did not start.
+///
 /// Declared facts are never deleted here, so a superseded date stays in `lifecycle_declared` (a few
 /// rows per product version). The evaluator decides which row wins; the store keeps both, each
 /// with its own `last_seen`. Retention ships with the first producer of declared facts.

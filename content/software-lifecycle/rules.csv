@@ -20,8 +20,10 @@
 #
 # Every date was read from the page named on its row; a release whose date could not be confirmed
 # there is absent (its state reads unknown) rather than estimated. Windows and macOS releases are
-# absent for that reason. Ubuntu rows end standard security maintenance; Expanded Security
-# Maintenance (a paid add-on) is not modelled.
+# absent for that reason. Java runtimes (Oracle JDK and JRE in the alias pack) have no rows yet
+# because their dates differ by vendor and support tier; they read unknown. A page that gives only
+# a month is recorded as the last day of that month and says so on the row. Ubuntu rows end
+# standard security maintenance; Expanded Security Maintenance (a paid add-on) is not modelled.
 product_key,version_prefix,event,date,source_reference
 product:postgresql:postgresql,12,end_of_life,2024-11-21,https://www.postgresql.org/support/versioning/ final release
 product:postgresql:postgresql,13,end_of_life,2025-11-13,https://www.postgresql.org/support/versioning/ final release
@@ -32,7 +34,7 @@ product:postgresql:postgresql,17,end_of_life,2029-11-08,https://www.postgresql.o
 product:postgresql:postgresql,18,end_of_life,2030-11-14,https://www.postgresql.org/support/versioning/ final release
 product:python:python,3.8,end_of_life,2024-10-07,https://peps.python.org/pep-0569/ end-of-life phase
 product:python:python,3.9,end_of_life,2025-10-31,https://peps.python.org/pep-0596/ end-of-life phase
-product:python:python,3.10,end_of_life,2026-10-01,https://peps.python.org/pep-0619/ end-of-life phase
+product:python:python,3.10,end_of_life,2026-10-31,https://peps.python.org/pep-0619/ end-of-life phase (month only)
 product:openjs:node.js,16,end_of_life,2023-09-11,https://github.com/nodejs/Release/blob/main/schedule.json end
 product:openjs:node.js,18,end_of_life,2025-04-30,https://github.com/nodejs/Release/blob/main/schedule.json end
 product:openjs:node.js,20,end_of_life,2026-04-30,https://github.com/nodejs/Release/blob/main/schedule.json end
