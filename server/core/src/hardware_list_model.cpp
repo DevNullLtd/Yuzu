@@ -773,6 +773,10 @@ nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded
         {"devices_omitted", devices_omitted},
         {"ci_degraded", ci_degraded},
         {"tags_degraded", tags_degraded},
+        // #5712: a typed partial. `total_matching`, `kpis.*` and the pagination total are then LOWER
+        // BOUNDS and a search/filter miss is not proof of absence (use the CI record to confirm one).
+        {"roster_truncated", page.roster_truncated},
+        {"roster_cap", kOfflineRosterRowCap},
         {"kpis",
          {{"total", page.kpis.total},
           {"online", page.kpis.online},
@@ -897,8 +901,10 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
 }
 
 bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps) {
-    if (eps)
+    if (eps) {
+        result.roster_truncated = eps->truncated; // a partial is served and flagged, never refused
         return true;
+    }
     result.roster_degraded = true; // unread, not empty
     result.ci_degraded = true;
     result.tags_degraded = true;
@@ -923,27 +929,25 @@ void apply_tag_read(InventoryDevicesResult& result,
 }
 
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
-offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
+offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
                      std::string (*human_age)(std::int64_t)) {
-    if (!eps)
-        return std::unexpected(eps.error());
-    for (const auto& e : *eps) {
-        if (e.agent_id != agent_id)
-            continue;
-        InventoryDeviceRow r;
-        r.agent_id = e.agent_id;
-        r.hostname = e.hostname;
-        r.os = e.os;
-        r.agent_version = e.agent_version;
-        r.arch = e.arch;
-        r.online = false;
-        const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-        r.stale = age_ms > kHardwareStaleAfterMs;
-        r.last_seen = human_age(age_ms);
-        r.last_seen_ms = e.last_heartbeat_ms;
-        return std::optional<InventoryDeviceRow>{std::move(r)};
-    }
-    return std::optional<InventoryDeviceRow>{};
+    if (!ep)
+        return std::unexpected(ep.error());
+    if (!*ep)
+        return std::optional<InventoryDeviceRow>{}; // confirmed absence from the window
+    const OfflineEndpoint& e = **ep;
+    InventoryDeviceRow r;
+    r.agent_id = e.agent_id;
+    r.hostname = e.hostname;
+    r.os = e.os;
+    r.agent_version = e.agent_version;
+    r.arch = e.arch;
+    r.online = false;
+    const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+    r.stale = age_ms > kHardwareStaleAfterMs;
+    r.last_seen = human_age(age_ms);
+    r.last_seen_ms = e.last_heartbeat_ms;
+    return std::optional<InventoryDeviceRow>{std::move(r)};
 }
 
 void apply_identity_read(HardwareCiDetail& detail,

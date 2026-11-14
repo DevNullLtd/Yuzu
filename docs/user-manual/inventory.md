@@ -1142,13 +1142,51 @@ synced yet") / degraded (an explicit "CI record unavailable" banner) are never
 conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
-endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+endpoints within the 30-day window. A fleet above that sees a **"Partial list"** notice
+above the table (and `roster_truncated: true` with `roster_cap: 100000` in the REST and
+MCP bodies): the list is still served, it holds the newest 100,000, and everything that
+counts it is a lower bound. The KPI counts (Total, Online, Offline, Stale) are shown as
+"at least" (`≥`), the REST `total_matching`, `pagination.total`, `devices_omitted` and
+`kpis.*` are lower bounds, and a search or filter that finds nothing does **not** prove a
+device does not exist. Open the device's record, or call `get_hardware_ci` /
+`GET /api/v1/hardware/{id}`, to confirm one device: that read goes straight to the
+device's row and is exact at any fleet size (for a device seen within the roster window). The notice is worked out afresh on every
+read, so it disappears by itself when the fleet is back under the cap; the list is never
+refused because of it. The Dashboard's device estate for a caller with fleet-wide read is
+an exact count of every endpoint in the window, so it can read higher than the Hardware
+list's "at least" figure on a fleet over the cap; a caller confined to a scope sees the same
+"at least" label on the Dashboard. The cap counts distinct enrolled
 `agent_id`s seen in the window: a device that disconnects cleanly stays listed as
 Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
 appears as two rows until the old one ages out. The per-device record's offline
-identity fallback reads the same capped set, so an offline device outside it shows no
-identity and, with nothing else synced, reads as not found.
+identity fallback is a direct lookup by `agent_id` within the same 30-day window, so an
+offline device outside the newest 100,000 still shows its identity. The Software and
+Quarantine pages' hostname column is display-only and reads the same capped roster: a
+device outside it shows its `agent_id` in place of the hostname.
+
+The KPI strip's other figures are derived from the same capped roster: the CI-coverage count,
+the manufacturer counts and "Showing a-b of N" are lower bounds too, while the median memory
+and the CI-coverage ratio describe only the listed devices. The notice says so, though only the
+four count tiles carry the `≥` mark.
+
+### Known limits above 100,000 devices
+
+The roster cap is a display and read cap, not a tested capacity. Above it:
+
+- The Hardware CI columns come from a separate read with its own 100,000-row cap (ordered by
+  hostname), so CI columns can be blank for devices that are listed (#7549).
+- Fleet topology answers `413` above the ceiling and cannot be raised past it (#7550).
+- The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
+  the Software page, show only devices inside the capped roster (a host outside it appears as
+  its `agent_id`, or not at all in the type-ahead).
+- The CI record's online state comes from the local session map of the replica serving the
+  request (#7551).
+- Online and Offline on the list derive from the live-presence read. On a deployment with more
+  than one server replica, if that read fails, or the fleet has more than 100,000 live agents (in
+  which case it is refused every time, not just briefly), agents connected to another replica
+  read Offline with no flag, and the Offline tile is not a true lower bound (#7566).
+- Search, filter and sort run over the capped set, and there is no way to page past the cap
+  (#7567). A device seen within the window is always reachable by its id.
 
 A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
 deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
@@ -1512,7 +1550,7 @@ rollout) are not counted, so a zero there does not rule out a skipping collector
 
 **A Windows device's installed-application rows are marked unconfirmed although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1, and the daily sync reports a status-only `installed_apps.list_inventory` section rather than committing a shorter inventory as authoritative; the server keeps the device's last good application rows, shown as unconfirmed, and every other source is still sent. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — reported constrained`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects and a full section confirms the rows. The section's token and the unconfirmed marker are the signals; there is no skip counter for this condition, because the report is still sent.
 
-**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed.
+**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed. A fleet with more than 100,000 endpoints in the window is **not** this fault: it shows the "Partial list" notice with the table, and `yuzu_server_agent_presence_roster_truncated_total` counts each truncated read (a steady state on such a fleet, so it has no alert). The per-device record's identity lookup counts its own failures under `op="find_within"` of the same failure counter.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
