@@ -79,13 +79,15 @@ inline constexpr std::uint64_t kMaxCdBytes = 16ULL * 1024 * 1024;
 inline constexpr std::size_t kMaxEntryNameLen = 1024;
 /// End record (22) + the longest comment a 16-bit length can describe.
 inline constexpr std::size_t kMaxTailBytes = 22 + 65535;
+/// The fixed part of a local file header: what a caller reads at local_header_at() before
+/// local_data_offset().
+inline constexpr std::size_t kLocalHeaderLen = 30;
 
 namespace zip_detail {
 
 inline constexpr std::size_t kEocdLen = 22;
 inline constexpr std::size_t kZip64LocatorLen = 20;
 inline constexpr std::size_t kCentralHeaderLen = 46;
-inline constexpr std::size_t kLocalHeaderLen = 30;
 inline constexpr std::uint32_t kEocdSig = 0x06054b50U;
 inline constexpr std::uint32_t kZip64LocatorSig = 0x07064b50U;
 inline constexpr std::uint32_t kCentralSig = 0x02014b50U;
@@ -240,11 +242,21 @@ std::expected<void, ZipError> for_each_central_entry(std::span<const std::byte> 
 }
 
 /**
+ * Absolute file offset of an entry's local header: tail.prefix +
+ * entry.local_header_offset, overflow-checked (nullopt on overflow). A caller
+ * never adds the prefix itself: that is the arithmetic the prepended-bytes
+ * handling depends on.
+ */
+inline std::optional<std::uint64_t> local_header_at(const ZipTail& tail, const ZipEntry& entry) {
+    return zip_detail::checked_add(tail.prefix, entry.local_header_offset);
+}
+
+/**
  * Absolute file offset of an entry's data, from its local header bytes
- * (the caller reads kLocalHeaderLen-or-more bytes at
- * prefix + entry.local_header_offset; the local name/extra lengths may differ
- * from the central ones, so they are read here, not assumed). `prefix` is
- * ZipTail::prefix; it is a required argument so a caller cannot forget it.
+ * (the caller reads kLocalHeaderLen-or-more bytes at local_header_at(); the
+ * local name/extra lengths may differ from the central ones, so they are read
+ * here, not assumed). `prefix` is ZipTail::prefix; it is a required argument
+ * so a caller cannot forget it.
  */
 inline std::expected<std::uint64_t, ZipError> local_data_offset(
     std::span<const std::byte> local_header, const ZipEntry& entry, std::uint64_t prefix) {

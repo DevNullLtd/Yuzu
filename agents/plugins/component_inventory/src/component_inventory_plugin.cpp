@@ -10,8 +10,10 @@
  * Wire rows (component_scan.hpp): exactly one leading `status|scan|<level>|<tokens or ->` row, then
  * `comp|java|name|version|version_source|path|size|mtime|anchor_app` rows.
  *
- * COMPLETENESS. Level supported and typed result OK/FULL only when the scan finished with nothing
- * hidden. Any budget, unreadable or truncated directory, archive that could not be enumerated or
+ * COMPLETENESS. Level supported and typed result OK/FULL only when the scan finished: no bound was
+ * reached and every directory and archive it opened was read in full (a link or network mount it
+ * passed over on purpose is named by an informational token on the status row). Any budget,
+ * unreadable or truncated directory, archive that could not be enumerated or
  * archive that changed while read answers constrained and CONSTRAINED/PARTIAL with the cause as a
  * `<os>:component_inventory:<cause>` token. The rows that were reachable are written at both levels.
  *
@@ -65,7 +67,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "bounded read-only walk of /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, "
          "/usr/local/share and /usr/share/maven; no link followed at any path component; archive "
          "central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped "
-         "via /proc/self/mountinfo",
+         "via /proc/<pid>/mountinfo",
          "Java archives only; machine roots only (per-user installs are not read); any budget, "
          "unreadable directory or unenumerable archive answers constrained"},
         /* .macos_leg   = */

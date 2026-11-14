@@ -3,14 +3,15 @@
 /**
  * component_java_parsers.hpp — pure parsers for Java archive inventory.
  *
- * Header-only, std-only, no I/O: the zip walk lives in the plugin shell.
+ * Header-only, std-only, no I/O: the zip directory walk is zip_directory.hpp.
  * Every input is untrusted file bytes, so each parser is a bounded linear
  * scan (no regex, no unbounded copies) and returns nullopt / false on
  * anything it cannot positively read.
  *
- * Version precedence is applied by the plugin shell, not here: file name,
- * then pom.properties, then manifest, else '' with version_source
- * `unreadable`. The component `name` is the artifact only (no group:artifact).
+ * Version precedence is applied by the scan (component_scan.hpp: read_archive
+ * and scan), not here: file name, then pom.properties, then manifest, else ''
+ * with version_source `unreadable`. The component `name` is the artifact only
+ * (no group:artifact).
  */
 
 #include <cstddef>
@@ -105,8 +106,9 @@ inline std::string_view next_line(std::string_view& text) noexcept {
 /// (foo-64bit.jar), which the pom/manifest fallbacks may then override.
 /// Names over kMaxJarFilenameBytes, or with any byte outside printable ASCII
 /// (NUL, control, non-ASCII), are rejected before anything is copied.
-// ponytail: non-ASCII file names are dropped, not inventoried; the component
-// name must stay valid UTF-8 downstream. Upgrade to a UTF-8 validator if needed.
+// ponytail: the parser refuses a non-ASCII file name; the scan still emits a row
+// for it (scan_detail::name_of), with each such byte as '?' so the component name
+// stays valid UTF-8 downstream. Upgrade to a UTF-8 validator if needed.
 inline std::optional<JarName> parse_jar_filename(std::string_view filename) {
     using namespace java_detail;
     if (filename.size() > kMaxJarFilenameBytes || !is_printable_ascii(filename) || !is_java_archive_name(filename))
@@ -221,31 +223,40 @@ inline std::optional<std::string> parse_manifest_version(std::string_view text) 
     return bundle;
 }
 
-/// BOOT-INF/lib/<x>.jar, WEB-INF/lib/<x>.jar or lib/<x>.jar, no further '/'.
+/// BOOT-INF/lib/<x>.jar, WEB-INF/lib/<x>.jar or lib/<x>.jar, no further '/'. The directory prefixes
+/// are exact; the extension folds case like is_java_archive_name, so X.JAR is listed, not hidden.
 inline bool is_nested_lib_entry(std::string_view entry) noexcept {
     for (const std::string_view prefix : {std::string_view{"BOOT-INF/lib/"}, std::string_view{"WEB-INF/lib/"},
                                           std::string_view{"lib/"}}) {
         if (!entry.starts_with(prefix))
             continue;
         const std::string_view rest = entry.substr(prefix.size());
-        return rest.size() > 4 && rest.find('/') == std::string_view::npos && rest.ends_with(".jar");
+        return rest.size() > 4 && rest.find('/') == std::string_view::npos &&
+               java_detail::iequals(rest.substr(rest.size() - 4), ".jar");
     }
     return false;
 }
 
-/// META-INF/maven/<g>/<a>/pom.properties
-inline bool is_pom_properties_entry(std::string_view entry) noexcept {
+/// The <a> of META-INF/maven/<g>/<a>/pom.properties; nullopt when `entry` is not that shape.
+inline std::optional<std::string_view> pom_properties_artifact(std::string_view entry) noexcept {
     constexpr std::string_view kPrefix = "META-INF/maven/";
     constexpr std::string_view kSuffix = "/pom.properties";
     if (!entry.starts_with(kPrefix) || !entry.ends_with(kSuffix))
-        return false;
+        return std::nullopt;
     if (entry.size() < kPrefix.size() + kSuffix.size())
-        return false;
+        return std::nullopt;
     const std::string_view mid =
         entry.substr(kPrefix.size(), entry.size() - kPrefix.size() - kSuffix.size());
     const auto slash = mid.find('/');
-    return slash != std::string_view::npos && slash > 0 && slash + 1 < mid.size() &&
-           mid.find('/', slash + 1) == std::string_view::npos;
+    if (slash == std::string_view::npos || slash == 0 || slash + 1 >= mid.size() ||
+        mid.find('/', slash + 1) != std::string_view::npos)
+        return std::nullopt;
+    return mid.substr(slash + 1);
+}
+
+/// META-INF/maven/<g>/<a>/pom.properties
+inline bool is_pom_properties_entry(std::string_view entry) noexcept {
+    return pom_properties_artifact(entry).has_value();
 }
 
 } // namespace yuzu::component_inventory

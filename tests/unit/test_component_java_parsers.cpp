@@ -8,6 +8,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -145,10 +146,20 @@ TEST_CASE("entry classifiers", "[runtime][component_inventory][java]") {
     CHECK(kManifestEntry == "META-INF/MANIFEST.MF");
     for (const char* e : {"BOOT-INF/lib/spring-core-5.3.20.jar", "WEB-INF/lib/a.jar", "lib/b-1.0.jar"})
         CHECK(is_nested_lib_entry(e));
-    for (const char* e : {"BOOT-INF/lib/a/b.jar", "lib/a/b.jar", "WEB-INF/lib/", "lib/.jar", "lib/a.zip",
-                          "BOOT-INF/classes/a.jar", "xlib/a.jar", "", "lib/a.jar/"})
+    // The extension folds case, like is_java_archive_name: X.JAR is listed, not silently absent.
+    for (const char* e : {"BOOT-INF/lib/X-1.0.JAR", "WEB-INF/lib/y.Jar", "lib/z-2.jAr", "lib/a.jaR"})
+        CHECK(is_nested_lib_entry(e));
+    for (const char* e : {"BOOT-INF/lib/a/b.jar", "lib/a/b.jar", "WEB-INF/lib/", "lib/.jar", "lib/.JAR", "lib/a.zip",
+                          "lib/a.ZIP", "lib/a.war", "BOOT-INF/classes/a.jar", "xlib/a.jar", "", "lib/a.jar/"})
+        CHECK_FALSE(is_nested_lib_entry(e));
+    // The directory prefixes stay exact.
+    for (const char* e : {"boot-inf/lib/a.jar", "Lib/a.jar", "LIB/a.JAR", "web-inf/lib/a.jar"})
         CHECK_FALSE(is_nested_lib_entry(e));
     CHECK(is_pom_properties_entry("META-INF/maven/org.apache/log4j-core/pom.properties"));
+    CHECK(pom_properties_artifact("META-INF/maven/org.apache/log4j-core/pom.properties") == "log4j-core");
+    CHECK(pom_properties_artifact("META-INF/maven/g/a/b/pom.properties") == std::nullopt);
+    CHECK(pom_properties_artifact("META-INF/maven/g//pom.properties") == std::nullopt);
+    CHECK(pom_properties_artifact("") == std::nullopt);
     for (const char* e : {"META-INF/maven/org.apache/pom.properties", "META-INF/maven//a/pom.properties",
                           "META-INF/maven/g/a/b/pom.properties", "META-INF/maven/g/a/pom.xml",
                           "META-INF/maven/g/a/", "META-INF/maven/pom.properties", ""})

@@ -27,6 +27,16 @@
  *    assertions.
  *  - emission: setting `wrote` before the write fails the first-write-throws case; a catch-all that
  *    can throw fails the answer_internal_error cases.
+ *  - stored entries: making read_entry_text's method-0 branch return nullopt fails the stored
+ *    success cases; returning the bytes without comparing comp_size and uncomp_size fails the
+ *    disagreeing-sizes case.
+ *  - link token: dropping links_skipped from scan_verdict (or from answer_scan's call) fails the
+ *    link_skipped verdict, answer and tree cases, which would otherwise read a bare `supported`.
+ *  - pom choice: taking the first pom.properties in directory order fails the several-poms cases (a
+ *    dependency's version becomes the archive's); accepting two poms that both name the artifact
+ *    fails the ambiguous case.
+ *  - quota key: keying the per-anchor quota on the folder name alone fails the two-roots case.
+ *  - nested extension: matching `.jar` case-sensitively fails the upper-case nested library case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -101,7 +111,7 @@ Zip victim_zip() {
 } // namespace
 
 TEST_CASE("scan: rows carry the right version_source for each way a version is found",
-          "[runtime][component_scan]") {
+          "[runtime][component_scan][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/acme/lib/log4j-core-2.17.1.jar", build_zip({stored("a.class", "x")}).bytes);
     tree.add_file("/opt/acme/lib/widget.jar",
@@ -143,7 +153,7 @@ TEST_CASE("scan: rows carry the right version_source for each way a version is f
 }
 
 TEST_CASE("scan: pom.properties beats the manifest, and an unreadable pom falls back to it",
-          "[runtime][component_scan]") {
+          "[runtime][component_scan][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/both.jar", build_zip({deflated("META-INF/MANIFEST.MF", manifest_with("2.0")),
                                                 deflated(kPomEntry, pom_with("1.0"))})
@@ -165,8 +175,122 @@ TEST_CASE("scan: pom.properties beats the manifest, and an unreadable pom falls 
     CHECK(find_row(r, "odd")->version_source == "unreadable");
 }
 
+TEST_CASE("scan: a pom or manifest version is read from a stored or a deflated entry alike",
+          "[runtime][component_scan][component_inventory]") {
+    const auto encode = [](bool store, const char* name, const std::string& text) {
+        return store ? stored(name, text) : deflated(name, text);
+    };
+    for (const bool store : {true, false}) {
+        INFO((store ? "stored (method 0)" : "deflated (method 8)"));
+        MemTree tree;
+        tree.add_file("/opt/a/widget.jar", build_zip({encode(store, kPomEntry, pom_with("3.4.5"))}).bytes);
+        tree.add_file("/opt/a/app.jar",
+                      build_zip({encode(store, "META-INF/MANIFEST.MF", manifest_with("7.1"))}).bytes);
+        // An unreadable pom falls back to the manifest, whichever way both are encoded.
+        tree.add_file("/opt/a/both.jar", build_zip({encode(store, kPomEntry, "no version here\n"),
+                                                    encode(store, "META-INF/MANIFEST.MF", manifest_with("2.5"))})
+                                             .bytes);
+        const auto r = run(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 3);
+        CHECK(find_row(r, "widget")->version == "3.4.5");
+        CHECK(find_row(r, "widget")->version_source == "pom");
+        CHECK(find_row(r, "app")->version == "7.1");
+        CHECK(find_row(r, "app")->version_source == "manifest");
+        CHECK(find_row(r, "both")->version == "2.5");
+        CHECK(find_row(r, "both")->version_source == "manifest");
+    }
+
+    SECTION("a stored entry whose compressed and uncompressed sizes disagree is unreadable, not guessed") {
+        Entry bad_manifest = stored("META-INF/MANIFEST.MF", manifest_with("9.9"));
+        bad_manifest.uncomp_size += 3;
+        Entry bad_pom = stored(kPomEntry, pom_with("8.8"));
+        bad_pom.uncomp_size += 3;
+        MemTree tree;
+        tree.add_file("/opt/a/app.jar", build_zip({bad_manifest}).bytes);
+        tree.add_file("/opt/a/widget.jar", build_zip({bad_pom}).bytes);
+        const auto r = run(tree);
+        CHECK(r.stop == Stop::complete); // an item-level gap: the rows exist, nothing is hidden
+        REQUIRE(r.rows.size() == 2);
+        for (const auto& row : r.rows) {
+            INFO(row.name);
+            CHECK(row.version.empty());
+            CHECK(row.version_source == "unreadable");
+        }
+        CHECK(r.version_unreadable == 2);
+    }
+}
+
+TEST_CASE("scan: with several pom.properties only one named for the archive is trusted",
+          "[runtime][component_scan][component_inventory]") {
+    const auto pom_of = [](const char* group, const char* artifact, const std::string& version) {
+        return deflated(std::string("META-INF/maven/") + group + "/" + artifact + "/pom.properties",
+                        pom_with(version));
+    };
+
+    SECTION("a shaded archive: its own pom wins over a dependency's, whichever comes first") {
+        MemTree tree;
+        tree.add_file("/opt/a/shaded.jar", build_zip({pom_of("org.dep", "log4j-core", "2.14.1"),
+                                                      pom_of("org.acme", "shaded", "1.0.0"),
+                                                      pom_of("org.other", "guava", "31.0")})
+                                               .bytes);
+        tree.add_file("/opt/a/other.jar", build_zip({pom_of("org.acme", "other", "4.0.0"),
+                                                     pom_of("org.dep", "log4j-core", "2.14.1")})
+                                              .bytes);
+        const auto r = run(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(find_row(r, "shaded")->version == "1.0.0");
+        CHECK(find_row(r, "shaded")->version_source == "pom");
+        CHECK(find_row(r, "other")->version == "4.0.0");
+        CHECK(find_row(r, "other")->version_source == "pom");
+    }
+    SECTION("none names the archive: no pom is read, the manifest decides") {
+        MemTree tree;
+        tree.add_file("/opt/a/plain.jar", build_zip({pom_of("org.dep", "log4j-core", "2.14.1"),
+                                                     pom_of("org.dep", "guava", "31.0"),
+                                                     deflated("META-INF/MANIFEST.MF", manifest_with("5.5"))})
+                                              .bytes);
+        const auto r = run(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].version == "5.5");
+        CHECK(r.rows[0].version_source == "manifest");
+    }
+    SECTION("none names the archive and there is no manifest: unreadable, and the scan stays complete") {
+        MemTree tree;
+        tree.add_file("/opt/a/bare.jar", build_zip({pom_of("org.dep", "log4j-core", "2.14.1"),
+                                                    pom_of("org.dep", "guava", "31.0")})
+                                             .bytes);
+        const auto r = run(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].version.empty());
+        CHECK(r.rows[0].version_source == "unreadable");
+        CHECK(r.version_unreadable == 1);
+        CHECK(tree.reads.size() == 2); // tail + directory: no pom entry was read at all
+    }
+    SECTION("two poms that both name the archive cannot be told apart: neither is trusted") {
+        MemTree tree;
+        tree.add_file("/opt/a/twin.jar", build_zip({pom_of("org.a", "twin", "1.0"), pom_of("org.b", "twin", "2.0")})
+                                             .bytes);
+        const auto r = run(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].version_source == "unreadable");
+    }
+    SECTION("the only pom is used even when its artifact is spelled differently") {
+        MemTree tree;
+        tree.add_file("/opt/a/widget.jar", build_zip({pom_of("org.acme", "widget-core", "3.4.5")}).bytes);
+        const auto r = run(tree);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].version == "3.4.5");
+        CHECK(r.rows[0].version_source == "pom");
+    }
+}
+
 TEST_CASE("scan: a fat jar is one outer row and one row per nested library, none inflated",
-          "[runtime][component_scan]") {
+          "[runtime][component_scan][component_inventory]") {
     MemTree tree;
     const auto zip = build_zip({stored("BOOT-INF/classes/A.class", "x"),
                                 nested_lib("BOOT-INF/lib/spring-core-5.3.1.jar", 123456),
@@ -204,8 +328,25 @@ TEST_CASE("scan: a fat jar is one outer row and one row per nested library, none
     CHECK(tree.reads.size() == 2);
 }
 
+TEST_CASE("scan: a nested library is listed whatever the case of its extension",
+          "[runtime][component_scan][component_inventory]") {
+    MemTree tree;
+    tree.add_file("/opt/app/app-1.0.jar", build_zip({nested_lib("BOOT-INF/lib/Upper-2.1.JAR", 11),
+                                                     nested_lib("WEB-INF/lib/mixed-3.0.Jar", 22)})
+                                              .bytes);
+    const auto r = run(tree);
+    CHECK(r.stop == Stop::complete);
+    REQUIRE(r.rows.size() == 3);
+    const auto* upper = find_row(r, "Upper");
+    REQUIRE(upper != nullptr);
+    CHECK(upper->version == "2.1");
+    CHECK(upper->path == "/opt/app/app-1.0.jar!BOOT-INF/lib/Upper-2.1.JAR");
+    CHECK(upper->size == 11);
+    CHECK(find_row(r, "mixed") != nullptr);
+}
+
 TEST_CASE("scan: a manifest over 64 KiB is unreadable, nothing past the cap is inflated, scan stays complete",
-          "[runtime][component_scan]") {
+          "[runtime][component_scan][component_inventory]") {
     SECTION("declared over the cap: the body is never read") {
         MemTree tree;
         const std::string big(100 * 1024, 'a');
@@ -266,7 +407,7 @@ TEST_CASE("scan: a manifest over 64 KiB is unreadable, nothing past the cap is i
     }
 }
 
-TEST_CASE("scan: an executable jar with prepended bytes is read at the shifted offsets", "[runtime][component_scan]") {
+TEST_CASE("scan: an executable jar with prepended bytes is read at the shifted offsets", "[runtime][component_scan][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/launcher.jar",
                   build_zip({deflated("META-INF/MANIFEST.MF", manifest_with("4.2")),
@@ -281,7 +422,7 @@ TEST_CASE("scan: an executable jar with prepended bytes is read at the shifted o
     CHECK(find_row(r, "dep") != nullptr);
 }
 
-TEST_CASE("scan: a file name the parser refuses still gets a row", "[runtime][component_scan]") {
+TEST_CASE("scan: a file name the parser refuses still gets a row", "[runtime][component_scan][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/caf\xC3\xA9-1.0.jar", build_zip({stored("a.class", "x")}).bytes);
     const auto r = run(tree);
@@ -292,7 +433,7 @@ TEST_CASE("scan: a file name the parser refuses still gets a row", "[runtime][co
 }
 
 TEST_CASE("scan: an archive that cannot be enumerated is never complete, and its outer row stays",
-          "[runtime][component_scan][completeness]") {
+          "[runtime][component_scan][completeness][component_inventory]") {
     struct Case {
         const char* name;
         Stop expect;
@@ -357,7 +498,7 @@ TEST_CASE("scan: an archive that cannot be enumerated is never complete, and its
 }
 
 TEST_CASE("scan: an unenumerable archive with no version in its name is an unreadable row and incomplete",
-          "[runtime][component_scan][completeness]") {
+          "[runtime][component_scan][completeness][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/plain.jar", "garbage");
     const auto r = run(tree);
@@ -368,7 +509,7 @@ TEST_CASE("scan: an unenumerable archive with no version in its name is an unrea
 }
 
 TEST_CASE("scan: the first cause recorded is reported, the walk's before the archives'",
-          "[runtime][component_scan][completeness]") {
+          "[runtime][component_scan][completeness][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/broken.jar", "garbage");
     tree.dangling_dir("/opt/gone");
@@ -378,7 +519,7 @@ TEST_CASE("scan: the first cause recorded is reported, the walk's before the arc
 }
 
 TEST_CASE("scan: one deadline covers the archive phase, and no archive is opened after it",
-          "[runtime][component_scan][budget]") {
+          "[runtime][component_scan][budget][component_inventory]") {
     SECTION("expiry between archives") {
         MemTree tree;
         for (const char* d : {"a", "b", "c"})
@@ -435,7 +576,7 @@ TEST_CASE("scan: one deadline covers the archive phase, and no archive is opened
     }
 }
 
-TEST_CASE("scan: every archive is opened once and read only through that view", "[runtime][component_scan]") {
+TEST_CASE("scan: every archive is opened once and read only through that view", "[runtime][component_scan][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/one.jar",
                   build_zip({deflated(kPomEntry, pom_with("1.1")), nested_lib("lib/x-1.jar", 1)}).bytes);
@@ -453,7 +594,7 @@ TEST_CASE("scan: every archive is opened once and read only through that view", 
     }
 }
 
-TEST_CASE("scan: row caps are recorded, never silent", "[runtime][component_scan][budget]") {
+TEST_CASE("scan: row caps are recorded, never silent", "[runtime][component_scan][budget][component_inventory]") {
     const auto fat = [] {
         std::vector<Entry> e;
         for (int i = 0; i < 5; ++i)
@@ -489,46 +630,72 @@ TEST_CASE("scan: row caps are recorded, never silent", "[runtime][component_scan
     }
 }
 
+TEST_CASE("scan: the rows-per-folder quota is per root, so same-named folders under two roots do not share one",
+          "[runtime][component_scan][budget]") {
+    MemTree tree;
+    for (const char* root : {"/opt", "/usr/local/lib"})
+        for (const char* jar : {"one-1.0.jar", "two-1.0.jar"})
+            tree.add_file(std::string(root) + "/acme/" + jar, build_zip({stored("x", "y")}).bytes);
+    WalkLimits limits;
+    limits.max_rows_per_anchor = 3; // each `acme` holds two archives: 2 + 2 across the roots, never 3 in one
+    const auto r = run(tree, {"/opt", "/usr/local/lib"}, limits);
+    CHECK(r.stop == Stop::complete);
+    CHECK(r.rows.size() == 4);
+
+    // Control: one folder over the same quota is still recorded, not silent.
+    MemTree one;
+    for (const char* jar : {"one-1.0.jar", "two-1.0.jar", "three-1.0.jar", "four-1.0.jar"})
+        one.add_file(std::string("/opt/acme/") + jar, build_zip({stored("x", "y")}).bytes);
+    const auto capped = run(one, {"/opt"}, limits);
+    CHECK(capped.stop == Stop::anchor_rows);
+    CHECK(capped.rows.size() == 3);
+}
+
 TEST_CASE("verdict: only a complete scan is supported; the table is a pure function",
-          "[runtime][component_scan][verdict]") {
+          "[runtime][component_scan][verdict][component_inventory]") {
     const Stop all[] = {Stop::budget_entries, Stop::budget_time,   Stop::anchor_rows,
                         Stop::section_rows,   Stop::depth,         Stop::dir_unreadable,
                         Stop::dir_truncated,  Stop::archive_unenumerated, Stop::archive_changed};
     for (const Stop s : all) {
         INFO(to_token(s));
         // Informational counters never rescue a non-complete stop.
-        const auto v = scan_verdict("linux", s, false, 2, 3, 4);
+        const auto v = scan_verdict("linux", s, false, 2, 5, 3, 4);
         CHECK(v.level == StatusLevel::constrained);
         CHECK_FALSE(v.complete);
         CHECK(v.tokens == "linux:component_inventory:" + std::string(to_token(s)));
     }
 
     SECTION("mount table unreadable maps to constrained (that nothing is walked is pinned by answer_scan)") {
-        const auto v = scan_verdict("macos", Stop::complete, true, 0, 0, 0);
+        const auto v = scan_verdict("macos", Stop::complete, true, 0, 0, 0, 0);
         CHECK(v.level == StatusLevel::constrained);
         CHECK_FALSE(v.complete);
         CHECK(v.tokens == "macos:component_inventory:mount_table_unreadable");
     }
     SECTION("complete with nothing to add") {
-        const auto v = scan_verdict("linux", Stop::complete, false, 0, 0, 0);
+        const auto v = scan_verdict("linux", Stop::complete, false, 0, 0, 0, 0);
         CHECK(v.level == StatusLevel::supported);
         CHECK(v.complete);
         CHECK(v.tokens.empty());
     }
     SECTION("informational tokens ride a supported row and never change the level") {
-        const auto v = scan_verdict("linux", Stop::complete, false, 1, 1, 1);
+        const auto v = scan_verdict("linux", Stop::complete, false, 1, 1, 1, 1);
         CHECK(v.level == StatusLevel::supported);
         CHECK(v.complete);
         CHECK(v.tokens ==
-              "linux:component_inventory:root_link_skipped,linux:component_inventory:network_fs_skipped,"
-              "linux:component_inventory:version_unreadable");
-        const auto one = scan_verdict("macos", Stop::complete, false, 0, 5, 0);
+              "linux:component_inventory:root_link_skipped,linux:component_inventory:link_skipped,"
+              "linux:component_inventory:network_fs_skipped,linux:component_inventory:version_unreadable");
+        const auto one = scan_verdict("macos", Stop::complete, false, 0, 0, 5, 0);
         CHECK(one.level == StatusLevel::supported);
         CHECK(one.tokens == "macos:component_inventory:network_fs_skipped");
+        // A link met inside a tree is reported on its own, not folded into the root token.
+        const auto link = scan_verdict("macos", Stop::complete, false, 0, 3, 0, 0);
+        CHECK(link.level == StatusLevel::supported);
+        CHECK(link.complete);
+        CHECK(link.tokens == "macos:component_inventory:link_skipped");
     }
 }
 
-TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[runtime][component_scan][heartbeat]") {
+TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[runtime][component_scan][heartbeat][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/fat-1.0.jar", build_zip({nested_lib("lib/x-1.jar", 1)}).bytes);
     tree.add_dir("/opt/a/sub");
@@ -560,7 +727,7 @@ TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[runtime
     CHECK(got.at("heartbeat.mounts_skipped") == "0");
 }
 
-TEST_CASE("wire row: nine fields, every text field escaped", "[runtime][component_scan][wire]") {
+TEST_CASE("wire row: nine fields, every text field escaped", "[runtime][component_scan][wire][component_inventory]") {
     Row r;
     r.name = "a|b";
     r.version = "1.0";
@@ -615,7 +782,7 @@ Answer answer_over(MemTree& tree, const FakeTargets& t = {}) {
 
 } // namespace
 
-TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[runtime][component_scan][answer]") {
+TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[runtime][component_scan][answer][component_inventory]") {
     int made = 0;
     int touched = 0;
     FakeTargets t;
@@ -649,7 +816,7 @@ TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[runti
 }
 
 TEST_CASE("answer: a readable table scans through the factory and carries what the targets dropped",
-          "[runtime][component_scan][answer]") {
+          "[runtime][component_scan][answer][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/lib-1.0.jar", build_zip({stored("x", "y")}).bytes);
     FakeTargets t;
@@ -671,8 +838,59 @@ TEST_CASE("answer: a readable table scans through the factory and carries what t
                             std::to_string(tree.files["/opt/a/lib-1.0.jar"].size()) + "|1700000000|a");
 }
 
+TEST_CASE("answer: a link inside the tree is reported, never a bare supported", "[runtime][component_scan][answer]") {
+    SECTION("a link to an archive: the archive is not listed and the token says a link was passed over") {
+        MemTree tree;
+        tree.add_file("/opt/app/lib/real-1.0.jar", build_zip({stored("x", "y")}).bytes);
+        tree.add_link("/opt/app/lib/log4j-core-2.14.1.jar");
+        const auto a = answer_over(tree);
+
+        CHECK(a.res.stop == Stop::complete);
+        CHECK(a.res.stats.links_skipped == 1);
+        CHECK(a.verdict.complete);
+        CHECK(a.verdict.level == StatusLevel::supported);
+        REQUIRE(a.lines.size() == 2); // the status row and the one real archive
+        CHECK(a.lines[0] == "status|scan|supported|linux:component_inventory:link_skipped");
+    }
+    SECTION("a link to a directory: it is not entered") {
+        MemTree tree;
+        tree.add_file("/opt/app/real/a-1.0.jar", build_zip({stored("x", "y")}).bytes);
+        tree.add_link("/opt/app/current");
+        const auto a = answer_over(tree);
+        CHECK(a.verdict.complete);
+        CHECK(a.lines[0] == "status|scan|supported|linux:component_inventory:link_skipped");
+        CHECK(tree.listed == std::vector<std::string>{"/opt", "/opt/app", "/opt/app/real"});
+    }
+    SECTION("beside the other informational tokens, in the verdict's order") {
+        MemTree tree;
+        tree.add_file("/opt/app/plain.jar", build_zip({stored("x", "y")}).bytes);
+        tree.add_link("/opt/app/shortcut");
+        FakeTargets t;
+        t.roots_link_skipped = 1;
+        const auto a = answer_over(tree, t);
+        CHECK(a.lines[0] == "status|scan|supported|linux:component_inventory:root_link_skipped,"
+                            "linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable");
+    }
+    SECTION("a scan that stopped for a cause reports that cause alone") {
+        MemTree tree;
+        tree.add_file("/opt/app/a-1.0.jar", build_zip({stored("x", "y")}).bytes);
+        tree.add_link("/opt/app/shortcut");
+        tree.dangling_dir("/opt/gone");
+        const auto a = answer_over(tree);
+        CHECK(a.res.stats.links_skipped == 1);
+        CHECK_FALSE(a.verdict.complete);
+        CHECK(a.lines[0] == "status|scan|constrained|linux:component_inventory:dir_unreadable");
+    }
+    SECTION("no link, no token") {
+        MemTree tree;
+        tree.add_file("/opt/app/a-1.0.jar", build_zip({stored("x", "y")}).bytes);
+        const auto a = answer_over(tree);
+        CHECK(a.lines[0] == "status|scan|supported|-");
+    }
+}
+
 TEST_CASE("emit: rows first, the typed result, then all six heartbeat keys with the scan's values",
-          "[runtime][component_scan][answer][heartbeat]") {
+          "[runtime][component_scan][answer][heartbeat][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/fat-1.0.jar", build_zip({nested_lib("lib/x-1.jar", 1)}).bytes);
     tree.list_step = 5ms;
@@ -703,7 +921,7 @@ TEST_CASE("emit: rows first, the typed result, then all six heartbeat keys with 
 }
 
 TEST_CASE("emit: an incomplete scan still writes its rows and answers CONSTRAINED/PARTIAL with the cause",
-          "[runtime][component_scan][answer]") {
+          "[runtime][component_scan][answer][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/ok-1.0.jar", build_zip({stored("x", "y")}).bytes);
     tree.dangling_dir("/opt/gone");
@@ -723,7 +941,7 @@ TEST_CASE("emit: an incomplete scan still writes its rows and answers CONSTRAINE
     CHECK(kv.sets.size() == 6); // the cost of a degraded scan is published too
 }
 
-TEST_CASE("emit: no plugin context is tolerated", "[runtime][component_scan][answer]") {
+TEST_CASE("emit: no plugin context is tolerated", "[runtime][component_scan][answer][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/ok-1.0.jar", build_zip({stored("x", "y")}).bytes);
     const auto a = answer_over(tree);
@@ -734,7 +952,7 @@ TEST_CASE("emit: no plugin context is tolerated", "[runtime][component_scan][ans
 }
 
 TEST_CASE("emit and catch-all: the status row is owed exactly when no row was written",
-          "[runtime][component_scan][answer]") {
+          "[runtime][component_scan][answer][component_inventory]") {
     MemTree tree;
     tree.add_file("/opt/a/ok-1.0.jar", build_zip({stored("x", "y")}).bytes);
     const auto a = answer_over(tree);
@@ -771,7 +989,7 @@ TEST_CASE("emit and catch-all: the status row is owed exactly when no row was wr
     }
 }
 
-TEST_CASE("catch-all: a failure while answering is swallowed, never thrown", "[runtime][component_scan][answer]") {
+TEST_CASE("catch-all: a failure while answering is swallowed, never thrown", "[runtime][component_scan][answer][component_inventory]") {
     SECTION("the row fails: the typed result still lands") {
         FakeCtx ctx;
         ctx.throw_on_write = 0;
@@ -816,7 +1034,7 @@ struct TempTree {
 
 } // namespace
 
-TEST_CASE("scan: through the real POSIX leg over a materialised tree", "[runtime][component_scan][posix]") {
+TEST_CASE("scan: through the real POSIX leg over a materialised tree", "[runtime][component_scan][posix][component_inventory]") {
     TempTree tmp;
     tmp.write("app/lib/widget.jar",
               build_zip({deflated(kPomEntry, pom_with("3.4.5"))}).bytes);

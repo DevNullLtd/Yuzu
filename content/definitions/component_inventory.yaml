@@ -9,8 +9,9 @@
 ##            /usr/share/maven.
 ##   macOS:   /Applications, /Library/Java, /usr/local and /opt/homebrew.
 ##   Both:    a root that is missing is not an error; a root reached through a link or sitting on
-##            a network mount is dropped and reported. No link is followed at any path component.
-##            Network mounts are read from /proc/self/mountinfo (Linux) or getmntinfo_r_np (macOS).
+##            a network mount is dropped and reported. No link is followed at any path component,
+##            so a link inside a tree is not entered or listed; that is reported too (`link_skipped`).
+##            Network mounts are read from /proc/<pid>/mountinfo (Linux) or getmntinfo_r_np (macOS).
 ## Candidates are files ending .jar, .war or .ear. For each one the archive's central directory
 ## is read in-process; the libraries nested one level deep (BOOT-INF/lib/, WEB-INF/lib/ or lib/)
 ## are listed from that directory alone, none is unpacked.
@@ -21,8 +22,11 @@
 ##
 ## Output: one `status|scan|<level>|<tokens>` row FIRST, then zero or more
 ## `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>` rows.
-## A `supported` status means the scan finished with nothing hidden; it does not mean nothing is
-## installed outside the roots above. A `constrained` status means a bound was hit, a directory
+## A `supported` status means the scan finished with no bound reached and every directory and
+## archive it opened read in full; it does not mean nothing is installed outside the roots above.
+## What it passed over on purpose rides the status row as an informational token, never silent:
+## `root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable`.
+## A `constrained` status means a bound was hit, a directory
 ## or an archive could not be read in full, or the mount table was unreadable: the list may be
 ## incomplete, and the rows that were reachable are still returned.
 
@@ -39,8 +43,9 @@ metadata:
     (name, version and where the version came from, path, size, modification time and the
     application folder it sits under). Linux and macOS only; per-user locations are not read and
     Windows is not read yet. Nothing is started or unpacked. A `supported` status means the scan
-    finished with nothing hidden; a `constrained` status means a bound was hit or something could
-    not be read in full, so the list may be incomplete.
+    finished and read everything it opened in full, naming in a token any link or network mount it
+    passed over; a `constrained` status means a bound was hit or something could not be read in
+    full, so the list may be incomplete.
   tags: [components, java, inventory]
 
 spec:

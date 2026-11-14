@@ -90,6 +90,7 @@ struct WalkLimits {
 struct Candidate {
     std::string path;
     std::string anchor_app; // first path component below the root
+    std::size_t root{0};    // index of the root it was found under: an anchor's quota is per root
 };
 
 struct WalkStats {
@@ -168,10 +169,10 @@ namespace walk_detail {
         std::string anchor; // empty for the root itself
     };
 
-    for (const auto& root : roots) {
+    for (std::size_t root_index = 0; root_index < roots.size(); ++root_index) {
         std::unordered_map<std::string, std::size_t> anchor_rows; // per root
         std::deque<Pending> queue;
-        queue.push_back({root, 0, {}});
+        queue.push_back({roots[root_index], 0, {}});
 
         while (!queue.empty()) {
             if (fs.now() >= deadline) {
@@ -229,7 +230,7 @@ namespace walk_detail {
                     return out;
                 }
                 ++rows;
-                out.candidates.push_back({walk_detail::join(cur.path, e.name), anchor});
+                out.candidates.push_back({walk_detail::join(cur.path, e.name), anchor, root_index});
             }
         }
     }

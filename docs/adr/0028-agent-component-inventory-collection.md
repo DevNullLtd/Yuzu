@@ -1495,7 +1495,11 @@ the archive's central directory alone. OSes: Linux and macOS. Roots, machine-wid
 (per-user locations are never read): Linux `/opt`, `/usr/share/java`, `/usr/lib/jvm`, `/usr/local/lib`,
 `/usr/local/share`, `/usr/share/maven`; macOS `/Applications`, `/Library/Java`, `/usr/local`,
 `/opt/homebrew`. No link is followed at any path component, and a root on a network mount is dropped.
-The action runs on demand; the daily sync does not carry it yet.
+This slice follows no link at all, which supersedes Decision 1's "ordinary in-root version symlinks are
+followed and resolved normally" for now: a link inside a tree is not entered and a link to an archive is
+not listed, and the answer says so (`link_skipped`, below) instead of skipping it silently. Following
+in-root links, scoped to escapes of the anchored root as Decision 1 describes, is a later change. The
+action runs on demand; the daily sync does not carry it yet.
 
 **Bounds as built.** 400,000 directory entries and 45 seconds per scan (one deadline covering the walk,
 the archive reads and the parsing, checked between directories and between archives, so one blocked
@@ -1505,15 +1509,17 @@ names, and the `pom.properties` and `MANIFEST.MF` entries read only up to 64 KiB
 inflated. ZIP64 archives are not enumerated.
 
 **Completeness rule as built (Decision 4).** The answer is `supported` (typed result OK/FULL) only when
-nothing was hidden. It is `constrained` (CONSTRAINED/PARTIAL), with the first cause as an
-`<os>:component_inventory:<cause>` token, for: `budget_entries`, `budget_time`, `section_rows`,
+no bound was reached and every directory and archive it opened was read in full. It is `constrained`
+(CONSTRAINED/PARTIAL), with the first cause as an `<os>:component_inventory:<cause>` token, for: `budget_entries`, `budget_time`, `section_rows`,
 `anchor_rows`, `depth`, `dir_unreadable`, `dir_truncated`, `archive_unenumerated` (an archive that could
 not be opened, read or parsed, ZIP64 included), `archive_changed` (an archive that changed while it was
 read) and `mount_table_unreadable` (nothing is walked, because a network mount could not be told from a
 local one). The rows that were reachable are returned at both levels. Reported but not blocking
-(informational tokens on a `supported` row): `root_link_skipped`, `network_fs_skipped` and
+(informational tokens on a `supported` row): `root_link_skipped` (a root dropped for a link),
+`link_skipped` (a link met inside a tree, not entered and not listed), `network_fs_skipped` and
 `version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
-A missing root is skipped silently.
+A missing root is skipped silently. A `constrained` answer names its cause alone; the informational
+tokens ride a `supported` row only.
 
 **Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
 (`zip_directory.hpp`: the end-record search, the directory walk and the local-header offset) with
@@ -1522,7 +1528,14 @@ in ClusterFuzzLite on pull requests (`cflite-pr.yml`) and in the batch run (`cfl
 path-filtered to `zip_directory*`. The Java file-name, manifest and `pom.properties` parsers and the
 capped inflate are covered by unit tests only, not by a fuzz target.
 
-**Still open.** The Windows leg (answers `windows:planned` today); Python and Node kinds; the daily-report
-section and the amendment to Decision 3 that goes with it; the customer opt-out switch (Decision 2 and
-Decision 8); and the `component_inventory.future_dated_rejected` audit event, which belongs to the store
-that does not exist yet.
+**Still open.**
+- The Windows leg (answers `windows:planned` today). It also brings the name-based exclusion of
+  OS-owned trees (`\WindowsApps`, `\Windows Kits`, `\WinSxS`, `\Windows`, `\System32`, `\SysWOW64`).
+  The Linux and macOS roots above hold no OS-owned tree, so this slice excludes no directory by name.
+- The hard per-cycle time bound (the sync assembler's bounded wait) arrives with the daily-report
+  section. Until then the 45 second budget is checked between directories and between archives, so one
+  blocked read inside a listing or a file read is not interrupted.
+- Python and Node kinds; the daily-report section and the amendment to Decision 3 that goes with it;
+  the customer opt-out switch (Decision 2 and Decision 8); and the
+  `component_inventory.future_dated_rejected` audit event, which belongs to the store that does not
+  exist yet.

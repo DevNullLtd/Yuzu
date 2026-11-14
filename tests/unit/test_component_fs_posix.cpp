@@ -9,9 +9,11 @@
  * directory is itself reached through a link on macOS (/var -> /private/var), and a leg that follows
  * no link would otherwise refuse the test's own root.
  *
- * The mount table is driven through read_mountinfo_stream and scan_targets(reader) with scripted reads,
- * so a read that fails part-way (EIO after a chunk of local mounts) is exercised through the same code
- * the live /proc reader runs, not just as a boolean handed to plan_targets.
+ * The mount table is driven through read_mountinfo_stream and scan_targets(candidates, reader) with
+ * scripted reads, so a read that fails part-way (EIO after a chunk of local mounts) is exercised
+ * through the same code the live /proc reader runs, not just as a boolean handed to plan_targets. The
+ * candidate roots are injected too: the cases open directories of their own temporary tree and never
+ * the host's real machine roots (only candidate_roots() itself is read, for its list).
  *
  * MUTATION NOTES (each assertion below FAILS if the named wiring is removed):
  *  - returning what read_mountinfo_stream has accumulated when a read fails (instead of nullopt) fails
@@ -25,6 +27,7 @@
  *  - dropping the S_ISLNK probe from the failing hop makes a linked root read as merely missing and
  *    fails the roots_link_skipped counts.
  *  - replacing the descriptor compare in unchanged() with nothing fails the append and time cases.
+ *  - adding, dropping or renaming a machine root in candidate_roots() fails the exact-set case.
  */
 #if !defined(_WIN32)
 
@@ -147,6 +150,23 @@ TEST_CASE("component_legs: candidate_roots are absolute, unslashed machine roots
                              r.starts_with("/Library");
         CHECK(allowed);
     }
+}
+
+TEST_CASE("component_legs: candidate_roots is exactly the documented machine-root set for this OS",
+          "[runtime][component_inventory][legs]") {
+    // The machine-scope boundary of ADR-0028 Decision 1, copied by hand into the README, the user
+    // manual, the privilege model, the definition and the descriptor: a root added or dropped here
+    // must change this list and those documents together.
+#if defined(__APPLE__)
+    std::vector<std::string> want{"/Applications", "/Library/Java", "/usr/local", "/opt/homebrew"};
+#else
+    std::vector<std::string> want{"/opt",           "/usr/share/java",  "/usr/lib/jvm",
+                                  "/usr/local/lib", "/usr/local/share", "/usr/share/maven"};
+#endif
+    auto got = candidate_roots();
+    std::ranges::sort(got);
+    std::ranges::sort(want);
+    CHECK(got == want);
 }
 
 TEST_CASE("component_legs: plan_targets drops a root on or under a network mount",
@@ -274,11 +294,14 @@ TEST_CASE("component_legs: a mount-table line over 1 MiB is a failure however it
 
 TEST_CASE("component_legs: scan_targets over a table that fails part-way yields no roots and touches nothing",
           "[runtime][component_inventory][legs]") {
+    Tree tree;
+    REQUIRE(fs::create_directories(tree.root / "app"));
+    const std::vector<std::string> cands{(tree.root / "app").string()};
     std::vector<std::string> log;
     const auto on_access = [&log](const std::string& p) { log.push_back(p); };
 
     // The production acquisition path: partial read, then EIO, then planning.
-    const auto t = scan_targets(table_of(serve(kLocalMount, 4096, EIO)), on_access);
+    const auto t = scan_targets(cands, table_of(serve(kLocalMount, 4096, EIO)), on_access);
     CHECK(t.mount_table_unreadable);
     CHECK(t.roots.empty());
     CHECK(t.network_mounts.empty());
@@ -287,29 +310,36 @@ TEST_CASE("component_legs: scan_targets over a table that fails part-way yields 
     CHECK(log.empty()); // no candidate root was opened
 
     // The reader that reports nullopt itself (the macOS shape) is the same.
-    const auto u = scan_targets([]() -> std::optional<std::vector<std::string>> { return std::nullopt; }, on_access);
+    const auto u = scan_targets(
+        cands, []() -> std::optional<std::vector<std::string>> { return std::nullopt; }, on_access);
     CHECK(u.mount_table_unreadable);
     CHECK(u.roots.empty());
     CHECK(log.empty());
 
-    // Control: the same stream read in full plans roots, and opens them.
-    const auto ok = scan_targets(table_of(serve(kLocalMount, 4096)), on_access);
+    // Control: the same stream read in full plans the candidate, and opens it.
+    const auto ok = scan_targets(cands, table_of(serve(kLocalMount, 4096)), on_access);
     CHECK_FALSE(ok.mount_table_unreadable);
+    CHECK(ok.roots == cands);
     CHECK_FALSE(log.empty());
 }
 
 TEST_CASE("component_legs: scan_targets drops a candidate root on a mount named by the stream, unopened",
           "[runtime][component_inventory][legs]") {
-    const auto cands = candidate_roots();
-    REQUIRE_FALSE(cands.empty());
+    Tree tree;
+    REQUIRE(fs::create_directories(tree.root / "local"));
+    REQUIRE(fs::create_directories(tree.root / "shared" / "sub"));
+    const std::string local = (tree.root / "local").string();
+    const std::string shared = (tree.root / "shared").string();
     std::vector<std::string> log;
     const auto t = scan_targets(
-        table_of(serve(kLocalMount + "41 22 0:41 / " + cands[0] + " rw - nfs4 srv:/y rw\n", 100)),
+        {local, shared},
+        table_of(serve(kLocalMount + "41 22 0:41 / " + shared + " rw - nfs4 srv:/y rw\n", 100)),
         [&log](const std::string& p) { log.push_back(p); });
     CHECK_FALSE(t.mount_table_unreadable);
-    CHECK(t.roots_network_skipped >= 1);
-    CHECK(std::ranges::find(t.roots, cands[0]) == t.roots.end());
-    CHECK(std::ranges::none_of(log, [&](const std::string& p) { return p == cands[0] || p.starts_with(cands[0] + "/"); }));
+    CHECK(t.roots_network_skipped == 1);
+    CHECK(t.roots == std::vector<std::string>{local});
+    CHECK_FALSE(log.empty()); // the local candidate was opened
+    CHECK(std::ranges::none_of(log, [&](const std::string& p) { return p == shared || p.starts_with(shared + "/"); }));
 }
 
 TEST_CASE("component_legs: a root reached through a link at any component is dropped and counted",

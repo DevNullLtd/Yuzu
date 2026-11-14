@@ -79,8 +79,11 @@ using ReadChunk = std::function<ssize_t(char* buf, std::size_t len)>;
 /// Test seam: where scan_targets gets the network mount points. nullopt: the table could not be read.
 using MountTableReader = std::function<std::optional<std::vector<std::string>>()>;
 
-/// scan_targets over an injected mount-table source (the live one is the overload below).
-[[nodiscard]] Targets scan_targets(const MountTableReader& read_mounts, AccessLog on_access = {});
+/// scan_targets over an injected candidate list and mount-table source (the live ones are the overload
+/// below): nothing outside `candidates` is opened, so a unit test points it at a temporary tree and
+/// never at the host's real roots.
+[[nodiscard]] Targets scan_targets(const std::vector<std::string>& candidates,
+                                   const MountTableReader& read_mounts, AccessLog on_access = {});
 
 /// Reads the live mount table (Linux /proc/<pid>/mountinfo through yuzu::shared::network_mount_points,
 /// macOS yuzu::shared::read_macos_network_mounts), plans candidate_roots() against it and drops the

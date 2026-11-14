@@ -437,9 +437,11 @@ It reads the archive files themselves in-process; nothing is started or unpacked
   not be enumerated or changed while it was read (`archive_unenumerated`, `archive_changed`), or the
   mount table could not be read so nothing was walked (`mount_table_unreadable`). Each token is
   prefixed `<os>:component_inventory:`. The rows that were reachable are still returned. Only
-  `supported` means the scan finished with nothing hidden.
+  `supported` means the scan finished: no bound was reached and every directory and archive it
+  opened was read in full.
 - **Reported without blocking the answer.** A root dropped because it is a link
-  (`root_link_skipped`), a root or directory on a network mount that was passed over
+  (`root_link_skipped`), a link met inside a tree (`link_skipped`: the scan follows no link, so the
+  link is neither entered nor listed), a root or directory on a network mount that was passed over
   (`network_fs_skipped`) and a row with no readable version (`version_unreadable`) ride the
   `supported` status row as information. A missing root is skipped silently.
 - **When it runs.** On demand only, as an instruction. The daily report does not carry these rows

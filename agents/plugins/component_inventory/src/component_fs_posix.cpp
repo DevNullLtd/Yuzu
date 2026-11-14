@@ -359,15 +359,16 @@ void drop_unreachable_roots(Targets& t, AccessLog on_access) {
     });
 }
 
-Targets scan_targets(const MountTableReader& read_mounts, AccessLog on_access) {
+Targets scan_targets(const std::vector<std::string>& candidates, const MountTableReader& read_mounts,
+                     AccessLog on_access) {
     const auto mounts = read_mounts();
-    Targets t = plan_targets(candidate_roots(), mounts.value_or(std::vector<std::string>{}), mounts.has_value());
+    Targets t = plan_targets(candidates, mounts.value_or(std::vector<std::string>{}), mounts.has_value());
     drop_unreachable_roots(t, std::move(on_access));
     return t;
 }
 
 Targets scan_targets() {
-    return scan_targets(read_network_mounts);
+    return scan_targets(candidate_roots(), read_network_mounts);
 }
 
 FsOps make_fs_ops(const Targets& targets, AccessLog on_access) {

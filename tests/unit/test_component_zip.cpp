@@ -130,7 +130,7 @@ std::expected<ZipTail, ZipError> find(const Bytes& file) {
 
 } // namespace
 
-TEST_CASE("zip: a small archive yields its entries with offsets and sizes", "[runtime][component_zip]") {
+TEST_CASE("zip: a small archive yields its entries with offsets and sizes", "[runtime][component_zip][component_inventory]") {
     const auto b = build({{"META-INF/MANIFEST.MF", 0, "Manifest-Version: 1.0\r\n"},
                           {"lib/a.class", 8, "xyz"}});
     const auto tail = find(b.file);
@@ -159,7 +159,7 @@ TEST_CASE("zip: a small archive yields its entries with offsets and sizes", "[ru
     CHECK(seen[1].local_header_offset == 30 + 20 + 23);
 }
 
-TEST_CASE("zip: an empty archive (end record only) has no entries", "[runtime][component_zip]") {
+TEST_CASE("zip: an empty archive (end record only) has no entries", "[runtime][component_zip][component_inventory]") {
     Bytes f;
     put_eocd(f, 0, 0, 0);
     const auto tail = find(f);
@@ -172,7 +172,7 @@ TEST_CASE("zip: an empty archive (end record only) has no entries", "[runtime][c
 }
 
 TEST_CASE("zip: truncating the tail at every boundary is an error, never a read overrun",
-          "[runtime][component_zip]") {
+          "[runtime][component_zip][component_inventory]") {
     const auto b = build({{"a.txt", 0, "hello"}, {"b/c.txt", 0, "world!"}});
     for (std::size_t n = 0; n < b.file.size(); ++n) {
         // Both a prefix as the whole file and a prefix as a tail of the real file.
@@ -182,7 +182,7 @@ TEST_CASE("zip: truncating the tail at every boundary is an error, never a read 
     CHECK(find(b.file).has_value());
 }
 
-TEST_CASE("zip: truncating the directory at every boundary is an error", "[runtime][component_zip]") {
+TEST_CASE("zip: truncating the directory at every boundary is an error", "[runtime][component_zip][component_inventory]") {
     const auto b = build({{"a.txt", 0, "hello"}, {"b/c.txt", 0, "world!"}});
     for (std::size_t n = 0; n < b.cd_size; ++n) {
         auto r = for_each_central_entry(view(b.file, b.cd_off, n), 2,
@@ -193,7 +193,7 @@ TEST_CASE("zip: truncating the directory at every boundary is an error", "[runti
 }
 
 TEST_CASE("zip: a directory above the cap is refused from the end record alone",
-          "[runtime][component_zip]") {
+          "[runtime][component_zip][component_inventory]") {
     Bytes f; // only the 22-byte end record is in hand; no directory byte exists
     put_eocd(f, 1, static_cast<std::uint32_t>(kMaxCdBytes + 1), 0);
     auto r = find_central_directory(f, 64ULL * 1024 * 1024);
@@ -206,7 +206,7 @@ TEST_CASE("zip: a directory above the cap is refused from the end record alone",
     CHECK(find_central_directory(g, 64ULL * 1024 * 1024).has_value());
 }
 
-TEST_CASE("zip: a directory that runs past the end record is refused", "[runtime][component_zip]") {
+TEST_CASE("zip: a directory that runs past the end record is refused", "[runtime][component_zip][component_inventory]") {
     Bytes f;
     put_eocd(f, 1, 100, 0); // 100 directory bytes claimed, file is only the end record
     auto r = find_central_directory(f, f.size());
@@ -218,7 +218,7 @@ TEST_CASE("zip: a directory that runs past the end record is refused", "[runtime
     CHECK_FALSE(find_central_directory(wrap, wrap.size()).has_value());
 }
 
-TEST_CASE("zip: 60000 entries are visited one at a time", "[runtime][component_zip]") {
+TEST_CASE("zip: 60000 entries are visited one at a time", "[runtime][component_zip][component_inventory]") {
     constexpr std::uint32_t kN = 60000;
     Bytes cd;
     for (std::uint32_t i = 0; i < kN; ++i) {
@@ -244,7 +244,7 @@ TEST_CASE("zip: 60000 entries are visited one at a time", "[runtime][component_z
     CHECK(last_off == 59999);
 }
 
-TEST_CASE("zip: the visitor can stop early without an error", "[runtime][component_zip]") {
+TEST_CASE("zip: the visitor can stop early without an error", "[runtime][component_zip][component_inventory]") {
     const auto b = build({{"a", 0, ""}, {"b", 0, ""}, {"c", 0, ""}});
     int n = 0;
     auto r = for_each_central_entry(view(b.file, b.cd_off, b.cd_size), 3, [&](const ZipEntry&) {
@@ -254,7 +254,7 @@ TEST_CASE("zip: the visitor can stop early without an error", "[runtime][compone
     CHECK(n == 2);
 }
 
-TEST_CASE("zip: more declared entries than records is truncated", "[runtime][component_zip]") {
+TEST_CASE("zip: more declared entries than records is truncated", "[runtime][component_zip][component_inventory]") {
     const auto b = build({{"a", 0, ""}});
     auto r = for_each_central_entry(view(b.file, b.cd_off, b.cd_size), 2,
                                     [](const ZipEntry&) { return true; });
@@ -262,7 +262,7 @@ TEST_CASE("zip: more declared entries than records is truncated", "[runtime][com
     CHECK(r.error() == ZipError::truncated);
 }
 
-TEST_CASE("zip: a directory with bytes past its declared records is refused", "[runtime][component_zip]") {
+TEST_CASE("zip: a directory with bytes past its declared records is refused", "[runtime][component_zip][component_inventory]") {
     SECTION("fewer declared entries than records") {
         const auto b = build({{"a", 0, ""}, {"b", 0, ""}});
         int visited = 0;
@@ -295,7 +295,7 @@ TEST_CASE("zip: a directory with bytes past its declared records is refused", "[
     }
 }
 
-TEST_CASE("zip: ZIP64 markers are refused", "[runtime][component_zip]") {
+TEST_CASE("zip: ZIP64 markers are refused", "[runtime][component_zip][component_inventory]") {
     SECTION("sentinel cd_offset") {
         Bytes f;
         put_eocd(f, 1, 46, 0xFFFFFFFFU);
@@ -333,7 +333,7 @@ TEST_CASE("zip: ZIP64 markers are refused", "[runtime][component_zip]") {
 }
 
 TEST_CASE("zip: a fake end signature in the archive comment does not redirect the parse",
-          "[runtime][component_zip]") {
+          "[runtime][component_zip][component_inventory]") {
     // The comment is a valid-looking end record claiming a directory far
     // outside the file, with a comment length that does not reach the buffer end.
     Bytes fake;
@@ -358,7 +358,7 @@ TEST_CASE("zip: a fake end signature in the archive comment does not redirect th
     CHECK(r.error() == ZipError::bad_record);
 }
 
-TEST_CASE("zip: record validation", "[runtime][component_zip]") {
+TEST_CASE("zip: record validation", "[runtime][component_zip][component_inventory]") {
     SECTION("bad central signature") {
         Item it{"a", 0, ""};
         Bytes cd;
@@ -427,7 +427,7 @@ TEST_CASE("zip: record validation", "[runtime][component_zip]") {
     }
 }
 
-TEST_CASE("zip: no end record is not_zip", "[runtime][component_zip]") {
+TEST_CASE("zip: no end record is not_zip", "[runtime][component_zip][component_inventory]") {
     Bytes junk(100, std::byte{0x41});
     auto r = find_central_directory(junk, junk.size());
     REQUIRE_FALSE(r.has_value());
@@ -436,7 +436,7 @@ TEST_CASE("zip: no end record is not_zip", "[runtime][component_zip]") {
 }
 
 TEST_CASE("zip: local_data_offset reads the local lengths, not the central ones",
-          "[runtime][component_zip]") {
+          "[runtime][component_zip][component_inventory]") {
     Item it{"lib/a.class", 8, "abc"};
     Bytes local;
     put_local(local, it, 6); // 6 extra bytes in the local header only
@@ -472,7 +472,7 @@ TEST_CASE("zip: local_data_offset reads the local lengths, not the central ones"
     CHECK(local_data_offset(local, e, UINT64_MAX).error() == ZipError::bad_record);
 }
 
-TEST_CASE("zip: an archive with prepended bytes is read through its prefix", "[runtime][component_zip]") {
+TEST_CASE("zip: an archive with prepended bytes is read through its prefix", "[runtime][component_zip][component_inventory]") {
     // An executable jar: a launch script in front, internal offsets unadjusted.
     const auto inner = build({{"a.txt", 0, "hello"}, {"lib/b.class", 8, "xyz"}});
     const std::string script = "#!/bin/sh\nexec java -jar \"$0\"\n";
@@ -516,7 +516,7 @@ TEST_CASE("zip: an archive with prepended bytes is read through its prefix", "[r
 }
 
 TEST_CASE("zip: a directory offset past where the directory can start is refused",
-          "[runtime][component_zip]") {
+          "[runtime][component_zip][component_inventory]") {
     // cd_offset beyond (end record - cd_size): negative prefix.
     auto b = build({{"a.txt", 0, "hello"}});
     Bytes f(b.file.begin(), b.file.end() - 22);

@@ -110,6 +110,9 @@ private:
 };
 
 /// Move-only owner of a file descriptor (the file-side twin of ScopedDir).
+/// Not agents/core's ScopedFd on purpose: agents/shared holds zero-dependency header-only leaves with
+/// no core dependency edge (docs/cpp-conventions.md, "What belongs in agents/shared/"), so this header
+/// cannot include scoped_fd.hpp.
 class ScopedFile {
 public:
     ScopedFile() noexcept = default;

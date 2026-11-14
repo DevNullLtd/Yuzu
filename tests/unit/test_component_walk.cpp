@@ -15,6 +15,7 @@
  *  - no exclusion by name: skipping a directory by its name (System, Windows, System32) fails the
  *    ordinary-names case, which would otherwise read complete with its jars silently missing.
  *  - trailing separator: joining without the trailing-'/' check fails the join case (a doubled '/').
+ *  - root index: leaving Candidate::root at 0 fails the multiple-roots case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -59,7 +60,7 @@ WalkResult run(MemTree& fs, const WalkLimits& lim, const std::vector<std::string
 } // namespace
 
 TEST_CASE("component walk: finds jar, war and ear case-insensitively, breadth first, with anchors",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/opt", {D("tomcat"), D("kafka"), F("top.JAR"), F("notes.txt"), F("jar")});
     dir(fs, "/opt/tomcat", {D("webapps"), F("boot.Jar")});
@@ -82,7 +83,7 @@ TEST_CASE("component walk: finds jar, war and ear case-insensitively, breadth fi
     CHECK(fs.total_opens == 0);
 }
 
-TEST_CASE("component walk: joins with '/' and never doubles a trailing one", "[runtime][component_walk]") {
+TEST_CASE("component walk: joins with '/' and never doubles a trailing one", "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/apps/", {D("x")});
     dir(fs, "/apps/x", {F("a.jar")});
@@ -93,7 +94,7 @@ TEST_CASE("component walk: joins with '/' and never doubles a trailing one", "[r
     CHECK(paths(r) == std::vector<std::string>{"/apps/x/a.jar"});
 }
 
-TEST_CASE("component walk: multiple roots, empty roots and dot entries", "[runtime][component_walk]") {
+TEST_CASE("component walk: multiple roots, empty roots and dot entries", "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/a", {F("1.jar"), F("."), F(".."), D(".."), F("")});
     dir(fs, "/b", {F("2.jar")});
@@ -103,10 +104,14 @@ TEST_CASE("component walk: multiple roots, empty roots and dot entries", "[runti
     CHECK(r.stop == Stop::complete);
     CHECK(paths(r) == std::vector<std::string>{"/a/1.jar", "/b/2.jar"});
     CHECK(r.stats.entries == 2); // dot entries are not entries
+    // Each candidate carries the index of its root: the scan keys an anchor's quota on it.
+    REQUIRE(r.candidates.size() == 2);
+    CHECK(r.candidates[0].root == 0);
+    CHECK(r.candidates[1].root == 1);
 }
 
 TEST_CASE("component walk: the entry budget is never exceeded and stops the walk",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     std::vector<DirEntry> big;
     for (int i = 0; i < 100; ++i)
@@ -134,7 +139,7 @@ TEST_CASE("component walk: the entry budget is never exceeded and stops the walk
     CHECK(run(fs, exact, {"/r"}).stop == Stop::budget_entries);
 }
 
-TEST_CASE("component walk: the entry budget spans directories", "[runtime][component_walk]") {
+TEST_CASE("component walk: the entry budget spans directories", "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/r", {D("a"), D("b")});
     dir(fs, "/r/a", {F("1.jar"), F("2.jar")});
@@ -150,7 +155,7 @@ TEST_CASE("component walk: the entry budget spans directories", "[runtime][compo
 }
 
 TEST_CASE("component walk: the fake clock passing the deadline between directories stops with budget_time",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     fs.list_step = 10ms;
     dir(fs, "/r", {D("a"), D("b"), D("c")});
@@ -167,7 +172,7 @@ TEST_CASE("component walk: the fake clock passing the deadline between directori
 }
 
 TEST_CASE("component walk: a deadline that expires on the last directory is not an incomplete walk",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     fs.list_step = 10ms;
     dir(fs, "/r", {F("1.jar")});
@@ -178,7 +183,7 @@ TEST_CASE("component walk: a deadline that expires on the last directory is not 
     CHECK(paths(r) == std::vector<std::string>{"/r/1.jar"});
 }
 
-TEST_CASE("component walk: a deadline already passed lists nothing", "[runtime][component_walk]") {
+TEST_CASE("component walk: a deadline already passed lists nothing", "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/r", {F("1.jar")});
 
@@ -189,7 +194,7 @@ TEST_CASE("component walk: a deadline already passed lists nothing", "[runtime][
 }
 
 TEST_CASE("component walk: candidates beyond max_rows end the walk with section_rows and never exceed it",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     std::vector<DirEntry> e;
     for (int i = 0; i < 8; ++i)
@@ -213,7 +218,7 @@ TEST_CASE("component walk: candidates beyond max_rows end the walk with section_
 }
 
 TEST_CASE("component walk: an anchor past max_rows_per_anchor records anchor_rows and the walk goes on",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/r", {D("big"), D("small")});
     dir(fs, "/r/big", {F("1.jar"), F("2.jar"), F("3.jar"), F("4.jar"), F("5.jar")});
@@ -233,7 +238,7 @@ TEST_CASE("component walk: an anchor past max_rows_per_anchor records anchor_row
 }
 
 TEST_CASE("component walk: a jar deeper than max_depth is not returned and the result is depth",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     // /r (depth 0) / d1 / d2 / d3 / d4
     dir(fs, "/r", {D("d1"), F("shallow.jar")});
@@ -257,7 +262,7 @@ TEST_CASE("component walk: a jar deeper than max_depth is not returned and the r
 }
 
 TEST_CASE("component walk: the default depth backstop of 32 reports depth, never complete",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     std::string p = "/r";
     for (int i = 1; i <= 33; ++i) {
@@ -274,7 +279,7 @@ TEST_CASE("component walk: the default depth backstop of 32 reports depth, never
 }
 
 TEST_CASE("component walk: an unlistable directory is dir_unreadable and its siblings are kept",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/r", {D("locked"), D("open"), F("top.jar")}); // /r/locked has no listing
     dir(fs, "/r/open", {F("a.jar")});
@@ -285,7 +290,7 @@ TEST_CASE("component walk: an unlistable directory is dir_unreadable and its sib
     CHECK(paths(r) == std::vector<std::string>{"/r/top.jar", "/r/open/a.jar"});
 }
 
-TEST_CASE("component walk: an unreadable root is dir_unreadable", "[runtime][component_walk]") {
+TEST_CASE("component walk: an unreadable root is dir_unreadable", "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/ok", {F("a.jar")}); // /gone has no listing
 
@@ -296,7 +301,7 @@ TEST_CASE("component walk: an unreadable root is dir_unreadable", "[runtime][com
 }
 
 TEST_CASE("component walk: a listing cut at max_dir_entries is dir_truncated with the rest intact",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/r", {F("1.jar"), F("2.jar"), F("3.jar"), F("4.jar"), D("sub")});
     dir(fs, "/r/sub", {F("s.jar")});
@@ -315,7 +320,7 @@ TEST_CASE("component walk: a listing cut at max_dir_entries is dir_truncated wit
 }
 
 TEST_CASE("component walk: a leg that over-delivers entries is still cut at max_dir_entries",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     auto ops = fs.ops();
     ops.list = [](const std::string&, std::size_t) { // ignores the cap and does not say truncated
@@ -334,7 +339,7 @@ TEST_CASE("component walk: a leg that over-delivers entries is still cut at max_
 }
 
 TEST_CASE("component walk: links, network mounts and other entries are counted and never listed",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/r", {{"l1", T::link}, {"l2.jar", T::link}, {"nfs", T::network_mount}, {"smb", T::network_mount},
                   {"smb2", T::network_mount}, {"dev", T::other}, {"ok", T::dir}});
@@ -354,7 +359,7 @@ TEST_CASE("component walk: links, network mounts and other entries are counted a
 }
 
 TEST_CASE("component walk: no directory is excluded by name, whatever it is called",
-          "[runtime][component_walk]") {
+          "[runtime][component_walk][component_inventory]") {
     MemTree fs;
     dir(fs, "/opt", {D("System"), D("Windows"), D("System32"), D("app")});
     dir(fs, "/opt/System", {F("bundle.jar")});
@@ -371,7 +376,7 @@ TEST_CASE("component walk: no directory is excluded by name, whatever it is call
                                                 "/opt/app"});
 }
 
-TEST_CASE("component walk: the first cause recorded is the one reported", "[runtime][component_walk]") {
+TEST_CASE("component walk: the first cause recorded is the one reported", "[runtime][component_walk][component_inventory]") {
     SECTION("depth, then an unreadable directory, then an anchor cap") {
         MemTree fs;
         dir(fs, "/r", {D("a"), D("bad"), D("c")});
@@ -418,7 +423,7 @@ TEST_CASE("component walk: the first cause recorded is the one reported", "[runt
     }
 }
 
-TEST_CASE("component walk: to_token covers every Stop value", "[runtime][component_walk]") {
+TEST_CASE("component walk: to_token covers every Stop value", "[runtime][component_walk][component_inventory]") {
     const std::vector<std::pair<Stop, std::string_view>> all{
         {Stop::complete, "complete"},
         {Stop::budget_entries, "budget_entries"},
@@ -441,7 +446,7 @@ TEST_CASE("component walk: to_token covers every Stop value", "[runtime][compone
     CHECK(static_cast<std::size_t>(Stop::archive_changed) + 1 == all.size());
 }
 
-TEST_CASE("component walk: default limits are the roadmap values", "[runtime][component_walk]") {
+TEST_CASE("component walk: default limits are the roadmap values", "[runtime][component_walk][component_inventory]") {
     const WalkLimits l;
     CHECK(l.max_entries == 400000);
     CHECK(l.max_wall == 45s);

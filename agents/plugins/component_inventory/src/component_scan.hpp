@@ -34,6 +34,11 @@
  * Nested libraries are listed from the central directory alone: name and version from the entry
  * name, size = the entry's uncompressed size, mtime = the outer file's. No nested entry is inflated.
  *
+ * REPORTED, NOT BLOCKING (ADR-0028 Decisions 1 and 4: never a silent skip). The leg follows no link,
+ * so a link inside a tree is not entered and a link to an archive is not listed; the walk counts each
+ * (WalkStats::links_skipped) and a complete scan says so with the informational token `link_skipped`,
+ * as `root_link_skipped` does for a root and `network_fs_skipped` for a network mount.
+ *
  * Also here, so the plugin TU holds no decision: the wire row, the status verdict (level, tokens,
  * typed result), the six heartbeat cost values, and the whole `scan` answer around them. The
  * answer (the unreadable-mount-table guard included), its emission (rows, typed result, heartbeat
@@ -55,11 +60,11 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -152,10 +157,10 @@ struct ArchiveRead {
         return std::nullopt;
     if (e.method != 0 && e.method != 8)
         return std::nullopt;
-    const auto at = zip_detail::checked_add(tail.prefix, e.local_header_offset);
+    const auto at = local_header_at(tail, e);
     if (!at)
         return std::nullopt;
-    const auto header = read_exact(fv, *at, zip_detail::kLocalHeaderLen);
+    const auto header = read_exact(fv, *at, kLocalHeaderLen);
     if (!header)
         return std::nullopt;
     const auto data_off = local_data_offset(as_bytes(*header), e, tail.prefix);
@@ -171,7 +176,14 @@ struct ArchiveRead {
 
 /// Open once; read the tail, the directory and (only when the file name gave no version) the
 /// pom.properties and MANIFEST.MF entries, all through the one FileView.
-[[nodiscard]] inline ArchiveRead read_archive(const FsOps& fs, const std::string& path, bool want_version) {
+///
+/// WHICH pom. A shaded archive carries its dependencies' META-INF/maven/<g>/<a>/pom.properties beside
+/// its own, and a dependency's version is not this archive's. So a pom is read only when it can only
+/// be this archive's: the sole pom.properties in the directory, or, among several, the one whose <a>
+/// is `artifact` (the outer row's name) when exactly one is. Otherwise no pom is read and the manifest
+/// decides, else the version is unreadable. Directory order is never the tie-break.
+[[nodiscard]] inline ArchiveRead read_archive(const FsOps& fs, const std::string& path, bool want_version,
+                                              std::string_view artifact) {
     ArchiveRead r;
     const auto fv = fs.open_file(path);
     if (!fv)
@@ -195,14 +207,20 @@ struct ArchiveRead {
     if (!cd)
         return finish();
 
-    std::optional<ZipEntry> pom, manifest;
+    std::optional<ZipEntry> first_pom, named_pom, manifest;
+    std::size_t poms = 0, named = 0;
     const auto walked = for_each_central_entry(as_bytes(*cd), tail->entries, [&](const ZipEntry& e) {
-        if (is_nested_lib_entry(e.name))
+        const auto pom_artifact = want_version ? pom_properties_artifact(e.name) : std::nullopt;
+        if (is_nested_lib_entry(e.name)) {
             r.nested.push_back({std::string(e.name), e.uncomp_size});
-        else if (want_version && !pom && is_pom_properties_entry(e.name))
-            pom = e;
-        else if (want_version && !manifest && e.name == kManifestEntry)
+        } else if (pom_artifact) {
+            if (++poms == 1)
+                first_pom = e;
+            if (*pom_artifact == artifact && ++named == 1)
+                named_pom = e;
+        } else if (want_version && !manifest && e.name == kManifestEntry) {
             manifest = e;
+        }
         return true;
     });
     if (!walked) {
@@ -211,6 +229,11 @@ struct ArchiveRead {
     }
     r.enumerated = true;
 
+    std::optional<ZipEntry> pom;
+    if (poms == 1)
+        pom = first_pom;
+    else if (named == 1)
+        pom = named_pom;
     if (pom)
         if (const auto text = read_entry_text(*fv, *tail, *pom))
             if (auto v = parse_pom_properties_version(*text))
@@ -260,14 +283,16 @@ struct ArchiveRead {
             out.stop = s;
     };
 
-    std::unordered_map<std::string, std::size_t> per_anchor; // outer + nested rows
+    // Outer + nested rows per (root, application folder): the walk counts its candidates the same way,
+    // so same-named folders under different roots (/opt/acme, /usr/local/lib/acme) never share a quota.
+    std::map<std::pair<std::size_t, std::string>, std::size_t> per_anchor;
     // false = the section is full: stop reading archives.
-    const auto add = [&](Row&& r) {
+    const auto add = [&](Row&& r, std::size_t root) {
         if (out.rows.size() >= limits.max_rows) {
             record(Stop::section_rows);
             return false;
         }
-        std::size_t& n = per_anchor[r.anchor_app];
+        std::size_t& n = per_anchor[{root, r.anchor_app}];
         if (n >= limits.max_rows_per_anchor) {
             record(Stop::anchor_rows);
             return true;
@@ -285,7 +310,7 @@ struct ArchiveRead {
             break;
         }
         JarName jn = scan_detail::name_of(scan_detail::leaf_of(c.path));
-        const auto ar = scan_detail::read_archive(fs, c.path, jn.version.empty());
+        const auto ar = scan_detail::read_archive(fs, c.path, jn.version.empty(), jn.artifact);
         if (!ar.enumerated)
             record(Stop::archive_unenumerated);
         if (ar.changed)
@@ -306,7 +331,7 @@ struct ArchiveRead {
         outer.size = ar.size;
         outer.mtime = ar.mtime;
         outer.anchor_app = c.anchor_app;
-        if (!add(std::move(outer)))
+        if (!add(std::move(outer), c.root))
             break;
 
         bool full = false;
@@ -320,7 +345,7 @@ struct ArchiveRead {
             row.size = n.size;
             row.mtime = ar.mtime;
             row.anchor_app = c.anchor_app;
-            if (!add(std::move(row))) {
+            if (!add(std::move(row), c.root)) {
                 full = true;
                 break;
             }
@@ -377,13 +402,15 @@ struct ScanVerdict {
 /**
  * The status row's level, tokens and typed result as a pure function of how the scan ended.
  * `os` is windows, linux or macos. Anything other than a complete scan (a stop cause, or an
- * unreadable mount table, in which case no walk ran) is constrained and names its cause. Only a
- * complete scan is supported; the informational tokens ride that row and never change the level.
- * `network_skipped` counts network roots dropped plus network mounts the walk passed over.
+ * unreadable mount table, in which case no walk ran) is constrained and names its cause alone. Only
+ * a complete scan is supported; the informational tokens ride that row and never change the level.
+ * `roots_link_skipped` counts roots dropped for a link, `links_skipped` the links the walk passed
+ * over inside the trees (it follows none), and `network_skipped` the network roots dropped plus the
+ * network mounts the walk passed over.
  */
 [[nodiscard]] inline ScanVerdict scan_verdict(std::string_view os, Stop stop, bool mount_table_unreadable,
-                                              std::size_t roots_link_skipped, std::size_t network_skipped,
-                                              std::size_t version_unreadable) {
+                                              std::size_t roots_link_skipped, std::size_t links_skipped,
+                                              std::size_t network_skipped, std::size_t version_unreadable) {
     ScanVerdict v;
     if (mount_table_unreadable || stop != Stop::complete) {
         v.level = yuzu::shared::StatusLevel::constrained;
@@ -400,6 +427,7 @@ struct ScanVerdict {
         v.tokens += component_token(os, cause);
     };
     info(roots_link_skipped > 0, "root_link_skipped");
+    info(links_skipped > 0, "link_skipped");
     info(network_skipped > 0, "network_fs_skipped");
     info(version_unreadable > 0, "version_unreadable");
     return v;
@@ -448,6 +476,7 @@ template <class Targets, class MakeFs>
     }
     a.roots_skipped = t.roots_link_skipped + t.roots_network_skipped;
     a.verdict = scan_verdict(os, a.res.stop, t.mount_table_unreadable, t.roots_link_skipped,
+                             a.res.stats.links_skipped,
                              t.roots_network_skipped + a.res.stats.mounts_skipped,
                              a.res.version_unreadable);
     a.lines.reserve(a.res.rows.size() + 1);

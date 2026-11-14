@@ -190,6 +190,9 @@ struct MemTree {
         dirs.try_emplace(path);
     }
 
+    /// Lists `path` as a link in its parent: the walk counts it and never enters it.
+    void add_link(const std::string& path) { link_into_parent(path, Type::link); }
+
     void add_file(const std::string& path, std::string content) {
         link_into_parent(path, Type::file);
         files[path] = std::move(content);
