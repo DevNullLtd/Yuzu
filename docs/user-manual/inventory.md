@@ -802,9 +802,11 @@ curl -H "Authorization: Bearer $TOKEN" \
 # also express several intervals and exclusions. Rows come back identical to version_min/version_max:
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software?name=OpenSSL&vers=vers:generic/%3E%3D3.0.0%7C%3C%3D3.0.6"
-# Who runs exactly this package? Search by Package URL (the canonical form, matched exactly):
-curl -H "Authorization: Bearer $TOKEN" \
-  "$SERVER/api/v1/inventory/software?purl=pkg:deb/debian/openssl@3.0.11-1?arch=amd64"
+# Who runs exactly this package? Search by Package URL (the canonical form, qualifiers and all,
+# matched exactly). The purl holds `?` and `&`, so let curl URL-encode it:
+curl -G -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'purl=pkg:deb/debian/openssl@3.0.11-1?arch=amd64&distro=debian-12' \
+  "$SERVER/api/v1/inventory/software"
 # Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
 curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
@@ -830,8 +832,9 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
   tool's rows keep the 14 package fields until its twin catches up.
 - **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
-  purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`);
-  it needs no `name`, and it turns `totals` off (`totals_omitted: "filters"`). `vers=` is the
+  purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
+  so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
+  turns `totals` off (`totals_omitted: "filters"`). `vers=` is the
   same range as `version_min` / `version_max`, written `vers:<scheme>/<constraint>|...` with
   comparators `=` `!=` `<` `<=` `>` `>=` (`*` alone matches every version); it needs `name` with
   `match=exact` and is not combined with `version`, `version_min` or `version_max`. The

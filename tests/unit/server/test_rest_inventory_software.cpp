@@ -2185,6 +2185,9 @@ TEST_CASE("REST inventory/software: rows carry purl (null when empty); purl= sel
     CHECK(agent_set(hit) == std::set<std::string>{"dev-a", "dev-c"});
     CHECK(hit.at("data").at("totals").is_null());
     CHECK(hit.at("data").at("totals_omitted") == "filters");
+    // The audit row records the purl filter in its target.
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().target_id == "fleet;purl=pkg:deb/debian/git@2.1");
     // The purl lookup answers the same rows as the equivalent name + version query.
     CHECK(agent_set(hit) == agent_set(get_lookup(h, "?name=git&version=2.1&ecosystem=deb")));
     CHECK(agent_set(get_lookup(h, "?purl=" + enc(purl_a) + "&agent_id=dev-c")) ==

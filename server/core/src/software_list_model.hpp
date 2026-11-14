@@ -86,9 +86,9 @@ inline constexpr std::string_view kOmittedBuilding = "building";
 
 // ── Parameters ───────────────────────────────────────────────────────────────
 
-struct ListRequest {
-    /// query.match, query.status and query.purl are filled by the parser.
-    software_catalogue::DevicesRequest base;
+/// The version-range part of a lookup request, carried by both routes' requests (and the parser's
+/// intermediate) as one base so the four fields are declared, moved and tested once.
+struct VersionFilter {
     std::string version_min;
     std::string version_max;
     std::string vers; ///< the raw `vers` text (fingerprint and audit); the parsed form is `range`
@@ -96,6 +96,11 @@ struct ListRequest {
     /// generic Range. nullopt = no version-range filter.
     std::optional<vers::Range> range;
     [[nodiscard]] bool has_range() const { return range.has_value(); }
+};
+
+struct ListRequest : VersionFilter {
+    /// query.match, query.status and query.purl are filled by the parser.
+    software_catalogue::DevicesRequest base;
 };
 
 /// parse_devices_params + `match` (exact|prefix|contains), `status` (current|unconfirmed|
@@ -107,15 +112,10 @@ struct ListRequest {
 /// message.
 [[nodiscard]] std::expected<ListRequest, std::string> parse_list_params(const Params& p);
 
-struct ComponentsRequest {
+struct ComponentsRequest : VersionFilter {
     SoftwareComponentQuery query;
     std::string cursor;
     std::string format; ///< "" | "json" | "csv"; non-empty = an export (the TOTAL-rows cap applies)
-    std::string version_min;
-    std::string version_max;
-    std::string vers;
-    std::optional<vers::Range> range; ///< as ListRequest::range
-    [[nodiscard]] bool has_range() const { return range.has_value(); }
     /// `version=` (exact) is kept apart so the range/exact exclusion and the fingerprint can
     /// tell it from a resolved range; the parser mirrors it into query.versions.
     std::optional<std::string> version;

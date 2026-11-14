@@ -25,7 +25,9 @@
 ///  * CONTAINMENT (`contains`): the VERS algorithm. `=` match wins, then a `!=` match refuses;
 ///    the remaining interval constraints are walked pairwise (an upper bound first and a lower
 ///    bound last are the open ends). A range of `!=` constraints alone matches every other
-///    version; a range holding `=` constraints and no interval matches only those.
+///    version; a range holding `=` constraints and no interval matches only those. The `!=`-only
+///    result is a DELIBERATE departure from the upstream text, whose fall-through ("reaching here
+///    ... is NOT IN the range") would match nothing, as it would for a lone `>=2.0` above 2.0.
 ///  * `from_bounds` is the lookup's `version_min`/`version_max` as a Range, so one evaluator
 ///    serves both forms. It is built, not normalised: min above max is the empty set, as it
 ///    always was.
@@ -249,10 +251,12 @@ template <class Cmp>
     if (iv.empty())
         return !has_eq && has_ne; // only `!=`: every other version
     const Constraint& first = *iv.front();
-    if (detail::is_upper(first.op) && in_interval(v, {}, false, first.version, first.op == Op::kLe, cmp))
+    if (detail::is_upper(first.op) &&
+        in_interval(v, {}, false, first.version, first.op == Op::kLe, cmp))
         return true;
     const Constraint& last = *iv.back();
-    if (detail::is_lower(last.op) && in_interval(v, last.version, last.op == Op::kGe, {}, false, cmp))
+    if (detail::is_lower(last.op) &&
+        in_interval(v, last.version, last.op == Op::kGe, {}, false, cmp))
         return true;
     for (std::size_t i = 0; i + 1 < iv.size(); ++i) {
         const Constraint& lo = *iv[i];

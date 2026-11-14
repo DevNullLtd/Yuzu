@@ -309,12 +309,17 @@ TEST_CASE("vers in_interval: the open/closed bound matrix under both comparators
     check(nvd_version_compare);
 }
 
-TEST_CASE("vers in_interval: the comparator is the caller's (catalogue and NVD orders differ)",
+TEST_CASE("vers in_interval: the comparator is the caller's (a reversed order flips the answer)",
           "[server][vers]") {
-    // The two comparators agree on the plain numeric cases above; they are two functions with
-    // their own documented divergences, and in_interval applies whichever it is handed. Pin one
-    // the catalogue and NVD orders both give, so a swap of the argument order is caught.
+    // in_interval applies whichever comparator it is handed. The same call under the catalogue
+    // order and under its reverse must therefore give opposite answers; a build that ignored the
+    // callback (or swapped its argument order) would answer both alike.
+    const auto reversed = [](std::string_view a, std::string_view b) {
+        return kCatalogCmp(b, a);
+    };
     CHECK(vers::in_interval("1.10", "1.9", true, "2.0", false, kCatalogCmp));
+    CHECK_FALSE(vers::in_interval("1.10", "1.9", true, "2.0", false, reversed));
+    // Orders the catalogue and NVD comparators both give: the argument order is the caller's.
     CHECK(vers::in_interval("1.10", "1.9", true, "2.0", false, nvd_version_compare));
     CHECK_FALSE(vers::in_interval("1.8", "1.9", true, "2.0", false, kCatalogCmp));
     CHECK_FALSE(vers::in_interval("2.0", "1.9", true, "2.0", false, nvd_version_compare));

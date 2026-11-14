@@ -51,13 +51,9 @@ std::string_view match_name(NameMatch m) {
 }
 
 // match= / status= / the version-range fields, shared by both parsers. nullopt = clean.
-struct CommonFilters {
+struct CommonFilters : VersionFilter { // `range`: parsed `vers`, else version_min/version_max
     NameMatch match{NameMatch::kExact};
     std::string status;
-    std::string version_min;
-    std::string version_max;
-    std::string vers;
-    std::optional<vers::Range> range; // parsed `vers`, else version_min/version_max
 };
 
 std::expected<CommonFilters, std::string> parse_common(const Params& p) {
@@ -159,10 +155,7 @@ std::expected<ListRequest, std::string> parse_list_params(const Params& p) {
     r.base.query.purl = std::move(purl);
     r.base.query.match = common->match;
     r.base.query.status = common->status;
-    r.version_min = std::move(common->version_min);
-    r.version_max = std::move(common->version_max);
-    r.vers = std::move(common->vers);
-    r.range = std::move(common->range);
+    static_cast<VersionFilter&>(r) = std::move(*common);
     return r;
 }
 
@@ -195,10 +188,7 @@ std::expected<ComponentsRequest, std::string> parse_components_params(const Para
         return std::unexpected("invalid cursor");
     if (const auto bad = version_rule_error(r.version.has_value(), *common, q.name))
         return std::unexpected(*bad);
-    r.version_min = std::move(common->version_min);
-    r.version_max = std::move(common->version_max);
-    r.vers = std::move(common->vers);
-    r.range = std::move(common->range);
+    static_cast<VersionFilter&>(r) = std::move(*common);
     if (r.version)
         q.versions = std::vector<std::string>{*r.version};
     const bool export_mode = !r.format.empty();
