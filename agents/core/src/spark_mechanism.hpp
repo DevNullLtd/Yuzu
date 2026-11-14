@@ -594,6 +594,26 @@ struct FileMechanismTestControls {
     /// shortened value takes effect at the next wake (the control call nudges the
     /// worker), so a test can hold it long, change the world, then shorten it.
     std::chrono::milliseconds path_verify_interval{0};
+    /// How long a lost path may wait for its cancelled read's completion before
+    /// the stuck-drain observation (a counter and one warn) is made. Production
+    /// default 30 s. Zero leaves the current value unchanged.
+    std::chrono::milliseconds path_lost_stuck_deadline{0};
+    /// Runs on the detached verification worker, with no lock, before the real
+    /// check. Returns 0 to run the real check, or a Win32 error to fail the open
+    /// step with (ERROR_PATH_NOT_FOUND reads as lost, anything else as undecidable).
+    /// May park (a hung path); the test must release it before stopping. Throwing
+    /// reads as undecidable. Null clears it.
+    std::function<unsigned long(std::wstring_view dir)> verify_hook;
+    /// Runs on the worker for every dequeued completion of a real directory, under
+    /// the mechanism's lock (it must not call back into the mechanism), with the
+    /// completion's result and byte count. Returning true swallows the completion:
+    /// nothing processes it, as if the OS never delivered it (the read is not
+    /// outstanding any more, and not reissued). Hand swallowed completions back
+    /// with release_suppressed_completions. Null clears it (swallowed ones stay).
+    std::function<bool(std::wstring_view dir, bool ok, unsigned long bytes)> completion_suppress_hook;
+    /// One-shot: re-post every completion the suppress hook swallowed so the worker
+    /// processes it with its original result and byte count.
+    bool release_suppressed_completions{false};
 };
 
 /// Mechanism-internal counters the public SparkMechanismStats does not carry.
@@ -627,6 +647,10 @@ struct FileMechanismDebugCounters {
     std::uint64_t verify_same{0};
     std::uint64_t verify_lost{0};
     std::uint64_t verify_unverifiable{0};
+    std::uint64_t verify_refused{0};       ///< verify launches refused by a full lane (retried)
+    std::uint64_t verify_launch_failed{0}; ///< verify launches that failed to start a thread (retried)
+    std::uint64_t path_lost_stuck{0};      ///< lost paths whose drain outlasted the stuck deadline
+    std::uint64_t path_lost_drained_ok{0}; ///< lost-path drains whose completion carried `ok`
 };
 
 /// Returns true if `mech` is the Windows File mechanism and the controls were
