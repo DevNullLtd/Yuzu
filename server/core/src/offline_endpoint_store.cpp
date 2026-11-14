@@ -9,6 +9,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <yuzu/log_token.hpp> // utf8_sequence_length (find_within id pre-check)
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
@@ -117,6 +118,45 @@ void record_presence_store_failure(yuzu::MetricsRegistry* metrics, std::string_v
                       {{"op", std::string(op)}, {"reason", reason}})
             .increment();
     }
+}
+
+constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roster_truncated_total";
+
+/// An agent_id that can never be a stored key: it holds a NUL byte or is not well-formed UTF-8.
+/// `agent_id` is a Postgres TEXT, which holds neither, so such an id CANNOT match a row; handing
+/// it to the server would raise SQLSTATE 22021 (or be refused by the NUL guard in pg_exec) and
+/// read as a store failure for an input that can never succeed. Reuses
+/// `yuzu::utf8_sequence_length` (log_token.hpp), the same rules PostgreSQL's UTF8 encoding applies.
+[[nodiscard]] bool agent_id_cannot_be_stored(std::string_view id) noexcept {
+    for (std::size_t i = 0; i < id.size();) {
+        const auto c = static_cast<unsigned char>(id[i]);
+        if (c == 0)
+            return true;
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        const std::size_t len = ::yuzu::utf8_sequence_length(id, i);
+        if (len == 0)
+            return true;
+        i += len;
+    }
+    return false;
+}
+
+// One `endpoints` row in the column order both roster reads select (agent_id, hostname, os,
+// last_heartbeat_ms, agent_ts, agent_version, arch) — one copy, so the roster scan and the
+// point read can never map a column differently.
+OfflineEndpoint read_endpoint_row(const PGresult* res, int i) {
+    OfflineEndpoint ep;
+    ep.agent_id = PQgetvalue(res, i, 0);
+    ep.hostname = PQgetvalue(res, i, 1);
+    ep.os = PQgetvalue(res, i, 2);
+    ep.last_heartbeat_ms = to_i64(PQgetvalue(res, i, 3));
+    ep.agent_ts = to_i64(PQgetvalue(res, i, 4));
+    ep.agent_version = PQgetvalue(res, i, 5);
+    ep.arch = PQgetvalue(res, i, 6);
+    return ep;
 }
 
 } // namespace
@@ -400,9 +440,7 @@ bool OfflineEndpointStore::delete_agent(std::string_view agent_id) {
     return true;
 }
 
-std::expected<std::vector<OfflineEndpoint>, PresenceReadError>
-OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
-    std::vector<OfflineEndpoint> out;
+OfflineRosterRead OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
     if (!open_)
         return std::unexpected(PresenceReadError::StoreUnavailable);
     auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
@@ -421,6 +459,9 @@ OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
     // LIMIT caps the materialised set (gov sec-LOW / UP-5) so the store never
     // allocates more rows than the viz page could serve, regardless of table
     // growth. Newest-first, so the cap keeps the most recently-seen hosts.
+    // #5712: the limit is kQueryRowCap + 1 — a row past the cap is how a truncated
+    // roster is DETECTED (a count of exactly kQueryRowCap is the complete set). The extra
+    // row is dropped and the result is flagged `truncated`; it is NOT an error (#5371).
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch "
@@ -428,27 +469,91 @@ OfflineEndpointStore::query_stale_within(std::chrono::seconds window) {
         "WHERE last_heartbeat_ms >= $1::bigint "
         "ORDER BY last_heartbeat_ms DESC "
         "LIMIT $2::bigint",
-        std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap)});
+        std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap + 1)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("OfflineEndpointStore: query_stale_within failed: {}",
                      PQerrorMessage(lease.get()));
         record_presence_store_failure(metrics_, "query_stale_within", /*had_lease=*/true);
         return std::unexpected(PresenceReadError::DbError);
     }
-    const int rows = PQntuples(res.get());
-    out.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i) {
-        OfflineEndpoint ep;
-        ep.agent_id = PQgetvalue(res.get(), i, 0);
-        ep.hostname = PQgetvalue(res.get(), i, 1);
-        ep.os = PQgetvalue(res.get(), i, 2);
-        ep.last_heartbeat_ms = to_i64(PQgetvalue(res.get(), i, 3));
-        ep.agent_ts = to_i64(PQgetvalue(res.get(), i, 4));
-        ep.agent_version = PQgetvalue(res.get(), i, 5);
-        ep.arch = PQgetvalue(res.get(), i, 6);
-        out.push_back(std::move(ep));
+    const int fetched = PQntuples(res.get());
+    OfflineRoster out;
+    out.truncated = fetched > kQueryRowCap;
+    const int rows = out.truncated ? kQueryRowCap : fetched;
+    out.rows.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        out.rows.push_back(read_endpoint_row(res.get(), i));
+    if (out.truncated) {
+        // Steady state on a fleet over the cap, so a counter and a debug line — never a per-read warn.
+        spdlog::debug("OfflineEndpointStore: query_stale_within serving a truncated roster "
+                      "(newest {} of more)",
+                      kQueryRowCap);
+        if (metrics_)
+            metrics_->counter(kRosterTruncatedMetric).increment();
     }
     return out;
+}
+
+OfflineEndpointRead OfflineEndpointStore::find_within(std::string_view agent_id,
+                                                      std::chrono::seconds window) {
+    // A malformed id (NUL byte, ill-formed UTF-8) can never be a stored key: that is a CONFIRMED
+    // absence by construction, decided without a store read, so no failure counter, no warn and
+    // no "store unavailable" for an input that can never succeed (the roster scan this replaces
+    // answered absent for it too).
+    if (agent_id_cannot_be_stored(agent_id))
+        return std::optional<OfflineEndpoint>{};
+    if (!open_)
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("OfflineEndpointStore: find_within failed, no connection in time ({})",
+                     pool_.last_error());
+        record_presence_store_failure(metrics_, "find_within", /*had_lease=*/false);
+        return std::unexpected(PresenceReadError::StoreUnavailable);
+    }
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const std::int64_t since = now_ms - static_cast<std::int64_t>(window.count()) * 1000;
+
+    // Primary-key lookup, same window predicate as query_stale_within (inclusive `>=`), so the
+    // two reads can never disagree about whether a row is inside the roster window.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch "
+        "FROM endpoint_state.endpoints "
+        "WHERE agent_id = $1::text AND last_heartbeat_ms >= $2::bigint",
+        std::vector<std::string>{std::string(agent_id), std::to_string(since)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("OfflineEndpointStore: find_within failed: {}", PQerrorMessage(lease.get()));
+        record_presence_store_failure(metrics_, "find_within", /*had_lease=*/true);
+        return std::unexpected(PresenceReadError::DbError);
+    }
+    if (PQntuples(res.get()) < 1)
+        return std::optional<OfflineEndpoint>{}; // confirmed absence, not a failed read
+    return std::optional<OfflineEndpoint>{read_endpoint_row(res.get(), 0)};
+}
+
+void OfflineEndpointStore::set_metrics(yuzu::MetricsRegistry* m) {
+    metrics_ = m;
+    if (m == nullptr)
+        return;
+    m->describe(kRosterTruncatedMetric,
+                "#5712: roster reads served as a truncated partial because more than 100000 "
+                "endpoints were inside the window (the Hardware list, the fleet topology and the "
+                "hostname map behind the Software, Quarantine and containment pages and REST "
+                "lookup-facts). One increment per truncated read, so the rate tracks page loads "
+                "and API polling, not fleet size; use increase() over a window. A steady state on "
+                "a fleet over the cap, not an incident. No alert rule.",
+                "counter");
+    m->counter(kRosterTruncatedMetric); // pre-seed at 0 so the series exists before the first cap hit
+    // The per-device point read's two failure series, pre-seeded so the first failure is an
+    // increase from 0 that increase() sees, not a series born at 1 (docs/observability-conventions.md,
+    // bounded-label counters). The other `op` values of this family are not seeded here: that is the
+    // existing shape of the family and is not widened by this change.
+    for (const char* reason : {"store_unavailable", "db_error"})
+        m->counter("yuzu_server_agent_presence_store_failed_total",
+                   {{"op", "find_within"}, {"reason", reason}});
 }
 
 std::expected<FleetStateCounts, PresenceReadError>

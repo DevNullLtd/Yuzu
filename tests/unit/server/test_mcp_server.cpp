@@ -522,6 +522,31 @@ TEST_CASE("MCP Policy: supervised requires approval for destructive ops", "[mcp]
     CHECK_FALSE(requires_approval("readonly", "Workflow", "Execute"));
     CHECK_FALSE(requires_approval("operator", "Workflow", "Execute"));
 
+    // #2146 batch C (owner ruling): an unticketed definition update can downgrade approval_mode or
+    // repoint plugin/action, so the write is the ticketed step. A set carries no authorization
+    // consumer (not gated); validate_definition_yaml is Read (not gated). The negatives only fail if
+    // the rule is hoisted out of the supervised branch.
+    CHECK(requires_approval("supervised", "InstructionDefinition", "Write"));
+    CHECK(requires_approval("supervised", "InstructionDefinition", "Delete"));
+    CHECK_FALSE(requires_approval("supervised", "InstructionDefinition", "Read"));
+    CHECK_FALSE(requires_approval("supervised", "InstructionSet", "Write"));
+    CHECK(requires_approval("supervised", "InstructionSet", "Delete")); // any Delete
+    CHECK_FALSE(requires_approval("", "InstructionDefinition", "Write"));
+    CHECK_FALSE(requires_approval("readonly", "InstructionDefinition", "Write"));
+    CHECK_FALSE(requires_approval("operator", "InstructionDefinition", "Write"));
+    CHECK_FALSE(tier_allows("operator", "InstructionDefinition", "Write")); // operator tier is denied
+
+    // ProductPack:Write (POST /api/product-packs): a pack install creates definitions with a
+    // pack-supplied approval_mode, plugin and action, so unticketed it bypasses the
+    // InstructionDefinition:Write rule above (owner ruling, batch C fix round). Read stays open,
+    // Delete is already gated, and the rule lives in the supervised branch only.
+    CHECK(requires_approval("supervised", "ProductPack", "Write"));
+    CHECK(requires_approval("supervised", "ProductPack", "Delete"));
+    CHECK_FALSE(requires_approval("supervised", "ProductPack", "Read"));
+    CHECK_FALSE(requires_approval("", "ProductPack", "Write"));
+    CHECK_FALSE(requires_approval("readonly", "ProductPack", "Write"));
+    CHECK_FALSE(requires_approval("operator", "ProductPack", "Write"));
+
     // Delete on any type
     CHECK(requires_approval("supervised", "Tag", "Delete"));
     CHECK(requires_approval("supervised", "Policy", "Delete"));
@@ -33385,6 +33410,16 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (a stored definition,
         // not execute_instruction's raw plugin.action); gated by the same Execution:Execute rule.
         {"execute_instruction_definition", nlohmann::json::parse(R"({"definition_id":"d"})")},
+        // #2146 batch C: InstructionDefinition:Write (owner ruling: an unticketed update can flip
+        // approval_mode to auto) and every Delete (InstructionDefinition, InstructionSet) are
+        // supervised-tier gated. create_instruction_set (InstructionSet:Write) is deliberately NOT.
+        {"create_definition",
+         nlohmann::json::parse(R"({"name":"n","type":"question","plugin":"os_info"})")},
+        {"update_definition", nlohmann::json::parse(R"({"id":"d1"})")},
+        {"delete_definition", nlohmann::json::parse(R"({"id":"d1"})")},
+        {"import_definition", nlohmann::json::parse(R"({"document":{"id":"d1"}})")},
+        {"save_definition_yaml", nlohmann::json::parse(R"({"yaml_source":"kind: x"})")},
+        {"delete_instruction_set", nlohmann::json::parse(R"({"id":"s1"})")},
         // ADR-0070 R1 (slice 2b-1a): the four RevocationSource:Write mutations are gated at the
         // supervised tier by the deliberate requires_approval() entry (removal, reset and
         // registration are all a Write, never a Delete).
@@ -38116,8 +38151,7 @@ TEST_CASE("MCP get_fleet_topology: a failed offline-roster read answers live-onl
     McpTestServer ts;
     ts.fleet_topology_store_for_test = &store;
     ts.offline_roster_fn_for_test = [](std::chrono::seconds) {
-        return std::expected<std::vector<yuzu::server::OfflineEndpoint>,
-                             yuzu::server::PresenceReadError>(
+        return yuzu::server::OfflineRosterRead(
             std::unexpected(yuzu::server::PresenceReadError::StoreUnavailable));
     };
     ts.start();
@@ -38155,9 +38189,8 @@ TEST_CASE("MCP get_fleet_topology: a healthy offline roster merges the stale hos
         ep.agent_id = "agent-off";
         ep.hostname = "host-off";
         ep.os = "linux";
-        return std::expected<std::vector<yuzu::server::OfflineEndpoint>,
-                             yuzu::server::PresenceReadError>(
-            std::vector<yuzu::server::OfflineEndpoint>{ep});
+        return yuzu::server::OfflineRosterRead(
+            yuzu::server::OfflineRoster{{ep}, /*truncated=*/false});
     };
     ts.start();
 
@@ -38176,6 +38209,63 @@ TEST_CASE("MCP get_fleet_topology: a healthy offline roster merges the stale hos
     CHECK_FALSE(payload.contains("offline_roster_degraded"));
     REQUIRE(ts.audit_details.size() == 1);
     CHECK(ts.audit_details[0].find("offline_roster_degraded") == std::string::npos);
+    CHECK_FALSE(payload.contains("offline_roster_truncated"));
+    CHECK(ts.audit_details[0].find("offline_roster_truncated") == std::string::npos);
+}
+
+// #5712. A roster past the store's row cap is a typed partial: merged, served, and flagged
+// offline_roster_truncated (body + audit), NOT degraded and NOT an error. The closure is injected;
+// the 100k-row fleet that really produces the flag is the store's own [pg] test.
+// Kills: dropping the flag, reading the partial as a failure (live-only + degraded), no audit marker,
+// and the 413 oversize path losing the marker (the viz ceiling equals the roster cap, so a truncated
+// merge is mostly reachable only there).
+TEST_CASE("MCP get_fleet_topology: a truncated offline roster is merged and flagged "
+          "offline_roster_truncated, not degraded",
+          "[mcp][integration][viz][roster_truncated]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
+                             /*ttl=*/std::chrono::seconds(60),
+                             /*fetch_deadline=*/std::chrono::milliseconds(50),
+                             /*max_snapshot_bytes=*/0};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.offline_roster_fn_for_test = [](std::chrono::seconds) {
+        yuzu::server::OfflineEndpoint a;
+        a.agent_id = "off-1";
+        a.os = "linux";
+        yuzu::server::OfflineEndpoint b;
+        b.agent_id = "off-2";
+        b.os = "linux";
+        return yuzu::server::OfflineRosterRead(
+            yuzu::server::OfflineRoster{{a, b}, /*truncated=*/true});
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["machines"].is_array());
+    CHECK(payload["machines"].size() == 3); // the live host + both merged offline rows
+    REQUIRE(payload.contains("offline_roster_truncated"));
+    CHECK(payload["offline_roster_truncated"] == true);
+    CHECK_FALSE(payload.contains("offline_roster_degraded"));
+    REQUIRE(ts.audit_details.size() == 1);
+    CHECK(ts.audit_details[0].find("offline_roster_truncated=1") != std::string::npos);
+
+    // The oversize refusal's audit row carries the marker too.
+    auto big = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{"machines_max":2}}})");
+    REQUIRE(big);
+    // It IS the oversize refusal (an error naming machines_max), not a 200 that happens to be audited.
+    const auto big_body = nlohmann::json::parse(big->body);
+    REQUIRE(big_body.contains("error"));
+    CHECK(big_body["error"]["message"].get<std::string>().find("machines_max") != std::string::npos);
+    REQUIRE(ts.audit_details.size() == 2);
+    CHECK(ts.audit_details[1].find("offline_roster_truncated=1") != std::string::npos);
 }
 
 TEST_CASE("MCP get_fleet_topology: kill switch answers before Response:Read is even "

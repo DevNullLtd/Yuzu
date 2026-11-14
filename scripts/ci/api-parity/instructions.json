@@ -14,41 +14,56 @@
     "method": "POST",
     "path": "/api/instructions",
     "capability_id": "post.api-instructions",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/instructions"
+    },
+    "mcp_twin": "create_definition",
+    "status": "twinned"
   },
   {
     "method": "POST",
     "path": "/api/instructions/import",
     "capability_id": "post.api-instructions-import",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/instructions/import"
+    },
+    "mcp_twin": "import_definition",
+    "status": "twinned"
   },
   {
     "method": "POST",
     "path": "/api/instructions/validate-yaml",
     "capability_id": "post.api-instructions-validate-yaml",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/instructions/validate-yaml"
+    },
+    "mcp_twin": "validate_definition_yaml",
+    "status": "twinned"
   },
   {
     "method": "POST",
     "path": "/api/instructions/yaml",
     "capability_id": "post.api-instructions-yaml",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/instructions/yaml"
+    },
+    "mcp_twin": "save_definition_yaml",
+    "status": "twinned"
   },
   {
     "method": "DELETE",
     "path": "/api/instructions/{param}",
     "capability_id": "delete.api-instructions-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/instructions/{param}"
+    },
+    "mcp_twin": "delete_definition",
+    "status": "twinned"
   },
   {
     "method": "GET",
@@ -65,9 +80,12 @@
     "method": "PUT",
     "path": "/api/instructions/{param}",
     "capability_id": "put.api-instructions-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "PUT",
+      "path": "/api/v1/instructions/{param}"
+    },
+    "mcp_twin": "update_definition",
+    "status": "twinned"
   },
   {
     "method": "POST",

@@ -92,7 +92,8 @@ void append_entries(std::string& out, const nlohmann::json& obj, const char* hea
     append_section(out, std::string(heading) + "\n", lines, budget, shortened);
 }
 
-// The visible scope cell is a clipped copy; the full text lives once, in `data-scope`.
+// The visible scope cell is a clipped copy; the longer one (kScopeAttrBytes) lives once, in
+// `data-scope`.
 constexpr std::size_t kScopeCellBytes = 120;
 
 const char* pill_class(const std::string& status) {
@@ -138,7 +139,12 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
     attr(out, "data-def", r.definition_id);
     attr(out, "data-name", r.name);
     attr(out, "data-by", r.submitted_by);
-    attr(out, "data-scope", r.scope_expression);
+    attr(out, "data-scope", truncate_utf8(r.scope_expression, kScopeAttrBytes));
+    // The approver cannot read this scope in full: carry the true size so the page can say so
+    // and withhold Approve (the controller reads this, the server still decides on the store).
+    const bool scope_clipped = scope_is_clipped(r.scope_expression);
+    if (scope_clipped)
+        attr_num(out, "data-scope-clipped", static_cast<int64_t>(r.scope_expression.size()));
     attr_num(out, "data-at", r.submitted_at);
     attr(out, "data-age", age);
     attr(out, "data-status", r.status);
@@ -169,6 +175,8 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
            html_escape(r.name);
     if (r.mcp)
         out += R"(<span class="tag">MCP</span>)";
+    if (scope_clipped)
+        out += R"(<span class="tag">Scope clipped</span>)";
     if (!r.request_json.empty())
         out += R"(<span class="tag">Bound</span>)";
     out += "</span>";
@@ -183,7 +191,7 @@ void append_row(std::string& out, const ApprovalRowView& r, int64_t now) {
         out += R"(<span class="tag">You</span>)";
     out += "</td>";
 
-    // Scope: clipped copy, no title (the full text is in data-scope, once).
+    // Scope: clipped copy, no title (the longer copy is in data-scope, once).
     if (r.scope_expression.empty())
         out += R"(<td><span class="faint">&mdash;</span></td>)";
     else
