@@ -27,6 +27,7 @@
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "quarantine_reapply.hpp"
 #include "quarantine_store.hpp"
 #include "response_store.hpp"
 
@@ -41,9 +42,11 @@
 
 #include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <functional>
 #include <latch>
 #include <memory>
@@ -120,11 +123,64 @@ struct MockDispatch {
     }
 };
 
+// The reconciler's monotonic clock (#7583): a test advances it instead of waiting, so every
+// backoff, claim window and response wait elapses exactly when the test says. Starts an hour in, so
+// a time_point of 0 ("never claimed") is always in the past. `on_read` runs on every read, which
+// lets a test change the world between a pass's claim and its write-back.
+struct FakeSteady {
+    std::chrono::steady_clock::time_point t =
+        std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    std::function<void()> on_read;
+
+    void advance(std::chrono::milliseconds d) { t += d; }
+    QuarantineContainmentReconciler::SteadyNowFn fn() {
+        return [this] {
+            if (on_read)
+                on_read();
+            return t;
+        };
+    }
+};
+
+// The token a confirmed end presents: the apply generation read now, with no claim live.
+std::int64_t fence_of(QuarantineStore& store, const std::string& agent_id, std::int64_t record_id) {
+    auto token = store.apply_fence_token(agent_id, record_id);
+    REQUIRE(token.has_value());
+    REQUIRE(token->has_value());
+    return **token;
+}
+
 // An ended record: the release asked for, then the device's confirmation recorded.
 void end_record(QuarantineStore& store, const std::string& agent_id) {
     auto id = store.request_release(agent_id);
     REQUIRE(id.has_value());
-    REQUIRE(store.mark_released(agent_id, *id, ReleaseEnd::device_confirmed).has_value());
+    REQUIRE(store.mark_released(agent_id, *id, ReleaseEnd::device_confirmed,
+                                fence_of(store, agent_id, *id))
+                .has_value());
+}
+
+// One statement on a fresh connection: a sabotage or its repair, for the cases that need a store
+// read to fail at one chosen moment.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult res{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(res.get()));
+    REQUIRE(res.ok());
+}
+
+// Ends the active record by SQL, with no fence. A confirmed end made while an apply's claim is live
+// is refused (that is the fence), so a test that needs the record to be GONE from inside a dispatch
+// hook, to pin what the reconciler does with a write that finds no record, ends it this way.
+void end_record_by_sql(const std::string& dsn, const std::string& agent_id) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult res{PQexec(conn.get(),
+                        ("UPDATE quarantine_store.quarantine_records SET status = 'released', "
+                         "released_at = 1 WHERE status = 'active' AND agent_id = '" +
+                         agent_id + "'")
+                            .c_str())};
+    REQUIRE(res.ok());
 }
 
 void store_status_response(ResponseStore& rs, const std::string& command_id,
@@ -158,6 +214,7 @@ TEST_CASE("QuarantineContainmentReconciler: an active record on a reachable devi
     registry.register_agent(make_info("agent-1")); // reachable
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -166,6 +223,7 @@ TEST_CASE("QuarantineContainmentReconciler: an active record on a reachable devi
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -202,6 +260,7 @@ TEST_CASE("QuarantineContainmentReconciler: no active record means no dispatch a
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -210,10 +269,12 @@ TEST_CASE("QuarantineContainmentReconciler: no active record means no dispatch a
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
     reconciler.notify_agent_heartbeat("agent-1");
+    reconciler.drain_heartbeat_due(); // the reconciler thread's next pass over the marked devices
 
     CHECK(dispatch.calls.empty());
 }
@@ -233,6 +294,7 @@ TEST_CASE("QuarantineContainmentReconciler: a device with no live session is ski
     // Deliberately NOT registered — no live session.
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -241,6 +303,7 @@ TEST_CASE("QuarantineContainmentReconciler: a device with no live session is ski
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -280,6 +343,7 @@ TEST_CASE("QuarantineContainmentReconciler: a device found offline is immediatel
     // Deliberately NOT registered yet — offline at the first tick.
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -288,6 +352,7 @@ TEST_CASE("QuarantineContainmentReconciler: a device found offline is immediatel
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         // A generous production-scale claim window — if the offline skip
         // held it, a same-millisecond heartbeat would be rate_limited; the
         // fix means it isn't, regardless of how large this is.
@@ -300,6 +365,7 @@ TEST_CASE("QuarantineContainmentReconciler: a device found offline is immediatel
     // Reconnect: register the session, then heartbeat right away — no sleep.
     registry.register_agent(make_info("agent-1"));
     reconciler.notify_agent_heartbeat("agent-1");
+    reconciler.drain_heartbeat_due(); // the reconciler thread's next pass over the marked devices
     REQUIRE(dispatch.calls.size() == 1); // NOT rate_limited despite the 60s window
     CHECK(dispatch.calls[0].plugin == "firewall");
     CHECK(dispatch.calls[0].action == "quarantine");
@@ -325,6 +391,7 @@ TEST_CASE("QuarantineContainmentReconciler: a busy mutation-gate response does n
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -333,6 +400,7 @@ TEST_CASE("QuarantineContainmentReconciler: a busy mutation-gate response does n
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     // Tick 1: apply dispatched.
@@ -349,6 +417,7 @@ TEST_CASE("QuarantineContainmentReconciler: a busy mutation-gate response does n
     // dispatch again. This is the concrete no-spin mechanism: rate_limited,
     // not another poll-then-dispatch.
     reconciler.notify_agent_heartbeat("agent-1");
+    reconciler.drain_heartbeat_due(); // the reconciler thread's next pass over the marked devices
     CHECK(dispatch.calls.size() == 1); // still just the one apply call — no spin
 }
 
@@ -382,6 +451,7 @@ TEST_CASE("QuarantineContainmentReconciler: confirmation requires a follow-up st
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -390,6 +460,7 @@ TEST_CASE("QuarantineContainmentReconciler: confirmation requires a follow-up st
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(20),
         .response_wait_override = std::chrono::milliseconds(200),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -405,7 +476,7 @@ TEST_CASE("QuarantineContainmentReconciler: confirmation requires a follow-up st
     // "busy") schedules a status verify — it does NOT dispatch status
     // itself in the same call (one dispatch decision per reconcile_one
     // call, by design).
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick();
     CHECK(dispatch.calls.size() == 1); // still just the apply — no dispatch yet
 
@@ -416,7 +487,7 @@ TEST_CASE("QuarantineContainmentReconciler: confirmation requires a follow-up st
     CHECK((*mid)->last_confirmed_at == 0);
 
     // Step 3: THIS call is the one that actually dispatches the status verify.
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick();
     REQUIRE(dispatch.calls.size() == 2);
     CHECK(dispatch.calls[1].action == "quarantine_status");
@@ -449,6 +520,7 @@ TEST_CASE("QuarantineContainmentReconciler: a follow-up status read of status|ac
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -457,6 +529,7 @@ TEST_CASE("QuarantineContainmentReconciler: a follow-up status read of status|ac
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(20),
         .response_wait_override = std::chrono::milliseconds(200),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -465,16 +538,16 @@ TEST_CASE("QuarantineContainmentReconciler: a follow-up status read of status|ac
     reconciler.tick(); // 1: apply dispatched
     REQUIRE(dispatch.calls.size() == 1);
     store_status_response(rstore, "cmd-1", "agent-1", "status|active_unproven");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 2: polls apply response, schedules status verify (no dispatch yet)
     CHECK(dispatch.calls.size() == 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 3: dispatches the status verify
     REQUIRE(dispatch.calls.size() == 2);
     CHECK(dispatch.calls[1].action == "quarantine_status");
 
     store_status_response(rstore, "cmd-2", "agent-1", "status|active");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 4: polls status response -> confirms
 
     auto status = qstore.get_status("agent-1");
@@ -487,7 +560,7 @@ TEST_CASE("QuarantineContainmentReconciler: a follow-up status read of status|ac
     // cycle's own reconcile_one work) is also the first one to see the
     // gauge reflect the confirm achieved during tick 4 (the gauge published
     // during tick 4 itself still reflected PRE-confirm state).
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick();
     CHECK(dispatch.calls.size() == 2); // unchanged — confirmed agents are skipped
     CHECK(metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
@@ -515,6 +588,7 @@ TEST_CASE("QuarantineContainmentReconciler: session churn on a confirmed agent r
     registry.map_session("session-A", "agent-1");
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -523,6 +597,7 @@ TEST_CASE("QuarantineContainmentReconciler: session churn on a confirmed agent r
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(20),
         .response_wait_override = std::chrono::milliseconds(200),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -532,14 +607,14 @@ TEST_CASE("QuarantineContainmentReconciler: session churn on a confirmed agent r
     reconciler.tick(); // 1: apply
     REQUIRE(dispatch.calls.size() == 1);
     store_status_response(rstore, "cmd-1", "agent-1", "status|active_unproven");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 2: polls apply, schedules status verify
     CHECK(dispatch.calls.size() == 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 3: dispatches status verify
     REQUIRE(dispatch.calls.size() == 2);
     store_status_response(rstore, "cmd-2", "agent-1", "status|active");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 4: polls status -> confirms
     auto confirmed = qstore.get_status("agent-1");
     REQUIRE(confirmed.has_value());
@@ -552,7 +627,7 @@ TEST_CASE("QuarantineContainmentReconciler: session churn on a confirmed agent r
     registry.register_agent(make_info("agent-1"));
     registry.map_session("session-B", "agent-1");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 5: tick's own sweep detects churn and dispatches STATUS
                        // first (verify_first is consumed on the SAME call that
                        // detects it, unlike apply's poll->schedule->dispatch
@@ -592,6 +667,7 @@ TEST_CASE("QuarantineContainmentReconciler: record churn on a confirmed, still-c
     registry.map_session("session-A", "agent-1"); // stays live through the whole test
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -600,6 +676,7 @@ TEST_CASE("QuarantineContainmentReconciler: record churn on a confirmed, still-c
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(20),
         .response_wait_override = std::chrono::milliseconds(200),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -609,13 +686,13 @@ TEST_CASE("QuarantineContainmentReconciler: record churn on a confirmed, still-c
     reconciler.tick(); // 1: apply
     REQUIRE(dispatch.calls.size() == 1);
     store_status_response(rstore, "cmd-1", "agent-1", "status|active_unproven");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 2: polls apply, schedules status verify
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 3: dispatches status verify
     REQUIRE(dispatch.calls.size() == 2);
     store_status_response(rstore, "cmd-2", "agent-1", "status|active");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 4: polls status -> confirms
     auto confirmed = qstore.get_status("agent-1");
     REQUIRE(confirmed.has_value());
@@ -626,7 +703,7 @@ TEST_CASE("QuarantineContainmentReconciler: record churn on a confirmed, still-c
     // A further tick would normally dispatch nothing for a confirmed,
     // session-unchanged agent (pinned by the sibling test above) — confirm
     // that baseline still holds right before the release+requarantine.
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 5
     REQUIRE(dispatch.calls.size() == 2);
 
@@ -644,7 +721,7 @@ TEST_CASE("QuarantineContainmentReconciler: record churn on a confirmed, still-c
     // tick()'s own sweep must detect the record churn and re-enter the fresh
     // apply path for the NEW record THIS tick — the same call, not a later
     // one — rather than silently continuing to treat this agent as confirmed.
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 6: record churn detected -> fresh apply dispatched
     REQUIRE(dispatch.calls.size() == 3);
     CHECK(dispatch.calls[2].action == "quarantine"); // fresh APPLY, not a status-only re-verify
@@ -680,6 +757,7 @@ TEST_CASE("QuarantineContainmentReconciler: a session churn between the status d
     registry.map_session("session-A", "agent-1");
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -688,6 +766,7 @@ TEST_CASE("QuarantineContainmentReconciler: a session churn between the status d
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(20),
         .response_wait_override = std::chrono::milliseconds(200),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -696,9 +775,9 @@ TEST_CASE("QuarantineContainmentReconciler: a session churn between the status d
     reconciler.tick(); // 1: apply
     REQUIRE(dispatch.calls.size() == 1);
     store_status_response(rstore, "cmd-1", "agent-1", "status|active_unproven");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 2: polls apply, schedules status verify
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 3: dispatches status verify (session-A live at dispatch time)
     REQUIRE(dispatch.calls.size() == 2);
     CHECK(dispatch.calls[1].action == "quarantine_status");
@@ -709,7 +788,7 @@ TEST_CASE("QuarantineContainmentReconciler: a session churn between the status d
     registry.register_agent(make_info("agent-1"));
     registry.map_session("session-B", "agent-1");
     store_status_response(rstore, "cmd-2", "agent-1", "status|active");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 4: polls status — must NOT confirm against session-B
 
     auto status = qstore.get_status("agent-1");
@@ -741,6 +820,7 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr, // degraded for the whole test
@@ -749,6 +829,7 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(100),
         .response_wait_override = std::chrono::milliseconds(5000), // large: never let
                                                                     // timed_out fire —
@@ -770,7 +851,7 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
     // much tighter 20ms/30ms pairing this test shipped with — cpp-safety and
     // cpp-expert independently flagged the original margin as thin enough to
     // risk a false-red (never false-green) under a contended CI runner.
-    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // past the 100ms interval
+    steady.advance(std::chrono::milliseconds(300)); // past the 100ms interval
     reconciler.tick(); // 2: polls, response_store null -> degraded, backoff 100ms -> 200ms
     CHECK(degraded_count() == 1);
     CHECK(dispatch.calls.size() == 1); // no new dispatch — still the same pending command
@@ -780,7 +861,7 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
     // comfortably short of the NEW 200ms window (50ms slack either side).
     // Under the fix, this call must be rate_limited — no poll attempt, no
     // second "degraded" count.
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    steady.advance(std::chrono::milliseconds(150));
     reconciler.tick(); // 3: rate_limited if backoff escalated; degraded again if it didn't
     CHECK(degraded_count() == 1); // unchanged — proves the wait window actually grew
 
@@ -788,7 +869,7 @@ TEST_CASE("QuarantineContainmentReconciler: a sustained response_store outage es
     // escalates again (200ms -> 400ms), continuing the same exponential
     // shape every other repeated-failure path in this state machine already
     // uses.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    steady.advance(std::chrono::milliseconds(100));
     reconciler.tick(); // 4
     CHECK(degraded_count() == 2);
     CHECK(dispatch.calls.size() == 1); // still no new dispatch — command is still pending
@@ -808,6 +889,7 @@ TEST_CASE("QuarantineContainmentReconciler: heartbeat fast path is a no-op for a
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -816,6 +898,7 @@ TEST_CASE("QuarantineContainmentReconciler: heartbeat fast path is a no-op for a
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     // Heartbeat BEFORE any tick() has ever run — the cache is empty, so this
@@ -823,6 +906,7 @@ TEST_CASE("QuarantineContainmentReconciler: heartbeat fast path is a no-op for a
     // (there is nothing to assert the "no store read" half directly, but a
     // dispatch call would prove the fast path failed).
     reconciler.notify_agent_heartbeat("agent-1");
+    reconciler.drain_heartbeat_due(); // the reconciler thread's next pass over the marked devices
     CHECK(dispatch.calls.empty());
 }
 
@@ -845,6 +929,7 @@ TEST_CASE("QuarantineContainmentReconciler: an unsafe stored whitelist is never 
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -853,6 +938,7 @@ TEST_CASE("QuarantineContainmentReconciler: an unsafe stored whitelist is never 
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -879,6 +965,7 @@ TEST_CASE("QuarantineContainmentReconciler: a released record disappears from th
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -887,6 +974,7 @@ TEST_CASE("QuarantineContainmentReconciler: a released record disappears from th
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -908,6 +996,7 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded quarantine-store read abo
     AgentRegistry registry{bus, metrics};
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = nullptr, // simulates "store unavailable"
         .response_store = nullptr,
@@ -916,6 +1005,7 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded quarantine-store read abo
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     // #3425 review (security-guardian + cpp-expert, gate11 focused re-review):
@@ -953,6 +1043,7 @@ TEST_CASE("QuarantineContainmentReconciler: a successful tick publishes tick_hea
     AgentRegistry registry{bus, metrics};
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -961,6 +1052,7 @@ TEST_CASE("QuarantineContainmentReconciler: a successful tick publishes tick_hea
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -997,6 +1089,7 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded list_quarantined() read o
     AgentRegistry registry{bus, metrics};
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -1005,6 +1098,7 @@ TEST_CASE("QuarantineContainmentReconciler: a degraded list_quarantined() read o
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     // Same pre-seed rationale as the sibling test above: Gauge::value()
@@ -1033,6 +1127,7 @@ TEST_CASE("QuarantineContainmentReconciler: on_tick_exception publishes tick_hea
     AgentRegistry registry{bus, metrics};
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = nullptr,
         .response_store = nullptr,
@@ -1041,6 +1136,7 @@ TEST_CASE("QuarantineContainmentReconciler: on_tick_exception publishes tick_hea
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
@@ -1084,8 +1180,9 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
     // Fires after the apply dispatch is recorded but before reconcile_one's
     // own mark_endpoint_applied call — releasing the device HERE means that
     // guarded UPDATE (WHERE status='active') affects zero rows.
-    dispatch.on_dispatch = [&] { end_record(qstore, "agent-1"); };
+    dispatch.on_dispatch = [&] { end_record_by_sql(qdb.dsn(), "agent-1"); };
 
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -1094,6 +1191,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -1109,7 +1207,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
     // "device is not quarantined" rather than setting pending=apply on an
     // unchecked write) — no second dispatch call. And THIS tick's snapshot
     // no longer contains agent-1 at all, so the unconfirmed gauge is 0.
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    steady.advance(std::chrono::milliseconds(10));
     reconciler.tick();
     CHECK(dispatch.calls.size() == 1);
     CHECK(metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "connected"}})
@@ -1136,6 +1234,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_confi
     registry.register_agent(make_info("agent-1"));
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -1144,6 +1243,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_confi
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(20),
         .response_wait_override = std::chrono::milliseconds(200),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -1153,10 +1253,10 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_confi
     reconciler.tick(); // 1: apply dispatched
     REQUIRE(dispatch.calls.size() == 1);
     store_status_response(rstore, "cmd-1", "agent-1", "status|active_unproven");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 2: polls apply response, schedules status verify — no new dispatch
     CHECK(dispatch.calls.size() == 1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 3: dispatches the status verify
     REQUIRE(dispatch.calls.size() == 2);
     CHECK(dispatch.calls[1].action == "quarantine_status");
@@ -1166,7 +1266,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_confi
     // status|active.
     store_status_response(rstore, "cmd-2", "agent-1", "status|active");
     end_record(qstore, "agent-1");
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    steady.advance(std::chrono::milliseconds(60));
     reconciler.tick(); // 4: polls cmd-2 -> confirms containment -> mark_endpoint_confirmed hits 0 rows
 
     // The fix must NOT set confirmed=true on that failed write — verified
@@ -1204,6 +1304,7 @@ TEST_CASE("QuarantineContainmentReconciler: backoff doubling takes effect on THI
     // A generous claim interval (200ms) but a SHORT response wait (30ms), so
     // a timed-out poll's freshly-doubled backoff is easy to distinguish from
     // "immediately eligible again" in a fast test.
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -1212,6 +1313,7 @@ TEST_CASE("QuarantineContainmentReconciler: backoff doubling takes effect on THI
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(200),
         .response_wait_override = std::chrono::milliseconds(30),
         .verify_grace_override = std::chrono::milliseconds(20),
@@ -1225,7 +1327,7 @@ TEST_CASE("QuarantineContainmentReconciler: backoff doubling takes effect on THI
     // cannot even run before then), which is also comfortably past
     // response_wait(30ms), so the poll below sees both "empty" and
     // "timed_out" at once.
-    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    steady.advance(std::chrono::milliseconds(220));
     reconciler.tick(); // times out, doubles backoff, and (fixed) advances next_eligible_at NOW
     CHECK(dispatch.calls.size() == 1); // no new dispatch on the timeout-processing call itself
 
@@ -1236,6 +1338,7 @@ TEST_CASE("QuarantineContainmentReconciler: backoff doubling takes effect on THI
     // deadline to now + the NEWLY DOUBLED backoff (400ms), so this must be
     // rate-limited.
     reconciler.notify_agent_heartbeat("agent-1");
+    reconciler.drain_heartbeat_due(); // the reconciler thread's next pass over the marked devices
     CHECK(dispatch.calls.size() == 1); // still just the one dispatch — no premature retry
 }
 
@@ -1280,8 +1383,9 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
     // callback so mark_endpoint_applied's guarded UPDATE affects zero rows —
     // but this time with a real audit_store wired, so the fix's
     // audit_unstamped call has somewhere real to land.
-    dispatch.on_dispatch = [&] { end_record(qstore, "agent-1"); };
+    dispatch.on_dispatch = [&] { end_record_by_sql(qdb.dsn(), "agent-1"); };
 
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -1290,6 +1394,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release racing mark_endpoint_appli
         .audit_store = &astore,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -1343,11 +1448,12 @@ TEST_CASE("QuarantineContainmentReconciler: a release+requarantine race does not
     // release-then-requarantine-for-a-new-reason sequence landing in the
     // window between dispatch and the store stamp.
     dispatch.on_dispatch = [&] {
-        end_record(qstore, "agent-1");
+        end_record_by_sql(qdb.dsn(), "agent-1");
         REQUIRE(qstore.quarantine_device("agent-1", "admin", "NEW-reason", "99.99.99.99")
                     .has_value());
     };
 
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -1356,6 +1462,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release+requarantine race does not
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
     });
 
     reconciler.tick();
@@ -1377,7 +1484,7 @@ TEST_CASE("QuarantineContainmentReconciler: a release+requarantine race does not
 
     // A further tick must dispatch a FRESH apply for the NEW record's own
     // whitelist — proving this isn't just non-corruption but real recovery.
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    steady.advance(std::chrono::milliseconds(10));
     reconciler.tick();
     REQUIRE(dispatch.calls.size() == 2);
     CHECK(dispatch.calls[1].parameters.at("exceptions") == "99.99.99.99/out,99.99.99.99/in");
@@ -1410,6 +1517,7 @@ TEST_CASE("QuarantineContainmentReconciler: tick() stops starting further agents
     }
 
     MockDispatch dispatch;
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = nullptr,
@@ -1418,6 +1526,7 @@ TEST_CASE("QuarantineContainmentReconciler: tick() stops starting further agents
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         // Stop signals true once 2 of the 5 eligible agents have already
         // been dispatched — proving the loop actually checks should_stop()
         // and exits early rather than pushing through all 5.
@@ -1470,7 +1579,7 @@ std::int64_t last_confirmed_at(QuarantineStore& qstore, const std::string& agent
 QuarantineContainmentReconciler::Deps fast_deps(QuarantineStore& qstore, ResponseStore& rstore,
                                                 AgentRegistry& registry,
                                                 yuzu::MetricsRegistry& metrics,
-                                                MockDispatch& dispatch) {
+                                                MockDispatch& dispatch, FakeSteady& steady) {
     return QuarantineContainmentReconciler::Deps{
         .quarantine_store = &qstore,
         .response_store = &rstore,
@@ -1479,6 +1588,7 @@ QuarantineContainmentReconciler::Deps fast_deps(QuarantineStore& qstore, Respons
         .audit_store = nullptr,
         .dispatch_fn = dispatch.fn(),
         .now_fn = {},
+        .steady_now_fn = steady.fn(),
         .min_reapply_interval_override = std::chrono::milliseconds(1),
         .response_wait_override = std::chrono::milliseconds(60'000),
         .verify_grace_override = std::chrono::milliseconds(1),
@@ -1486,6 +1596,8 @@ QuarantineContainmentReconciler::Deps fast_deps(QuarantineStore& qstore, Respons
 }
 
 constexpr int kMaxTicksToConfirm = 5000;
+// What a tick loop advances the fake clock by: past the 1 ms timing overrides fast_deps sets.
+constexpr std::chrono::milliseconds kTickStep{5};
 
 } // namespace
 
@@ -1527,8 +1639,9 @@ TEST_CASE("QuarantineContainmentReconciler: session id reads race-free against a
 
     MockDispatch dispatch;
     auto_respond(dispatch, rstore);
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(
-        fast_deps(qstore, rstore, registry, metrics, dispatch));
+        fast_deps(qstore, rstore, registry, metrics, dispatch, steady));
 
     // std::thread + atomic stop flag + a join guard, NOT std::jthread: Apple
     // Clang's libc++ has no std::jthread (modelled on test_secret_codec.cpp).
@@ -1558,10 +1671,13 @@ TEST_CASE("QuarantineContainmentReconciler: session id reads race-free against a
     int ticks = 0;
     while (ticks < kMaxTicksToConfirm && last_confirmed_at(qstore, "agent-1") == 0) {
         reconciler.tick();
+        steady.advance(kTickStep);
         ++ticks;
     }
-    for (int i = 0; i < 200; ++i)
+    for (int i = 0; i < 200; ++i) {
         reconciler.tick(); // confirmed + unchanged session: the churn check runs every tick
+        steady.advance(kTickStep);
+    }
     stop_writer.store(true, std::memory_order_release);
     writer.join();
 
@@ -1605,13 +1721,15 @@ TEST_CASE("QuarantineContainmentReconciler: a confirmed device that goes offline
     // A strictly increasing stamp clock, so a SECOND last_confirmed_at stamp
     // (the re-confirm against session-B) is observable without sleeping.
     std::int64_t clock = 1'000;
-    auto deps = fast_deps(qstore, rstore, registry, metrics, dispatch);
+    FakeSteady steady;
+    auto deps = fast_deps(qstore, rstore, registry, metrics, dispatch, steady);
     deps.now_fn = [&clock] { return ++clock; };
     QuarantineContainmentReconciler reconciler(std::move(deps));
 
     int ticks = 0;
     while (ticks < kMaxTicksToConfirm && last_confirmed_at(qstore, "agent-1") == 0) {
         reconciler.tick();
+        steady.advance(kTickStep);
         ++ticks;
     }
     REQUIRE(ticks < kMaxTicksToConfirm);
@@ -1620,8 +1738,10 @@ TEST_CASE("QuarantineContainmentReconciler: a confirmed device that goes offline
     REQUIRE(first_confirmed_at > 0);
 
     registry.remove_agent("agent-1");
-    for (int i = 0; i < 50; ++i)
+    for (int i = 0; i < 50; ++i) {
         reconciler.tick();
+        steady.advance(kTickStep);
+    }
     CHECK(dispatch.calls.size() == 2);
     CHECK(
         metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", "offline"}})
@@ -1632,16 +1752,20 @@ TEST_CASE("QuarantineContainmentReconciler: a confirmed device that goes offline
 
     REQUIRE(registry.register_agent(make_info("agent-1")).has_value());
     registry.map_session("session-B", "agent-1");
-    for (int i = 0; i < kMaxTicksToConfirm && dispatch.calls.size() == 2; ++i)
+    for (int i = 0; i < kMaxTicksToConfirm && dispatch.calls.size() == 2; ++i) {
         reconciler.tick();
+        steady.advance(kTickStep);
+    }
     REQUIRE(dispatch.calls.size() == 3);
     CHECK(dispatch.calls[2].action == "quarantine_status"); // verify-first, never a blind re-apply
 
     // ...and that status verification confirms against session-B: a SECOND,
     // later last_confirmed_at stamp, with no further dispatch needed.
     for (int i = 0; i < kMaxTicksToConfirm && last_confirmed_at(qstore, "agent-1") == first_confirmed_at;
-         ++i)
+         ++i) {
         reconciler.tick();
+        steady.advance(kTickStep);
+    }
     CHECK(last_confirmed_at(qstore, "agent-1") > first_confirmed_at);
     CHECK(dispatch.calls.size() == 3);
     reconciler.tick(); // the gauge is published at the start of a tick
@@ -1692,8 +1816,9 @@ TEST_CASE("QuarantineContainmentReconciler: a session swapped during the status 
             registry.map_session("session-B", "agent-1"); // swap mid-dispatch
         }
     };
+    FakeSteady steady;
     QuarantineContainmentReconciler reconciler(
-        fast_deps(qstore, rstore, registry, metrics, dispatch));
+        fast_deps(qstore, rstore, registry, metrics, dispatch, steady));
 
     auto unconfirmed_count = [&] {
         return metrics.counter("yuzu_server_quarantine_reapply_total", {{"result", "unconfirmed"}})
@@ -1704,7 +1829,7 @@ TEST_CASE("QuarantineContainmentReconciler: a session swapped during the status 
     int ticks = 0;
     while (ticks < kMaxTicksToConfirm && unconfirmed_count() == 0) {
         reconciler.tick();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        steady.advance(kTickStep);
         ++ticks;
     }
     REQUIRE(ticks < kMaxTicksToConfirm);
@@ -1722,7 +1847,7 @@ TEST_CASE("QuarantineContainmentReconciler: a session swapped during the status 
     // that confirms against session-B.
     for (int i = 0; i < kMaxTicksToConfirm && last_confirmed_at(qstore, "agent-1") == 0; ++i) {
         reconciler.tick();
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        steady.advance(kTickStep);
     }
     CHECK(last_confirmed_at(qstore, "agent-1") > 0);
     REQUIRE(dispatch.calls.size() == 4);
@@ -1766,6 +1891,7 @@ struct ReconRig {
     // What the "device" answers each dispatch ("" = no answer). Called with the call just made.
     std::function<std::string(const DispatchCall&)> script;
     std::int64_t clock{1'800'000'000};
+    FakeSteady steady; // the reconciler's monotonic clock; a step advances it, nothing waits
     // Timing of the reconciler build() makes; a test that needs a visible backoff sets these
     // and calls build() again.
     std::chrono::milliseconds min_interval{1};
@@ -1806,6 +1932,7 @@ struct ReconRig {
             .audit_store = &astore,
             .dispatch_fn = dispatch.fn(),
             .now_fn = [this] { return clock; },
+            .steady_now_fn = steady.fn(),
             .min_reapply_interval_override = min_interval,
             .response_wait_override = std::chrono::milliseconds(60'000),
             .verify_grace_override = std::chrono::milliseconds(1),
@@ -1815,8 +1942,13 @@ struct ReconRig {
     }
 
     void step() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        steady.advance(std::chrono::milliseconds(8));
         rec->tick();
+    }
+    // A heartbeat, then the reconciler thread's next pass over the devices it marked.
+    void heartbeat() {
+        rec->notify_agent_heartbeat("agent-1");
+        rec->drain_heartbeat_due();
     }
     void run(int n) {
         for (int i = 0; i < n; ++i)
@@ -1881,6 +2013,28 @@ struct ReconRig {
         REQUIRE(o.has_value());
         return *o;
     }
+    // The expiry stamped on a command's stored reply: shortened replies sit near a day out, the
+    // default (90 days here) well beyond a month.
+    std::int64_t ttl_of(const std::string& command_id) {
+        auto rows = rstore.query(command_id, ResponseTierFilter::unrestricted_internal_consumer(),
+                                 ResponseQuery{.agent_id = "agent-1"});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        return rows->front().ttl_expires_at;
+    }
+    bool shortened(const std::string& command_id) {
+        const auto now = static_cast<std::int64_t>(std::time(nullptr));
+        const auto ttl = ttl_of(command_id);
+        REQUIRE(ttl > 0);
+        return ttl <= now + 2 * 86400;
+    }
+    bool kept_at_default(const std::string& command_id) {
+        const auto now = static_cast<std::int64_t>(std::time(nullptr));
+        return ttl_of(command_id) > now + 30 * 86400;
+    }
+    // The id of the Nth dispatch (1-based), as the mock hands it out.
+    static std::string cmd(std::size_t n) { return "cmd-" + std::to_string(n); }
+
     double gauge(const char* name, const char* reach) {
         return metrics.gauge(name, {{"reachability", reach}}).value();
     }
@@ -1909,7 +2063,7 @@ struct ReconRig {
     }
     // One re-verify: past the interval, a status goes out and its reply is read.
     void reverify_once() {
-        std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        steady.advance(std::chrono::milliseconds(45));
         step(); // sends the status
         step(); // reads it
     }
@@ -2008,7 +2162,7 @@ TEST_CASE("reconciler (firewall): a confirmed record is re-read after the interv
     CHECK(rig.rows_with("quarantine.reapply", "CONFIRMED") == 1);
 
     rig.clock += 60; // the re-verify's stamp is observably later
-    std::this_thread::sleep_for(std::chrono::milliseconds(45));
+    rig.steady.advance(std::chrono::milliseconds(45));
     rig.step(); // past the interval: a status goes out
     CHECK(rig.sent().back() == "firewall.quarantine_status");
     CHECK(rig.sent().size() == 3);
@@ -2287,7 +2441,7 @@ TEST_CASE("reconciler (firewall): a record flipped to releasing after the tick s
     CHECK(rig.dispatch.calls.empty());
     rig.connect("session-A");
     REQUIRE(rig.qstore.request_release("agent-1").has_value()); // flips after the snapshot
-    rig.rec->notify_agent_heartbeat("agent-1"); // the cached entry still thinks it is active
+    rig.heartbeat(); // the cached entry still thinks it is active
     CHECK(rig.dispatch.calls.empty()); // release_pending: nothing dispatched, never a firewall.quarantine
     rig.step();
     CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine_status"}); // now a releasing entry
@@ -2304,9 +2458,12 @@ TEST_CASE("reconciler (firewall): release is never sent for a row a fresh read d
     CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine_status"});
     // The record ends elsewhere (the REST route, say) before the next cycle's release.
     const auto id = rig.active()->id;
-    REQUIRE(rig.qstore.mark_released("agent-1", id, ReleaseEnd::device_confirmed).has_value());
-    std::this_thread::sleep_for(std::chrono::milliseconds(8));
-    rig.rec->notify_agent_heartbeat("agent-1"); // the cached releasing entry would send a release
+    REQUIRE(rig.qstore
+                .mark_released("agent-1", id, ReleaseEnd::device_confirmed,
+                               fence_of(rig.qstore, "agent-1", id))
+                .has_value());
+    rig.steady.advance(std::chrono::milliseconds(8));
+    rig.heartbeat(); // the cached releasing entry would send a release
     CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine_status"}); // it did not
     rig.run(3);
     CHECK(rig.count_sent("firewall.release") == 0);
@@ -2483,7 +2640,7 @@ TEST_CASE("reconciler (firewall): each busy answer to an owed release escalates 
     REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
     rig.reply("", "status|active", "status|busy");
     const auto pause_then_tick = [&rig](int ms) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+        rig.steady.advance(std::chrono::milliseconds(ms));
         rig.rec->tick();
     };
     // Backoff 60 ms: the status goes out, its answer doubles the wait to 120 ms, the release goes out.
@@ -2503,15 +2660,13 @@ TEST_CASE("reconciler (firewall): each busy answer to an owed release escalates 
                                                   "firewall.quarantine_status"}));
 }
 
-// The reconciler reads steady_clock::now() itself (no clock seam), so this case spends real time,
-// but every assertion is in the direction a slow machine cannot break. Phase 1 only asserts that at
-// least a SUM OF WAITS elapsed between sends (a stall makes that longer). Phase 2 sleeps past
-// max_backoff before every tick (a stall is again harmless), so a tick is rate limited only if some
-// wait was longer than max_backoff.
+// Time here is the rig's fake steady clock, so the waits are exact. Phase 1 ticks every millisecond
+// until the third release has gone out and measures the gap between sends; phase 2 advances past
+// max_backoff before every tick, so a tick is rate limited only if some wait was longer than
+// max_backoff.
 TEST_CASE("reconciler (firewall): repeated busy answers to an owed release grow the backoff only "
           "up to max_backoff and the release is still retried: no park and no failure row",
           "[pg][quarantine][reconciler][prq2][owed][busy]") {
-    using Clock = std::chrono::steady_clock;
     using Ms = std::chrono::milliseconds;
     constexpr Ms kMin{3};
     constexpr Ms kMax{24}; // 8 x kMin: the clamp first bites at the second busy answer
@@ -2523,23 +2678,20 @@ TEST_CASE("reconciler (firewall): repeated busy answers to an owed release grow 
     REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
     rig.reply("", "status|active", "status|busy");
 
-    // Phase 1: tick as fast as the state machine allows until the third release has gone out,
-    // keeping when each tick that sent a release started and ended. Backoff: status read 2 x kMin,
-    // first busy 4 x, status read 8 x, second busy 16 x clamped to kMax.
-    std::vector<std::pair<Clock::time_point, Clock::time_point>> release_ticks;
-    const auto give_up = Clock::now() + std::chrono::seconds(10);
-    while (release_ticks.size() < 3 && Clock::now() < give_up) {
+    // Phase 1: tick every millisecond until the third release has gone out, keeping when each
+    // tick that sent a release ran. Backoff: status read 2 x kMin, first busy 4 x, status read 8 x,
+    // second busy 16 x clamped to kMax.
+    std::vector<std::chrono::steady_clock::time_point> release_ticks;
+    for (int i = 0; i < 100'000 && release_ticks.size() < 3; ++i) {
         const auto before = rig.count_sent("firewall.release");
-        const auto started = Clock::now();
         rig.rec->tick();
         if (rig.count_sent("firewall.release") > before)
-            release_ticks.emplace_back(started, Clock::now());
-        std::this_thread::sleep_for(Ms(1));
+            release_ticks.push_back(rig.steady.t);
+        rig.steady.advance(Ms(1));
     }
     REQUIRE(release_ticks.size() == 3);
     const auto gap_ms = [&](std::size_t i) {
-        return std::chrono::duration_cast<Ms>(release_ticks[i].second - release_ticks[i - 1].first)
-            .count();
+        return std::chrono::duration_cast<Ms>(release_ticks[i] - release_ticks[i - 1]).count();
     };
     // Between two release sends: the busy answer's wait, the status send's, the status read's and
     // the release send's. First pair 2 + 4 + 4 + 8 x kMin, then all four are kMax: the delay grew.
@@ -2551,7 +2703,7 @@ TEST_CASE("reconciler (firewall): repeated busy answers to an owed release grow 
     // outgrew max_backoff, and the owed release keeps being retried, never parked.
     const auto limited = rig.counter("rate_limited");
     for (int i = 0; i < 8; ++i) {
-        std::this_thread::sleep_for(kMax + Ms(4));
+        rig.steady.advance(kMax + Ms(4));
         rig.rec->tick();
     }
     CHECK(rig.counter("rate_limited") == limited);
@@ -2607,8 +2759,8 @@ TEST_CASE("reconciler (firewall): a heartbeat for an owed device whose new recor
     rig.step(); // status read: still contained; the next cycle would send the release
     CHECK(rig.sent() == std::vector<std::string>{"firewall.quarantine_status"});
     rig.quarantine("10.0.0.2"); // the device is quarantined again in between
-    std::this_thread::sleep_for(std::chrono::milliseconds(8));
-    rig.rec->notify_agent_heartbeat("agent-1"); // the cached owed entry
+    rig.steady.advance(std::chrono::milliseconds(8));
+    rig.heartbeat(); // the cached owed entry
     CHECK(rig.count_sent("firewall.release") == 0); // a fresh read shows an active record: nothing sent
 }
 
@@ -2643,4 +2795,594 @@ TEST_CASE("reconciler (firewall): a failed owed read counts degraded, and the ac
     CHECK(rig.active()->last_confirmed_at > 0);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Follow-ups to the PRQ.2 review: the heartbeat mark, identity-checked write-back, the drift
+// re-read, alerts, retention of status replies and the apply fence.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── #7620 / #7645: a pass whose entry was reset drops its result ─────────────
+
+TEST_CASE("reconciler (firewall): a tick run from inside a drained heartbeat pass's dispatch, after "
+          "a release was requested, leaves ONE command pending and the outer pass's result dropped",
+          "[pg][quarantine][reconciler][prq2][reentrant]") {
+    RECON_RIG(rig);
+    rig.quarantine();
+    // The first pass is the heartbeat's: the entry exists (an offline tick made it), the device
+    // then connects.
+    rig.disconnect();
+    rig.step();
+    rig.connect("session-A");
+    rig.reply("status|active_unproven", "status|active");
+    bool fired = false;
+    rig.dispatch.on_dispatch = [&rig, &fired, base = rig.dispatch.on_dispatch] {
+        base(); // the scripted reply for the command just made
+        if (fired)
+            return;
+        fired = true;
+        // While the apply is dispatching: the operator asks for the release, and the reconciler
+        // thread's tick runs (the entry is reset to a releasing one, which reads status first).
+        REQUIRE(rig.qstore.request_release("agent-1").has_value());
+        rig.rec->tick();
+    };
+    rig.steady.advance(std::chrono::milliseconds(8));
+    rig.heartbeat(); // the outer pass: send_apply
+    REQUIRE(fired);
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine", "firewall.quarantine_status"}));
+    // The outer pass wrote nothing into the releasing entry: the pending command is still the
+    // status the tick sent, whose reply (still contained) is read next and followed by the release.
+    // A clobbered entry would have read the apply's reply instead and sent a second status.
+    rig.run(2);
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine", "firewall.quarantine_status",
+                                                  "firewall.release"}));
+    CHECK(rig.active()->status == "releasing");
+}
+
+TEST_CASE("reconciler (firewall): quarantine, release, quarantine again with other exceptions on a "
+          "contained device writes a second allow_set_not_applied row naming the new record",
+          "[pg][quarantine][reconciler][prq2][allowset]") {
+    const std::string kKept =
+        "status|active\nnote|already_active=1\nnote|allow_set_unchanged_use_quarantine_allow=1";
+    RECON_RIG(rig);
+    const auto first = rig.quarantine("10.0.0.2");
+    rig.reply(kKept, "status|active");
+    rig.run(6);
+    CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied record_id=" +
+                                                  std::to_string(first.id)) == 1);
+    end_record(rig.qstore, "agent-1");
+    const auto second = rig.quarantine("10.0.0.3"); // other exceptions, the device still contained
+    REQUIRE(second.id != first.id);
+    rig.run(6);
+    CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied record_id=" +
+                                                  std::to_string(second.id)) == 1);
+    CHECK(rig.rows_with("quarantine.reapply", "allow_set_not_applied") == 2);
+}
+
+TEST_CASE("reconciler (firewall): a reset from the steady-clock read between a pass's claim and its "
+          "write-back leaves the NEW entry's flags and backoff untouched",
+          "[pg][quarantine][reconciler][prq2][reentrant]") {
+    RECON_RIG(rig);
+    rig.quarantine();
+    rig.reply("status|active_unproven", "status|active");
+    rig.step(); // the apply goes out, its reply is stored
+    REQUIRE(rig.sent() == std::vector<std::string>{"firewall.quarantine"});
+    // The next pass claims the entry and polls the apply's reply. Its next monotonic-clock read is
+    // OUTSIDE the lock and ahead of the write-back: a release is requested and a tick resets the
+    // entry to a releasing one, which sends its own status.
+    // (The pass reads the clock at its claim, under the entry lock, where a re-entrant tick would
+    // deadlock itself; the read after the poll is outside it. So the hook skips the claim's.)
+    bool fired = false;
+    int reads = 0;
+    rig.steady.on_read = [&rig, &fired, &reads] {
+        if (fired || ++reads < 2)
+            return;
+        fired = true;
+        REQUIRE(rig.qstore.request_release("agent-1").has_value());
+        rig.rec->tick();
+    };
+    rig.steady.advance(std::chrono::milliseconds(8));
+    // The outer pass is a heartbeat's: the cache still holds the agent from the earlier tick.
+    rig.heartbeat();
+    rig.steady.on_read = nullptr;
+    REQUIRE(fired);
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine", "firewall.quarantine_status"}));
+    // The outer pass's reply handling (verify_next: clear `pending`, set verify_first) was dropped:
+    // the status the tick sent is still pending, so the next step reads ITS reply (still contained)
+    // and sends the release. A pass that wrote back would have sent a second status instead.
+    rig.run(2);
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine", "firewall.quarantine_status",
+                                                  "firewall.release"}));
+}
+
+// ── #7621 / #7622: a re-verify that no longer confirms ────────────────────────
+
+TEST_CASE("reconciler (firewall): a release requested during a pending re-verify, handled before the next "
+          "tick, ends as a confirmed release when the device answers inactive: no drift row",
+          "[pg][quarantine][reconciler][prq2][drift]") {
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
+    const auto rec = rig.quarantine();
+    rig.confirm("status|active");
+    rig.reply("status|active_unproven", "status|inactive");
+    rig.steady.advance(std::chrono::milliseconds(45));
+    rig.step(); // the re-verify's status goes out
+    REQUIRE(rig.sent().back() == "firewall.quarantine_status");
+    // The operator asks for the release while that status is in flight; the heartbeat pass reads
+    // the earlier reply before any tick sees the new kind.
+    REQUIRE(rig.qstore.request_release("agent-1").has_value());
+    rig.steady.advance(std::chrono::milliseconds(8));
+    rig.heartbeat();
+    CHECK(rig.rows_with("quarantine.reapply", "drift") == 0);
+    CHECK_FALSE(rig.active().has_value()); // the record ended on the device's word
+    CHECK(rig.has_row("quarantine.disable", "success", "confirmed record_id=" + std::to_string(rec.id)));
+    CHECK(rig.counter("released") == 1);
+    CHECK(rig.counter("drift") == 0);
+    CHECK(rig.owed().empty());
+}
+
+TEST_CASE("reconciler (firewall): the fresh store read before a drift row fails -> no drift row, degraded "
+          "counted, the entry re-verifies",
+          "[pg][quarantine][reconciler][prq2][drift]") {
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
+    rig.quarantine();
+    rig.confirm("status|active");
+    rig.reply("status|active_unproven", "status|degraded|policy_not_blocking");
+    rig.steady.advance(std::chrono::milliseconds(45));
+    rig.step(); // the re-verify's status goes out
+    const auto status_sends = rig.count_sent("firewall.quarantine_status");
+    const double degraded = rig.counter("degraded");
+    // The reply is read with the store unreadable: the pass cannot tell drift from a release.
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records RENAME TO quarantine_records_x");
+    rig.steady.advance(std::chrono::milliseconds(8));
+    rig.heartbeat();
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records_x RENAME TO quarantine_records");
+    CHECK(rig.rows_with("quarantine.reapply", "drift") == 0);
+    CHECK(rig.counter("degraded") == degraded + 1);
+    CHECK(rig.counter("drift") == 0);
+    CHECK(rig.active()->last_confirmed_at > 0); // still confirmed: nothing was concluded
+    // the entry re-verifies on its next cycle, and the real drift is then counted once
+    rig.run(3);
+    CHECK(rig.count_sent("firewall.quarantine_status") > status_sends);
+    CHECK(rig.rows_with("quarantine.reapply", "drift") == 1);
+}
+
+TEST_CASE("reconciler (firewall): a real drift counts result=drift once and result=unconfirmed not at all",
+          "[pg][quarantine][reconciler][prq2][drift]") {
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
+    rig.quarantine();
+    rig.confirm("status|active");
+    REQUIRE(rig.counter("unconfirmed") == 0);
+    rig.reply("status|active_unproven", "status|degraded|policy_not_blocking");
+    rig.reverify_once();
+    CHECK(rig.counter("drift") == 1);
+    CHECK(rig.counter("unconfirmed") == 0);
+    CHECK(rig.rows_with("quarantine.reapply", "drift status=unconfirmed") == 1);
+    // an ordinary unconfirmed read on a never-confirmed record still counts unconfirmed
+}
+
+// ── #7623: the last-tick gauge ───────────────────────────────────────────────
+
+TEST_CASE("reconciler (firewall): the last-tick gauge moves on a healthy tick and on a degraded early "
+          "return, and not from on_tick_exception",
+          "[pg][quarantine][reconciler][prq2][metrics]") {
+    RECON_RIG(rig);
+    const auto last_tick = [&rig] {
+        return rig.metrics.gauge("yuzu_server_quarantine_reconciler_last_tick_unixtime").value();
+    };
+    rig.step();
+    CHECK(last_tick() == static_cast<double>(rig.clock));
+    rig.clock += 100;
+    rig.step();
+    CHECK(last_tick() == static_cast<double>(rig.clock)); // moved on a healthy tick
+    CHECK(rig.metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 1);
+
+    // a degraded read: the tick returns early, still a tick that finished
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records RENAME TO quarantine_records_x");
+    rig.clock += 100;
+    rig.step();
+    CHECK(rig.metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 0);
+    CHECK(last_tick() == static_cast<double>(rig.clock));
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records_x RENAME TO quarantine_records");
+
+    // a tick that threw did not finish: the gauge stays where it was
+    const double before = last_tick();
+    rig.clock += 100;
+    rig.rec->on_tick_exception();
+    CHECK(last_tick() == before);
+}
+
+// ── #7625: release_sent is audited once per session ───────────────────────────
+
+TEST_CASE("reconciler (firewall): a device that always refuses the release gets one release_sent row per "
+          "session, while every dispatch is counted",
+          "[pg][quarantine][reconciler][prq2][release]") {
+    RECON_RIG(rig);
+    rig.quarantine();
+    REQUIRE(rig.qstore.request_release("agent-1").has_value());
+    rig.reply("", "status|active", "status|refused|privilege_unavailable");
+    rig.run(16);
+    const auto sends = rig.count_sent("firewall.release");
+    REQUIRE(sends >= 3); // six-plus cycles: the release went out repeatedly
+    CHECK(rig.rows_with("quarantine.disable", "release_sent") == 1);
+    CHECK(rig.counter("release_sent") == static_cast<double>(sends)); // every dispatch counted
+    CHECK(rig.active()->status == "releasing");
+
+    // a new session is a new cycle: one more row
+    rig.connect("session-B");
+    rig.run(16);
+    CHECK(rig.count_sent("firewall.release") > sends);
+    CHECK(rig.rows_with("quarantine.disable", "release_sent") == 2);
+}
+
+// ── #7626: a restart sends one more owed release ──────────────────────────────
+
+TEST_CASE("reconciler (firewall): a fresh reconciler over a parked owed device sends exactly one more "
+          "release and writes one more forced_release_unconfirmed row",
+          "[pg][quarantine][reconciler][prq2][owed]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+    rig.reply("", "status|active", "status|active");
+    rig.run(8);
+    REQUIRE(rig.count_sent("firewall.release") == 1);
+    REQUIRE(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 1);
+    rig.run(8); // parked: status-only reads
+    REQUIRE(rig.count_sent("firewall.release") == 1);
+
+    rig.build(); // a server restart: no in-memory bookkeeping
+    rig.run(14);
+    CHECK(rig.count_sent("firewall.release") == 2);
+    CHECK(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 2);
+    CHECK(rig.owed().size() == 1);
+}
+
+// ── #7627: which status replies keep the default lifetime ─────────────────────
+
+TEST_CASE("reconciler (firewall): status replies the reconciler reads are shortened to a day unless they "
+          "changed what the server holds",
+          "[pg][quarantine][reconciler][prq2][retention]") {
+    SECTION("the first confirm keeps the default; a repeat confirm is shortened") {
+        RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
+        rig.quarantine();
+        rig.confirm("status|active");
+        REQUIRE(rig.sent() == kApplyThenVerify);
+        CHECK(rig.kept_at_default(rig.cmd(2)));   // the status reply that first confirmed
+        rig.reverify_once();
+        REQUIRE(rig.count_sent("firewall.quarantine_status") == 2);
+        CHECK(rig.shortened(rig.cmd(3)));          // the repeat confirm
+        CHECK(rig.kept_at_default(rig.cmd(2)));
+    }
+    SECTION("a drift reply keeps the default") {
+        RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
+        rig.quarantine();
+        rig.confirm("status|active");
+        rig.reply("status|active_unproven", "status|degraded|policy_not_blocking");
+        rig.reverify_once();
+        REQUIRE(rig.rows_with("quarantine.reapply", "drift") == 1);
+        CHECK(rig.kept_at_default(rig.cmd(3)));
+    }
+    SECTION("a still-contained reply on a releasing record is shortened; the reply that ends it is not") {
+        RECON_RIG(rig);
+        rig.quarantine();
+        REQUIRE(rig.qstore.request_release("agent-1").has_value());
+        int statuses = 0;
+        rig.script = [&statuses](const DispatchCall& c) -> std::string {
+            if (c.action == "quarantine_status")
+                return ++statuses == 1 ? "status|active" : "status|inactive";
+            if (c.action == "release")
+                return "status|active"; // whatever it says to the release ends nothing by itself
+            return {};
+        };
+        rig.run(8);
+        REQUIRE_FALSE(rig.active().has_value());
+        const auto sent = rig.sent();
+        REQUIRE(sent.size() >= 3);
+        CHECK(rig.shortened(rig.cmd(1)));          // the first status: still contained
+        CHECK(rig.kept_at_default(rig.cmd(3)));    // the second status: inactive, the record ended
+    }
+    SECTION("an unconfirmed reply on a never-confirmed record is shortened") {
+        RECON_RIG(rig);
+        rig.quarantine();
+        rig.reply("status|active_unproven", "status|degraded|policy_not_blocking");
+        rig.run(4);
+        REQUIRE(rig.sent().size() >= 2);
+        CHECK(rig.shortened(rig.cmd(2)));
+    }
+    SECTION("a parked owed read is shortened; the reply that clears the owed release is not") {
+        RECON_RIG(rig);
+        const auto rec = rig.quarantine();
+        REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+        rig.reply("", "status|active", "status|active");
+        rig.run(10); // status, release, status (parks), then status-only reads
+        REQUIRE(rig.rows_with("quarantine.disable", "forced_release_unconfirmed") == 1);
+        rig.run(2);
+        std::size_t last_status = 0;
+        for (std::size_t i = 0; i < rig.dispatch.calls.size(); ++i)
+            if (rig.dispatch.calls[i].action == "quarantine_status")
+                last_status = i + 1;
+        REQUIRE(last_status > 3);
+        CHECK(rig.shortened(rig.cmd(last_status))); // a parked read
+        // the device is released at last
+        rig.reply("", "status|inactive", "status|inactive");
+        rig.steady.advance(std::chrono::seconds(10));
+        rig.run(12);
+        REQUIRE(rig.owed().empty());
+        std::size_t clearing = 0;
+        for (std::size_t i = 0; i < rig.dispatch.calls.size(); ++i)
+            if (rig.dispatch.calls[i].action == "quarantine_status")
+                clearing = i + 1;
+        CHECK(rig.kept_at_default(rig.cmd(clearing)));
+    }
+}
+
+// ── #7584c: one failed owed read between ticks ────────────────────────────────
+
+TEST_CASE("reconciler (firewall): one failed owed read between ticks keeps the owed entry, so no second "
+          "release is sent in the session",
+          "[pg][quarantine][reconciler][prq2][owed]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+    rig.reply("", "status|active", "status|active");
+    rig.run(3);
+    REQUIRE(rig.sent() == (std::vector<std::string>{"firewall.quarantine_status", "firewall.release"}));
+    // The owed read fails for one tick (the column type is flipped, then restored).
+    exec_sql(qdb.dsn(), "DROP INDEX quarantine_store.idx_quarantine_release_owed");
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                        "ALTER COLUMN device_release_owed_at DROP DEFAULT, "
+                        "ALTER COLUMN device_release_owed_at TYPE text USING device_release_owed_at::text");
+    const double degraded = rig.counter("degraded");
+    rig.step();
+    CHECK(rig.counter("degraded") == degraded + 1);
+    exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                        "ALTER COLUMN device_release_owed_at TYPE bigint USING device_release_owed_at::bigint, "
+                        "ALTER COLUMN device_release_owed_at SET DEFAULT 0");
+    exec_sql(qdb.dsn(), "CREATE INDEX idx_quarantine_release_owed ON quarantine_store.quarantine_records"
+                        "(agent_id, id) WHERE status = 'released' AND device_release_owed_at <> 0");
+    rig.run(16);
+    CHECK(rig.count_sent("firewall.release") == 1); // the entry survived, so the session's release stands
+    CHECK(rig.owed().size() == 1);
+}
+
+// ── #7613: the apply fence through the reconciler ─────────────────────────────
+
+TEST_CASE("reconciler (firewall): DELETE's release request and confirmed mark run inside the reconciler's "
+          "apply dispatch: the mark is refused, the record stays releasing, then status, release, "
+          "inactive end it",
+          "[pg][quarantine][reconciler][prq2][fence]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    int statuses = 0;
+    rig.script = [&statuses](const DispatchCall& c) -> std::string {
+        if (c.action == "quarantine")
+            return "status|active_unproven";
+        if (c.action == "quarantine_status")
+            return ++statuses == 1 ? "status|active" : "status|inactive";
+        if (c.action == "release")
+            return "status|active"; // whatever it says to the release ends nothing by itself
+        return {};
+    };
+    bool ran = false;
+    rig.dispatch.on_dispatch = [&rig, &ran, &rec, base = rig.dispatch.on_dispatch] {
+        base();
+        if (ran || rig.dispatch.calls.back().action != "quarantine")
+            return;
+        ran = true;
+        // What DELETE does, from inside the apply's dispatch: the claim is live.
+        REQUIRE(rig.qstore.request_release("agent-1").has_value());
+        auto token = rig.qstore.apply_fence_token("agent-1", rec.id);
+        REQUIRE(token.has_value());
+        CHECK_FALSE(token->has_value()); // empty while the apply's claim is live
+        auto mark = rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::device_confirmed, *token);
+        REQUIRE_FALSE(mark.has_value());
+        CHECK(mark.error() == std::string(kQuarantineApplyInFlight));
+    };
+    rig.run(9);
+    REQUIRE(ran);
+    CHECK(rig.sent() == (std::vector<std::string>{"firewall.quarantine", "firewall.quarantine_status",
+                                                  "firewall.release", "firewall.quarantine_status"}));
+    CHECK_FALSE(rig.active().has_value());
+    CHECK(rig.has_row("quarantine.disable", "success", "confirmed record_id=" + std::to_string(rec.id)));
+    CHECK(rig.owed().empty());
+}
+
+TEST_CASE("reconciler (firewall): a status read sent while the record was confirmed, an apply through the "
+          "chokepoint, then a release request: the device's EARLIER inactive reply ends nothing; the "
+          "next status read takes a fresh token and settles it",
+          "[pg][quarantine][reconciler][prq2][fence]") {
+    RECON_RIG_REVERIFY(rig, std::chrono::milliseconds(30));
+    const auto rec = rig.quarantine();
+    rig.confirm("status|active");
+    rig.reply("status|active_unproven", "status|inactive");
+    rig.steady.advance(std::chrono::milliseconds(45));
+    rig.step(); // the re-verify's status is sent: its token is read now
+    REQUIRE(rig.sent().back() == "firewall.quarantine_status");
+    // The MCP path: an apply goes through the chokepoint after that read...
+    QuarantineRecord stored{};
+    auto applied = redispatch_stored_containment(
+        rig.qstore, "agent-1",
+        [&rig](const std::unordered_map<std::string, std::string>& params)
+            -> std::pair<std::string, int> {
+            const auto out = rig.dispatch.fn()("firewall", "quarantine", {"agent-1"}, "", params, "");
+            return {out.command_id, out.sent};
+        },
+        stored);
+    REQUIRE(applied.has_value());
+    // ...and the operator then asks for the release.
+    REQUIRE(rig.qstore.request_release("agent-1").has_value());
+    rig.steady.advance(std::chrono::milliseconds(8));
+    rig.heartbeat(); // the earlier status's `inactive` is read now
+    const auto row = rig.active();
+    REQUIRE(row.has_value());
+    CHECK(row->status == "releasing");                // the end was refused
+    CHECK(rig.audit("quarantine.disable").empty());    // no row, no counter for a refusal
+    CHECK(rig.counter("released") == 0);
+    CHECK(rig.rows_with("quarantine.reapply", "drift") == 0);
+    // the next status read takes a fresh token and settles it
+    rig.run(4);
+    CHECK_FALSE(rig.active().has_value());
+    CHECK(rig.has_row("quarantine.disable", "success", "confirmed record_id=" + std::to_string(rec.id)));
+}
+
+TEST_CASE("reconciler (firewall): the owed leg: a record ended by force while an apply's claim is live is "
+          "not cleared by an inactive read taken with an empty token; after the claim is released the "
+          "next status read clears it",
+          "[pg][quarantine][reconciler][prq2][fence][owed]") {
+    RECON_RIG(rig);
+    const auto rec = rig.quarantine();
+    auto claim = rig.qstore.claim_apply("agent-1", rec.id); // an apply is dispatching
+    REQUIRE(claim.has_value());
+    REQUIRE(rig.qstore.mark_released("agent-1", rec.id, ReleaseEnd::forced).has_value());
+    rig.reply("", "status|inactive");
+    rig.run(5); // status (token empty), its reply read and refused, status again (still empty)
+    CHECK(rig.count_sent("firewall.quarantine_status") >= 2);
+    CHECK(rig.count_sent("firewall.release") == 0);      // the device answered inactive: no release
+    CHECK(rig.owed().size() == 1);                       // not cleared on an unfenced answer
+    CHECK(rig.audit("quarantine.disable").empty());
+    REQUIRE(rig.qstore.release_apply_claim("agent-1", rec.id, *claim).has_value());
+    rig.run(4);
+    CHECK(rig.owed().empty());                            // the next status read settles it
+    CHECK(rig.has_row("quarantine.disable", "success", "forced_release_confirmed record_id=" +
+                                                           std::to_string(rec.id)));
+}
+
 #undef RECON_RIG
+
+// ── Cases that need no rig ────────────────────────────────────────────────────
+
+TEST_CASE("QuarantineContainmentReconciler::seed_metrics: every series exists at 0 before the first tick, "
+          "every result label is present, and the last-tick gauge starts at boot time",
+          "[quarantine][reconciler][metrics]") {
+    yuzu::MetricsRegistry metrics;
+    QuarantineContainmentReconciler::seed_metrics(metrics);
+    const std::string text = metrics.serialize();
+    for (const auto result : kQuarantineReapplyResults)
+        CHECK(text.find("yuzu_server_quarantine_reapply_total{result=\"" + std::string(result) +
+                        "\"} 0") != std::string::npos);
+    CHECK(kQuarantineReapplyResults.size() == 14);
+    CHECK(std::find(kQuarantineReapplyResults.begin(), kQuarantineReapplyResults.end(), "drift") !=
+          kQuarantineReapplyResults.end());
+    for (const char* reach : {"connected", "offline"})
+        for (const char* name : {"yuzu_server_quarantine_endpoint_unconfirmed",
+                                 "yuzu_server_quarantine_release_pending",
+                                 "yuzu_server_quarantine_forced_release_owed"})
+            CHECK(metrics.gauge(name, {{"reachability", reach}}).value() == 0);
+    CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").value() == 1);
+    // a plausible epoch (after 2020), so the stall alert does not fire before the first tick
+    CHECK(metrics.gauge("yuzu_server_quarantine_reconciler_last_tick_unixtime").value() > 1.6e9);
+}
+
+TEST_CASE("QuarantineContainmentReconciler: a heartbeat only marks the device due: with every lease of "
+          "the store pool held it makes no acquire attempt and no dispatch, and the drain does the work "
+          "once the leases are back",
+          "[pg][quarantine][reconciler][heartbeat]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    std::atomic<int> acquires{0};
+    std::atomic<int> timeouts{0};
+    PgPool qpool{{.conninfo = qdb.dsn(),
+                  .size = 2,
+                  .observer = {.on_acquire_timeout = [&timeouts] { ++timeouts; },
+                               .on_acquire_wait_seconds = [&acquires](double) { ++acquires; }}}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    for (const char* id : {"agent-1", "agent-2", "agent-3"})
+        REQUIRE(qstore.quarantine_device(id, "admin", "malware", "").has_value());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry{bus, metrics};
+    MockDispatch dispatch;
+    FakeSteady steady;
+    QuarantineContainmentReconciler reconciler(QuarantineContainmentReconciler::Deps{
+        .quarantine_store = &qstore,
+        .response_store = nullptr,
+        .registry = &registry,
+        .metrics = &metrics,
+        .audit_store = nullptr,
+        .dispatch_fn = dispatch.fn(),
+        .now_fn = {},
+        .steady_now_fn = steady.fn(),
+    });
+    reconciler.tick(); // the three devices are offline: the entries and the cache exist, nothing sent
+    REQUIRE(dispatch.calls.empty());
+    for (const char* id : {"agent-1", "agent-2", "agent-3"})
+        REQUIRE(registry.register_agent(make_info(id)).has_value());
+
+    {
+        auto lease_a = qpool.acquire();
+        auto lease_b = qpool.acquire();
+        REQUIRE(lease_a);
+        REQUIRE(lease_b);
+        acquires = 0;
+        timeouts = 0;
+        for (const char* id : {"agent-1", "agent-2", "agent-3"})
+            reconciler.notify_agent_heartbeat(id);
+        CHECK(acquires.load() == 0);
+        CHECK(timeouts.load() == 0);
+        CHECK(dispatch.calls.empty());
+    }
+    // the leases are back: the reconciler thread's next pass does the work for all three
+    CHECK(reconciler.drain_heartbeat_due() == 3);
+    CHECK(dispatch.calls.size() == 3);
+    for (const auto& call : dispatch.calls)
+        CHECK(call.action == "quarantine");
+    // the marks were taken: a second drain has nothing to do
+    CHECK(reconciler.drain_heartbeat_due() == 0);
+}
+
+TEST_CASE("redispatch_stored_containment claims the apply: the token is empty inside the dispatch, the new "
+          "generation after it, and another apply's live claim means nothing is dispatched",
+          "[pg][quarantine][reconciler][fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_recon_tpl);
+    PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineStore qstore{qpool};
+    REQUIRE(qstore.is_open());
+    REQUIRE(qstore.quarantine_device("agent-1", "admin", "malware", "10.0.0.1").has_value());
+    const auto id = qstore.get_status("agent-1")->value().id;
+
+    std::optional<std::optional<std::int64_t>> inside;
+    QuarantineRecord stored{};
+    auto first = redispatch_stored_containment(
+        qstore, "agent-1",
+        [&](const std::unordered_map<std::string, std::string>&) -> std::pair<std::string, int> {
+            auto token = qstore.apply_fence_token("agent-1", id);
+            REQUIRE(token.has_value());
+            inside = *token;
+            return {"cmd-1", 1};
+        },
+        stored);
+    REQUIRE(first.has_value());
+    REQUIRE(inside.has_value());
+    CHECK_FALSE(inside->has_value()); // a claim is live inside the dispatch
+    auto after = qstore.apply_fence_token("agent-1", id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK(**after == 1); // the claim is dropped, the generation moved
+
+    // another apply holds a live claim: the chokepoint dispatches nothing
+    auto other = qstore.claim_apply("agent-1", id);
+    REQUIRE(other.has_value());
+    int calls = 0;
+    auto second = redispatch_stored_containment(
+        qstore, "agent-1",
+        [&](const std::unordered_map<std::string, std::string>&) -> std::pair<std::string, int> {
+            ++calls;
+            return {"cmd-2", 1};
+        },
+        stored);
+    REQUIRE_FALSE(second.has_value());
+    CHECK(second.error().kind == ContainmentReapplyErrorKind::no_active_record);
+    CHECK(second.error().detail == "quarantine record changed or another apply is in flight");
+    CHECK(calls == 0);
+    // a dispatch that throws still drops the claim
+    REQUIRE(qstore.release_apply_claim("agent-1", id, *other).has_value());
+    auto threw = redispatch_stored_containment(
+        qstore, "agent-1",
+        [&](const std::unordered_map<std::string, std::string>&) -> std::pair<std::string, int> {
+            throw std::runtime_error("dispatch failed");
+        },
+        stored);
+    REQUIRE(threw.has_value());
+    CHECK(threw->dispatch_threw);
+    auto settled = qstore.apply_fence_token("agent-1", id);
+    REQUIRE(settled.has_value());
+    CHECK(settled->has_value()); // no claim left behind
+}

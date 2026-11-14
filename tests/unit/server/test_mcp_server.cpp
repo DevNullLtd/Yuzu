@@ -33868,6 +33868,80 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     // provenance, since firewall.quarantine's compiled dispatch-chokepoint
     // gate (AdminOrApproval) checks it independently of MCP's own tier gate.
     CHECK(captured_provenance == yuzu::server::ApprovalProvenance::Ticket);
+
+    // #7628: the success audit row names the record (the created path), so it joins to the later
+    // quarantine.disable rows for the same record.
+    const std::string record_ref = "record_id=" + std::to_string((*rec)->id);
+    const auto success_row = [&](const std::string& tail) {
+        return std::any_of(ts.audit_details.begin(), ts.audit_details.end(), [&](const std::string& d) {
+            return d.find("agent_id=agent-q " + record_ref + " command_id=cmd-quar agents_reached=1" +
+                          tail) == 0;
+        });
+    };
+    CHECK(success_row(""));
+
+    // ...and on the pre-existing path: a second call for the same device re-dispatches the stored
+    // record and the row carries the SAME record id.
+    auto mint2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2410,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-q","reason":"again"}}})");
+    REQUIRE(mint2);
+    const std::string approval_id2 =
+        nlohmann::json::parse(mint2->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", ""));
+    auto res3 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2411,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-q","reason":"again","approval_id":")" +
+        approval_id2 + R"("}}})");
+    auto payload3 = write_tool_payload(res3);
+    CHECK(payload3["record_pre_existing"] == true);
+    CHECK(success_row(" record_pre_existing=1"));
+}
+
+TEST_CASE("MCP quarantine_device refuses a 513-character whitelist and names the limit",
+          "[mcp][integration][quarantine][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.approval_manager_for_test = &appr;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                    const std::string&, const std::string&) -> bool { return true; };
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 1, .command_id = "cmd-long"}; };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    // 513 characters of address charset: over the limit whatever the address count is.
+    const std::string long_list(513, '1');
+    const std::string args =
+        R"("arguments":{"agent_id":"agent-long","reason":"r","whitelist":")" + long_list + '"';
+    auto mint = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":2420,"params":{"name":"quarantine_device",)" +
+                        args + "}}}");
+    REQUIRE(mint);
+    const auto minted = nlohmann::json::parse(mint->body);
+    REQUIRE(minted.contains("error"));
+    std::string text = mint->body;
+    if (minted["error"]["code"] == yuzu::server::mcp::kApprovalRequired) {
+        // The input schema did not stop it: the handler's own check does, after the ticket.
+        const std::string approval_id = minted["error"]["data"]["approval_id"].get<std::string>();
+        REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+        auto recall = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2421,"params":{"name":"quarantine_device",)" +
+            args + R"(,"approval_id":")" + approval_id + R"("}}})");
+        REQUIRE(recall);
+        text = recall->body;
+        CHECK(nlohmann::json::parse(text)["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    // Either way the caller is told the limit, and no record was written.
+    CHECK(text.find("512") != std::string::npos);
+    auto st = quar.get_status("agent-long");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value());
 }
 
 TEST_CASE("MCP quarantine_device records-only (agents_reached=0) returns a RETRYABLE "

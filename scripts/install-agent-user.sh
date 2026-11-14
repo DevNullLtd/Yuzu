@@ -486,10 +486,34 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/security delete-certificate -t /Libr
 EOF
     else  # linux
         cat <<EOF
-# firewall plugin — iptables / ip6tables, the containment fallback when nft is absent. Their
-# rule text rides argv, so sudoers cannot pin them the way it pins nft and pfctl below.
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables
+# firewall plugin — iptables / ip6tables, the containment fallback when nft is absent. These
+# lines NARROW the argv shape to the nine the plugin builds (list, and create / append / insert
+# the jump / remove the jump / flush / delete on its own yuzu-fwq-* generation chains); they do
+# not confine the tool: a sudo glob matches concatenated args, so the -A line also admits
+# whatever follows the chain name. The confinement is the firewall plugin's token validation
+# (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp, iptables_argv_in_sudo_shape is the
+# one statement of these shapes). There is no bare iptables or ip6tables grant. Sudo regular
+# expressions would pin them tighter but need sudo 1.9.10, and the hosts that fall back to
+# iptables ship older ones.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -S
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -N yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -A yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT 1 -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -I OUTPUT 1 -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -I FORWARD 1 -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -D * -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -F yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/iptables -X yuzu-fwq-*
+
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -S
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -N yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -A yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -I INPUT 1 -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -I OUTPUT 1 -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -I FORWARD 1 -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -D * -j yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -F yuzu-fwq-*
+$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/ip6tables -X yuzu-fwq-*
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). These lines NARROW
 # the argv shape; they do not confine nft: sudo globs match concatenated args, and the file

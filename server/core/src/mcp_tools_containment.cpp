@@ -33,10 +33,10 @@ constexpr std::size_t kDefaultLimit = 200;
 constexpr std::size_t kMaxLimit = 500;
 
 constexpr const char* kInputSchema =
-    R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500,"default":200,"description":"Maximum records returned, 1..500 (default 200). This bound exists on the MCP tool only; the REST list is unbounded. When more records are visible, `more` is true."}}})j";
+    R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":500,"default":200,"description":"Maximum records returned, 1..500 (default 200). This bound exists on the MCP tool only; the REST list is unbounded. When more records are visible, `more` is true. With include, the limit applies to the active records and to the owed records separately."},"include":{"type":"string","enum":["release_owed"],"description":"release_owed also lists, after the active records, the records an operator ended by force whose device has not yet confirmed a release (status release_owed, with released_at and release_owed_since). Omit it for the active records only."}}})j";
 
 constexpr const char* kOutputSchema =
-    R"j({"type":"object","properties":{"quarantined":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string","description":"active, or releasing while a release the device has not yet confirmed is in progress"},"quarantined_by":{"type":"string"},"quarantined_at":{"type":"integer"},"whitelist":{"type":"string"},"reason":{"type":"string"},"last_applied_at":{"type":"integer"},"last_confirmed_at":{"type":"integer"}},"required":["agent_id","status","quarantined_by","quarantined_at","whitelist","reason","last_applied_at","last_confirmed_at"]}},"count":{"type":"integer"},"more":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["quarantined","count","more"]})j";
+    R"j({"type":"object","properties":{"quarantined":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string","description":"active, releasing while a release the device has not yet confirmed is in progress, or release_owed (only with include=release_owed)"},"quarantined_by":{"type":"string"},"quarantined_at":{"type":"integer"},"whitelist":{"type":"string"},"reason":{"type":"string"},"last_applied_at":{"type":"integer"},"last_confirmed_at":{"type":"integer"},"released_at":{"type":"integer","description":"Present only on a release_owed record: when the record was ended"},"release_owed_since":{"type":"integer","description":"Present only on a release_owed record: when the device became owed a release"}},"required":["agent_id","status","quarantined_by","quarantined_at","whitelist","reason","last_applied_at","last_confirmed_at"]}},"count":{"type":"integer"},"more":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit row for this read failed to persist"}},"required":["quarantined","count","more"]})j";
 
 // Strict-typed limit: absent selects the default; anything but an in-range JSON integer is
 // refused (never stringified or clamped). enum/minimum/maximum in the advertised schema are
@@ -57,6 +57,20 @@ bool parse_limit(const nlohmann::json& args, std::size_t& limit) {
     if (v < 1 || v > kMaxLimit)
         return false;
     limit = static_cast<std::size_t>(v);
+    return true;
+}
+
+// Strict-typed include: absent selects the active records only; the one accepted value is
+// "release_owed" (#7624). Anything else, a non-string included, is refused. Returns false on a
+// bad value.
+bool parse_include(const nlohmann::json& args, bool& include_owed) {
+    include_owed = false;
+    const auto it = args.find("include");
+    if (it == args.end())
+        return true;
+    if (!it->is_string() || it->get<std::string>() != "release_owed")
+        return false;
+    include_owed = true;
     return true;
 }
 
@@ -89,11 +103,39 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
         return;
     }
 
+    bool include_owed = false;
+    if (!parse_include(ctx.args, include_owed)) {
+        const bool audit_ok = ctx.audit("denied", "invalid arguments: include");
+        ctx.res.set_content(
+            ctx.a4_error(kInvalidParams, "include must be release_owed",
+                         "omit `include`, or pass \"release_owed\"", -1, {}, audit_ok), // retry-hint-exempt: caller-input rejection
+            "application/json");
+        return;
+    }
+    if (include_owed && !deps->quarantine_owed_list_fn) {
+        answer_unwired(ctx, "service unavailable", "dependency unwired; failing closed", {},
+                       "list_quarantined_devices: quarantine_owed_list_fn unwired - misconfigured "
+                       "call site; failing closed");
+        return;
+    }
+
     // The scope is pushed into the store query, so the cap applies to the caller's own
     // records. A null store read is StoreDegraded, never an empty list: a device could
     // still be contained while the caller sees "nothing quarantined".
-    const auto visible = quarantine_visible_records(gate.scope, deps->quarantine_list_fn,
-                                                    QuarantineVisibleOptions{.max_visible = limit});
+    auto visible = quarantine_visible_records(gate.scope, deps->quarantine_list_fn,
+                                              QuarantineVisibleOptions{.max_visible = limit});
+    // #7624: the owed records, read the same way (same scope, the same cap applied to them on
+    // their own), appended after the active ones. `more` is true if either list was cut.
+    if (visible.status == QuarantineReadStatus::Ok && include_owed) {
+        const auto owed = quarantine_visible_records(gate.scope, deps->quarantine_owed_list_fn,
+                                                     QuarantineVisibleOptions{.max_visible = limit});
+        if (owed.status == QuarantineReadStatus::StoreDegraded) {
+            visible.status = QuarantineReadStatus::StoreDegraded;
+        } else {
+            visible.records.insert(visible.records.end(), owed.records.begin(), owed.records.end());
+            visible.more = visible.more || owed.more;
+        }
+    }
     if (visible.status == QuarantineReadStatus::StoreDegraded) {
         const bool audit_ok = ctx.audit("failure", "quarantine list unavailable; store degraded");
         ctx.res.set_content(ctx.a4_error(kInternalError, "Quarantine list unavailable - read failed",
@@ -105,7 +147,9 @@ void handle_list_quarantined_devices(const ToolCallContext& ctx) {
 
     // REST GET writes no success audit; this generic row is the only one. A dropped row is
     // surfaced as audit_persisted:false (set-and-proceed), the data is still returned.
-    const bool audit_ok = ctx.audit("success", "limit=" + std::to_string(limit) + " returned=" +
+    const bool audit_ok = ctx.audit("success", "limit=" + std::to_string(limit) +
+                                                   (include_owed ? " include=release_owed" : "") +
+                                                   " returned=" +
                                                    std::to_string(visible.records.size()) +
                                                    (visible.more ? " more=true" : " more=false"));
 
@@ -137,7 +181,10 @@ constexpr ToolRecord kToolRecords[] = {
      "visible device is quarantined, not that none is quarantined fleet-wide. `limit` is "
      "1..500 (default 200); when `more` is true further visible records exist and this tool "
      "does not page: raise limit up to 500, and past that use REST GET /api/v1/quarantine for "
-     "the complete list. "
+     "the complete list. Pass include=release_owed to also list, after the active records, the "
+     "records an operator ended by force whose device has not yet confirmed a release (status "
+     "release_owed, with released_at and release_owed_since): the device may still be "
+     "contained and is released when it next connects. "
      "A degraded store read is a retryable error, never an empty list. Read-only. If the audit "
      "row for the read cannot be written the list is still returned with audit_persisted "
      "false.",

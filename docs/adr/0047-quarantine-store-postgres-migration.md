@@ -13,7 +13,9 @@
 `QuarantineStore` (`quarantine.db` today, `server/core/src/quarantine_store.{hpp,cpp}`, ~54 + 226
 lines) holds Guardian device-quarantine records: the server-side bookkeeping of which agents are
 currently network-isolated, who isolated them, why, and their full history. Single table
-(`quarantine_records`), two indexes, no foreign keys, no secret-bearing columns. Postgres ladder
+(`quarantine_records`), three indexes besides the primary key (`idx_quarantine_agent`, the partial unique
+`idx_quarantine_agent_active`, and from schema v4 the partial `idx_quarantine_release_owed`), no foreign keys,
+no secret-bearing columns. Postgres ladder
 Wave 2, batch 2.
 
 A quarantine record is not expendable telemetry — it is the server's only durable record of an
@@ -513,3 +515,69 @@ forces it with `DELETE ...?force=true`. A device's own state never ends a record
 active record is drift and is re-applied. A forced end does not release the device, which may
 still be contained. Fresh-database deployment contract applies: v4 is
 applied to a new database, with no data carried from earlier builds.
+
+## Update (2026-11-14) — schema v5: the apply fence; follow-ups to the release work
+
+Appended as migration v5 after v1-v4, which stay byte-identical (`PgMigrationRunner` pins each applied
+migration's SHA-256, and v4 is on `dev` before this change, so it is recorded as shipped, never
+edited). v5 adds no index. The store's indexes are the primary key, `idx_quarantine_agent`,
+`idx_quarantine_agent_active` (the partial unique index on active records) and
+`idx_quarantine_release_owed` (v4, the partial index behind the owed list).
+
+**The two v5 columns** (`BIGINT NOT NULL DEFAULT 0`, added with `ADD COLUMN IF NOT EXISTS`):
+
+- `apply_gen`: the number of applies ever claimed for the record.
+- `apply_claimed_at`: when an apply's dispatch started and has not yet returned; 0 = none. A claim older
+  than 120 seconds (`kApplyClaimTtlSecs`) is ignored by comparison, so a crashed holder needs no cleanup.
+
+**The fence rule (#7613).** A record ends on the device's `inactive` answer. An apply that reaches the
+device after the observation behind that answer would leave a contained device with no record and
+nothing owed. So:
+
+1. `redispatch_stored_containment`, the one chokepoint for a stored-record apply (the reconciler and the
+   MCP `quarantine_device` retry), calls `claim_apply` before the dispatch (`apply_gen + 1` and the claim
+   stamp; refused once a release is requested, the record has ended, or another claim is live) and
+   `release_apply_claim` after it, which clears the claim only while `apply_gen` is still its own. A
+   dispatch that returned is not a delivery (the gateway path only queues), so the generation, not the
+   claim, outlives the dispatch.
+2. Whoever will act on an `inactive` answer reads `apply_fence_token` (the current `apply_gen`, or nothing
+   while a claim is live) **before it sends the command whose answer it will use**: the reconciler before
+   its status read, `DELETE` before its release.
+3. The write that ends the record (`mark_released(device_confirmed)`, `clear_release_owed`) presents the
+   token and succeeds only if `apply_gen` is unchanged and no claim is live, checked in the same guarded
+   `UPDATE`. A missing token fails closed. The forced end rests on no observation and ignores the fence.
+   A refused end is `apply_in_flight`: the record stays releasing and the next status read takes a fresh
+   token.
+
+**Residuals, accepted and documented rather than closed.** The rule assumes commands to one device
+arrive in the order one server dispatched them (one stream, a first-in first-out gateway queue). A
+transport that reorders them, an apply and a release dispatched by two different server replicas, and a
+dispatch stalled past the 120-second claim window can still reopen the window. DELETE's own release and
+the owed-release leg each check the record and then dispatch, with the same narrow window against a new
+quarantine of the same device. The operator-visible trace is a `quarantine.reapply` failure row and a
+device contained under no record or a releasing one; the way back is `firewall.release` through the generic
+routes.
+
+**The four contract rulings of #7588**, recorded here as the issue asks:
+
+- (a) *Record reason on a device-side expiry*: **keep.** No server code ends a record on a device time
+  limit (routed-concern clause 5; Alex's ruling, PRQ.2 B8), so there is no expiry reason to store:
+  `ReleaseEnd` stays `device_confirmed | forced`, and a device-reported limit is drift and is re-applied.
+- (b) *Error class for a release in progress*: **keep** `kInvalidParams` ("a release is in progress for
+  this device") with no `retry_after_ms`. The closed JSON-RPC code set (`mcp_jsonrpc.hpp`) has no
+  conflict class, and a release can stay pending for as long as the device stays unreachable, so no
+  retry interval would be honest. (The route answers `kInvalidParams`; the issue cited the earlier
+  `kInternalError`.)
+- (c) *Worker hold time on DELETE*: **keep the shared budget.** `LiveInflightGuard` is the whole-server
+  bound on workers pinned by a poll, and a second budget for DELETE would raise that bound. A request over
+  the budget skips the wait and answers `202`, never `429`.
+- (d) *Test allowlist width*: **narrowed.** `tests/test_legacy_quarantine_plugin_removed_lexical.py` now
+  exempts nine named sections of `docs/user-manual/upgrading.md`, matched by heading prefix, instead of
+  the whole file; a line under any other heading is scanned.
+
+**Related decisions in the same change.** A heartbeat only marks a device due and the reconciler thread
+acts within a second (#7619), so reconcile work is single-threaded and every write back is identity
+checked (#7620, #7645). The owed-release bookkeeping stays in memory: a restart sends one more release
+and one more `forced_release_*` row, which is harmless because a release is idempotent on the device
+(#7626). The reconciler's status replies are kept 24 hours unless they changed what the server holds
+(#7627). The `list_release_owed_in` read takes the caller's scope and limit in the query (#7624).

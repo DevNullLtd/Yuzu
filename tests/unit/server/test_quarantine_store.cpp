@@ -42,12 +42,18 @@
 
 #include <libpq-fe.h>
 
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
 
+using yuzu::server::classify_quarantine_write;
+using yuzu::server::kApplyClaimTtlSecs;
+using yuzu::server::kQuarantineApplyInFlight;
+using yuzu::server::kQuarantineNotQuarantined;
 using yuzu::server::QuarantineRecord;
 using yuzu::server::QuarantineStore;
+using yuzu::server::QuarantineWrite;
 using yuzu::server::ReleaseEnd;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
@@ -62,17 +68,37 @@ yuzu::test::PgTestTemplate quarantine_tpl{"quarantinestore", [](const std::strin
         throw std::runtime_error("quarantine_store template: store failed to migrate");
 }};
 
+// The token a confirmed end presents (#7613): the apply generation read now, with no claim live.
+std::int64_t fence_of(QuarantineStore& store, const std::string& agent_id, std::int64_t record_id) {
+    auto token = store.apply_fence_token(agent_id, record_id);
+    REQUIRE(token.has_value());
+    REQUIRE(token->has_value());
+    return **token;
+}
+
 // An ended record: the release asked for, then the device's confirmation recorded.
 void end_record(QuarantineStore& store, const std::string& agent_id) {
     auto id = store.request_release(agent_id);
     REQUIRE(id.has_value());
-    REQUIRE(store.mark_released(agent_id, *id, ReleaseEnd::device_confirmed).has_value());
+    REQUIRE(store.mark_released(agent_id, *id, ReleaseEnd::device_confirmed,
+                                fence_of(store, agent_id, *id))
+                .has_value());
 }
 
 std::optional<QuarantineRecord> active_row(QuarantineStore& store, const std::string& agent_id) {
     auto st = store.get_status(agent_id);
     REQUIRE(st.has_value());
     return *st;
+}
+
+// One statement on a fresh connection: ages a claim or seeds a historical value the store itself
+// would never write.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
 }
 
 bool owed_contains(QuarantineStore& store, const std::string& agent_id) {
@@ -560,7 +586,7 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
     REQUIRE(after->has_value());
     CHECK((*after)->last_applied_at == 5000);
 
-    // v3 (#3623, migrate_from_sqlite retired) and v4 (PRQ.2): the same construction call also runs the
+    // v3 (#3623, migrate_from_sqlite retired), v4 (PRQ.2) and v5 (#7613): the same construction call also runs the
     // DROP TABLE against quarantine_meta — seeded by the v1 DDL above but never touched by
     // v2's ALTER, so this is the only ladder test that actually exercises the drop landing
     // against a populated (not merely fresh-templated) database.
@@ -572,7 +598,7 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
                             "'quarantine_store'")};
         REQUIRE(ver.ok());
         REQUIRE(PQntuples(ver.get()) == 1);
-        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4");
+        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "5");
         PgResult tbl{PQexec(conn.get(),
                             "SELECT COUNT(*) FROM information_schema.tables WHERE "
                             "table_schema = 'quarantine_store' AND table_name = "
@@ -714,7 +740,9 @@ TEST_CASE("QuarantineStore: mark_released(device_confirmed) ends the record and 
     auto id = store.request_release("agent-r6");
     REQUIRE(id.has_value());
 
-    REQUIRE(store.mark_released("agent-r6", *id, ReleaseEnd::device_confirmed).has_value());
+    REQUIRE(store.mark_released("agent-r6", *id, ReleaseEnd::device_confirmed,
+                                fence_of(store, "agent-r6", *id))
+                .has_value());
     CHECK_FALSE(active_row(store, "agent-r6").has_value());
     CHECK_FALSE(owed_contains(store, "agent-r6")); // nothing owed on a confirmed end
     auto history = store.get_history("agent-r6");
@@ -740,7 +768,8 @@ TEST_CASE("QuarantineStore: mark_released with a stale record id affects no row"
     const auto new_id = active_row(store, "agent-r7")->id;
     REQUIRE(new_id != old_id);
 
-    auto stale = store.mark_released("agent-r7", old_id, ReleaseEnd::device_confirmed);
+    auto stale = store.mark_released("agent-r7", old_id, ReleaseEnd::device_confirmed,
+                                     fence_of(store, "agent-r7", old_id));
     REQUIRE_FALSE(stale.has_value());
     CHECK(stale.error() == "device is not quarantined");
     auto stale_forced = store.mark_released("agent-r7", old_id, ReleaseEnd::forced);
@@ -818,14 +847,14 @@ TEST_CASE("QuarantineStore: clear_release_owed removes the mark; a repeat and a 
     REQUIRE(store.mark_released("agent-c1", id, ReleaseEnd::forced).has_value());
     REQUIRE(owed_contains(store, "agent-c1"));
 
-    auto stale = store.clear_release_owed("agent-c1", id + 1000);
+    auto stale = store.clear_release_owed("agent-c1", id + 1000, 0);
     REQUIRE_FALSE(stale.has_value());
     CHECK(stale.error() == "device is not quarantined");
     CHECK(owed_contains(store, "agent-c1"));
 
-    REQUIRE(store.clear_release_owed("agent-c1", id).has_value());
+    REQUIRE(store.clear_release_owed("agent-c1", id, fence_of(store, "agent-c1", id)).has_value());
     CHECK_FALSE(owed_contains(store, "agent-c1"));
-    auto again = store.clear_release_owed("agent-c1", id);
+    auto again = store.clear_release_owed("agent-c1", id, fence_of(store, "agent-c1", id));
     REQUIRE_FALSE(again.has_value());
     CHECK(again.error() == "device is not quarantined");
     // a record that was never forced has nothing to clear
@@ -833,7 +862,8 @@ TEST_CASE("QuarantineStore: clear_release_owed removes the mark; a repeat and a 
     end_record(store, "agent-c2");
     auto history = store.get_history("agent-c2");
     REQUIRE(history.has_value());
-    auto none = store.clear_release_owed("agent-c2", (*history)[0].id);
+    auto none = store.clear_release_owed("agent-c2", (*history)[0].id,
+                                         fence_of(store, "agent-c2", (*history)[0].id));
     REQUIRE_FALSE(none.has_value());
 }
 
@@ -856,4 +886,392 @@ TEST_CASE("QuarantineStore: mark_endpoint_confirmed stamps last_confirmed_at, th
     REQUIRE_FALSE(stale.has_value());
     CHECK(stale.error() == "device is not quarantined");
     CHECK(active_row(store, "agent-t1")->last_confirmed_at == 3000);
+}
+
+// ── #7584b, #7628: the store's smaller contracts ──────────────────────────────
+
+TEST_CASE("QuarantineStore: a historical non-zero release_requested_at seeded by SQL is unchanged by "
+          "request_release (the CASE keeps the first request)",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-h1", "admin", "reason", "").has_value());
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET release_requested_at = 12345 "
+                       "WHERE agent_id = 'agent-h1'");
+
+    auto id = store.request_release("agent-h1");
+    REQUIRE(id.has_value());
+    const auto row = active_row(store, "agent-h1");
+    REQUIRE(row.has_value());
+    CHECK(row->id == *id);
+    CHECK(row->release_requested_at == 12345);
+    CHECK(row->status == "releasing");
+}
+
+TEST_CASE("QuarantineStore: quarantine_device returns the new row's id", "[pg][quarantine][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    auto first = store.quarantine_device("agent-i1", "admin", "reason", "");
+    REQUIRE(first.has_value());
+    CHECK(*first == active_row(store, "agent-i1")->id);
+    end_record(store, "agent-i1");
+    auto second = store.quarantine_device("agent-i1", "admin", "again", "");
+    REQUIRE(second.has_value());
+    CHECK(*second > *first);
+    CHECK(*second == active_row(store, "agent-i1")->id);
+    // a conflict is still the unprefixed business error, carrying no id
+    auto dup = store.quarantine_device("agent-i1", "admin", "dup", "");
+    REQUIRE_FALSE(dup.has_value());
+    CHECK(dup.error() == "device is already quarantined");
+}
+
+// ── The apply claim and generation (#7613) ───────────────────────────────────
+
+TEST_CASE("QuarantineStore: v5 adds the two apply columns, defaulting to 0 (no claim, generation 0)",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-v5", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-v5")->id;
+    auto token = store.apply_fence_token("agent-v5", id);
+    REQUIRE(token.has_value());
+    REQUIRE(token->has_value());
+    CHECK(**token == 0); // no apply has ever been claimed
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult cols{PQexec(conn.get(),
+                         "SELECT column_name, data_type, column_default FROM information_schema.columns "
+                         "WHERE table_schema = 'quarantine_store' AND table_name = 'quarantine_records' "
+                         "AND column_name IN ('apply_gen', 'apply_claimed_at') ORDER BY column_name")};
+    REQUIRE(cols.ok());
+    REQUIRE(PQntuples(cols.get()) == 2);
+    CHECK(std::string(PQgetvalue(cols.get(), 0, 0)) == "apply_claimed_at");
+    CHECK(std::string(PQgetvalue(cols.get(), 1, 0)) == "apply_gen");
+    CHECK(std::string(PQgetvalue(cols.get(), 0, 1)) == "bigint");
+    CHECK(std::string(PQgetvalue(cols.get(), 1, 2)) == "0");
+}
+
+TEST_CASE("QuarantineStore: claim_apply moves the generation by one each time and refuses a releasing "
+          "row, an ended row and a second live claim; an expired claim is taken over",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-a1", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-a1")->id;
+
+    auto g1 = store.claim_apply("agent-a1", id);
+    REQUIRE(g1.has_value());
+    CHECK(*g1 == 1);
+    // a live claim refuses another: the answer is the business error, nothing is dispatched
+    auto blocked = store.claim_apply("agent-a1", id);
+    REQUIRE_FALSE(blocked.has_value());
+    CHECK(blocked.error() == std::string(kQuarantineNotQuarantined));
+    REQUIRE(store.release_apply_claim("agent-a1", id, *g1).has_value());
+    auto g2 = store.claim_apply("agent-a1", id);
+    REQUIRE(g2.has_value());
+    CHECK(*g2 == 2); // the generation outlives each claim
+    REQUIRE(store.release_apply_claim("agent-a1", id, *g2).has_value());
+
+    // an expired claim (older than kApplyClaimTtlSecs) no longer counts: it is taken over
+    auto g3 = store.claim_apply("agent-a1", id);
+    REQUIRE(g3.has_value());
+    CHECK(*g3 == 3);
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(id));
+    auto g4 = store.claim_apply("agent-a1", id);
+    REQUIRE(g4.has_value());
+    CHECK(*g4 == 4);
+    // a claim seeded just inside the window still blocks
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = "
+                       "EXTRACT(EPOCH FROM now())::bigint - " +
+                           std::to_string(kApplyClaimTtlSecs - 30) + " WHERE id = " + std::to_string(id));
+    CHECK_FALSE(store.claim_apply("agent-a1", id).has_value());
+    REQUIRE(store.release_apply_claim("agent-a1", id, *g4).has_value());
+
+    // a stale record id and an unknown device are the same business error
+    CHECK(store.claim_apply("agent-a1", id + 1000).error() == std::string(kQuarantineNotQuarantined));
+    CHECK(store.claim_apply("nobody", 1).error() == std::string(kQuarantineNotQuarantined));
+    CHECK(store.claim_apply("", 1).error() == "agent_id is required");
+
+    // a releasing row is never claimed: containment is not re-applied under a release
+    REQUIRE(store.request_release("agent-a1").has_value());
+    auto releasing = store.claim_apply("agent-a1", id);
+    REQUIRE_FALSE(releasing.has_value());
+    CHECK(releasing.error() == std::string(kQuarantineNotQuarantined));
+    // an ended row neither
+    REQUIRE(store.mark_released("agent-a1", id, ReleaseEnd::forced).has_value());
+    CHECK(store.claim_apply("agent-a1", id).error() == std::string(kQuarantineNotQuarantined));
+}
+
+TEST_CASE("QuarantineStore: release_apply_claim clears only its own generation, so an expired holder "
+          "cannot drop a replacement's live claim",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-a2", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-a2")->id;
+
+    auto holder_a = store.claim_apply("agent-a2", id);
+    REQUIRE(holder_a.has_value());
+    // A's claim ages past the window (a stalled dispatch), and B takes over.
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(id));
+    auto holder_b = store.claim_apply("agent-a2", id);
+    REQUIRE(holder_b.has_value());
+    REQUIRE(*holder_b == *holder_a + 1);
+    // A finally returns and releases ITS generation: B's claim is left alone.
+    REQUIRE(store.release_apply_claim("agent-a2", id, *holder_a).has_value());
+    auto token = store.apply_fence_token("agent-a2", id);
+    REQUIRE(token.has_value());
+    CHECK_FALSE(token->has_value()); // B's claim is still live
+    CHECK_FALSE(store.claim_apply("agent-a2", id).has_value());
+    // B releases its own: the claim is gone and the generation is B's.
+    REQUIRE(store.release_apply_claim("agent-a2", id, *holder_b).has_value());
+    token = store.apply_fence_token("agent-a2", id);
+    REQUIRE(token.has_value());
+    REQUIRE(token->has_value());
+    CHECK(**token == *holder_b);
+    // releasing a generation that never existed, or on an unknown record, is a successful no-op
+    CHECK(store.release_apply_claim("agent-a2", id, 99).has_value());
+    CHECK(store.release_apply_claim("agent-a2", id + 1000, 1).has_value());
+}
+
+TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is live, empty while one "
+          "is, the bumped generation after its release, and empty for an unknown record",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-a3", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-a3")->id;
+
+    auto fresh = store.apply_fence_token("agent-a3", id);
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->has_value());
+    CHECK(**fresh == 0);
+
+    auto claim = store.claim_apply("agent-a3", id);
+    REQUIRE(claim.has_value());
+    auto during = store.apply_fence_token("agent-a3", id);
+    REQUIRE(during.has_value());
+    CHECK_FALSE(during->has_value()); // a claim is live: nothing may be read as settled
+
+    REQUIRE(store.release_apply_claim("agent-a3", id, *claim).has_value());
+    auto after = store.apply_fence_token("agent-a3", id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK(**after == 1); // the bumped generation: a token read before the apply no longer matches
+
+    // an expired claim does not hide the token either
+    auto again = store.claim_apply("agent-a3", id);
+    REQUIRE(again.has_value());
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 1 WHERE id = " +
+                           std::to_string(id));
+    auto expired = store.apply_fence_token("agent-a3", id);
+    REQUIRE(expired.has_value());
+    REQUIRE(expired->has_value());
+    CHECK(**expired == 2);
+
+    // an unknown record and an unknown device have no token; the read did not fail
+    auto unknown = store.apply_fence_token("agent-a3", id + 1000);
+    REQUIRE(unknown.has_value());
+    CHECK_FALSE(unknown->has_value());
+    auto nobody = store.apply_fence_token("nobody", 1);
+    REQUIRE(nobody.has_value());
+    CHECK_FALSE(nobody->has_value());
+    // the token is readable on an ended record too (the owed leg reads it)
+    REQUIRE(store.release_apply_claim("agent-a3", id, *again).has_value());
+    REQUIRE(store.mark_released("agent-a3", id, ReleaseEnd::forced).has_value());
+    auto ended = store.apply_fence_token("agent-a3", id);
+    REQUIRE(ended.has_value());
+    REQUIRE(ended->has_value());
+    CHECK(**ended == 2);
+}
+
+TEST_CASE("QuarantineStore: a confirmed end needs the generation it observed against: refused with no "
+          "fence, under a live claim, and after a later apply; a forced end ignores both",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto classify = [](const std::expected<void, std::string>& r) {
+        return classify_quarantine_write(r);
+    };
+
+    SECTION("no fence: refused without a round trip, the record is untouched") {
+        REQUIRE(store.quarantine_device("agent-m1", "admin", "reason", "").has_value());
+        const auto id = active_row(store, "agent-m1")->id;
+        REQUIRE(store.request_release("agent-m1").has_value());
+        auto r = store.mark_released("agent-m1", id, ReleaseEnd::device_confirmed);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == std::string(kQuarantineApplyInFlight));
+        CHECK(classify(r) == QuarantineWrite::apply_in_flight);
+        CHECK(active_row(store, "agent-m1").has_value()); // still releasing and listed
+    }
+    SECTION("under a live claim: refused even with the right generation") {
+        REQUIRE(store.quarantine_device("agent-m2", "admin", "reason", "").has_value());
+        const auto id = active_row(store, "agent-m2")->id;
+        const auto token = store.apply_fence_token("agent-m2", id);
+        REQUIRE(token.has_value());
+        REQUIRE(token->has_value());
+        auto claim = store.claim_apply("agent-m2", id); // generation moves to 1, claim live
+        REQUIRE(claim.has_value());
+        auto r = store.mark_released("agent-m2", id, ReleaseEnd::device_confirmed, **token);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(classify(r) == QuarantineWrite::apply_in_flight);
+        // a token matching the CURRENT generation is still refused while the claim is live
+        auto current = store.mark_released("agent-m2", id, ReleaseEnd::device_confirmed, *claim);
+        REQUIRE_FALSE(current.has_value());
+        CHECK(classify(current) == QuarantineWrite::apply_in_flight);
+        CHECK(active_row(store, "agent-m2").has_value());
+    }
+    SECTION("the late-apply order: a token read before an apply that has since returned is stale") {
+        REQUIRE(store.quarantine_device("agent-m3", "admin", "reason", "").has_value());
+        const auto id = active_row(store, "agent-m3")->id;
+        const auto token = store.apply_fence_token("agent-m3", id); // read BEFORE the release goes out
+        REQUIRE(token.has_value());
+        REQUIRE(token->has_value());
+        auto claim = store.claim_apply("agent-m3", id);              // an apply is claimed after it...
+        REQUIRE(claim.has_value());
+        REQUIRE(store.release_apply_claim("agent-m3", id, *claim).has_value()); // ...and has returned
+        auto r = store.mark_released("agent-m3", id, ReleaseEnd::device_confirmed, **token);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(classify(r) == QuarantineWrite::apply_in_flight);
+        CHECK(active_row(store, "agent-m3").has_value());
+        // a fresh token, read now, succeeds
+        const auto fresh = store.apply_fence_token("agent-m3", id);
+        REQUIRE(fresh.has_value());
+        REQUIRE(fresh->has_value());
+        CHECK(store.mark_released("agent-m3", id, ReleaseEnd::device_confirmed, **fresh).has_value());
+        CHECK_FALSE(active_row(store, "agent-m3").has_value());
+    }
+    SECTION("a zero-row mark with a fence is not_quarantined, not apply_in_flight") {
+        REQUIRE(store.quarantine_device("agent-m4", "admin", "reason", "").has_value());
+        const auto id = active_row(store, "agent-m4")->id;
+        auto stale = store.mark_released("agent-m4", id + 1000, ReleaseEnd::device_confirmed, 0);
+        REQUIRE_FALSE(stale.has_value());
+        CHECK(classify(stale) == QuarantineWrite::not_quarantined);
+        end_record(store, "agent-m4");
+        auto ended = store.mark_released("agent-m4", id, ReleaseEnd::device_confirmed, 0);
+        REQUIRE_FALSE(ended.has_value());
+        CHECK(classify(ended) == QuarantineWrite::not_quarantined);
+    }
+    SECTION("forced ignores the fence and any live claim, and leaves both columns as they are") {
+        REQUIRE(store.quarantine_device("agent-m5", "admin", "reason", "").has_value());
+        const auto id = active_row(store, "agent-m5")->id;
+        auto claim = store.claim_apply("agent-m5", id); // live
+        REQUIRE(claim.has_value());
+        REQUIRE(store.mark_released("agent-m5", id, ReleaseEnd::forced).has_value());
+        CHECK(owed_contains(store, "agent-m5"));
+        // the owed leg still sees the live claim: no token while it lasts
+        auto token = store.apply_fence_token("agent-m5", id);
+        REQUIRE(token.has_value());
+        CHECK_FALSE(token->has_value());
+    }
+}
+
+TEST_CASE("QuarantineStore: clear_release_owed needs the fence too: refused with none, under a live claim "
+          "and after a later apply; it succeeds with the current token",
+          "[pg][quarantine][apply_fence]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.quarantine_device("agent-o1", "admin", "reason", "").has_value());
+    const auto id = active_row(store, "agent-o1")->id;
+    REQUIRE(store.mark_released("agent-o1", id, ReleaseEnd::forced).has_value());
+    REQUIRE(owed_contains(store, "agent-o1"));
+
+    // no fence
+    auto none = store.clear_release_owed("agent-o1", id, std::nullopt);
+    REQUIRE_FALSE(none.has_value());
+    CHECK(classify_quarantine_write(none) == QuarantineWrite::apply_in_flight);
+
+    // An ended record is not claimable (status released), so the late-apply order for the owed leg
+    // is a claim taken before the end, seeded directly: a token read, then an apply claimed and live.
+    const auto token = store.apply_fence_token("agent-o1", id);
+    REQUIRE(token.has_value());
+    REQUIRE(token->has_value());
+    CHECK_FALSE(store.claim_apply("agent-o1", id).has_value());
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_gen = apply_gen + 1, "
+                       "apply_claimed_at = EXTRACT(EPOCH FROM now())::bigint WHERE id = " +
+                           std::to_string(id));
+    auto live = store.clear_release_owed("agent-o1", id, **token);
+    REQUIRE_FALSE(live.has_value());
+    CHECK(classify_quarantine_write(live) == QuarantineWrite::apply_in_flight);
+    // the claim returns: the old token is stale (the generation moved), a fresh one works
+    exec_sql(db.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = 0 WHERE id = " +
+                           std::to_string(id));
+    auto stale = store.clear_release_owed("agent-o1", id, **token);
+    REQUIRE_FALSE(stale.has_value());
+    CHECK(classify_quarantine_write(stale) == QuarantineWrite::apply_in_flight);
+    CHECK(owed_contains(store, "agent-o1"));
+    const auto fresh = store.apply_fence_token("agent-o1", id);
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->has_value());
+    REQUIRE(store.clear_release_owed("agent-o1", id, **fresh).has_value());
+    CHECK_FALSE(owed_contains(store, "agent-o1"));
+    // already cleared: the business error, not the fence
+    auto again = store.clear_release_owed("agent-o1", id, **fresh);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(classify_quarantine_write(again) == QuarantineWrite::not_quarantined);
+}
+
+TEST_CASE("QuarantineStore: list_release_owed_in pushes the scope and the limit into the query, and an "
+          "empty scope returns nothing without a round trip",
+          "[pg][quarantine][release]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* agent : {"agent-w1", "agent-w2", "agent-w3"}) {
+        REQUIRE(store.quarantine_device(agent, "admin", "reason", "").has_value());
+        REQUIRE(store.mark_released(agent, active_row(store, agent)->id, ReleaseEnd::forced).has_value());
+    }
+    // a device with an active record and one owed record is not owed (its new record governs)
+    REQUIRE(store.quarantine_device("agent-w1", "admin", "again", "").has_value());
+    // an ended-and-confirmed record is not owed either
+    REQUIRE(store.quarantine_device("agent-w4", "admin", "reason", "").has_value());
+    end_record(store, "agent-w4");
+
+    auto all = store.list_release_owed_in(nullptr, 0);
+    REQUIRE(all.has_value());
+    REQUIRE(all->size() == 2);
+    for (const auto& r : *all) {
+        CHECK(r.status == "released");
+        CHECK(r.device_release_owed_at != 0);
+    }
+    // list_release_owed() is the unscoped, unlimited form
+    auto plain = store.list_release_owed();
+    REQUIRE(plain.has_value());
+    CHECK(plain->size() == 2);
+
+    const std::vector<std::string> scope{"agent-w1", "agent-w3", "agent-w4"};
+    auto scoped = store.list_release_owed_in(&scope, 0);
+    REQUIRE(scoped.has_value());
+    REQUIRE(scoped->size() == 1);
+    CHECK((*scoped)[0].agent_id == "agent-w3");
+
+    auto limited = store.list_release_owed_in(nullptr, 1);
+    REQUIRE(limited.has_value());
+    CHECK(limited->size() == 1);
+
+    // deny-all: an empty scope matches nothing, with no round trip
+    const std::vector<std::string> nobody;
+    auto none = store.list_release_owed_in(&nobody, 0);
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
 }

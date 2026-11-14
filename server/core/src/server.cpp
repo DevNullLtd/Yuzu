@@ -1895,36 +1895,10 @@ public:
             metrics_.counter("yuzu_server_quarantine_gate_total",
                              {{"outcome", std::string(outcome)}});
 
-        // #3425: QuarantineContainmentReconciler's outcome series, seeded
-        // across its whole closed label set for the same "absent must not
-        // be confused with never ran" reason as the gate outcomes above.
-        for (const auto result : yuzu::server::kQuarantineReapplyResults)
-            metrics_.counter("yuzu_server_quarantine_reapply_total",
-                             {{"result", std::string(result)}});
-        // Per-replica gauge (never sum() across instances — each replica
-        // only sees the sessions its own gRPC listener holds). Seeded at 0
-        // for both label values so a healthy fleet with nothing unconfirmed
-        // renders as an explicit 0, not an absent series.
-        for (const char* reachability : {"connected", "offline"}) {
-            metrics_.gauge("yuzu_server_quarantine_endpoint_unconfirmed",
-                           {{"reachability", reachability}})
-                .set(0);
-            // Releasing records (a release asked for, the device not yet confirmed) and records
-            // an operator ended by force whose device still owes a release.
-            metrics_.gauge("yuzu_server_quarantine_release_pending",
-                           {{"reachability", reachability}})
-                .set(0);
-            metrics_.gauge("yuzu_server_quarantine_forced_release_owed",
-                           {{"reachability", reachability}})
-                .set(0);
-        }
-        // Freshness signal for the gauge above (#3425 review, Doomgoose
-        // #3567): pre-seeded optimistic (1) since the reconciler's tick
-        // thread starts within a boot-time window measured in seconds, not
-        // minutes — a brief false-healthy read before the first real tick
-        // is a negligible tradeoff against the alternative of a 0 (falsely
-        // degraded) or absent (loses absent()-alertability) default.
-        metrics_.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+        // #3425: QuarantineContainmentReconciler's outcome counters and gauges, seeded across
+        // their whole closed label sets so `absent()` is never confused with "never ran"
+        // (#7584e: one function, so a test can run it too).
+        QuarantineContainmentReconciler::seed_metrics(metrics_);
 
         // The quarantine read-degrade family was never pre-seeded, unlike its
         // mgmt-group and discovery siblings above, so every reason read as
@@ -18586,11 +18560,13 @@ private:
         // Heartbeat-triggered fast path (the ONLY event-driven trigger that
         // is dispatch-safe — Register returns before Subscribe establishes
         // the stream, so a hook fired from there would have `send_to`
-        // silently drop it). The tick below is the periodic backstop:
-        // AgentRegistry::send_to drops offline agents silently, so a tick
-        // against a still-offline device costs one cheap skip and catches a
-        // device that reconnected between heartbeats (same shape as
-        // PreflightRunner's re-dispatch-on-reconnect loop).
+        // silently drop it). It only MARKS the device due (#7619): no store
+        // read and no dispatch on the heartbeat ingest path. The reconciler
+        // thread below drains the marks every second and runs the periodic
+        // tick every 20th pass. AgentRegistry::send_to drops offline agents
+        // silently, so a tick against a still-offline device costs one cheap
+        // skip and catches a device that reconnected between heartbeats (same
+        // shape as PreflightRunner's re-dispatch-on-reconnect loop).
         if (heartbeat_ingestion_) {
             heartbeat_ingestion_->set_quarantine_reconcile_fn(
                 [this](std::string_view agent_id) {
@@ -18599,12 +18575,20 @@ private:
                 });
         }
         quarantine_reconcile_thread_ = std::thread([this]() {
-            spdlog::info("Quarantine containment reconciler thread started (cadence=20s)");
+            spdlog::info("Quarantine containment reconciler thread started (heartbeat drain "
+                         "every 1s, tick every 20s)");
+            // ponytail: one reconciler thread does all reconcile I/O, so a mass quarantine is
+            // worked through here at kMaxDispatchesPerTick per pass; shard by agent if that
+            // ceiling is ever reached.
+            constexpr int kTickEvery = 20; // passes of 1 s
+            int pass = 0;
             while (!stop_requested_.load(std::memory_order_acquire)) {
-                for (int i = 0; i < 4 && !stop_requested_.load(std::memory_order_acquire); ++i)
-                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                std::this_thread::sleep_for(std::chrono::seconds{1});
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                const bool tick_pass = ++pass >= kTickEvery;
+                if (tick_pass)
+                    pass = 0;
                 if (quarantine_reconciler_) {
                     // tick() touches PG and gRPC dispatch — either can throw;
                     // an escaping exception would std::terminate the whole
@@ -18624,8 +18608,12 @@ private:
                         // reclassify this pass to a ReplicaSafe stream-partitioned
                         // form. Correct + inert today (single replica == leader).
                         if (leader_gate_permits<background_job_class("quarantine_reconciler.tick")>(
-                                leader_elector_.get()))
-                            quarantine_reconciler_->tick();
+                                leader_elector_.get())) {
+                            if (tick_pass)
+                                quarantine_reconciler_->tick();
+                            else
+                                (void)quarantine_reconciler_->drain_heartbeat_due();
+                        }
                     } catch (const std::exception& e) {
                         spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
                                       e.what());
@@ -23366,6 +23354,16 @@ private:
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
+            // #7624: records an operator ended by force whose device still owes a release, for
+            // `list_quarantined_devices` with include=release_owed. The same scope-in-query read
+            // the REST route makes.
+            tool_deps.quarantine_owed_list_fn =
+                [this](const std::vector<std::string>* ids,
+                       std::size_t limit) -> std::optional<std::vector<QuarantineRecord>> {
+                if (!quarantine_store_ || !quarantine_store_->is_open())
+                    return std::nullopt;
+                return quarantine_store_->list_release_owed_in(ids, limit);
+            };
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
             // withhold and list_issued_certs' filtered form use the SAME callback as the REST
             // routes and the dashboard. One instance feeds both consumers below: the seven

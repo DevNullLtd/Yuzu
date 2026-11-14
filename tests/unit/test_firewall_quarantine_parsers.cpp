@@ -1406,6 +1406,80 @@ TEST_CASE("iptables listing and removal plan", "[agent][firewall_quarantine]") {
     CHECK(iptables_remove_plan(kIptablesPath, l, 0).size() == 4 + 8);
 }
 
+// ── The sudoers shapes (#7634) ──────────────────────────────────────────────
+
+TEST_CASE("every iptables argv the plugin can build is inside the shapes the sudoers file grants",
+          "[agent][firewall_quarantine][sudoers]") {
+    // The plans the leg runs, for both tools and both families: TCP reply rules, neighbour
+    // discovery, loopback, DHCP and a rule set that is empty of operator exceptions.
+    const auto set = make_set({"203.0.113.53", "2001:4860:4860::8888"},
+                              {ex("10.0.0.5:22/tcp/in"), ex("[2001:db8::]/32:443/out"),
+                               ex("10.0.0.6:443/tcp/out")});
+    std::vector<Argv> argvs;
+    for (const auto& [tool, v6] : {std::pair{kIptablesPath, false}, std::pair{kIp6tablesPath, true}}) {
+        for (const auto& a : iptables_build_plan(set, tool, 7, v6))
+            argvs.push_back(a);
+        for (const auto& a : iptables_activate_plan(tool, 7))
+            argvs.push_back(a);
+        argvs.push_back(Argv{std::string{tool}, "-S"});
+    }
+    // Removal over a listing that includes a jump from a chain that is not a built-in (the plan
+    // takes the chain from the listing), generation 2 kept out.
+    const auto listing = parse_iptables_listing(
+        "-P INPUT ACCEPT\n-N yuzu-fwq-2\n-N yuzu-fwq-2-f\n-N yuzu-fwq-3\n-N yuzu-fwq-3-f\n-N DOCKER\n"
+        "-A INPUT -j yuzu-fwq-3\n-A INPUT -j yuzu-fwq-2\n-A OUTPUT -j yuzu-fwq-3\n"
+        "-A FORWARD -j yuzu-fwq-3-f\n-A DOCKER -j yuzu-fwq-2-f\n-A yuzu-fwq-3 -j DROP\n");
+    for (const auto tool : {kIptablesPath, kIp6tablesPath}) {
+        for (const auto& a : iptables_remove_plan(tool, listing, 3))
+            argvs.push_back(a);
+        for (const auto& a : iptables_remove_plan(tool, listing, 0))
+            argvs.push_back(a);
+    }
+    REQUIRE(argvs.size() > 40);
+    for (const auto& a : argvs) {
+        CAPTURE(join(a));
+        CHECK(iptables_argv_in_sudo_shape(a));
+    }
+}
+
+TEST_CASE("iptables_argv_in_sudo_shape: anything outside the granted shapes is refused",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string t4{kIptablesPath};
+    const std::string t6{kIp6tablesPath};
+    const auto in_shape = [](Argv a) { return iptables_argv_in_sudo_shape(a); };
+    // the nine shapes, spelled out once
+    CHECK(in_shape({t4, "-S"}));
+    CHECK(in_shape({t6, "-N", "yuzu-fwq-12"}));
+    CHECK(in_shape({t4, "-A", "yuzu-fwq-12-f", "-j", "DROP"}));
+    CHECK(in_shape({t4, "-I", "FORWARD", "1", "-j", "yuzu-fwq-12-f"}));
+    CHECK(in_shape({t4, "-D", "DOCKER", "-j", "yuzu-fwq-12"}));
+    CHECK(in_shape({t4, "-F", "yuzu-fwq-12"}));
+    CHECK(in_shape({t4, "-X", "yuzu-fwq-12-f"}));
+    // not granted: a policy change, a bare flush, a rule on a built-in chain, another table, a
+    // position other than 1, a jump to a chain that is not ours, extra tokens on a one-token shape
+    CHECK_FALSE(in_shape({t4, "-P", "INPUT", "ACCEPT"}));
+    CHECK_FALSE(in_shape({t4, "-F"}));
+    CHECK_FALSE(in_shape({t4, "-F", "INPUT"}));
+    CHECK_FALSE(in_shape({t4, "-X", "DOCKER"}));
+    CHECK_FALSE(in_shape({t4, "-A", "INPUT", "-j", "ACCEPT"}));
+    CHECK_FALSE(in_shape({t4, "-A", "INPUT", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in_shape({t4, "-t", "nat", "-A", "yuzu-fwq-1", "-j", "DROP"}));
+    CHECK_FALSE(in_shape({t4, "-I", "INPUT", "2", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in_shape({t4, "-I", "INPUT", "1", "-j", "ACCEPT"}));
+    CHECK_FALSE(in_shape({t4, "-I", "yuzu-fwq-1", "1", "-j", "yuzu-fwq-1"}));
+    CHECK_FALSE(in_shape({t4, "-D", "INPUT", "-j", "ACCEPT"}));
+    CHECK_FALSE(in_shape({t4, "-D", "INPUT", "1"}));
+    CHECK_FALSE(in_shape({t4, "-S", "INPUT"}));
+    CHECK_FALSE(in_shape({t4, "-N", "yuzu-fwq-1", "extra"}));
+    CHECK_FALSE(in_shape({t4, "-N", "yuzu-fwq-"}));      // no generation
+    CHECK_FALSE(in_shape({t4, "-N", "yuzu-fwq-1x"}));
+    // another tool, an empty argv, and a bare tool
+    CHECK_FALSE(in_shape({"/sbin/iptables", "-S"}));
+    CHECK_FALSE(in_shape({"/usr/sbin/iptables-save", "-S"}));
+    CHECK_FALSE(in_shape({}));
+    CHECK_FALSE(in_shape({t4}));
+}
+
 TEST_CASE("iptables worst case stays inside the operation budget as counted calls",
           "[agent][firewall_quarantine]") {
     std::vector<Endpoint> many;

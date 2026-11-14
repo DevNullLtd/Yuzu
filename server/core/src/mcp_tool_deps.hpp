@@ -101,6 +101,10 @@ struct ToolDeps {
     CiDetailFn ci_detail_fn; // hw_ci_detail_fn: the full per-device CI record composition
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;
+    // Records ended by force whose device still owes a release (include=release_owed, #7624);
+    // same shape and scope-in-query contract as quarantine_list_fn. Empty = the include option is
+    // refused as unwired, never read as "nothing owed".
+    QuarantineListFn quarantine_owed_list_fn;
 
     // ── /crypto (mcp_tools_crypto.cpp) ──────────────────────────────────────────────────
     // One closure per CryptoApi method the seven /crypto tools call, each a thin forward to

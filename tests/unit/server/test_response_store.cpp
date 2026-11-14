@@ -24,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -781,6 +783,76 @@ TEST_CASE("ResponseStore: custom ttl_expires_at preserved", "[pg][response_store
     REQUIRE(results.has_value());
     REQUIRE(results->size() == 1);
     CHECK((*results)[0].ttl_expires_at == 999999);
+}
+
+// shorten_ttl (#7627): the quarantine reconciler's recurring status replies are kept for a day.
+TEST_CASE("ResponseStore: shorten_ttl lowers ttl_expires_at for that command and agent only, and never "
+          "raises an earlier expiry",
+          "[pg][response_store][shorten_ttl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+
+    const auto put = [&](const std::string& command, const std::string& agent, std::int64_t ttl = 0) {
+        StoredResponse resp;
+        resp.instruction_id = command;
+        resp.agent_id = agent;
+        resp.status = 1;
+        resp.output = "status|active";
+        resp.ttl_expires_at = ttl; // 0 = the default retention (30 days from now)
+        store.store(resp);
+    };
+    const auto ttl_of = [&](const std::string& command, const std::string& agent) {
+        auto rows = store.query(command, kAllRows, ResponseQuery{.agent_id = agent});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        return rows->front().ttl_expires_at;
+    };
+    const std::int64_t before = static_cast<std::int64_t>(std::time(nullptr));
+    put("cmd-a", "agent-1");
+    put("cmd-a", "agent-2");
+    put("cmd-b", "agent-1");
+    put("cmd-early", "agent-1", /*ttl=*/before + 3600); // already expires in an hour
+    const auto thirty_days = before + 30 * 86400;
+    REQUIRE(ttl_of("cmd-a", "agent-1") >= thirty_days);
+
+    REQUIRE(store.shorten_ttl("cmd-a", "agent-1", std::chrono::hours(24)));
+    const std::int64_t after = static_cast<std::int64_t>(std::time(nullptr));
+    CHECK(ttl_of("cmd-a", "agent-1") >= before + 86400);
+    CHECK(ttl_of("cmd-a", "agent-1") <= after + 86400);
+    // the same command for another agent, and another command for the same agent, are untouched
+    CHECK(ttl_of("cmd-a", "agent-2") >= thirty_days);
+    CHECK(ttl_of("cmd-b", "agent-1") >= thirty_days);
+
+    // never raises: an expiry already earlier than the new one stays
+    REQUIRE(store.shorten_ttl("cmd-early", "agent-1", std::chrono::hours(24)));
+    CHECK(ttl_of("cmd-early", "agent-1") == before + 3600);
+
+    // an unknown command is a successful no-op, not a failure
+    CHECK(store.shorten_ttl("cmd-none", "agent-1", std::chrono::hours(24)));
+}
+
+TEST_CASE("ResponseStore: shorten_ttl sets an expiry on a row kept forever (retention 0)",
+          "[pg][response_store][shorten_ttl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/0);
+    StoredResponse resp;
+    resp.instruction_id = "cmd-forever";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = "status|active";
+    store.store(resp);
+    auto rows = store.query("cmd-forever", kAllRows, ResponseQuery{.agent_id = "agent-1"});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().ttl_expires_at == 0); // never expires
+
+    REQUIRE(store.shorten_ttl("cmd-forever", "agent-1", std::chrono::hours(24)));
+    rows = store.query("cmd-forever", kAllRows, ResponseQuery{.agent_id = "agent-1"});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().ttl_expires_at > static_cast<std::int64_t>(std::time(nullptr)));
 }
 
 // ============================================================================

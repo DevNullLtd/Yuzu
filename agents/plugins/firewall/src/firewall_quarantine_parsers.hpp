@@ -2448,6 +2448,39 @@ struct IptablesListing {
     return out;
 }
 
+/// Whether `a` is one of the argv shapes the agent's sudoers grants for iptables / ip6tables
+/// (`scripts/install-agent-user.sh`, #7634) and nothing else. This is the SINGLE statement of those
+/// shapes: the sudoers lines are written from it and `tests/test_legacy_quarantine_plugin_removed_lexical.py`
+/// checks the two against each other, and a unit test feeds it every argv the plans above build.
+///   {tool, -S}                           list
+///   {tool, -N, ours}                     create a generation chain
+///   {tool, -A, ours, ...}                append a rule to a generation chain
+///   {tool, -I, INPUT|OUTPUT|FORWARD, 1, -j, ours}   insert the jump at the head
+///   {tool, -D, <chain>, -j, ours}        remove a jump (any chain: the plan takes it from the listing)
+///   {tool, -F, ours} / {tool, -X, ours}  flush / delete a generation chain
+/// where `tool` is `kIptablesPath` or `kIp6tablesPath` and `ours` is a `yuzu-fwq-<gen>[-f]` chain.
+/// Anything else (-P, a bare -F, -A on a built-in chain, -t nat, another tool) is outside the shape.
+/// This narrows the argv; it does not confine the tool (a sudo glob spans arguments): the control is
+/// that the plugin builds every argv from validated tokens.
+[[nodiscard]] inline bool iptables_argv_in_sudo_shape(const Argv& a) {
+    if (a.size() < 2 || (a[0] != kIptablesPath && a[0] != kIp6tablesPath))
+        return false;
+    const auto ours = [](const std::string& chain) { return ipt_chain_gen(chain).has_value(); };
+    const std::string& op = a[1];
+    if (op == "-S")
+        return a.size() == 2;
+    if (op == "-N" || op == "-F" || op == "-X")
+        return a.size() == 3 && ours(a[2]);
+    if (op == "-A")
+        return a.size() >= 3 && ours(a[2]);
+    if (op == "-I")
+        return a.size() == 6 && (a[2] == "INPUT" || a[2] == "OUTPUT" || a[2] == "FORWARD") &&
+               a[3] == "1" && a[4] == "-j" && ours(a[5]);
+    if (op == "-D")
+        return a.size() == 5 && a[3] == "-j" && ours(a[4]);
+    return false;
+}
+
 /// Insert the new generation's jumps. The caller removes the old generation
 /// only after these succeed, so both chains exist during the swap and the new
 /// one (first in each built-in chain) governs from the first insert.

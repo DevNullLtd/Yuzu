@@ -63,8 +63,8 @@
           hint: 'Comma-separated IPv4 or IPv6 addresses (no ranges, no host names). The agent adds its ' +
                 'configured server address on its own; on a dual-stack host, with a pinned route, or ' +
                 'after a server address change, add the server explicitly. A device that cannot reach ' +
-                'the server needs out-of-band recovery. See security-hardening.md, "Whitelisting on a ' +
-                'dual-stack host".' }
+                'the server needs out-of-band recovery. See security-hardening.md, "The whitelist (read ' +
+                'this before quarantining a dual-stack host)".' }
       ],
       submitLabel: 'Continue',
       validate: validateWhitelist

@@ -48,6 +48,7 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu {
@@ -71,8 +72,38 @@ namespace yuzu::server {
 /// callers key off the shared constant, never a local copy of the literal.
 inline constexpr const char* kQuarantineDbErrorPrefix = "db_error: ";
 
+/// The two business-state answers of a record-scoped guarded write, each stated ONCE under
+/// `server/` (#7585c). Callers compare through `classify_quarantine_write`, never a local copy of
+/// the text. `kQuarantineNotQuarantined`: the guarded UPDATE touched no row (the record ended, was
+/// superseded by a newer one, or its owed release was already cleared). `kQuarantineApplyInFlight`:
+/// the record is still there, but an apply's claim is live or an apply was claimed after the
+/// observation the write rests on (#7613).
+inline constexpr std::string_view kQuarantineNotQuarantined{"device is not quarantined"};
+inline constexpr std::string_view kQuarantineApplyInFlight{
+    "an apply is in flight or followed this observation"};
+
+/// A claim older than this is ignored (a crashed or stalled holder). Compared by timestamp at
+/// every read and write, never swept, so a dead holder needs no cleanup.
+inline constexpr std::int64_t kApplyClaimTtlSecs = 120;
+
+/// Maps a guarded write's result onto the pure decision code's enum. Anything that is neither
+/// success nor one of the two business-state answers is `store_error` (a genuine store failure).
+[[nodiscard]] inline QuarantineWrite
+classify_quarantine_write(const std::expected<void, std::string>& r) {
+    if (r)
+        return QuarantineWrite::ok;
+    if (r.error() == kQuarantineNotQuarantined)
+        return QuarantineWrite::not_quarantined;
+    if (r.error() == kQuarantineApplyInFlight)
+        return QuarantineWrite::apply_in_flight;
+    return QuarantineWrite::store_error;
+}
+
 /// How a record came to end. `device_confirmed`: the device answered `inactive` to a release.
 /// `forced`: an operator ended it without the device's word; the device is then owed a release.
+/// There is no third end: a time limit the device reports never ends a record (it is drift and is
+/// re-applied; routed-concern clause 5, Alex's ruling PRQ.2 B8), so no expiry reason is stored
+/// (#7588a).
 enum class ReleaseEnd { device_confirmed, forced };
 
 class QuarantineStore {
@@ -96,13 +127,14 @@ public:
 
     // ── Quarantine operations ────────────────────────────────────────────
 
-    /// Quarantine a device. `std::unexpected("device is already
+    /// Quarantine a device and return the new record's id (the id the audit rows carry as
+    /// `record_id=`, #7628). `std::unexpected("device is already
     /// quarantined")` when an active record already exists for `agent_id`
     /// (the partial unique index conflict, a business/state error — 400 at
     /// REST); any other `unexpected(msg)` a genuine store/pool/query
     /// failure, prefixed `kQuarantineDbErrorPrefix` so the REST route
     /// classifies it 503. AUTHORITATIVE write.
-    [[nodiscard]] std::expected<void, std::string>
+    [[nodiscard]] std::expected<std::int64_t, std::string>
     quarantine_device(const std::string& agent_id, const std::string& by,
                       const std::string& reason, const std::string& whitelist);
 
@@ -119,11 +151,21 @@ public:
 
     /// End the record `record_id` for `agent_id` (status `released`, `released_at` now).
     /// `ReleaseEnd::forced` also stamps `device_release_owed_at`, so the reconciler keeps
-    /// owing the device a release. Same `record_id` scoping and error contract as
-    /// `mark_endpoint_applied`: `std::unexpected("device is not quarantined")` when the
-    /// guarded UPDATE touched no row (already ended, or superseded by a newer record).
+    /// owing the device a release, and ignores `fence` (an operator's forced end rests on no
+    /// observation of the device and leaves both apply columns as they are, so the owed leg still
+    /// sees a live claim). Same `record_id` scoping and error contract as `mark_endpoint_applied`:
+    /// `kQuarantineNotQuarantined` when the guarded UPDATE touched no row (already ended, or
+    /// superseded by a newer record).
+    ///
+    /// `ReleaseEnd::device_confirmed` rests on the device's `inactive` answer, so it needs `fence`:
+    /// the `apply_fence_token` read BEFORE the command that produced that answer was dispatched.
+    /// The same UPDATE that ends the record checks `apply_gen = fence` and that no claim is live,
+    /// so an apply claimed after the observation refuses the end with
+    /// `kQuarantineApplyInFlight`. An empty `fence` (the token read found a live claim, or failed)
+    /// fails closed with the same answer and no round trip (#7613).
     [[nodiscard]] std::expected<void, std::string>
-    mark_released(const std::string& agent_id, std::int64_t record_id, ReleaseEnd end);
+    mark_released(const std::string& agent_id, std::int64_t record_id, ReleaseEnd end,
+                  std::optional<std::int64_t> fence = std::nullopt);
 
     /// Records ended by force whose device has not yet confirmed a release, for the
     /// reconciler's owed-release leg. A device quarantined again since is governed by its
@@ -131,12 +173,56 @@ public:
     /// a silent empty.
     [[nodiscard]] std::optional<std::vector<QuarantineRecord>> list_release_owed();
 
+    /// The owed records restricted to `visible_ids` IN the query, with the same contract as
+    /// `list_quarantined_in` (nullptr = every agent, present-but-empty = nothing without a round
+    /// trip, `limit == 0` = no limit, `std::nullopt` = degraded). Newest first (#7624).
+    [[nodiscard]] std::optional<std::vector<QuarantineRecord>>
+    list_release_owed_in(const std::vector<std::string>* visible_ids, std::size_t limit);
+
     /// The device confirmed the release a forced end owed it: sets
     /// `device_release_owed_at` back to 0. Same `record_id` scoping and error contract as
-    /// `mark_endpoint_applied` (zero rows, including an already-cleared mark, is "device is
-    /// not quarantined").
-    [[nodiscard]] std::expected<void, std::string> clear_release_owed(const std::string& agent_id,
-                                                                      std::int64_t record_id);
+    /// `mark_endpoint_applied` (zero rows, including an already-cleared mark, is
+    /// `kQuarantineNotQuarantined`), and the same `fence` rule as a confirmed `mark_released`:
+    /// `kQuarantineApplyInFlight` with no `fence`, under a live claim, or when an apply was
+    /// claimed after the token was read. No default: every caller says what it observed.
+    [[nodiscard]] std::expected<void, std::string>
+    clear_release_owed(const std::string& agent_id, std::int64_t record_id,
+                       std::optional<std::int64_t> fence);
+
+    // ── Apply claim and generation (#7613) ───────────────────────────────
+    //
+    // A stored-record apply (`redispatch_stored_containment`, the one chokepoint) can be sent
+    // while a release is being confirmed. The device's `inactive` answer to the release then
+    // describes a state the apply is about to change, and ending the record on it would leave a
+    // contained device with no record and nothing owed. `apply_gen` counts the applies ever
+    // claimed for a record; `apply_claimed_at` marks one whose dispatch has not returned. A
+    // dispatch that returned is NOT a delivery (the gateway path only queues the command), so the
+    // generation outlives the claim: whoever will act on a device's `inactive` answer reads the
+    // token BEFORE it sends the command whose answer it will use, and the write that ends the
+    // record presents it. An apply claimed after the token read moves the generation, so the end
+    // is refused; an apply claimed before it had left the server before the observing command
+    // was sent, so the observing command is queued behind it. A crashed holder's claim is never
+    // cleared by anyone: it stops counting `kApplyClaimTtlSecs` after it was stamped.
+
+    /// Claim an apply for `record_id`: `apply_gen + 1` and the claim stamp, in one guarded UPDATE.
+    /// Returns the generation the caller now owns (pass it to `release_apply_claim`).
+    /// `kQuarantineNotQuarantined` when the record ended, a release was requested, or another
+    /// apply holds a live claim; `kQuarantineDbErrorPrefix` on a store failure. AUTHORITATIVE write.
+    [[nodiscard]] std::expected<std::int64_t, std::string>
+    claim_apply(const std::string& agent_id, std::int64_t record_id);
+
+    /// Drop the claim taken at generation `gen`. Conditional on `apply_gen = gen`, so a holder
+    /// whose claim expired and was replaced cannot clear the replacement's live claim; zero rows is
+    /// success. Any record status. A failure leaves the claim to expire.
+    [[nodiscard]] std::expected<void, std::string>
+    release_apply_claim(const std::string& agent_id, std::int64_t record_id, std::int64_t gen);
+
+    /// The generation to present with a confirmed end, or empty when a claim is live or the record
+    /// does not exist. Read BEFORE the command whose `inactive` answer will be acted on is
+    /// dispatched, never after the answer is read. `std::unexpected` (prefixed
+    /// `kQuarantineDbErrorPrefix`) on a store failure. Any record status.
+    [[nodiscard]] std::expected<std::optional<std::int64_t>, std::string>
+    apply_fence_token(const std::string& agent_id, std::int64_t record_id);
 
     /// The current active record for `agent_id`, if any. AUTHORITATIVE read:
     /// `std::unexpected(msg)` on a store/pool/query failure (prefixed
@@ -172,7 +258,7 @@ public:
     /// never-actually-dispatched record) rather than silently succeeding
     /// against the wrong row. `std::unexpected(msg)` prefixed
     /// `kQuarantineDbErrorPrefix` on a genuine store/pool/query failure;
-    /// `std::unexpected("device is not quarantined")` (unprefixed business
+    /// `kQuarantineNotQuarantined` (unprefixed business
     /// error, matching `request_release`) when the guarded UPDATE returned
     /// zero rows — covers BOTH "released, nothing active" and "superseded by
     /// a different active record" identically; every existing caller's

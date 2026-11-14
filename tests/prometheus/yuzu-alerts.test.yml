@@ -8970,3 +8970,66 @@ tests:
             value: 1
           - labels: 'ALERTS{alertname="YuzuPluginInitFailed", alertstate="firing", job="yuzu", plugin="wmi", severity="warning"}'
             value: 1
+
+  # ── YuzuQuarantineDriftRepeated (#7622) ───────────────────────────────────
+  #
+  # `increase(yuzu_server_quarantine_reapply_total{result="drift"}[1h]) >= 3`, no hold, warning.
+  # The counters below start at 5 (a server that has already counted earlier drifts), so the
+  # window's first sample is not 0 and the extrapolation cannot clamp to zero: three drifts read
+  # a little over 3, two read a little over 2, which keeps both sides clear of the threshold.
+
+  # CASE M -- three drifts inside the hour fire; two on another instance do not. RED if the
+  # threshold moves to > 3 (the firing side reads about 3.05) or to >= 2 (the other side fires).
+  - interval: 1m
+    name: quarantine drift - three drifts in an hour fire, two do not
+    input_series:
+      - series: 'yuzu_server_quarantine_reapply_total{job="yuzu",instance="s1",result="drift"}'
+        values: "5x20 6 7 8 8x20"
+      - series: 'yuzu_server_quarantine_reapply_total{job="yuzu",instance="s2",result="drift"}'
+        values: "5x20 6 7 7x22"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineDriftRepeated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineDriftRepeated", alertstate="firing", instance="s1", job="yuzu", result="drift", severity="warning"}'
+            value: 1
+
+  # ── YuzuQuarantineReconcilerStalled (#7623) ───────────────────────────────
+  #
+  # `time() - max by (job) (yuzu_server_quarantine_reconciler_last_tick_unixtime) > 300`,
+  # for: 5m, warning. Under promtool `time()` is the evaluation time in seconds from the start of
+  # the test, so a series whose value equals its own timestamp is a gauge that is being stamped
+  # every scrape ("0+60x40" at a 1m interval) and a series stuck at 0 is a thread that stopped.
+
+  # CASE N -- a gauge that stopped at t=0 fires once it is older than five minutes AND has stayed
+  # so for the hold: quiet at 8m (stale since 5m, still pending), firing at 20m. RED if the age
+  # threshold or the hold is removed.
+  - interval: 1m
+    name: quarantine reconciler stalled - a stale last-tick gauge fires after the hold
+    input_series:
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s1"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE O -- a gauge stamped on every scrape never fires, and neither does a job where ONE of
+  # two instances is stale and the other is fresh (a follower that does not tick: the max over the
+  # job is the leader's). RED if `max by (job)` becomes a per-instance comparison.
+  - interval: 1m
+    name: quarantine reconciler stalled - a fresh instance keeps the job quiet
+    input_series:
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s1"}'
+        values: "0+60x40"
+      - series: 'yuzu_server_quarantine_reconciler_last_tick_unixtime{job="yuzu",instance="s2"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineReconcilerStalled"}'
+        eval_time: 30m
+        exp_samples: []

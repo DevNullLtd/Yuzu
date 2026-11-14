@@ -3,7 +3,7 @@
 //   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
 //                 and the discovered set matches EXPECTED (nav drift fails both ways).
 //   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
-//   3. SCENARIOS  stubbed write paths (#6076, add user, #5840, #6074); each forces its own
+//   3. SCENARIOS  stubbed write paths (#6076, add user, #5840, #6074, #7584f); each forces its own
 //                 precondition with a request stub, nothing is written to the server.
 // One line per check; exit 1 when any check fails.
 //
@@ -266,6 +266,50 @@ async function scenarioPki(page) {
     w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
 }
 
+// #7584f: the release dialog's confirm sends DELETE /api/v1/quarantine/{id}; on the server's 200
+// (released) or 202 (releasing) the page re-reads the containment fragment (yuzu-estate.js
+// refresh()), so it shows the state the server now holds. The lens fragment is not served for an
+// agent the server does not know, so the control and the fragment are stubbed: the DELETE, and
+// the GET that must follow it, never reach the server.
+async function scenarioReleaseRefresh(page) {
+  const w = watch(page);
+  const agent = 'smoke-agent';
+  const fragment = '/fragments/hardware/ci/containment';
+  const control = '<div id="hw-containment"><button id="smoke-release" data-act="release" ' +
+    'data-agent="' + agent + '" data-host="smoke host">Release</button></div>';
+  await stub(page, { method: 'GET', path: fragment, status: 200, contentType: 'text/html', body: control });
+  const del = await stub(page, { method: 'DELETE', path: '/api/v1/quarantine/' + agent, status: 200,
+    body: JSON.stringify({ data: { released: true, state: 'released' } }) });
+  await visit(page, '/hardware');
+  await page.waitForFunction(() => !!window.YuzuDialog && !!window.htmx, { timeout: WAIT_MS });
+  // The page's own hardware list does not hold this agent: put the lens fragment's control in.
+  await page.evaluate((html) => {
+    const box = document.createElement('div');
+    box.innerHTML = html; // test-only markup built above; the page under test never does this
+    document.body.appendChild(box.firstChild);
+  }, control);
+  const fragmentGets = () => requestLog(page).filter((r) => r.method === 'GET' && r.path === fragment &&
+    r.search.includes('id=' + agent) && !r.search.includes('banner=1'));
+  for (const [status, body] of [[200, { data: { released: true, state: 'released' } }],
+    [202, { data: { released: false, state: 'releasing' } }]]) {
+    del.status = status;
+    del.body = JSON.stringify(body);
+    const before = fragmentGets().length;
+    const deletes = del.calls.length;
+    await page.waitForSelector('#smoke-release', { timeout: WAIT_MS });
+    await page.click('#smoke-release');
+    await page.waitForSelector('dialog[open] button.btn-danger', { timeout: WAIT_MS });
+    await page.click('dialog[open] button.btn-danger');
+    const deadline = Date.now() + WAIT_MS;
+    while (fragmentGets().length <= before && Date.now() < deadline)
+      await new Promise((r) => setTimeout(r, 50));
+    check('#7584f a stubbed DELETE ' + status + ' is followed by a containment fragment GET, no page error',
+      del.calls.length === deletes + 1 && fragmentGets().length === before + 1 && w.pageErrors().length === 0,
+      'deletes=' + (del.calls.length - deletes) + ' fragment GETs=' + (fragmentGets().length - before) +
+        ' pageErrors=' + JSON.stringify(w.pageErrors()));
+  }
+}
+
 // ---- selftest ------------------------------------------------------------------------
 // A gate whose checks can pass vacuously is worse than none, so every crawl and overflow check
 // gets a positive control. A local fixture serves a fake shell (28 nav links, forms) with the
@@ -406,6 +450,7 @@ async function main() {
       ['add-user', scenarioAddUser],
       ['ctrl-k', scenarioCtrlK],
       ['pki', scenarioPki],
+      ['release-refresh', scenarioReleaseRefresh],
     ];
     for (const [name, fn] of scenarios) {
       const p = await browser.newPage();

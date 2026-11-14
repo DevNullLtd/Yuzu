@@ -881,6 +881,24 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
     return affected_rows(res) > 0 ? FinalizeResult::Updated : FinalizeResult::NoRow;
 }
 
+bool ResponseStore::shorten_ttl(const std::string& instruction_id, const std::string& agent_id,
+                                std::chrono::seconds keep) {
+    if (!open_)
+        return false;
+    auto lease = pool_.try_acquire_for(kIngestTimeout);
+    if (!lease)
+        return false;
+    const std::string expires = std::to_string(now_epoch() + static_cast<int64_t>(keep.count()));
+    // Never raises an earlier expiry: only a row with no expiry (0 = default retention) or a later
+    // one is moved.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE response_store.responses SET ttl_expires_at = $1::bigint WHERE instruction_id = $2 "
+        "AND agent_id = $3 AND (ttl_expires_at = 0 OR ttl_expires_at > $1::bigint)",
+        std::vector<std::string>{expires, instruction_id, agent_id});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
 // ── Reads (degrade-distinguishable) ──────────────────────────────────────────
 
 namespace {

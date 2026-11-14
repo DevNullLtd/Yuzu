@@ -2,6 +2,7 @@
 
 #include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
 #include "quarantine_reapply.hpp"    // ContainmentReply (the parsed firewall status/release reply)
+#include "quarantine_release_decision.hpp" // ReconcileKind and the pure reply tables
 
 /// @file quarantine_containment_reconciler.hpp
 /// #3425: closes the "quarantined while offline, never re-contained on
@@ -15,9 +16,9 @@
 /// `firewall.quarantine` applies, `firewall.quarantine_status` reads,
 /// `firewall.release` lifts.
 ///
-/// Two triggers, one component (mirrors PreflightRunner + the Guardian
+/// Two triggers, one component, one thread (mirrors PreflightRunner + the Guardian
 /// heartbeat reconcile, both already in this file's neighborhood):
-///   * `tick()` — a background thread calls this on a cadence (server.cpp).
+///   * `tick()` — the reconciler thread calls this every 20 s (server.cpp).
 ///     `AgentRegistry::send_to` silently drops offline agents, so a tick
 ///     against a still-offline device costs one cheap skip and naturally
 ///     catches a device that reconnected since the last tick.
@@ -25,11 +26,15 @@
 ///     `HeartbeatIngestion::set_quarantine_reconcile_fn` (heartbeat, NOT
 ///     `AgentServiceImpl::Register` — Register returns before the Subscribe
 ///     stream exists, so `send_to` would silently drop a dispatch fired from
-///     there). Fast path is one mutex-guarded lookup in a cache `tick()`
-///     refreshes; a miss (the overwhelming majority of heartbeats, from
-///     agents with no active record) costs nothing — no store read on the
-///     hot path, and NOTHING on the registration path at all (acceptance
-///     criterion).
+///     there). It only MARKS the device due (#7619): one lookup in a cache
+///     `tick()` refreshes and, on a hit, an insert into a set, under a small
+///     mutex of its own. It reads no store, dispatches nothing and never waits
+///     on a pool or a lock the reconcile work holds; a miss (the overwhelming
+///     majority of heartbeats, from agents with no active record) costs one
+///     hash lookup, and NOTHING touches the registration path (acceptance
+///     criterion). The reconciler thread calls `drain_heartbeat_due()` every
+///     second, which does the reconcile work for the devices marked since, so
+///     a heartbeat-triggered reconcile starts within a second of the mark.
 ///
 /// WHAT CONFIRMED MEANS. Confirmation is a FOLLOW-UP `firewall.quarantine_status`
 /// read, never inferred from `agents_reached > 0` (dispatch acceptance is not
@@ -59,8 +64,16 @@
 /// (5 minutes) while its device is connected; the record stays confirmed meanwhile
 /// (the unconfirmed gauge and its alert do not blink) and the CONFIRMED audit row is
 /// written once per transition, not on every re-verify. A re-verify that no longer
-/// confirms is DRIFT: one `quarantine.reapply` failure row (`drift status=<name>`),
-/// then the record is unconfirmed and the next cycle re-applies through the chokepoint.
+/// confirms is not called drift on the reply alone (#7621): the store row is read again
+/// first, because the reply may describe a record that ended or began releasing while
+/// the status command was in flight. A failed read counts `degraded`, writes no row and
+/// re-verifies; no row, or another record's row, drops the entry; a release requested in
+/// the meantime turns the entry into a releasing one and the reply is handled as the
+/// releasing reply it now is. Only a row that still reads active makes it DRIFT: one
+/// `quarantine.reapply` failure row (`drift status=<name>`), counted as
+/// `yuzu_server_quarantine_reapply_total{result="drift"}` (#7622), then the record is
+/// unconfirmed and the next cycle re-applies through the chokepoint.
+/// `YuzuQuarantineDriftRepeated` fires when that repeats.
 ///
 /// A previously-CONFIRMED agent also re-verifies on EITHER of two independent churn
 /// signals, checked separately every tick (governance re-review, Findings UP-1/UP-2):
@@ -114,6 +127,12 @@
 /// the forced end. A containment sent outside the quarantine routes is not recorded, listed,
 /// re-applied or protected by this component; to keep such a device contained, quarantine it
 /// again through the quarantine routes (the new record stops the owed release).
+/// WHEN IT IS SENT: once per device reconnect and once per server start. The in-memory
+/// bookkeeping that remembers "this session's release was sent" is not persisted, and a server
+/// restart drops every device's Subscribe stream anyway (each device reconnects, a new session),
+/// so a still-owed device is sent one more release after a restart, and the `forced_release_*`
+/// audit rows repeat with it. A release is idempotent on the device, so persisting the bookkeeping
+/// would buy nothing (#7626).
 ///
 /// State: durable across restarts via `QuarantineStore::mark_endpoint_applied`/
 /// `mark_endpoint_confirmed` (schema v2) and the v4 release columns; in-memory (this
@@ -121,45 +140,52 @@
 /// lost on restart. A restart therefore costs one full apply-then-verify cycle per
 /// previously-confirmed active record (a fresh `AgentState` defaults `confirmed=false`).
 ///
-/// Concurrency: `tick()` and `notify_agent_heartbeat()` both funnel into
-/// `reconcile_one()`, which claims a per-agent rate-limit slot UNDER THE
-/// LOCK before any I/O (the Guardian heartbeat reconcile's claim-then-act
-/// shape) — a concurrent tick and heartbeat for the same agent cannot both
-/// dispatch. Store reads/dispatch calls never run WHILE the lock is held
-/// (PolicyEvaluator's rule — dispatch is blocking gRPC).
+/// Concurrency: the reconciler thread runs `tick()` and `drain_heartbeat_due()` in turn, so
+/// production reconcile work is single-threaded; `notify_agent_heartbeat()` is the only entry
+/// point called from other threads and it touches `cache_mu_` alone. Both funnel into
+/// `reconcile_one()`, which claims a per-agent rate-limit slot UNDER `mu_` before any I/O (the
+/// Guardian heartbeat reconcile's claim-then-act shape), so a second caller (a test, a future
+/// second thread) for the same agent cannot also dispatch. Store reads and dispatch calls never run
+/// WHILE either mutex is held (PolicyEvaluator's rule: dispatch is blocking gRPC), and the two
+/// mutexes are never held together. After the claim a pass works from a COPY of the entry, and every
+/// write back goes through `entry_for`, which hands the live entry out only while its kind and
+/// record id still equal the copy's. An entry reset in the meantime (a `tick()` run from inside the
+/// pass's own dispatch, a release requested, a requarantine) therefore drops the pass's result
+/// instead of overwriting the new entry's flags and backoff (#7620, #7645); audit rows for facts
+/// that did happen are still written.
 ///
 /// Multi-replica: `reconcile_one`'s reachability check
 /// (`AgentRegistry::get_session`) naturally partitions reapply work to
 /// whichever replica holds the agent's live Subscribe stream — no
 /// cross-replica coordination needed.
 ///
-/// KNOWN RESIDUAL RACE, DISCLOSED NOT SILENTLY ACCEPTED (adversarial review
-/// 2026-08-24, Kimi K8 / Codex CDX-P1-01): `redispatch_stored_containment`
-/// reads the active row, then dispatches, with no re-validation in between —
-/// a concurrent release request can commit inside that window. The dispatch
-/// itself cannot be recalled once sent, so an apply read just before a DELETE can
-/// land after the release. Two orderings:
-///   (1) the apply lands while the record still reads releasing: the
-///       release_pending guard and this component's status-first rule make the
-///       next cycle correct it;
-///   (2) the release completes first and the apply lands after it (DELETE took the
-///       device's `inactive` and ended the record, then the late apply contained the
-///       device): the device is firewalled with NO record naming it.
-///       `mark_endpoint_applied` touches no row, this component erases its entry and
-///       nothing re-reads that device; the only trace is the `quarantine.reapply`
-///       failure row `dispatch accepted record_id=<id> command_id=<id> but the durable
-///       stamp failed: device is not quarantined`, and the way back is a
-///       `firewall.release` sent through the generic dispatch routes.
-/// REST DELETE's own release has the same check-then-dispatch window against a
-/// re-quarantine of the device, as does the owed-release leg (the new record's
-/// re-verify corrects either within 5 minutes). The same outcome follows when a release sent
-/// earlier is run by the device after a later record's apply: commands are not ordered on the
-/// device, so the new record can be confirmed and the device then released, uncontained until the
-/// re-verify re-applies it (up to 5 minutes). The window is narrow (one
-/// synchronous read-then-dispatch pair inside a single `reconcile_one` call, not
-/// spanning any of this component's own waiting); the proper fix (a database-backed
-/// claim or generation on the active row, checked by the release and the reapply path)
-/// is a real schema/contract change of its own, not a same-round patch.
+/// THE APPLY FENCE, WHAT IT CLOSES AND WHAT IT DOES NOT (#7613; the store side is in
+/// `quarantine_store.hpp`, the chokepoint side in `quarantine_reapply.hpp`). A record ends on the
+/// device's `inactive` answer, and an apply that reaches the device after the observation that
+/// produced that answer would leave the device contained with no record and nothing owed. The rule:
+///   * `redispatch_stored_containment` claims the apply first (`claim_apply` moves the record's
+///     `apply_gen` and stamps a claim) and drops the claim when the dispatch returns. The
+///     generation outlives the claim, because a dispatch that returned is not a delivery.
+///   * Whoever will act on an `inactive` answer reads `apply_fence_token` BEFORE it sends the
+///     command whose answer it will use: `send_status` here (stored as `pending_fence` beside the
+///     command id), DELETE after `request_release` and before its `firewall.release`. The token is
+///     empty while a claim is live.
+///   * The write that ends the record (`mark_released(device_confirmed)`, `clear_release_owed`)
+///     presents the token and the store checks it in the same guarded UPDATE: an apply claimed after
+///     the token was read refuses the end (`apply_in_flight`). An apply claimed before it had left
+///     the server before the observing command was sent, so that command is queued behind it.
+///   * A refused end backs off and re-reads: the next status read takes a fresh token and settles it.
+///     `send_release` reads no token, because no answer to a release ends a record here.
+/// Residuals, stated plainly: (1) the rule assumes commands to one device arrive in the order one
+/// server dispatched them (one stream, a first-in first-out gateway queue); a transport that
+/// reorders them, or an apply and a release dispatched by two different server replicas, can still
+/// reopen the window. (2) A claim older than `kApplyClaimTtlSecs` (120 s) is ignored, so a dispatch
+/// stalled longer than that reopens it. (3) DELETE's own release has a check-then-dispatch window
+/// against a re-quarantine of the device, as does the owed-release leg; the new record's re-verify
+/// corrects either within 5 minutes. (4) The same outcome follows when a release sent earlier is run
+/// by the device after a later record's apply, for the same ordering reason: the new record can be
+/// confirmed and the device then released, uncontained until the re-verify re-applies it (up to 5
+/// minutes).
 
 #include <array>
 #include <chrono>
@@ -189,11 +215,13 @@ namespace yuzu::server {
 /// distinct failure branches — but every site for a given value emits the
 /// same semantic outcome, and the SET itself stays closed/exhaustive (grep
 /// `count("` to enumerate).
-inline constexpr std::array<std::string_view, 13> kQuarantineReapplyResults{
+inline constexpr std::array<std::string_view, 14> kQuarantineReapplyResults{
     "reapplied",         // an apply or status dispatch was accepted (agents_reached > 0)
     "confirmed",         // a status read reported the device's rules in force (status|active, or active_unproven with no probe target)
-    "unconfirmed",       // a status read reported anything else (partial, inactive, refused, degraded, ...),
-                         // or an apply reply said the device kept other exceptions (never-confirmed record)
+    "unconfirmed",       // a status read reported anything else (partial, refused, degraded, ...) for a record
+                         // not yet confirmed, or an apply reply said the device kept other exceptions
+    "drift",             // a confirmed record's device no longer reports its rules in force (the store row
+                         // was re-read and still reads active); the record is re-applied next cycle
     "busy",              // the plugin's mutation gate answered status|busy
     "offline",           // no live AgentSession — dispatch skipped entirely
     "not_reached",       // dispatched but agents_reached==0, or the response never arrived before kResponseWait
@@ -229,6 +257,9 @@ public:
 
     /// Epoch-seconds clock, injectable for tests.
     using NowFn = std::function<std::int64_t()>;
+    /// Monotonic clock for every backoff, claim and wait deadline, injectable for tests (#7583):
+    /// a test advances it instead of sleeping.
+    using SteadyNowFn = std::function<std::chrono::steady_clock::time_point()>;
 
     struct Deps {
         QuarantineStore* quarantine_store{nullptr};
@@ -238,6 +269,7 @@ public:
         AuditStore* audit_store{nullptr}; // nullable — tests may omit
         CommandDispatchFn dispatch_fn;
         NowFn now_fn; // unset = system clock
+        SteadyNowFn steady_now_fn; // unset = std::chrono::steady_clock::now()
         // governance Gate 5 (chaos-injector, Finding 4b): tick()'s reconcile
         // loop had NO interior cancellation check — once started, a single
         // tick() call could sequentially work through up to
@@ -264,6 +296,11 @@ public:
 
     explicit QuarantineContainmentReconciler(Deps deps);
 
+    /// Pre-seeds the reconciler's metric series at 0 across their closed label sets, so an alert
+    /// can use `absent()` and an idle server reads as an explicit 0 (server.cpp calls this once at
+    /// boot; a test calls it on its own registry). The last-tick gauge starts at the current time.
+    static void seed_metrics(yuzu::MetricsRegistry& metrics);
+
     /// One scheduler cycle. Safe to call from a single background thread.
     /// Lists active records (releasing ones included) and the records ended by
     /// force that still owe their device a release, GCs per-agent state for
@@ -277,11 +314,17 @@ public:
     /// closed.
     void tick();
 
-    /// Heartbeat fast path: O(1) cache lookup; a miss (no active
-    /// unconfirmed record for this agent) returns immediately with no store
-    /// read. A hit calls `reconcile_one`, which shares the same per-agent
-    /// rate-limit claim as `tick()` so a racing tick cannot double-dispatch.
+    /// Heartbeat fast path (#7619): marks the device due and returns. O(1) cache lookup under
+    /// `cache_mu_`; a miss (no record needing work for this agent) returns with nothing recorded.
+    /// No store read, no dispatch, no `mu_`: heartbeat ingest never waits on reconcile work.
     void notify_agent_heartbeat(std::string_view agent_id);
+
+    /// Does the reconcile work for the devices `notify_agent_heartbeat` marked since the last call
+    /// (the set is moved out and cleared first), through the same `reconcile_one` and per-agent
+    /// claim as `tick()`. Called every second by the reconciler thread. Checks `Deps::should_stop`
+    /// once per device and stops after `kMaxDispatchesPerTick` dispatch attempts (the rest stay
+    /// marked). Returns the number of dispatch attempts.
+    std::size_t drain_heartbeat_due();
 
     /// #3425 governance correction round (cpp-safety SHOULD + unhappy-path
     /// UP-1, independently converged): call from the tick-thread's outer
@@ -305,7 +348,7 @@ private:
     // What the row behind an entry is: an active record, one with a release requested
     // (the store reads it "releasing"), or one ended by force that still owes the device
     // a release.
-    enum class Kind { active, releasing, owed };
+    using Kind = ReconcileKind;
 
     struct AgentState {
         Kind kind{Kind::active};
@@ -324,6 +367,11 @@ private:
         bool verify_first{false};
         Pending pending{Pending::none};
         std::string pending_command_id;
+        // #7613: the apply generation read BEFORE the in-flight status command was dispatched, for
+        // every kind (empty while an apply's claim was live, or never read). The write that ends a
+        // record on this command's `inactive` answer presents it; the store refuses the end when an
+        // apply was claimed since.
+        std::optional<std::int64_t> pending_fence;
         // #3425 governance Gate 4 (unhappy-path, Finding A): the
         // `QuarantineRecord::id` the in-flight command was actually built
         // from — carried into the eventual `mark_endpoint_applied`/
@@ -353,6 +401,10 @@ private:
         std::string owed_tried_session_id;
         bool owed_release_sent{false};
         bool owed_parked{false};
+        // Releasing entries (#7625): the `release_sent` audit row is written once per agent session,
+        // not once per cycle; the counter still counts every dispatch.
+        bool release_audited{false};
+        std::string release_audited_session_id;
         std::chrono::steady_clock::time_point pending_since{};
         std::chrono::steady_clock::time_point next_eligible_at{};
         // Zero = "never claimed yet" — reconcile_one initializes it to
@@ -389,20 +441,32 @@ private:
     // outcome). The send_* pieces return the same "a dispatch was attempted" signal.
     void handle_mutation_reply(const std::string& agent_id, const AgentState& c,
                                const ContainmentReply& reply,
-                               std::chrono::steady_clock::time_point steady_now);
+                               std::chrono::steady_clock::time_point now_steady);
     void handle_status_reply(const std::string& agent_id, const AgentState& c,
                              const ContainmentReply& reply,
-                             std::chrono::steady_clock::time_point steady_now);
+                             std::chrono::steady_clock::time_point now_steady);
     bool send_status(const std::string& agent_id, const AgentState& c);
     bool send_release(const std::string& agent_id, const AgentState& c);
-    bool send_apply(const std::string& agent_id, std::string_view trigger);
+    bool send_apply(const std::string& agent_id, const AgentState& c, std::string_view trigger);
     // Dispatches one parameterless firewall containment action to one agent. Returns the command
     // id when an agent was reached; counts `dispatch_error` when the dispatch threw and
     // `not_reached` when it reached nobody (both "a dispatch was attempted").
     std::optional<std::string> dispatch_bare(const std::string& agent_id, std::string_view action);
-    // Escalates the entry's backoff and holds its next claim until it elapses.
-    void back_off(const std::string& agent_id, std::chrono::steady_clock::time_point steady_now);
+    // The only reset of an entry: a fresh AgentState for `record_id`, a releasing or owed one reading
+    // status before it dispatches anything. Used at every site that starts an entry over.
+    static void reset_for(AgentState& st, Kind kind, std::int64_t record_id);
+    // The live entry for `agent_id` when its kind and record id still equal `c`'s (the copy a pass
+    // took at its claim), else nullptr: the entry was reset, replaced or removed since, and the
+    // pass's result is dropped. The caller holds `mu_`, and the pointer is valid only while it does.
+    [[nodiscard]] AgentState* entry_for(const std::string& agent_id, const AgentState& c);
+    // Escalates the entry's backoff and holds its next claim until it elapses (dropped when the
+    // entry is no longer the one `c` was copied from).
+    void back_off(const std::string& agent_id, const AgentState& c,
+                  std::chrono::steady_clock::time_point now_steady);
     void count(const char* result) const;
+    [[nodiscard]] std::chrono::steady_clock::time_point steady_now() const;
+    // Stamps yuzu_server_quarantine_reconciler_last_tick_unixtime: tick() reached its end (#7623).
+    void stamp_last_tick() const;
     // #3425 review (Doomgoose, #3567): freshness signal for
     // yuzu_server_quarantine_endpoint_unconfirmed — see tick()'s call sites.
     void publish_tick_health(bool healthy) const;
@@ -436,9 +500,14 @@ private:
     [[nodiscard]] std::chrono::milliseconds max_backoff() const;
 
     Deps d_;
-    std::mutex mu_;
+    std::mutex mu_; // guards state_
     std::unordered_map<std::string, AgentState> state_;
-    std::unordered_set<std::string> unconfirmed_cache_; // refreshed by tick(), read by the heartbeat fast path
+    // The heartbeat fast path's own mutex (#7619), never held together with mu_: tick() swaps the
+    // cache in, notify_agent_heartbeat() reads it and marks devices due, drain_heartbeat_due() takes
+    // the marks.
+    std::mutex cache_mu_;
+    std::unordered_set<std::string> unconfirmed_cache_; // refreshed by tick()
+    std::unordered_set<std::string> heartbeat_due_;     // marked by heartbeats, drained every second
 };
 
 } // namespace yuzu::server

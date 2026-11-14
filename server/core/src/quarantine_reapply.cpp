@@ -4,6 +4,8 @@
 #include "quarantine_store.hpp"
 #include "response_store.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cctype>
 #include <exception>
@@ -172,12 +174,34 @@ redispatch_stored_containment(QuarantineStore& store, const std::string& agent_i
         return std::unexpected(
             ContainmentReapplyError{ContainmentReapplyErrorKind::whitelist_invalid, ""});
 
+    // Claim the apply BEFORE it can reach the device (#7613). The claim moves the record's apply
+    // generation, so a confirmed end resting on an `inactive` answer observed before this point is
+    // refused, and it stays live while the dispatch is in progress, so a mark attempted during the
+    // dispatch is refused too. Refused when the record changed since the read above (ended, a
+    // release requested) or another apply holds a live claim: nothing is dispatched, and the
+    // callers' no_active_record arms re-derive the record on their next pass.
+    auto gen = store.claim_apply(agent_id, out_record.id);
+    if (!gen) {
+        if (gen.error() == kQuarantineNotQuarantined)
+            return std::unexpected(ContainmentReapplyError{
+                ContainmentReapplyErrorKind::no_active_record,
+                "quarantine record changed or another apply is in flight"});
+        return std::unexpected(
+            ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, gen.error()});
+    }
+
     ContainmentReapplyResult result;
     try {
         std::tie(result.command_id, result.agents_reached) = dispatch_fn(*params);
     } catch (const std::exception&) {
         result.dispatch_threw = true;
     }
+    // Always drop our own claim; the generation it moved outlives it (see the header). A failed
+    // release leaves the claim to expire after kApplyClaimTtlSecs, which only delays a confirmed end.
+    if (auto rel = store.release_apply_claim(agent_id, out_record.id, *gen); !rel)
+        spdlog::warn("redispatch_stored_containment: could not release the apply claim for record "
+                     "{}: {}",
+                     out_record.id, rel.error());
     return result;
 }
 

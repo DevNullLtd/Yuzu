@@ -11,6 +11,8 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <expected>
+#include <iterator>
 
 namespace yuzu::server {
 
@@ -56,18 +58,76 @@ std::chrono::milliseconds QuarantineContainmentReconciler::max_backoff() const {
     return d_.max_backoff_override.count() > 0 ? d_.max_backoff_override : kMaxBackoff;
 }
 
-void QuarantineContainmentReconciler::back_off(const std::string& agent_id,
-                                               std::chrono::steady_clock::time_point steady_now) {
+std::chrono::steady_clock::time_point QuarantineContainmentReconciler::steady_now() const {
+    return d_.steady_now_fn ? d_.steady_now_fn() : std::chrono::steady_clock::now();
+}
+
+void QuarantineContainmentReconciler::reset_for(AgentState& st, Kind kind, std::int64_t record_id) {
+    st = AgentState{};
+    st.kind = kind;
+    st.record_id = record_id;
+    // A releasing or owed entry reads status before it dispatches anything.
+    st.verify_first = kind != Kind::active;
+}
+
+QuarantineContainmentReconciler::AgentState*
+QuarantineContainmentReconciler::entry_for(const std::string& agent_id, const AgentState& c) {
+    const auto it = state_.find(agent_id);
+    if (it == state_.end() || it->second.kind != c.kind || it->second.record_id != c.record_id)
+        return nullptr;
+    return &it->second;
+}
+
+void QuarantineContainmentReconciler::back_off(const std::string& agent_id, const AgentState& c,
+                                               std::chrono::steady_clock::time_point now_steady) {
     std::lock_guard<std::mutex> lk(mu_);
-    auto& st = state_[agent_id];
-    st.backoff = next_backoff(st.backoff, max_backoff());
-    st.next_eligible_at = steady_now + st.backoff;
+    if (auto* st = entry_for(agent_id, c)) {
+        st->backoff = next_backoff(st->backoff, max_backoff());
+        st->next_eligible_at = now_steady + st->backoff;
+    }
+}
+
+void QuarantineContainmentReconciler::seed_metrics(yuzu::MetricsRegistry& metrics) {
+    // #3425: the reconciler's outcome series, seeded across its whole closed label set so that
+    // `absent()` on any value can never be confused with "the reconciler has never run".
+    for (const auto result : kQuarantineReapplyResults)
+        metrics.counter("yuzu_server_quarantine_reapply_total", {{"result", std::string(result)}});
+    // Per-replica gauges (never sum() across instances: each replica only sees the sessions its
+    // own gRPC listener holds). Seeded at 0 for both label values so a healthy fleet with nothing
+    // unconfirmed renders as an explicit 0, not an absent series.
+    for (const char* reachability : {"connected", "offline"}) {
+        metrics.gauge("yuzu_server_quarantine_endpoint_unconfirmed", {{"reachability", reachability}})
+            .set(0);
+        // Releasing records (a release asked for, the device not yet confirmed) and records an
+        // operator ended by force whose device still owes a release.
+        metrics.gauge("yuzu_server_quarantine_release_pending", {{"reachability", reachability}})
+            .set(0);
+        metrics.gauge("yuzu_server_quarantine_forced_release_owed", {{"reachability", reachability}})
+            .set(0);
+    }
+    // Freshness signal for the gauges above (#3425 review, Doomgoose #3567): pre-seeded optimistic
+    // (1) since the reconciler's thread starts within a boot-time window measured in seconds, not
+    // minutes: a brief false-healthy read before the first real tick is a negligible tradeoff
+    // against a 0 (falsely degraded) or an absent default.
+    metrics.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+    // #7623: when tick() last finished, so a thread that stopped ticking is visible. Seeded with
+    // the boot time, so the stall alert does not fire before the first tick.
+    metrics.gauge("yuzu_server_quarantine_reconciler_last_tick_unixtime")
+        .set(static_cast<double>(default_now_epoch()));
 }
 
 void QuarantineContainmentReconciler::count(const char* result) const {
     if (d_.metrics)
         d_.metrics->counter("yuzu_server_quarantine_reapply_total", {{"result", result}})
             .increment();
+}
+
+void QuarantineContainmentReconciler::stamp_last_tick() const {
+    // #7623: stamped on each of tick()'s three exits (no store, a degraded read, the end), never
+    // from on_tick_exception: a tick that threw did not finish, and a stalled thread stamps nothing.
+    if (d_.metrics)
+        d_.metrics->gauge("yuzu_server_quarantine_reconciler_last_tick_unixtime")
+            .set(static_cast<double>(now_epoch()));
 }
 
 void QuarantineContainmentReconciler::publish_tick_health(bool healthy) const {
@@ -160,6 +220,7 @@ void QuarantineContainmentReconciler::tick() {
         // publish below, 0 on either early return.
         publish_tick_health(false);
         count("degraded");
+        stamp_last_tick();
         return;
     }
     auto rows = d_.quarantine_store->list_quarantined();
@@ -169,6 +230,7 @@ void QuarantineContainmentReconciler::tick() {
         // device for as long as the read stays degraded.
         publish_tick_health(false);
         count("degraded");
+        stamp_last_tick();
         return;
     }
     // Records ended by force that still owe their device a release. A failed read here is not
@@ -195,7 +257,7 @@ void QuarantineContainmentReconciler::tick() {
     double releasing_offline = 0;
     double owed_connected = 0;
     double owed_offline = 0;
-    const auto steady_now = std::chrono::steady_clock::now();
+    const auto now_steady = steady_now();
     {
         std::lock_guard<std::mutex> lk(mu_);
         for (auto it = state_.begin(); it != state_.end();) {
@@ -209,17 +271,14 @@ void QuarantineContainmentReconciler::tick() {
         for (const auto& r : *rows) {
             const auto& agent_id = r.agent_id;
             const Kind row_kind = r.release_requested_at != 0 ? Kind::releasing : Kind::active;
-            auto& st = state_[agent_id]; // default-constructs an unconfirmed entry
+            auto [entry, inserted] = state_.try_emplace(agent_id); // a new entry reads unconfirmed
+            auto& st = entry->second;
             // A different kind (a release was requested) or a different record (released, then
             // requarantined, possibly with another whitelist, while the agent stayed connected on
             // the same session) means nothing this entry learned is about this row: start over. A
             // releasing entry reads status before it dispatches anything.
-            if (st.kind != row_kind || (st.record_id != 0 && st.record_id != r.id)) {
-                st = AgentState{};
-                st.kind = row_kind;
-                st.verify_first = row_kind == Kind::releasing;
-            }
-            st.record_id = r.id;
+            if (inserted || st.kind != row_kind || st.record_id != r.id)
+                reset_for(st, row_kind, r.id);
             auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
             const bool connected = sess != nullptr;
             if (row_kind == Kind::active && st.confirmed && connected) {
@@ -233,7 +292,7 @@ void QuarantineContainmentReconciler::tick() {
                     st.confirmed = false;
                     st.verify_first = true;
                 } else if (st.pending == Pending::none &&
-                           steady_now - st.confirmed_at >= reverify_interval()) {
+                           now_steady - st.confirmed_at >= reverify_interval()) {
                     // Re-verify without clearing `confirmed`, so the unconfirmed gauge and its
                     // alert do not blink on a healthy device. Not while a command is in flight:
                     // its reply is read first (a confirm then moves confirmed_at forward).
@@ -258,13 +317,10 @@ void QuarantineContainmentReconciler::tick() {
                 const auto& agent_id = r.agent_id;
                 if (!owed_ids.contains(agent_id))
                     continue;
-                auto& st = state_[agent_id];
-                if (st.kind != Kind::owed || st.record_id != r.id) {
-                    st = AgentState{};
-                    st.kind = Kind::owed;
-                    st.record_id = r.id;
-                    st.verify_first = true; // status before any release dispatch
-                }
+                auto [entry, inserted] = state_.try_emplace(agent_id);
+                auto& st = entry->second;
+                if (inserted || st.kind != Kind::owed || st.record_id != r.id)
+                    reset_for(st, Kind::owed, r.id); // status before any release dispatch
                 auto sess = d_.registry ? d_.registry->get_session(agent_id) : nullptr;
                 if (!sess) {
                     owed_offline += 1; // nothing is sent to an offline device
@@ -280,10 +336,15 @@ void QuarantineContainmentReconciler::tick() {
                     st.owed_parked = false;
                     st.verify_first = true;
                 }
-                if (!st.owed_parked || steady_now >= st.next_eligible_at)
+                if (!st.owed_parked || now_steady >= st.next_eligible_at)
                     to_reconcile.push_back(agent_id);
             }
         }
+    }
+    {
+        // The heartbeat fast path's view (#7619). Swapped in AFTER mu_ is released: the two
+        // mutexes are never held together.
+        std::lock_guard<std::mutex> lk(cache_mu_);
         unconfirmed_cache_ =
             std::unordered_set<std::string>(to_reconcile.begin(), to_reconcile.end());
     }
@@ -337,6 +398,7 @@ void QuarantineContainmentReconciler::tick() {
         if (reconcile_one(to_reconcile[i], "tick"))
             ++dispatched;
     }
+    stamp_last_tick();
 }
 
 void QuarantineContainmentReconciler::on_tick_exception() const {
@@ -355,155 +417,267 @@ void QuarantineContainmentReconciler::on_tick_exception() const {
 }
 
 void QuarantineContainmentReconciler::notify_agent_heartbeat(std::string_view agent_id_sv) {
+    // A mark and nothing else (#7619): this runs on the heartbeat ingest path, so it must never
+    // wait on a store read, a dispatch, or the lock reconcile work holds.
     const std::string agent_id(agent_id_sv);
+    std::lock_guard<std::mutex> lk(cache_mu_);
+    if (unconfirmed_cache_.contains(agent_id))
+        heartbeat_due_.insert(agent_id);
+}
+
+std::size_t QuarantineContainmentReconciler::drain_heartbeat_due() {
+    std::unordered_set<std::string> due;
     {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (!unconfirmed_cache_.contains(agent_id))
-            return; // fast path: no record needing work — no store read
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        due.swap(heartbeat_due_);
     }
-    (void)reconcile_one(agent_id, "heartbeat"); // no per-tick budget to track on this path
+    std::size_t dispatched = 0;
+    for (auto it = due.begin(); it != due.end(); ++it) {
+        if (d_.should_stop && d_.should_stop())
+            break; // shutting down: a device still marked is reconciled by the next heartbeat
+        if (dispatched >= kMaxDispatchesPerTick) {
+            // Same per-pass bound as tick(): the rest stay marked for the next drain.
+            std::lock_guard<std::mutex> lk(cache_mu_);
+            heartbeat_due_.insert(std::make_move_iterator(it), std::make_move_iterator(due.end()));
+            break;
+        }
+        if (reconcile_one(*it, "heartbeat"))
+            ++dispatched;
+    }
+    return dispatched;
 }
 
 // ── An in-flight reply, by what was pending ──────────────────────────────────
 
 void QuarantineContainmentReconciler::handle_mutation_reply(
     const std::string& agent_id, const AgentState& c, const ContainmentReply& reply,
-    std::chrono::steady_clock::time_point steady_now) {
+    std::chrono::steady_clock::time_point now_steady) {
     // The reply to `firewall.quarantine` or `firewall.release`. Neither ends anything: no answer to
     // a release ends a record (only the device's `inactive` on a status read does), and dispatch
     // acceptance (agents_reached>0, already known when the command was issued) is not proof of
-    // containment. So whatever it said, read status next, with the two exceptions below.
+    // containment. So whatever it said, read status next, with the exceptions in
+    // `decide_mutation_reply`.
+    const auto action = decide_mutation_reply(MutationReplyFacts{
+        .kind = c.kind,
+        .was_apply = c.pending == Pending::apply,
+        .apply_for_unconfirmed = c.apply_for_unconfirmed,
+        .allow_set_unchanged = reply.allow_set_unchanged,
+        .state = reply.state,
+    });
 
     // An apply for a record that was never confirmed, answered with the device's note that it kept
     // other operator exceptions: the device is contained, but not under this record's whitelist, so
     // a status read would only confirm the wrong containment. Leave the record unconfirmed.
-    const bool allow_set_kept =
-        c.pending == Pending::apply && c.apply_for_unconfirmed && reply.allow_set_unchanged;
-    if (allow_set_kept && !c.allow_set_reported)
+    if (action == MutationReplyAction::allow_set_kept && !c.allow_set_reported)
         audit_event(agent_id,
                     "allow_set_not_applied record_id=" + std::to_string(c.pending_record_id) +
                         " command_id=" + c.pending_command_id,
                     "failure");
 
-    std::lock_guard<std::mutex> lk(mu_);
-    auto& st = state_[agent_id];
-    st.pending = Pending::none;
-    if (allow_set_kept) {
-        st.allow_set_reported = true;
-        st.backoff = next_backoff(st.backoff, max_backoff());
-        st.next_eligible_at = steady_now + st.backoff;
-        count("unconfirmed");
-        return;
-    }
-    if (reply.state == QuarantineEndpointState::busy) {
-        // The plugin's mutation gate blocked the command — not a failure, just "already busy".
-        count("busy");
-        if (c.kind == Kind::owed && c.pending == Pending::release) {
-            // The device did not run the owed release at all, so this session's one release is not
-            // spent: send it again, status first, after an escalated backoff. Reading status next
-            // with the release marked spent would park the device with a failure row and no
-            // further release for the session.
-            st.owed_release_sent = false;
-            st.verify_first = true;
-            st.backoff = next_backoff(st.backoff, max_backoff());
-            st.next_eligible_at = steady_now + st.backoff;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto* st = entry_for(agent_id, c)) {
+            st->pending = Pending::none;
+            switch (action) {
+            case MutationReplyAction::allow_set_kept:
+                st->allow_set_reported = true;
+                st->backoff = next_backoff(st->backoff, max_backoff());
+                st->next_eligible_at = now_steady + st->backoff;
+                break;
+            case MutationReplyAction::owed_release_unspent:
+                // The device did not run the owed release at all, so this session's one release is
+                // not spent: send it again, status first, after an escalated backoff. Reading
+                // status next with the release marked spent would park the device with a failure
+                // row and no further release for the session.
+                st->owed_release_sent = false;
+                st->verify_first = true;
+                st->backoff = next_backoff(st->backoff, max_backoff());
+                st->next_eligible_at = now_steady + st->backoff;
+                break;
+            case MutationReplyAction::wait_claim_interval:
+                // The plugin's mutation gate blocked the command: not a failure, just "already
+                // busy". The entry waits for the normal claim interval before trying again.
+                break;
+            case MutationReplyAction::verify_next:
+                // Verify soon, overriding the big claim-time interval so the follow-up isn't
+                // delayed a full backoff cycle.
+                st->verify_first = true;
+                st->next_eligible_at = now_steady + verify_grace();
+                break;
+            }
         }
-        // Any other entry waits for the normal claim interval before trying again.
-        return;
     }
-    // Verify soon, overriding the big claim-time interval so the follow-up isn't delayed a full
-    // backoff cycle.
-    st.verify_first = true;
-    st.next_eligible_at = steady_now + verify_grace();
+    switch (action) {
+    case MutationReplyAction::allow_set_kept:
+        count("unconfirmed");
+        break;
+    case MutationReplyAction::owed_release_unspent:
+    case MutationReplyAction::wait_claim_interval:
+        count("busy");
+        break;
+    case MutationReplyAction::verify_next:
+        break;
+    }
 }
 
 void QuarantineContainmentReconciler::handle_status_reply(
-    const std::string& agent_id, const AgentState& c, const ContainmentReply& reply,
-    std::chrono::steady_clock::time_point steady_now) {
+    const std::string& agent_id, const AgentState& claimed, const ContainmentReply& reply,
+    std::chrono::steady_clock::time_point now_steady) {
+    // `c` starts as the copy the pass claimed; it becomes a releasing view of the entry if the
+    // fresh read below finds a release was requested while the status command was in flight.
+    AgentState c = claimed;
     const auto record = std::to_string(c.pending_record_id);
     const auto cmd = "command_id=" + c.pending_command_id;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        auto& st = state_[agent_id];
-        st.pending = Pending::none;
+        if (auto* st = entry_for(agent_id, c))
+            st->pending = Pending::none;
     }
+    const auto erase_entry = [&] {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (entry_for(agent_id, c))
+            state_.erase(agent_id);
+    };
 
-    // The device answered `inactive` and `res` is the store write that settles the entry (the
-    // caller made it, outside `mu_`). A "device is not quarantined" failure means the record was
-    // ended elsewhere first: the entry goes. Any other failure backs off, and either way the
-    // observed fact is audited as unstamped; on success it is audited and the entry goes.
-    const auto on_inactive = [&](const std::expected<void, std::string>& res,
-                                 std::string_view unstamped_what, const std::string& ok_detail) {
-        if (!res) {
-            if (res.error() == "device is not quarantined") {
+    // #7621: a confirmed record whose re-verify no longer confirms is not called drift on the
+    // reply alone. The reply may describe a record that ended or began releasing while the status
+    // command was in flight, so the row is read again first.
+    if (c.kind == Kind::active && c.confirmed && !reply_confirms_containment(reply)) {
+        auto fresh = d_.quarantine_store->get_status(agent_id);
+        if (!fresh) {
+            // Cannot tell drift from a release: no row, re-verify on the next cycle.
+            back_off(agent_id, c, now_steady);
+            {
                 std::lock_guard<std::mutex> lk(mu_);
-                state_.erase(agent_id); // ended elsewhere first
-            } else {
-                back_off(agent_id, steady_now);
+                if (auto* st = entry_for(agent_id, c))
+                    st->verify_first = true;
             }
-            audit_unstamped(agent_id, c.pending_record_id, c.pending_command_id, unstamped_what,
-                            res.error(), "quarantine.disable");
             count("degraded");
             return;
         }
-        audit_event(agent_id, ok_detail, "success", "quarantine.disable");
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id);
+        if (!fresh->has_value() || fresh->value().id != c.pending_record_id) {
+            erase_entry(); // ended, or superseded by another record: nothing left to judge
+            return;
         }
-        count("released");
+        if (fresh->value().release_requested_at != 0) {
+            // A release was requested after the status command was sent: handle the reply as the
+            // releasing reply it now is. An `inactive` answer ends the record through the same
+            // fenced write, with the token read before this command was dispatched.
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (auto* st = entry_for(agent_id, c))
+                    reset_for(*st, Kind::releasing, c.pending_record_id);
+            }
+            c.kind = Kind::releasing;
+            c.record_id = c.pending_record_id;
+        }
+    }
+
+    const auto action = decide_status_reply(StatusReplyFacts{
+        .kind = c.kind,
+        .state = reply.state,
+        .confirms = reply_confirms_containment(reply),
+        .was_confirmed = c.confirmed,
+        .owed_parked = c.owed_parked,
+        .owed_release_sent = c.owed_release_sent,
+    });
+
+    // #7627: this reply is read every cycle for as long as a record lives. Only the four that
+    // changed what the server holds about the device are kept at the default lifetime; the rest
+    // are shortened. A failure to shorten is ignored: the row simply keeps the default lifetime.
+    if (d_.response_store && !status_reply_is_evidence(action, c.confirmed))
+        (void)d_.response_store->shorten_ttl(c.pending_command_id, agent_id, std::chrono::hours(24));
+
+    const auto state_count = [&] {
+        count(reply.state == QuarantineEndpointState::busy ? "busy" : "unconfirmed");
     };
 
-    // ── A record being released: only the device's `inactive` ends it ──
-    if (c.kind == Kind::releasing) {
-        if (reply.state == QuarantineEndpointState::inactive) {
-            on_inactive(d_.quarantine_store->mark_released(agent_id, c.pending_record_id,
-                                                           ReleaseEnd::device_confirmed),
-                        "status read confirmed the release",
-                        "confirmed record_id=" + record + " " + cmd);
+    // The device answered `inactive` and `res` is the store write that settles the entry (the
+    // caller made it, outside `mu_`, with the fence token read before the status command went
+    // out). `kQuarantineNotQuarantined` means the record was ended elsewhere first: the entry goes.
+    // `kQuarantineApplyInFlight` means an apply followed the observation: the end is refused,
+    // nothing happened to the record, so there is no row and no counter, and the next cycle's
+    // status read takes a fresh token. Any other failure backs off. Either way a refused or failed
+    // observation is audited as unstamped; on success it is audited and the entry goes.
+    const auto on_inactive = [&](const std::expected<void, std::string>& res,
+                                 std::string_view unstamped_what, const std::string& ok_detail) {
+        switch (classify_quarantine_write(res)) {
+        case QuarantineWrite::ok:
+            audit_event(agent_id, ok_detail, "success", "quarantine.disable");
+            erase_entry();
+            count("released");
             return;
+        case QuarantineWrite::apply_in_flight:
+            back_off(agent_id, c, now_steady);
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (auto* st = entry_for(agent_id, c))
+                    st->verify_first = true;
+            }
+            return;
+        case QuarantineWrite::not_quarantined:
+            erase_entry(); // ended elsewhere first
+            break;
+        case QuarantineWrite::store_error:
+            back_off(agent_id, c, now_steady);
+            break;
         }
-        // Still contained (or the device could not say): the next cycle dispatches release.
-        back_off(agent_id, steady_now);
-        count(reply.state == QuarantineEndpointState::busy ? "busy" : "unconfirmed");
+        audit_unstamped(agent_id, c.pending_record_id, c.pending_command_id, unstamped_what,
+                        res.error(), "quarantine.disable");
+        count("degraded");
+    };
+
+    switch (action) {
+    // ── A record being released: only the device's `inactive` ends it ──
+    case StatusReplyAction::end_record:
+        on_inactive(d_.quarantine_store->mark_released(agent_id, c.pending_record_id,
+                                                       ReleaseEnd::device_confirmed, c.pending_fence),
+                    "status read confirmed the release",
+                    "confirmed record_id=" + record + " " + cmd);
         return;
-    }
+    case StatusReplyAction::release_next:
+        // Still contained (or the device could not say): the next cycle dispatches release.
+        back_off(agent_id, c, now_steady);
+        state_count();
+        return;
 
     // ── A record ended by force: the device still owes a release ──
-    if (c.kind == Kind::owed) {
-        if (reply.state == QuarantineEndpointState::inactive) {
-            on_inactive(d_.quarantine_store->clear_release_owed(agent_id, c.pending_record_id),
-                        "status read confirmed the owed release",
-                        "forced_release_confirmed record_id=" + record + " " + cmd);
-            return;
-        }
-        if (c.owed_parked) {
-            // A status-only read of a parked device that still is not inactive: nothing new to say.
-            std::lock_guard<std::mutex> lk(mu_);
-            auto& st = state_[agent_id];
-            st.backoff = max_backoff();
-            st.next_eligible_at = steady_now + st.backoff;
-        } else if (c.owed_release_sent) {
-            // The release this session sent did not take: say so once, then park (a connected
-            // device that cannot release is not sent one forever).
-            audit_event(agent_id,
-                        std::string("forced_release_unconfirmed status=") + endpoint_state_name(reply.state) +
-                            " record_id=" + record,
-                        "failure", "quarantine.disable");
-            std::lock_guard<std::mutex> lk(mu_);
-            auto& st = state_[agent_id];
-            st.owed_parked = true;
-            st.backoff = max_backoff();
-            st.next_eligible_at = steady_now + st.backoff;
-        } else {
-            back_off(agent_id, steady_now); // the next cycle sends this session's release
-        }
-        count(reply.state == QuarantineEndpointState::busy ? "busy" : "unconfirmed");
+    case StatusReplyAction::clear_owed:
+        on_inactive(d_.quarantine_store->clear_release_owed(agent_id, c.pending_record_id,
+                                                            c.pending_fence),
+                    "status read confirmed the owed release",
+                    "forced_release_confirmed record_id=" + record + " " + cmd);
         return;
+    case StatusReplyAction::owed_keep_parked: {
+        // A status-only read of a parked device that still is not inactive: nothing new to say.
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto* st = entry_for(agent_id, c)) {
+            st->backoff = max_backoff();
+            st->next_eligible_at = now_steady + st->backoff;
+        }
+        break;
     }
+    case StatusReplyAction::owed_park: {
+        // The release this session sent did not take: say so once, then park (a connected
+        // device that cannot release is not sent one forever).
+        audit_event(agent_id,
+                    std::string("forced_release_unconfirmed status=") +
+                        endpoint_state_name(reply.state) + " record_id=" + record,
+                    "failure", "quarantine.disable");
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto* st = entry_for(agent_id, c)) {
+            st->owed_parked = true;
+            st->backoff = max_backoff();
+            st->next_eligible_at = now_steady + st->backoff;
+        }
+        break;
+    }
+    case StatusReplyAction::owed_release_next:
+        back_off(agent_id, c, now_steady); // the next cycle sends this session's release
+        break;
 
     // ── An active record ──
-    if (reply_confirms_containment(reply)) {
+    case StatusReplyAction::confirm: {
         // #3425 review K1/CDX-P1-02: the guarded UPDATE (WHERE status='active') affects zero rows
         // if the record was released concurrently, and can fail on a genuine store error — never
         // trust the in-memory "confirmed" transition on an unchecked write, or the reconciler can
@@ -524,7 +698,7 @@ void QuarantineContainmentReconciler::handle_status_reply(
         // component's own test harness) never populate `AgentSession::session_id` at all, so
         // "both empty" must read as a match — only a genuine CHANGE is the signal.
         if (confirmed_session_id != c.pending_session_id) {
-            back_off(agent_id, steady_now);
+            back_off(agent_id, c, now_steady);
             audit_event(agent_id,
                         "status read confirmed containment but the session churned "
                         "between dispatch and confirm (dispatch_session=" +
@@ -537,12 +711,10 @@ void QuarantineContainmentReconciler::handle_status_reply(
         auto mark_res =
             d_.quarantine_store->mark_endpoint_confirmed(agent_id, c.pending_record_id, now_epoch());
         if (!mark_res) {
-            if (mark_res.error() == "device is not quarantined") {
-                std::lock_guard<std::mutex> lk(mu_);
-                state_.erase(agent_id); // released concurrently — nothing left to confirm
-            } else {
-                back_off(agent_id, steady_now);
-            }
+            if (classify_quarantine_write(mark_res) == QuarantineWrite::not_quarantined)
+                erase_entry(); // released concurrently — nothing left to confirm
+            else
+                back_off(agent_id, c, now_steady);
             // The status read DID confirm — that observation is a real fact regardless of whether
             // the stamp landed, and must not vanish with no audit trail.
             audit_unstamped(agent_id, c.pending_record_id, c.pending_command_id,
@@ -556,32 +728,42 @@ void QuarantineContainmentReconciler::handle_status_reply(
             audit_confirmed(agent_id, c.pending_record_id, c.pending_command_id);
         {
             std::lock_guard<std::mutex> lk(mu_);
-            auto& st = state_[agent_id];
-            st.confirmed = true;
-            st.confirmed_at = steady_now;
-            st.confirmed_session_id = confirmed_session_id;
-            st.backoff = min_reapply_interval();
+            if (auto* st = entry_for(agent_id, c)) {
+                st->confirmed = true;
+                st->confirmed_at = now_steady;
+                st->confirmed_session_id = confirmed_session_id;
+                st->backoff = min_reapply_interval();
+            }
         }
         if (!c.confirmed)
             count("confirmed");
         return;
     }
-
-    if (c.confirmed) {
-        // DRIFT: a record that read confirmed no longer does (`inactive` included: only a release
-        // ends a record, never a device's own state). One audit row (the enumerator's name, never
-        // device text), then unconfirmed: the next cycle re-applies through the chokepoint.
+    case StatusReplyAction::drift: {
+        // DRIFT: a record that read confirmed no longer does, and a fresh read still shows it
+        // active (`inactive` included: only a release ends a record, never a device's own state).
+        // One audit row (the enumerator's name, never device text), then unconfirmed: the next
+        // cycle re-applies through the chokepoint.
         audit_event(agent_id,
-                    std::string("drift status=") + endpoint_state_name(reply.state) + " record_id=" + record +
-                        " " + cmd,
+                    std::string("drift status=") + endpoint_state_name(reply.state) +
+                        " record_id=" + record + " " + cmd,
                     "failure");
         {
             std::lock_guard<std::mutex> lk(mu_);
-            state_[agent_id].confirmed = false;
+            if (auto* st = entry_for(agent_id, c))
+                st->confirmed = false;
         }
+        back_off(agent_id, c, now_steady); // K9/CDX-P1-03: enforce the doubled wait on THIS claim's deadline
+        count("drift");
+        return;
     }
-    back_off(agent_id, steady_now); // K9/CDX-P1-03: enforce the doubled wait on THIS claim's deadline
-    count(reply.state == QuarantineEndpointState::busy ? "busy" : "unconfirmed");
+    case StatusReplyAction::stay_unconfirmed:
+        back_off(agent_id, c, now_steady); // K9/CDX-P1-03: enforce the doubled wait on THIS claim's deadline
+        state_count();
+        return;
+    }
+    // The owed arms that only adjust the entry share this tail count.
+    state_count();
 }
 
 // ── Sending ─────────────────────────────────────────────────────────────────
@@ -622,20 +804,23 @@ bool QuarantineContainmentReconciler::send_status(const std::string& agent_id,
         count("degraded");
         return false;
     }
+    const auto drop_entry = [&] {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (entry_for(agent_id, c))
+            state_.erase(agent_id);
+    };
     std::int64_t record_id = 0;
     if (c.kind == Kind::owed) {
         // An owed row has no active record: one that shows now means the device was quarantined
         // again, and its new record governs.
         if (status_res->has_value()) {
-            std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id);
+            drop_entry();
             return false;
         }
         record_id = c.record_id;
     } else {
         if (!status_res->has_value()) {
-            std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id); // released since verify_first was set
+            drop_entry(); // released since verify_first was set
             return false;
         }
         const auto& row = status_res->value();
@@ -643,11 +828,8 @@ bool QuarantineContainmentReconciler::send_status(const std::string& agent_id,
         if (row_kind != c.kind) {
             // A release was requested since the claim: this entry's view of the row is stale.
             std::lock_guard<std::mutex> lk(mu_);
-            auto& st = state_[agent_id];
-            st = AgentState{};
-            st.kind = row_kind;
-            st.record_id = row.id;
-            st.verify_first = row_kind == Kind::releasing;
+            if (auto* st = entry_for(agent_id, c))
+                reset_for(*st, row_kind, row.id);
             return false;
         }
         // #3425 governance Gate 4 (unhappy-path, Finding A), residual window:
@@ -658,11 +840,20 @@ bool QuarantineContainmentReconciler::send_status(const std::string& agent_id,
         // reconciler never actually applied. Bail; the new record re-enters fresh via the normal
         // apply path on the next tick/heartbeat.
         if (c.pending_record_id != 0 && row.id != c.pending_record_id) {
-            std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id);
+            drop_entry();
             return false;
         }
         record_id = row.id;
+    }
+
+    // #7613: the apply generation, read BEFORE the status command goes out, so the `inactive`
+    // answer to it can only end the record if no apply was claimed after this point. Empty while an
+    // apply's claim is live (the end is then refused and re-read). A failed read dispatches nothing:
+    // a status command sent without a token could never end a record anyway.
+    const auto fence = d_.quarantine_store->apply_fence_token(agent_id, record_id);
+    if (!fence) {
+        count("degraded");
+        return false;
     }
 
     // #5684: read under the registry lock, BEFORE the dispatch, so a session swapped during the
@@ -671,18 +862,23 @@ bool QuarantineContainmentReconciler::send_status(const std::string& agent_id,
     const auto command_id = dispatch_bare(agent_id, kContainmentStatusAction);
     if (!command_id)
         return true; // a dispatch WAS attempted (it threw, or the registry reached nobody)
-    std::lock_guard<std::mutex> lk(mu_);
-    auto& st = state_[agent_id];
-    st.pending = Pending::status;
-    st.pending_command_id = *command_id;
-    // The record this status dispatch is ABOUT is the one just read — carried forward so the
-    // eventual stamp or end is scoped to it, not to whatever happens to be active by then.
-    st.pending_record_id = record_id;
-    // The session live right now, at the moment this status dispatch is actually sent — compared
-    // at confirm time against whatever session is live THEN.
-    st.pending_session_id = dispatch_session_id;
-    st.pending_since = std::chrono::steady_clock::now();
-    st.verify_first = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (auto* st = entry_for(agent_id, c)) {
+            st->pending = Pending::status;
+            st->pending_command_id = *command_id;
+            st->pending_fence = *fence;
+            // The record this status dispatch is ABOUT is the one just read — carried forward so
+            // the eventual stamp or end is scoped to it, not to whatever happens to be active by
+            // then.
+            st->pending_record_id = record_id;
+            // The session live right now, at the moment this status dispatch is actually sent —
+            // compared at confirm time against whatever session is live THEN.
+            st->pending_session_id = dispatch_session_id;
+            st->pending_since = steady_now();
+            st->verify_first = false;
+        }
+    }
     count("reapplied");
     return true;
 }
@@ -697,18 +893,21 @@ bool QuarantineContainmentReconciler::send_release(const std::string& agent_id,
         count("degraded");
         return false;
     }
+    const auto drop_entry = [&] {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (entry_for(agent_id, c))
+            state_.erase(agent_id);
+    };
     std::int64_t record_id = c.record_id;
     if (c.kind == Kind::owed) {
         if (status_res->has_value() || record_id == 0) {
-            std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id);
+            drop_entry();
             return false;
         }
     } else {
         if (!status_res->has_value() || status_res->value().release_requested_at == 0 ||
             (record_id != 0 && status_res->value().id != record_id)) {
-            std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id); // not (or no longer) a releasing record: never dispatch a release
+            drop_entry(); // not (or no longer) a releasing record: never dispatch a release
             return false;
         }
         record_id = status_res->value().id;
@@ -718,32 +917,41 @@ bool QuarantineContainmentReconciler::send_release(const std::string& agent_id,
     const auto command_id = dispatch_bare(agent_id, kContainmentReleaseAction);
     if (!command_id)
         return true; // a dispatch WAS attempted (it threw, or the registry reached nobody)
-    audit_event(agent_id,
-                std::string(c.kind == Kind::owed ? "forced_release_sent" : "release_sent") +
-                    " record_id=" + std::to_string(record_id) + " command_id=" + *command_id,
-                "pending", "quarantine.disable");
+    // #7625: the row is written for the first release of an agent session, not for every cycle of
+    // a device that keeps refusing it (the counter below still counts every dispatch). An owed
+    // entry's own state machine already sends one release per session.
+    const bool owed = c.kind == Kind::owed;
+    if (owed || !(c.release_audited && c.release_audited_session_id == dispatch_session_id))
+        audit_event(agent_id,
+                    std::string(owed ? "forced_release_sent" : "release_sent") +
+                        " record_id=" + std::to_string(record_id) + " command_id=" + *command_id,
+                    "pending", "quarantine.disable");
     {
         std::lock_guard<std::mutex> lk(mu_);
-        auto& st = state_[agent_id];
-        st.pending = Pending::release;
-        st.pending_command_id = *command_id;
-        st.pending_record_id = record_id;
-        st.pending_session_id = dispatch_session_id;
-        st.pending_since = std::chrono::steady_clock::now();
-        if (c.kind == Kind::owed) {
-            st.owed_tried_session_id = dispatch_session_id; // this session's one release cycle
-            st.owed_release_sent = true;
+        if (auto* st = entry_for(agent_id, c)) {
+            st->pending = Pending::release;
+            st->pending_command_id = *command_id;
+            st->pending_record_id = record_id;
+            st->pending_session_id = dispatch_session_id;
+            st->pending_since = steady_now();
+            if (owed) {
+                st->owed_tried_session_id = dispatch_session_id; // this session's one release cycle
+                st->owed_release_sent = true;
+            } else {
+                st->release_audited = true;
+                st->release_audited_session_id = dispatch_session_id;
+            }
         }
     }
     count("release_sent");
     return true;
 }
 
-bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id,
+bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id, const AgentState& c,
                                                  std::string_view trigger) {
     // Re-drive the STORED whitelist via the one shared recipe (quarantine_reapply.hpp) — the same
     // chokepoint MCP's already_active retry path uses, so the stored-whitelist-only invariant
-    // lives in exactly one function.
+    // lives in exactly one function. The chokepoint also claims the apply (#7613).
     QuarantineRecord stored{};
     auto reapply_res = redispatch_stored_containment(
         *d_.quarantine_store, agent_id,
@@ -766,24 +974,25 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id,
             count("degraded");
             break;
         case ContainmentReapplyErrorKind::no_active_record: {
+            // Released between the tick snapshot and this call, or the apply claim was refused
+            // (the record changed, or another apply is in flight): the entry goes and the next
+            // tick re-derives it.
             std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id); // released between the tick snapshot and this call
+            if (entry_for(agent_id, c))
+                state_.erase(agent_id);
             break;
         }
         case ContainmentReapplyErrorKind::release_pending: {
             // A release was requested since the tick snapshot: containment is not re-applied under
             // it. Start over as a releasing entry (status first); nothing was dispatched.
             std::lock_guard<std::mutex> lk(mu_);
-            auto& st = state_[agent_id];
-            st = AgentState{};
-            st.kind = Kind::releasing;
-            st.record_id = stored.id;
-            st.verify_first = true;
+            if (auto* st = entry_for(agent_id, c))
+                reset_for(*st, Kind::releasing, stored.id);
             break;
         }
         case ContainmentReapplyErrorKind::whitelist_invalid:
             count("validation_failed");
-            back_off(agent_id, std::chrono::steady_clock::now());
+            back_off(agent_id, c, steady_now());
             // The value is never echoed: it is what the mapper refused.
             audit_event(agent_id,
                         "stored whitelist cannot be expressed as firewall exceptions record_id=" +
@@ -808,21 +1017,21 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id,
     // the write to the record this dispatch was actually built from.
     auto mark_res = d_.quarantine_store->mark_endpoint_applied(agent_id, stored.id, now_epoch());
     if (!mark_res) {
-        if (mark_res.error() == "device is not quarantined") {
+        if (classify_quarantine_write(mark_res) == QuarantineWrite::not_quarantined) {
+            // Released, OR superseded by a requarantine, concurrently: the dispatch already fired
+            // but there is nothing left here to track as pending; the current active record (if
+            // any) re-enters fresh via the normal apply path on the next tick/heartbeat. The
+            // apply claim made the record's generation move, so a release that was waiting on an
+            // older observation could not end it on that observation (#7613).
             std::lock_guard<std::mutex> lk(mu_);
-            state_.erase(agent_id); // released, OR superseded by a requarantine, concurrently
-                                     // — the dispatch already fired (K8/CDX-P1-01, the
-                                     // disclosed residual TOCTOU — see the "KNOWN RESIDUAL
-                                     // RACE" note in the header) but there is nothing left
-                                     // here to track as pending; the current active record
-                                     // (if any) re-enters fresh via the normal apply path on
-                                     // the next tick/heartbeat.
+            if (entry_for(agent_id, c))
+                state_.erase(agent_id);
         } else {
             // #3425 governance Gate 3 (cpp-safety, finding C): mirror the confirm branch's backoff
             // escalation — without this, a sustained QuarantineStore write outage re-dispatches a
             // fresh apply every fixed kMinReapplyInterval instead of backing off like every other
             // repeated-failure path in this state machine.
-            back_off(agent_id, std::chrono::steady_clock::now());
+            back_off(agent_id, c, steady_now());
         }
         // #3425 governance Gate 2 (security-guardian): the dispatch WAS accepted
         // (agents_reached>0, checked above) — a real containment-affecting system action already
@@ -835,15 +1044,16 @@ bool QuarantineContainmentReconciler::send_apply(const std::string& agent_id,
     audit_reapply(agent_id, stored.id, reapply_res->command_id, trigger);
     {
         std::lock_guard<std::mutex> lk(mu_);
-        auto& st = state_[agent_id];
-        st.pending = Pending::apply;
-        st.pending_command_id = reapply_res->command_id;
-        // #3425 governance Gate 4 (unhappy-path, Finding A): carried forward into the eventual
-        // verify -> mark_endpoint_confirmed call too (the confirm is ABOUT the record whose
-        // whitelist was just applied).
-        st.pending_record_id = stored.id;
-        st.apply_for_unconfirmed = stored.last_confirmed_at == 0;
-        st.pending_since = std::chrono::steady_clock::now();
+        if (auto* st = entry_for(agent_id, c)) {
+            st->pending = Pending::apply;
+            st->pending_command_id = reapply_res->command_id;
+            // #3425 governance Gate 4 (unhappy-path, Finding A): carried forward into the eventual
+            // verify -> mark_endpoint_confirmed call too (the confirm is ABOUT the record whose
+            // whitelist was just applied).
+            st->pending_record_id = stored.id;
+            st->apply_for_unconfirmed = stored.last_confirmed_at == 0;
+            st->pending_since = steady_now();
+        }
     }
     count("reapplied");
     return true;
@@ -859,12 +1069,16 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     // tick and a heartbeat racing for the same agent cannot both dispatch —
     // the second caller sees the already-claimed `next_eligible_at` and
     // bails immediately. This is the concrete mechanism behind "a busy gate
-    // does not spin".
+    // does not spin". An agent with no entry has nothing to reconcile (only
+    // tick() creates entries), so nothing is created here.
     AgentState c;
     {
         std::lock_guard<std::mutex> lk(mu_);
-        auto& st = state_[agent_id];
-        const auto now_steady = std::chrono::steady_clock::now();
+        const auto it = state_.find(agent_id);
+        if (it == state_.end())
+            return false;
+        auto& st = it->second;
+        const auto now_steady = steady_now();
         if (now_steady < st.next_eligible_at) {
             count("rate_limited");
             return false;
@@ -873,7 +1087,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             st.backoff = min_reapply_interval(); // first-ever claim for this agent
         st.next_eligible_at = now_steady + st.backoff;
         // What reconcile_one reads about the entry from here on: nothing is read under a lock
-        // again after the claim except to write the outcome.
+        // again after the claim, and every write back goes through entry_for(agent_id, c).
         c = st;
     }
     // A parked owed device is only ever read, never sent another release in the same session.
@@ -900,26 +1114,29 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
             // less often over time — a sustained response_store outage instead retried at a flat
             // ~60s cadence forever. `st.pending` stays untouched (the command genuinely is still
             // pending; this round simply couldn't check its status).
-            back_off(agent_id, std::chrono::steady_clock::now());
+            back_off(agent_id, c, steady_now());
             count("degraded");
             return false;
         }
-        const auto steady_now = std::chrono::steady_clock::now();
-        const bool timed_out = (steady_now - c.pending_since) >= response_wait();
+        const auto now_steady = steady_now();
+        const bool timed_out = (now_steady - c.pending_since) >= response_wait();
         if (resp->empty()) {
             if (!timed_out) {
                 count("pending"); // no re-dispatch — the no-spin contract
                 return false;
             }
-            std::lock_guard<std::mutex> lk(mu_);
-            auto& st = state_[agent_id];
-            st.pending = Pending::none;
-            st.verify_first = false;
-            st.backoff = next_backoff(st.backoff, max_backoff());
-            // #3425 review K9/CDX-P1-03: enforce the just-doubled wait on THIS claim's deadline
-            // now, not only on some future claim — otherwise the very next heartbeat/tick retries
-            // immediately.
-            st.next_eligible_at = steady_now + st.backoff;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (auto* st = entry_for(agent_id, c)) {
+                    st->pending = Pending::none;
+                    st->verify_first = false;
+                    st->backoff = next_backoff(st->backoff, max_backoff());
+                    // #3425 review K9/CDX-P1-03: enforce the just-doubled wait on THIS claim's
+                    // deadline now, not only on some future claim — otherwise the very next
+                    // heartbeat/tick retries immediately.
+                    st->next_eligible_at = now_steady + st->backoff;
+                }
+            }
             count("not_reached");
             return false;
         }
@@ -928,10 +1145,10 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         switch (c.pending) {
         case Pending::apply:
         case Pending::release:
-            handle_mutation_reply(agent_id, c, reply, steady_now);
+            handle_mutation_reply(agent_id, c, reply, now_steady);
             break;
         case Pending::status:
-            handle_status_reply(agent_id, c, reply, steady_now);
+            handle_status_reply(agent_id, c, reply, now_steady);
             break;
         case Pending::none:
             break;
@@ -951,7 +1168,8 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         // untouched, so a flapping device still can't spin faster than its own reconnect cadence.
         {
             std::lock_guard<std::mutex> lk(mu_);
-            state_[agent_id].next_eligible_at = std::chrono::steady_clock::now();
+            if (auto* st = entry_for(agent_id, c))
+                st->next_eligible_at = steady_now();
         }
         count("offline");
         return false;
@@ -960,7 +1178,7 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     if (c.verify_first)
         return send_status(agent_id, c);
     if (c.kind == Kind::active)
-        return send_apply(agent_id, trigger);
+        return send_apply(agent_id, c, trigger);
     return send_release(agent_id, c);
 }
 

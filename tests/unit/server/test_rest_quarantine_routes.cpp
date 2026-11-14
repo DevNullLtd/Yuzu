@@ -67,13 +67,16 @@ yuzu::test::PgTestTemplate responsestore_route_tpl{"responsestore", [](const std
 struct ReleasePollSeams {
     int saved_interval{detail::live_poll_interval_ms().load()};
     int saved_polls{detail::release_confirm_max_polls().load()};
+    std::function<void()> saved_pause_hook{detail::release_confirm_pause_hook()};
     explicit ReleasePollSeams(int polls) {
         detail::live_poll_interval_ms().store(0);
         detail::release_confirm_max_polls().store(polls);
+        detail::release_confirm_pause_hook() = {}; // a case installs its own, restored on exit
     }
     ~ReleasePollSeams() {
         detail::live_poll_interval_ms().store(saved_interval);
         detail::release_confirm_max_polls().store(saved_polls);
+        detail::release_confirm_pause_hook() = saved_pause_hook;
     }
 };
 
@@ -581,6 +584,36 @@ TEST_CASE("REST POST /api/v1/quarantine rejects an unsafe whitelist (400, no wri
         auto res = h.post(body);
         REQUIRE(res);
         CHECK(res->status == 400);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+    }
+    SECTION("513 characters is a 400 that names the 512 limit; 512 passes the length check (#7639)") {
+        auto res = h.post(std::string(R"({"agent_id":"agent-B","reason":"test","whitelist":")") +
+                          std::string(513, '1') + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("whitelist exceeds 512 characters") != std::string::npos);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+        // exactly 512 characters of address list is not refused for its length: it fails (or passes)
+        // on the grammar, with the other message
+        std::string at_limit;
+        while (at_limit.size() + 9 <= 512)
+            at_limit += (at_limit.empty() ? "" : ",") + std::string("10.0.0.1");
+        at_limit.resize(512, ' ');
+        auto edge = h.post(std::string(R"({"agent_id":"agent-B","reason":"test","whitelist":")") +
+                           at_limit + R"("})");
+        REQUIRE(edge);
+        CHECK(edge->body.find("whitelist exceeds") == std::string::npos);
+    }
+    SECTION("33 addresses name the count in the message") {
+        std::string many;
+        for (int i = 1; i <= 33; ++i)
+            many += (i > 1 ? "," : "") + std::string("10.0.0.") + std::to_string(i);
+        REQUIRE(many.size() <= 512);
+        auto res = h.post(std::string(R"({"agent_id":"agent-B","reason":"test","whitelist":")") +
+                          many + R"("})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("at most 32 and 512 characters in total") != std::string::npos);
         CHECK_FALSE(h.is_quarantined("agent-B"));
     }
     SECTION("a port, a leading-zero octet and 33 addresses are refused too") {
@@ -1245,7 +1278,14 @@ void end_record_as(QuarantineStore& store, const std::string& agent, ReleaseEnd 
     auto rec = store.get_status(agent);
     REQUIRE(rec.has_value());
     REQUIRE(rec->has_value());
-    REQUIRE(store.mark_released(agent, (*rec)->id, end).has_value());
+    // A confirmed end presents the apply generation, read now with no claim live (#7613).
+    std::optional<std::int64_t> fence;
+    if (end == ReleaseEnd::device_confirmed) {
+        auto token = store.apply_fence_token(agent, (*rec)->id);
+        REQUIRE(token.has_value());
+        fence = *token;
+    }
+    REQUIRE(store.mark_released(agent, (*rec)->id, end, fence).has_value());
 }
 
 // Runs one statement on a fresh connection to the test database, for the races that need the
@@ -1468,7 +1508,9 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: the device offline -> 200 
     REQUIRE(res);
     CHECK(res->status == 200);
     const auto body = parse_body(res->body);
-    CHECK(body["data"]["released"] == true);
+    // `released` is the device's word, not the record's: a forced end answers false (#7642),
+    // while `state` still says the record ended.
+    CHECK(body["data"]["released"] == false);
     CHECK(body["data"]["state"] == "released");
     CHECK(body["data"]["forced"] == true);
     CHECK(body["data"]["device_confirmed"] == false);
@@ -1486,9 +1528,8 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: the device offline -> 200 
     const auto* success = find_audit(h, "success");
     REQUIRE(success != nullptr);
     CHECK(success->detail.find("state=released reason=forced device_confirmed=false record_id=") == 0);
-    // nothing in the answer or the audit row says the device was released
-    CHECK(res->body.find("\"released\":false") == std::string::npos);
-    CHECK(success->detail.find("state=released reason=forced") != std::string::npos);
+    // nothing in the answer says the device was released
+    CHECK(res->body.find("\"released\":true") == std::string::npos);
 }
 
 TEST_CASE("REST DELETE /api/v1/quarantine?force=true: a reachable device that answers inactive is "
@@ -1725,6 +1766,243 @@ TEST_CASE("REST DELETE /api/v1/quarantine?force=true: a store failure in the for
     CHECK(failure->detail.starts_with("db_error: "));
     CHECK(find_audit(h, "success") == nullptr);
     CHECK(find_audit(h, "pending") == nullptr);
+}
+
+// ── #7584a: a confirmation that lands BETWEEN the polls ─────────────────────
+
+TEST_CASE("REST DELETE /api/v1/quarantine: a device reply stored after the first empty poll is read by "
+          "the second -> 200 released, and the wait paused exactly once",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, ""); // nothing is stored at dispatch time
+    int pauses = 0;
+    detail::release_confirm_pause_hook() = [&] {
+        ++pauses;
+        // the late confirmation: the device answers while the route waits
+        StoredResponse sr;
+        sr.instruction_id = "cmd-1";
+        sr.agent_id = "agent-B";
+        sr.status = 1;
+        sr.output = "status|inactive";
+        sr.plugin = "firewall";
+        rstore.store(sr);
+    };
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["released"] == true);
+    CHECK(body["data"]["device_confirmed"] == true);
+    CHECK(pauses == 1);
+    CHECK_FALSE(h.is_quarantined("agent-B"));
+    CHECK(owed_list(h.quarantine_store).empty());
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: a device that answers inactive while the confirming mark hits a "
+          "store error is 202, never a 200 over a record that did not end",
+          "[rest][quarantine][release][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    h.on_dispatch = [&qdb] {
+        // The token was read before the dispatch; the schema disappearing now fails the mark.
+        exec_sql(qdb.dsn(), "DROP SCHEMA quarantine_store CASCADE");
+    };
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto body = parse_body(res->body);
+    CHECK(body["data"]["released"] == false);
+    CHECK(body["data"]["state"] == "releasing");
+    CHECK(find_audit(h, "success") == nullptr);
+    const auto* pending = find_audit(h, "pending");
+    REQUIRE(pending != nullptr);
+    CHECK(pending->detail.find("state=releasing") == 0);
+    // a store error is not the fence: neither note is added
+    CHECK(pending->detail.find("apply_in_flight=1") == std::string::npos);
+    CHECK(pending->detail.find("fence_unread=1") == std::string::npos);
+}
+
+// ── #7628: the enable and disable rows name the same record ───────────────────
+
+TEST_CASE("REST POST then DELETE /api/v1/quarantine: the record_id on the quarantine.enable success row "
+          "equals the one on the quarantine.disable success row",
+          "[rest][quarantine][audit][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    YUZU_REQUIRE_PG_DB_TPL(rdb, responsestore_route_tpl);
+    pg::PgPool rpool{{.conninfo = rdb.dsn(), .size = 4}};
+    ResponseStore rstore{rpool};
+    REQUIRE(rstore.is_open());
+    QuarantineRouteHarness h(qpool, true, true, true, &rstore);
+    h.release_reply = "status|inactive";
+
+    auto created = h.post(R"({"agent_id":"agent-B","reason":"seeded by the route"})");
+    REQUIRE(created);
+    REQUIRE(created->status == 201);
+    std::string enable_detail;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "quarantine.enable" && a.result == "success")
+            enable_detail = a.detail;
+    REQUIRE_FALSE(enable_detail.empty());
+    REQUIRE(enable_detail.rfind("record_id=", 0) == 0);
+    const auto space = enable_detail.find(' ');
+    REQUIRE(space != std::string::npos);
+    const std::string enable_ref = enable_detail.substr(0, space);
+    CHECK(enable_detail.substr(space + 1) == "seeded by the route"); // the reason follows, unchanged
+
+    auto released = h.del("agent-B");
+    REQUIRE(released);
+    REQUIRE(released->status == 200);
+    const auto* disable = find_audit(h, "success");
+    REQUIRE(disable != nullptr);
+    CHECK(disable->detail.find("state=released " + enable_ref + " ") == 0);
+}
+
+// ── #7624: the owed records, on request ───────────────────────────────────────
+
+TEST_CASE("REST GET /api/v1/quarantine?include=release_owed: owed rows follow the active rows with status "
+          "release_owed; the caller's scope applies; any other include is a 400; a degraded owed read "
+          "is a 503",
+          "[rest][quarantine][release_owed][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    REQUIRE(h.quarantine_store.quarantine_device("agent-active", "seed", "contained", "10.0.0.1"));
+    const auto owed_id = h.quarantine_store.quarantine_device("agent-owed", "seed", "ended by force", "");
+    REQUIRE(owed_id.has_value());
+    REQUIRE(h.quarantine_store.mark_released("agent-owed", *owed_id, ReleaseEnd::forced).has_value());
+    const auto hidden_id = h.quarantine_store.quarantine_device("agent-hidden", "seed", "x", "");
+    REQUIRE(hidden_id.has_value());
+    REQUIRE(h.quarantine_store.mark_released("agent-hidden", *hidden_id, ReleaseEnd::forced).has_value());
+
+    const auto get = [&](const std::string& q) { return h.sink.Get("/api/v1/quarantine" + q); };
+    const auto agents = [](const std::string& body) {
+        std::vector<std::pair<std::string, std::string>> out;
+        for (const auto& row : parse_body(body)["data"])
+            out.emplace_back(row["agent_id"].get<std::string>(), row["status"].get<std::string>());
+        return out;
+    };
+
+    SECTION("the default body is the active rows only") {
+        auto res = get("");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(agents(res->body) ==
+              std::vector<std::pair<std::string, std::string>>{{"agent-active", "active"}});
+        CHECK(res->body.find("release_owed") == std::string::npos);
+    }
+    SECTION("with include, the owed rows follow, newest first, with the two extra keys") {
+        auto res = get("?include=release_owed");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto rows = agents(res->body);
+        REQUIRE(rows.size() == 3);
+        CHECK(rows[0] == std::make_pair(std::string{"agent-active"}, std::string{"active"}));
+        CHECK(rows[1].second == "release_owed");
+        CHECK(rows[2].second == "release_owed");
+        const auto data = parse_body(res->body)["data"];
+        CHECK(data[0].size() == 8); // an active row keeps its eight keys
+        CHECK(data[1].contains("released_at"));
+        CHECK(data[1].contains("release_owed_since"));
+        CHECK(parse_body(res->body)["pagination"]["total"] == 3);
+    }
+    SECTION("the caller's scope is pushed into both reads") {
+        h.list_scope = std::unordered_set<std::string>{"agent-active", "agent-owed"};
+        auto res = get("?include=release_owed");
+        REQUIRE(res);
+        const auto rows = agents(res->body);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].first == "agent-active");
+        CHECK(rows[1].first == "agent-owed");
+        CHECK(res->body.find("agent-hidden") == std::string::npos);
+    }
+    SECTION("any other include value is a 400 before any read") {
+        for (const char* q : {"?include=all", "?include=", "?include=release_owed,x", "?include=RELEASE_OWED"}) {
+            CAPTURE(q);
+            auto res = get(q);
+            REQUIRE(res);
+            CHECK(res->status == 400);
+            CHECK(res->body.find("include must be release_owed") != std::string::npos);
+            CHECK(res->body.find("agent-active") == std::string::npos);
+        }
+    }
+    SECTION("a degraded owed read is a 503, never a list that leaves the owed devices out") {
+        // Fail ONLY the owed read: its WHERE compares device_release_owed_at with 0, which stops
+        // type-checking once the column is text (the active read never compares it).
+        exec_sql(qdb.dsn(), "DROP INDEX quarantine_store.idx_quarantine_release_owed");
+        exec_sql(qdb.dsn(), "ALTER TABLE quarantine_store.quarantine_records "
+                            "ALTER COLUMN device_release_owed_at DROP DEFAULT, "
+                            "ALTER COLUMN device_release_owed_at TYPE text "
+                            "USING device_release_owed_at::text");
+        auto res = get("?include=release_owed");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("agent-active") == std::string::npos);
+        // the plain list still works
+        auto plain = get("");
+        REQUIRE(plain);
+        CHECK(plain->status == 200);
+    }
+}
+
+// ── #7613: an apply that is in flight when the DELETE starts ─────────────────
+
+TEST_CASE("REST DELETE /api/v1/quarantine: an apply's claim is live when the DELETE starts and the device "
+          "answers inactive -> 202 with apply_in_flight=1, the record stays releasing; with force it "
+          "ends by force and is owed",
+          "[rest][quarantine][release][fence][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    const auto seeded = active_record(h.quarantine_store, "agent-B");
+    REQUIRE(seeded.has_value());
+    auto claim = h.quarantine_store.claim_apply("agent-B", seeded->id); // an apply is dispatching
+    REQUIRE(claim.has_value());
+
+    SECTION("without force: the device's answer cannot end the record") {
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 202);
+        CHECK(parse_body(res->body)["data"]["state"] == "releasing");
+        const auto* pending = find_audit(h, "pending");
+        REQUIRE(pending != nullptr);
+        CHECK(pending->detail.find(" apply_in_flight=1") != std::string::npos);
+        CHECK(find_audit(h, "success") == nullptr);
+        const auto rec = active_record(h.quarantine_store, "agent-B");
+        REQUIRE(rec.has_value());
+        CHECK(rec->status == "releasing");
+        CHECK(owed_list(h.quarantine_store).empty());
+    }
+    SECTION("with force: the operator's own end goes through and the device is owed a release") {
+        auto res = h.del("agent-B", "?force=true");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto body = parse_body(res->body);
+        CHECK(body["data"]["released"] == false);
+        CHECK(body["data"]["forced"] == true);
+        CHECK_FALSE(h.is_quarantined("agent-B"));
+        CHECK(owed_list(h.quarantine_store).size() == 1);
+        const auto* success = find_audit(h, "success");
+        REQUIRE(success != nullptr);
+        CHECK(success->detail.find(" apply_in_flight=1") != std::string::npos);
+    }
+}
+
+TEST_CASE("REST DELETE /api/v1/quarantine: an apply claimed AFTER the route read its token ends nothing on "
+          "the device's earlier answer",
+          "[rest][quarantine][release][fence][pg]") {
+    RELEASE_RIG(h, "status|inactive");
+    // The apply is claimed and returns while the release is on its way: the route's token (read
+    // before the release went out) is stale by the time it marks.
+    h.on_dispatch = [&qdb] {
+        // a releasing record is not claimable, so the apply that "followed" is stood in for by the
+        // generation moving, which is exactly what a claim does
+        exec_sql(qdb.dsn(), "UPDATE quarantine_store.quarantine_records SET apply_gen = apply_gen + 1 "
+                            "WHERE agent_id = 'agent-B'");
+    };
+    auto res = h.del("agent-B");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    const auto* pending = find_audit(h, "pending");
+    REQUIRE(pending != nullptr);
+    CHECK(pending->detail.find(" apply_in_flight=1") != std::string::npos);
+    CHECK(active_record(h.quarantine_store, "agent-B").has_value());
 }
 
 #undef RELEASE_RIG
