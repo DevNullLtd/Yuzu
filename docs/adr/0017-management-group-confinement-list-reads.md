@@ -10,6 +10,13 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 
 # 0017 — Management-group confinement applies to list/fan-out reads: the admit-then-filter list gate
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0) — currency notes.** (1) References to `rbac.db` are
+> from the SQLite era: RBAC now lives in the Postgres `rbac_store` schema (ADR-0041), which fails
+> closed on a degraded read. The rule each passage states is unchanged. (2) The `file:line` cites in
+> this ADR (notably the `server.cpp:NNNN` ones) record where each site was when the passage was
+> written. `server.cpp` has since grown several-fold and they no longer point at the named code;
+> find each site by the function or route it names.
+
 > **Update (2026-07-24) — #1715 resolved; PR-A foundation landed.** The global↔management-group
 > deny-precedence lattice the "Combining algorithm" section below left *undecided* has been decided:
 > **cross-boundary combining is additive/OR; deny-overrides applies only within a single group's

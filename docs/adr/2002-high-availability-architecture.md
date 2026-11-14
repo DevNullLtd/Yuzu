@@ -1,15 +1,24 @@
-# High Availability Architecture
-
 ---
 status: accepted
 owner: Fraser Jarvis (@fjarvis)
 ---
+
+# High Availability Architecture
 
 **Authors:** Fraser Jarvis (@fjarvis)
 **Review:** hardened after adversarial review by the `enterprise-architect` validator and
 `gpt-5.6-sol` (both read the codebase), then revised again per the PR #3320 `CHANGES_REQUESTED`
 review; see *Guarantees and non-guarantees*, *Deployment topology and replication axes*, and the two
 *Review findings incorporated* rounds below.
+
+> **Implementation state (2026-11-14, against dev @ 2c49b4ea0).** Partially implemented; one server
+> replica is still the only supported shape. `LeaderElector` (`leader_elector.{hpp,cpp}`) is built
+> and constructed at boot in `server.cpp`, and the singleton-loop gate (`leader_gate.hpp`, classes
+> from `background_jobs.hpp`) is wired at five `leader_gate_permits` sites: `ca.publish_crl`,
+> `policy_evaluator.dispatch_due`, `quarantine_reconciler.tick`, `command_outbox.deliver` and
+> `schedule_runner.tick`. The **safe-to-scale gate is not lifted**: the per-workstream status and
+> the open gate clauses are in `docs/ha-delivery-matrix.md`, which tracks what ships (this ADR
+> wins on conflict about the decisions).
 
 ## Context
 

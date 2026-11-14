@@ -27,7 +27,14 @@ related: >-
 
 # ADR-0034 — Held-open connections must not own a worker thread
 
-> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — mitigated, not solved. The shipped fix is a `StreamBudget` admission cap (`stream_budget.hpp`, wired at `server.cpp:12172`) over the existing thread-per-connection httplib pool (`server.cpp:12091-12125`), not the Drogon rewrite this ADR's Decision 4 target architecture describes (conditional on G10, framework port separately estimated, per frontmatter `deciders:`).
+> **Implementation status (2026-09-07 ADR reconciliation):** Accepted — mitigated, not solved. The shipped fix is a `StreamBudget` admission cap (`stream_budget.hpp`, held as `ServerImpl::stream_budget_` in `server.cpp`) over the existing thread-per-connection httplib pool (`web_server_->new_task_queue` in `server.cpp`; line numbers dropped 2026-11-14 because they drifted), not the Drogon rewrite this ADR's Decision 4 target architecture describes (conditional on G10, framework port separately estimated, per frontmatter `deciders:`).
+
+> **Update (2026-11-14): the server is Linux-only (ADR-0035, accepted 2026-11-10).** ADR-0035
+> Decision 6 voids the "Windows MSVC static linking included" clause of G10, so the Drogon canary
+> this ADR's acceptance is conditional on is Linux-only. In the Decision section, the required
+> per-held-stream RSS baseline ("Linux glibc, MSVC, macOS") is now needed for Linux glibc only, and
+> the Windows MSVC static-linking risk cited for Drogon no longer applies to the server. The text
+> below is kept as written.
 
 > **Update (2026-10-29, #4754):** the `GET /mcp/v1/` row in the table below dates from the original decision and says "principal-bound session". Today the session is bound to the principal and the credential class that minted it, and the channel refuses a service-scoped token; see `docs/mcp-server.md`, "GET channel posture" and "Session binding". The held-open-connection decision itself is unchanged.
 

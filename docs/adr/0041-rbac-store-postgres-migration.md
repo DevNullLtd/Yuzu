@@ -3,6 +3,7 @@
 - **Status:** Accepted (governance-resolved 2026-08-01 — the deferred cache-coherence
   decision below was adjudicated by the security/architect/performance/compliance gates in favour
   of the generation-token interval; see "Permission cache")
+- **Owner:** Nathan Dornbrook (platform)
 - **Date:** 2026-08-01
 - **Deciders:** pg workstream; security-guardian + architect + performance + docs-writer (governance)
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012, ADR-0017 (management-group

@@ -10,6 +10,12 @@ supersedes: the agent-side `__bundle__` multiplex explored on branch `feat/live-
 
 # 0011 — Live-query bundle: server-side async fan-out
 
+> **Update (2026-11-14, against dev @ 2c49b4ea0).** The condition "once `response_store` itself migrates
+> off per-instance SQLite" under the durable-manifest direction is met: `ResponseStore` is
+> Postgres-native (ADR-0039). The bundle manifest itself is still in memory
+> (`bundle_orchestrator.hpp`, STORAGE comment), so the durable Postgres manifest remains the open
+> committed direction.
+
 ## Context
 
 Operators (and the ServiceNow integration in particular) need to read several live signals
