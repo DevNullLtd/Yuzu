@@ -2933,7 +2933,7 @@ gw::BatchHeartbeatResponse batch_hb(GatewayUpstreamServiceImpl& svc,
 bool offline_row_present(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
     const auto roster = s.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the read is typed; a store fault is not "absent"
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == agent_id)
             return true;
     return false;
@@ -3384,7 +3384,7 @@ std::int64_t now_ms() {
 std::string presence_hostname(yuzu::server::OfflineEndpointStore& s, const std::string& agent_id) {
     const auto roster = s.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the read is typed; a store fault is not "absent"
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == agent_id)
             return e.hostname;
     return {};
@@ -3996,7 +3996,7 @@ TEST_CASE("NotifyStreamStatus DISCONNECTED for the CURRENT session clears presen
     const auto roster = offline_store.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the roster read is typed; a store fault is not "absent"
     const yuzu::server::OfflineEndpoint* row = nullptr;
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == "agent-presence-1")
             row = &e;
     REQUIRE(row != nullptr);

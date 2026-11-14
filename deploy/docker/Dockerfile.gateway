@@ -44,7 +44,7 @@
 # yuzu:gateway-platforms linux/amd64
 
 # ── Stage 1: deps — fetch and compile Erlang dependencies (cached) ────────
-FROM erlang:28-alpine@sha256:e1db7a6948008f2f97b63bd139add18e9304980bdc90da6ddab91d89f0a665da AS deps
+FROM erlang:28-alpine@sha256:a61e716415b2ec95369e3ba18ea59a4379a82ae7744f6045a4145297f5ca1521 AS deps
 
 # BuildKit sets TARGETARCH from --platform (and from the host when it is not
 # given). Keep the allowed set in step with the marker line above.

@@ -32,8 +32,11 @@
 #include "test_webhook_store_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_blocking_http_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 
@@ -42,6 +45,15 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_TSAN_BUILD 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_TSAN_BUILD 1
+#endif
 
 using namespace yuzu::server;
 using yuzu::test::WebhookStorePg;
@@ -435,3 +447,70 @@ TEST_CASE("WebhookStore[pg]: get separates not-found from a failed read and deli
     REQUIRE_FALSE(failed.has_value());
     CHECK(failed.error() == integrations::ReadError::failed);
 }
+
+// ── Drop accounting: the `reason` label on yuzu_server_webhook_delivery_dropped_total ──────────
+
+namespace {
+
+double webhook_dropped(yuzu::MetricsRegistry& reg, const char* reason) {
+    return reg.counter("yuzu_server_webhook_delivery_dropped_total", {{"reason", reason}}).value();
+}
+
+} // namespace
+
+TEST_CASE("WebhookStore[pg]: a delivery refused after quiesce() counts reason=quiescing",
+          "[webhook_store][pg][metrics]") {
+    WebhookStorePg store;
+    yuzu::MetricsRegistry reg;
+    store->set_metrics(&reg);
+    auto id = store->create_webhook("http://127.0.0.1:1/h", "agent.registered", /*secret=*/"");
+    REQUIRE(id.has_value());
+    REQUIRE(store->quiesce(std::chrono::seconds(5))); // nothing in flight: closes the pool
+
+    store->fire_event("agent.registered", R"({"k":"v"})");
+
+    CHECK(webhook_dropped(reg, "quiescing") == 1.0);
+    CHECK(webhook_dropped(reg, "queue_full") == 0.0);
+}
+
+// Compiled out under TSan: the deliveries below are real loopback HTTP calls, which hit the glibc
+// getaddrinfo_a crash under this repo's TSan build (#2504); the same exclusion as the other
+// loopback-httplib tests. The pool's own concurrency is covered without HTTP in
+// test_store_worker_pool.cpp, and the reason=quiescing case above does no HTTP.
+#ifndef YUZU_TSAN_BUILD
+TEST_CASE("WebhookStore[pg]: deliveries past a full queue count reason=queue_full and the "
+          "backlog accessors read the pool",
+          "[webhook_store][pg][metrics]") {
+    // Every delivery blocks in the sink, so the pool's 4 workers stay busy and its 256-slot queue
+    // fills: of 300 matching webhooks at most 260 are accepted and the rest are dropped.
+    constexpr int kWebhooks = 300;
+    // Declaration order is load-bearing: locals are destroyed in reverse. The registry comes first
+    // so it outlives the store (a delivery still running during the store's teardown writes to
+    // it), and the store comes before the sink so the sink releases its held deliveries first and
+    // the store's drain is quick.
+    yuzu::MetricsRegistry reg;
+    WebhookStorePg store;
+    yuzu::test::BlockingHttpSink sink;
+    REQUIRE(sink.ok());
+    store->set_metrics(&reg);
+    for (int i = 0; i < kWebhooks; ++i)
+        REQUIRE(store->create_webhook(sink.url(), "agent.registered", /*secret=*/"").has_value());
+    const auto capacity = store->delivery_pool_capacity();
+    CHECK(capacity == 260);
+    CHECK(store->delivery_pool_pending() == 0);
+
+    store->fire_event("agent.registered", R"({"k":"v"})");
+
+    const double dropped = webhook_dropped(reg, "queue_full");
+    CHECK(dropped >= kWebhooks - static_cast<double>(capacity)); // at least 40
+    CHECK(dropped <= kWebhooks - 256.0);                         // at most 44
+    CHECK(webhook_dropped(reg, "quiescing") == 0.0);
+    // Accepted deliveries are queued or held in the sink, none finished: the pool is full.
+    CHECK(store->delivery_pool_pending() == kWebhooks - static_cast<std::size_t>(dropped));
+    CHECK(store->delivery_pool_pending() >= 256);
+
+    sink.release(); // the held deliveries finish, so the store drains on teardown
+    REQUIRE(store->quiesce(std::chrono::seconds(60)));
+    CHECK(store->delivery_pool_pending() == 0);
+}
+#endif // !YUZU_TSAN_BUILD
