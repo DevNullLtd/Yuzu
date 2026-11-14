@@ -38,7 +38,6 @@ constexpr const char* kTargetType = "Inventory";
 struct Ctx {
     SoftwareReadRoutes::FleetReadFn fleet_read_fn;
     SoftwareReadRoutes::AuditFn audit_fn;
-    SoftwareReadRoutes::HostnamesFn hostnames_fn;
     SoftwareReadRoutes::RosterFn roster_fn;
     SoftwareReadRoutes::SnapshotFn snapshot_fn;
     SoftwareReadRoutes::NowFn now_fn;
@@ -46,14 +45,12 @@ struct Ctx {
     bool ready{false};
 
     [[nodiscard]] std::int64_t now() const { return now_fn ? now_fn() : now_epoch_seconds(); }
-    // Display-only: a roster that is not wired or cannot be read leaves the names null.
-    [[nodiscard]] swh::Roster roster() const { return hostnames_fn ? hostnames_fn() : swh::Roster{}; }
-    // For a decision made FROM the roster (the `q` search): nullopt = the read failed.
+    // For a decision made FROM the roster (the `q` search): nullopt = unwired, or the read failed.
     [[nodiscard]] std::optional<swh::Roster> checked_roster() const {
-        if (roster_fn)
-            return roster_fn();
-        return roster();
+        return roster_fn ? roster_fn() : std::nullopt;
     }
+    // Display-only: a roster that is not wired or cannot be read leaves the names null.
+    [[nodiscard]] swh::Roster roster() const { return checked_roster().value_or(swh::Roster{}); }
 };
 
 // Bind every read the caller left empty to the store.
@@ -223,7 +220,6 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     bind_store_reads(deps.reads, deps.store);
     Ctx built{.fleet_read_fn = std::move(deps.fleet_read_fn),
               .audit_fn = std::move(deps.audit_fn),
-              .hostnames_fn = std::move(deps.hostnames_fn),
               .roster_fn = std::move(deps.roster_fn),
               .snapshot_fn = std::move(deps.snapshot_fn),
               .now_fn = std::move(deps.now_fn),
@@ -253,7 +249,7 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // outside it takes no part in the match or the cap. A search with no roster
                  // wired, or one whose roster read failed, cannot be answered, and an empty answer
                  // would read as "no such device". Without a `q` the roster only names devices.
-                 if (!rq.q.empty() && !ctx->hostnames_fn && !ctx->roster_fn) {
+                 if (!rq.q.empty() && !ctx->roster_fn) {
                      fail(res, 503, "device roster not available",
                           {.retry_after_ms = 5000, .remediation = "retry the request"});
                      return;
@@ -340,7 +336,7 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      return;
                  swl::FactsReads io;
                  io.last_seen = ctx->reads.last_seen;
-                 io.hostnames = ctx->hostnames_fn;
+                 io.hostnames = [ctx] { return ctx->roster(); };
                  const auto facts = swl::load_device_facts(io, {agent_id});
                  if (!facts) {
                      degraded(*ctx, req, res, cid, kVerbHost, target, "last-poll read");

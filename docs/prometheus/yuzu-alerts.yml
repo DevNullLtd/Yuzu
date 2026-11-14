@@ -8124,18 +8124,22 @@ groups:
     # rules: a facet the OS does not support reports not_collected permanently, and a disabled
     # facet collected nothing on purpose. The 20-device floor keeps a small cohort from paging
     # on one slow device. A device reports about once a day, so a 24h hold means the share
-    # survived a full reporting cycle.
+    # survived a full reporting cycle. Every replica recomputes and exports the same fleet
+    # figure, so each count is collapsed across replicas with max by (job, facet, status)
+    # before it is summed over the statuses: a bare sum over N replicas would turn the
+    # 20-device floor into 20/N real devices (docs/observability-conventions.md, "Alerts
+    # over a row shared by every replica take max by (job)").
     rules:
       - alert: YuzuSoftwareFacetTimeoutShareHigh
         expr: |
           (
-            sum by (facet) (yuzu_software_facet_devices{status="timeout"})
-            / sum by (facet) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})
+            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status="timeout"}))
+            / sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}))
             > 0.05
           )
           and
           (
-            sum by (facet) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}) >= 20
+            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})) >= 20
           )
         for: 24h
         labels:
@@ -8151,13 +8155,13 @@ groups:
       - alert: YuzuSoftwareFacetFailingShareHigh
         expr: |
           (
-            sum by (facet) (yuzu_software_facet_devices{status=~"constrained|timeout|oversize"})
-            / sum by (facet) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})
+            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"constrained|timeout|oversize"}))
+            / sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}))
             > 0.20
           )
           and
           (
-            sum by (facet) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}) >= 20
+            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})) >= 20
           )
         for: 24h
         labels:

@@ -6,8 +6,8 @@ namespace yuzu::server::software_plugin_health {
 
 namespace {
 
-std::int64_t count_of(const FacetHealth& f, const std::string& status) {
-    const auto it = f.devices_by_status.find(status);
+std::int64_t count_of(const FacetHealth& f, V3Status st) {
+    const auto it = f.devices_by_status.find(std::string(v3_status_name(st)));
     return it == f.devices_by_status.end() ? 0 : it->second;
 }
 
@@ -31,15 +31,14 @@ nlohmann::json plugin_health_json(const std::vector<FacetHealth>& facets,
         nlohmann::json devices = nlohmann::json::object();
         std::int64_t total = 0;
         for (const auto st : kV3AllStatuses) {
-            const std::string s(v3_status_name(st));
-            devices[s] = count_of(f, s);
-            total += count_of(f, s);
+            devices[std::string(v3_status_name(st))] = count_of(f, st);
+            total += count_of(f, st);
         }
-        const std::int64_t collecting = count_of(f, "full") + count_of(f, "delta") +
-                                        count_of(f, "constrained") + count_of(f, "timeout") +
-                                        count_of(f, "oversize");
-        const std::int64_t failing =
-            count_of(f, "constrained") + count_of(f, "timeout") + count_of(f, "oversize");
+        const std::int64_t failing = count_of(f, V3Status::kConstrained) +
+                                     count_of(f, V3Status::kTimeout) +
+                                     count_of(f, V3Status::kOversize);
+        const std::int64_t collecting =
+            count_of(f, V3Status::kFull) + count_of(f, V3Status::kDelta) + failing;
 
         auto slowest = nlohmann::json::array();
         for (const auto& s : f.slowest) {
@@ -56,10 +55,10 @@ nlohmann::json plugin_health_json(const std::vector<FacetHealth>& facets,
             {"plugin", plugin_of(f.facet)},
             {"devices", std::move(devices)},
             {"collecting", collecting},
-            {"timeout_share", share(count_of(f, "timeout"), collecting)},
+            {"timeout_share", share(count_of(f, V3Status::kTimeout), collecting)},
             {"failing_share", share(failing, collecting)},
-            {"disabled_share", share(count_of(f, "disabled"), total)},
-            {"not_collected_share", share(count_of(f, "not_collected"), total)},
+            {"disabled_share", share(count_of(f, V3Status::kDisabled), total)},
+            {"not_collected_share", share(count_of(f, V3Status::kNotCollected), total)},
             {"duration_ms",
              {{"p50", f.duration_ms_p50}, {"p95", f.duration_ms_p95}, {"max", f.duration_ms_max}}},
             {"bytes_read",
@@ -75,11 +74,19 @@ nlohmann::json plugin_health_json(const std::vector<FacetHealth>& facets,
 
 void publish_facet_health_gauges(yuzu::MetricsRegistry& metrics,
                                  const std::vector<FacetHealth>& facets) {
+    // An agent-population rollup is cleared and re-emitted each sweep
+    // (observability-conventions.md), so a facet no device reports any longer goes absent instead
+    // of holding its last value. The caller reaches here only after both reads succeeded, so
+    // keep-last-good on a failed refresh is unaffected, and nothing caches a reference into these
+    // two families.
+    metrics.clear_gauge_family("yuzu_software_facet_devices");
+    metrics.clear_gauge_family("yuzu_software_facet_duration_ms");
     for (const auto& f : facets) {
         for (const auto st : kV3AllStatuses) {
-            const std::string s(v3_status_name(st));
-            metrics.gauge("yuzu_software_facet_devices", {{"facet", f.facet}, {"status", s}})
-                .set(static_cast<double>(count_of(f, s)));
+            metrics
+                .gauge("yuzu_software_facet_devices",
+                       {{"facet", f.facet}, {"status", std::string(v3_status_name(st))}})
+                .set(static_cast<double>(count_of(f, st)));
         }
         metrics.gauge("yuzu_software_facet_duration_ms", {{"facet", f.facet}, {"quantile", "0.5"}})
             .set(static_cast<double>(f.duration_ms_p50));

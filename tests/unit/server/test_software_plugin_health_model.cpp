@@ -74,3 +74,42 @@ TEST_CASE("publish_facet_health_gauges: all seven statuses, zeros included, no a
     CHECK(text.find("quantile=\"0.95\"} 90") != std::string::npos);
     CHECK(text.find("agent-secret") == std::string::npos);
 }
+
+TEST_CASE("plugin_health_json: duration and bytes distributions keep p50, p95 and max apart",
+          "[software_plugin_health][model]") {
+    // Six distinct values, so a swap of any two columns in the model or in the store's in-order
+    // parse is a red test. A non-zero delta count also pins the "delta" status key.
+    FacetHealth a = make("installed_software.dpkg", {{"full", 3}, {"delta", 4}});
+    a.duration_ms_p50 = 11;
+    a.duration_ms_p95 = 22;
+    a.duration_ms_max = 33;
+    a.bytes_read_p50 = 4400;
+    a.bytes_read_p95 = 5500;
+    a.bytes_read_max = 6600;
+
+    const auto j = sph::plugin_health_json({a}, {}, 1, "");
+    const auto& f = j["facets"][0];
+    CHECK(f["devices"]["delta"] == 4);
+    CHECK(f["collecting"] == 7);
+    CHECK(f["duration_ms"]["p50"] == 11);
+    CHECK(f["duration_ms"]["p95"] == 22);
+    CHECK(f["duration_ms"]["max"] == 33);
+    CHECK(f["bytes_read"]["p50"] == 4400);
+    CHECK(f["bytes_read"]["p95"] == 5500);
+    CHECK(f["bytes_read"]["max"] == 6600);
+}
+
+TEST_CASE("publish_facet_health_gauges: a facet absent from the next sweep goes absent",
+          "[software_plugin_health][model]") {
+    yuzu::MetricsRegistry m;
+    FacetHealth a = make("installed_software.dpkg", {{"timeout", 3}});
+    FacetHealth b = make("installed_software.rpm", {{"full", 2}});
+    sph::publish_facet_health_gauges(m, {a, b});
+    REQUIRE(m.serialize().find("installed_software.dpkg") != std::string::npos);
+
+    sph::publish_facet_health_gauges(m, {b});
+    const auto text = m.serialize();
+    CHECK(text.find("installed_software.dpkg") == std::string::npos);
+    CHECK(text.find("yuzu_software_facet_devices{facet=\"installed_software.rpm\","
+                    "status=\"full\"} 2") != std::string::npos);
+}

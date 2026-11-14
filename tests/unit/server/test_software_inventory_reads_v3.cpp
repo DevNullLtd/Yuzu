@@ -498,8 +498,10 @@ TEST_CASE("facet_health: status counts incl. enabled=false as disabled, percenti
     add_facet(pool, "d-8", apps, "not_collected");
     add_facet(pool, "d-9", apps, "disabled");
     add_facet(pool, "d-10", apps, "full", 999999, 999999, /*enabled=*/false); // disabled, unmeasured
-    // A second facet with 12 measured rows exercises the top-10 cut.
-    for (int i = 1; i <= 12; ++i)
+    // A second facet with 21 measured rows exercises the top-10 cut and gives p50, p95 and max
+    // three different values for both columns (durations i * 10, bytes i): of 21 sorted rows
+    // percentile_disc picks the 11th for 0.5 and the 20th for 0.95, the 21st is the max.
+    for (int i = 1; i <= 21; ++i)
         add_facet(pool, "r-" + std::to_string(i), "runtimes.python", "full", i * 10, i);
 
     const auto health = store.facet_health(std::nullopt);
@@ -519,6 +521,9 @@ TEST_CASE("facet_health: status counts incl. enabled=false as disabled, percenti
     CHECK(a.duration_ms_p50 == 200);
     CHECK(a.duration_ms_p95 == 5000);
     CHECK(a.duration_ms_max == 5000);
+    // Sorted measured bytes: 0, 0, 10, 20, 30, 40, 50 -> p50 = 4th = 20, p95 = 7th = 50.
+    CHECK(a.bytes_read_p50 == 20);
+    CHECK(a.bytes_read_p95 == 50);
     CHECK(a.bytes_read_max == 50);
     REQUIRE(a.slowest.size() == 7);
     CHECK(a.slowest[0].agent_id == "d-5");
@@ -529,12 +534,17 @@ TEST_CASE("facet_health: status counts incl. enabled=false as disabled, percenti
 
     const auto& b = (*health)[1];
     CHECK(b.facet == "runtimes.python");
-    CHECK(b.devices_by_status.at("full") == 12);
+    CHECK(b.devices_by_status.at("full") == 21);
     CHECK(b.devices_by_status.at("timeout") == 0);
-    CHECK(b.duration_ms_max == 120);
+    CHECK(b.duration_ms_p50 == 110);
+    CHECK(b.duration_ms_p95 == 200);
+    CHECK(b.duration_ms_max == 210);
+    CHECK(b.bytes_read_p50 == 11);
+    CHECK(b.bytes_read_p95 == 20);
+    CHECK(b.bytes_read_max == 21);
     REQUIRE(b.slowest.size() == 10);
-    CHECK(b.slowest.front().agent_id == "r-12");
-    CHECK(b.slowest.back().agent_id == "r-3");
+    CHECK(b.slowest.front().agent_id == "r-21");
+    CHECK(b.slowest.back().agent_id == "r-12");
     CHECK(std::is_sorted(b.slowest.begin(), b.slowest.end(), [](const auto& x, const auto& y) {
         return x.duration_ms > y.duration_ms;
     }));

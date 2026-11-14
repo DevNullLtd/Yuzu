@@ -31,6 +31,7 @@
 
 #include "authz_gates.hpp"
 #include "http_route_sink.hpp"
+#include "software_catalog_rollup.hpp"
 #include "software_catalogue_model.hpp"
 #include "software_changes_model.hpp"
 #include "software_hosts_model.hpp"
@@ -41,38 +42,12 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
-
-/// The fleet-wide aggregates the rollup thread computes once per tick, immutable once published.
-struct SoftwareFleetSnapshot {
-    std::vector<FacetHealth> facets;
-    SoftwareSummary summary;
-    std::int64_t as_of{0}; ///< epoch seconds the snapshot was computed
-};
-
-/// Single-writer (the rollup thread) / many-reader holder. A failed refresh simply does not call
-/// publish(), so the last good snapshot stays.
-class SoftwareFleetSnapshotHolder {
-public:
-    [[nodiscard]] std::shared_ptr<const SoftwareFleetSnapshot> get() const {
-        std::lock_guard lock(mu_);
-        return snapshot_;
-    }
-    void publish(std::shared_ptr<const SoftwareFleetSnapshot> s) {
-        std::lock_guard lock(mu_);
-        snapshot_ = std::move(s);
-    }
-
-private:
-    mutable std::mutex mu_;
-    std::shared_ptr<const SoftwareFleetSnapshot> snapshot_;
-};
 
 class SoftwareReadRoutes {
 public:
@@ -85,10 +60,10 @@ public:
     using AuditFn = std::function<bool(const httplib::Request& req, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
-    /// agent_id -> hostname: the device table's roster (the one the UI device table reads).
-    using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
-    /// The same roster, but a failed read is nullopt instead of an empty map. The hosts search
-    /// decides from the roster, so it must tell "no such device" from "the roster could not be read".
+    /// agent_id -> hostname: the device table's roster (the one the UI device table reads). A
+    /// failed read is nullopt, not an empty map: the hosts search decides from the roster, so it
+    /// must tell "no such device" from "the roster could not be read". Where the roster only names
+    /// devices, a failed or unwired read leaves the names null.
     using RosterFn = std::function<std::optional<std::unordered_map<std::string, std::string>>()>;
     /// The current fleet snapshot, or null before the first successful refresh.
     using SnapshotFn = std::function<std::shared_ptr<const SoftwareFleetSnapshot>()>;
@@ -116,8 +91,7 @@ public:
     struct Deps {
         FleetReadFn fleet_read_fn;
         AuditFn audit_fn;
-        HostnamesFn hostnames_fn;
-        RosterFn roster_fn; ///< checked roster for the hosts `q` search; empty = hostnames_fn
+        RosterFn roster_fn; ///< empty = no roster wired: names are null and a `q` search is a 503
         SnapshotFn snapshot_fn;
         NowFn now_fn;
         SoftwareInventoryStore* store{nullptr}; ///< borrowed; null (with no `reads`) answers 503

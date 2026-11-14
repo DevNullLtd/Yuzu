@@ -9126,6 +9126,7 @@ Collection health per facet across the fleet: how many devices are in each statu
 ```
 
 - `collecting` counts devices whose facet is `full`, `delta`, `constrained`, `timeout` or `oversize`; `timeout_share` is `timeout` over `collecting`, and `failing_share` is `constrained`, `timeout` and `oversize` over `collecting`. `disabled_share` and `not_collected_share` are over all devices reporting the facet. A share is `null` when its denominator is `0`.
+- "Failing" is `constrained`, `timeout` and `oversize`. Rows from those devices read `unconfirmed` in the software list and on the host rows (`row_status`). Rows from `not_collected` devices also read `unconfirmed` there, but they are not failing: a collector the OS cannot run reports `not_collected` permanently, so those devices are counted in `not_collected_share` and are outside `collecting`, `failing_share` and both alerts.
 - `duration_ms` and `bytes_read` are percentiles over the devices that actually collected (a disabled or not-collected device contributes nothing, so its zeros do not pull them down). `slowest` lists up to ten of those devices by duration; `hostname` is `null` if unknown.
 - `plugin` is the part of the facet name before the first `.`.
 

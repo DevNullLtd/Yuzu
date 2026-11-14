@@ -102,7 +102,7 @@ struct Harness {
 
     // The data and the read counters.
     std::unordered_map<std::string, std::string> roster;
-    bool roster_fails{false}; ///< the checked roster read (hosts `q` search) reports a failure
+    bool roster_fails{false}; ///< the roster read reports a failure (nullopt)
     std::vector<SoftwareHostRow> hosts;
     std::vector<SoftwareChangeRow> changes;
     std::vector<SoftwareFleetRow> installs;
@@ -115,7 +115,7 @@ struct Harness {
     std::optional<std::vector<std::string>> last_aggregate_ids;
     std::string last_install_agent;
 
-    explicit Harness(bool wire_reads = true, bool wire_roster = true, bool wire_checked_roster = true) {
+    explicit Harness(bool wire_reads = true, bool wire_roster = true) {
         SoftwareReadRoutes::Deps deps;
         deps.fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
                                     const std::string&,
@@ -137,8 +137,6 @@ struct Harness {
             return audit_persists;
         };
         if (wire_roster)
-            deps.hostnames_fn = [this] { return roster; };
-        if (wire_roster && wire_checked_roster)
             deps.roster_fn = [this]() -> std::optional<std::unordered_map<std::string, std::string>> {
                 if (roster_fails)
                     return std::nullopt;
@@ -433,15 +431,12 @@ TEST_CASE("hosts: a search over a roster that could not be read is a 503, never 
     REQUIRE(plain);
     CHECK(plain->status == 200);
     CHECK(body_of(*plain).at("data").at("hosts").size() == 1);
+    CHECK(body_of(*plain).at("data").at("hosts")[0].at("hostname").is_null()); // names stay unknown
 
-    // A roster read that works answers the search, and so does the display roster alone.
+    // A roster read that works answers the search.
     h.roster_fails = false;
     CHECK(ids_of(body_of(*h.sink.Get("/api/v1/inventory/software/hosts?q=alpha")).at("data").at("hosts")) ==
           std::vector<std::string>{"a1"});
-    Harness display_only(/*wire_reads=*/true, /*wire_roster=*/true, /*wire_checked_roster=*/false);
-    display_only.hosts = {host_row("a1")};
-    display_only.roster = {{"a1", "alpha"}};
-    CHECK(display_only.sink.Get("/api/v1/inventory/software/hosts?q=alpha")->status == 200);
 }
 
 TEST_CASE("host detail: out-of-scope and unknown hosts answer the same 404",

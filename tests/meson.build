@@ -4887,6 +4887,15 @@ test('software lookup wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-33: the software v3 read routes must register ahead of the generic inventory route, and the
+# fleet snapshot holder must be attached to the rollup before it starts and read by the routes;
+# either gap leaves every test green and the routes or the alert gauges silently wrong.
+test('software read wiring lexical',
+  _python3_test,
+  args: [files('test_software_read_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 test('forensics tier wiring lexical selftest',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical_selftest.py')],

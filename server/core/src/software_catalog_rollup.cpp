@@ -7,7 +7,6 @@
 
 #include "software_inventory_store.hpp"
 #include "software_plugin_health_model.hpp"
-#include "software_read_routes.hpp"
 #include "web_utils.hpp"
 
 #include <yuzu/metrics.hpp>

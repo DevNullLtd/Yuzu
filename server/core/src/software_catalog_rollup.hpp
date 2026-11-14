@@ -26,9 +26,15 @@
 /// A recompute failure is keep-last-good in the store; the thread logs + counts it and
 /// keeps ticking (an exception escaping a std::thread entry would call std::terminate).
 
+#include "software_inventory_store.hpp"
+
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 namespace yuzu {
 class MetricsRegistry;
@@ -36,8 +42,30 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 
-class SoftwareInventoryStore;
-class SoftwareFleetSnapshotHolder;
+/// The fleet-wide aggregates the rollup thread computes once per tick, immutable once published.
+struct SoftwareFleetSnapshot {
+    std::vector<FacetHealth> facets;
+    SoftwareSummary summary;
+    std::int64_t as_of{0}; ///< epoch seconds the snapshot was computed
+};
+
+/// Single-writer (the rollup thread) / many-reader holder. A failed refresh simply does not call
+/// publish(), so the last good snapshot stays.
+class SoftwareFleetSnapshotHolder {
+public:
+    [[nodiscard]] std::shared_ptr<const SoftwareFleetSnapshot> get() const {
+        std::lock_guard lock(mu_);
+        return snapshot_;
+    }
+    void publish(std::shared_ptr<const SoftwareFleetSnapshot> s) {
+        std::lock_guard lock(mu_);
+        snapshot_ = std::move(s);
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::shared_ptr<const SoftwareFleetSnapshot> snapshot_;
+};
 
 class SoftwareCatalogRollup {
 public:
