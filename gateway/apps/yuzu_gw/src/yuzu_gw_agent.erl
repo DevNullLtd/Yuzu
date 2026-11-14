@@ -125,7 +125,18 @@
     session_id  :: binary() | undefined,
     stream_pid  :: pid() | undefined,     %% subscribe handler process
     stream_mon  :: reference() | undefined, %% monitor ref for stream_pid
-    agent_info  :: map(),
+    %% The agent's hostname. It replaces the whole AgentInfo the field used to
+    %% hold (about 26 KiB for an agent with 69 plugins, measured
+    %% 2026-10-26): this process reads only the hostname of it (registry
+    %% row, re-register, get_info), and the owner table keeps the start
+    %% arguments for a restart. A supervised owner holds no AgentInfo at all
+    %% once it has registered, because drop_request/1 empties register_req; an
+    %% owner started directly (no owner_key) keeps the request, and so its
+    %% AgentInfo, in register_req. The tuple position is unchanged, so the
+    %% code_change/4 clause for a record from before the owner kept the
+    %% hostname alone finds the old AgentInfo map here.
+    %% (stream_pid's position does not depend on this: it precedes the field.)
+    hostname    :: binary(),
     register_req :: map(),                %% verbatim RegisterRequest (for upstream-reconnect replay)
     plugins     :: [binary()],
     %% command_id => {reply_to, fanout_ref, dispatched_at, plugin}. The plugin
@@ -286,6 +297,7 @@ init_owner(#{agent_id := AgentId, agent_info := AgentInfo,
              stream_pid := StreamPid, peer_addr := PeerAddr} = Args, OwnerKey, StreamHomeId) ->
     SessionId = maps:get(session_id, Args, undefined),
     Plugins = extract_plugin_names(AgentInfo),
+    Hostname = hostname_of(AgentInfo),
     %% Verbatim RegisterRequest, threaded from the subscribe handler.
     %% Defaulted so an agent started without it (older callers, tests)
     %% still works — replay just skips agents whose req is empty.
@@ -306,7 +318,7 @@ init_owner(#{agent_id := AgentId, agent_info := AgentInfo,
         session_id  = SessionId,
         stream_pid  = StreamPid,
         stream_mon  = StreamMon,
-        agent_info  = AgentInfo,
+        hostname    = Hostname,
         register_req = RegisterReq,
         plugins     = Plugins,
         pending     = #{},
@@ -330,13 +342,11 @@ registering(enter, _OldState, _Data) ->
     keep_state_and_data;
 
 registering(internal, {register, ConnKey, Ack},
-            #data{agent_id = AgentId, session_id = SessionId, agent_info = AgentInfo,
+            #data{agent_id = AgentId, session_id = SessionId, hostname = Hostname,
                   plugins = Plugins, register_req = RegisterReq} = Data) ->
     %% Register in the routing table. The RegisterRequest is stashed in the
     %% registry so yuzu_gw_upstream can re-proxy it when the upstream
     %% connection re-establishes.
-    Hostname = maps:get(<<"hostname">>, AgentInfo,
-                        maps:get(hostname, AgentInfo, <<>>)),
     case yuzu_gw_registry:register_agent(AgentId, self(), SessionId, Plugins,
                                          Hostname, RegisterReq, ConnKey) of
         ok ->
@@ -541,8 +551,7 @@ await_settled(#data{agent_id = AgentId, session_id = SessionId, stream_home_id =
     end.
 
 register_again(#data{agent_id = AgentId, session_id = SessionId, plugins = Plugins,
-                     agent_info = AgentInfo, register_req = RegisterReq} = Data) ->
-    Hostname = maps:get(<<"hostname">>, AgentInfo, maps:get(hostname, AgentInfo, <<>>)),
+                     hostname = Hostname, register_req = RegisterReq} = Data) ->
     case yuzu_gw_registry:recover_agent(AgentId, self(), SessionId, Plugins, Hostname,
                                         RegisterReq, conn_key(Data)) of
         ok ->
@@ -590,7 +599,7 @@ restored_data(#{agent_id := AgentId, agent_info := AgentInfo, peer_addr := PeerA
           session_id   = maps:get(session_id, Args, undefined),
           stream_pid   = maps:get(stream_pid, Args, undefined),
           stream_mon   = undefined,
-          agent_info   = AgentInfo,
+          hostname     = hostname_of(AgentInfo),
           register_req = maps:get(register_req, Args, #{}),
           plugins      = extract_plugin_names(AgentInfo),
           pending      = #{},
@@ -835,6 +844,14 @@ code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0
                                                 tuple_size(Data0) =:= tuple_size(#data{}) - 1 ->
     %% A record from before OWNER-RESTART: no owner_key (never restarted).
     code_change(_OldVsn, State, erlang:append_element(Data0, undefined), Extra);
+code_change(_OldVsn, State, Data0, Extra) when is_tuple(Data0), element(1, Data0) =:= data,
+                                                tuple_size(Data0) =:= tuple_size(#data{}),
+                                                is_map(element(#data.hostname, Data0)) ->
+    %% A record from before the owner kept the hostname alone (2026-10-26):
+    %% the field held the whole AgentInfo; only its hostname is kept. Matched
+    %% as a tuple, not as #data{}, whose field is now typed binary().
+    Info = element(#data.hostname, Data0),
+    code_change(_OldVsn, State, setelement(#data.hostname, Data0, hostname_of(Info)), Extra);
 code_change(_OldVsn, State, #data{pending = Pending} = Data, _Extra) ->
     %% A pending entry from a version that did not keep the dispatched plugin
     %% is a 3-tuple; it completes with the plugin unknown.
@@ -1023,17 +1040,23 @@ notify_watchers(Event) ->
 ensure_binary(undefined) -> <<>>;
 ensure_binary(B) when is_binary(B) -> B.
 
+%% The hostname from an AgentInfo map (atom keys from gpb, binary keys from a
+%% hand-built map in tests).
+hostname_of(AgentInfo) ->
+    maps:get(<<"hostname">>, AgentInfo, maps:get(hostname, AgentInfo, <<>>)).
+
 extract_plugin_names(AgentInfo) ->
     Plugins = maps:get(<<"plugins">>, AgentInfo,
                        maps:get(plugins, AgentInfo, [])),
     [maps:get(<<"name">>, P, maps:get(name, P, <<"unknown">>)) || P <- Plugins].
 
+%% The answer to get_info/1 (GetAgent reads plugins, hostname and
+%% connected_at). It no longer carries the agent's whole AgentInfo: the process
+%% does not keep it (see #data.hostname).
 format_info(#data{agent_id = AgentId, session_id = SessionId,
                    plugins = Plugins, connected_at = ConnectedAt,
-                   agent_info = AgentInfo, peer_addr = PeerAddr,
+                   hostname = Hostname, peer_addr = PeerAddr,
                    pending = Pending}, State) ->
-    Hostname = maps:get(<<"hostname">>, AgentInfo,
-                        maps:get(hostname, AgentInfo, <<>>)),
     #{agent_id     => AgentId,
       session_id   => SessionId,
       state        => State,
@@ -1041,5 +1064,4 @@ format_info(#data{agent_id = AgentId, session_id = SessionId,
       hostname     => Hostname,
       connected_at => ConnectedAt,
       peer_addr    => PeerAddr,
-      agent_info   => AgentInfo,
       pending_cmds => maps:size(Pending)}.

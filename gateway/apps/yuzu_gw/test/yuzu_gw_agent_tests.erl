@@ -75,6 +75,14 @@ agent_test_() ->
       {"agent stops on stream_error", fun stops_on_error/0},
       {"disconnect notifies pending waiters", fun disconnect_notifies_pending/0},
       {"get_info returns state", fun get_info_works/0},
+      {"the owner keeps the hostname, not the whole AgentInfo",
+       fun owner_keeps_hostname_not_agent_info/0},
+      {"code_change reduces an old record's AgentInfo field to its hostname",
+       fun code_change_reduces_agent_info_to_hostname/0},
+      {"the hostname is read from a binary key, an atom key, or defaults to <<>>",
+       fun hostname_key_shapes/0},
+      {"code_change/4 on an old record: no owner_key, whole AgentInfo in the hostname slot",
+       fun code_change_pure_pre_g1_tuple/0},
       {"stream handler death triggers disconnect", fun stream_handler_death/0},
       {"stream handler death in connecting state", fun stream_handler_death_connecting/0},
       {"HA WS-4 4.4: reannounce for the CURRENT session re-sends CONNECTED",
@@ -408,6 +416,120 @@ get_info_works() ->
     ?assertEqual(<<"gi-1">>, maps:get(agent_id, Info)),
     ?assertEqual(streaming, maps:get(state, Info)),
     ?assert(is_integer(maps:get(connected_at, Info))),
+    stop_agent(Pid).
+
+%% The owner keeps the hostname alone (measured 2026-10-26): the hostname
+%% field replaces the whole AgentInfo.
+%% An owner started directly (no owner_key) keeps its RegisterRequest in
+%% register_req, and so one copy of the AgentInfo there; the hostname field
+%% must not add a second. A marker in another AgentInfo field therefore occurs
+%% exactly once in the process's state (twice in earlier builds), and get_info/1
+%% still answers hostname and plugins.
+owner_keeps_hostname_not_agent_info() ->
+    Marker = <<"MARKER-g1-description">>,
+    AgentInfo = #{hostname => <<"host-g1">>,
+                  platform => #{os => <<"linux">>},
+                  plugins  => [#{name => <<"svc">>, description => Marker}]},
+    Args = #{agent_id     => <<"g1-1">>,
+             session_id   => <<"sess-g1-1">>,
+             stream_pid   => self(),
+             agent_info   => AgentInfo,
+             register_req => #{info => AgentInfo},
+             peer_addr    => <<"127.0.0.1">>},
+    {ok, Pid} = yuzu_gw_agent:start_link(Args),
+    unlink(Pid),
+    {ok, Info} = yuzu_gw_agent:get_info(Pid),
+    ?assertEqual(<<"host-g1">>, maps:get(hostname, Info)),
+    ?assertEqual([<<"svc">>], maps:get(plugins, Info)),
+    ?assertNot(maps:is_key(agent_info, Info)),
+    {_State, Data} = sys:get_state(Pid),
+    ?assertEqual(1, length(binary:matches(term_to_binary(Data), Marker))),
+    stop_agent(Pid).
+
+%% The hostname is read from a binary key or an atom key of the AgentInfo,
+%% and is <<>> when the AgentInfo has none.
+hostname_key_shapes() ->
+    Cases = [{<<"g1-key-bin">>, #{<<"hostname">> => <<"h">>}, <<"h">>},
+             {<<"g1-key-atom">>, #{hostname => <<"h">>}, <<"h">>},
+             {<<"g1-key-none">>, #{}, <<>>}],
+    lists:foreach(
+      fun({Id, Info, Want}) ->
+              {ok, Pid} = yuzu_gw_agent:start_link(#{agent_id   => Id,
+                                                      session_id => <<Id/binary, "-s">>,
+                                                      stream_pid => self(),
+                                                      agent_info => Info,
+                                                      peer_addr  => <<"127.0.0.1">>}),
+              unlink(Pid),
+              {ok, Got} = yuzu_gw_agent:get_info(Pid),
+              ?assertEqual({Id, Want}, {Id, maps:get(hostname, Got)}),
+              stop_agent(Pid)
+      end, Cases).
+
+%% code_change/4 called directly on a record from before both owner restart
+%% (no owner_key) and the hostname-only owner (one element short, the AgentInfo
+%% map in the hostname slot). The tuple is built from a live owner's state, so the
+%% test does not hard-code the record: the hostname slot is the one element
+%% holding the owner's unique hostname, and the last element is dropped.
+code_change_pure_pre_g1_tuple() ->
+    Id = <<"g1-cc-pure">>,
+    {ok, Pid} = yuzu_gw_agent:start_link(#{agent_id   => Id,
+                                            session_id => <<Id/binary, "-s">>,
+                                            stream_pid => self(),
+                                            agent_info => #{hostname => <<"h-cc-pure-slot">>},
+                                            peer_addr  => <<"127.0.0.1">>}),
+    unlink(Pid),
+    {State, Live} = sys:get_state(Pid),
+    stop_agent(Pid),
+    Elems = tuple_to_list(Live),
+    [Slot] = [I || {I, E} <- lists:zip(lists:seq(1, length(Elems)), Elems),
+                   E =:= <<"h-cc-pure-slot">>],
+    Size = tuple_size(Live),
+    Short = erlang:delete_element(Size, Live),
+    Cases = [{#{<<"hostname">> => <<"h">>, <<"plugins">> => []}, <<"h">>},
+             {#{hostname => <<"h">>, plugins => []}, <<"h">>},
+             {#{plugins => []}, <<>>}],
+    lists:foreach(
+      fun({Info, Want}) ->
+              Old = setelement(Slot, Short, Info),
+              {ok, State, New} = yuzu_gw_agent:code_change(old_vsn, State, Old, []),
+              ?assertEqual(Size, tuple_size(New)),
+              ?assertEqual(Want, element(Slot, New)),
+              ?assertEqual(undefined, element(Size, New))
+      end, Cases).
+
+%% The owner keeps the hostname alone: a #data record from an earlier build
+%% holds the whole AgentInfo map in the hostname position. code_change/4
+%% reduces it to the hostname, and the upgraded owner still answers get_info/1 and dispatches.
+code_change_reduces_agent_info_to_hostname() ->
+    Args = #{agent_id   => <<"g1-cc">>,
+             session_id => <<"sess-g1-cc">>,
+             stream_pid => self(),
+             agent_info => #{hostname => <<"host-g1-cc">>,
+                             plugins  => [#{name => <<"svc">>}]},
+             peer_addr  => <<"127.0.0.1">>},
+    {ok, Pid} = yuzu_gw_agent:start_link(Args),
+    unlink(Pid),
+    OldInfo = #{hostname => <<"host-g1-cc">>, plugins => [#{name => <<"svc">>}]},
+    %% Put the old AgentInfo map where the hostname is: the only field of the
+    %% record that holds the binary <<"host-g1-cc">>.
+    Upgrade = fun(<<"host-g1-cc">>) -> OldInfo; (Other) -> Other end,
+    _ = sys:replace_state(Pid, fun({St, Data}) ->
+                                       {St, list_to_tuple([Upgrade(E) || E <- tuple_to_list(Data)])}
+                               end),
+    {_, Old} = sys:get_state(Pid),
+    ?assert(lists:member(OldInfo, tuple_to_list(Old))),
+    ok = sys:suspend(Pid),
+    ok = sys:change_code(Pid, yuzu_gw_agent, old_vsn, []),
+    ok = sys:resume(Pid),
+    {_, New} = sys:get_state(Pid),
+    ?assertNot(lists:member(OldInfo, tuple_to_list(New))),
+    {ok, Info} = yuzu_gw_agent:get_info(Pid),
+    ?assertEqual(<<"host-g1-cc">>, maps:get(hostname, Info)),
+    yuzu_gw_agent:dispatch(Pid, #{command_id => <<"cmd-g1-cc">>, plugin => <<"svc">>},
+                           {self(), make_ref()}),
+    receive {send_command, _} -> ok
+    after 2000 -> ?assert(false, "Expected {send_command, _} after code_change")
+    end,
     stop_agent(Pid).
 
 stream_handler_death() ->
