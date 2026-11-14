@@ -4,6 +4,7 @@ status-note: >-
   Status reconciled 2026-11-14 against dev @ 2c49b4ea0: this ADR's own `effective` clause binds
   the listed items on merge, and it is merged; the five items it excludes stay unsettled.
   Implementation has not started: no user-session helper code exists under `agents/`.
+  Kept accepted while unimplemented by @Tr3kkR (Nathan Dornbrook), 2026-11-14.
 date: 2026-07-30
 owner: "@Doomgoose (Alex Young)"
 deciders: >-

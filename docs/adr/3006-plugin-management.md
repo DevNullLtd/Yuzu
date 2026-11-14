@@ -5,11 +5,13 @@ status-note: >-
   it on merge as direction, and it is merged. Implementation is partial: the server-side
   enablement store (`server/core/src/enablement_store.{hpp,cpp}`, `enablement_state_core.hpp`,
   ADR-3005 schema v3) is built and opened at boot; enforcement on the endpoint is not delivered.
-  Recorded exception (owner ruling, PR #6360, merged 2026-10-23): every Echo capture source,
-  DNS and ARP included, was made on by default on every OS and moved to on for upgraded agents
+  Recorded exception (PR #6360, authored and merged by @Doomgoose, approved by @FortitudeEtc
+  (2026-10-23); its body records the ruling as an owner ruling without naming the owner): every
+  Echo capture source, DNS and ARP included, was made on by default on every OS and moved to on for upgraded agents
   (schema v8), ahead of the `effective` clause's "new defaults are not delivered ahead of
   enforcement" and of the D2 ordering. The other new defaults are not delivered: the four
   plugins seeded off at server start (`server.cpp` `seed_kill_switch_default_off`) stay off.
+  Kept accepted with this exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14.
 date: 2026-10-06
 owner: "@Doomgoose (Alex Young)"
 deciders: >-
@@ -47,9 +49,11 @@ context-refs: ["#5294", "#5355", "#5371", "#5372", "#5373", "#5374", "#5375", "#
 
 This ADR sets a direction. It is not current behaviour: nothing described here is in the product
 until the retrofit it calls for lands (see `effective` above, and D2). (2026-11-14: the server-side
-enablement store has landed and endpoint enforcement has not. One default shipped early by owner
-ruling: every Echo capture source is on by default (PR #6360, 2026-10-23). The other defaults are
-unchanged. See `status-note`.)
+enablement store has landed and endpoint enforcement has not. One default shipped early by a ruling
+recorded as an owner ruling: every Echo capture source is on by default (PR #6360, authored and
+merged by @Doomgoose, approved by @FortitudeEtc (2026-10-23); its body records the ruling as an
+owner ruling without naming the owner). The other defaults are unchanged. Kept accepted with this
+exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14. See `status-note`.)
 
 Yuzu will ship with everything in the box and everything switched on. Every plugin will be
 installed on every endpoint, and every capture source and every other unit that runs by itself
