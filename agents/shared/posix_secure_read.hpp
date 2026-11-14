@@ -70,6 +70,7 @@
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <utility>
 
@@ -299,6 +300,81 @@ inline FileRead read_file_no_follow(const std::string& path, std::size_t cap) {
 /// Read the regular file `name` under `dir_fd` (leaf not followed) up to `cap` bytes.
 inline FileRead read_file_no_follow_at(int dir_fd, const char* name, std::size_t cap) {
     return read_file_at(dir_fd, name, cap, Leaf::no_follow);
+}
+
+/// Move-only owner of a file descriptor (the file-side twin of ScopedDir).
+class ScopedFile {
+public:
+    ScopedFile() noexcept = default;
+    explicit ScopedFile(int fd) noexcept : fd_(fd) {}
+    ~ScopedFile() {
+        if (fd_ >= 0) ::close(fd_);
+    }
+    ScopedFile(const ScopedFile&) = delete;
+    ScopedFile& operator=(const ScopedFile&) = delete;
+    ScopedFile(ScopedFile&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    ScopedFile& operator=(ScopedFile&& o) noexcept {
+        if (this != &o) {
+            if (fd_ >= 0) ::close(fd_);
+            fd_ = o.fd_;
+            o.fd_ = -1;
+        }
+        return *this;
+    }
+    [[nodiscard]] int fd() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
+private:
+    int fd_ = -1;
+};
+
+/// Result of open_file_no_follow_at: the open regular file, or why not. `error`/`err` follow the
+/// read forms (symlink_refused for a link leaf, not_regular for a directory, FIFO or device,
+/// io + errno for the rest). `size` and `mtime` come from the fstat of the opened descriptor, so
+/// they describe the object that will be read, not the name it was reached by.
+struct FileOpen {
+    ScopedFile file;
+    ReadError error = ReadError::none;
+    int err = 0;
+    std::uint64_t size = 0;
+    struct timespec mtime {};
+    [[nodiscard]] bool opened() const noexcept { return file.valid(); }
+};
+
+/// Open the regular file `name` under `dir_fd` for ranged reads by the caller (pread, fstat), the
+/// leaf not followed. Same single-component contract, flags and by-descriptor regular-file check
+/// as the read forms; unlike them it reads nothing and applies no size cap.
+inline FileOpen open_file_no_follow_at(int dir_fd, const char* name) {
+    FileOpen out;
+    if (!detail::is_single_component(name)) {
+        out.error = ReadError::io;
+        out.err = EINVAL;
+        return out;
+    }
+    ScopedFile file{::openat(dir_fd, name, detail::kFileFlags)};
+    if (!file.valid()) {
+        out.err = errno;
+        out.error = out.err == ELOOP ? ReadError::symlink_refused : ReadError::io;
+        return out;
+    }
+    struct stat st {};
+    if (::fstat(file.fd(), &st) != 0) {
+        out.err = errno;
+        out.error = ReadError::io;
+        return out;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        out.error = ReadError::not_regular;
+        return out;
+    }
+    out.size = static_cast<std::uint64_t>(st.st_size);
+#if defined(__APPLE__)
+    out.mtime = st.st_mtimespec;
+#else
+    out.mtime = st.st_mtim;
+#endif
+    out.file = std::move(file);
+    return out;
 }
 
 } // namespace yuzu::shared

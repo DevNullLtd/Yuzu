@@ -356,6 +356,108 @@ TEST_CASE("posix_secure_read: Leaf::follow follows a link, still refuses non-reg
     CHECK(read_file_at(d.dir.fd(), "a/b", 64, Leaf::follow).err == EINVAL); // single-component guard holds
 }
 
+TEST_CASE("posix_secure_read: open_file_no_follow_at hands back an owned descriptor with the file's size and time",
+          "[shared][posix_secure_read]") {
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    write_file(tmp.path / "f", "hello");
+
+    auto root = open_dir_no_follow(tmp.path.string());
+    REQUIRE(root.opened());
+
+    int raw = -1;
+    {
+        auto f = open_file_no_follow_at(root.dir.fd(), "f");
+        REQUIRE(f.opened());
+        CHECK(f.error == ReadError::none);
+        CHECK(f.err == 0);
+        CHECK(f.size == 5);
+        CHECK(f.mtime.tv_sec > 0);
+        raw = f.file.fd();
+        CHECK((::fcntl(raw, F_GETFD) & FD_CLOEXEC) == FD_CLOEXEC);
+
+        // The descriptor serves ranged reads: nothing is read until the caller asks.
+        char buf[8]{};
+        CHECK(::pread(raw, buf, sizeof buf, 1) == 4);
+        CHECK(std::string(buf, 4) == "ello");
+
+        // Moving the owner transfers the descriptor; the moved-from handle no longer owns it.
+        ScopedFile moved{std::move(f.file)};
+        CHECK(moved.fd() == raw);
+        CHECK(f.file.fd() < 0);
+        CHECK_FALSE(f.opened());
+    }
+    // The only owner went out of scope, so the descriptor is closed.
+    const int closed_rc = ::fcntl(raw, F_GETFD);
+    const int closed_errno = errno;
+    CHECK(closed_rc == -1);
+    CHECK(closed_errno == EBADF);
+
+    // A file larger than any read cap still opens: there is no cap here.
+    write_file(tmp.path / "big", std::string(100000, 'z'));
+    auto big = open_file_no_follow_at(root.dir.fd(), "big");
+    REQUIRE(big.opened());
+    CHECK(big.size == 100000);
+}
+
+TEST_CASE("posix_secure_read: open_file_no_follow_at refuses a symlink, a directory and a FIFO",
+          "[shared][posix_secure_read]") {
+    // MUTATION: dropping O_NOFOLLOW from the open follows the link; dropping the by-descriptor
+    // S_ISREG check hands a directory or FIFO to a caller that preads it.
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    write_file(tmp.path / "real", "x");
+    fs::create_symlink(tmp.path / "real", tmp.path / "link");
+    fs::create_directory(tmp.path / "dir");
+    fs::create_directory_symlink(tmp.path / "dir", tmp.path / "dirlink");
+    REQUIRE(::mkfifo((tmp.path / "fifo").c_str(), 0600) == 0);
+
+    auto root = open_dir_no_follow(tmp.path.string());
+    REQUIRE(root.opened());
+    const int fd = root.dir.fd();
+
+    for (const char* name : {"link", "dirlink"}) {
+        INFO("name=" << name);
+        const auto link = open_file_no_follow_at(fd, name);
+        CHECK_FALSE(link.opened());
+        CHECK(link.error == ReadError::symlink_refused);
+        CHECK(link.err == ELOOP);
+    }
+    // O_NONBLOCK: a FIFO with no writer must not hang the open.
+    const auto fifo = open_file_no_follow_at(fd, "fifo");
+    CHECK_FALSE(fifo.opened());
+    CHECK(fifo.error == ReadError::not_regular);
+    const auto dir = open_file_no_follow_at(fd, "dir");
+    CHECK_FALSE(dir.opened());
+    CHECK(dir.error == ReadError::not_regular);
+
+    const auto missing = open_file_no_follow_at(fd, "nope");
+    CHECK_FALSE(missing.opened());
+    CHECK(missing.error == ReadError::io);
+    CHECK(missing.err == ENOENT);
+}
+
+TEST_CASE("posix_secure_read: open_file_no_follow_at keeps the single-component contract",
+          "[shared][posix_secure_read]") {
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directories(tmp.path / "sub" / "inner"));
+    write_file(tmp.path / "sub" / "inner" / "f", "x");
+    write_file(tmp.path / "marker", "secret");
+
+    auto sub = open_dir_no_follow((tmp.path / "sub").string());
+    REQUIRE(sub.opened());
+    for (const char* bad : {"inner/f", "..", "../marker", "/etc/hosts", "", "."}) {
+        INFO("name=\"" << bad << "\"");
+        const auto f = open_file_no_follow_at(sub.dir.fd(), bad);
+        CHECK_FALSE(f.opened());
+        CHECK(f.error == ReadError::io);
+        CHECK(f.err == EINVAL);
+    }
+    const auto null_name = open_file_no_follow_at(sub.dir.fd(), nullptr);
+    CHECK_FALSE(null_name.opened());
+    CHECK(null_name.err == EINVAL);
+}
+
 TEST_CASE("posix_secure_read: fdopendir failure closes its descriptor",
           "[shared][posix_secure_read]") {
     yuzu::test::TempDir tmp{"yuzu_test_psr_"};
