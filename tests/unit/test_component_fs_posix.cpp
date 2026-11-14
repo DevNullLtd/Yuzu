@@ -133,7 +133,8 @@ struct Fd {
 
 } // namespace
 
-TEST_CASE("component_legs: candidate_roots are absolute, unslashed machine roots", "[component_inventory][legs]") {
+TEST_CASE("component_legs: candidate_roots are absolute, unslashed machine roots",
+          "[runtime][component_inventory][legs]") {
     // The machine allowlist of installed_software_v3.cpp keeps /opt, /usr, /Applications, /Library.
     const auto roots = candidate_roots();
     CHECK_FALSE(roots.empty());
@@ -148,7 +149,8 @@ TEST_CASE("component_legs: candidate_roots are absolute, unslashed machine roots
     }
 }
 
-TEST_CASE("component_legs: plan_targets drops a root on or under a network mount", "[component_inventory][legs]") {
+TEST_CASE("component_legs: plan_targets drops a root on or under a network mount",
+          "[runtime][component_inventory][legs]") {
     SECTION("a root ON a network mount is dropped and counted") {
         const auto t = plan_targets({"/opt", "/usr/lib/jvm"}, {"/opt"}, true);
         CHECK(t.roots == std::vector<std::string>{"/usr/lib/jvm"});
@@ -195,7 +197,8 @@ TEST_CASE("component_legs: plan_targets drops a root on or under a network mount
     }
 }
 
-TEST_CASE("component_legs: an unreadable mount table yields no roots and says so", "[component_inventory][legs]") {
+TEST_CASE("component_legs: an unreadable mount table yields no roots and says so",
+          "[runtime][component_inventory][legs]") {
     // MUTATION: treating table_ok == false as "no mounts" would walk with no guard at all.
     const auto t = plan_targets({"/opt", "/usr/lib/jvm"}, {"/opt"}, false);
     CHECK(t.mount_table_unreadable);
@@ -206,7 +209,7 @@ TEST_CASE("component_legs: an unreadable mount table yields no roots and says so
 }
 
 TEST_CASE("component_legs: read_mountinfo_stream finds the network mounts however the table is cut into reads",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     const std::string table = kLocalMount + kNfsMount;
     const std::vector<std::string> want{"/opt/share"};
     CHECK(read_mountinfo_stream(serve(table, 4096)) == want);
@@ -234,7 +237,7 @@ TEST_CASE("component_legs: read_mountinfo_stream finds the network mounts howeve
 }
 
 TEST_CASE("component_legs: a mount table that fails part-way is unreadable, never the part read so far",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     // MUTATION: returning the accumulated vector on a failed read hands back a table missing the
     // network mounts that follow, and the scan would walk into them.
     SECTION("a chunk of local mounts, then EIO, with an NFS mount still unread") {
@@ -249,7 +252,7 @@ TEST_CASE("component_legs: a mount table that fails part-way is unreadable, neve
 }
 
 TEST_CASE("component_legs: a mount-table line over 1 MiB is a failure however it arrives",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     // MUTATION: checking only the unfinished tail accepts the second case (the newline arrives in the
     // same read as the last bytes, so the line is complete before any tail check sees it).
     SECTION("exactly 1 MiB is accepted, and a mount after it is still read") {
@@ -270,7 +273,7 @@ TEST_CASE("component_legs: a mount-table line over 1 MiB is a failure however it
 }
 
 TEST_CASE("component_legs: scan_targets over a table that fails part-way yields no roots and touches nothing",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     std::vector<std::string> log;
     const auto on_access = [&log](const std::string& p) { log.push_back(p); };
 
@@ -296,7 +299,7 @@ TEST_CASE("component_legs: scan_targets over a table that fails part-way yields 
 }
 
 TEST_CASE("component_legs: scan_targets drops a candidate root on a mount named by the stream, unopened",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     const auto cands = candidate_roots();
     REQUIRE_FALSE(cands.empty());
     std::vector<std::string> log;
@@ -310,7 +313,7 @@ TEST_CASE("component_legs: scan_targets drops a candidate root on a mount named 
 }
 
 TEST_CASE("component_legs: a root reached through a link at any component is dropped and counted",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "real" / "lib"));
     fs::create_directory_symlink(t.root / "real", t.root / "linked");           // intermediate component
@@ -331,7 +334,7 @@ TEST_CASE("component_legs: a root reached through a link at any component is dro
 }
 
 TEST_CASE("component_legs: a root that cannot be opened for another reason stays, so the walk reports it",
-          "[component_inventory][legs]") {
+          "[runtime][component_inventory][legs]") {
     if (::geteuid() == 0)
         SKIP("root bypasses mode bits");
     Tree t;
@@ -350,7 +353,7 @@ TEST_CASE("component_legs: a root that cannot be opened for another reason stays
     CHECK(listing.error);
 }
 
-TEST_CASE("component_fs_posix: list types every entry from d_type", "[component_inventory][fs_posix]") {
+TEST_CASE("component_fs_posix: list types every entry from d_type", "[runtime][component_inventory][fs_posix]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "d" / "sub"));
     write_file(t.root / "d" / "a.jar", "a");
@@ -376,7 +379,7 @@ TEST_CASE("component_fs_posix: list types every entry from d_type", "[component_
 }
 
 TEST_CASE("component_fs_posix: list refuses a path that is missing, relative or holds a NUL",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     const auto ops = plain_ops();
     CHECK(ops.list((t.root / "nope").string(), 100).error);
@@ -389,7 +392,7 @@ TEST_CASE("component_fs_posix: list refuses a path that is missing, relative or 
 }
 
 TEST_CASE("component_fs_posix: a directory swapped for a link after its listing is refused",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "app" / "sub"));
     REQUIRE(fs::create_directories(t.root / "app" / "inner"));
@@ -421,7 +424,7 @@ TEST_CASE("component_fs_posix: a directory swapped for a link after its listing 
 }
 
 TEST_CASE("component_fs_posix: a file swapped for a link after its listing is not opened",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "app"));
     write_file(t.root / "app" / "a.jar", "AAAA");
@@ -450,7 +453,7 @@ TEST_CASE("component_fs_posix: a file swapped for a link after its listing is no
     CHECK(ops.open_file((t.root / "other.jar").string()).has_value());
 }
 
-TEST_CASE("component_fs_posix: read_at serves ranges from one descriptor", "[component_inventory][fs_posix]") {
+TEST_CASE("component_fs_posix: read_at serves ranges from one descriptor", "[runtime][component_inventory][fs_posix]") {
     Tree t;
     std::string body(40000, '\0');
     for (std::size_t i = 0; i < body.size(); ++i)
@@ -492,7 +495,7 @@ TEST_CASE("component_fs_posix: read_at serves ranges from one descriptor", "[com
 }
 
 TEST_CASE("component_fs_posix: unchanged() detects an in-place change of size or time",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     const auto grown = (t.root / "grown.bin").string();
     const auto touched = (t.root / "touched.bin").string();
@@ -519,7 +522,7 @@ TEST_CASE("component_fs_posix: unchanged() detects an in-place change of size or
 }
 
 TEST_CASE("component_fs_posix: a network mount point is typed from its path and never stat'ed or opened",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "mnt"));
     REQUIRE(fs::create_directories(t.root / "plain"));
@@ -557,7 +560,7 @@ TEST_CASE("component_fs_posix: a network mount point is typed from its path and 
 }
 
 TEST_CASE("component_fs_posix: classify_dirent never stats a network mount, whatever d_type says",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     // MUTATION: moving the mount check below the DT_UNKNOWN fstatat fails the first two checks (the
     // mount point is stat'ed, which can block on a dead server or trigger an automount).
     Tree t;
@@ -578,7 +581,7 @@ TEST_CASE("component_fs_posix: classify_dirent never stats a network mount, what
 }
 
 TEST_CASE("component_fs_posix: classify_dirent resolves DT_UNKNOWN with a no-follow stat",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "d"));
     write_file(t.root / "f.jar", "x");
@@ -612,7 +615,7 @@ TEST_CASE("component_fs_posix: classify_dirent resolves DT_UNKNOWN with a no-fol
 }
 
 TEST_CASE("component_fs_posix: the walk over the real leg skips links and mounts and reaches the jars",
-          "[component_inventory][fs_posix]") {
+          "[runtime][component_inventory][fs_posix]") {
     Tree t;
     REQUIRE(fs::create_directories(t.root / "app" / "lib"));
     REQUIRE(fs::create_directories(t.root / "app" / "mnt"));

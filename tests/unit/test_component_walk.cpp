@@ -388,7 +388,7 @@ TEST_CASE("component walk: links, network mounts and other entries are counted a
     CHECK(r.stats.entries == 7 + 1);
 }
 
-TEST_CASE("component walk: excluded directories are skipped on both separators, case-insensitively, and are not a gap",
+TEST_CASE("component walk: Windows OS trees are skipped on a backslash walk only, and are not a gap",
           "[runtime][component_walk]") {
     SECTION("backslash separator") {
         FakeFs fs;
@@ -406,22 +406,21 @@ TEST_CASE("component walk: excluded directories are skipped on both separators, 
         CHECK(fs.listed == std::vector<std::string>{"C:\\", "C:\\Program Files", "C:\\Apps",
                                                     "C:\\Program Files\\Java"});
     }
-    SECTION("forward slash on a Windows path and the POSIX /System") {
+    SECTION("forward slash: the same names are ordinary directories, listed, and the walk stays complete") {
         FakeFs fs;
-        fs.dir("C:/", {D("WINDOWS"), D("Apps")});
-        fs.dir("C:/Apps", {F("a.jar")});
-        fs.dir("/", {D("System"), D("opt")});
-        fs.dir("/opt", {F("o.jar")});
+        fs.dir("/opt", {D("System"), D("Windows"), D("System32"), D("app")});
+        fs.dir("/opt/System", {F("bundle.jar")});
+        fs.dir("/opt/Windows", {F("w.jar")});
+        fs.dir("/opt/System32", {F("s.jar")});
+        fs.dir("/opt/app", {F("a.jar")});
 
-        const auto w = run(fs, {}, {"C:/"});
-        CHECK(w.stop == Stop::complete);
-        CHECK(paths(w) == std::vector<std::string>{"C:/Apps/a.jar"});
+        const auto r = run(fs, {}, {"/opt"});
 
-        fs.listed.clear();
-        const auto p = run(fs, {}, {"/"});
-        CHECK(p.stop == Stop::complete);
-        CHECK(paths(p) == std::vector<std::string>{"/opt/o.jar"});
-        CHECK(fs.listed == std::vector<std::string>{"/", "/opt"});
+        CHECK(r.stop == Stop::complete);
+        CHECK(paths(r) == std::vector<std::string>{"/opt/System/bundle.jar", "/opt/Windows/w.jar",
+                                                   "/opt/System32/s.jar", "/opt/app/a.jar"});
+        CHECK(fs.listed == std::vector<std::string>{"/opt", "/opt/System", "/opt/Windows", "/opt/System32",
+                                                    "/opt/app"});
     }
 }
 

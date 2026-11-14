@@ -1513,7 +1513,7 @@ read) and `mount_table_unreadable` (nothing is walked, because a network mount c
 local one). The rows that were reachable are returned at both levels. Reported but not blocking
 (informational tokens on a `supported` row): `root_link_skipped`, `network_fs_skipped` and
 `version_unreadable` (a row whose version no source gives is listed with `version_source` `unreadable`).
-Directories of system trees (for example `Windows`, `System32`) are skipped silently.
+A missing root is skipped silently.
 
 **Fuzz harness.** `tests/fuzz/fuzz_component_zip.cpp` drives the ZIP central-directory reader
 (`zip_directory.hpp`: the end-record search, the directory walk and the local-header offset) with

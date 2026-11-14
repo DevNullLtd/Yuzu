@@ -119,7 +119,7 @@ std::optional<LoadedPlugin> load_plugin() {
 } // namespace
 
 TEST_CASE("component_inventory plugin: exactly one action, `scan`, with the declared legs",
-          "[component_inventory][descriptors]") {
+          "[runtime][component_inventory][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) {
         require_plugin_or_skip();

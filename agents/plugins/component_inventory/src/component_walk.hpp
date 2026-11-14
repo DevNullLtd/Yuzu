@@ -21,8 +21,10 @@
  * reaching it is an incomplete walk, never a silent cut (ADR-0028 Decision 4,
  * docs/adr/0028-agent-component-inventory-collection.md).
  *
- * Excluded directories (system trees that hold no application components) are skipped on both path
- * separators, case-insensitively. A skip is deliberate and does not make the walk incomplete.
+ * Excluded directories are Windows OS trees (WindowsApps, Windows Kits, WinSxS, Windows, System32,
+ * SysWOW64), matched by name case-insensitively and ONLY on a backslash walk. A '/' walk (Linux, macOS)
+ * excludes nothing by name: those names are ordinary application directories there (an OSGi container
+ * keeps its bundles in <product>/system). A skip is deliberate and does not make the walk incomplete.
  * Links, network mounts and other entry types are never listed; each is counted in its own stat.
  */
 #pragma once
@@ -154,13 +156,17 @@ namespace walk_detail {
     return ends_with_ci(n, ".jar") || ends_with_ci(n, ".war") || ends_with_ci(n, ".ear");
 }
 
-// Both separators are treated alike, so one list covers the Windows and POSIX spellings.
-[[nodiscard]] inline bool is_excluded_dir(std::string_view path) noexcept {
-    static constexpr std::string_view kNames[] = {"/windowsapps", "/windows kits", "/winsxs", "/windows",
-                                                  "/system32",    "/syswow64",     "/system"};
+// Windows OS trees, by name. Applies only to a backslash walk: the fixed roots of the POSIX legs hold no OS
+// tree, so on a '/' walk the same names can only be application directories and are listed, never skipped.
+// The name match is not anchored to a volume root; the Windows leg must anchor it before it ships.
+[[nodiscard]] inline bool is_excluded_dir(std::string_view path, char sep) noexcept {
+    if (sep != '\\')
+        return false;
+    static constexpr std::string_view kNames[] = {"\\windowsapps", "\\windows kits", "\\winsxs",
+                                                  "\\windows",     "\\system32",     "\\syswow64"};
     std::string norm(path);
     for (char& c : norm)
-        c = (c == '\\') ? '/' : ascii_lower(c);
+        c = ascii_lower(c);
     for (auto n : kNames)
         if (ends_with_ci(norm, n))
             return true;
@@ -242,7 +248,7 @@ namespace walk_detail {
                         continue;
                     }
                     std::string path = walk_detail::join(cur.path, e.name, sep);
-                    if (walk_detail::is_excluded_dir(path))
+                    if (walk_detail::is_excluded_dir(path, sep))
                         continue;
                     queue.push_back({std::move(path), cur.depth + 1, cur.anchor.empty() ? e.name : cur.anchor});
                     continue;

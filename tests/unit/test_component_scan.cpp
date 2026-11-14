@@ -90,7 +90,7 @@ Zip victim_zip() {
 } // namespace
 
 TEST_CASE("scan: rows carry the right version_source for each way a version is found",
-          "[component_scan]") {
+          "[runtime][component_scan]") {
     MemTree tree;
     tree.add_file("/opt/acme/lib/log4j-core-2.17.1.jar", build_zip({stored("a.class", "x")}).bytes);
     tree.add_file("/opt/acme/lib/widget.jar",
@@ -133,7 +133,7 @@ TEST_CASE("scan: rows carry the right version_source for each way a version is f
 }
 
 TEST_CASE("scan: pom.properties beats the manifest, and an unreadable pom falls back to it",
-          "[component_scan]") {
+          "[runtime][component_scan]") {
     MemTree tree;
     tree.add_file("/opt/a/both.jar", build_zip({deflated("META-INF/MANIFEST.MF", manifest_with("2.0")),
                                                 deflated(kPomEntry, pom_with("1.0"))})
@@ -156,7 +156,7 @@ TEST_CASE("scan: pom.properties beats the manifest, and an unreadable pom falls 
 }
 
 TEST_CASE("scan: a fat jar is one outer row and one row per nested library, none inflated",
-          "[component_scan]") {
+          "[runtime][component_scan]") {
     MemTree tree;
     const auto zip = build_zip({stored("BOOT-INF/classes/A.class", "x"),
                                 nested_lib("BOOT-INF/lib/spring-core-5.3.1.jar", 123456),
@@ -195,7 +195,7 @@ TEST_CASE("scan: a fat jar is one outer row and one row per nested library, none
 }
 
 TEST_CASE("scan: a manifest over 64 KiB is unreadable, nothing past the cap is inflated, scan stays complete",
-          "[component_scan]") {
+          "[runtime][component_scan]") {
     SECTION("declared over the cap: the body is never read") {
         MemTree tree;
         const std::string big(100 * 1024, 'a');
@@ -256,7 +256,7 @@ TEST_CASE("scan: a manifest over 64 KiB is unreadable, nothing past the cap is i
     }
 }
 
-TEST_CASE("scan: an executable jar with prepended bytes is read at the shifted offsets", "[component_scan]") {
+TEST_CASE("scan: an executable jar with prepended bytes is read at the shifted offsets", "[runtime][component_scan]") {
     MemTree tree;
     tree.add_file("/opt/a/launcher.jar",
                   build_zip({deflated("META-INF/MANIFEST.MF", manifest_with("4.2")),
@@ -271,7 +271,7 @@ TEST_CASE("scan: an executable jar with prepended bytes is read at the shifted o
     CHECK(find_row(r, "dep") != nullptr);
 }
 
-TEST_CASE("scan: a file name the parser refuses still gets a row", "[component_scan]") {
+TEST_CASE("scan: a file name the parser refuses still gets a row", "[runtime][component_scan]") {
     MemTree tree;
     tree.add_file("/opt/a/caf\xC3\xA9-1.0.jar", build_zip({stored("a.class", "x")}).bytes);
     const auto r = run(tree);
@@ -282,7 +282,7 @@ TEST_CASE("scan: a file name the parser refuses still gets a row", "[component_s
 }
 
 TEST_CASE("scan: an archive that cannot be enumerated is never complete, and its outer row stays",
-          "[component_scan][completeness]") {
+          "[runtime][component_scan][completeness]") {
     struct Case {
         const char* name;
         Stop expect;
@@ -347,7 +347,7 @@ TEST_CASE("scan: an archive that cannot be enumerated is never complete, and its
 }
 
 TEST_CASE("scan: an unenumerable archive with no version in its name is an unreadable row and incomplete",
-          "[component_scan][completeness]") {
+          "[runtime][component_scan][completeness]") {
     MemTree tree;
     tree.add_file("/opt/a/plain.jar", "garbage");
     const auto r = run(tree);
@@ -358,7 +358,7 @@ TEST_CASE("scan: an unenumerable archive with no version in its name is an unrea
 }
 
 TEST_CASE("scan: the first cause recorded is reported, the walk's before the archives'",
-          "[component_scan][completeness]") {
+          "[runtime][component_scan][completeness]") {
     MemTree tree;
     tree.add_file("/opt/a/broken.jar", "garbage");
     tree.dangling_dir("/opt/gone");
@@ -368,7 +368,7 @@ TEST_CASE("scan: the first cause recorded is reported, the walk's before the arc
 }
 
 TEST_CASE("scan: one deadline covers the archive phase, and no archive is opened after it",
-          "[component_scan][budget]") {
+          "[runtime][component_scan][budget]") {
     SECTION("expiry between archives") {
         MemTree tree;
         for (const char* d : {"a", "b", "c"})
@@ -425,7 +425,7 @@ TEST_CASE("scan: one deadline covers the archive phase, and no archive is opened
     }
 }
 
-TEST_CASE("scan: every archive is opened once and read only through that view", "[component_scan]") {
+TEST_CASE("scan: every archive is opened once and read only through that view", "[runtime][component_scan]") {
     MemTree tree;
     tree.add_file("/opt/a/one.jar",
                   build_zip({deflated(kPomEntry, pom_with("1.1")), nested_lib("lib/x-1.jar", 1)}).bytes);
@@ -443,7 +443,7 @@ TEST_CASE("scan: every archive is opened once and read only through that view", 
     }
 }
 
-TEST_CASE("scan: row caps are recorded, never silent", "[component_scan][budget]") {
+TEST_CASE("scan: row caps are recorded, never silent", "[runtime][component_scan][budget]") {
     const auto fat = [] {
         std::vector<Entry> e;
         for (int i = 0; i < 5; ++i)
@@ -479,7 +479,8 @@ TEST_CASE("scan: row caps are recorded, never silent", "[component_scan][budget]
     }
 }
 
-TEST_CASE("verdict: only a complete scan is supported; the table is a pure function", "[component_scan][verdict]") {
+TEST_CASE("verdict: only a complete scan is supported; the table is a pure function",
+          "[runtime][component_scan][verdict]") {
     const Stop all[] = {Stop::budget_entries, Stop::budget_time,   Stop::anchor_rows,
                         Stop::section_rows,   Stop::depth,         Stop::dir_unreadable,
                         Stop::dir_truncated,  Stop::archive_unenumerated, Stop::archive_changed};
@@ -518,7 +519,7 @@ TEST_CASE("verdict: only a complete scan is supported; the table is a pure funct
     }
 }
 
-TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[component_scan][heartbeat]") {
+TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[runtime][component_scan][heartbeat]") {
     MemTree tree;
     tree.add_file("/opt/a/fat-1.0.jar", build_zip({nested_lib("lib/x-1.jar", 1)}).bytes);
     tree.add_dir("/opt/a/sub");
@@ -546,7 +547,7 @@ TEST_CASE("heartbeat: six keys the agent can publish, decimal values", "[compone
     CHECK(kHeartbeatKeys.size() <= yuzu::agent::kPluginHeartbeatMaxKeys);
 }
 
-TEST_CASE("wire row: nine fields, every text field escaped", "[component_scan][wire]") {
+TEST_CASE("wire row: nine fields, every text field escaped", "[runtime][component_scan][wire]") {
     Row r;
     r.kind = "java";
     r.name = "a|b";
@@ -611,7 +612,7 @@ Answer answer_over(MemTree& tree, const FakeTargets& t = {}) {
 
 } // namespace
 
-TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[component_scan][answer]") {
+TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[runtime][component_scan][answer]") {
     int made = 0;
     int touched = 0;
     FakeTargets t;
@@ -645,7 +646,7 @@ TEST_CASE("answer: an unreadable mount table walks nothing and says so", "[compo
 }
 
 TEST_CASE("answer: a readable table scans through the factory and carries what the targets dropped",
-          "[component_scan][answer]") {
+          "[runtime][component_scan][answer]") {
     MemTree tree;
     tree.add_file("/opt/a/lib-1.0.jar", build_zip({stored("x", "y")}).bytes);
     FakeTargets t;
@@ -668,7 +669,7 @@ TEST_CASE("answer: a readable table scans through the factory and carries what t
 }
 
 TEST_CASE("emit: rows first, the typed result, then all six heartbeat keys with the scan's values",
-          "[component_scan][answer][heartbeat]") {
+          "[runtime][component_scan][answer][heartbeat]") {
     MemTree tree;
     tree.add_file("/opt/a/fat-1.0.jar", build_zip({nested_lib("lib/x-1.jar", 1)}).bytes);
     tree.list_step = 5ms;
@@ -702,7 +703,7 @@ TEST_CASE("emit: rows first, the typed result, then all six heartbeat keys with 
 }
 
 TEST_CASE("emit: an incomplete scan still writes its rows and answers CONSTRAINED/PARTIAL with the cause",
-          "[component_scan][answer]") {
+          "[runtime][component_scan][answer]") {
     MemTree tree;
     tree.add_file("/opt/a/ok-1.0.jar", build_zip({stored("x", "y")}).bytes);
     tree.dangling_dir("/opt/gone");
@@ -722,7 +723,7 @@ TEST_CASE("emit: an incomplete scan still writes its rows and answers CONSTRAINE
     CHECK(kv.sets.size() == kHeartbeatKeys.size()); // the cost of a degraded scan is published too
 }
 
-TEST_CASE("emit: no plugin context is tolerated", "[component_scan][answer]") {
+TEST_CASE("emit: no plugin context is tolerated", "[runtime][component_scan][answer]") {
     MemTree tree;
     tree.add_file("/opt/a/ok-1.0.jar", build_zip({stored("x", "y")}).bytes);
     const auto a = answer_over(tree);
@@ -733,7 +734,7 @@ TEST_CASE("emit: no plugin context is tolerated", "[component_scan][answer]") {
 }
 
 TEST_CASE("emit and catch-all: the status row is owed exactly when no row was written",
-          "[component_scan][answer]") {
+          "[runtime][component_scan][answer]") {
     MemTree tree;
     tree.add_file("/opt/a/ok-1.0.jar", build_zip({stored("x", "y")}).bytes);
     const auto a = answer_over(tree);
@@ -770,7 +771,7 @@ TEST_CASE("emit and catch-all: the status row is owed exactly when no row was wr
     }
 }
 
-TEST_CASE("catch-all: a failure while answering is swallowed, never thrown", "[component_scan][answer]") {
+TEST_CASE("catch-all: a failure while answering is swallowed, never thrown", "[runtime][component_scan][answer]") {
     SECTION("the row fails: the typed result still lands") {
         FakeCtx ctx;
         ctx.throw_on_write = 0;
@@ -815,7 +816,7 @@ struct TempTree {
 
 } // namespace
 
-TEST_CASE("scan: through the real POSIX leg over a materialised tree", "[component_scan][posix]") {
+TEST_CASE("scan: through the real POSIX leg over a materialised tree", "[runtime][component_scan][posix]") {
     TempTree tmp;
     tmp.write("app/lib/widget.jar",
               build_zip({deflated(kPomEntry, pom_with("3.4.5"))}).bytes);

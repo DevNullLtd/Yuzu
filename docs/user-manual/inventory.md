@@ -441,8 +441,7 @@ It reads the archive files themselves in-process; nothing is started or unpacked
 - **Reported without blocking the answer.** A root dropped because it is a link
   (`root_link_skipped`), a root or directory on a network mount that was passed over
   (`network_fs_skipped`) and a row with no readable version (`version_unreadable`) ride the
-  `supported` status row as information. Missing roots and system trees such as `Windows` or
-  `System` directories are skipped silently.
+  `supported` status row as information. A missing root is skipped silently.
 - **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
   yet, so they do not appear in the software inventory views.
 
