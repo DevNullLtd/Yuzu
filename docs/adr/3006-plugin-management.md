@@ -7,9 +7,12 @@ status-note: >-
   ADR-3005 schema v3) is built and opened at boot; enforcement on the endpoint is not delivered.
   Recorded exception (PR #6360, authored and merged by @Doomgoose, approved by @FortitudeEtc
   (2026-10-23); its body records the ruling as an owner ruling without naming the owner): every
-  Echo capture source, DNS and ARP included, was made on by default on every OS and moved to on for upgraded agents
-  (schema v8), ahead of the `effective` clause's "new defaults are not delivered ahead of
-  enforcement" and of the D2 ordering. The other new defaults are not delivered: the four
+  Echo capture source, DNS and ARP included, was made on by default on every OS where it is
+  supported, and upgraded agents were moved to on (Echo schema v8), including the eight
+  formerly opt-in sources an operator had switched off before the upgrade. That departs from
+  three normative clauses: the `effective` clause's "new defaults are not delivered ahead of
+  enforcement", the D2 ordering, and D9 ("whatever is off at the moment of upgrade ... stays
+  off"). The other new defaults are not delivered: the four
   plugins seeded off at server start (`server.cpp` `seed_kill_switch_default_off`) stay off.
   Kept accepted with this exception recorded by @Tr3kkR (Nathan Dornbrook), 2026-11-14.
 date: 2026-10-06
