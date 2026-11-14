@@ -1795,8 +1795,7 @@ routes accept a `vers:` range. No schema change: the `purl` column and its parti
   a scheme's own ordering at the edges (Maven qualifiers, PyPI post and dev releases, written
   epochs) can differ. `deb` and `rpm` are refused by name as not supported yet, any other scheme
   is unknown; both are a `400`, never an unbounded match. The text is bounded (1024 bytes, 32
-  constraints, scheme `[a-z0-9.+-]{1,32}`), carries no control byte or space, and an error never
-  echoes the input.
+  constraints), carries no control byte or space, and an error never echoes the input.
 - **The CVE matcher shares only the interval core.** `nvd_version_in_range`'s bounded branch calls
   `vers::in_interval` once for the inclusive pair and once for the exclusive pair under
   `nvd_version_compare`; results are identical (pinned by `test_nvd.cpp`). The matcher's

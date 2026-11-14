@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "purl_compose.hpp"
 #include "software_list_model.hpp"
 
 #include <algorithm>
@@ -156,7 +157,14 @@ TEST_CASE("parse_list_params: purl must start pkg:, is bounded, and is exact-mat
         REQUIRE_FALSE(r);
         CHECK(r.error() == "invalid purl (expected pkg:...)");
     }
-    CHECK_FALSE(parse_list_params(params({{"purl", "pkg:deb/" + std::string(1100, 'a')}})));
+    // The bound is the stored-purl cap: exactly kMaxPurlBytes is accepted, one more is refused.
+    const std::string prefix = "pkg:deb/";
+    CHECK(parse_list_params(
+        params({{"purl", prefix + std::string(yuzu::server::kMaxPurlBytes - prefix.size(), 'a')}})));
+    const auto over = parse_list_params(
+        params({{"purl", prefix + std::string(yuzu::server::kMaxPurlBytes - prefix.size() + 1, 'a')}}));
+    REQUIRE_FALSE(over);
+    CHECK(over.error() == "parameter too long");
     CHECK_FALSE(parse_list_params(params({{"purl", std::string("pkg:deb/a\0b", 11)}})));
 }
 

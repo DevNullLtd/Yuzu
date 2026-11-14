@@ -3,6 +3,7 @@
 #include "data_export.hpp"
 #include "list_keyset.hpp"
 #include "model_param_helpers.hpp"
+#include "purl_compose.hpp"
 #include "software_catalog_rules.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -44,8 +45,6 @@ void tail(std::string& out, std::string_view key, const std::string& v) {
         out += ::yuzu::log_token(v);
     }
 }
-
-constexpr std::size_t kPurlMaxBytes = 1024;
 
 std::string_view match_name(NameMatch m) {
     return m == NameMatch::kExact ? "exact" : m == NameMatch::kPrefix ? "prefix" : "contains";
@@ -146,12 +145,12 @@ std::expected<ListRequest, std::string> parse_list_params(const Params& p) {
             version_rule_error(base->query.version.has_value(), *common, base->query.name))
         return std::unexpected(*bad);
     // purl: matched by byte equality with the stored canonical purl; only the scheme prefix is
-    // validated here (the same text bounds as every other filter), a value no row carries just
-    // matches nothing.
+    // validated here, and the length bound is the stored-purl cap (kMaxPurlBytes), so any purl a
+    // row can return is also accepted as a filter. A value no row carries just matches nothing.
     std::string purl = get(p, "purl");
     if (!valid_text(purl))
         return std::unexpected("invalid parameter encoding");
-    if (purl.size() > kPurlMaxBytes)
+    if (purl.size() > kMaxPurlBytes)
         return std::unexpected("parameter too long");
     if (!purl.empty() && !purl.starts_with("pkg:"))
         return std::unexpected("invalid purl (expected pkg:...)");

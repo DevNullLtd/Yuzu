@@ -47,7 +47,6 @@ bool in(const vers::Range& r, std::string_view v) { return vers::contains(r, v, 
 
 TEST_CASE("vers parse: a single interval and a bare version", "[server][vers]") {
     const auto r = make("vers:generic/>=2.0|<2.17");
-    CHECK(r.scheme == "generic");
     CHECK_FALSE(r.all);
     REQUIRE(r.constraints.size() == 2);
     CHECK(r.constraints[0].op == vers::Op::kGe);
@@ -159,11 +158,13 @@ TEST_CASE("vers refusals: deb and rpm by name, any other scheme unknown, never a
     CHECK(refusal("vers:golang/>=1.0") == "unknown vers scheme");
     // The unknown scheme is never echoed.
     CHECK(refusal("vers:nope/>=1.0").find("nope") == std::string::npos);
-    CHECK(vers::scheme_support("deb") == vers::SchemeSupport::kNotYet);
-    CHECK(vers::scheme_support("rpm") == vers::SchemeSupport::kNotYet);
-    CHECK(vers::scheme_support("generic") == vers::SchemeSupport::kSupported);
-    CHECK(vers::scheme_support("Generic") == vers::SchemeSupport::kUnknown);
-    CHECK(vers::scheme_support("") == vers::SchemeSupport::kUnknown);
+    for (const char* ok : {"generic", "semver", "maven", "npm", "pypi", "nuget"}) {
+        CAPTURE(ok);
+        CHECK(vers::parse(std::string("vers:") + ok + "/>=1"));
+    }
+    // Scheme names are case-sensitive, and an empty one is unknown.
+    CHECK(refusal("vers:Generic/>=1") == "unknown vers scheme");
+    CHECK(refusal("vers:/>=1") == "unknown vers scheme");
 }
 
 TEST_CASE("vers parse: malformed shapes are refused", "[server][vers]") {
@@ -173,7 +174,7 @@ TEST_CASE("vers parse: malformed shapes are refused", "[server][vers]") {
                             "vers:generic",        // no constraints part
                             "vers:generic/",       // empty constraint list
                             "vers:/>=1",           // empty scheme
-                            "vers:Generic/>=1",    // scheme is [a-z0-9.+-]
+                            "vers:Generic/>=1",    // scheme names are lower case
                             "vers:gen_eric/>=1",
                             "vers:generic/>=",     // comparator with no version
                             "vers:generic/>=1||<2",// empty constraint between bars
@@ -192,7 +193,8 @@ TEST_CASE("vers parse: malformed shapes are refused", "[server][vers]") {
     CHECK(vers::parse("vers:generic/>=SECRET%zz").error().find("SECRET") == std::string::npos);
 }
 
-TEST_CASE("vers parse: bounds on size, constraint count, scheme length and bytes", "[server][vers]") {
+TEST_CASE("vers parse: bounds on size, constraint count, an over-long scheme and bytes",
+          "[server][vers]") {
     // Input size: 1024 bytes is accepted, 1025 refused.
     const std::string head = "vers:generic/=";
     CHECK(vers::parse(head + std::string(vers::kMaxInputBytes - head.size(), '1')));
@@ -213,11 +215,10 @@ TEST_CASE("vers parse: bounds on size, constraint count, scheme length and bytes
     REQUIRE_FALSE(over);
     CHECK(over.error() == "vers has too many constraints");
 
-    // Scheme length: 32 accepted (then refused as unknown, not as malformed), 33 malformed.
-    CHECK(vers::parse("vers:" + std::string(vers::kMaxSchemeBytes, 'a') + "/>=1").error() ==
-          "unknown vers scheme");
-    CHECK(vers::parse("vers:" + std::string(vers::kMaxSchemeBytes + 1, 'a') + "/>=1").error() ==
-          "invalid vers scheme");
+    // An over-long scheme is just an unknown one, and is never echoed.
+    const std::string long_scheme = refusal("vers:" + std::string(512, 'Q') + "/>=1");
+    CHECK(long_scheme == "unknown vers scheme");
+    CHECK(long_scheme.find('Q') == std::string::npos);
 
     // Control bytes, NUL and spaces anywhere are refused, raw or after a percent escape.
     for (const std::string& bad : {std::string("vers:generic/>=1\n"), std::string("vers:generic/>=1\t"),

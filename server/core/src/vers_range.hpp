@@ -11,13 +11,14 @@
 ///  * GRAMMAR: `vers:<scheme>/<c1>|<c2>|...`. A constraint is a comparator (`=` `!=` `<` `<=` `>`
 ///    `>=`) followed by a version; a bare version means `=`; `*` alone (nothing else) matches every
 ///    version. Versions are percent-decoded. The whole text is bounded (kMaxInputBytes,
-///    kMaxConstraints, kMaxSchemeBytes) and carries no control byte or space; the parser never
-///    echoes caller text in an error.
+///    kMaxConstraints) and carries no control byte or space; the parser never echoes caller text
+///    in an error.
 ///  * SCHEMES: generic, semver, maven, npm, pypi and nuget are evaluated, ALL under the one
 ///    comparator the caller passes (the catalogue's). That is a documented approximation: a
 ///    scheme's own edge ordering (maven qualifiers, pypi post/dev releases, epochs) can differ.
 ///    deb and rpm are refused by name (their ordering is not implemented); anything else is
-///    unknown. A refused or unknown scheme is an error, never an unbounded match.
+///    unknown (the scheme is checked against that closed list, so any other text, however it is
+///    spelled, is unknown). A refused or unknown scheme is an error, never an unbounded match.
 ///  * NORMAL FORM (`normalize`): constraints sorted by version; a version listed twice, or two
 ///    lower bounds (`>` `>=`) or two upper bounds (`<` `<=`) in a row among the interval
 ///    constraints, is refused. `=` and `!=` stand outside the alternation.
@@ -30,6 +31,7 @@
 ///    always was.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <expected>
 #include <string>
@@ -40,7 +42,6 @@ namespace yuzu::server::vers {
 
 inline constexpr std::size_t kMaxInputBytes = 1024;
 inline constexpr std::size_t kMaxConstraints = 32;
-inline constexpr std::size_t kMaxSchemeBytes = 32;
 
 inline constexpr std::string_view kInvalidIntervalList =
     "vers constraints are not a valid interval list";
@@ -53,21 +54,9 @@ struct Constraint {
 };
 
 struct Range {
-    std::string scheme;
     bool all{false}; ///< `vers:<scheme>/*`
     std::vector<Constraint> constraints;
 };
-
-enum class SchemeSupport { kSupported, kNotYet, kUnknown };
-
-[[nodiscard]] inline SchemeSupport scheme_support(std::string_view scheme) noexcept {
-    for (const std::string_view s : {"generic", "semver", "maven", "npm", "pypi", "nuget"})
-        if (scheme == s)
-            return SchemeSupport::kSupported;
-    if (scheme == "deb" || scheme == "rpm")
-        return SchemeSupport::kNotYet;
-    return SchemeSupport::kUnknown;
-}
 
 /// Membership of `v` in the interval between `lo` and `hi`; an empty bound is open. The one core
 /// behind both the lookup ranges and the CVE matcher's CPE start/end bounds.
@@ -152,23 +141,15 @@ inline constexpr std::string_view kShape = "invalid vers (expected vers:<scheme>
     const std::string_view scheme = text.substr(0, slash);
     std::string_view body = text.substr(slash + 1);
 
-    bool scheme_ok = !scheme.empty() && scheme.size() <= kMaxSchemeBytes;
-    for (const char ch : scheme)
-        scheme_ok = scheme_ok && ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
-                                  ch == '.' || ch == '+' || ch == '-');
-    if (!scheme_ok)
-        return std::unexpected("invalid vers scheme");
-    switch (scheme_support(scheme)) {
-    case SchemeSupport::kSupported:
-        break;
-    case SchemeSupport::kNotYet:
+    // Only the fixed deb/rpm literals are ever echoed back; any other scheme is just "unknown".
+    constexpr std::array<std::string_view, 6> kSupported{"generic", "semver", "maven",
+                                                         "npm",     "pypi",   "nuget"};
+    if (scheme == "deb" || scheme == "rpm")
         return std::unexpected("vers scheme " + std::string(scheme) + " is not supported yet");
-    case SchemeSupport::kUnknown:
+    if (std::ranges::find(kSupported, scheme) == kSupported.end())
         return std::unexpected("unknown vers scheme");
-    }
 
     Range r;
-    r.scheme = std::string(scheme);
     if (body == "*") {
         r.all = true;
         return r;
@@ -283,11 +264,10 @@ template <class Cmp>
     return false;
 }
 
-/// `version_min`/`version_max` (inclusive, an empty bound is open) as a `generic` Range. At least
-/// one bound must be non-empty.
+/// `version_min`/`version_max` (inclusive, an empty bound is open) as a Range. At least one bound
+/// must be non-empty.
 [[nodiscard]] inline Range from_bounds(std::string_view min, std::string_view max) {
     Range r;
-    r.scheme = "generic";
     if (!min.empty())
         r.constraints.push_back({Op::kGe, std::string(min)});
     if (!max.empty())
