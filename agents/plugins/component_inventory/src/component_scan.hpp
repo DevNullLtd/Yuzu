@@ -113,10 +113,6 @@ struct ArchiveRead {
     std::vector<Nested> nested;
 };
 
-[[nodiscard]] inline std::span<const std::byte> as_bytes(const std::string& s) noexcept {
-    return {reinterpret_cast<const std::byte*>(s.data()), s.size()};
-}
-
 /// Exactly `len` bytes at `offset`, or nullopt (I/O error or a short read): every read here lies
 /// inside the size the file had when it was opened, so a short read means it changed or failed.
 [[nodiscard]] inline std::optional<std::string> read_exact(const FileView& fv, std::uint64_t offset,
@@ -164,7 +160,7 @@ struct ArchiveRead {
     const auto header = read_exact(fv, *at, kLocalHeaderLen);
     if (!header)
         return std::nullopt;
-    const auto data_off = local_data_offset(as_bytes(*header), e, tail.prefix);
+    const auto data_off = local_data_offset(std::as_bytes(std::span{*header}), e, tail.prefix);
     if (!data_off)
         return std::nullopt;
     const auto data = read_exact(fv, *data_off, static_cast<std::size_t>(e.comp_size));
@@ -201,7 +197,7 @@ struct ArchiveRead {
     const auto tail_bytes = read_exact(*fv, fv->size - tail_len, tail_len);
     if (!tail_bytes)
         return finish();
-    const auto tail = find_central_directory(as_bytes(*tail_bytes), fv->size);
+    const auto tail = find_central_directory(std::as_bytes(std::span{*tail_bytes}), fv->size);
     if (!tail)
         return finish();
     const auto cd = read_exact(*fv, tail->cd_offset, static_cast<std::size_t>(tail->cd_size));
@@ -210,20 +206,21 @@ struct ArchiveRead {
 
     std::optional<ZipEntry> first_pom, named_pom, manifest;
     std::size_t poms = 0, named = 0;
-    const auto walked = for_each_central_entry(as_bytes(*cd), tail->entries, [&](const ZipEntry& e) {
-        const auto pom_artifact = want_version ? pom_properties_artifact(e.name) : std::nullopt;
-        if (is_nested_lib_entry(e.name)) {
-            r.nested.push_back({std::string(e.name), e.uncomp_size});
-        } else if (pom_artifact) {
-            if (++poms == 1)
-                first_pom = e;
-            if (*pom_artifact == artifact && ++named == 1)
-                named_pom = e;
-        } else if (want_version && !manifest && e.name == kManifestEntry) {
-            manifest = e;
-        }
-        return true;
-    });
+    const auto walked = for_each_central_entry(
+        std::as_bytes(std::span{*cd}), tail->entries, [&](const ZipEntry& e) {
+            const auto pom_artifact = want_version ? pom_properties_artifact(e.name) : std::nullopt;
+            if (is_nested_lib_entry(e.name)) {
+                r.nested.push_back({std::string(e.name), e.uncomp_size});
+            } else if (pom_artifact) {
+                if (++poms == 1)
+                    first_pom = e;
+                if (*pom_artifact == artifact && ++named == 1)
+                    named_pom = e;
+            } else if (want_version && !manifest && e.name == kManifestEntry) {
+                manifest = e;
+            }
+            return true;
+        });
     if (!walked) {
         r.nested.clear(); // a directory that does not parse lists nothing it can vouch for
         return finish();

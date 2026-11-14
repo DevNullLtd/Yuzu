@@ -45,7 +45,6 @@ namespace {
 // The internal_error token is a literal per OS: the catch-all must answer without allocating
 // outside its own guarded calls.
 #if defined(_WIN32)
-[[maybe_unused]] constexpr std::string_view kOs = "windows"; // the planned leg names no os token itself
 constexpr std::string_view kInternalError = "windows:component_inventory:internal_error";
 #elif defined(__linux__)
 constexpr std::string_view kOs = "linux";
@@ -56,8 +55,6 @@ constexpr std::string_view kInternalError = "macos:component_inventory:internal_
 #else
 #error "component_inventory_plugin.cpp: unsupported host OS"
 #endif
-
-constexpr std::string_view kAction = yuzu::component_inventory::kScanAction;
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
@@ -117,14 +114,14 @@ public:
         // No exception may cross the plugin ABI: the whole body runs inside the try.
         bool wrote = false;
         try {
-            if (action != kAction) {
+            if (action != yuzu::component_inventory::kScanAction) {
                 // `action` is request-supplied and lands in a pipe-delimited stream, so it goes
                 // through the shared escaper. Deliberately NOT a row.
                 ctx.write_output(std::string{"unknown action: "} + yuzu::util::safe_output_field(action));
                 return 1;
             }
 #if defined(_WIN32)
-            return yuzu::shared::report_planned(ctx, kAction);
+            return yuzu::shared::report_planned(ctx, yuzu::component_inventory::kScanAction);
 #else
             namespace ci = yuzu::component_inventory;
             const ci::Targets t = ci::scan_targets();
