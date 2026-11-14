@@ -2904,7 +2904,28 @@ and the names in `tests/test_gateway_test_summary.py` (and the shard count in
 `docs/rhel9-build-setup.md`),
 delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
 priority; each of the three is separable.
-*Samples.* To be recorded here after the change's own runs.
+*Samples (measured, 2026-11-13 to -14).* Three same-SHA samples per leg on the
+PR #7703 head `f17fcc7c26`, run 43456524845 (Linux attempts 1, 2 and 4, jobs
+131992161922, 132062790009, 132464908320; Windows attempts 1, 3 and 5, jobs
+131992161930, 132075575242, 132467714240). Every gateway entry passed on its
+first attempt in all six.
+
+| Leg | Shard A (s) | Shard B (s) | Shard C (s) | `gateway ct` (s) | non-pg half (s) |
+|---|---|---|---|---|---|
+| Linux | 100, 98, 103 | 107, 103, 113 | 130, 127, 109 | 143, 145, 142 | 411, 401, 394 |
+| Windows | 154, 155, 154 | 149, 152, 145 | 170, 170, 165 | 48, 49, 48 | — |
+
+The cheap-suites invocation's wall is not printed on its own (the half's log is
+written at its end); taking the non-pg half less the server-shard invocation
+(about 95 s to 110 s at two workers, from its entries' durations) gives about
+290 s to 300 s in each Linux sample, against the 362 s to 375 s baseline: rule
+(a) holds (about 19%), and the non-pg half fell from about 480 s to 394 s to
+411 s. Rule (c): the longest shard is 130 s on Linux (22% of its 600 s meson
+timeout) and 170 s on Windows (31% of the wrapper's 540 s deadline). Not
+checked from CI: rule (b) entry by entry, and the EUnit test count (a green run
+uploads no test logs, and meson's summary shows each shard passing, not its
+count); the 2807 is from the local cover-off run. The Windows job took 7.6 to
+10.3 min; its barrier wait is not measured separately.
 
 ### Persistent runner-local test history
 
