@@ -2275,6 +2275,78 @@ saving is an estimate until measured:
   set `YUZU_CI_SEQUENTIAL_HALVES=1`, record why here, and revisit.
 - Record the samples, run and job ids, SHAs, runner names and slot waits here.
 
+**Measured (2026-11-13), after the merge (#7460, merge commit `0f8a891fb2`, 2026-11-10).**
+The per-entry 1.5x check failed in 2 of the 10 candidate runs, and the median job wall
+time fell 35%, from 18.8 min to 12.2 min. The owner kept the concurrency (2026-11-13),
+accepting the misses as the cost of sharing the CPUs, not as a revert trigger. Both
+results are recorded below, so the next change to this step starts from them.
+
+- Samples. The candidate is the first 10 successful `dev`-push runs of the job after the
+  merge, not a same-SHA pair: the PR's own same-SHA samples are not recorded (not in the
+  PR, its ledger fragment or this doc). One run in that window (42913101361, 2026-11-10
+  22:17, 0.1 min) is excluded because its job skipped every step. The baseline is the 12
+  successful `dev`-push runs before the merge. All 22 ran on Big Tam
+  (`yuzu-bigtam-linux-0` to `-3`), and every `with-test-slot` acquisition in every run
+  waited 0 s.
+- Job wall time (jobs API, `started_at` to `completed_at`): baseline median 18.8 min
+  (range 17.6 to 24.8), candidate median 12.2 min (range 10.6 to 16.6), so 35% below the
+  baseline against the 10% bar.
+- 80% of timeout: no entry of either half reached it. The closest was
+  `gateway eunit shard A`, at 267 s of 600 s (45%); the slowest pg shard, A, reached
+  187 s of 700 s (27%).
+- 1.5x baseline mean (entries of 5 s or more): **failed in 2 of 10 runs**, by two pg
+  shards on the same two adjacent runs (2026-11-10 21:11 and 21:45): shard O at 79.9 s
+  and 82.9 s against a 48.0 s mean (1.73x worst), and shard E at 146.5 s and 147.9 s
+  against a 93.9 s mean (1.57x worst). In the other 8 runs no entry exceeded 1.5x; the
+  next-worst entries were pg shards G (1.49x) and D (1.47x).
+- What the misses show: the halves share the job's CPUs, and the pg shards pay for it. The
+  14 pg shards' serial time per run rose from a 1,482 s baseline mean to a 1,710 s
+  candidate median (+15%; per-run sums, mean of the 12 baseline runs against median of the
+  10 candidates), while the pg half still finishes in 448 s to 578 s. Not all of that rise
+  is contention: the shard definitions are unchanged across the window, but they select by
+  tag, and 117 files under `tests/unit/server/` changed between the first baseline and the
+  last candidate SHA, so the shards also gained tests. Neither half dominates: the non-pg
+  half took 471 s to 488 s in every run.
+- None of the revert triggers above fired in the 10 candidate runs: no meson test
+  failed (so nothing was retried as a flake), no entry raised the over-80%-of-timeout
+  warning, and no pg shard timed out. The triggers still apply unchanged; setting
+  `YUZU_CI_SEQUENTIAL_HALVES=1` on one of them is the way back, and the accepted 1.5x
+  misses are not one of them.
+- Per-entry values come from the meson summary lines in each job log (the `OK <secs>s`
+  column). Runs:
+
+Candidate (after the merge):
+
+| Run | Job | SHA | Runner | Job wall | Slot wait | non-pg / pg half |
+|---|---|---|---|---|---|---|
+| 42895515198 | 130107665542 | `0f8a891fb2` | `yuzu-bigtam-linux-0` | 16.5 min | 0 s | 476 s / 513 s |
+| 42902526001 | 130132146775 | `9d7ee88511` | `yuzu-bigtam-linux-3` | 14.9 min | 0 s | 484 s / 576 s |
+| 42908124262 | 130151599835 | `f4c2c95aa7` | `yuzu-bigtam-linux-2` | 12.4 min | 0 s | 480 s / 578 s |
+| 42991568006 | 130425661643 | `7e3e782456` | `yuzu-bigtam-linux-0` | 11.9 min | 0 s | 471 s / 449 s |
+| 43005450029 | 130471818809 | `43e65ea5e1` | `yuzu-bigtam-linux-0` | 10.6 min | 0 s | 471 s / 461 s |
+| 43008185580 | 130481028464 | `71519912c4` | `yuzu-bigtam-linux-1` | 11.2 min | 0 s | 483 s / 503 s |
+| 43011603201 | 130492527502 | `b357fe186e` | `yuzu-bigtam-linux-3` | 16.6 min | 0 s | 488 s / 542 s |
+| 43035122774 | 130572045791 | `dcd9a0a29e` | `yuzu-bigtam-linux-1` | 10.8 min | 0 s | 480 s / 448 s |
+| 43038808720 | 130584994620 | `5814e80383` | `yuzu-bigtam-linux-1` | 11.6 min | 0 s | 482 s / 522 s |
+| 43064481453 | 130675854942 | `7088f0cf2b` | `yuzu-bigtam-linux-0` | 13.4 min | 0 s | 481 s / 483 s |
+
+Baseline (before the merge):
+
+| Run | Job | SHA | Runner | Job wall | Slot wait |
+|---|---|---|---|---|---|
+| 42879744786 | 130052739576 | `cd163fe4dd` | `yuzu-bigtam-linux-3` | 18.6 min | 0 s |
+| 42865414562 | 130002550762 | `8846f70cfc` | `yuzu-bigtam-linux-1` | 17.6 min | 0 s |
+| 42832393723 | 129885791745 | `97122a2f26` | `yuzu-bigtam-linux-0` | 24.8 min | 0 s |
+| 42822889919 | 129852765513 | `1f2698663b` | `yuzu-bigtam-linux-1` | 19.4 min | 0 s |
+| 42816558875 | 129831141504 | `a7721dced7` | `yuzu-bigtam-linux-2` | 18.2 min | 0 s |
+| 42674958480 | 129353923619 | `f362bc7bb0` | `yuzu-bigtam-linux-1` | 19.0 min | 0 s |
+| 42658377286 | 129303139031 | `a11b1660d6` | `yuzu-bigtam-linux-3` | 17.7 min | 0 s |
+| 42640706924 | 129240990338 | `4482311586` | `yuzu-bigtam-linux-1` | 18.5 min | 0 s |
+| 42620776217 | 129172220558 | `dcadb36a85` | `yuzu-bigtam-linux-1` | 20.5 min | 0 s |
+| 42614415550 | 129150732618 | `29df02ac0b` | `yuzu-bigtam-linux-3` | 18.9 min | 0 s |
+| 42607751220 | 129128112839 | `6bb06db296` | `yuzu-bigtam-linux-1` | 19.3 min | 0 s |
+| 42593254595 | 129079839035 | `bc4296f651` | `yuzu-bigtam-linux-0` | 18.3 min | 0 s |
+
 This is a topology change; measure it on its own, as for the ladder below,
 before bundling it with a width push.
 
