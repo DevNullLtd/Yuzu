@@ -44,6 +44,7 @@
 #include "component_scan.hpp"
 
 #include <plugin_heartbeat_tags.hpp>
+#include <wire_utf8.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -739,6 +740,25 @@ TEST_CASE("wire row: nine fields, every text field escaped", "[runtime][componen
     CHECK(format_component_row(r) == "comp|java|a\\|b|1.0|filename|/opt/x/y\\|z.jar|12|-5|x");
 }
 
+TEST_CASE("wire row: a NUL or a byte outside UTF-8 never reaches the C string", "[runtime][component_scan][wire][component_inventory]") {
+    using namespace std::string_literals;
+    Row r;
+    r.name = "n\xff"s;
+    r.version = "1.\0"s + "0";
+    r.version_source = "filename";
+    r.path = "/opt/caf\xff"s + "/x\0y.jar"s + "!lib/z\xc3"s; // a lone lead byte is not UTF-8
+    r.size = 12;
+    r.mtime = -5;
+    r.anchor_app = "ap\0p"s + "\xe2\x82"s; // a NUL, then a truncated three-byte sequence
+    const std::string line = format_component_row(r);
+
+    CHECK(line == "comp|java|n?|1.?0|filename|/opt/caf?/x?y.jar!lib/z?|12|-5|ap?p??");
+    CHECK(std::count(line.begin(), line.end(), '|') == 8); // nine fields
+    CHECK(yuzu::shared::count_invalid_wire_bytes(line) == 0);
+    CHECK(line == std::string(line.c_str())); // the whole row survives the C-string seam
+    CHECK(r.path.find('\0') != std::string::npos); // the Row keeps the raw bytes: acquisition opens the real name
+}
+
 namespace {
 
 /// The OS leg's targets as answer_scan sees them (it is duck-typed on these four members), so the
@@ -763,7 +783,7 @@ struct FakeCtx {
     void write_output(std::string_view t) {
         if (writes++ == throw_on_write)
             throw std::bad_alloc{};
-        out.emplace_back(t);
+        out.emplace_back(std::string(t).c_str()); // the plugin ABI carries a C string: a NUL ends it
     }
     void set_result_status(YuzuResultStatus s, YuzuResultCompleteness c, std::string_view p = {}) {
         if (throw_on_status)
@@ -887,6 +907,32 @@ TEST_CASE("answer: a link inside the tree is reported, never a bare supported", 
         const auto a = answer_over(tree);
         CHECK(a.lines[0] == "status|scan|supported|-");
     }
+}
+
+TEST_CASE("answer: hostile names cross the C-string seam whole, the raw path is what was opened",
+          "[runtime][component_scan][answer][wire][component_inventory]") {
+    using namespace std::string_literals;
+    MemTree tree;
+    const std::string dir = "/opt/caf\xff"s; // a folder name that is not UTF-8
+    const std::string jar = dir + "/app-1.0.jar";
+    const auto zip = build_zip({nested_lib("lib/x\0-1.jar"s, 77)}); // a nested entry name holding a NUL
+    tree.add_file(jar, zip.bytes);
+    const auto a = answer_over(tree);
+
+    REQUIRE(a.lines.size() == 3); // the status row, the outer archive, the nested library
+    CHECK(tree.opens[jar] == 1);  // the raw name was opened, not its scrubbed copy
+    FakeCtx ctx;
+    bool wrote = false;
+    emit_answer(ctx, static_cast<FakeKv*>(nullptr), a, wrote);
+    REQUIRE(ctx.out.size() == a.lines.size());
+    for (std::size_t i = 0; i < a.lines.size(); ++i) {
+        CHECK(ctx.out[i] == a.lines[i]); // nothing was cut at a NUL
+        CHECK(yuzu::shared::count_invalid_wire_bytes(ctx.out[i]) == 0);
+    }
+    const std::string size = std::to_string(zip.bytes.size());
+    CHECK(ctx.out[1] == "comp|java|app|1.0|filename|/opt/caf?/app-1.0.jar|" + size + "|1700000000|caf?");
+    // The refused leaf name still gets a row (name_of shows the NUL as '?', no version).
+    CHECK(ctx.out[2] == "comp|java|x?-1||unreadable|/opt/caf?/app-1.0.jar!lib/x?-1.jar|77|1700000000|caf?");
 }
 
 TEST_CASE("emit: rows first, the typed result, then all six heartbeat keys with the scan's values",

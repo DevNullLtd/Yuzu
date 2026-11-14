@@ -94,7 +94,7 @@ spec:
         platforms: [darwin, linux]
       - name: path
         type: string
-        description: 'Absolute path of the archive; a nested library is <archive path>!<entry name>.'
+        description: 'Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?.'
         example: /opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar
         platforms: [darwin, linux]
       - name: size
@@ -109,7 +109,7 @@ spec:
         platforms: [darwin, linux]
       - name: anchor_app
         type: string
-        description: 'First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root).'
+        description: 'First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?.'
         example: app
         platforms: [darwin, linux]
 

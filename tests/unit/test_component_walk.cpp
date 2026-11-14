@@ -278,6 +278,28 @@ TEST_CASE("component walk: the default depth backstop of 32 reports depth, never
     CHECK(r.candidates.empty());
 }
 
+TEST_CASE("component walk: a directory at max_depth is listed by its whole path and keeps its anchor",
+          "[runtime][component_walk][component_inventory]") {
+    // The queue holds parent indices, not paths; the path of the deepest directory is rebuilt from
+    // the whole chain when it is popped.
+    MemTree fs;
+    std::string p = "/r";
+    for (int i = 1; i <= 32; ++i) {
+        const std::string name = "n" + std::to_string(i);
+        dir(fs, p, {D(name)});
+        p += "/" + name;
+    }
+    dir(fs, p, {F("deep.jar")});
+
+    const auto r = run(fs, {}, {"/r"});
+
+    CHECK(r.stop == Stop::complete);
+    CHECK(paths(r) == std::vector<std::string>{p + "/deep.jar"});
+    CHECK(r.candidates[0].anchor_app == "n1");
+    CHECK(fs.listed.size() == 33); // the root and the 32 levels below it
+    CHECK(fs.listed.back() == p);
+}
+
 TEST_CASE("component walk: an unlistable directory is dir_unreadable and its siblings are kept",
           "[runtime][component_walk][component_inventory]") {
     MemTree fs;

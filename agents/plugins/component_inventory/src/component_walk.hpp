@@ -21,6 +21,14 @@
  * reaching it is an incomplete walk, never a silent cut (ADR-0028 Decision 4,
  * docs/adr/0028-agent-component-inventory-collection.md).
  *
+ * MEMORY. The queue holds directory indices, not paths. Each directory queued gets one node (its
+ * parent's index and its own name), and its path is rebuilt from the chain only when it is popped for
+ * listing, so the cost of a queued directory is one name plus about 64 bytes (node and queue slot)
+ * however deep it sits. The entry budget bounds the nodes: at most max_entries x (one name + about
+ * 64 bytes), about 130 MB at the hostile worst (400,000 names of 255 bytes), a few MB on a real
+ * tree. (A queued full path costs up to max_depth x 256 bytes, about 8 KiB, and the same bounds
+ * would allow gigabytes.)
+ *
  * Paths are joined with '/': only the POSIX legs ship. No directory is excluded by name (an OSGi
  * container keeps its bundles in <product>/system, so such names are ordinary application directories).
  * Links and network mounts are never listed; each is counted in its own stat. Any other entry type is
@@ -138,10 +146,16 @@ struct WalkResult {
 
 namespace walk_detail {
 
-[[nodiscard]] inline std::string join(const std::string& dir, const std::string& name) {
-    if (!dir.empty() && dir.back() == '/')
-        return dir + name;
-    return dir + '/' + name;
+/// dir + '/' + name, with no doubled slash when `dir` already ends in one.
+inline void append(std::string& dir, const std::string& name) {
+    if (dir.empty() || dir.back() != '/')
+        dir += '/';
+    dir += name;
+}
+
+[[nodiscard]] inline std::string join(std::string dir, const std::string& name) {
+    append(dir, name);
+    return dir;
 }
 
 } // namespace walk_detail
@@ -163,26 +177,47 @@ namespace walk_detail {
             out.stop = s;
     };
 
+    constexpr std::size_t kNoNode = static_cast<std::size_t>(-1);
+    // One per directory queued under the current root: its parent and its own name (the root's name is
+    // the root path as given). Pending refers to these by index.
+    struct Node {
+        std::size_t parent;
+        std::string name;
+    };
     struct Pending {
-        std::string path;
+        std::size_t node;
         std::size_t depth;
-        std::string anchor; // empty for the root itself
+        std::size_t anchor; // the depth-1 ancestor's node, kNoNode for the root itself
     };
 
     for (std::size_t root_index = 0; root_index < roots.size(); ++root_index) {
         std::unordered_map<std::string, std::size_t> anchor_rows; // per root
+        std::vector<Node> nodes;
         std::deque<Pending> queue;
-        queue.push_back({roots[root_index], 0, {}});
+        nodes.push_back({kNoNode, roots[root_index]});
+        queue.push_back({0, 0, kNoNode});
+
+        // The directory's path, root first. Appended in place: one pass over the final length.
+        const auto path_of = [&nodes](std::size_t node) {
+            std::vector<std::size_t> chain; // leaf first
+            for (; node != kNoNode; node = nodes[node].parent)
+                chain.push_back(node);
+            std::string path = nodes[chain.back()].name;
+            for (auto it = chain.rbegin() + 1; it != chain.rend(); ++it)
+                walk_detail::append(path, nodes[*it].name);
+            return path;
+        };
 
         while (!queue.empty()) {
             if (fs.now() >= deadline) {
                 record(Stop::budget_time);
                 return out;
             }
-            Pending cur = std::move(queue.front());
+            const Pending cur = queue.front();
             queue.pop_front();
 
-            ListResult listing = fs.list(cur.path, limits.max_dir_entries);
+            const std::string cur_path = path_of(cur.node);
+            ListResult listing = fs.list(cur_path, limits.max_dir_entries);
             if (listing.error) {
                 record(Stop::dir_unreadable);
                 continue;
@@ -210,8 +245,9 @@ namespace walk_detail {
                         record(Stop::depth);
                         continue;
                     }
-                    queue.push_back({walk_detail::join(cur.path, e.name), cur.depth + 1,
-                                     cur.anchor.empty() ? e.name : cur.anchor});
+                    nodes.push_back({cur.node, e.name});
+                    queue.push_back({nodes.size() - 1, cur.depth + 1,
+                                     cur.anchor == kNoNode ? nodes.size() - 1 : cur.anchor});
                     continue;
                 }
                 case Type::file: break;
@@ -219,7 +255,7 @@ namespace walk_detail {
 
                 if (!is_java_archive_name(e.name))
                     continue;
-                const std::string& anchor = cur.anchor.empty() ? e.name : cur.anchor;
+                const std::string& anchor = cur.anchor == kNoNode ? e.name : nodes[cur.anchor].name;
                 std::size_t& rows = anchor_rows[anchor];
                 if (rows >= limits.max_rows_per_anchor) {
                     record(Stop::anchor_rows);
@@ -230,7 +266,7 @@ namespace walk_detail {
                     return out;
                 }
                 ++rows;
-                out.candidates.push_back({walk_detail::join(cur.path, e.name), anchor, root_index});
+                out.candidates.push_back({walk_detail::join(cur_path, e.name), anchor, root_index});
             }
         }
     }

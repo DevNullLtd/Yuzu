@@ -51,6 +51,7 @@
 #include "zip_directory.hpp"
 
 #include <inventory_status_row.hpp> // yuzu::shared::StatusLevel (agents/shared)
+#include <wire_utf8.hpp>            // yuzu::shared::scrub_wire_bytes (agents/shared)
 #include <yuzu/plugin.h>            // YUZU_RESULT_STATUS_* / YUZU_RESULT_COMPLETENESS_*
 #include <yuzu/string_utils.hpp>    // yuzu::util::safe_output_field
 
@@ -366,23 +367,34 @@ struct ArchiveRead {
 
 // ---- output: the wire row, the status verdict and the cost values (pure) ----
 
-/// comp|java|name|version|version_source|path|size|mtime|anchor_app, every text field escaped.
+/// A text field as it may cross the plugin ABI: a NUL or a byte outside well-formed UTF-8 becomes '?'
+/// first (the row travels as a C string and is parsed as UTF-8, so a NUL would cut it and a bad byte
+/// would cost the host's whole response), then the pipe/backslash/CR/LF escape. `path` and `anchor_app`
+/// carry file-system and archive-entry bytes verbatim; the other three are already printable ASCII.
+[[nodiscard]] inline std::string wire_field(std::string_view v) {
+    std::string s(v);
+    yuzu::shared::scrub_wire_bytes(s);
+    return yuzu::util::safe_output_field(s);
+}
+
+/// comp|java|name|version|version_source|path|size|mtime|anchor_app, every text field scrubbed and
+/// escaped. The Row keeps its raw bytes (the real name is what acquisition opens); only the wire copy
+/// is changed.
 [[nodiscard]] inline std::string format_component_row(const Row& r) {
-    using yuzu::util::safe_output_field;
     std::string s = "comp|java|";
-    s += safe_output_field(r.name);
+    s += wire_field(r.name);
     s += '|';
-    s += safe_output_field(r.version);
+    s += wire_field(r.version);
     s += '|';
-    s += safe_output_field(r.version_source);
+    s += wire_field(r.version_source);
     s += '|';
-    s += safe_output_field(r.path);
+    s += wire_field(r.path);
     s += '|';
     s += std::to_string(r.size);
     s += '|';
     s += std::to_string(r.mtime);
     s += '|';
-    s += safe_output_field(r.anchor_app);
+    s += wire_field(r.anchor_app);
     return s;
 }
 
