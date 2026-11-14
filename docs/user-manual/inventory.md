@@ -941,8 +941,8 @@ place, **Hardware** and **Software**, each its own page:
   reachable from this one, so actions that need a connection to the answering server, such as
   **Sync now**, stay unavailable on its record (the sync route answers 503, "agent is not
   connected"). The Hardware list reads the session timeout as currently configured; the
-  registry's own presence read, behind the Home figure (which the Home page also caches for 60
-  seconds), keeps the value the server started
+  registry's own presence read, which the Home figure uses whenever it can answer (and the
+  Home page caches that figure for 60 seconds), keeps the value the server started
   with until it is restarted, so the two can differ after a runtime change of
   `heartbeat_timeout`.
 
