@@ -41,13 +41,11 @@ A role assignment on "London Office" applies to both "London Desktops" and "Lond
 
 ## Visibility Filtering
 
-When RBAC is enabled, the agent list shown in the dashboard and returned by the agent API is filtered based on management group role assignments:
+When RBAC is enabled, what a user sees in an agent list depends on the permission the list route requires:
 
 - **Global administrators** (users with the `Infrastructure:Read` permission) see all agents.
-- **Non-admin users** only see agents that belong to management groups where they have at least one role assignment (Operator or Viewer; an existing `ITServiceOwner` row also counts, but that role can no longer be assigned at group scope).
-- This applies to the dashboard view, the `/api/agents` endpoint, and any UI page that lists devices.
-
-For example, if `jane.ops` holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").
+- **Non-admin users** are narrowed to the management groups they hold a role on only by a list route that checks the permission per group, such as `/api/v1/devices`, and only if the group role itself carries that permission. A user whose only grant is a group-scoped `Operator` role is refused (`403`, `Infrastructure:Read`) and is not shown the group's agents. An existing `ITServiceOwner` row (that role can no longer be assigned at group scope) does show its holder the agents of its group on `/api/v1/devices`.
+- `/api/agents` and the dashboard device list require the global `Infrastructure:Read` permission, so they do not narrow by group role at all.
 
 > **When RBAC is disabled (the default posture):** management-group role
 > assignments are **not** consulted. Every authenticated user sees the full
