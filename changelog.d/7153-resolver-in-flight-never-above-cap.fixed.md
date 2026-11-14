@@ -1,0 +1,1 @@
+- **The resolver pool's in-flight reading never exceeds its cap.** A refused lookup used to raise the in-flight count for a moment before releasing it, so `yuzu_server_oidc_resolver_in_flight` and `yuzu_server_revocation_source_resolver_in_flight` could sample above 16. Admission now only counts a lookup when a slot is free.

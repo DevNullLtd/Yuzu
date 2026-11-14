@@ -1,0 +1,1 @@
+- **The OIDC "lookup pool is full" and NAT64 "prefix lookup was not started" warnings are written at most once per 60 s each.** Later occurrences in that window are written at debug level; `yuzu_server_oidc_resolver_lookups_total{outcome="busy"}` has the full count. The timeout warning is unchanged. See `docs/user-manual/upgrading.md`.
