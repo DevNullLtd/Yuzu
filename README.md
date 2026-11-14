@@ -250,7 +250,7 @@ meson compile -C build-windows
 | Option | Default | Notes |
 |---|---|---|
 | `-Dbuild_agent` | true | Agent daemon |
-| `-Dbuild_server` | true | Server daemon |
+| `-Dserver` | auto | Server daemon (feature option; Linux only: `auto` builds it on a Linux target and skips it elsewhere, `enabled` elsewhere is an error). The old `-Dbuild_server` boolean is deprecated |
 | `-Dbuild_tests` | false | Catch2 test suite |
 | `-Dbuild_examples` | true | Demo plugins only (`example`, `chargen`, `procfetch`, `netprobe`) — every other plugin builds under `-Dbuild_agent` regardless |
 | `-Db_lto` | false | Link-time optimisation |

@@ -1,5 +1,7 @@
 #include "offload_target_store.hpp"
 
+#include "delivery_pool_metrics.hpp"
+
 #include "outbound_url_policy.hpp"
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -347,16 +349,26 @@ OffloadTargetStore::~OffloadTargetStore() {
 
 void OffloadTargetStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metrics; }
 
-void OffloadTargetStore::log_dropped_delivery(const std::string& target_url) {
-    spdlog::warn("OffloadTargetStore: dropped delivery to {} - worker pool queue full or "
-                 "server shutting down",
-                 url_log_host(target_url));
+void OffloadTargetStore::log_dropped_delivery(const std::string& target_url,
+                                              StoreWorkerPool::SubmitResult why) {
+    const char* reason = StoreWorkerPool::drop_reason(why);
+    spdlog::warn("OffloadTargetStore: dropped delivery to {} - the delivery worker pool refused it "
+                 "({})",
+                 url_log_host(target_url), reason);
     if (metrics_)
-        metrics_->counter("yuzu_server_offload_delivery_dropped_total").increment();
+        metrics_->counter(kOffloadDeliveryDroppedMetric, {{"reason", reason}}).increment();
 }
 
 bool OffloadTargetStore::quiesce(std::chrono::milliseconds timeout) {
     return delivery_pool_.quiesce(timeout);
+}
+
+std::size_t OffloadTargetStore::delivery_pool_pending() const {
+    return delivery_pool_.pending();
+}
+
+std::size_t OffloadTargetStore::delivery_pool_capacity() const noexcept {
+    return delivery_pool_.capacity();
 }
 
 // ── CRUD ────────────────────────────────────────────────────────────────────
@@ -964,11 +976,11 @@ void OffloadTargetStore::fire_event(const std::string& event_type,
     // delivery (logged + counted) rather than spawning an unbounded thread.
     for (auto& tgt : matching) {
         if (tgt.batch_size <= 1) {
-            const bool queued = delivery_pool_.submit([this, tgt, event_type, payload_json]() {
+            const auto queued = delivery_pool_.try_submit([this, tgt, event_type, payload_json]() {
                 deliver_single(tgt, event_type, /*event_count=*/1, payload_json);
             });
-            if (!queued)
-                log_dropped_delivery(tgt.url);
+            if (queued != StoreWorkerPool::SubmitResult::kQueued)
+                log_dropped_delivery(tgt.url, queued);
             continue;
         }
 
@@ -986,11 +998,11 @@ void OffloadTargetStore::fire_event(const std::string& event_type,
         if (!to_flush.empty()) {
             auto body = build_batch_body(to_flush, tgt.id);
             int count = static_cast<int>(to_flush.size());
-            const bool queued = delivery_pool_.submit([this, tgt, event_type, count, body]() {
+            const auto queued = delivery_pool_.try_submit([this, tgt, event_type, count, body]() {
                 deliver_single(tgt, event_type, count, body);
             });
-            if (!queued)
-                log_dropped_delivery(tgt.url);
+            if (queued != StoreWorkerPool::SubmitResult::kQueued)
+                log_dropped_delivery(tgt.url, queued);
         }
     }
 }
@@ -1043,11 +1055,11 @@ void OffloadTargetStore::flush_all() {
         auto event_type = events.front().event_type; // representative
         auto body = build_batch_body(events, target_id);
         int count = static_cast<int>(events.size());
-        const bool queued = delivery_pool_.submit([this, tgt, event_type, count, body]() {
+        const auto queued = delivery_pool_.try_submit([this, tgt, event_type, count, body]() {
             deliver_single(tgt, event_type, count, body);
         });
-        if (!queued)
-            log_dropped_delivery(tgt.url);
+        if (queued != StoreWorkerPool::SubmitResult::kQueued)
+            log_dropped_delivery(tgt.url, queued);
     }
 }
 

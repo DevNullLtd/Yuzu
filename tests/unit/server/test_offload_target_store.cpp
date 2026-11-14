@@ -28,14 +28,25 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
+#include "test_blocking_http_sink.hpp"
 
 #include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define YUZU_TSAN_BUILD 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define YUZU_TSAN_BUILD 1
+#endif
 
 using namespace yuzu::server;
 using yuzu::test::OffloadTargetStorePg;
@@ -709,3 +720,67 @@ TEST_CASE("OffloadTargetStore[pg]: a non-NULL auth_credential with has_credentia
         std::vector<std::string>{std::to_string(*result)});
     CHECK(res.status() == PGRES_FATAL_ERROR);
 }
+
+// ── Drop accounting: the `reason` label on yuzu_server_offload_delivery_dropped_total ──────────
+
+namespace {
+
+double offload_dropped(yuzu::MetricsRegistry& reg, const char* reason) {
+    return reg.counter("yuzu_server_offload_delivery_dropped_total", {{"reason", reason}}).value();
+}
+
+} // namespace
+
+TEST_CASE("OffloadTargetStore[pg]: a delivery refused after quiesce() counts reason=quiescing",
+          "[offload_store][pg][metrics]") {
+    OffloadTargetStorePg store;
+    yuzu::MetricsRegistry reg;
+    store->set_metrics(&reg);
+    REQUIRE(store->create_target("quiesced", "http://127.0.0.1:1/h", OffloadAuthType::None, "", "*",
+                                 /*batch_size=*/1)
+                .has_value());
+    REQUIRE(store->quiesce(std::chrono::seconds(5)));
+
+    store->fire_event("execution.completed", R"({"k":"v"})");
+
+    CHECK(offload_dropped(reg, "quiescing") == 1.0);
+    CHECK(offload_dropped(reg, "queue_full") == 0.0);
+}
+
+// Compiled out under TSan for the same reason as the webhook twin: real loopback HTTP deliveries
+// hit the glibc getaddrinfo_a crash under this repo's TSan build (#2504).
+#ifndef YUZU_TSAN_BUILD
+TEST_CASE("OffloadTargetStore[pg]: deliveries past a full queue count reason=queue_full and the "
+          "backlog accessors read the pool",
+          "[offload_store][pg][metrics]") {
+    constexpr int kTargets = 300;
+    // Declaration order is load-bearing (locals are destroyed in reverse): the registry outlives
+    // the store, which a running delivery writes to, and the store comes before the sink so the
+    // sink releases its held deliveries first.
+    yuzu::MetricsRegistry reg;
+    OffloadTargetStorePg store;
+    yuzu::test::BlockingHttpSink sink;
+    REQUIRE(sink.ok());
+    store->set_metrics(&reg);
+    for (int i = 0; i < kTargets; ++i)
+        REQUIRE(store->create_target("held-" + std::to_string(i), sink.url(), OffloadAuthType::None,
+                                     "", "*", /*batch_size=*/1)
+                    .has_value());
+    const auto capacity = store->delivery_pool_capacity();
+    CHECK(capacity == 260);
+    CHECK(store->delivery_pool_pending() == 0);
+
+    store->fire_event("execution.completed", R"({"k":"v"})");
+
+    const double dropped = offload_dropped(reg, "queue_full");
+    CHECK(dropped >= kTargets - static_cast<double>(capacity));
+    CHECK(dropped <= kTargets - 256.0);
+    CHECK(offload_dropped(reg, "quiescing") == 0.0);
+    CHECK(store->delivery_pool_pending() == kTargets - static_cast<std::size_t>(dropped));
+    CHECK(store->delivery_pool_pending() >= 256);
+
+    sink.release();
+    REQUIRE(store->quiesce(std::chrono::seconds(60)));
+    CHECK(store->delivery_pool_pending() == 0);
+}
+#endif // !YUZU_TSAN_BUILD

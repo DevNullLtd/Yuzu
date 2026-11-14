@@ -34,7 +34,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
   `pg_mode: full`). **Since ADR-0035 ladder step 1**, the Windows and macOS legs
-  are agent-only (`-Dbuild_server=false`): they build and test no server code and
+  are agent-only (the `server` option is `auto`, off on any non-Linux target; step 1 passed `-Dbuild_server=false`): they build and test no server code and
   run no Postgres suite, so `pg_mode` exists on the Linux matrix only. (From the
   Windows test-phase split, #3443 on 2026-08-28, until then the Windows matrix
   carried the same `pg_mode` key: debug=full, release=smoke.)
@@ -337,8 +337,9 @@ dashboard: it crawls every route the shell nav links to (200, the `Content-Secur
 header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs four scenarios (stubbed where they write: those requests are answered in the browser,
-so nothing reaches the server). The gate first runs
+and runs six scenarios (five that each force their own precondition, with writes answered by a
+request stub in the browser so nothing reaches the server, and the DEX Apps tab: a live keyboard
+half plus a committed golden page served through a GET stub). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
 layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
@@ -428,6 +429,11 @@ the `release` job needs `docker-publish`, `docker-publish-postgres` and
 `docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
 `:latest`) first (the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
+An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
+`docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
+(`build-linux`, `build-gateway`, `build-windows`, `build-macos`; ADR-0035 step 3,
+a success gate, not an artifact dependency), so a failed build, including a failed
+agent packaging step, pushes no versioned image.
 `docker-publish-chisel` joined the release's needs in #5242, so the release
 waits for the chisel builds (minutes with a warm cache, much longer cold) and
 the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
@@ -1064,11 +1070,12 @@ pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip pat
 prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
 (server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
 identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
-allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+allocation (`--free-ports`). A start-up that loses one to another process before binding it is retried, up to 3 attempts, on an unambiguous bind failure only, and a retry is a `::warning::` annotation and a step-summary line (#7538). The Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
 the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
 `runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
 fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
-the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+the step "Upload gateway real-wire logs on failure" uploads its logs, including each retried
+attempt's `server.attemptN.log` / `gateway.attemptN.log` (`failure() &&` leads the
 condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
 (`mgmt_driver.log`) is among the uploaded `*.log` files.
 
@@ -1217,7 +1224,7 @@ telemetry start step exports the same values for already-running listeners.
 ### Windows test-phase concurrency gate
 
 **Update (ADR-0035 ladder step 1).** The Windows leg is now agent-only: it
-configures with `-Dbuild_server=false` into `build-windows-agent-{debug,release}`
+configures agent-only (step 1 passed `-Dbuild_server=false`; since step 3 it passes nothing and the `server` option's `auto` is off on Windows) into `build-windows-agent-{debug,release}`
 and has one test step, `Test (non-pg suites)`, selecting `--suite agent --suite
 platform --suite proto --suite echo --suite gateway`. The `Ensure Postgres`,
 `Resolve pg_mode + assert Postgres DSN`, `Test (pg shards, full)` and `Test (pg
@@ -2309,6 +2316,7 @@ delta is attributable to one axis ("never bundled with a topology change"):
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
 | 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
 | 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
+| 2d | Gateway EUnit shards without cover, three shards, `gateway ct` `priority: 120` (see Push 2d below) | cost + ordering | | | | | | |
 | 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8 (moot: the step was removed by ADR-0035 step 1), non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
@@ -2790,6 +2798,56 @@ and 1.96 to 1.97 at np=2. Shard times show no change from the width beyond the
 about the 12-shard regime, which only the post-merge watch can reach. The
 max_connections and `pg_stat_activity` peak were not measured.
 
+**Push 2d (gateway EUnit shards without cover, three shards, `gateway ct` at
+`priority: 120`).** Three changes to the gateway entries of the Linux cheap-suites
+invocation, made together because each one alone leaves the gateway as that
+invocation's tail. (1) The EUnit shards run with the `test` profile's
+`cover_enabled` false (`gateway/eunit_shard.config.script`; a plain
+`rebar3 eunit --dir` and `gateway ct` keep cover). meck preserves cover data on
+every `meck:new`/`meck:unload` of a cover-compiled module, and the foreach
+fixtures pay that per test: the whole suite took 459 s with cover and 268 s
+without, the same 2807 tests passing, and nothing reads a shard's cover data.
+(2) Three shards instead of two, balanced by weights measured without cover
+(`scripts/gateway_eunit_shards.py`). (3) `gateway ct`, last to finish in all 22
+sampled runs because it had no priority and is defined after every `tests/`
+entry, gets the shards' `priority: 120`, so the four gateway entries start at t=0.
+
+*Baseline.* The concurrent-halves runs (2026-11-10 to -13): shard A 234 s to
+267 s, shard B 191 s to 214 s, `gateway ct` 124 s to 136 s, cheap-suites
+invocation 362 s to 375 s where the log carries per-line timestamps.
+*Expectation (an estimate).* A replay of a four-worker list scheduler in meson's
+priority order, which reproduces two observed baseline walls to within 3 s, gives
+269 s to 279 s with the shards at about 100 s and `gateway ct` at 130 s to 160 s,
+and 290 s to 302 s with the shards at 130 s; the invocation only gets longer than
+today if each shard runs past about 190 s. This takes the `gateway ct` half of the
+rung Push 2b named, at the shards' 120 rather than its own duration: ct is no
+longer the 37 s entry Push 2b measured but 124 s to 136 s under the concurrent
+halves, so it needs to start with the shards. Local runs, all four entries at
+once: 92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average
+of 20 to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no
+priority); a priority for it is the next rung. The non-pg half should fall from
+about 480 s to about 390 s to 400 s, which leaves the pg half the longer one.
+*Measurement and rule* are Push 2b's (two same-SHA samples, attempt-specific
+logs), judged on the cheap-suites invocation wall and the non-pg half's wall:
+(a) the invocation median improves by 10% or more; (b) no entry of 5 s or more
+other than the gateway entries takes more than 1.5x its baseline; (c) no entry
+reaches 80% of its own meson timeout, and the EUnit test count across the three
+shards equals a contemporaneous `dev` push's (2807 at the time of writing; a test
+module added to `dev` meanwhile would move it). Windows (Wee Tam) runs the same entries: its
+`agent tsan-heavy checkpoints` barrier (`is_parallel: false`) now waits for C and
+`gateway ct` as well as A and B, which should still be shorter than the two
+covered shards were, but is not measured; read its first runs. Unfiltered nightly
+runs now start `gateway ct` with the shards, after the pg shards. Faster code
+without cover can move a race: watch about five runs per leg for a gateway flake
+and name the module before any re-run. To revert, take the shards back to two in
+the root `meson.build` table, `REQUIRED` in `scripts/ci/assert-gateway-tests.py`
+and the names in `tests/test_gateway_test_summary.py` (and the shard count in
+`docs/erlang-gateway-build.md`, `docs/testing/integration-tests.md` and
+`docs/rhel9-build-setup.md`),
+delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
+priority; each of the three is separable.
+*Samples.* To be recorded here after the change's own runs.
+
 ### Persistent runner-local test history
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
@@ -2957,7 +3015,7 @@ false at the test-file level: nine entries pin OS-specific behaviour inside the
 test file or script itself, not behind a meson guard. Those nine carry the
 `platform` suite instead, which every leg runs (except where an entry is not
 registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
-with `-Dbuild_server=false`, so a `build_server`-gated entry runs on Linux only):
+agent-only (the `server` option is off for a non-Linux target), so a `build_server`-gated entry runs on Linux only):
 
 | Entry | Why it is OS-contract |
 |---|---|
@@ -3002,8 +3060,8 @@ as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
 (linux) and nightly.yml (asan / tsan / coverage).
 
 **Only Linux runs the server suites (ADR-0035 ladder step 1).** The Windows and
-macOS legs of `ci.yml` configure with `-Dbuild_server=false`, so they build no
-server code, register no server suite and need no Postgres; the Windows job no
+macOS legs of `ci.yml` configure agent-only (`server` option `auto`, off on any
+non-Linux target), so they build no server code, register no server suite and need no Postgres; the Windows job no
 longer runs `Ensure Postgres`. Wee Tam's per-agent PostgreSQL services stay
 provisioned until ladder step 4 deprovisions them, and
 `deploy/windows/Assert-Toolchain.ps1` still health-checks them in the Windows
@@ -3179,8 +3237,8 @@ value sets it itself.
 |---|---|---|---|
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other legs: clang-21 debug on a push; release legs on a `main` push or Tier 2b dispatch) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
-| macOS | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
+| Windows | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
+| macOS | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
 
 Until ADR-0035 ladder step 1, Windows debug (every PR and push) ran the full
 14 shards and Windows release (a `main` push or a Tier 2b dispatch) the smoke
@@ -3290,6 +3348,8 @@ sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`
 (per-triplet, outside workspace). macOS joined this model with the BigMags
 cutover; its former `actions/cache@v5` round-trip was removed.
+
+**Install profile (ADR-0035 ladder step 3).** The key deliberately has no install-profile term. Every Windows and macOS workflow now installs an agent-only profile with no `server` feature (`--x-no-default-features`, plus `--x-feature=tests` where tests build; `release.yml` omits `tests`), so the persistent self-hosted tree (each Wee Tam runner keeps its own `vcpkg_installed/x64-windows` in its workspace, under its own work root, and the CI, nightly and CodeQL Windows jobs it picks up reuse it) is never reconciled between a full and an agent-only shape in steady state (when main and dev carry different `VCPKG_COMMIT` values the sentinel key changes and the tree is wiped and rebuilt instead). Linux legs install the full manifest; the Linux agent images use the agent-only profile in their own containers. A workflow that mixes profiles on one tree pays an incremental vcpkg reconcile on each switch (`docs/build-guide.md` "Dependency features"); do not add a second profile on Wee Tam without updating that section and the pins in `scripts/ci/test_runner_health_check.py`.
 
 The script must run cleanly under MSYS2 bash on Windows. **Do NOT use
 `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under
@@ -3559,7 +3619,7 @@ a stale build instead of queueing behind it, and a 120-min timeout. Since
 failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
-release's own signed agent archives) on a GitHub-hosted runner — no
+release's own agent archives, after verifying the release `SHA256SUMS` cosign signature) on a GitHub-hosted runner — no
 compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
 attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
 jobs.

@@ -2822,6 +2822,7 @@
       "changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md",
       "changelog.d/6386-echo-tests-windows-honesty.fixed.md",
       "changelog.d/7037-echo-rollup-only-v10.changed.md",
+      "changelog.d/7286-echo-db-open-hardening.security.md",
       "changelog.d/7318-echo-rollup-only-server.changed.md",
       "changelog.d/7371-echo-rollup-only-ui.changed.md",
       "changelog.d/7371-echo-rollup-only-ui.removed.md",

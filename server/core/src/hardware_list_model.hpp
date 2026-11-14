@@ -159,6 +159,11 @@ struct HardwareListPage {
     std::size_t total_matching{0};        // after q/os/status, before paging
     HardwareKpis kpis;                    // see hardware_kpis()
     HardwareListQuery query;              // the normalised, canonical echo
+    /// The roster this page was cut from was a typed PARTIAL (#5712; copied from
+    /// `InventoryDevicesResult::roster_truncated` by the route). `total_matching`, `kpis.*` and
+    /// the pagination total are then LOWER BOUNDS, and an empty result for a search proves
+    /// nothing. Never set by `build_hardware_list_page` itself (it sees only rows).
+    bool roster_truncated{false};
     // Quarantine state for the page's rows ONLY (never the whole roster): ids whose
     // active record the caller may read. `quarantine_degraded` = the read or a
     // per-record authz check failed, so absence of a pill proves nothing.
@@ -386,7 +391,9 @@ inline constexpr std::int64_t kHardwareStaleAfterMs = 2LL * 24 * 60 * 60 * 1000;
 // ── #5531: the store-to-bit mappings, pure so a revert is visible to a unit test ──
 
 /// Failed read -> `roster_degraded` + `ci_degraded` + `tags_degraded` (no enrichment of an
-/// unknown roster) and returns false; a healthy read touches nothing and returns true.
+/// unknown roster) and returns false. A healthy read returns true and copies the read's typed
+/// `truncated` bit to `roster_truncated` (#5712) — a partial roster is NOT a degraded one: it is
+/// served, flagged, and every other bit is left alone.
 [[nodiscard]] bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
 
 /// `agent_id -> (key -> value)` bulk tag read (`TagStore::get_values_for_keys`).
@@ -403,11 +410,13 @@ void apply_tag_read(InventoryDevicesResult& result,
                     const std::expected<std::vector<std::string>, TagReadError>& keys,
                     const TagValuesReader& read_values);
 
-/// One device's identity from an offline-roster read: the error is propagated (a failed read
-/// is never "not in the roster"); a healthy read yields the matching row (online=false, stale
-/// past 2 days) or nullopt when the agent is absent.
+/// One device's identity from the offline point read (`OfflineEndpointStore::find_within`, #5712):
+/// the error is propagated (a failed read is never "not in the roster"); a hit yields the row
+/// (online=false, stale past 2 days) and an empty read is a CONFIRMED absence (nullopt) — the
+/// point read is a primary-key lookup, so unlike the roster scan it replaced (a lower bound past
+/// the row cap, which read an enrolled offline device as absent) its miss is exact.
 [[nodiscard]] std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
-offline_identity_row(const OfflineRosterRead& eps, std::string_view agent_id, std::int64_t now_ms,
+offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
                      std::string (*human_age)(std::int64_t));
 
 /// Identity read -> `identity` on success (nullopt = absent), `identity_degraded` on error.

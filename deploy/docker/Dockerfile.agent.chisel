@@ -63,7 +63,7 @@ COPY vcpkg.json vcpkg-configuration.json ./
 # arch fail with "failed to take lock ... Device or resource busy". `locked`
 # serialises the two vcpkg installs against this mount instead.
 #
-# Agent-only: the meson configure below is -Dbuild_server=false -Dbuild_tests=false,
+# Agent-only: the meson configure below is -Dserver=disabled -Dbuild_tests=false,
 # so --x-no-default-features opts out of vcpkg.json's default `server` + `tests`
 # features (libpq, xmlsec, drogon, catch2). Add --x-feature=agent once it has content,
 # and --x-feature=tests if -Dbuild_tests=true is ever set below (tests/meson.build
@@ -89,7 +89,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         -Dcmake_prefix_path=/src/vcpkg_installed/$T \
         -Dpkg_config_path=/src/vcpkg_installed/$T/lib/pkgconfig \
         -Dbuild_tests=false \
-        -Dbuild_server=false \
+        -Dserver=disabled \
     && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"} \
     && ccache -s
 

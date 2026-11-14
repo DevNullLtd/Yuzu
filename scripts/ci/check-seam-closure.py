@@ -512,14 +512,17 @@ FAMILIES = {
     # `DexApi`; `device_lens_routes.cpp`'s `/fragments/device/dex` lens is ALSO
     # now rewired onto `DexApi` (issue #4576) and is enforced too — but via the
     # `device` family's TU set above (it is that family's own second
-    # presentation TU), not this one, since `dex`'s enforced set here is
-    # header-only.
+    # presentation TU), not this one. The Apps tab renderer (`dex_apps_ui.*`,
+    # AP-3.2) is this family's one enforced presentation TU: it reads
+    # `DexApi::apps` through a pure model, so it cannot reach the store.
     "dex": {
         "tus": [
             "server/core/src/dex_types.hpp",
             "server/core/src/dex_read_model.hpp",
             "server/core/src/dex_api.hpp",
             "server/core/src/dex_api_local.hpp",
+            "server/core/src/dex_apps_ui.hpp",
+            "server/core/src/dex_apps_ui.cpp",
         ],
     },
     # dex_perf: the SIXTH family — DexPerfApi, the DEX app-perf-over-time

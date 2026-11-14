@@ -37,9 +37,10 @@ using EventEmitHook = std::function<void(std::string_view event_type, const nloh
 /// `other`. NOT named `event`: docs/observability-conventions.md routes SIEM filters on a label
 /// called `event` (`event="security"`), and this counter must never match one.
 inline constexpr char kEventEmitFailedMetric[] = "yuzu_server_event_emit_failed_total";
-inline constexpr std::array<std::string_view, 7> kEmittedEvents{
+inline constexpr std::array<std::string_view, 10> kEmittedEvents{
     "execution.created",   "execution.completed", "command.dispatched", "instruction.executed",
-    "approval.created",    "workflow.executed",   "other"};
+    "approval.created",    "workflow.executed",   "instruction.created", "instruction.updated",
+    "instruction.deleted", "other"};
 
 /// Logs and counts one emission that threw. Never throws: observability must not fail a request.
 inline void report_event_emit_failure(yuzu::MetricsRegistry* metrics,

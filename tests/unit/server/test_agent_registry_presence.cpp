@@ -313,7 +313,7 @@ TEST_CASE("HA WS-5: a graceful disconnect's remove_if_session prevents zero-mono
     bool on_roster = false;
     const auto roster = store.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the roster read is typed
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         on_roster = on_roster || e.agent_id == "departed-agent";
     CHECK(on_roster);
     CHECK_FALSE(contains(registry.all_ids(), "departed-agent"));
