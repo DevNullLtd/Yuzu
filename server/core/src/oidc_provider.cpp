@@ -5,6 +5,7 @@
 #include "evp_raii.hpp"
 #include "oidc_abandoned_ledger.hpp"
 #include "oidc_egress_policy.hpp"
+#include "refusal_log_throttle.hpp"
 #include "sha256_steps.hpp"
 
 #include <httplib.h>
@@ -970,6 +971,15 @@ const std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
     return p;
 }
 
+// The pool-full warning and the NAT64 "not started" warning are written at most once per 60 s each
+// (one key each); later ones in the window go to debug. The lookups counter and the failing
+// request's own error carry every occurrence. The timeout warning is not throttled. A leaked
+// function-local static, like the pool.
+RefusalLogThrottle& oidc_resolver_log_throttle() {
+    static RefusalLogThrottle& t = *new RefusalLogThrottle(std::chrono::seconds(60), 4);
+    return t;
+}
+
 // The test hook (OidcProvider::set_bounded_lookup_for_test): empty in production, which means the
 // system lookup and the OIDC pool.
 struct BoundedLookupHook {
@@ -1119,9 +1129,14 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
     case net::ResolveStatus::kOk:
         break;
     case net::ResolveStatus::kBusy:
-        spdlog::warn("OIDC egress: the name lookup for '{}' was not started: the lookup pool ({} "
-                     "slots) is full or a worker could not be created",
-                     ::yuzu::log_key_token(host), pool_cap);
+        spdlog::log(oidc_resolver_log_throttle().should_warn("oidc_lookup_busy")
+                        ? spdlog::level::warn
+                        : spdlog::level::debug,
+                    "OIDC egress: the name lookup for '{}' was not started: the lookup pool ({} "
+                    "slots) is full or a worker could not be created (this line is written at "
+                    "most once per 60 s; yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} "
+                    "has the full count)",
+                    ::yuzu::log_key_token(host), pool_cap);
         return net::ResolveStatus::kBusy;
     case net::ResolveStatus::kTimeout:
         spdlog::warn("OIDC egress: the name lookup for '{}' did not answer within {} s; its slot "
@@ -1256,9 +1271,12 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
     if (outcome == ProbeOutcome::kBusy) {
         // Not started: no negative window, so the next IPv6 fetch probes again. Learned prefixes
         // and an earlier overflow stay as they are.
-        spdlog::warn("OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) was not started; it "
-                     "will be retried on the next fetch, and IPv6 destinations are classified "
-                     "without it until then");
+        spdlog::log(oidc_resolver_log_throttle().should_warn("oidc_nat64_probe_busy")
+                        ? spdlog::level::warn
+                        : spdlog::level::debug,
+                    "OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) was not started; it "
+                    "will be retried on the next fetch, and IPv6 destinations are classified "
+                    "without it until then (this line is written at most once per 60 s)");
         std::lock_guard lock(cache.mu);
         if (cache.overflowed)
             return std::nullopt;
@@ -2667,6 +2685,10 @@ static_assert(net::kResolveStatusCount == 5,
 
 std::array<std::uint64_t, 5> oidc_resolver_outcome_counts() {
     return oidc_resolver_pool_ref()->outcome_counts();
+}
+
+void OidcProvider::reset_resolver_log_throttle_for_test() {
+    oidc_resolver_log_throttle().clear();
 }
 
 void OidcProvider::clear_nat64_discovery_cache_for_test() {

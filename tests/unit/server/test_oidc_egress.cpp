@@ -58,7 +58,12 @@ const Nat64Net kPub64{"pub/64",
 
 /// The discovery cache is process-wide: every case starts and ends with it empty.
 struct Nat64CacheReset {
-    Nat64CacheReset() { OidcProvider::clear_nat64_discovery_cache_for_test(); }
+    // Also forgets the once-per-60-s warning throttle, which is process state like the cache: a
+    // case that reads a warning line must not find it already spent by an earlier case.
+    Nat64CacheReset() {
+        OidcProvider::clear_nat64_discovery_cache_for_test();
+        OidcProvider::reset_resolver_log_throttle_for_test();
+    }
     ~Nat64CacheReset() { OidcProvider::clear_nat64_discovery_cache_for_test(); }
     Nat64CacheReset(const Nat64CacheReset&) = delete;
     Nat64CacheReset& operator=(const Nat64CacheReset&) = delete;
@@ -1510,6 +1515,47 @@ TEST_CASE("OIDC resolver: every lookup through the OIDC pool is counted once, by
     CHECK(counted(net::ResolveStatus::kTimeout) == 1);
     CHECK(counted(net::ResolveStatus::kBusy) == 1);
     CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{1, 1, 1, 1, 1});
+}
+
+TEST_CASE("OIDC resolver: a full pool warns once per interval for each warning, the counter counts "
+          "every refusal",
+          "[oidc][oidc_egress][oidc_resolver]") {
+    Nat64CacheReset cache; // also resets the warning throttle
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool);
+    const auto count_lines = [](const std::string& text, const std::string& needle) {
+        int n = 0;
+        for (auto at = text.find(needle); at != std::string::npos;
+             at = text.find(needle, at + needle.size()))
+            ++n;
+        return n;
+    };
+
+    VetThread holder(st->gate, "slow.a.test", 10000);
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+
+    // Captured at warn level: a throttled line is written at debug and is not in the capture.
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    for (int i = 0; i < 3; ++i) {
+        const auto refused = vet_name("other.test", 10000);
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == kBusyReason);
+    }
+    // Two refused probes: its warning has its own throttle key, so it is written once as well.
+    for (int i = 0; i < 2; ++i)
+        (void)vet_name(kLiteralTarget, 10000);
+    cap.stop();
+
+    CHECK(count_lines(cap.text(), "was not started: the lookup pool (1 slots) is full") == 1);
+    CHECK(count_lines(cap.text(), "the NAT64 prefix lookup (ipv4only.arpa) was not started") == 1);
+    CHECK(st->others.load() == 0);
+    CHECK(st->probes.load() == 0);
+    // The counter has every refusal: three names and two probes.
+    CHECK(pool->outcome_counts()[static_cast<std::size_t>(net::ResolveStatus::kBusy)] == 5);
+
+    holder.finish();
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
 }
 
 TEST_CASE("OIDC resolver: a failed or busy NAT64 probe changes nothing in the learned prefixes",

@@ -369,6 +369,9 @@ public:
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
+    /// Test-only seam: forgets the once-per-60-s throttle of the pool-full and NAT64 "not started"
+    /// warnings, so the next one of each is written at warn level again. Same source-scan rule.
+    static void reset_resolver_log_throttle_for_test();
     /// Test-only seam: forgets the process-wide cache of NAT64 prefixes learned from
     /// `ipv4only.arpa`, so the next eligible fetch looks them up again. Same source-scan pin.
     static void clear_nat64_discovery_cache_for_test();
