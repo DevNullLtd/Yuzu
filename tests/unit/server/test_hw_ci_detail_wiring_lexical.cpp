@@ -142,10 +142,13 @@ TEST_CASE("build_hw_roster wiring (LEXICAL pin, not behaviour): the roster read 
     // #7566: "online" is the roster row's own `live` flag OR a session held on THIS replica. The
     // registry's presence-merged `all_ids()` (a second read that can fail or be truncated on its own
     // and silently read connected devices as Offline) must not come back into this closure, and the
-    // ttl must be the session timeout (the presence window the registry itself uses).
+    // TTL must be the session timeout (the presence window the registry itself uses).
     CHECK(count_occurrences(roster_body, "registry_.all_ids()") == 0);
     CHECK(count_occurrences(roster_body, "registry_.local_ids()") == 1);
-    CHECK(count_occurrences(roster_body, "r.online=e.live||online.count(e.agent_id)>0;") == 1);
+    // The composition itself is `roster_row_online` (behaviourally tested in test_hardware_list_model);
+    // this pins that the closure calls it, and that nothing else assigns `online` afterwards.
+    CHECK(count_occurrences(roster_body, "r.online=roster_row_online(e,online);") == 1);
+    CHECK(count_occurrences(roster_body, "r.online=") == 1);
     // The rows come from the served partial's `.rows`, not from a re-read.
     CHECK(count_occurrences(roster_body, "eps->rows") >= 1);
 }

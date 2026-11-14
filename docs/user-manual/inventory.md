@@ -907,17 +907,7 @@ place, **Hardware** and **Software**, each its own page:
   plus a sticky bulk-tag bar let you apply or remove one tag across every selected
   device in one action — under the hood it loops the existing single-device tag routes,
   so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
-  audit row; nothing is bulk-authorized. **Online** means the device holds a session on the
-  server answering the request, or the database says it is connected to some server (it has
-  recorded a session and been seen within the presence window, the server's session timeout,
-  90 seconds by default). The database half is read in the same statement as the roster, so
-  there is no second read to fail: on a deployment with more than one server replica a device
-  connected to another replica reads Online, on the list, the per-device record, `GET
-  /api/v1/hardware/{id}` and MCP `get_hardware_ci` alike, and the Online/Offline filter, the
-  status sort and the Online and Offline tiles agree with it. Two limits remain: a device that
-  drops without saying goodbye reads Online until the window passes, and a device whose first
-  heartbeat has not recorded a session yet reads Offline on a replica other than the one it
-  is connected to until its next heartbeat. The KPI strip (Total CIs / Online / Offline /
+  audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
   Stale / CI coverage) is computed over the same rows the table shows. Two readouts sit
   beside it: **Median memory** (over the devices that have synced a positive RAM figure,
   with that device count in the label) and a **By manufacturer** line (case-folded, the
@@ -935,6 +925,18 @@ place, **Hardware** and **Software**, each its own page:
   unavailable"** / **"Tags unavailable"** banner (never silently "no CI"/"no tags") —
   distinct from a single device that simply hasn't synced yet, which still shows a plain
   `—` placeholder in just that cell.
+
+  **Online** on the Hardware list means the device holds a session on the
+  server answering the request, or the database says it is connected to some server (it has
+  recorded a session and been seen within the presence window, the server's session timeout,
+  90 seconds by default). The database half is read in the same statement as the roster, so
+  there is no second read to fail: on a deployment with more than one server replica a device
+  connected to another replica reads Online, on the list, the per-device record, `GET
+  /api/v1/hardware/{id}` and MCP `get_hardware_ci` alike, and the Online/Offline filter, the
+  status sort and the Online and Offline tiles agree with it. Two limits remain: a device that
+  drops without saying goodbye reads Online until the window passes, and a device whose first
+  heartbeat has not recorded a session yet reads Offline on a replica other than the one it
+  is connected to until its next heartbeat.
 
   **Click a device** (or visit `/hardware/ci?id=`) for its record — a seven-tab CI
   record, gated per device on `Inventory:Read` for the device's management group

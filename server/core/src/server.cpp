@@ -20256,7 +20256,7 @@ private:
             // (`OfflineEndpoint::live`, the `query_live_ids` predicate on the database clock), so
             // Online/Offline no longer needs a SECOND read (the registry's cached presence read)
             // that could fail or be truncated on its own and silently turn devices connected to
-            // another replica into Offline. The ttl is the registry's own presence window.
+            // another replica into Offline. The TTL is the registry's own presence window.
             auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow,
                                                                    cfg_.session_timeout);
             if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
@@ -20268,7 +20268,7 @@ private:
             // dispatch hot-path mutex (gov perf-S2) - and does no presence read, so nothing here
             // can fail. A device gracefully departed from another replica reads offline as soon
             // as its cleared session_id is written (#5678); one that dropped without a goodbye
-            // reads online for up to the ttl, the documented residual of the liveness predicate.
+            // reads online for up to the TTL, the documented residual of the liveness predicate.
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
             auto online_ids = registry_.local_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
@@ -20285,7 +20285,7 @@ private:
                 // registry session's copy when the agent is currently online.
                 r.agent_version = e.agent_version;
                 r.arch = e.arch;
-                r.online = e.live || online.count(e.agent_id) > 0;
+                r.online = roster_row_online(e, online);
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > kHardwareStaleAfterMs; // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);

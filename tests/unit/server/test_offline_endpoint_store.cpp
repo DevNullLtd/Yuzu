@@ -1060,7 +1060,7 @@ TEST_CASE("OfflineEndpointStore roster and point reads carry the live flag, on t
     REQUIRE(store.remove_if_session("lv-gone", "sess-gone"));
     // never recorded a session id (a first heartbeat that raced session lookup).
     REQUIRE(store.upsert("lv-blank", "host-blank", "linux", t, 0, "1.0.0", "x86_64"));
-    // had a session id but has not been seen for two hours: outside the presence ttl.
+    // had a session id but has not been seen for two hours: outside the presence TTL.
     REQUIRE(store.upsert("lv-old", "host-old", "linux", t, 0, "1.0.0", "x86_64", "sess-old"));
     exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval '2 hours' "
                        "WHERE agent_id = 'lv-old'");
@@ -1073,7 +1073,7 @@ TEST_CASE("OfflineEndpointStore roster and point reads carry the live flag, on t
         return out;
     };
 
-    SECTION("with a ttl, exactly the rows a presence read would call live are live") {
+    SECTION("with a TTL, exactly the rows a presence read would call live are live") {
         auto roster = store.query_stale_within(std::chrono::hours(1), kTtl);
         REQUIRE(roster.has_value());
         REQUIRE(roster->rows.size() == 4); // the live flag never filters rows out
@@ -1083,6 +1083,12 @@ TEST_CASE("OfflineEndpointStore roster and point reads carry the live flag, on t
         for (const auto& p : live_ids_ok(store, kTtl))
             presence.insert(p.agent_id);
         CHECK(live_of(roster->rows) == presence);
+        // ...and with the third copy of the predicate, the fleet tally (all four rows are inside
+        // its window too, so its live count is the roster's live count).
+        auto tally = store.fleet_state_counts(t, std::chrono::hours(1),
+                                              std::chrono::milliseconds{1000}, kTtl);
+        REQUIRE(tally.has_value());
+        CHECK(tally->live == static_cast<std::int64_t>(live_of(roster->rows).size()));
         // The row's other columns still map (the live column is appended, not interleaved).
         const auto* r = find(roster->rows, "lv-live");
         REQUIRE(r != nullptr);
@@ -1091,7 +1097,7 @@ TEST_CASE("OfflineEndpointStore roster and point reads carry the live flag, on t
         CHECK(r->arch == "x86_64");
         CHECK(r->last_heartbeat_ms == t);
     }
-    SECTION("without a ttl nothing is asked, so no row claims to be live") {
+    SECTION("without a TTL nothing is asked, so no row claims to be live") {
         auto roster = store.query_stale_within(std::chrono::hours(1));
         REQUIRE(roster.has_value());
         CHECK(live_of(roster->rows).empty());

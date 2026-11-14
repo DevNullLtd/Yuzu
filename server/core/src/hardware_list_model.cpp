@@ -928,6 +928,10 @@ void apply_tag_read(InventoryDevicesResult& result,
             r.tags.assign(it->second.begin(), it->second.end());
 }
 
+bool roster_row_online(const OfflineEndpoint& e, const std::unordered_set<std::string>& local_ids) {
+    return e.live || local_ids.count(e.agent_id) > 0;
+}
+
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
 offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
                      std::string (*human_age)(std::int64_t)) {

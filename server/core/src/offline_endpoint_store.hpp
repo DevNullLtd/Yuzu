@@ -246,10 +246,10 @@ public:
     ///
     /// `live_ttl` (#7566) asks the same statement which of those rows are connected now, so the
     /// Online/Offline view needs no second presence read that can fail or be truncated on its own:
-    /// each row's `OfflineEndpoint::live` is `session_id <> '' AND last_seen_at >= now() - ttl` on the
+    /// each row's `OfflineEndpoint::live` is `session_id <> '' AND last_seen_at >= now() - TTL` on the
     /// database clock (the predicate `query_live_ids` and `fleet_state_counts` use). The default
     /// `0` means "not asked": `live` is `false` for every row, which is what the viz and
-    /// hostname-map consumers, who never read it, get. The ttl is a presence TTL, normally
+    /// hostname-map consumers, who never read it, get. The TTL is a presence TTL, normally
     /// `Config::session_timeout`.
     [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window,
                                                        std::chrono::seconds live_ttl = {});

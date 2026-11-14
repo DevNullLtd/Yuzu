@@ -150,8 +150,8 @@ constexpr const char* kRosterTruncatedMetric = "yuzu_server_agent_presence_roste
 // list AND of the liveness predicate, so the roster scan and the point read can never map a column
 // or judge presence differently. `live` is the predicate `query_live_ids` and `fleet_state_counts`
 // use (DB clock, non-blank session), gated on a positive TTL so "not asked" (0) is a literal
-// `false` and never a row that happens to sit at the clock's edge. `$<ttl>` is the bind number of
-// the TTL parameter in the calling statement.
+// `false` by construction rather than by the clock arithmetic happening to come out that way.
+// `ttl_param` is the bind number of the TTL parameter in the calling statement.
 std::string endpoint_columns(int ttl_param) {
     const std::string p = "$" + std::to_string(ttl_param) + "::bigint";
     return "agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch, "

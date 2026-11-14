@@ -396,6 +396,14 @@ inline constexpr std::int64_t kHardwareStaleAfterMs = 2LL * 24 * 60 * 60 * 1000;
 /// served, flagged, and every other bit is left alone.
 [[nodiscard]] bool apply_roster_read(InventoryDevicesResult& result, const OfflineRosterRead& eps);
 
+/// Whether a roster row reads Online (#7566): the database says it is connected to some replica
+/// (`OfflineEndpoint::live`, which needs a non-zero TTL on the read) OR this replica holds its
+/// session (`local_ids`, the one thing the database can lag on: a session whose row has not recorded
+/// a session id yet). Pure, so the composition is unit-tested rather than pinned by source text
+/// alone; a `live` of false means "not asked or not live", never an error.
+[[nodiscard]] bool roster_row_online(const OfflineEndpoint& e,
+                                     const std::unordered_set<std::string>& local_ids);
+
 /// `agent_id -> (key -> value)` bulk tag read (`TagStore::get_values_for_keys`).
 using TagValuesRead =
     std::expected<std::unordered_map<std::string, std::unordered_map<std::string, std::string>>,

@@ -1071,7 +1071,7 @@ TEST_CASE("offline_identity_row: a row the database says is live reads online, n
     CHECK((*hit)->last_seen_ms == 10 * kDayMs);     // the read's clock, as the list does
     CHECK_FALSE((*hit)->stale);
 
-    // The same row without the flag (a read that was not given a ttl, or a departed device) is the
+    // The same row without the flag (a read that was not given a TTL, or a departed device) is the
     // offline row it always was: the flag is the ONLY thing that changes it.
     const auto not_live = offline_identity_row(
         OfflineEndpointRead{std::optional<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - 5000)}},
@@ -1081,6 +1081,26 @@ TEST_CASE("offline_identity_row: a row the database says is live reads online, n
     CHECK_FALSE((*not_live)->online);
     CHECK((*not_live)->last_seen == "aged");
     CHECK((*not_live)->last_seen_ms == 10 * kDayMs - 5000);
+}
+
+// #7566: a roster row reads Online when the database says it is live OR this replica holds its
+// session. Kills: dropping the `live` half (a device connected to ANOTHER replica reads Offline
+// again), dropping the local half (a session whose row has not recorded a session id reads Offline),
+// and treating "nothing says so" as Online.
+TEST_CASE("roster_row_online: live OR local session, nothing else", "[hardware][model]") {
+    OfflineEndpoint e = make_offline_ep("a1", 1000);
+    const std::unordered_set<std::string> none;
+    const std::unordered_set<std::string> local{"a1", "other"};
+    const std::unordered_set<std::string> elsewhere{"zzz"};
+
+    CHECK_FALSE(roster_row_online(e, none));
+    CHECK_FALSE(roster_row_online(e, elsewhere));
+    CHECK(roster_row_online(e, local)); // local session only: the database lags
+
+    e.live = true; // the database says it is connected (another replica)
+    CHECK(roster_row_online(e, none));
+    CHECK(roster_row_online(e, elsewhere));
+    CHECK(roster_row_online(e, local));
 }
 
 // Kills: apply_identity_read never setting identity_degraded, or setting it on a clean miss.
