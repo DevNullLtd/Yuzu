@@ -1300,7 +1300,8 @@ TEST_CASE("find software: an empty page is told apart by its cursor, so a Load b
 
 namespace {
 /// {controls whose request targets #fs-results, how many of those carry the shared sync scope}.
-std::pair<std::size_t, std::size_t> results_controls(const std::string& h) {
+/// An array, not a pair: Catch2 prints a range on failure ({ 2, 1 }), a pair as {?}.
+std::array<std::size_t, 2> results_controls(const std::string& h) {
     const std::string target = "hx-target=\"#fs-results\"";
     std::size_t all = 0, synced = 0;
     for (auto p = h.find(target); p != std::string::npos; p = h.find(target, p + 1)) {
@@ -1315,38 +1316,27 @@ std::pair<std::size_t, std::size_t> results_controls(const std::string& h) {
 TEST_CASE("find software: every control that re-runs the search shares the form's sync scope, so a "
           "slow earlier response cannot overwrite a newer search",
           "[inventory][ui][find]") {
+    using Counts = std::array<std::size_t, 2>;
     // The form (the panel on the page).
-    const auto panel = results_controls(full({}, page()));
-    REQUIRE(panel.first == 1);
-    REQUIRE(panel.second == 1);
+    REQUIRE(results_controls(full({}, page())) == Counts{1, 1});
     // The status pill's x on a status-filtered result.
     SoftwareFindData st = find_data({find_install("a1", "host-0188", "4.2.1", "unconfirmed")});
     st.f.status = "unconfirmed";
-    const auto pill = results_controls(render_software_find(st));
-    REQUIRE(pill.first == 1);
-    REQUIRE(pill.second == 1);
+    REQUIRE(results_controls(render_software_find(st)) == Counts{1, 1});
     // A component result with unconfirmed devices: "show only these", and with a status filter the
     // pill's x as well.
     SoftwareFindData comp = find_data({find_install("a1", "host-0188", "2.14.1", "unconfirmed")});
     comp.f.kind = "java";
     comp.totals = SoftwareFindTotals{214, 163, 4, std::nullopt};
-    const auto only = results_controls(render_software_find(comp));
-    REQUIRE(only.first == 1);
-    REQUIRE(only.second == 1);
+    REQUIRE(results_controls(render_software_find(comp)) == Counts{1, 1});
     comp.f.status = "unconfirmed";
-    const auto both = results_controls(render_software_find(comp));
-    REQUIRE(both.first == 2);
-    REQUIRE(both.second == 2);
+    REQUIRE(results_controls(render_software_find(comp)) == Counts{2, 2});
     // Retry on the degraded banner, first page and inside a Load-more row.
     SoftwareFindData degraded;
     degraded.f.name = "x";
-    const auto retry = results_controls(render_software_find(degraded));
-    REQUIRE(retry.first == 1);
-    REQUIRE(retry.second == 1);
+    REQUIRE(results_controls(render_software_find(degraded)) == Counts{1, 1});
     degraded.f.cursor = "cur";
-    const auto in_row = results_controls(render_software_find(degraded));
-    REQUIRE(in_row.first == 1);
-    REQUIRE(in_row.second == 1);
+    REQUIRE(results_controls(render_software_find(degraded)) == Counts{1, 1});
 }
 
 TEST_CASE("find software: the per-device software tab gains Install type and Location columns",

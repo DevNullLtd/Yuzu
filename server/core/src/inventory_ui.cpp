@@ -757,6 +757,12 @@ std::string find_url(const SoftwareFindFilters& f) {
     return std::string(kFindFragment) + "?" + query_of(find_kv(f, true));
 }
 
+// A control that re-runs the search with other filters into #fs-results.
+std::string find_get_attrs(const SoftwareFindFilters& f) {
+    return "hx-get=\"" + esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" " +
+           kFindSync;
+}
+
 // The REST lookup the current filters correspond to: the copy-able call line (`csv` = false) and
 // the Export CSV link (`csv` = true). Applications carry no `kind` (that parameter is the
 // catalogue's app/pkg split, not the chip).
@@ -819,9 +825,8 @@ std::string find_degrade(const SoftwareFindFilters& f) {
     return "<div class=\"inv-degrade\" role=\"alert\"><b>Inventory store unavailable.</b> The "
            "installed-software store did not answer, so nothing is shown rather than an empty "
            "list that could be mistaken for \"no software\". <button type=\"button\" "
-           "class=\"inv-btn\" data-act=\"retry\" hx-get=\"" +
-           esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" " + kFindSync +
-           ">Retry</button></div>";
+           "class=\"inv-btn\" data-act=\"retry\" " +
+           find_get_attrs(f) + ">Retry</button></div>";
 }
 
 // The device's name as a link to its Hardware record; an agent the roster does not name shows its
@@ -979,12 +984,6 @@ std::string find_table_head(bool comp) {
                   "was not\">Status</th><th scope=\"col\" title=\"When a report last confirmed this "
                   "install\">Last confirmed</th><th scope=\"col\" title=\"When the device last sent "
                   "its software inventory; amber after 48 h\">Last synced</th>";
-}
-
-// A control that re-runs the search with other filters into #fs-results.
-std::string find_get_attrs(const SoftwareFindFilters& f) {
-    return "hx-get=\"" + esc(find_url(f)) + "\" hx-target=\"#fs-results\" hx-swap=\"innerHTML\" " +
-           kFindSync;
 }
 
 std::string find_cards(const SoftwareFindData& d) {
@@ -1273,14 +1272,11 @@ std::string render_software_devices_table(const SoftwarePageFilters& f, const So
 std::string render_software_find(const SoftwareFindData& d) {
     const bool rows_only = !d.f.cursor.empty();
     const bool comp = find_is_components(d.f);
-    if (d.caveat) {
-        const std::string c = "<div class=\"inv-caveat\">" + esc(*d.caveat) + "</div>";
-        return rows_only ? "<tr><td colspan=\"8\" class=\"fs-msg\">" + c + "</td></tr>" : c;
+    if (d.caveat || !d.rows) { // a degraded read: the retry banner, never an empty table
+        const std::string m = d.caveat ? "<div class=\"inv-caveat\">" + esc(*d.caveat) + "</div>"
+                                       : find_degrade(d.f);
+        return rows_only ? "<tr><td colspan=\"8\" class=\"fs-msg\">" + m + "</td></tr>" : m;
     }
-    if (!d.rows) // a degraded read: the retry banner, never an empty table
-        return rows_only ? "<tr><td colspan=\"8\" class=\"fs-msg\">" + find_degrade(d.f) +
-                               "</td></tr>"
-                         : find_degrade(d.f);
     if (rows_only)
         return find_body(d);
 
