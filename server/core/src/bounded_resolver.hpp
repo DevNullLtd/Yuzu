@@ -182,10 +182,13 @@ inline ResolveResult system_lookup(const std::string& host) {
         pool = detail::process_pool();
     if (!lookup)
         lookup = &detail::system_lookup;
-    if (pool->in_flight.fetch_add(1) >= pool->cap) {
-        pool->in_flight.fetch_sub(1);
-        return {ResolveStatus::kBusy, {}};
-    }
+    // Admit by compare-exchange so the counter only ever moves up when a slot is free: a refused
+    // call never raises it, and `in_flight` never reads above `cap`.
+    int cur = pool->in_flight.load();
+    do {
+        if (cur >= pool->cap)
+            return {ResolveStatus::kBusy, {}};
+    } while (!pool->in_flight.compare_exchange_weak(cur, cur + 1));
     std::shared_ptr<detail::ResolveState> state;
     try {
         state = std::make_shared<detail::ResolveState>();

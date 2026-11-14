@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <future>
@@ -80,6 +81,60 @@ TEST_CASE("bounded resolver: the default cap is exactly 16 and a blocked lookup 
     CHECK(pool->in_flight.load() == 16);
     CHECK(net::bounded_resolve("blocked.example", 1ms, blocked, pool).status ==
           net::ResolveStatus::kBusy);
+
+    latch->release();
+    for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
+        std::this_thread::sleep_for(10ms);
+    CHECK(pool->in_flight.load() == 0);
+}
+
+TEST_CASE("bounded resolver: the in-flight reading never exceeds the cap under a refused burst",
+          "[bounded_resolver]") {
+    namespace net = yuzu::server::net;
+    using namespace std::chrono_literals;
+    constexpr int kCap = 2;
+    auto latch = std::make_shared<Latch>();
+    const net::LookupFn blocked = [latch](const std::string&) -> net::ResolveResult {
+        latch->wait();
+        return {net::ResolveStatus::kOk, {"192.0.2.1"}};
+    };
+    auto pool = std::make_shared<net::ResolverPool>(kCap);
+
+    // Fill the pool, then hammer it from several threads so almost every call is refused while a
+    // sampler reads the counter. A refused call must never raise the counter, so the highest
+    // reading ever seen is the cap. (Nothing asserts on a worker thread: results go to atomics.)
+    for (int i = 0; i < kCap; ++i)
+        CHECK(net::bounded_resolve("blocked.example", 1ms, blocked, pool).status ==
+              net::ResolveStatus::kTimeout);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> max_seen{0};
+    std::atomic<int> admitted_beyond_cap{0};
+    std::vector<std::thread> hammer;
+    for (int t = 0; t < 8; ++t)
+        hammer.emplace_back([&] {
+            while (!stop.load()) {
+                if (net::bounded_resolve("blocked.example", 1ms, blocked, pool).status !=
+                    net::ResolveStatus::kBusy)
+                    admitted_beyond_cap.fetch_add(1);
+            }
+        });
+    std::thread sampler([&] {
+        while (!stop.load()) {
+            const int v = pool->in_flight.load();
+            int prev = max_seen.load();
+            while (v > prev && !max_seen.compare_exchange_weak(prev, v)) {
+            }
+        }
+    });
+    std::this_thread::sleep_for(200ms);
+    stop.store(true);
+    for (auto& th : hammer)
+        th.join();
+    sampler.join();
+
+    CHECK(admitted_beyond_cap.load() == 0);
+    CHECK(max_seen.load() == kCap);
 
     latch->release();
     for (int i = 0; i < 400 && pool->in_flight.load() > 0; ++i)
