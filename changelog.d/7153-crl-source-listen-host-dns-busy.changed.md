@@ -1,0 +1,1 @@
+- **A CRL source registration refused because the resolver pool was at its cap while looking up a listen-host name is now counted as `dns_busy`.** It used to be counted as `own_addresses_unavailable` in `yuzu_server_revocation_source_degrade_total`; the request is unchanged (the same retryable `503`, nothing registered). See `docs/user-manual/upgrading.md`.
