@@ -3098,11 +3098,20 @@ Resolution order inside the script:
    overridden; `tests/shell/test_linux_concurrent_step.sh` pins both). The
    checkpoint `FILE_COPY` forces stays inside the job's own per-runner
    Postgres container. No other workflow sets it. It needs PostgreSQL 15+ (every
-   Big Tam agent runs the pinned 18 image). It moves the pg step's baseline:
-   pg-step samples taken for a later push (the tmpfs push, Push 3, or the
-   concurrent-halves acceptance) compare only against runs that include it.
-   Revert: `git revert` the commit that wired it (the export, the step's
-   contract test and the leak warning text move together). Contract:
+   Big Tam agent runs the pinned 18 image), and the gain depends on the cluster
+   running with `fsync=off`, as `ensure-postgres.sh`'s Docker cluster does: in a
+   local check on that image a 25 MB template cloned in 44 ms with `FILE_COPY`
+   and 65 ms with `WAL_LOG` with fsync off, but 636 ms against 68 ms with fsync
+   on, so a durable cluster (a pre-set DSN or a native fallback) should leave
+   it unset. It moves the pg step's baseline:
+   pg-step samples for a later push (the tmpfs push, Push 3) compare only
+   against runs that include it, and samples taken before it (the
+   concurrent-halves runs, and #7703's Push 2d samples) do not. Revert:
+   `git revert -m 1` the merge commit of the PR that wired it (the export, the
+   step's contract test and the leak warning text move together). The
+   concurrent-halves kill switch (`YUZU_CI_SEQUENTIAL_HALVES=1`) does not undo
+   it: if a pg-half revert trigger persists with the switch set, revert this
+   next. Contract:
    `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on

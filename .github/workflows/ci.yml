@@ -1831,9 +1831,12 @@ jobs:
             # two same-job A/B runs (#7701): the server-pg suite ran about 6-7%
             # faster in wall time than with the server default (WAL_LOG). Each
             # runner has its own Postgres container, so the checkpoint FILE_COPY
-            # forces stays inside this job's cluster. Needs PostgreSQL 15+.
-            # Revert: git revert the commit that added this line (the step's
-            # contract test and the leak warning above change with it).
+            # forces stays inside this job's cluster. Needs PostgreSQL 15+, and
+            # is only a gain with fsync off, as ensure-postgres.sh's Docker
+            # cluster runs (on an fsync-on cluster each clone measured ~9x slower).
+            # Revert: `git revert -m 1` the merge commit of the PR that added
+            # this line (the step's contract test and the leak warning above
+            # change with it). YUZU_CI_SEQUENTIAL_HALVES=1 does not undo it.
             export YUZU_TEST_PG_CLONE_STRATEGY=file_copy
             if [[ "$PG_MODE" == "full" ]]; then
               bash scripts/ci/with-test-slot.sh 3 -- \
