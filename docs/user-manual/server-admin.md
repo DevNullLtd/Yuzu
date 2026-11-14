@@ -346,7 +346,7 @@ separately.
   Compact) applies to the Console results table. Both are saved in this browser only.
 - **Server** holds the two runtime settings that change on a running server, written through
   `PUT /api/config/{key}`: the **agent heartbeat timeout** (`heartbeat_timeout`; seconds of silence
-  after which this server drops an agent connected directly to it) and the **log level**
+  after which this server drops an agent connected directly to it; it is also the presence window behind **Online** on the Hardware list, see [Inventory](inventory.md)) and the **log level**
   (`log_level`). Both apply to this server process only, are stored, and are re-applied at restart;
   the log level then wins over `--log-level`. Neither is the dashboard sign-in expiry: that is the
   read-only **Console idle timeout** (`--session-inactivity-secs`) and **Console session
