@@ -96,9 +96,9 @@
 ///     `"error"` (`referrer_check_unwired` / `referrer_check_unavailable`) and
 ///     a referenced definition audits `"denied"` (`referenced`), each refusal
 ///     deleting nothing; a not-found audits `"denied"`; success audits
-///     `"success"`, its detail the pre-image (`plugin`, `action`,
-///     `approval_mode`, `concurrency_mode`) and, when packs contain the
-///     definition, `packs=<ids>`.
+///     `"success"`, its detail the pre-image (`name`, `plugin`, `action`,
+///     `approval_mode`, `concurrency_mode`, `enabled`) and, when packs contain
+///     the definition, `packs=<ids>`.
 ///   - `POST /api/instructions/import`: a DB error audits `"error"`; EVERY
 ///     other rejection (conflict or otherwise) audits `"denied"` — unlike
 ///     the plain JSON create route, `import` audits every non-DB-error

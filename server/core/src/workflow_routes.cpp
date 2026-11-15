@@ -4524,12 +4524,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto id = req.matches[1].str();
 
         // M2: refuse BEFORE the first item is deleted (uninstall() deletes items one at a time, so
-        // a refusal part-way would leave a pack with some items gone and the rest left). A pack whose InstructionDefinition
-        // is still named by a schedule, a workflow or a policy fragment is not uninstalled; the
-        // pack's OWN workflow items and the own policy fragments no policy uses do not count, they
-        // are removed by this same uninstall. A pack that carries no InstructionDefinition item
-        // skips the lookup. Advisory-not-transactional: a schedule created after the check is not
-        // seen.
+        // a refusal part-way would leave a pack with some items gone and the rest left). A pack
+        // whose InstructionDefinition is still named by a schedule, a workflow or a policy
+        // fragment is not uninstalled; the pack's OWN workflow items and the own policy fragments
+        // no policy uses do not count, they are removed by this same uninstall. A pack that
+        // carries no InstructionDefinition item skips the lookup. Advisory-not-transactional: a
+        // schedule created after the check is not seen.
         {
             auto pack = product_pack_store->get(id);
             if (!pack) {
@@ -4564,8 +4564,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (has_definition) {
                     if (!referrers_fn)
                         return refuse(503, "error", "referrer_check_unwired",
-                                      "definition reference check not configured; nothing was "
-                                      "uninstalled");
+                                      "definition reference check not configured; the pack was "
+                                      "not uninstalled");
                     // The pack's own items are left out of the lookup INSIDE its capped queries
                     // (a filter applied to the capped answer would let a pack with many own
                     // workflows fill the window and hide a foreign referrer). Workflows go in the
@@ -4580,15 +4580,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     for (const auto& fragment_id : own_fragments) {
                         if (!policy_store)
                             return refuse(503, "error", "referrer_check_unwired",
-                                          "definition reference check not configured; nothing was "
-                                          "uninstalled");
+                                          "definition reference check not configured; the pack was "
+                                          "not uninstalled");
                         auto used = policy_store->query_policies(PolicyQuery{
                             .fragment_filter = fragment_id,
                             .limit = static_cast<int>(kMaxHeldByPoliciesNamed) + 1});
                         if (!used)
                             return refuse(503, "error", "referrer_check_unavailable",
-                                          "definition reference check unavailable; nothing was "
-                                          "uninstalled");
+                                          "definition reference check unavailable; the pack was "
+                                          "not uninstalled");
                         if (used->empty())
                             exclusions.fragment_ids.insert(fragment_id);
                         else {
@@ -4608,8 +4608,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                         auto referrers = referrers_fn(item.item_id, exclusions);
                         if (!referrers)
                             return refuse(503, "error", "referrer_check_unavailable",
-                                          "definition reference check unavailable; nothing was "
-                                          "uninstalled");
+                                          "definition reference check unavailable; the pack was "
+                                          "not uninstalled");
                         // A foreign referrer can name two of the pack's definitions: list it
                         // (and count it) once.
                         for (auto& r : *referrers) {

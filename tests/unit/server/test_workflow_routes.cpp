@@ -7098,7 +7098,7 @@ TEST_CASE("N2-3: an unwired policy store 503s the uninstall of a pack with a def
     auto del = h.sink.Delete("/api/product-packs/" + pack_id);
     REQUIRE(del);
     CHECK(del->status == 503);
-    CHECK(del->body.find("nothing was uninstalled") != std::string::npos);
+    CHECK(del->body.find("the pack was not uninstalled") != std::string::npos);
     REQUIRE(h.audit_calls.size() == 1);
     CHECK(h.audit_calls[0].result == "error");
     CHECK(h.audit_calls[0].detail == "referrer_check_unwired");
@@ -7148,7 +7148,7 @@ TEST_CASE("N2-3: a failing policy read 503s the uninstall of a pack with a defin
     broken.repair();
     REQUIRE(del);
     CHECK(del->status == 503);
-    CHECK(del->body.find("nothing was uninstalled") != std::string::npos);
+    CHECK(del->body.find("the pack was not uninstalled") != std::string::npos);
     REQUIRE(h.audit_calls.size() == 1);
     CHECK(h.audit_calls[0].result == "error");
     CHECK(h.audit_calls[0].detail == "referrer_check_unavailable");
@@ -7258,6 +7258,57 @@ TEST_CASE("N4-2: a policy-held fragment of a pack with no definition is still to
     auto kept = policies.get_fragment("held-frag");
     REQUIRE(kept.has_value());
     CHECK(kept->has_value());
+}
+
+// N4-2b: the Policy branch of the same read-back. delete_policy answers a bare false for a database
+// fault too, and a policy that is still there after the false is a db_error that aborts the
+// uninstall (the pack stays listed, the retry removes the policy and the pack). Turns red if a
+// failed policy delete is read as the tolerated not_found (200, pack gone, policy left behind).
+TEST_CASE("N4-2b: a failed delete of a pack's own policy aborts the uninstall and the retry "
+          "finishes it",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore policies{pool};
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, {}, &policies);
+    REQUIRE(policies.create_fragment(fragment_naming("no-such-definition", "frag-for-pol"))
+                .has_value());
+    std::string policy_id;
+    const std::string bundle = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: policy-only\n"
+                               "version: 1.0.0\ndescription: d\n---\n"
+                               "apiVersion: yuzu.io/v1alpha1\nkind: Policy\nname: own-policy\n";
+    auto install_fn = [&](const std::string&,
+                          const std::string&) -> std::expected<std::string, std::string> {
+        auto id = policies.create_policy(policy_using("frag-for-pol"));
+        if (id)
+            policy_id = *id;
+        return id;
+    };
+    auto installed = h.product_pack_store->install(bundle, install_fn);
+    REQUIRE(installed.has_value());
+    REQUIRE_FALSE(policy_id.empty());
+
+    yuzu::test::WriteFault fault(pool, "policy_store.policies", "n42");
+    fault.arm();
+    auto failed = h.sink.Delete("/api/product-packs/" + *installed);
+    fault.repair();
+    REQUIRE(failed);
+    CHECK(failed->status == 503);
+    auto still_pack = h.product_pack_store->get(*installed);
+    REQUIRE(still_pack.has_value());
+    CHECK(still_pack->has_value());
+    auto still_policy = policies.get_policy(policy_id);
+    REQUIRE(still_policy.has_value());
+    CHECK(still_policy->has_value());
+
+    auto ok = h.sink.Delete("/api/product-packs/" + *installed);
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    auto gone_policy = policies.get_policy(policy_id);
+    REQUIRE(gone_policy.has_value());
+    CHECK_FALSE(gone_policy->has_value());
 }
 
 // N4-3: UP-7. The referrer sources read an empty definition id as "no filter" and would answer
@@ -7619,7 +7670,7 @@ TEST_CASE("M2-2: a failing or unwired referrer lookup 503s the uninstall of a pa
     auto del = h.sink.Delete("/api/product-packs/" + pack_id);
     REQUIRE(del);
     CHECK(del->status == 503);
-    CHECK(del->body.find("nothing was uninstalled") != std::string::npos);
+    CHECK(del->body.find("the pack was not uninstalled") != std::string::npos);
     auto still_def = h.instructions->get_definition(def_id);
     REQUIRE(still_def.has_value());
     CHECK(still_def->has_value());

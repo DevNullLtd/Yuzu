@@ -515,9 +515,20 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content(detail::a4_error(res, message), "application/json");
                 // The Instructions page's Delete button is a plain hx-delete and htmx swaps no
                 // 4xx/5xx body, so the refusal is also a toast (an HX-Trigger header is processed
-                // whatever the status). ensure_ascii keeps the header 7-bit.
+                // whatever the status). ensure_ascii keeps the header 7-bit, and the toast text is
+                // cut to kToastMaxBytes (on a character boundary) so a long referrer list cannot
+                // outgrow a proxy's response-header buffer; the body keeps the full text.
+                constexpr std::size_t kToastMaxBytes = 600;
+                std::string toast_text(message);
+                if (toast_text.size() > kToastMaxBytes) {
+                    std::size_t cut = kToastMaxBytes;
+                    while (cut > 0 && (static_cast<unsigned char>(toast_text[cut]) & 0xC0) == 0x80)
+                        --cut;
+                    toast_text.resize(cut);
+                    toast_text += "...";
+                }
                 const nlohmann::json trigger = {
-                    {"showToast", {{"message", std::string(message)}, {"level", "error"}}}};
+                    {"showToast", {{"message", toast_text}, {"level", "error"}}}};
                 res.set_header("HX-Trigger",
                                trigger.dump(-1, ' ', true,
                                             nlohmann::json::error_handler_t::replace));
