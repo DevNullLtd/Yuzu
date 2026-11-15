@@ -1,6 +1,9 @@
 // A subset JSON-Schema checker for the MCP output-schema conformance tests (shared by the
 // hardware and containment twin tests so a served body is validated against the schema
-// tools/list publishes, not against a copy). Not a general validator.
+// tools/list publishes, not against a copy). Not a general validator. A separate checker for the
+// served OpenAPI document is openapi_body_check.hpp: it models `$ref`, `allOf`, `oneOf`, bounds and
+// `nullable` and returns every violation, but takes no `type` array. The two are not
+// interchangeable.
 #pragma once
 
 #include <nlohmann/json.hpp>

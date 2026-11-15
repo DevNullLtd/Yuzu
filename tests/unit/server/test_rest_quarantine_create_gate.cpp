@@ -445,7 +445,7 @@ struct Rig {
         if (auto active = quarantine.list_quarantined())
             for (const auto& r : *active)
                 quarantined.insert(r.agent_id);
-        const auto gate = yuzu::protective::is_quarantine_control_plugin(plugin, norm_action)
+        const auto gate = yuzu::protective::is_firewall_control_plugin(plugin, norm_action)
                               ? ContainmentGate::exempt_control_plugin()
                               : ContainmentGate::enforcing(/*fail_closed_in=*/false,
                                                            std::move(quarantined));

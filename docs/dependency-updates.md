@@ -252,7 +252,7 @@ No CVE id is cited: none appears in the vcpkg tree.
 **New behaviour.** On glibc builds a lookup against an unresponsive resolver now waits for the
 resolver itself (about 30 seconds with default resolver settings; cpp-httplib's header says the
 system resolver timeout, about 30 s by default, past the caller's timeout; read as
-about 30 s from the start of the lookup, not measured) before the request fails; see `docs/user-manual/upgrading.md`.
+about 30 s from the start of the lookup, not measured) before the request fails, except the server's OIDC name lookups, which stop waiting at the per-operation timeout; see the upgrade note in `docs/user-manual/upgrading.md`.
 
 **SBOMs.** Unchanged mechanism: `.github/workflows/release.yml` generates them
 with Syft (`anchore/sbom-action`), scanning the build workspace and the pushed

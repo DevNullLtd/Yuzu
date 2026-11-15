@@ -30,8 +30,9 @@
 //     size and mtime: nothing has touched tar.db since the sidecars moved; resume as normal.
 //   - the same with the marker ABSENT or recording a different tar.db: the echo.db sidecar is not
 //     provably this adoption's own (the marker is written before every move it guards), so adoption
-//     fails closed, naming both files, and moves nothing; EchoDatabase::open() then refuses until
-//     the operator resolves the two files.
+//     fails closed, naming both files, and moves no legacy file (a foreign echo.db or sidecar that
+//     the planted-file heal below already set aside is logged before the refusal);
+//     EchoDatabase::open() then refuses until the operator resolves the two files.
 // The marker is a plain file written with write_file_atomic (fsync'd on POSIX; on Windows the
 // shared writer documents no flush-by-handle, so a power loss right after the write can lose the
 // marker there, which fails closed rather than open). A marker left behind once tar.db is gone (the
@@ -48,6 +49,36 @@
 // left for the operator, and one warning names them. Old tar.db.corrupt-* quarantine files are
 // never touched.
 //
+// ONE exception, Windows only (#6695): the both-present state is also what a PLANTED echo.db looks
+// like. A local user who can write the state directory creates echo.db before the first start of
+// the upgraded agent; open() refuses it (foreign owner), and the legitimate tar.db could never be
+// adopted, so the agent would fail closed on every start with an operator visit as the only exit.
+// So when echo.db is owned by an account other than SYSTEM, Administrators or the agent's, it is
+// moved aside to `echo.db.planted-<epoch>[-n]` (kept as evidence, never overwritten) and the
+// adoption below proceeds. Each file is judged on its own and moved ALONE, never as a group: the
+// resume state "tar.db present, echo.db-wal already moved" legitimately leaves an owner-verified
+// echo.db-wal beside echo.db, and carrying it away would resume the adoption without its
+// committed rows. Only a foreign-owned file moves; an owner-verified sidecar stays and pairs with
+// tar.db as in any resume. FAIL CLOSED: when the owner of echo.db or of any existing sidecar
+// cannot be resolved nothing is moved, the warning above is the only effect and echo.db wins, so
+// an unreadable owner can never be turned into a move.
+//
+// Recorded limit: the owner probe and the move are two operations on a NAME, so a file swapped
+// into that name between them is moved on the earlier verdict. The swap needs rename rights over
+// files whose protected DACL withholds them from the planting account, so it reduces to an
+// account moving a file it could already move; it is accepted, not closed.
+//
+// The second shape a planted file takes is a SIDECAR with no echo.db: a planted echo.db-wal
+// beside the real tar.db-wal, which the collision refusal below would otherwise stop for good.
+// So when echo.db is absent, every echo.db sidecar whose tar.db twin also exists is probed the
+// same way; a foreign-owned one is moved aside alone (`echo.db-wal.planted-<epoch>[-n]`), an
+// owner-verified one is left where it is and the refusal below stands, and an unresolved one
+// cancels every move, as above. A lone echo.db sidecar with no tar.db twin is the resume state
+// and is never probed or moved. Adoption
+// proceeds only once everything in its way was moved aside: echo.db itself when present, the
+// colliding sidecars otherwise. The POSIX arm is unchanged: the state directory is root-owned
+// there, so a local user cannot plant a file in it.
+//
 // A sidecar present at BOTH names while tar.db is being adopted (for example a downgrade wrote a
 // fresh tar.db-wal beside an already-moved echo.db-wal) cannot be paired safely: moving tar.db
 // anyway would open it with a foreign WAL and strand the legacy WAL's committed rows. Adoption
@@ -59,19 +90,65 @@
 // has tar.db present, because sidecars move before the main file.
 #pragma once
 
+#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <system_error>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
+#include <sqlite_quarantine.hpp> // claim_quarantine_name: the shared no-overwrite move (#6914)
+
+#ifdef _WIN32
+#include <win_echo_db_owner_probe.hpp> // the owner test EchoDatabase::open applies
+#endif
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic: the fsync'd marker write
 
 namespace yuzu::agent {
+
+/// Whose a database file is, as far as the owner test can tell. `unknown` = it could not be
+/// examined (a failed open or owner read, no token user): never treated as either of the others.
+enum class EchoFileOwner { ours, foreign, unknown };
+
+/// Judges one existing file. Empty = no judgement (the POSIX default), so the both-present arm
+/// leaves everything alone. A parameter so the decision logic is tested without a Windows host.
+using EchoOwnerProbe = std::function<EchoFileOwner(const std::filesystem::path&)>;
+
+/// The probe adoption uses by default: the same owner test open() applies, through a handle opened
+/// no-follow with READ_CONTROL only. Empty off Windows.
+[[nodiscard]] inline EchoOwnerProbe default_echo_owner_probe() {
+#ifdef _WIN32
+    auto probe = std::make_shared<yuzu::win::EchoDbOwnerProbe>();
+    return [probe](const std::filesystem::path& file) {
+        if (!probe->ok())
+            return EchoFileOwner::unknown;
+        constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        const HANDLE raw = ::CreateFileW(file.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+                                         kShareAll, nullptr, OPEN_EXISTING,
+                                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                                         nullptr);
+        if (raw == INVALID_HANDLE_VALUE)
+            return EchoFileOwner::unknown;
+        const std::unique_ptr<void, decltype(&::CloseHandle)> handle{raw, ::CloseHandle};
+        DWORD owner_rc = ERROR_SUCCESS;
+        if (probe->foreign_owner(handle.get(), &owner_rc))
+            return EchoFileOwner::foreign;
+        // nullopt is "ours" only when the owner was actually read (a filesystem without ACLs has
+        // no owner to compare: unknown, so nothing is moved on that ground).
+        return owner_rc == ERROR_SUCCESS ? EchoFileOwner::ours : EchoFileOwner::unknown;
+    };
+#else
+    return {};
+#endif
+}
+
 
 namespace detail {
 
@@ -92,18 +169,87 @@ legacy_echo_fingerprint(const std::filesystem::path& legacy) {
 } // namespace detail
 
 [[nodiscard]] inline std::expected<void, std::string>
-adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
+adopt_legacy_echo_db(const std::filesystem::path& echo_db,
+                     const EchoOwnerProbe& owner_of = default_echo_owner_probe()) {
     namespace fs = std::filesystem;
     constexpr const char* kSidecars[] = {"-journal", "-wal", "-shm"};
     const fs::path legacy = echo_db.parent_path() / "tar.db";
 
     std::error_code ec;
-    const bool echo_present = fs::exists(echo_db, ec);
+    bool echo_present = fs::exists(echo_db, ec);
     if (ec)
         return std::unexpected(std::format("cannot stat {}: {}", echo_db.string(), ec.message()));
     const bool legacy_present = fs::exists(legacy, ec);
     if (ec)
         return std::unexpected(std::format("cannot stat {}: {}", legacy.string(), ec.message()));
+
+    if (legacy_present && owner_of) {
+        // Planted-file self-heal (#6695, see the header comment). Probe every candidate before
+        // moving any.
+        std::vector<fs::path> foreign;
+        bool echo_foreign = false;
+        bool unresolved = false;
+        for (const char* suffix : {"", "-journal", "-wal", "-shm"}) {
+            fs::path file = echo_db;
+            file += suffix;
+            const bool present = fs::exists(file, ec);
+            if (ec) {
+                unresolved = true; // cannot even tell it is there: nothing is moved
+                break;
+            }
+            if (!present)
+                continue;
+            if (!echo_present) {
+                fs::path twin = legacy;
+                twin += suffix;
+                const bool collides = fs::exists(twin, ec);
+                if (ec) {
+                    unresolved = true;
+                    break;
+                }
+                if (!collides)
+                    continue;
+            }
+            switch (owner_of(file)) {
+            case EchoFileOwner::ours:
+                break;
+            case EchoFileOwner::foreign:
+                foreign.push_back(file);
+                echo_foreign = echo_foreign || suffix[0] == '\0';
+                break;
+            case EchoFileOwner::unknown:
+                unresolved = true;
+                break;
+            }
+        }
+        const bool heal = !unresolved && (echo_present ? echo_foreign : !foreign.empty());
+        if (heal) {
+            const auto epoch = yuzu::shared::sqlite_quarantine::now_epoch_seconds();
+            // One at a time. The sidecars first, the main file last, so an interruption leaves
+            // "echo.db still planted" (re-detected on the next start), never a stranded sidecar.
+            for (auto it = foreign.rbegin(); it != foreign.rend(); ++it) {
+                std::vector<std::string> notes;
+                const auto moved = yuzu::shared::sqlite_quarantine::claim_quarantine_name(
+                    *it, epoch, ".planted-", &notes);
+                for (const auto& note : notes)
+                    spdlog::warn("Legacy adoption: {}", note);
+                if (!moved) {
+                    return std::unexpected(std::format(
+                        "cannot move the foreign-owned {} aside; resolve it by hand",
+                        it->string()));
+                }
+                spdlog::warn("{} is owned by an account other than SYSTEM, Administrators or the "
+                             "agent's: moved aside to {} so the legacy {} can be adopted",
+                             it->string(), moved->string(), legacy.string());
+            }
+            if (echo_foreign)
+                echo_present = false; // echo.db is gone: carry on to the adoption proper
+        }
+        if (unresolved) {
+            spdlog::warn("Could not resolve the owner of every file at {}: none moved aside",
+                         echo_db.string());
+        }
+    }
 
     // <data_dir>/echo.db.adopting: the adoption-intent marker (path only; no I/O here).
     fs::path marker = echo_db;
@@ -177,8 +323,8 @@ adopt_legacy_echo_db(const std::filesystem::path& echo_db) {
             if (to_present && !from_present)
                 return std::unexpected(std::format(
                     "cannot adopt {}: {} exists but {}, so it cannot be shown to belong to this "
-                    "adoption (it could be an older database's log); nothing was moved, resolve "
-                    "{} by hand",
+                    "adoption (it could be an older database's log); no legacy files were moved "
+                    "(a foreign file moved aside is logged above), resolve {} by hand",
                     legacy.string(), to.string(),
                     recorded ? std::format("{} records a different {}", marker.string(),
                                            legacy.string())

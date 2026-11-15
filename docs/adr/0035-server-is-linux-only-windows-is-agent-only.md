@@ -426,7 +426,8 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    - **#5325 and #1835** are closed as resolved by removal when this change merges.
    - Proof without an RC (owner decision, 2026-11-11): the static pins, plus a Windows rehearsal of
      the agent-only build, packaging and installer on a build box. The first stable tag after this
-     change is the first real run of the changed jobs.
+     change is the first real run of the changed jobs. (Superseded 2026-11-12: the next release tag
+     is an RC by plan and is the first real run of both steps' changes.)
 3. **Build guard** — implement Decision 4: convert `build_server` to a feature option, key the guard
    on `host_machine.system()`, make the non-Linux `vcpkg install` paths skip the `server` feature,
    and update `scripts/setup.sh`, the CLAUDE.md quickstarts, and any docs passing
@@ -440,6 +441,103 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    and `tests/test_release_agent_only.py` (`release.yml`, step 2). This includes `release.yml`'s
    `build-windows` and `build-macos` jobs: verify afterwards that the Windows agent archive no
    longer carries `libpq.dll` or the other server-port DLLs.
+
+   *Status: done — #7632.* As implemented, with these deviations and additions:
+   - **Option name: `server`** (feature, default `auto`). `auto` builds the server on a Linux
+     target (judged by `host_machine.system()` lowercased, because Meson keeps a cross file's
+     `system = 'Linux'` verbatim; so a Linux-target cross build from any host stays legal) and is off for any other target; `-Dserver=enabled` on a non-Linux target is a
+     configure error carrying the ADR message; `disabled` never builds it.
+   - **`build_server` is KEPT, deprecated** (`deprecated: true`, default `true`), still honoured
+     as an extra off-switch, and `-Dserver=enabled` together with a passed or stored
+     `build_server=false` is an error. Deleting it would break every build dir and branch that stored or passes it;
+     its removal is owned by step 4, with the build-dir delete-or-rename (step 4's text now says so). On
+     Linux, a server turned off only by the deprecated boolean says so at configure.
+   - **vcpkg choice.** The manifest default is unchanged (`server` and `tests` stay default
+     features, so Linux and the images keep the full set). Non-Linux paths opt out instead:
+     `ci.yml` Windows/macOS, `nightly.yml` Windows ASan and `codeql.yml` Windows install with
+     `--x-no-default-features --x-feature=tests`; `release.yml`'s Windows and macOS jobs with
+     `--x-no-default-features` (no tests); `scripts/setup.sh` on a Windows or macOS host without
+     a cross file always passes `--x-no-default-features --x-feature=tests` (a plain run after
+     `--tests` must not drop Catch2 from a build dir that stored `build_tests=true`; pinned).
+     The agent Dockerfiles use `-Dserver=disabled`. Each Wee Tam runner keeps its own persistent
+     `vcpkg_installed/x64-windows` tree; the CI, nightly and CodeQL Windows jobs share the
+     `+tests` agent-only profile on it, and `release.yml` (a clean checkout, no `tests`) installs
+     its own. The reverse reconcile (a full tree down to agent-only) was exercised on Windows in
+     the rehearsal below (one non-healing case: a kill while removing libpq); it has not been
+     exercised on macOS.
+   - **No server switch in CI.** The Windows and macOS `ci.yml` legs, nightly Windows ASan and
+     CodeQL Windows pass no `-Dserver` at all (`auto` is already off there), because a stored
+     non-default option in a persistent build dir breaks an older branch's reconfigure.
+     `release.yml` is the exception and passes `-Dserver=disabled`, as it builds fresh.
+   - **Deviation: `tests/shell/test_build_examples_gating.sh` passes no off-switch.** The text
+     above said it must pass `-Dbuild_server=false` or `disabled`; with `auto` it configures
+     agent-only off Linux on its own, so adding a flag would test less. Instead, off Linux it now
+     asserts from the introspected targets that no `yuzu-server` target exists.
+   - **Added: `release.yml` refuses server-port DLLs.** The "Verify the agent runs from the
+     packaged archive" step fails if the archive holds a `libpq*`, `libecpg*`, `libpgtypes*`, `drogon*`,
+     `trantor*`, `jsoncpp*` or `*xmlsec*` DLL (the nine DLLs a full x64-windows vcpkg tree has
+     and an agent-only one lacks, measured: drogon, jsoncpp, libecpg, libecpg_compat,
+     libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor), so the "verify afterwards" instruction above is a permanent
+     gate, pinned (with mutants) in `tests/test_release_agent_only.py`. This supersedes step 2's
+     note that the DLL sweep was left unchanged.
+   - **Not yet verified** (the first-RC checks are tracked in #7597). The release-time DLL refusal has never run on a real release (it
+     ran in the Windows rehearsal below, which is not a release), nothing was run on macOS
+     (no box), and the added publish wait below is untimed. If the refusal fails on
+     a release tag, no image is pushed (the other build jobs' attestations and workflow artifacts are
+     still recorded; build-windows records neither, because the refusal precedes both): `docker-publish`, `docker-publish-chisel` and
+     `docker-publish-postgres` all need `build-windows` and `build-macos` (UP-12, pinned in
+     `tests/test_release_agent_only.py`), so a failed agent packaging step pushes no versioned
+     image. The first release tag after this change (an RC by plan) has to confirm the added wait
+     (the images now start after the slowest agent build, ~40 min).
+   - **Release publish coupling (owner decision, 2026-11-12; wording confirmed by the owner the
+     same day; recovery sentence corrected and re-confirmed by the owner the same day).** The three image-publish jobs (`docker-publish`, `docker-publish-chisel`,
+     `docker-publish-postgres`) need all four build jobs (`build-linux`, `build-gateway`,
+     `build-windows`, `build-macos`) as success gates; none takes a build's output as an input.
+     Why: no `:X.Y.Z` image may exist for a release whose server or agent packaging failed (UP-12).
+     Costs: the images start only after the slowest build (the Windows agent, ~40 min, untimed
+     until an RC), and a failed or cancelled build job blocks every image and the GitHub Release. Recovery: a server-DLL refusal is deterministic (the release job installs from a clean checkout, so re-running the same tag refuses again): fix the cause and re-tag. 'Re-run failed jobs' on the newest run for the tag is only for a transient failure such as a runner or network fault. There is no sanctioned images-only publish
+     path today (tracked in #7596).
+   - **Interim gap until step 5: no native server stack on macOS.** `scripts/start-UAT.sh`
+     and the native-stack phases of `/test` need a server binary, which macOS no longer
+     builds; run the Linux stack (containers) instead.
+   - Pins: `tests/test_server_feature_option.py` (new: lexical pins with mutants, a real
+     configure for Windows, macOS and Linux targets, and the `setup.sh` / gating pins),
+     `tests/test_release_agent_only.py` and `scripts/ci/test_runner_health_check.py` move to the
+     new switch and the install opt-out.
+   - Proof: static pins plus a Windows rehearsal on a build box (not a CI run, not a release;
+     the first release tag after this change, an RC by plan, is the first real run of the changed
+     release jobs).
+     Rehearsal (2026-11-12, Windows 11 build box, MSVC 19.44, Meson 1.11.1, pwsh 7.6, scratch
+     clones and a scratch vcpkg copy and binary cache; workflow step bodies extracted from the
+     YAML, never retyped):
+     - `ci.yml`'s Windows install, configure (no server switch: "Server: off", no server
+       target) and build pass; `meson test --suite agent` 19/19. `-Dserver=enabled` is refused
+       with the ADR-0035 message. `release.yml`'s install (none of the nine server DLLs),
+       `-Dserver=disabled` configure and build pass, with no `yuzu-server.exe`.
+     - The archive refusal, run on a real packaged zip under both a plain `pwsh -File` and the
+       Actions template: a clean archive passes and `yuzu-agent.exe --help` runs; `bin\libpq.dll`,
+       a nested `xmlsec1-openssl.dll` plus `bin\LIBPQ.DLL`, and `libecpg.dll` plus
+       `libpgtypes.dll` alone are each refused, naming every planted file, before `--help`.
+       Without `-Recurse` the refusal never fires (the reason the pin keeps it).
+     - vcpkg reconcile in place, both directions, with `scripts/setup.sh`: full to agent-only
+       removes the nine DLLs; agent-only to full restores them; killing vcpkg during a
+       binary-cache restore or during `Installing libpq` converges on the next run; the agent
+       builds and `--suite agent` passes in both directions; a pre-step-3 checkout with no
+       re-install fails its configure naming libpq, and its `setup.sh` fixes it. One gap: a
+       kill while vcpkg is REMOVING libpq (full to agent-only) leaves libpq `purge ok
+       half-installed` with part of its files on disk, and re-running the agent-only install
+       does not finish the purge (3 of 3). `libpq.dll` was already gone each time, a
+       pre-step-3 build still fails loudly (a debug build at configure, measured; a release
+       build likely at compile, since `lib/libpq.lib` survives and `include/libpq-fe.h` does
+       not), and the archive refusal catches any surviving
+       DLL; the remedy is to delete `vcpkg_installed` (or run a full install) and re-run
+       `setup.sh` (`docs/windows-build.md`).
+     - Persistent build dirs alternated between this change and its parent (`ci.yml`'s
+       `build-windows-agent-debug`, and the `build-windows-asan` configure with
+       `-Dbuild_server=false`): every reconfigure and build passes without a wipe. A
+       pre-step-3 checkout reconfiguring a step-3 dir prints Meson's "build_server is
+       deprecated" notice and drops the stored `server` value (harmless; step 4 must allow
+       for it).
 4. **Code + build/CI plumbing** — remove server-side `_WIN32` / `__APPLE__`-specific branches under
    `server/core/` (retain POSIX/Linux; do not disturb `agents/shared/` or `sdk/`, which stay
    cross-platform); and remove the plumbing that exists only for the non-Linux server: the
@@ -449,6 +547,17 @@ is the runner-provisioning path (`deploy/windows/Provision-Windows-Runner.ps1`, 
    paragraph, and the server-dep entries in `deploy/windows/README.md` / `toolchain-contract.json`
    (its Postgres pin). Remove only the libpq branch: CLAUDE.md's "Windows grpc/protobuf/abseil is
    load-bearing — both halves" rule survives, because the agent still links that stack.
+   Also in this step: **remove the deprecated `build_server` boolean** that step 3 kept declared
+   (`meson.options`, its two reads in `meson.build`, and the pins in
+   `tests/test_server_feature_option.py`). Deleting it makes Meson refuse to reconfigure any
+   build dir that stored it ("Unknown options", even with `--wipe`), so this is a build-dir
+   delete-or-rename event (`rm -rf <dir>`; `--wipe` replays the stored options and does not
+   help) on every persistent dir (Wee Tam's, the macOS and Linux runners', and
+   developers' `build-*`), done together with the Wee Tam deprovisioning. `main`'s nightly still passes
+   `-Dbuild_server=false` until `main` carries step 3, so delete a persistent dir only once
+   the branch that removes the option is the one its jobs build. (Measured in the step-3
+   rehearsal: a branch that still declares the option, reconfiguring a dir that stored the
+   step-3 `server` value, drops it silently and prints Meson's deprecation notice.)
 5. **Docs + dev workflow** — retire the server sections of `docs/windows-build.md`; scope
    `docs/darwin-compat.md` to the agent and **document the replacement macOS server dev workflow**
    (Linux builder container / VM / Docker image) and the `/test` platform-asymmetry

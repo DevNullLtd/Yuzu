@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "purl_compose.hpp"
 #include "software_list_model.hpp"
 
 #include <algorithm>
@@ -91,6 +92,82 @@ TEST_CASE("parse_list_params: a version range requires name with match=exact; a 
     CHECK_FALSE(parse_list_params(params({{"name", "git"}, {"version", "1"}, {"version_min", "0"}})));
 }
 
+TEST_CASE("parse_list_params / parse_components_params: vers rules", "[server][software_list_model]") {
+    const char* const kVers = "vers:generic/>=2.0|<2.17";
+    // vers needs name with match=exact, on both routes.
+    CHECK(parse_list_params(params({{"name", "git"}, {"vers", kVers}})));
+    CHECK(parse_components_params(params({{"name", "libfoo"}, {"vers", kVers}})));
+    const auto no_name = parse_list_params(params({{"vers", kVers}}));
+    REQUIRE_FALSE(no_name);
+    CHECK(no_name.error() == "vers requires name with match=exact");
+    const auto prefix = parse_list_params(params({{"name", "git"}, {"match", "prefix"}, {"vers", kVers}}));
+    REQUIRE_FALSE(prefix);
+    CHECK(prefix.error() == "vers requires name with match=exact");
+    const auto comp_no_name = parse_components_params(params({{"vers", kVers}}));
+    REQUIRE_FALSE(comp_no_name);
+    CHECK(comp_no_name.error() == "vers requires name with match=exact");
+    // vers is the alternative to version / version_min / version_max, never an addition.
+    for (const char* key : {"version", "version_min", "version_max"}) {
+        CAPTURE(key);
+        const auto both = parse_list_params(params({{"name", "git"}, {"vers", kVers}, {key, "1.0"}}));
+        REQUIRE_FALSE(both);
+        CHECK(both.error() == "vers cannot be combined with version, version_min or version_max");
+        const auto comp =
+            parse_components_params(params({{"name", "libfoo"}, {"vers", kVers}, {key, "1.0"}}));
+        REQUIRE_FALSE(comp);
+        CHECK(comp.error() == "vers cannot be combined with version, version_min or version_max");
+    }
+    // The parser's own refusals surface as the 400 message and never echo the input.
+    const auto deb = parse_list_params(params({{"name", "git"}, {"vers", "vers:deb/>=1.0"}}));
+    REQUIRE_FALSE(deb);
+    CHECK(deb.error() == "vers scheme deb is not supported yet");
+    const auto unknown = parse_list_params(params({{"name", "git"}, {"vers", "vers:nope/>=1.0"}}));
+    REQUIRE_FALSE(unknown);
+    CHECK(unknown.error() == "unknown vers scheme");
+    CHECK(unknown.error().find("nope") == std::string::npos);
+    const auto dup = parse_list_params(params({{"name", "git"}, {"vers", "vers:generic/1.0|1.0.0"}}));
+    REQUIRE_FALSE(dup);
+    CHECK(dup.error() == "vers constraints are not a valid interval list");
+    CHECK_FALSE(parse_list_params(params({{"name", "git"}, {"vers", "not-a-range"}})));
+    // present-empty vers is no vers at all.
+    const auto empty = parse_list_params(params({{"name", "git"}, {"vers", ""}}));
+    REQUIRE(empty);
+    CHECK_FALSE(empty->has_range());
+    // The range is engaged by either spelling and by neither when absent.
+    CHECK_FALSE(parse_list_params(params({{"name", "git"}}))->has_range());
+    CHECK(parse_list_params(params({{"name", "git"}, {"version_max", "1"}}))->has_range());
+    const auto ok = parse_components_params(params({{"name", "libfoo"}, {"vers", kVers}}));
+    REQUIRE(ok);
+    CHECK(ok->has_range());
+    CHECK(ok->vers == kVers);
+}
+
+TEST_CASE("parse_list_params: purl must start pkg:, is bounded, and is exact-matched",
+          "[server][software_list_model]") {
+    const auto none = parse_list_params(params({{"name", "git"}}));
+    REQUIRE(none);
+    CHECK(none->base.query.purl.empty());
+    const auto ok = parse_list_params(params({{"purl", "pkg:deb/debian/git@2.39?arch=amd64"}}));
+    REQUIRE(ok);
+    CHECK(ok->base.query.purl == "pkg:deb/debian/git@2.39?arch=amd64"); // no name needed
+    CHECK(parse_list_params(params({{"purl", ""}}))->base.query.purl.empty());
+    for (const char* bad : {"deb/debian/git", "PKG:deb/x", "http://x", " pkg:deb/x"}) {
+        CAPTURE(bad);
+        const auto r = parse_list_params(params({{"purl", bad}}));
+        REQUIRE_FALSE(r);
+        CHECK(r.error() == "invalid purl (expected pkg:...)");
+    }
+    // The bound is the stored-purl cap: exactly kMaxPurlBytes is accepted, one more is refused.
+    const std::string prefix = "pkg:deb/";
+    CHECK(parse_list_params(
+        params({{"purl", prefix + std::string(yuzu::server::kMaxPurlBytes - prefix.size(), 'a')}})));
+    const auto over = parse_list_params(
+        params({{"purl", prefix + std::string(yuzu::server::kMaxPurlBytes - prefix.size() + 1, 'a')}}));
+    REQUIRE_FALSE(over);
+    CHECK(over.error() == "parameter too long");
+    CHECK_FALSE(parse_list_params(params({{"purl", std::string("pkg:deb/a\0b", 11)}})));
+}
+
 TEST_CASE("parse_list_params: status is a closed set and the defaults add no filter",
           "[server][software_list_model]") {
     auto none = parse_list_params(params({{"name", "git"}}));
@@ -132,20 +209,89 @@ TEST_CASE("parse_list_params / parse_components_params: a repeated key keeps the
 TEST_CASE("resolve_version_range: inclusive bounds under the catalogue comparator",
           "[server][software_list_model]") {
     const std::vector<std::string> versions{"1.9", "1.10", "2.0-rc1", "2.0", "", "1.0"};
-    auto r = resolve_version_range(versions, "1.9", "2.0-rc1");
+    auto r = resolve_version_range(versions, vers::from_bounds("1.9", "2.0-rc1"));
     REQUIRE(r);
     std::ranges::sort(*r);
     // 1.9 < 1.10 numerically, and 2.0-rc1 < 2.0; both bounds are inclusive; '' never matches.
     CHECK(*r == std::vector<std::string>{"1.10", "1.9", "2.0-rc1"});
-    r = resolve_version_range(versions, "2.0", "");
+    r = resolve_version_range(versions, vers::from_bounds("2.0", ""));
     REQUIRE(r);
     CHECK(*r == std::vector<std::string>{"2.0"});
-    r = resolve_version_range(versions, "", "1.0");
+    r = resolve_version_range(versions, vers::from_bounds("", "1.0"));
     REQUIRE(r);
     CHECK(*r == std::vector<std::string>{"1.0"});
-    r = resolve_version_range(versions, "5", "6"); // nothing inside: an empty set, not an error
+    r = resolve_version_range(versions, vers::from_bounds("5", "6")); // nothing inside: an empty set
     REQUIRE(r);
     CHECK(r->empty());
+    // min above max is the empty set, as it always was (the range is built, never re-sorted).
+    r = resolve_version_range(versions, vers::from_bounds("2.0", "1.0"));
+    REQUIRE(r);
+    CHECK(r->empty());
+}
+
+TEST_CASE("version_min/version_max and the equivalent vers: range resolve to the same set",
+          "[server][software_list_model]") {
+    const std::vector<std::string> versions{"1.9", "1.10", "2.0-rc1", "2.0", "", "1.0", "3.1"};
+    struct Case {
+        const char* min;
+        const char* max;
+        const char* vers;
+    };
+    for (const Case& c : {Case{"1.9", "2.0-rc1", "vers:generic/>=1.9|<=2.0-rc1"},
+                          Case{"2.0", "", "vers:generic/>=2.0"},
+                          Case{"", "1.0", "vers:generic/<=1.0"},
+                          Case{"5", "6", "vers:generic/>=5|<=6"}}) {
+        CAPTURE(c.min, c.max, c.vers);
+        std::vector<std::pair<std::string, std::string>> bounds;
+        if (*c.min)
+            bounds.emplace_back("version_min", c.min);
+        if (*c.max)
+            bounds.emplace_back("version_max", c.max);
+        Params bp = params({{"name", "git"}});
+        for (const auto& [k, v] : bounds)
+            bp.emplace(k, v);
+        const auto by_bounds = parse_list_params(bp);
+        const auto by_vers = parse_list_params(params({{"name", "git"}, {"vers", c.vers}}));
+        REQUIRE(by_bounds);
+        REQUIRE(by_vers);
+        REQUIRE(by_bounds->has_range());
+        REQUIRE(by_vers->has_range());
+        auto a = resolve_version_range(versions, *by_bounds->range);
+        auto b = resolve_version_range(versions, *by_vers->range);
+        REQUIRE(a);
+        REQUIRE(b);
+        std::ranges::sort(*a);
+        std::ranges::sort(*b);
+        CHECK(*a == *b);
+    }
+    // A vers range with several intervals, and != punching a hole.
+    auto multi = parse_list_params(params({{"name", "git"}, {"vers", "vers:generic/<1.9|>=2.0|<3.0"}}));
+    REQUIRE(multi);
+    auto set = resolve_version_range(versions, *multi->range);
+    REQUIRE(set);
+    std::ranges::sort(*set);
+    CHECK(*set == std::vector<std::string>{"1.0", "2.0"});
+    auto hole = parse_list_params(params({{"name", "git"}, {"vers", "vers:generic/>=1.0|<3.0|!=2.0"}}));
+    REQUIRE(hole);
+    set = resolve_version_range(versions, *hole->range);
+    REQUIRE(set);
+    std::ranges::sort(*set);
+    CHECK(*set == std::vector<std::string>{"1.0", "1.10", "1.9", "2.0-rc1"});
+    // `*` matches every non-empty version; the empty version never matches.
+    auto all = parse_list_params(params({{"name", "git"}, {"vers", "vers:generic/*"}}));
+    REQUIRE(all);
+    set = resolve_version_range(versions, *all->range);
+    REQUIRE(set);
+    CHECK(set->size() == 6);
+    // A `!=`-only range is "every other version that has one": the empty version is outside it too
+    // (an unknown version is not asserted to differ from 2.0), so it is only reachable by version=.
+    auto other = parse_list_params(params({{"name", "git"}, {"vers", "vers:generic/!=2.0"}}));
+    REQUIRE(other);
+    set = resolve_version_range(versions, *other->range);
+    REQUIRE(set);
+    std::ranges::sort(*set);
+    CHECK(*set == std::vector<std::string>{"1.0", "1.10", "1.9", "2.0-rc1", "3.1"});
+    CHECK(std::ranges::find(*set, std::string()) == set->end());
 }
 
 TEST_CASE("resolve_version_range: a read that filled the cap is refused, wording neutral",
@@ -153,12 +299,12 @@ TEST_CASE("resolve_version_range: a read that filled the cap is refused, wording
     std::vector<std::string> many;
     for (int i = 0; i < kCatalogRowCap; ++i)
         many.push_back(std::to_string(i));
-    const auto r = resolve_version_range(many, "1", "2");
+    const auto r = resolve_version_range(many, vers::from_bounds("1", "2"));
     REQUIRE_FALSE(r);
     CHECK(r.error() == kRangeNotResolvable);
     CHECK(r.error().find("2000") == std::string::npos); // names no count and no title
     many.pop_back();
-    CHECK(resolve_version_range(many, "1", "2"));
+    CHECK(resolve_version_range(many, vers::from_bounds("1", "2")));
 }
 
 TEST_CASE("totals_decision: scoped admission never serves; global admission serves an exact name",
@@ -224,6 +370,16 @@ TEST_CASE("totals_decision: scoped admission never serves; global admission serv
     CHECK(totals_decision(true, c).omitted == "filters");
 }
 
+TEST_CASE("totals_decision: a purl filter turns the totals off", "[server][software_list_model]") {
+    SoftwareFleetQuery q;
+    q.name = "git";
+    CHECK(totals_decision(true, q).serve);
+    q.purl = "pkg:deb/debian/git@2.39";
+    const auto d = totals_decision(true, q);
+    CHECK_FALSE(d.serve);
+    CHECK(d.omitted == "filters");
+}
+
 TEST_CASE("derive_status truth table", "[server][software_list_model]") {
     CHECK(derive_status("full", true) == "current");
     CHECK(derive_status("delta", true) == "current");
@@ -257,7 +413,7 @@ TEST_CASE("list_row_json carries the lookup keys and leaves device_row_json unto
         REQUIRE(j.contains(k));
         CHECK(j[k] == v); // the 14 original keys are byte-for-byte what device_row_json emits
     }
-    CHECK(j.size() == base.size() + 8);
+    CHECK(j.size() == base.size() + 9);
     CHECK(j["hostname"] == "host-1");
     CHECK(j["last_seen"] == 1700000000);
     CHECK(j["status"] == "current");
@@ -266,6 +422,10 @@ TEST_CASE("list_row_json carries the lookup keys and leaves device_row_json unto
     CHECK(j["install_scope"] == "machine");
     CHECK(j["install_location"] == "/usr/bin");
     CHECK(j["instance_key"] == "abc");
+    CHECK(j["purl"].is_null()); // an empty purl is null, never ""
+    r.entry.purl = "pkg:deb/debian/git@2.39";
+    CHECK(list_row_json(r, facts)["purl"] == "pkg:deb/debian/git@2.39");
+    r.entry.purl.clear();
 
     // An unknown device and a never-synced one are null, not blank or zero.
     const auto unknown = list_row_json(r, DeviceFacts{});
@@ -636,17 +796,19 @@ TEST_CASE("read_components_page: push-down, wide path counts distinct dropped de
     }
 }
 
-TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[server][software_list_model]") {
+TEST_CASE("CSV: 23-column installs header; quoting; the components header", "[server][software_list_model]") {
     // The first 14 columns are the existing installs header, byte for byte.
     CHECK(kListCsvHeader.substr(0, swc::kInstallsCsvHeader.size()) == swc::kInstallsCsvHeader);
-    CHECK(kListCsvColumns == 22);
+    CHECK(kListCsvColumns == 23);
+    CHECK(kListCsvHeader.ends_with(",instance_key,purl"));
 
     auto r = fleet_row("a,b\nc", "a1", 1); // comma and newline in a cell
+    r.entry.purl = "pkg:deb/debian/git@2.39";
     DeviceFacts facts;
     const auto csv = list_csv({r}, facts);
     CHECK(csv.starts_with(std::string(kListCsvHeader) + "\n"));
     CHECK(csv.find("\"a,b\nc\"") != std::string::npos);
-    // Data row: the quoted newline stays inside one record; 22 cells are written.
+    // Data row: the quoted newline stays inside one record; 23 cells are written, purl last.
     const auto body = csv.substr(kListCsvHeader.size() + 1);
     std::size_t commas = 0;
     bool quoted = false;
@@ -657,6 +819,10 @@ TEST_CASE("CSV: 22-column installs header; quoting; the components header", "[se
             ++commas;
     }
     CHECK(commas == kListCsvColumns - 1);
+    CHECK(body.ends_with(",pkg:deb/debian/git@2.39\n"));
+    // A row with no purl ends in an empty cell, not a missing one.
+    r.entry.purl.clear();
+    CHECK(list_csv({r}, facts).ends_with(",\n"));
 
     const auto ccsv = components_csv({comp_row("libfoo", "a1", "01")}, facts);
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
@@ -722,6 +888,20 @@ TEST_CASE("fingerprints: each filter alone moves the components and list fingerp
         CHECK(lseen.insert(list_fingerprint(*rq)).second);
     }
     CHECK(lseen.size() == 7);
+
+    // vers and purl bind too, and the two spellings of a range are distinct inputs.
+    for (const auto& extra : std::vector<std::pair<std::string, std::string>>{
+             {"vers", "vers:generic/>=1.0"}, {"vers", "vers:generic/>=1.0|<2.0"},
+             {"purl", "pkg:deb/debian/git@1"}, {"purl", "pkg:deb/debian/git@2"}}) {
+        CAPTURE(extra.first, extra.second);
+        const auto rq = parse_list_params(params({{"name", "git"}, {extra.first, extra.second}}));
+        REQUIRE(rq);
+        CHECK(lseen.insert(list_fingerprint(*rq)).second);
+    }
+    const auto cvers = parse_components_params(
+        params({{"name", "libfoo"}, {"vers", "vers:generic/>=1.0"}}));
+    REQUIRE(cvers);
+    CHECK(seen.insert(components_fingerprint(*cvers)).second);
 }
 
 TEST_CASE("component_row_json: the exact key set; 0 stamps are null", "[server][software_list_model]") {

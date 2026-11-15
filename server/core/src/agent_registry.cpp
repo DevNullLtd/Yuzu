@@ -22,6 +22,7 @@
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label for yuzu_fleet_plugin_init_failed
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "echo_corruption_audit.hpp" // #1567 tag keys + parse helpers
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -1623,6 +1624,15 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     return ids;
 }
 
+std::vector<std::string> AgentRegistry::local_ids() const {
+    std::lock_guard lock(mu_);
+    std::vector<std::string> ids;
+    ids.reserve(agents_.size());
+    for (const auto& id : agents_ | std::views::keys)
+        ids.push_back(id);
+    return ids;
+}
+
 std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
     auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
     if (!presence)
@@ -1788,6 +1798,36 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     yuzu::scope::collect_attribute_suffixes(expr, "from_result_set:", out);
 }
 
+// The from_result_set:<id> references whose result depends on the set being COMPLETE: every
+// use other than a plain membership test (the bare atom, which the parser lowers to EXISTS)
+// outside any NOT. An incomplete set (an agent failed or never answered) is missing members, so a
+// plain positive reference can only under-match, but under a NOT (or LEN, STARTSWITH ...) a
+// missing member evaluates as "matches". Such references must abort on an incomplete set.
+static void collect_completeness_dependent_result_set_ids(const yuzu::scope::Expression& expr,
+                                                          bool negated,
+                                                          std::vector<std::string>& out) {
+    constexpr std::string_view kPrefix = "from_result_set:";
+    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
+        if (!cond->attribute.starts_with(kPrefix)) {
+            // A synthetic form (LEN/STARTSWITH) wraps the real attribute: never a plain test.
+            const auto real = yuzu::scope::classify_synthetic(cond->attribute).real;
+            if (real.starts_with(kPrefix))
+                out.push_back(std::string(real.substr(kPrefix.size())));
+            return;
+        }
+        const bool plain = !negated && cond->op == yuzu::scope::CompOp::Exists;
+        if (!plain)
+            out.push_back(cond->attribute.substr(kPrefix.size()));
+    } else if (const auto* comb = std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
+        if (*comb) {
+            const bool child_negated =
+                (*comb)->op == yuzu::scope::CombOp::Not ? !negated : negated;
+            for (const auto& child : (*comb)->children)
+                collect_completeness_dependent_result_set_ids(child, child_negated, out);
+        }
+    }
+}
+
 // props.<key> and tag:<key> collection use the same shared
 // yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
 // ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
@@ -1951,10 +1991,25 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
         }
         if (rs_store && !principal.empty()) {
             const std::string owner(principal);
+            std::vector<std::string> needs_complete;
+            collect_completeness_dependent_result_set_ids(expr, false, needs_complete);
             for (const auto& rsid : refs) {
                 if (rs_members.contains(rsid))
                     continue;
                 auto mem = rs_store->member_set_owned(rsid, owner);
+                // An owned set that cannot be used as scope. The caller passed the owner check,
+                // so the id and cause go in the detail (fixed tokens, the id neutralised). A
+                // pending set may fill (transient); a failed set, or an incomplete one where a
+                // missing member would match, will not change by retrying (permanent). An
+                // expected state, so a warning, not an error.
+                const auto unusable = [&rsid, &owner](ScopeEvalError::Kind kind,
+                                                      std::string_view cause) {
+                    spdlog::warn("AgentRegistry::evaluate_scope: result-set {} (owner={}) cannot "
+                                 "be used as scope (cause={}) — aborting scope evaluation",
+                                 ::yuzu::log_id_token(rsid), ::yuzu::log_id_token(owner), cause);
+                    return std::unexpected(ScopeEvalError{
+                        kind, "cause=" + std::string(cause) + " result_set=" + audit_token(rsid)});
+                };
                 if (!mem) {
                     // #4981 PR-1 A1/A3: member_set_owned's rewritten single-
                     // statement query now type-distinguishes a genuine DB
@@ -1972,6 +2027,13 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                     // test: a set deleted between a caller's own pre-dispatch
                     // ownership gate and this preload used to surface here as
                     // a SUCCESSFUL empty membership, not an error).
+                    // A set that is not ready (pending or failed) has no usable membership;
+                    // it is owned (the owner check ran first), so naming it leaks nothing.
+                    if (mem.error() == ResultSetError::NotReady)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusable, "pending");
+                    if (mem.error() == ResultSetError::Failed)
+                        return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent,
+                                        "failed");
                     const bool owner_check_failed = mem.error() == ResultSetError::NotFound ||
                                                     mem.error() == ResultSetError::NotOwner;
                     spdlog::error("AgentRegistry::evaluate_scope: member_set_owned {} for "
@@ -1983,6 +2045,10 @@ AgentRegistry::evaluate_scope_impl(const yuzu::scope::Expression& expr, const Ta
                                                           : ScopeEvalError::Kind::StoreDegraded,
                                       rsid});
                 }
+                // Incomplete and referenced where a missing member would match (under NOT, LEN,
+                // STARTSWITH): only re-running the producer changes that.
+                if (!mem->complete && std::ranges::find(needs_complete, rsid) != needs_complete.end())
+                    return unusable(ScopeEvalError::Kind::ResultSetUnusablePermanent, "incomplete");
                 // #4981 PR-1 A4: touch EVERY owned result (empty or not) — an
                 // owned-but-empty set is now a real, distinguishable success
                 // case (A1), not indistinguishable from not-owned, so it
@@ -2345,6 +2411,13 @@ void AgentHealthStore::set_corruption_sink(CorruptionSink sink) {
     corruption_sink_ = std::move(sink);
 }
 
+void AgentHealthStore::set_known_plugins(std::vector<std::string> names) {
+    std::lock_guard lock(mu_);
+    known_plugins_.clear();
+    known_plugins_.insert(std::make_move_iterator(names.begin()),
+                          std::make_move_iterator(names.end()));
+}
+
 void AgentHealthStore::remove(const std::string& agent_id) {
     std::lock_guard lock(mu_);
     snapshots_.erase(agent_id);
@@ -2440,11 +2513,9 @@ void pause_between_slices() {
 }
 } // namespace
 
-std::vector<std::optional<std::string_view>>
-AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
-                                       std::chrono::seconds staleness) const {
-    std::vector<std::optional<std::string_view>> out;
-    out.reserve(agent_ids.size());
+template <typename Fn>
+void AgentHealthStore::for_each_snapshot_sliced(std::span<const std::string> agent_ids,
+                                                Fn&& fn) const {
     const auto now = std::chrono::steady_clock::now();
     for (std::size_t base = 0; base < agent_ids.size(); base += kGuardianBackendSlice) {
         if (base != 0)
@@ -2453,11 +2524,39 @@ AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
         std::lock_guard lock(mu_);
         for (std::size_t i = base; i < end; ++i) {
             const auto it = snapshots_.find(agent_ids[i]);
-            out.push_back(it == snapshots_.end()
-                              ? std::nullopt
-                              : guardian_backend_from_snapshot(it->second, now, staleness));
+            fn(it == snapshots_.end() ? nullptr : &it->second, now);
         }
     }
+}
+
+std::vector<std::optional<std::string_view>>
+AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
+                                       std::chrono::seconds staleness) const {
+    std::vector<std::optional<std::string_view>> out;
+    out.reserve(agent_ids.size());
+    for_each_snapshot_sliced(agent_ids, [&](const AgentHealthSnapshot* snap, auto now) {
+        out.push_back(snap ? guardian_backend_from_snapshot(*snap, now, staleness) : std::nullopt);
+    });
+    return out;
+}
+
+std::vector<DexObserverState>
+AgentHealthStore::dex_observer_for(std::span<const std::string> agent_ids,
+                                   std::chrono::seconds staleness) const {
+    static const std::string kKey{kDexObserverArmedTag};
+    std::vector<DexObserverState> out;
+    out.reserve(agent_ids.size());
+    for_each_snapshot_sliced(agent_ids, [&](const AgentHealthSnapshot* snap, auto now) {
+        DexObserverState st = DexObserverState::NoneReported;
+        if (snap && (now - snap->last_seen) <= staleness) {
+            const auto it = snap->status_tags.find(kKey);
+            if (it != snap->status_tags.end())
+                st = it->second == "1"   ? DexObserverState::Armed
+                     : it->second == "0" ? DexObserverState::Disarmed
+                                         : DexObserverState::NoneReported;
+        }
+        out.push_back(st);
+    });
     return out;
 }
 
@@ -2786,6 +2885,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     int ota_signature_refusing = 0;
     int echo_db_corruption_agents = 0;               // #1567
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
+    // Tokens summed under plugin="unknown" (a well-formed name outside the catalogue), and the
+    // AGENTS that sent at least one token the label dropped, per reason (the rejected gauge).
+    int64_t plugin_init_unknown = 0;
+    int plugin_reject_unknown = 0;
+    int plugin_reject_malformed = 0;
+    int plugin_reject_over_cap = 0;
     int sync_skipping = 0; // #5332: agents whose installed_software daily sync is skipping
 
     // #3663: agent command-dedup store telemetry. Counts of AGENTS (not sums of per-process
@@ -2843,22 +2948,42 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             // its repeat count instead of by 1. `seen_this_agent` holds views into
             // `it->second`, which outlives this block.
             std::unordered_set<std::string_view> seen_this_agent;
+            bool agent_unknown = false;
+            bool agent_malformed = false;
             while (!rest.empty() && tokens < 32) {
                 ++tokens; // every split counts toward the cap, valid or not
                 const auto comma = rest.find(',');
                 const auto tok = rest.substr(0, comma);
                 rest = comma == std::string_view::npos ? std::string_view{}
                                                        : rest.substr(comma + 1);
-                if (tok.empty() || tok.size() > 64 ||
+                if (tok.empty())
+                    continue;
+                if (tok.size() > 64 ||
                     !std::all_of(tok.begin(), tok.end(), [](char ch) {
                         return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
                                (ch >= '0' && ch <= '9') || ch == '_';
-                    }))
+                    })) {
+                    agent_malformed = true;
                     continue;
+                }
                 if (!seen_this_agent.insert(tok).second)
                     continue; // already counted for this agent this sweep
+                // The label is server-chosen: a name the catalogue does not know is summed
+                // under "unknown" (not a catalogue name, so it can never collide with one),
+                // never given a series of its own (an unwired store knows no names).
+                if (!known_plugins_.contains(tok)) {
+                    ++plugin_init_unknown;
+                    agent_unknown = true;
+                    continue;
+                }
                 ++plugin_init_failed[std::string{tok}];
             }
+            // Tokens remain after the 32-split cap: not read, not scanned (an unbounded tag
+            // value is never walked past the cap), reported once per agent.
+            const bool agent_over_cap = !rest.empty();
+            plugin_reject_unknown += agent_unknown;
+            plugin_reject_malformed += agent_malformed;
+            plugin_reject_over_cap += agent_over_cap;
         }
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
@@ -2970,11 +3095,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (!cmd_val.empty())
             add_finite_count(total_commands, cmd_val);
 
-        // DEX signal observer: a Windows agent (DEX enabled) reporting "0" failed to
-        // arm (or a channel went deaf at runtime). The tag is only emitted by such
-        // agents (see agent heartbeat), so absent / other values are correctly not
-        // counted as a fault.
-        if (get("yuzu.dex_observer_armed") == "0")
+        // DEX signal observer: an agent (DEX enabled; Windows, Linux or macOS) reporting "0"
+        // failed to arm (or a channel went deaf at runtime). The tag is only emitted by such
+        // agents (see agent heartbeat), so absent / other values are correctly not counted as a
+        // fault.
+        if (get(std::string(kDexObserverArmedTag)) == "0")
             ++dex_observer_disarmed;
 
         auto dex_val = get("yuzu.dex_observed");
@@ -3288,8 +3413,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         .set(static_cast<double>(ota_signature_refusing));
     // #1567: agents reporting a quarantined echo.db (cumulative per agent since
     // install; a RISING value is the signal), and per-plugin init failures
-    // (absent-not-zero). Fleet-wide label cap: the first 64 plugin names in
-    // lexicographic order, the remainder summed under plugin="other".
+    // (absent-not-zero). The plugin label is bounded by the server's catalogue; every
+    // other well-formed name is summed under plugin="unknown" (see the block below).
     metrics.gauge("yuzu_fleet_echo_db_corruption_agents")
         .set(static_cast<double>(echo_db_corruption_agents));
     // #5332: published every sweep, 0 included (a server-owned count over the reporting
@@ -3309,21 +3434,23 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     if (dedup_rows_reported)
         metrics.gauge(kDedupRowsMaxGauge).set(static_cast<double>(dedup_rows_max));
     {
-        constexpr std::size_t kMaxPluginLabels = 64;
-        std::size_t n = 0;
-        int64_t other = 0;
-        for (const auto& [plugin, count] : plugin_init_failed) {
-            if (n < kMaxPluginLabels) {
-                metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
-                    .set(static_cast<double>(count));
-                ++n;
-            } else {
-                other += count;
-            }
-        }
-        if (other > 0)
-            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", "other"}})
-                .set(static_cast<double>(other));
+        // Every label is a name the SERVER knows (the catalogue, about 73 names), so the label
+        // set is bounded without a cap an agent could fill to displace a real plugin. Names the
+        // catalogue does not know are summed under "unknown", never "other", so a real plugin
+        // named "other" is never overwritten.
+        for (const auto& [plugin, count] : plugin_init_failed)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", plugin}})
+                .set(static_cast<double>(count));
+        if (plugin_init_unknown > 0)
+            metrics.gauge("yuzu_fleet_plugin_init_failed", {{"plugin", kUnknownPluginLabel}})
+                .set(static_cast<double>(plugin_init_unknown));
+        // Fixed label set, published every sweep including 0 (no clear needed).
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectUnknownPlugin}})
+            .set(static_cast<double>(plugin_reject_unknown));
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectMalformed}})
+            .set(static_cast<double>(plugin_reject_malformed));
+        metrics.gauge(kPluginInitFailedRejectedGauge, {{"reason", kRejectOverCap}})
+            .set(static_cast<double>(plugin_reject_over_cap));
     }
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")

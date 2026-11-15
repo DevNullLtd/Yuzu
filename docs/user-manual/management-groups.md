@@ -41,13 +41,13 @@ A role assignment on "London Office" applies to both "London Desktops" and "Lond
 
 ## Visibility Filtering
 
-When RBAC is enabled, the agent list shown in the dashboard and returned by the agent API is filtered based on management group role assignments:
+When RBAC is enabled, what a user sees in an agent list depends on the permission the list route requires:
 
 - **Global administrators** (users with the `Infrastructure:Read` permission) see all agents.
-- **Non-admin users** only see agents that belong to management groups where they have at least one role assignment (Operator, Viewer, or ITServiceOwner).
-- This applies to the dashboard view, the `/api/agents` endpoint, and any UI page that lists devices.
-
-For example, if `jane.ops` holds the Operator role on the "London Office" group, she sees only agents that are members of "London Office" or its child groups ("London Desktops", "London Servers").
+- **Non-admin users** are narrowed to the groups they hold a group-scoped role on only by a list route that makes a per-group permission check, such as `/api/v1/devices`.
+- That narrowing applies only if the group-scoped role itself carries `Infrastructure:Read`. A user whose only grant is a group-scoped `Operator` role is refused (`403`, `Infrastructure:Read`) and is not shown the group's agents.
+- An existing `ITServiceOwner` row shows its holder the agents of its group on `/api/v1/devices`. That role can no longer be assigned at group scope.
+- `/api/agents` and the dashboard device list require the global `Infrastructure:Read` permission, so they do not narrow by group-scoped role: a caller without that permission is refused (`403`).
 
 > **When RBAC is disabled (the default posture):** management-group role
 > assignments are **not** consulted. Every authenticated user sees the full
@@ -357,7 +357,7 @@ curl -s -b cookies.txt \
 
 ### Add a Role Assignment
 
-Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A service-scoped API token is refused outright, and the `ITServiceOwner` arm is also refused for any MCP-tier session and for an engine-classed session (those two need the global `ManagementGroup:Write` permission); the same refusals apply to listing and removing role assignments.
 
 ```bash
 curl -s -b cookies.txt -X POST \
@@ -405,7 +405,7 @@ Returns `200 OK`:
 }
 ```
 
-The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A caller admitted only as `ITServiceOwner` of the group can remove only `Operator` and `Viewer` assignments (`403` otherwise); removing an `ITServiceOwner` assignment needs the global `ManagementGroup:Write` permission.
 
 ## Service Groups
 
@@ -501,7 +501,7 @@ Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
 | `DELETE` | `/api/v1/management-groups/{id}/members/{agent_id}` | Remove an agent from a group |
 | `GET` | `/api/v1/management-groups/{id}/roles` | List role assignments for a group |
 | `POST` | `/api/v1/management-groups/{id}/roles` | Add a role assignment to a group |
-| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group |
+| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group (a caller who is only the group's `ITServiceOwner` can remove only `Operator` and `Viewer`) |
 
 ## Constraints
 

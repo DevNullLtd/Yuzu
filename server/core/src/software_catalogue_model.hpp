@@ -46,6 +46,14 @@ inline constexpr std::size_t kCursorMaxBytes = 2048; ///< longest cursor token a
 inline constexpr std::size_t kScopePushdownMaxIds = 10000;
 /// Most store reads one page (or export) makes on the wide post-filtered scope path.
 inline constexpr int kWideScopeMaxReads = 4;
+/// Most rows a wide-scope cursor may ask the store to pass over (its `skip`, an SQL OFFSET): a
+/// deliberate product limit. An honest walk over a sparse scope grows the skip by
+/// kWideScopeMaxReads x limit per request, so in page mode 100000 is 25 consecutive empty pages of
+/// the maximum size (250 at limit 100); an export reads up to 10000 rows per request and reaches
+/// the ceiling after a few continuations. The cursor is opaque and unauthenticated, so the same bound holds for
+/// any token a caller presents: no request's OFFSET exceeds it. A cursor past it is refused with
+/// CursorError::kScanLimit; the caller narrows the filter or pages with a smaller scope.
+inline constexpr std::int64_t kWideScopeMaxSkip = 100000;
 inline constexpr std::int64_t kStaleWindowSecs = 172800; ///< 48 h
 inline constexpr std::size_t kSourceMaxBytes = 256;
 /// Longest accepted `name` (the ingest-side field cap, inventory_ingestion.cpp kMaxFieldLen).
@@ -127,7 +135,7 @@ struct DevicesRequest {
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
-enum class CursorError { kMalformed, kFilterMismatch, kStale };
+enum class CursorError { kMalformed, kFilterMismatch, kStale, kScanLimit };
 
 /// Wire message for a refused cursor (an HTTP 400 on the REST routes).
 [[nodiscard]] std::string_view cursor_error_message(CursorError e);
@@ -158,7 +166,8 @@ struct DevicesCursor {
 /// Each field is `<len>:<bytes>` + 0x1F, so no byte inside a field (the separator included) can
 /// shift a boundary. Any other prefix (a `d1:` token) is malformed.
 [[nodiscard]] std::string encode_devices_cursor(const DevicesCursor& at, std::string_view fp);
-/// Refusal order: malformed -> filter mismatch (never kStale).
+/// Refusal order: malformed -> filter mismatch -> scan limit (a skip above kWideScopeMaxSkip;
+/// never kStale).
 [[nodiscard]] std::expected<DevicesCursor, CursorError>
 decode_devices_cursor(std::string_view token, std::string_view fp);
 
@@ -345,8 +354,8 @@ struct ScopedPage {
     bool hit_cap{false};               ///< the same condition as next_cursor being non-empty
     /// DISTINCT devices hidden by the post-filter within the scanned window(s) (0 under push-down).
     std::int64_t devices_omitted{0};
-    /// The request named an `agent_id` outside the caller's scope. Under push-down the SQL then
-    /// returns nothing and devices_omitted stays 0; the transports still audit it as a denial.
+    /// The request named an `agent_id` outside the caller's scope: the page is empty (nothing is
+    /// read, devices_omitted 0, no cursor) for every scope class; the transports still audit it.
     bool target_denied{false};
 };
 using DevicesPage = ScopedPage<SoftwareFleetRow>;
@@ -363,7 +372,9 @@ using ScopedReader = std::function<std::optional<std::vector<typename Ops::Row>>
     const typename Ops::Query&)>;
 
 /// One scoped keyset page: decode the cursor (bound to the filter set, never to the scope), push
-/// the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
+/// the caller's scope into the query, read, then post-filter. A named `agent_id` outside the scope
+/// is answered first with the empty denied page and no read, whatever the scope's size. The scope:
+/// TOP -> unfiltered;
 /// engaged-empty -> agent_ids = {} (the store returns empty without SQL); engaged and
 /// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden; one read, the
 /// cursor is the last row); larger -> the rows are filtered here with authz::in_scope and
@@ -392,6 +403,8 @@ read_scoped_page(const ScopedReader<Ops>& read, typename Ops::Query q, const std
         q.after = incoming_after;
     ScopedPage<typename Ops::Row> out;
     out.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
+    if (out.target_denied) // every scope class, no read: empty page, devices_omitted 0, no cursor
+        return out;
     // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
     // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
     const bool filter = scope && scope->size() > kScopePushdownMaxIds;

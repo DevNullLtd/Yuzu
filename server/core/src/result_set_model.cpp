@@ -17,7 +17,10 @@ nlohmann::json result_set_json(const ResultSet& r) {
         {"source_execution_id", r.source_execution_id},
         {"device_count", r.device_count},
         {"agents_failed", r.agents_failed},
-        {"partial", r.agents_failed > 0},
+        {"agents_unanswered", r.agents_unanswered},
+        // Partial when any agent is known to be missing from the membership: one that answered
+        // with a failure, or one that never answered (or whose answer was not stored).
+        {"partial", r.agents_failed > 0 || r.agents_unanswered > 0},
     };
 }
 

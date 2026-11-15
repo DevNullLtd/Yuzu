@@ -552,6 +552,22 @@ TEST_CASE("The analytics HTML fragment sanitizes the ClickHouse URL identically 
     CHECK(res->body.find("host:9000/yuzu") != std::string::npos);
 }
 
+// #6940: the fragment shows the ClickHouse username and whether a password is set; it is never
+// cached. `set_header` appends and `get_header_value` returns the first, so count them too.
+TEST_CASE("The analytics HTML fragment is Cache-Control: no-store, private with Vary: Cookie",
+          "[settings][settings-read-twins][cache]") {
+    SettingsReadTwinsHarness h;
+    h.cfg.clickhouse_url = "clickhouse://admin:s3cr3t@host:9000/yuzu";
+
+    auto res = h.sink.Get("/fragments/settings/analytics");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Cookie");
+    CHECK(res->headers.count("Cache-Control") == 1);
+    CHECK(res->headers.count("Vary") == 1);
+}
+
 TEST_CASE("The NVD settings fragment never re-shows proxy credentials",
           "[settings][security]") {
     SettingsReadTwinsHarness h;

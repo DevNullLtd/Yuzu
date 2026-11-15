@@ -2,8 +2,8 @@
 
 /// @file bounded_resolver.hpp
 /// A name lookup with a hard time bound whose state is OWNED BY THE LOOKUP, never by the caller's
-/// stack. CRL source registration (ADR-0070 R1) is the first consumer; the OIDC egress path may
-/// adopt it in a later change, so that later egress checks resolve the same way.
+/// stack. CRL source registration (ADR-0070 R1) is the first consumer; the OIDC egress path is
+/// the second, with a pool of its own, so both resolve the same way.
 ///
 /// WHY NOT httplib's `getaddrinfo_with_timeout`: on Linux its wait is not bounded the way this
 /// header's is. Here the blocking lookup runs on a worker thread that owns a heap-allocated
@@ -24,7 +24,9 @@
 /// the timeout, the cap and the not-found paths deterministically, with no DNS.
 ///
 /// POOLS IN USE: CRL source registration uses the default process-wide pool (cap
-/// `kMaxInFlightLookups`), which any consumer that passes no pool also gets.
+/// `kMaxInFlightLookups`), which any consumer that passes no pool also gets. OIDC name lookups
+/// (`resolve_host_addresses_status` in `oidc_provider.cpp`) use their own pool of the same cap, so
+/// sign-in and registration do not starve each other.
 ///
 /// CONTRACT FOR CONSUMERS:
 ///  - POOL OWNERSHIP. Every consumer that passes no pool shares the process pool, so a slow
@@ -63,9 +65,12 @@
 
 #include "resolver_errors.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -81,7 +86,10 @@ enum class ResolveStatus {
     kNotFound,  ///< the resolver answered definitively: no such name / no address
     kTemporary, ///< the resolver failed transiently (EAI_AGAIN / EAI_FAIL): retry, not a "no"
     kTimeout,   ///< no answer within the bound (the lookup may still be running)
-    kBusy       ///< the pool's cap of lookups are already outstanding; nothing was started
+    kBusy,      ///< the pool's cap of lookups are already outstanding; nothing was started
+    /// NOT a status: the number of statuses above, kept LAST so that it moves when an enumerator is
+    /// added before it. Never returned by a lookup; `kResolveStatusCount` is derived from it.
+    kCount
 };
 
 struct ResolveResult {
@@ -90,6 +98,33 @@ struct ResolveResult {
 };
 
 using LookupFn = std::function<ResolveResult(const std::string& host)>;
+
+/// The outcomes a call can have, one per real `ResolveStatus` member, derived from the `kCount`
+/// sentinel: adding a status before it widens the per-outcome counters, and the fixed-size users of
+/// this count (the `std::array<std::uint64_t, 5>` accessor in oidc_provider.hpp and its
+/// `static_assert`) stop compiling until each is widened with it. `kCount` must stay the last
+/// enumerator; that is not machine-checked, and a value after it is outside the count, so
+/// `note_outcome` folds it into `kTemporary`.
+inline constexpr std::size_t kResolveStatusCount = static_cast<std::size_t>(ResolveStatus::kCount);
+
+/// The metric label of a status: the closed outcome set of `resolver_pool_metrics.hpp`.
+[[nodiscard]] constexpr const char* resolve_status_label(ResolveStatus s) noexcept {
+    switch (s) {
+    case ResolveStatus::kOk:
+        return "ok";
+    case ResolveStatus::kNotFound:
+        return "not_found";
+    case ResolveStatus::kTemporary:
+        return "temporary";
+    case ResolveStatus::kTimeout:
+        return "timeout";
+    case ResolveStatus::kBusy:
+        return "busy";
+    case ResolveStatus::kCount:
+        break;
+    }
+    return "unknown";
+}
 
 inline constexpr int kMaxInFlightLookups = 16;
 
@@ -100,7 +135,29 @@ struct ResolverPool;
 struct ResolverPool {
     std::atomic<int> in_flight{0};
     int cap{kMaxInFlightLookups};
+    /// How many calls ended in each status, indexed by `ResolveStatus`. Written only by
+    /// `note_outcome`: one increment per lookup, made by `bounded_resolve` for a lookup it ran, or
+    /// by the OIDC adapter (`resolve_host_addresses_status`) for a lookup it refused before the
+    /// pool was asked.
+    std::array<std::atomic<std::uint64_t>, kResolveStatusCount> outcomes{};
     explicit ResolverPool(int c = kMaxInFlightLookups) : cap(c) {}
+
+    /// A status outside the closed set (the sentinel, or a value cast in from elsewhere) is counted
+    /// as `kTemporary` rather than indexing past the array.
+    void note_outcome(ResolveStatus s) noexcept {
+        auto i = static_cast<std::size_t>(s);
+        if (i >= kResolveStatusCount)
+            i = static_cast<std::size_t>(ResolveStatus::kTemporary);
+        outcomes[i].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// A snapshot of the per-status counts, in `ResolveStatus` order.
+    [[nodiscard]] std::array<std::uint64_t, kResolveStatusCount> outcome_counts() const noexcept {
+        std::array<std::uint64_t, kResolveStatusCount> out{};
+        for (std::size_t i = 0; i < kResolveStatusCount; ++i)
+            out[i] = outcomes[i].load(std::memory_order_relaxed);
+        return out;
+    }
 };
 
 namespace detail {
@@ -169,21 +226,21 @@ inline ResolveResult system_lookup(const std::string& host) {
     return detail::process_pool()->in_flight.load();
 }
 
-/// Resolve `host`, waiting at most `timeout`. Never blocks the caller past the bound, never
-/// touches caller-owned memory from another thread. `lookup` (default: the system resolver) and
-/// `pool` (default: the process pool) are injectable for tests.
-[[nodiscard]] inline ResolveResult bounded_resolve(const std::string& host,
-                                                   std::chrono::milliseconds timeout,
-                                                   LookupFn lookup = {},
-                                                   std::shared_ptr<ResolverPool> pool = {}) {
-    if (!pool)
-        pool = detail::process_pool();
+namespace detail {
+
+/// The resolve itself, on an already-chosen pool. Callers count its status (see `bounded_resolve`).
+inline ResolveResult bounded_resolve_impl(const std::string& host,
+                                          std::chrono::milliseconds timeout, LookupFn lookup,
+                                          const std::shared_ptr<ResolverPool>& pool) {
     if (!lookup)
         lookup = &detail::system_lookup;
-    if (pool->in_flight.fetch_add(1) >= pool->cap) {
-        pool->in_flight.fetch_sub(1);
-        return {ResolveStatus::kBusy, {}};
-    }
+    // Admit by compare-exchange so the counter only ever moves up when a slot is free: a refused
+    // call never raises it, and `in_flight` never reads above `cap`.
+    int cur = pool->in_flight.load();
+    do {
+        if (cur >= pool->cap)
+            return {ResolveStatus::kBusy, {}};
+    } while (!pool->in_flight.compare_exchange_weak(cur, cur + 1));
     std::shared_ptr<detail::ResolveState> state;
     try {
         state = std::make_shared<detail::ResolveState>();
@@ -211,6 +268,24 @@ inline ResolveResult system_lookup(const std::string& host) {
     if (!state->cv.wait_for(lk, timeout, [&] { return state->done; }))
         return {ResolveStatus::kTimeout, {}};
     return std::move(state->result);
+}
+
+} // namespace detail
+
+/// Resolve `host`, waiting at most `timeout`. Never blocks the caller past the bound, never
+/// touches caller-owned memory from another thread. `lookup` (default: the system resolver) and
+/// `pool` (default: the process pool) are injectable for tests. Every call is counted once in
+/// `pool->outcomes`, by the status it returns: a `kTimeout` is counted when the caller stops
+/// waiting, not again when the lookup later finishes.
+[[nodiscard]] inline ResolveResult bounded_resolve(const std::string& host,
+                                                   std::chrono::milliseconds timeout,
+                                                   LookupFn lookup = {},
+                                                   std::shared_ptr<ResolverPool> pool = {}) {
+    if (!pool)
+        pool = detail::process_pool();
+    ResolveResult result = detail::bounded_resolve_impl(host, timeout, std::move(lookup), pool);
+    pool->note_outcome(result.status);
+    return result;
 }
 
 } // namespace yuzu::server::net

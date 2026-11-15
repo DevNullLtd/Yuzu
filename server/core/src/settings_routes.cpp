@@ -3535,6 +3535,7 @@ void SettingsRoutes::register_routes(
                 res.status = 500;
                 return;
             }
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
         });
 
@@ -3572,6 +3573,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -3682,6 +3684,7 @@ void SettingsRoutes::register_routes(
                  if (refuse_engine_session(req, res, *session, "access_review.list",
                                            "AccessReview"))
                      return;
+                 no_store_private(res);
                  res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
              });
 
@@ -3703,6 +3706,7 @@ void SettingsRoutes::register_routes(
                  if (refuse_engine_session(req, res, *session, "access_review.get",
                                            "AccessReview"))
                      return;
+                 no_store_private(res);
                  res.set_content(render_access_review_campaign_fragment(req, id),
                                  "text/html; charset=utf-8");
              });
@@ -3801,6 +3805,7 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
              });
 
@@ -3908,7 +3913,11 @@ void SettingsRoutes::register_routes(
                  const bool admin = session->token_scope_service.empty() &&
                                     session->mcp_tier.empty() &&
                                     auth::effective_role(*session) == auth::Role::admin;
-                 std::string html = dex_subnav("alerts", 7) + dex_alerts_style();
+                 // The sub-navigation carries the chosen window on, like the other DEX tabs; the
+                 // canonical resolver maps a missing or unknown value to 7 days.
+                 const int window_days = dex_window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d");
+                 std::string html = dex_subnav("alerts", window_days) + dex_alerts_style();
                  if (!admin) {
                      html += "<div class=\"note\" data-denied=\"admin\"><b>Alert settings need the "
                              "Administrator role.</b> Ask an administrator to change DEX alert "
@@ -4154,7 +4163,11 @@ void SettingsRoutes::register_routes(
             return;
         httplib::Response scratch; // the probe's refusal lands here, never on the page
         const bool editable = read_perm(req, scratch, "Infrastructure", "Write");
-        std::string html = dex_subnav("scoring", 7) + dex_alerts_style();
+        // The sub-navigation carries the chosen window on, like the other DEX tabs; the canonical
+        // resolver maps a missing or unknown value to 7 days.
+        const int window_days =
+            dex_window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        std::string html = dex_subnav("scoring", window_days) + dex_alerts_style();
         // #dex-scoring-section is the inner swap target of every POST; the sub-nav above it is
         // never re-rendered.
         html += "<div id=\"dex-scoring-section\">";
@@ -5185,6 +5198,7 @@ void SettingsRoutes::register_routes(
 
         if (username.empty() || password.empty()) {
             res.status = 400;
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username) +
                                 "<script>document.getElementById('user-feedback')."
                                 "className='feedback feedback-error';"
@@ -5331,6 +5345,7 @@ void SettingsRoutes::register_routes(
                                             "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"User created","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
@@ -5607,6 +5622,7 @@ void SettingsRoutes::register_routes(
             run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         case auth::RemoveUserOutcome::LastAdministratorRefused:
@@ -5639,8 +5655,9 @@ void SettingsRoutes::register_routes(
                      "credentials were revoked. Try again");
             return;
         case auth::RemoveUserOutcome::RemovedSessionWipeFailed:
-            // The account IS deactivated (committed) but the durable session wipe failed, so a
-            // live session may survive: a repeated DELETE finishes the wipe.
+            // The account IS deactivated (committed) but the durable session wipe failed, so the
+            // session row may survive (a local session is refused at validation): a repeated
+            // DELETE finishes the wipe.
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
@@ -5829,6 +5846,7 @@ void SettingsRoutes::register_routes(
                       "same_role=" + auth::role_to_string(new_role));
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Role unchanged","level":"info"}})");
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         }
@@ -5912,6 +5930,7 @@ void SettingsRoutes::register_routes(
                                             "old_role=" + old_role_str + ",new_role=" + new_role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Role updated","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
@@ -5975,6 +5994,7 @@ void SettingsRoutes::register_routes(
                            bad_input
                                ? R"({"showToast":{"message":"Invalid token parameters","level":"error"}})"
                                : R"({"showToast":{"message":"Enrollment store unavailable - token not created","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6006,6 +6026,7 @@ void SettingsRoutes::register_routes(
             res.status = bad_input ? 400 : 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - token NOT revoked","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6019,6 +6040,7 @@ void SettingsRoutes::register_routes(
             *revoked
                 ? R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})"
                 : R"j({"showToast":{"message":"Token not found - nothing revoked (it may have been removed)","level":"warning"}})j");
+        no_store_private(res);
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6326,6 +6348,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment(result.value(), filter),
                         "text/html; charset=utf-8");
     });
@@ -6472,6 +6495,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -6495,6 +6519,7 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing approved","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6504,6 +6529,7 @@ void SettingsRoutes::register_routes(
         spdlog::info("Bulk approved {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) approved","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6521,6 +6547,7 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing denied","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6530,6 +6557,7 @@ void SettingsRoutes::register_routes(
         spdlog::info("Bulk denied {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) denied","level":"warning"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6546,6 +6574,7 @@ void SettingsRoutes::register_routes(
         res.status = 400;
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
         return true;
     };
@@ -6580,6 +6609,7 @@ void SettingsRoutes::register_routes(
             toast(bad_input ? "Invalid agent id"
                             : "Enrollment store unavailable - agent NOT " + past,
                   "error");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -6606,6 +6636,7 @@ void SettingsRoutes::register_routes(
                   "warning");
             break;
         }
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     };
 
@@ -6663,6 +6694,7 @@ void SettingsRoutes::register_routes(
                             break;
                         }
                     }
+                    no_store_private(res);
                     res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                 });
 
@@ -7727,13 +7759,15 @@ void SettingsRoutes::register_routes(
     // `target_type="user"` + `success/failure` used elsewhere in
     // auth_routes — Gate 4 consistency B1+B2 picks the spec lane.
     //
-    // `Cache-Control: no-store, private` is set on every response that
-    // contains a one-time secret (init's otpauth URI / base32 secret,
-    // verify's recovery codes, recovery-codes regenerate) so the
-    // browser/proxy/CDN cannot retain the material past the response
-    // lifetime (Gate 4 unhappy-path UP-9).
+    // `Cache-Control: no-store, private` and `Vary: Cookie` are set on every
+    // MFA response that renders data: the one-time secrets (init's otpauth URI / base32 secret,
+    // verify's recovery codes, recovery-codes regenerate) and the MFA state of
+    // the account (the fragment and its re-renders), so the browser/proxy/CDN
+    // cannot retain the material past the response lifetime (Gate 4
+    // unhappy-path UP-9, #6940).
     auto set_no_store = [](httplib::Response& res) {
         res.set_header("Cache-Control", "no-store, private");
+        res.set_header("Vary", "Cookie");
         res.set_header("Pragma", "no-cache");
         res.set_header("Referrer-Policy", "no-referrer");
     };
@@ -7779,7 +7813,8 @@ void SettingsRoutes::register_routes(
     // for a request the central gate admitted, or by a TestRouteSink test
     // that bypasses pre-routing.
 
-    sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/settings/mfa", [this, set_no_store](const httplib::Request& req,
+                                                            httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
         auto session = auth_fn_(req, res);
@@ -7787,6 +7822,7 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        set_no_store(res);
         res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
     });
 
@@ -7805,6 +7841,7 @@ void SettingsRoutes::register_routes(
         if (!db) {
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
                       "auth_db unavailable");
+            set_no_store(res);
             res.set_content(
                 render_mfa_fragment(*session, {}, {}, {}, {}, "MFA backend unavailable"),
                 "text/html; charset=utf-8");
@@ -7822,6 +7859,7 @@ void SettingsRoutes::register_routes(
             // Settings init/verify).
             audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                       "credential_changed");
+            set_no_store(res);
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                 kMfaCredentialChangedMsg),
                             "text/html; charset=utf-8");
@@ -7853,6 +7891,7 @@ void SettingsRoutes::register_routes(
                           ? std::string{"csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
                                         "fail-closed)"}
                           : std::string{msg});
+            set_no_store(res);
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
@@ -7879,6 +7918,7 @@ void SettingsRoutes::register_routes(
                   auto code = extract_form_value(req.body, "code");
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
@@ -7894,6 +7934,7 @@ void SettingsRoutes::register_routes(
                       // the credential change); the session is being revoked.
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                                 "credential_changed");
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           kMfaCredentialChangedMsg),
                                       "text/html; charset=utf-8");
@@ -7913,6 +7954,7 @@ void SettingsRoutes::register_routes(
                       // again but offered only a confirm box that can never succeed.
                       audit_fn_(req, "mfa.enroll.cancelled", "ok", "User", session->username,
                                 "reason=provisional_secret_changed; nothing enrolled");
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "Enrollment was cancelled or replaced. "
                                                           "Start enrollment again."),
@@ -7945,6 +7987,7 @@ void SettingsRoutes::register_routes(
                           audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
+                          set_no_store(res);
                           res.set_content(
                               render_mfa_fragment(*session, {}, {}, {}, session->username,
                                                   "MFA is already enrolled on this account."),
@@ -7975,6 +8018,7 @@ void SettingsRoutes::register_routes(
                               ? "Authentication store is temporarily unavailable — retry shortly."
                               : "Code rejected. Try the next code shown by your authenticator "
                                 "(codes refresh every 30 seconds).";
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");
@@ -8068,6 +8112,7 @@ void SettingsRoutes::register_routes(
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
@@ -8095,6 +8140,7 @@ void SettingsRoutes::register_routes(
                                       "(mfa_regenerate_recovery_codes, fail-closed, existing codes "
                                       "unchanged)"
                                     : "regeneration failed");
+                      set_no_store(res);
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes. Your existing "
@@ -8111,7 +8157,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post("/api/settings/mfa/disable",
-              [this, origin_safe](const httplib::Request& req, httplib::Response& res) {
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
                   if (!origin_safe(req, res, "/api/settings/mfa/disable"))
                       return;
                   if (!admin_fn_(req, res))
@@ -8121,6 +8168,9 @@ void SettingsRoutes::register_routes(
                       res.status = 401;
                       return;
                   }
+                  // ONE call for every response path below (a repeat would append a second
+                  // Cache-Control header): the state-of-MFA fragments and the sign-out reply.
+                  set_no_store(res);
                   // MFA step-up gate (see recovery-codes above): stripping the factor the gate
                   // checks needs a fresh proof. Before the enforcement guard and any mutation.
                   if (step_up_fn_ &&

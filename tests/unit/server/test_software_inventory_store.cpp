@@ -26,6 +26,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <chrono>
 #include <cstddef>
@@ -3791,7 +3792,10 @@ TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fe
         return plan;
     };
 
-    SECTION("rollup") {
+    // Both checks below read the ONE seeded fleet (the EXPLAINs run inside a rolled-back
+    // transaction and the drill only reads), so they share it: two SECTIONs re-ran the case and
+    // re-seeded the ~24,000 rows for each.
+    { // the rollup
         yuzu::server::NamePatternQuery q;
         q.patterns = {"libssl%"};
         q.labels = {"openssl"};
@@ -3819,7 +3823,7 @@ TEST_CASE("name-pattern rollup and drill: a confined scope keeps the OFFSET 0 fe
         CHECK(plan.find("installed_software_agent_idx") == std::string::npos); // not driven by scope
     }
 
-    SECTION("drill, scope holding none of the family's devices") {
+    { // the drill, a scope holding none of the family's devices
         yuzu::server::NamePatternDevicesQuery q;
         q.patterns = {"libssl%"};
         q.leads = {"lib"};
@@ -5124,6 +5128,83 @@ TEST_CASE("find_by_purl: exact match across agents, ordered, bounded, and served
     pg::PgResult plan = pg::exec_params(
         lease.get(), ("EXPLAIN (COSTS OFF) " + SoftwareInventoryStore::find_by_purl_sql()).c_str(),
         std::vector<std::string>{target, "100"});
+    REQUIRE(plan.status() == PGRES_TUPLES_OK);
+    std::string text;
+    for (int i = 0; i < PQntuples(plan.get()); ++i)
+        text += std::string(PQgetvalue(plan.get(), i, 0)) + "\n";
+    CHECK(text.find("installed_software_purl_idx") != std::string::npos);
+}
+
+TEST_CASE("query_software purl filter: exact, rows carry the purl, the scope push-down still applies, "
+          "present-empty runs no SQL, and the predicate reaches the partial index",
+          "[pg][software_inventory][v3][purl]") {
+    SWINV_SHARED(store, pool);
+    const auto curl = v3_linux("curl", "deb", "7.88.1", "10");
+    for (const char* agent : {"agent-qa", "agent-qb", "agent-qc"}) {
+        REQUIRE(store.apply_installed_software_v3(
+                    agent, v3_report({v3_full(kV3Apps, {curl, v3_linux("git", "deb", "2.39.2", "1")})}))[0]
+                    .outcome == V3SectionOutcome::kStored);
+    }
+    // A v2-style row (no purl) of the same name must never answer a purl query.
+    const std::vector<SoftwareEntry> v2rows = {v3_entry("curl", kV3Pkgs)};
+    REQUIRE(store.apply_installed_software("agent-qv2",
+                                           SoftwareInventoryStore::canonical_hash(v2rows), v2rows,
+                                           0) == InventoryIngestOutcome::kStored);
+
+    const std::string target = "pkg:deb/debian/curl@7.88.1-10?arch=amd64&distro=debian-12";
+    auto agents_of = [](const auto& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : *rows)
+            out.push_back(r.agent_id);
+        return out;
+    };
+
+    SoftwareFleetQuery q;
+    q.purl = target;
+    auto all = store.query_software(q);
+    REQUIRE(all.has_value());
+    CHECK(agents_of(all) == std::vector<std::string>{"agent-qa", "agent-qb", "agent-qc"});
+    CHECK((*all)[0].entry.purl == target); // the row carries its purl
+    // No prefix matching and no case folding.
+    q.purl = target + "x";
+    CHECK(store.query_software(q).value().empty());
+    q.purl = "PKG" + target.substr(3);
+    CHECK(store.query_software(q).value().empty());
+
+    // The scope push-down composes with the purl predicate: only in-scope rows come back.
+    q.purl = target;
+    q.agent_ids = std::vector<std::string>{"agent-qb", "agent-nobody"};
+    CHECK(agents_of(store.query_software(q)) == std::vector<std::string>{"agent-qb"});
+    // Present-empty is deny-all: an empty value, never the whole fleet.
+    q.agent_ids = std::vector<std::string>{};
+    CHECK(store.query_software(q).value().empty());
+    // Composes with an exact name and version.
+    q.agent_ids.reset();
+    q.name = "curl";
+    q.version = "7.88.1";
+    CHECK(store.query_software(q).value().size() == 3);
+    q.name = "git";
+    CHECK(store.query_software(q).value().empty());
+
+    // The shared predicate reaches the partial index (seq scan priced out: the table is tiny).
+    auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(lease);
+    const std::vector<std::string> none;
+    struct RollbackGuard {
+        PGconn* conn;
+        ~RollbackGuard() { pg::exec_params(conn, "ROLLBACK", std::vector<std::string>{}); }
+    };
+    REQUIRE(pg::exec_params(lease.get(), "BEGIN", none).status() == PGRES_COMMAND_OK);
+    const RollbackGuard rollback{lease.get()};
+    REQUIRE(pg::exec_params(lease.get(), "SET LOCAL enable_seqscan = off", none).status() ==
+            PGRES_COMMAND_OK);
+    pg::PgResult plan = pg::exec_params(
+        lease.get(),
+        ("EXPLAIN (COSTS OFF) SELECT 1 FROM software_inventory_store.installed_software i "
+         "WHERE 1=1" +
+         SoftwareInventoryStore::query_software_purl_predicate_sql(1))
+            .c_str(),
+        std::vector<std::string>{target});
     REQUIRE(plan.status() == PGRES_TUPLES_OK);
     std::string text;
     for (int i = 0; i < PQntuples(plan.get()); ++i)
@@ -7341,8 +7422,8 @@ TEST_CASE("query_software: match=prefix and a status filter run under the 5 s st
     // kSearchStatementTimeout) cancels that wait; the bare-lease path would wait to the pool's
     // lock_timeout (10 s) and, on a scan, its statement_timeout (30 s). Elapsed time therefore
     // tells the two paths apart: both shapes must degrade (nullopt) well inside 10 s. Costs
-    // about 10 s of wall-clock (two 5 s bounds); the ordering is of two server-side timers, not
-    // of this process's scheduling.
+    // about 5 s of wall-clock (the two 5 s bounds run concurrently); the ordering is of two
+    // server-side timers, not of this process's scheduling.
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
     REQUIRE(pool.valid());
@@ -7362,14 +7443,31 @@ TEST_CASE("query_software: match=prefix and a status filter run under the 5 s st
     SoftwareFleetQuery status;
     status.status = "disabled";
     status.limit = 10;
-    for (const auto* q : {&prefix, &status}) {
-        CAPTURE(q->name, q->status);
-        const auto t0 = std::chrono::steady_clock::now();
-        CHECK_FALSE(store.query_software(*q).has_value()); // degraded, never an empty page
-        const auto secs =
-            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0)
-                .count();
-        CHECK(secs < 9); // the 5 s bound fired, not the 10 s lock_timeout
+    // The two shapes wait on the same lock side by side (the pool has a lease for each beside the
+    // holder's), so the case costs one 5 s bound, not two: each still times its own read.
+    struct Shape {
+        const SoftwareFleetQuery* q;
+        bool answered{true};
+        std::chrono::milliseconds took{0};
+    };
+    std::array<Shape, 2> shapes{Shape{&prefix}, Shape{&status}};
+    {
+        std::vector<std::jthread> readers;
+        for (auto& sh : shapes)
+            readers.emplace_back([&store, &sh] {
+                const auto t0 = std::chrono::steady_clock::now();
+                sh.answered = store.query_software(*sh.q).has_value();
+                sh.took = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0);
+            });
+    } // joined
+    for (const auto& sh : shapes) {
+        CAPTURE(sh.q->name, sh.q->status, sh.took.count());
+        CHECK_FALSE(sh.answered); // degraded, never an empty page
+        // It waited on the lock until a server-side bound cancelled it ...
+        CHECK(sh.took >= std::chrono::milliseconds{4500});
+        // ... and that bound was the 5 s statement_timeout, not the 10 s lock_timeout.
+        CHECK(sh.took < std::chrono::seconds{9});
     }
     pg::PgResult rb = pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
     REQUIRE(rb.status() == PGRES_COMMAND_OK);

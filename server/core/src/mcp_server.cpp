@@ -12,6 +12,7 @@
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
 #include "mcp_input_schema.hpp" // input-schema subset compiler (#2405 C8 pre-approval gate)
 #include "mcp_instruction_execute.hpp" // execute_instruction_definition: bounds + rendering over instruction_execute (#2146)
+#include "mcp_instruction_authoring.hpp" // the nine instruction-definition / instruction-set authoring twins (#2146 batch C)
 #include "mcp_jsonrpc.hpp"
 #include "discovered_devices_model.hpp" // list_discovered_devices shared builders
 #include "mcp_orientation.hpp" // shared initialize.instructions / yuzu://about source (2g PR 1)
@@ -44,9 +45,11 @@
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "outbound_url_policy.hpp"       // url_audit_detail: audit rows never carry a destination URL in full
+#include "guardian_order_json.hpp"       // UP-14: the shared JSON of a device's ordering block (REST twin)
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
+#include "result_set_members.hpp"        // plugin_may_seed_result_set: Forensics-tier source refusal
 #include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "revocation_source_admin_gate.hpp" // ADR-0070 R1: decide_admin + RevocationSourceService (shared REST+MCP)
@@ -70,6 +73,7 @@
 // handler's pre-validation can never diverge from what the store accepts.
 #include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
+#include "mgmt_group_owner_gate.hpp"        // the one management-group owner-arm predicate
 #include "rbac_admin_predicate.hpp"       // A2: is_rbac_administrator/is_self_target — global human role assignment gate
 #include "rbac_assignable_roles.hpp"      // A2: kRbacAssignableRoles/is_rbac_assignable_role — closed 7-role set
 #include "dex_window.hpp"               // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (pure, store-free/httplib-free window resolver — narrower than dex_routes.hpp, which this file no longer needs)
@@ -710,8 +714,8 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are not counted. 0 without information for a set filled before this release or by an older server replica, and 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed is above zero: at least one answering agent failed. Says nothing about agents that never answered; false without information for a set filled before this release or by an older server replica, and false for a failed set"})j"
-#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","partial")j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
      "List the connected agents the caller may read, with hostname, OS, architecture, "
@@ -1553,7 +1557,11 @@ static const ToolDef kTools[] = {
      "it still resolves store-only. See docs/asset-tagging-guide.md \"Tag source precedence\". A "
      "from_result_set:<id> atom referencing a result set that is absent, expired, or not owned "
      "by the caller aborts with kInvalidParams (RESULT_SET_NOT_FOUND) rather than silently "
-     "matching nothing or everything. REST v1 twin: POST /api/v1/scope/preview.",
+     "matching nothing or everything. An owned set that is still pending aborts with "
+     "kInternalError result_set_unusable and retry_after_ms 5000; one that has failed, or is "
+     "incomplete (partial) and referenced under NOT, LEN or STARTSWITH, aborts as "
+     "result_set_unusable with retry_after_ms null (re-run the producer that created the set). "
+     "REST v1 twin: POST /api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -1563,8 +1571,8 @@ static const ToolDef kTools[] = {
     // v1 had a full 12-operation API with zero MCP tools before this batch.
     // Every tool below shares the SAME `ResultSet` row shape (id/name/
     // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
-    // source_kind/status/source_execution_id/device_count/agents_failed/partial) as its REST v1
-    // twin — both surfaces call the SAME result_set_json() builder
+    // source_kind/status/source_execution_id/device_count/agents_failed/agents_unanswered/partial)
+    // as its REST v1 twin — both surfaces call the SAME result_set_json() builder
     // (result_set_model.hpp), so the shape cannot drift.
 
     {"list_result_sets",
@@ -1584,7 +1592,10 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. A non-empty device_ids is checked against the "
      "fleet — any id that does not exist or is not visible to the caller rejects the whole "
-     "request (RESULT_SET_UNKNOWN_DEVICE_ID). REST v1 twin: POST /api/v1/result-sets. "
+     "request (RESULT_SET_UNKNOWN_DEVICE_ID). A parent_id that is pending or failed is "
+     "refused -32602 RESULT_SET_NOT_READY (wait for a pending parent, re-create a failed one); "
+     "the new set does not inherit the parent's agents_failed or agents_unanswered, since its "
+     "members are the given device_ids. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored as supplied -- except that when parent_id is also supplied AND source_payload is itself a JSON object, a scope_input_id key recording the raw parent_id is merged in (overwriting any caller-supplied key of that name, #4306), so a later re-eval can detect the row was narrowed at creation if this parent is deleted; a non-object source_payload skips this marker (re-eval independently refuses such a row before dispatch regardless)"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1603,7 +1614,9 @@ static const ToolDef kTools[] = {
      "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
      "materialise a result set narrower than the true match set (#4496, extended by the #4496 "
      "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
-     "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
+     "reason - query_truncated/poison_excluded/parse_error_excluded). A parent_id that is "
+     "pending or failed is refused -32602 RESULT_SET_NOT_READY; the new set inherits the "
+     "parent's agents_failed and agents_unanswered. REST v1 twin: "
      "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512,"description":"Declared as a string because the in-house schema compiler (mcp_input_schema.cpp) supports a single type per node. The handler also accepts a JSON number for ==, !=, >, >=, <, <= (== and != then compare numerically) and a boolean for == and != only. Under > >= < <= a string that is a plain decimal number (e.g. \"4\", \"2e-7\") is compared exactly against a stored number or fully numeric string; a stored string that merely starts with a number (a dotted version, \"5 GB\") keeps the legacy leading-number read (use version_gte or version_lte for dotted versions) and any other stored value never matches, whereas a JSON number operand never matches a non-numeric stored string; == and != with a string stay an exact text compare. JSON integers are exact; every JSON float (a decimal point or exponent: 5.0, 1e3, 5.5) is -32602: send an integer, or send the decimal as a string under > >= < <= (at most 15 significant digits, a magnitude below 2^53, not subnormal, within the range of a double), where == and != stay a text compare; write a whole number as an integer up to 18446744073709551615, or as digits or an exponent form such as 1e16 (read exactly). Null, an array, an object, or a number/boolean under another op is -32602. maxLength bounds the string form."}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
@@ -1619,7 +1632,7 @@ static const ToolDef kTools[] = {
      "the server only length-checks (max 100000 bytes). Membership is every agent that "
      "returned >=1 row (include_empty=true widens to every responder); an agent whose "
      "query failed is not a member, and the filled set reports how many in agents_failed "
-     "with partial=true (an execution with more than 100000 stored answers marks the set "
+     "(and the agents that never answered in agents_unanswered) with partial=true (an execution with more than 100000 stored answers marks the set "
      "failed instead, with agents_failed 0 and the reason in the server log). SQL that "
      "reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
@@ -1627,8 +1640,10 @@ static const ToolDef kTools[] = {
      "$Process_Hourly. Dispatches to "
      "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
      "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
-     "nothing is refused (400), never silently widened. REST v1 twin: POST "
-     "/api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
+     "nothing is refused (400), never silently widened. A parent_id that is pending or failed "
+     "is refused -32602 RESULT_SET_NOT_READY before anything is dispatched; the new set "
+     "carries the parent's agents_failed and agents_unanswered from creation. REST v1 twin: "
+     "POST /api/v1/result-sets/from-echo-query. NEVER re-send this call on a timeout or an "
      "ambiguous/post-dispatch error - it dispatches a real command to the fleet; poll "
      "instead. Two distinct fault tokens distinguish when retry is safe: a pre-dispatch "
      "RESULT_SET_STORE_UNAVAILABLE (the quota check degraded before anything was sent) "
@@ -1649,15 +1664,17 @@ static const ToolDef kTools[] = {
      "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
      "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
      "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
-     "create_result_set_from_echo_query. Find valid instruction_id values via list_definitions "
+     "create_result_set_from_echo_query, including the RESULT_SET_NOT_READY refusal of a pending "
+     "or failed parent and the inherited agents_failed and agents_unanswered. Find valid "
+     "instruction_id values via list_definitions "
      "or discover_instructions — do not guess. An echo.sql definition whose SQL (params.sql, "
      "else the definition's own default) reads a raw capture table ($<Source>_Live or a "
      "<source>_live table, which Echo no longer keeps) is refused with "
      "RESULT_SET_REEVAL_STALE_SOURCE and nothing is dispatched, the same as "
-     "create_result_set_from_echo_query. If the definition runs a Forensics-tier "
-     "plugin (an action on the Forensics securable) the set materializes with no members "
-     "for every creator, because the materializer never reads Forensics-tier output; an "
-     "empty set from such a definition says nothing about the fleet. A definition whose "
+     "create_result_set_from_echo_query. A definition that runs a Forensics-tier "
+     "plugin is refused with RESULT_SET_SOURCE_NOT_SUPPORTED (-32602) before anything is "
+     "dispatched, because the stored responses of such a plugin are withheld from "
+     "result-set membership. A definition whose "
      "plugin.action is gated (admin or approval) is refused for a non-admin caller with a "
      "permission-denied error whose error.data.reason is approval_required (permanent, "
      "retry_after_ms null): an approval ticket never lifts that gate for this tool, so a "
@@ -1701,6 +1718,9 @@ static const ToolDef kTools[] = {
      "narrowed to a parent set at creation time and that parent has since been deleted, this "
      "REFUSES (RESULT_SET_BAD_REQUEST, reason=parent_gone) rather than silently broadcasting "
      "to every visible device (#4306) — create a new set from the intended parent instead. "
+     "An original whose parent is pending or failed is refused -32602 RESULT_SET_NOT_READY, "
+     "and an instruction_result original whose definition runs a Forensics-tier plugin is "
+     "refused -32602 RESULT_SET_SOURCE_NOT_SUPPORTED, both before anything is dispatched. "
      "An instruction_result source whose definition's plugin.action is gated (admin or "
      "approval) is refused for a non-admin caller (permission denied, "
      "error.data.reason=approval_required, retry_after_ms null): an approval ticket never "
@@ -1841,11 +1861,17 @@ static const ToolDef kTools[] = {
      "0 does NOT prove the census is fresh or complete, since an event that never arrived leaves "
      "no trace, and a pending event whose pair has no census row is not counted (the per-device "
      "reads get_guardian_device_guards and get_guardian_device_compliance report those as "
-     "unrepresented_pending_guards). A service-scoped "
+     "unrepresented_pending_guards). unordered_agents counts agents whose latest event without "
+     "an emit-order pair is later than the time their pair clock last advanced (an agent that "
+     "never sent a pair counts), within the same scope; unordered_agent_ids lists the first 50 "
+     "in ascending byte order of agent id (a count above the list length means truncation). The "
+     "pair is stored and counted, not yet compared: no verdict depends on it. 0 does NOT prove "
+     "every agent sends a pair, since an agent with no census-bearing event has no order row. A "
+     "service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
+     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"unordered_agents":{"type":"integer","minimum":0},"unordered_agent_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules","unordered_agents","unordered_agent_ids"]})j"},
 
     {"list_guardian_rules",
      "List every Guaranteed State rule (Guard) in the catalogue — full rule bodies "
@@ -1899,11 +1925,19 @@ static const ToolDef kTools[] = {
      "non-atomic observations (a pair may appear in both guards[] and the unrepresented list); a "
      "zero count or false flag establishes neither freshness nor "
      "completeness. A pending-evidence read that times out answers a non-retryable error (no "
-     "retry hint): the most likely cause is a large retained pending backlog. Per-device scoped "
-     "(management-group aware) via the same "
+     "retry hint): the most likely cause is a large retained pending backlog. ordering is the "
+     "device's stored emit-order pair state, or null when the device has no order row (no "
+     "census-bearing event was ever accepted, or it was decommissioned): epoch, emit_seq_hwm "
+     "and epoch_recv_ns (server clock, nanoseconds) are the pair clock; unpaired_recv_ns is the "
+     "latest accepted event without a pair; currently_unordered is true when that is later than "
+     "epoch_recv_ns (a never-paired device counts). The counters count accepted events by the "
+     "kind of pair they carried against the clock. They are stored and counted, not yet "
+     "compared: no verdict was held or refused on them, and pair_duplicates stays 0 until the "
+     "comparator ships. The integers are 64-bit and can exceed 2^53, so read them as 64-bit "
+     "integers. Per-device scoped (management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},"ordering":{"type":["object","null"],"properties":{"epoch":{"type":["integer","null"]},"emit_seq_hwm":{"type":["integer","null"]},"epoch_recv_ns":{"type":["integer","null"]},"retired_epoch":{"type":["integer","null"]},"unpaired_recv_ns":{"type":["integer","null"]},"currently_unordered":{"type":"boolean"},"unpaired_events":{"type":"integer","minimum":0},"unpaired_held":{"type":"integer","minimum":0},"pair_regressions":{"type":"integer","minimum":0},"pair_stragglers":{"type":"integer","minimum":0},"pair_recoveries":{"type":"integer","minimum":0},"pair_duplicates":{"type":"integer","minimum":0},"retired_events":{"type":"integer","minimum":0}},"required":["epoch","emit_seq_hwm","epoch_recv_ns","retired_epoch","unpaired_recv_ns","currently_unordered","unpaired_events","unpaired_held","pair_regressions","pair_stragglers","pair_recoveries","pair_duplicates","retired_events"]}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids","ordering"]})j"},
 
     // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
     // Closes the remaining MCP gap on the Guaranteed State surface: the 6
@@ -2235,18 +2269,26 @@ static const ToolDef kTools[] = {
      "including agents whose operating system is not recognised, so not the sum of the per-platform "
      "results), windows, macos or linux. The population is that scope's devices online now "
      "(population: null = no fleet source wired, 0 = no device of the scope online now; "
-     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage says "
-     "per platform whether its crash sources are complete (windows) or partial (linux, macos), so "
-     "a short list for linux or macos is not proof of a healthy fleet. An empty apps list means no "
+     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage is the "
+     "shipped design of the crash sources per platform, complete (windows) or partial (linux, macos), "
+     "not live collector health: it does not change when a collector is off or missing on a host, so "
+     "a short list for linux or macos is not proof of a healthy fleet. observer_state is the live "
+     "count: per platform in scope, how many online devices report the crash and hang observer "
+     "armed, disarmed or not at all (null when no observer source is wired); a device that is not "
+     "armed or not reporting may not be sending all of its crash and hang signals (collection can "
+     "be incomplete or unavailable), so a quiet list does not cover it. An empty apps list means no "
      "crash or hang signal in the window on that scope, not a failure. "
      "Pass platform=windows for the Windows scope only; get_dex_app is the per-application drill-down and counts every platform. An invalid platform or window is invalid params (-32602, terminal: do not retry it unchanged). No device floor is applied. "
      "The policy object names the score policy every figure was scored under (source default or custom, "
      "revision, fault - a reason string when a stored policy document was refused and the shipped "
-     "defaults are in force, otherwise null - and the four tier edges and display names); each "
-     "application's profile is override when a per-application override shaped its tiers or weights, "
+     "defaults are in force, otherwise null - interval_confidence, and the four tier edges and display "
+     "names); each score carries tier, the display name its band reads as for that row (null when "
+     "withheld); each application's profile is override when a per-application override shaped its tiers or weights, "
      "else default. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
-     "read within its staleness bound, is an error, never an empty list. "
+     "read within its staleness bound, is an error naming the reason (concurrency_budget, "
+     "pool_acquire_timeout, statement_timeout, query_error, store_not_open, score_policy_unavailable "
+     "or score_policy_invalid), never an empty list. "
      "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read "
      "is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
@@ -2254,11 +2296,12 @@ static const ToolDef kTools[] = {
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Look-back window for crash and hang signals."})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"crash_source_coverage":{"type":"object","additionalProperties":{"type":"string","enum":["complete","partial"]}},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
-     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
+     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"interval_confidence":{"type":"number"},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","interval_confidence","tiers"]},)j"
+     R"j("observer_state":{"type":["object","null"],"description":"Live observer counts per platform (windows, linux, macos, other under all); null when no observer source is wired.","additionalProperties":{"type":"object","properties":{"armed":{"type":"integer"},"disarmed":{"type":"integer"},"none_reported":{"type":"integer"}},"required":["armed","disarmed","none_reported"]}},)j"
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","policy","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"tier":{"type":["string","null"],"description":"The tier name the band reads as under the policy that scored this row; null when withheld."},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","tier","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"tier":{"type":["string","null"],"description":"The tier name the band reads as under the policy that scored this row; null when withheld."},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","tier","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
+     R"j("required":["window","apps","policy","observer_state","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -4141,7 +4184,7 @@ static const ToolDef kTools[] = {
      "keys need an administrator account over REST: /mcp/v1/ requires a token that carries an "
      "MCP tier, and even an administrator token with a tier cannot write them over MCP, so use "
      "PUT /api/v1/config/{key} or the Settings pages; dex_score_policy has its own route and "
-     "answers invalid params. Values are sent as "
+     "answers invalid params (write it with set_dex_score_policy). Values are sent as "
      "strings, e.g. \"90\"; key is 1 to 64 characters from a-z and _, value at most 256 bytes "
      "(a longer value, such as a long dex_alert_routing, goes through PUT /api/v1/config/{key}); "
      "extra arguments are refused. "
@@ -4420,6 +4463,13 @@ static const ToolDef kTools[] = {
      "treat that shape as 'last known identity, no current detail', never as an error. "
      "When the durable offline-host read itself fails the snapshot is live-only (stale hosts "
      "missing) and the body carries offline_roster_degraded=true -- not an error. "
+     "The durable roster is the newest 100000 hosts seen in the last 7 days, online or not. When "
+     "more exist it is truncated and the merged fleet is at least 100000 machines, so the call "
+     "is refused as oversize unless machines_max=100000 (the ceiling) and every live host is "
+     "already inside the roster; only then does the body "
+     "carry offline_roster_truncated=true: hosts beyond the newest 100000 are missing, so a host "
+     "absent from the result is not proof it does not exist (use get_hardware_ci, which reads one "
+     "device exactly). A fleet this large is otherwise a persistent oversize refusal (#7550). "
      "machines_max bounds the response size (DoS protection, default 5000, ceiling 100000): a "
      "fleet larger than the cap is refused outright, never silently truncated, so a caller "
      "never mistakes a partial view for the whole fleet -- raise machines_max or use "
@@ -4430,7 +4480,7 @@ static const ToolDef kTools[] = {
      "disabled the visualization feature (yuzu_viz_disabled / --viz-disable). Requires "
      "Response:Read.",
      R"j({"type":"object","properties":{"include_vuln":{"type":"boolean","default":false,"description":"Join known-CVE severity onto each process by name (best-effort; often inert if the fleet has no version-bearing inventory match)"},"fresh":{"type":"boolean","default":false,"description":"Force a live re-fetch, invalidating the shared 60s cache for every caller"},"machines_max":{"type":"integer","minimum":1,"maximum":100000,"default":5000,"description":"Refuse (do not truncate) a snapshot with more machines than this"}}})j",
-     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"include_vuln":{"type":"boolean"},"machines":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"offline_roster_degraded":{"type":"boolean","description":"Present (true) only when the durable offline-host read failed; machines is then live-only (stale hosts missing), not an error"}},"required":["schema","schema_minor","generated_at","include_vuln","machines"]})j"},
+     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"include_vuln":{"type":"boolean"},"machines":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"offline_roster_degraded":{"type":"boolean","description":"Present (true) only when the durable offline-host read failed; machines is then live-only (stale hosts missing), not an error"},"offline_roster_truncated":{"type":"boolean","description":"Present (true) only when more offline hosts exist than the durable read returns (the newest 100000 are merged); stale hosts beyond them are missing, so absence from machines is not proof a host does not exist. Not an error."}},"required":["schema","schema_minor","generated_at","include_vuln","machines"]})j"},
 
     {"get_host_topology",
      "Per-host slice of the fleet topology -- one machine's processes, open connections, and "
@@ -4976,6 +5026,236 @@ static const ToolDef kTools[] = {
      R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
      R"j(},"required":["id"],"additionalProperties":false})j",
      R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned"]})j"},
+    // ── #2146 batch C: the instruction-definition / instruction-set authoring twins ─────────────
+    // MCP twins of the nine v1 REST routes in instruction_authoring_routes.cpp (and the legacy
+    // /api/instructions and /api/instruction-sets writes). Legacy kTools[] path, helper TU
+    // mcp_instruction_authoring.{hpp,cpp}; the input bounds below are the MCP schema contract AND
+    // are re-enforced by the shared builders (a test binds the constants to these literals).
+    // Appended at the VERY END of kTools[] per the standing governance note above.
+    {"create_definition",
+     "Create an instruction definition: a stored, named plugin.action that schedules, workflows "
+     "and operators run by id (discover_instructions and list_definitions find one; "
+     "execute_instruction_definition runs one). Creating one runs nothing. Required: name, type, "
+     "plugin. id is optional (omitted: the server generates one; a duplicate id is a conflict, and "
+     "the ids \".\" and \"..\" are refused). "
+     "approval_mode defaults to auto, and AUTO MEANS A LATER RUN OF THIS DEFINITION BY AN "
+     "EXISTING SCHEDULE, A WORKFLOW OR AN OPERATOR-TIER TOKEN NEEDS NO HUMAN APPROVAL: set "
+     "role-gated or always for anything that changes a device. No parameter_schema, "
+     "result_schema or yaml_source is accepted here: save_definition_yaml stores a YAML "
+     "source but does not set the parameter_schema or result_schema columns, and only "
+     "import_definition carries them. Bounds: plugin and action 1 to 128 characters of A-Z a-z 0-9 "
+     "_ . -, name 128, description 512, gather_ttl_seconds 1 to 86400, response_ttl_days 1 to "
+     "3650; an unknown or mistyped field is refused with -32602, never dropped. SUPERVISED tier "
+     "only (operator and readonly tokens are refused). Approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with "
+     "the SAME arguments plus that approval_id. Audited: an instruction.create row is written "
+     "BEFORE the change, and the change is refused (retryable, nothing changed) if that row "
+     "cannot be stored; audit_persisted:false means only the outcome row was lost after the "
+     "change was made. Returns {id}. Mirrors POST /api/v1/instructions. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Optional definition id (omit to have the server generate one); letters, digits, underscore, dot, hyphen"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Display name"},)j"
+     R"j("version":{"type":"string","minLength":1,"maxLength":64,"description":"Definition version, e.g. 1.0 (create default 1.0)"},)j"
+     R"j("type":{"type":"string","enum":["question","action"],"description":"question reads state, action changes it"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Agent plugin name"},)j"
+     R"j("action":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Plugin action name (stored lowercased)"},)j"
+     R"j("description":{"type":"string","maxLength":512,"description":"Free text"},)j"
+     R"j("enabled":{"type":"boolean","description":"Whether the definition can be run (create default true)"},)j"
+     R"j("instruction_set_id":{"type":"string","maxLength":128,"description":"Id of the instruction set this definition belongs to (list_instruction_sets); an empty string on update clears the membership"},)j"
+     R"j("gather_ttl_seconds":{"type":"integer","minimum":1,"maximum":86400,"description":"How long a run gathers responses (create default 300)"},)j"
+     R"j("response_ttl_days":{"type":"integer","minimum":1,"maximum":3650,"description":"How long responses are kept (create default 90)"},)j"
+     R"j("approval_mode":{"type":"string","enum":["auto","role-gated","always"],"description":"Whether a RUN of this definition needs a human: auto never, role-gated unless the caller is an administrator, always every run. Create default auto"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["name","type","plugin"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id"],"additionalProperties":false})j"},
+
+    {"update_definition",
+     "Edit an existing instruction definition by id: only the fields you send change (name, "
+     "version, type, plugin, action, description, enabled, instruction_set_id, "
+     "gather_ttl_seconds, response_ttl_days, approval_mode; the id cannot change). plugin, "
+     "action, approval_mode and enabled decide what a later run executes and whether a human "
+     "must approve it: setting approval_mode to auto, or repointing plugin or action, lets an "
+     "existing schedule or an operator-tier run execute WITHOUT a human, which is why this is "
+     "approval-gated and why the audit row records each of those four changes as old -> new. The "
+     "parameter_schema, result_schema and response templates are not touched. A stored YAML "
+     "source is kept unless the update changes name, description, version, type, plugin, action or "
+     "approval_mode, which clears it "
+     "so that a later save_definition_yaml round trip cannot revert the edit (a change to "
+     "enabled alone keeps it); use save_definition_yaml to change the YAML. expected_updated_at is the updated_at you read "
+     "from get_definition and is REQUIRED (-32602 without it, before any approval is created): the "
+     "approval is for that version, and if the row has changed since the call is refused as a "
+     "conflict and nothing is written. SUPERVISED tier only (operator and readonly tokens are "
+     "refused). Approval-gated: "
+     "the first call returns approval_required (-32006) with an approval_id; after an admin "
+     "approves it, re-call with the SAME arguments plus that approval_id. Audited: an "
+     "instruction.update row is written BEFORE the change, and the change is refused (retryable, "
+     "nothing changed) if that row cannot be stored; audit_persisted:false means only the "
+     "outcome row was lost after the change was made. Returns {id, updated:true}; an unknown id "
+     "is -32602 not_found. Mirrors PUT /api/v1/instructions/{id}. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the definition to edit"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Display name"},)j"
+     R"j("version":{"type":"string","minLength":1,"maxLength":64,"description":"Definition version, e.g. 1.0 (create default 1.0)"},)j"
+     R"j("type":{"type":"string","enum":["question","action"],"description":"question reads state, action changes it"},)j"
+     R"j("plugin":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Agent plugin name"},)j"
+     R"j("action":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Plugin action name (stored lowercased)"},)j"
+     R"j("description":{"type":"string","maxLength":512,"description":"Free text"},)j"
+     R"j("enabled":{"type":"boolean","description":"Whether the definition can be run (create default true)"},)j"
+     R"j("instruction_set_id":{"type":"string","maxLength":128,"description":"Id of the instruction set this definition belongs to (list_instruction_sets); an empty string on update clears the membership"},)j"
+     R"j("gather_ttl_seconds":{"type":"integer","minimum":1,"maximum":86400,"description":"How long a run gathers responses (create default 300)"},)j"
+     R"j("response_ttl_days":{"type":"integer","minimum":1,"maximum":3650,"description":"How long responses are kept (create default 90)"},)j"
+     R"j("approval_mode":{"type":"string","enum":["auto","role-gated","always"],"description":"Whether a RUN of this definition needs a human: auto never, role-gated unless the caller is an administrator, always every run. Create default auto"},)j"
+     R"j("expected_updated_at":{"type":"integer","minimum":0,"description":"The updated_at read from get_definition; REQUIRED at the supervised tier; a changed row is refused as a conflict"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"updated":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","updated"],"additionalProperties":false})j"},
+
+    {"delete_definition",
+     "Delete an instruction definition by id. A definition bundled with the server is TOMBSTONED "
+     "rather than just removed: it does not reappear on the next boot, and only re-importing or "
+     "re-creating it brings it back. The id comes from list_definitions or discover_instructions. "
+     "A definition that a schedule, a live workflow or a policy fragment still names is refused "
+     "(-32602, reason referenced, at most 20 referrers listed) and nothing is deleted: remove or "
+     "repoint each referrer first. expected_updated_at is the updated_at you read from "
+     "get_definition and is REQUIRED (-32602 without it, before any approval is created): the "
+     "approval is for that version, and if the row has changed or been re-created since, the call "
+     "is refused as a conflict (-32602, reason conflict) or not_found, before any approval is "
+     "created or spent, and nothing is deleted. Every delete is approval-gated at the supervised "
+     "tier. SUPERVISED tier only "
+     "(operator and readonly tokens are refused). The first call returns approval_required "
+     "(-32006) with an approval_id; after an admin approves it, re-call with the SAME arguments "
+     "plus that approval_id. Audited: an instruction.delete row is written BEFORE the change, and the "
+     "change is refused (retryable, nothing changed) if that row cannot be stored; "
+     "audit_persisted:false means only the outcome row was lost after the change was made. "
+     "Returns {id, deleted:true}; an unknown id is -32602 not_found and nothing changes. Mirrors "
+     "DELETE /api/v1/instructions/{id}. Requires InstructionDefinition:Delete.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the definition to delete"},)j"
+     R"j("expected_updated_at":{"type":"integer","minimum":0,"description":"The updated_at read from get_definition; REQUIRED at the supervised tier; a changed or re-created row is refused as a conflict"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"deleted":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","deleted"],"additionalProperties":false})j"},
+
+    {"import_definition",
+     "Import an instruction definition from a document: the definition object that "
+     "export_definition returns (its data object when read over REST), plus optional signature "
+     "and publicKey. An export carries NO signature or publicKey; a signed document is "
+     "produced outside the product. An unsigned document is refused unless the server runs "
+     "with --allow-unsigned-definitions, and a signed one is verified against the publicKey "
+     "SUPPLIED IN THE DOCUMENT, so the signature proves the document was not altered after "
+     "signing, NOT who signed it or that the signer is trusted (there is no trust anchor): a "
+     "holder of InstructionDefinition:Write can sign with a key of their own, and unsigned "
+     "create_definition and save_definition_yaml are separate authoring paths. For a signed document plugin, action and approval_mode "
+     "are taken from the verified YAML and an envelope that disagrees is refused. A duplicate id "
+     "is a conflict. The whole request is at most 4 MiB over MCP (the legacy REST "
+     "/api/instructions/import admits 16 MiB; POST /api/v1/instructions/import admits 4 MiB). "
+     "The document is passed to the store as sent; one the store refuses is -32602 carrying the "
+     "store's own message. The approval ticket binds a SHA-256 of the document, not the document "
+     "itself, so the re-call must send the identical document. SUPERVISED tier "
+     "only (operator and readonly tokens are refused). Approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with "
+     "the SAME arguments plus that approval_id. Audited: an instruction.import row is written "
+     "BEFORE the change, and the change is refused (retryable, nothing changed) if that row "
+     "cannot be stored; audit_persisted:false means only the outcome row was lost after the "
+     "change was made. Returns {id}. Mirrors POST /api/v1/instructions/import. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("document":{"type":"object","description":"The definition object export_definition returns (id, name, version, type, plugin, action, yaml_source, ...) and, for a signed import, signature and publicKey (hex Ed25519) added outside the product; an export has neither"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["document"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id"],"additionalProperties":false})j"},
+
+    {"save_definition_yaml",
+     "Create or update an instruction definition from a YAML document (the Instruction Engine "
+     "format: apiVersion yuzu.io/v1alpha1, kind InstructionDefinition). id omitted or empty: "
+     "CREATE (the YAML's metadata.id is honoured, a duplicate is a conflict, absent means the "
+     "server generates one). id given: UPDATE that definition; the YAML's metadata.id, if "
+     "present, must equal it, and the columns the YAML cannot express (enabled, "
+     "instruction_set_id, TTLs, schemas, response templates) are kept. A YAML that sets "
+     "approval_mode auto, or repoints the plugin or action, changes what a later schedule or "
+     "operator-tier run executes without a human, so this is approval-gated and an update's "
+     "audit row records those changes as old -> new. updated_at is the updated_at you read from "
+     "get_definition and is REQUIRED when id is given (-32602 without it, before any approval "
+     "is created): the approval is for that version, and a changed row is refused as a "
+     "conflict. The approval ticket binds a SHA-256 of the YAML, not the YAML itself. The YAML is validated first "
+     "(validate_definition_yaml returns the same errors): invalid is -32602 with the list in "
+     "error.data.errors and nothing is saved. At most 1 MiB of YAML. SUPERVISED tier only "
+     "(operator and readonly tokens are refused). Approval-gated: the first call returns "
+     "approval_required (-32006) with an approval_id; after an admin approves it, re-call with "
+     "the SAME arguments plus that approval_id. Audited: an instruction.create or "
+     "instruction.update row is written BEFORE the change, and the change is refused (retryable, "
+     "nothing changed) if that row cannot be stored; audit_persisted:false means only the "
+     "outcome row was lost after the change was made. Returns {id, created} (created is false "
+     "for an update). Mirrors POST /api/v1/instructions/yaml. Requires "
+     "InstructionDefinition:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("yaml_source":{"type":"string","minLength":1,"maxLength":1048576,"description":"The definition YAML document"},)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the definition to UPDATE; omit or leave empty to create"},)j"
+     R"j("updated_at":{"type":"integer","minimum":0,"description":"The updated_at read from get_definition; REQUIRED when id is given (update); a changed row is refused as a conflict"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["yaml_source"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"created":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","created"],"additionalProperties":false})j"},
+
+    {"validate_definition_yaml",
+     "Check a definition YAML document WITHOUT saving anything. Returns {valid, errors}: errors "
+     "lists every reason the document would be refused (empty when valid). It is the validator "
+     "save_definition_yaml runs first, so a valid result means the save will not fail validation "
+     "(it can still conflict on an id or a stale updated_at). No store is read or written. "
+     "Read-only. Mirrors POST /api/v1/instructions/validate-yaml, with a JSON answer in place of "
+     "the dashboard's HTML. Requires InstructionDefinition:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("yaml_source":{"type":"string","maxLength":1048576,"description":"The definition YAML document (at most 1 MiB)"})j"
+     R"j(},"required":["yaml_source"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"valid":{"type":"boolean"},"errors":{"type":"array","items":{"type":"string"},"description":"Every reason the document would be refused; empty when valid"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["valid","errors"],"additionalProperties":false})j"},
+
+    {"list_instruction_sets",
+     "List instruction sets, the named groups a definition can belong to (instruction_set_id on "
+     "a definition). Returns {sets:[{id,name,description,created_by,created_at}], count}: a live "
+     "read of the store at call time, not a snapshot, and an empty sets array with count 0 means "
+     "no set exists (a failed read is an error, never an empty list). The list is not paged. Use it to find the id that "
+     "create_definition or update_definition takes as instruction_set_id and that "
+     "delete_instruction_set deletes; it lists sets only (the definitions are in list_definitions). "
+     "Read-only. Mirrors GET /api/v1/instruction-sets. Requires InstructionSet:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j(},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"sets":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"created_by":{"type":"string"},"created_at":{"type":"integer"}},"required":["id","name","description","created_by","created_at"]}},"count":{"type":"integer","minimum":0},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["sets","count"],"additionalProperties":false})j"},
+
+    {"create_instruction_set",
+     "Create an instruction set: a named group that definitions join through instruction_set_id. "
+     "Membership grants nothing: a set carries no authorization, so creating one changes no "
+     "one's access. name is required (at most 128 characters), description optional (at most "
+     "512); an unknown or mistyped field is refused with -32602. SUPERVISED tier only (operator "
+     "and readonly tokens are refused); unlike the definition writes this is NOT approval-gated, "
+     "so it runs on the first call. Audited: an instruction_set.create row is written BEFORE the "
+     "change, and the change is refused (retryable, nothing changed) if that row cannot be "
+     "stored; audit_persisted:false means only the outcome row was lost after the change was "
+     "made. Returns {id}. Mirrors POST /api/v1/instruction-sets. Requires InstructionSet:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":128,"description":"Set name"},)j"
+     R"j("description":{"type":"string","maxLength":512,"description":"Free text"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"Accepted for uniformity with the other authoring tools. This tool is not approval-gated, so no ticket is ever issued for it and the value is ignored."})j"
+     R"j(},"required":["name"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id"],"additionalProperties":false})j"},
+
+    {"delete_instruction_set",
+     "Delete an instruction set by id (list_instruction_sets supplies the id). Member definitions are NOT deleted: their "
+     "instruction_set_id is cleared, so they become ungrouped. A set bundled with the server is "
+     "TOMBSTONED and does not reappear on the next boot. Every delete is approval-gated at the "
+     "supervised tier. SUPERVISED tier only (operator and readonly tokens are refused). The "
+     "first call returns approval_required (-32006) with an approval_id; after an admin approves "
+     "it, re-call with the SAME id plus that approval_id. Audited: an instruction_set.delete row "
+     "is written BEFORE the change, and the change is refused (retryable, nothing changed) if "
+     "that row cannot be stored; audit_persisted:false means only the outcome row was lost after "
+     "the change was made. Returns {id, deleted:true}; an unknown id is -32602 not_found and "
+     "nothing changes. Mirrors DELETE /api/v1/instruction-sets/{id}. Requires "
+     "InstructionSet:Delete.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"string","minLength":1,"maxLength":128,"pattern":"^[A-Za-z0-9_.-]+$","description":"Id of the set to delete (list_instruction_sets)"},)j"
+     R"j("approval_id":{"type":"string","maxLength":128,"description":"SUPERVISED tier: the approval ticket id from a prior approval_required (-32006) response, supplied after an admin approves it. Re-send exactly the same other arguments as the call that minted it."})j"
+     R"j(},"required":["id"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"deleted":{"const":true},"audit_persisted":{"type":"boolean","description":"Present and false only when the OUTCOME audit row failed to persist after the change was made"}},"required":["id","deleted"],"additionalProperties":false})j"},
 };
 #undef YUZU_MCP_RESULT_SET_ROW_PROPS
 #undef YUZU_MCP_RESULT_SET_ROW_REQUIRED
@@ -4999,6 +5279,11 @@ static const char* const kWriteToolsRaw[] = {
     "sync_hardware_software",
     "set_tag",         "delete_tag",     "execute_instruction", "execute_instruction_definition",
     "execute_workflow",
+    // #2146 batch C: instruction-definition and instruction-set authoring twins. The five
+    // definition writes (+ deletes) are supervised-only and ticketed (mcp_policy.hpp
+    // requires_approval); create_instruction_set is supervised-only but unticketed.
+    "create_definition", "update_definition", "delete_definition", "import_definition",
+    "save_definition_yaml", "create_instruction_set", "delete_instruction_set",
     "approve_request", "reject_request", "quarantine_device",
     "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
@@ -5142,6 +5427,20 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
     {"export_definition", {"InstructionDefinition", "Read"}},
+    // #2146 batch C: the authoring twins. The REST twins gate on the plain, global pair, which a
+    // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so every row is
+    // the default `denied` class: `confined` would claim a per-agent mechanism that gate does not
+    // have. validate_definition_yaml is the REST validate-yaml pair (InstructionDefinition:Read).
+    // Do NOT add any of them to kServiceScopeGlobalSafe.
+    {"create_definition", {"InstructionDefinition", "Write"}},
+    {"update_definition", {"InstructionDefinition", "Write"}},
+    {"delete_definition", {"InstructionDefinition", "Delete"}},
+    {"import_definition", {"InstructionDefinition", "Write"}},
+    {"save_definition_yaml", {"InstructionDefinition", "Write"}},
+    {"validate_definition_yaml", {"InstructionDefinition", "Read"}},
+    {"list_instruction_sets", {"InstructionSet", "Read"}},
+    {"create_instruction_set", {"InstructionSet", "Write"}},
+    {"delete_instruction_set", {"InstructionSet", "Delete"}},
     {"list_product_packs", {"ProductPack", "Read"}},
     {"get_product_pack", {"ProductPack", "Read"}},
     // #1634 (adversarial-review C3/D7) — migrated onto fleet_read_fn_, which
@@ -6027,6 +6326,20 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_definitions", {ToolEffect::ReadOnly, true, "List instruction definitions"}},
     {"get_definition", {ToolEffect::ReadOnly, true, "Get instruction definition"}},
     {"export_definition", {ToolEffect::ReadOnly, true, "Export instruction definition"}},
+    // #2146 batch C: authoring twins. create_* are additive (a new row; a duplicate id is refused);
+    // update/import/save-yaml replace or add what a later run executes and are not idempotent in the
+    // hint's sense (each is an audited, event-emitting write, and a YAML save without an id creates
+    // a new definition every time); deletes are destructive and idempotent (a second delete only
+    // answers not found).
+    {"create_definition", {ToolEffect::Additive, false, "Create instruction definition"}},
+    {"update_definition", {ToolEffect::Destructive, false, "Update instruction definition"}},
+    {"delete_definition", {ToolEffect::Destructive, true, "Delete instruction definition"}},
+    {"import_definition", {ToolEffect::Destructive, false, "Import instruction definition"}},
+    {"save_definition_yaml", {ToolEffect::Destructive, false, "Save instruction definition from YAML"}},
+    {"validate_definition_yaml", {ToolEffect::ReadOnly, true, "Validate instruction definition YAML"}},
+    {"list_instruction_sets", {ToolEffect::ReadOnly, true, "List instruction sets"}},
+    {"create_instruction_set", {ToolEffect::Additive, false, "Create instruction set"}},
+    {"delete_instruction_set", {ToolEffect::Destructive, true, "Delete instruction set"}},
     {"list_product_packs", {ToolEffect::ReadOnly, true, "List product packs"}},
     {"get_product_pack", {ToolEffect::ReadOnly, true, "Get product pack"}},
     {"query_responses", {ToolEffect::ReadOnly, true, "Query responses"}},
@@ -9975,6 +10288,113 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
 
+                    // #2146 batch C: the instruction authoring tools that carry a ticket. Three
+                    // checks run HERE, before a ticket is minted or consumed (the sg-b1 order:
+                    // schema above, then RBAC, then the call's own preconditions), so a call that
+                    // is going to be refused creates no approval row and burns no approval.
+                    {
+                        namespace iauth_pre = yuzu::server::mcp::instruction_authoring;
+                        const bool authoring_ticketed =
+                            tool_name == "create_definition" || tool_name == "update_definition" ||
+                            tool_name == "delete_definition" || tool_name == "import_definition" ||
+                            tool_name == "save_definition_yaml" ||
+                            tool_name == "delete_instruction_set";
+                        if (authoring_ticketed) {
+                            // UP-3: RBAC FIRST, on the pair the handler gates on (the registry
+                            // row the tier ladder above just used). Without it a principal with
+                            // no grant mints up to the pending cap of tickets for a human to
+                            // approve, and the handler's own check then refuses the recall and the
+                            // approval is spent. perm_fn writes its own refusal row and body; the
+                            // handler keeps its check as defence in depth.
+                            if (!perm_fn(req, res, std::string(sec_type), std::string(sec_op)))
+                                return;
+                            // At the supervised tier the human approves ONE VERSION: an update
+                            // without the version token is refused (owner ruling).
+                            if (const auto missing = iauth_pre::missing_version_token(tool_name, args)) {
+                                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                count_denial("yuzu_mcp_tool_args_invalid_total", nullptr);
+                                const bool audit_ok = mcp_audit(
+                                    "denied", "reason=version_token_required correlation_id=" + cid);
+                                res.set_content(
+                                    a4_error(kInvalidParams, *missing,
+                                             "read the definition with get_definition and re-call "
+                                             "with its updated_at; no approval ticket was created "
+                                             "or consumed",
+                                             -1, cid, audit_ok, "version_token_required"),
+                                    "application/json");
+                                return;
+                            }
+                            // UP-6: a delete of a definition that schedules, workflows or policy
+                            // fragments still name is refused here, before a ticket is minted or
+                            // consumed (the handler checks again). Nothing is written but the generic
+                            // mcp.* row below.
+                            if (tool_name == "delete_definition") {
+                                if (const auto refusal = iauth_pre::delete_referrer_refusal(
+                                        param_str(args, "id"), definition_referrers_fn_,
+                                        instruction_store)) {
+                                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                                    // The reason follows the refusal: referenced, or the
+                                    // lookup itself unavailable (unwired or failing).
+                                    const char* reason =
+                                        refusal->kind == iauth_pre::Kind::kReferenced
+                                            ? "referenced"
+                                            : "lookup_unavailable";
+                                    const bool audit_ok = mcp_audit(
+                                        std::string(iauth_pre::generic_audit_result(refusal->kind)),
+                                        std::string("reason=") + reason + " correlation_id=" + cid);
+                                    const auto rendered = iauth_pre::render(*refusal, cid, !audit_ok);
+                                    res.set_content(error_response(id, rendered.code, rendered.message,
+                                                                   rendered.data_json),
+                                                    "application/json");
+                                    return;
+                                }
+                            }
+                            // UP-12: the human approves ONE VERSION, so a token that already
+                            // does not match the stored row (changed, deleted, or re-created
+                            // since the caller read it) is refused here, before a ticket is
+                            // minted OR consumed: a stale token burns no approval. Best effort
+                            // (the handler still enforces the token atomically). An unreadable
+                            // store fails closed and consumes nothing.
+                            if (const auto stale = iauth_pre::stale_version_refusal(
+                                    tool_name, args, instruction_store)) {
+                                const std::string cid = yuzu::server::detail::make_correlation_id();
+                                const char* reason =
+                                    stale->kind == iauth_pre::Kind::kNotFound   ? "not_found"
+                                    : stale->kind == iauth_pre::Kind::kConflict ? "stale_version"
+                                                                                : "store_unavailable";
+                                const bool audit_ok = mcp_audit(
+                                    std::string(iauth_pre::generic_audit_result(stale->kind)),
+                                    std::string("reason=") + reason + " correlation_id=" + cid);
+                                const auto rendered = iauth_pre::render(*stale, cid, !audit_ok);
+                                res.set_content(error_response(id, rendered.code, rendered.message,
+                                                               rendered.data_json),
+                                                "application/json");
+                                return;
+                            }
+                            // UP-1: bind a DIGEST of the large argument, not its bytes, so a 4 MiB
+                            // document neither lands in approvals.scope_expression nor travels to
+                            // every approvals list. The recall computes the same subject from its
+                            // own arguments, so the binding to the exact bytes is unchanged.
+                            if (iauth_pre::ticket_binds_digest(tool_name)) {
+                                const auto subject = iauth_pre::ticket_subject(tool_name, args);
+                                if (!subject) {
+                                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                                    const bool audit_ok = mcp_audit(
+                                        "failure", "reason=digest_unavailable correlation_id=" + cid);
+                                    res.set_content(
+                                        a4_error(kInternalError,
+                                                 "the approval subject could not be computed",
+                                                 "retry shortly; no approval ticket was created or "
+                                                 "consumed",
+                                                 mcp::kMcpStoreFaultRetryMs, cid, audit_ok,
+                                                 "digest_unavailable"),
+                                        "application/json");
+                                    return;
+                                }
+                                canon = *subject;
+                            }
+                        }
+                    }
                     // #3893 fix round (Doomgoose review, blocking findings
                     // 1+2): generalized from the #3687 Gate 6 UP-5 fix,
                     // execute_instruction-only, to every dispatch-capable
@@ -10800,7 +11220,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // NOTE: the per-handler perm_fn (real RBAC op) has not run
                     // yet; a tier-allows-but-RBAC-denies token can mint→approve→
                     // then 403 at the handler, burning the ticket. Rare, flows
-                    // from the deliberate two-gate (tier then RBAC) split.
+                    // from the deliberate two-gate (tier then RBAC) split. Exceptions
+                    // that run perm_fn BEFORE the mint (so a no-grant caller never gets
+                    // a ticket): execute_instruction_definition, execute_workflow, the
+                    // definition-resolved result-set producers and the six ticketed
+                    // authoring tools (the block above the dispatch-pair check).
                 }
             }
 
@@ -11494,6 +11918,176 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── #2146 batch C: instruction-definition / instruction-set authoring twins ──
+            // Nine tools, one runner. The helper TU (mcp_instruction_authoring.cpp) owns the store
+            // sequences, the audit-first rows and the JSON-RPC rendering; the shared request
+            // builders (instruction_definition_model.hpp) are the SAME code the v1 REST routes call.
+            // Each branch below pins its OWN declared (securable, operation) pair: the tier
+            // (readonly/operator refused for every write), the approval ticket (C8, for the
+            // definition writes and every delete) and the service-scope default-deny all ran in
+            // the generic C8 block above; tier_allows/perm_fn here are the defence-in-depth pair
+            // every sibling tool carries. The ungated create_instruction_set and the Read tools got
+            // NO C8 schema check, so the helper validates every argument itself.
+            namespace iauth = yuzu::server::mcp::instruction_authoring;
+            auto run_instruction_authoring =
+                [&](const std::function<iauth::Result(const iauth::Ports&)>& op) {
+                    iauth::Ports ports;
+                    ports.store = instruction_store;
+                    ports.referrers_fn = definition_referrers_fn_;
+                    ports.pack_advisory_fn = definition_pack_advisory_fn_;
+                    ports.created_by = session->username;
+                    // The consumed ticket, if the C8 gate spent one for this call (C-6).
+                    if (approval_ticket_just_consumed)
+                        ports.approval_id = param_str(args, "approval_id");
+                    // try_persist_audit, not a bare audit_fn call: a throwing sink refuses the
+                    // write like a failed row, never escapes the handler as a bare 500. An
+                    // UNWIRED sink leaves Ports::audit unset, so every write refuses and the error
+                    // carries no retry hint (a configuration fault, as the REST twins' 503):
+                    // try_persist_audit reads a null sink as "audit off" and returns true, which
+                    // would let a write proceed with no attempted row. Production always wires
+                    // it (server.cpp), so this guards a misconfigured embedder.
+                    if (audit_fn)
+                        ports.audit = [&](std::string_view action, std::string_view result_word,
+                                          std::string_view target_type,
+                                          const std::string& target_id,
+                                          const std::string& detail) {
+                            return yuzu::server::detail::try_persist_audit(
+                                audit_fn, req, std::string(action), std::string(result_word),
+                                std::string(target_type), target_id, detail);
+                        };
+                    // The legacy routes' instruction.created / .updated / .deleted.
+                    ports.emit = bind_event_emit(emit_event_fn_, req, metrics);
+                    const iauth::Result out = op(ports);
+                    const bool generic_ok = mcp_audit(std::string(iauth::generic_audit_result(out.kind)));
+                    const auto rendered = iauth::render(
+                        out, yuzu::server::detail::make_correlation_id(), !generic_ok);
+                    res.set_content(
+                        rendered.is_error
+                            ? error_response(id, rendered.code, rendered.message, rendered.data_json)
+                            : success_response(id, tool_result(rendered.payload_json,
+                                                               kObjectOutputSchema)),
+                        "application/json");
+                };
+
+            if (tool_name == "create_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::create_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "update_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::update_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "delete_definition") {
+                if (!tier_allows(tier, "InstructionDefinition", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Delete"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::delete_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "import_definition") {
+                // The ONLY signature-gated authoring surface: import_definition_json, never the
+                // _trusted variant (mcp_instruction_authoring.hpp).
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::import_definition(args, ports); });
+                return;
+            }
+
+            if (tool_name == "save_definition_yaml") {
+                if (!tier_allows(tier, "InstructionDefinition", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::save_definition_yaml(args, ports); });
+                return;
+            }
+
+            if (tool_name == "validate_definition_yaml") {
+                if (!tier_allows(tier, "InstructionDefinition", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionDefinition", "Read"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports&) { return iauth::validate_definition_yaml(args); });
+                return;
+            }
+
+            if (tool_name == "list_instruction_sets") {
+                if (!tier_allows(tier, "InstructionSet", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionSet", "Read"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::list_instruction_sets(ports); });
+                return;
+            }
+
+            if (tool_name == "create_instruction_set") {
+                if (!tier_allows(tier, "InstructionSet", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionSet", "Write"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::create_instruction_set(args, ports); });
+                return;
+            }
+
+            if (tool_name == "delete_instruction_set") {
+                if (!tier_allows(tier, "InstructionSet", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "InstructionSet", "Delete"))
+                    return;
+                run_instruction_authoring([&](const iauth::Ports& ports) { return iauth::delete_instruction_set(args, ports); });
                 return;
             }
 
@@ -14128,15 +14722,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                 bool authorized = perm_fn(req, probe, "UserManagement", "Read");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
+                if (!authorized)
+                    authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                    RbacAdminSurface::kMcp);
                 if (!authorized) {
                     mcp_audit("denied", "forbidden");
                     res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
@@ -14211,15 +14799,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                 bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                if (!authorized && session->token_scope_service.empty()) {
-                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                            gr.role_name == "ITServiceOwner") {
-                            authorized = true;
-                            break;
-                        }
-                    }
-                }
+                if (!authorized)
+                    authorized = group_owner_admits(*mgmt_store, group_id, *session,
+                                                    RbacAdminSurface::kMcp);
                 if (!authorized) {
                     mcp_audit("denied", "forbidden");
                     res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
@@ -15343,29 +15925,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     // null) applies, the transient arm passes a concrete hint.
                     mcp_audit("failure", expression);
                     // #4981 fix-round finding: was a raw string comparison against
-                    // outcome.detail, which cannot warn if a future 6th
-                    // ScopeEvalError::Kind value lands unclassified. Routed
-                    // through the shared, exhaustive scope_abort_is_permanent()
-                    // classifier (scope_eval_error.hpp) instead — see that
-                    // function's doc comment for why OwnerCheckFailed never
-                    // actually reaches here (handled above).
-                    const bool permanent = outcome.abort_kind &&
-                                           yuzu::server::scope_abort_is_permanent(*outcome.abort_kind);
-                    if (permanent) {
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "scope evaluation unavailable: " + outcome.detail,
-                                     "this is a permanent condition and will NOT clear on "
-                                     "retry; escalate to an operator"),
-                            "application/json");
-                    } else {
-                        res.set_content(
-                            a4_error(kInternalError,
-                                     "scope evaluation unavailable: " + outcome.detail,
-                                     "retry once the server reports ready",
-                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                            "application/json");
-                    }
+                    // outcome.detail, which cannot warn if a further ScopeEvalError::Kind
+                    // value lands unclassified. Routed through scope_abort_advice, over the
+                    // shared, exhaustive scope_abort_is_permanent() classifier
+                    // (scope_eval_error.hpp), shared with the REST twin — see that function's
+                    // doc comment for why OwnerCheckFailed never actually reaches here
+                    // (handled above).
+                    // result_set_unusable names the caller's own set and why (REST twin).
+                    const std::string message =
+                        "scope evaluation unavailable: " + outcome.detail +
+                        (outcome.abort_detail.empty() ? "" : " (" + outcome.abort_detail + ")");
+                    // A pending set is transient (wait for it); a failed or incomplete one is not.
+                    const auto advice = yuzu::server::scope_abort_advice(
+                        outcome.abort_kind, mcp::kMcpStoreFaultRetryMs);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInternalError, message, advice.remediation, retry_ms),
+                        "application/json");
                     return;
                 }
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
@@ -15388,8 +15965,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // producers (matching REST exactly: the synchronous creators
             // below use `rs_load_owned` directly on a canonical id, no alias
             // resolution). Resolves a per-operator alias OR a canonical
-            // "rs_"-prefixed id to a canonical id this session owns.
-            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<std::string> {
+            // "rs_"-prefixed id to the materialized row this session owns.
+            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<ResultSet> {
                 std::string rs_id = raw;
                 if (!raw.starts_with("rs_")) {
                     auto canon = result_set_store_->resolve_alias(session->username, raw);
@@ -15409,7 +15986,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return std::nullopt;
-                return rs_id;
+                if (!parent_may_seed(*row)) {
+                    // A pending parent is transient (retry hint), a failed one is not.
+                    const auto advice = parent_not_ready_advice(*row);
+                    const long retry_ms =
+                        static_cast<long>(advice.retry_after_ms.value_or(-1));
+                    res.set_content(
+                        a4_error(kInvalidParams, parent_not_ready_message(*row),
+                                 advice.remediation, retry_ms),
+                        "application/json");
+                    return std::nullopt;
+                }
+                return row; // the caller snapshots its completeness (inherit_completeness)
             };
 
             // A NUL byte in a result-set producer input (name, parameters, parent_id) is
@@ -15471,6 +16059,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (rs_params_have_nul(params)) {
                     rs_refuse_nul("parameters", src_kind);
+                    return;
+                }
+                // A Forensics-tier plugin's stored responses are withheld from result-set
+                // membership, so a set built from one would fill empty while every agent counts
+                // as answered: refused before any execution row or dispatch (REST twin: run_async).
+                if (!plugin_may_seed_result_set(plugin, forensics_plugins_)) {
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   "reason=forensics_source source_kind=" + audit_token(src_kind));
+                    // retry-hint-exempt: caller-input rejection (an unsupported source), not a
+                    // transient fault.
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kSourceNotSupportedMessage)),
+                                    "application/json");
                     return;
                 }
                 if (!result_set_store_ || !execution_tracker) {
@@ -15618,14 +16219,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 std::optional<std::string> parent_id;
+                std::optional<ResultSet> parent_row;
                 std::string scope_expr;
                 if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
                     !args_for_parent["parent_id"].get<std::string>().empty()) {
-                    auto canon = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
-                    if (!canon)
+                    parent_row = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
+                    if (!parent_row)
                         return; // rs_resolve_owned_parent already wrote the error
-                    parent_id = *canon;
-                    scope_expr = "from_result_set:" + *canon;
+                    parent_id = parent_row->id;
+                    scope_expr = "from_result_set:" + parent_row->id;
                 }
 
                 // Create-before-dispatch (UP2-4): the execution_id must be
@@ -15787,6 +16389,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.owner_principal = session->username;
                 cr.name = name;
                 cr.parent_id = parent_id;
+                // Narrowed to the parent's members: the pending row carries the parent's
+                // completeness from birth (REST twin: run_async).
+                if (parent_row)
+                    inherit_completeness(cr, *parent_row);
                 cr.source_kind = std::string(src_kind);
                 cr.source_payload = source_payload;
                 cr.matcher = matcher;
@@ -16081,6 +16687,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto parent = rs_load_owned(*pid);
                     if (!parent)
                         return; // rs_load_owned already wrote the error
+                    if (!parent_may_seed(*parent)) {
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
+                        return;
+                    }
+                    // Lineage only: a directly created set's members are the caller's explicit
+                    // device_ids, not a narrowing of the parent's members, so it does not call
+                    // inherit_completeness (the inventory and async producers, whose members come
+                    // from the parent's, do).
                     cr.parent_id = *pid;
                     // #4306 follow-up: do NOT add the marker for a parent_id
                     // that failed ownership above -- that request is already
@@ -16409,6 +17030,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     auto parent = rs_load_owned(pid);
                     if (!parent)
                         return;
+                    if (!parent_may_seed(*parent)) {
+                        // A pending parent is transient (retry hint), a failed one is not.
+                        const auto advice = parent_not_ready_advice(*parent);
+                        const long retry_ms =
+                            static_cast<long>(advice.retry_after_ms.value_or(-1));
+                        res.set_content(
+                            a4_error(kInvalidParams, parent_not_ready_message(*parent),
+                                     advice.remediation, retry_ms),
+                            "application/json");
+                        return;
+                    }
+                    // The child is narrowed from this parent, so it is no more complete than
+                    // it (REST twin: from-inventory-query).
+                    inherit_completeness(cr, *parent);
                     cr.parent_id = pid;
                     args["scope_input_id"] = pid;
                     std::unordered_set<std::string> ms;
@@ -17832,6 +18467,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // UP-14: same ids as the REST twin (scoped by the same list-read gate, in SQL).
+                JArr unordered_ids;
+                for (const auto& agent : rollup->unordered_agent_ids)
+                    unordered_ids.add(agent);
                 mcp_audit("success");
                 res.set_content(
                     success_response(
@@ -17841,6 +18480,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                              .add("drifted_rules", rollup->drifted_rules)
                                              .add("errored_rules", rollup->errored_rules)
                                              .add("uncertain_rules", rollup->uncertain_rules)
+                                             .add("unordered_agents", rollup->unordered_agents)
+                                             .raw("unordered_agent_ids", unordered_ids.str())
                                              .str(),
                                         kObjectOutputSchema)),
                     "application/json");
@@ -18199,7 +18840,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     .raw("guards", arr.str())
                     .add("total_guards", static_cast<int64_t>(rows->guards.size()))
                     .add("unrepresented_pending_guards", rows->unrepresented_pending_guards)
-                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str())
+                    // UP-14: one rendering shared with the REST twin; null = no order row.
+                    .raw("ordering", rows->ordering
+                                         ? render_guardian_agent_order_json(*rows->ordering)
+                                         : std::string("null"));
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(
@@ -23454,7 +24099,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         [&](const std::unordered_map<std::string, std::string>& params)
                             -> std::pair<std::string, int> {
                             // ReapplyDispatchFn's narrower pair shape is deliberate --
-                            // see its own doc comment. `is_quarantine_control_plugin`
+                            // see its own doc comment. `is_firewall_control_plugin`
                             // is the closed firewall containment set inside the shared
                             // protective predicate (yuzu::protective::
                             // is_protective_action): these actions are exempt from
@@ -26713,12 +27358,16 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 // #5531: a failed durable read answers live-only + a flag.
                 bool viz_offline_degraded = false;
+                // #5712: a roster past the store's row cap is a typed partial, served and
+                // flagged (see VizRoutes), never an error.
+                bool viz_offline_truncated = false;
                 if (offline_roster_fn_) {
                     auto persisted = offline_roster_fn_(
                         std::chrono::seconds(yuzu::server::VizRoutes::kOfflineStaleWindowSecs));
                     if (persisted) {
+                        viz_offline_truncated = persisted->truncated;
                         const auto viz_before = snap->machines.size();
-                        snap = yuzu::server::merge_offline_topology(std::move(snap), *persisted);
+                        snap = yuzu::server::merge_offline_topology(std::move(snap), persisted->rows);
                         const auto viz_merged_count = snap->machines.size() - viz_before;
                         if (viz_merged_count > 0 && metrics)
                             metrics->counter("yuzu_viz_offline_hosts_total")
@@ -26732,7 +27381,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool audit_ok = yuzu::server::detail::try_persist_audit(
                         audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
                         "oversize machines=" + std::to_string(snap->machines.size()) +
-                            " cap=" + std::to_string(machines_max) + " via MCP");
+                            " cap=" + std::to_string(machines_max) +
+                            (viz_offline_truncated ? " offline_roster_truncated=1" : "") +
+                            " via MCP");
                     if (metrics)
                         metrics->counter("yuzu_viz_oversize_response_total").increment();
                     res.set_content(
@@ -26748,11 +27399,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "viz.fleet_topology", "success", "FleetTopology", "",
                     "machines=" + std::to_string(snap->machines.size()) +
                         " include_vuln=" + (include_vuln ? "1" : "0") +
-                        (viz_offline_degraded ? " offline_roster_degraded=1" : "") + " via MCP");
+                        (viz_offline_degraded ? " offline_roster_degraded=1" : "") +
+                        (viz_offline_truncated ? " offline_roster_truncated=1" : "") + " via MCP");
                 if (!audit_ok)
                     j["audit_persisted"] = false;
                 if (viz_offline_degraded)
                     j["offline_roster_degraded"] = true;
+                if (viz_offline_truncated)
+                    j["offline_roster_truncated"] = true;
                 if (metrics) {
                     const auto viz_elapsed = std::chrono::steady_clock::now() - viz_t_start;
                     metrics->histogram("yuzu_viz_topology_request_seconds")
@@ -30684,21 +31338,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Same multi-store (rbac_store + mgmt_store) authority check as
                     // the REST route: fleet-wide ManagementGroup:Write OR the caller
                     // already holding ITServiceOwner on the 'Service: <scope_service>'
-                    // management group (skipped for a service-scoped MCP token).
+                    // management group (the owner arm skips a service-scoped or
+                    // engine-classed session: mgmt_group_owner_gate.hpp).
                     httplib::Response probe; // throwaway: the fleet-wide arm, never sent
                     bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
-                    if (!authorized && mgmt_store && session->token_scope_service.empty()) {
+                    if (!authorized && mgmt_store) {
                         auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
-                        if (svc_group) {
-                            for (const auto& gr : mgmt_store->get_group_roles(svc_group->id)) {
-                                if (gr.principal_type == "user" &&
-                                    gr.principal_id == session->username &&
-                                    gr.role_name == "ITServiceOwner") {
-                                    authorized = true;
-                                    break;
-                                }
-                            }
-                        }
+                        if (svc_group)
+                            authorized = group_owner_admits(*mgmt_store, svc_group->id, *session,
+                                                            RbacAdminSurface::kMcp);
                     }
                     if (!authorized) {
                         mcp_audit("denied", "ITServiceOwner authority required");
