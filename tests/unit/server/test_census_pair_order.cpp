@@ -2281,3 +2281,22 @@ TEST_CASE("census pair order, B3 fix: with the agent step off a refused duplicat
     CHECK(order_text(db.dsn(), "a").empty()); // no order row was made or counted on
     CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate");
 }
+
+TEST_CASE("census pair order, B3 fix: the batch decides each row by the mode its order step "
+          "decided",
+          PAIR_TAGS) {
+    // The second row is a same-epoch LOWER sequence while the clock is fresh: the step's mode is
+    // current_straggler, so it is refused and the row flagged. Decided as the default `current` it
+    // would apply by arrival over the higher sequence.
+    PAIR_FIXTURE();
+    const DecisionCounts counts = decision_counts(metrics);
+    const auto r = store.insert_events({
+        with_pair(stamped("b1", "r1", "a", kCompliant, 1000), 5, 10),
+        with_pair(stamped("b2", "r1", "a", kDrifted, 1010), 5, 9),
+    });
+    REQUIRE(r.has_value());
+    CHECK(*r == 2);
+    CHECK(verdict(db.dsn(), "a", "r1") == "C F 5/10");
+    CHECK(order_text(db.dsn(), "a") == "5|10|-|0|0|0|1|0|0|0");
+    CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_straggler");
+}
