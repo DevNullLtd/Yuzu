@@ -1905,6 +1905,12 @@ std::string repair_outcome_count_text(yuzu::MetricsRegistry& m, const char* sour
                                    .value()));
 }
 
+// The value of the unlabelled Repair-shed counter (`kGuardianRepairsShedMetric`).
+std::string repairs_shed_series_text(yuzu::MetricsRegistry& m) {
+    return std::to_string(static_cast<long long>(
+        m.counter(yuzu::server::detail::kGuardianRepairsShedMetric).value()));
+}
+
 } // namespace
 
 TEST_CASE("census pair order, UP-5: currently unordered is ONE SQL predicate, read the same by the "
@@ -2910,9 +2916,14 @@ TEST_CASE("census pair order, Gate 7: Repairs past the cap are shed at once, the
                 [&, i] { outcomes[i] = store.insert_event_classified(events[i]).outcome; });
 
         // Two Repairs are admitted and parked at the barrier; the other two are shed, with no wait.
-        REQUIRE(
-            wait_until([&] { return park.inside.load() == 2 && store.repairs_shed_total() == 2; },
-                       std::chrono::seconds(10)));
+        // The shed threads return their lease after their ROLLBACK (and a WARN write), so the
+        // lease count settles after the shed counter does: wait for it, then check it.
+        REQUIRE(wait_until(
+            [&] {
+                return park.inside.load() == 2 && store.repairs_shed_total() == 2 &&
+                       pool.in_use() == 2;
+            },
+            std::chrono::seconds(10)));
         CHECK(store.repairs_in_flight() == 2);
         CHECK(park.max_inside.load() == 2); // never more than the cap
         // The shed Repairs hold no lease: only the two parked ones do (the pool has 4).
@@ -2925,6 +2936,8 @@ TEST_CASE("census pair order, Gate 7: Repairs past the cap are shed at once, the
         }
         CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "2");
         CHECK(store.census_proj_failures_total() == failures_before + 2);
+        // The shed series counts exactly one per shed, apart from the failed series above.
+        CHECK(repairs_shed_series_text(metrics) == "2");
         // Nothing of a shed Repair was written, and nothing of a parked one has committed.
         CHECK(pending_count(db.dsn()) == "4");
         CHECK(order_snapshot(db.dsn()) == order_before);
@@ -2938,6 +2951,7 @@ TEST_CASE("census pair order, Gate 7: Repairs past the cap are shed at once, the
     CHECK(park.max_inside.load() == 2);
     CHECK(store.repairs_in_flight() == 0);
     CHECK(store.repairs_shed_total() == 2);
+    CHECK(repairs_shed_series_text(metrics) == "2");
     CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "2");
     CHECK(pending_count(db.dsn()) == "2"); // the two shed events are still pending
 
@@ -2948,6 +2962,7 @@ TEST_CASE("census pair order, Gate 7: Repairs past the cap are shed at once, the
     CHECK(pending_count(db.dsn()) == "0");
     CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "4");
     CHECK(store.repairs_shed_total() == 2);
+    CHECK(repairs_shed_series_text(metrics) == "2"); // repairs that were admitted shed nothing
     CHECK(pool.in_use() == 0);
 }
 
@@ -2972,6 +2987,7 @@ TEST_CASE("census pair order, Gate 7: a shed Repair logs a sampled warning, and 
     CHECK(store.insert_events(batch).has_value());
     cap.stop();
     CHECK(store.repairs_shed_total() == 4);
+    CHECK(repairs_shed_series_text(metrics) == "4");
     CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "4");
     CHECK(pending_count(db.dsn()) == "4");
     CHECK(verdict(db.dsn(), "fd-a", "r1") == "D - 5/11");
@@ -3084,7 +3100,7 @@ TEST_CASE("census pair order, Gate 7 M1: a first delivery starved of its order r
     // `lock_timeout` is per wait, and a FOR SHARE locker does not queue behind a waiting FOR
     // UPDATE, so a rolling chain of overlapping share holders keeps the first delivery's wait going
     // past the 1 s lock bound (measured on PG 17: 4 s and 8 s). The step's statement timeout counts
-    // the whole statement, waits included, so it ends at 1.5 s with SQLSTATE 57014, which takes the
+    // the whole statement, waits included, so it ends at 3 s with SQLSTATE 57014, which takes the
     // failed-step path: the event is stored pending, the step's writes are undone, the delivery is
     // acked. Production bounds throughout; only the chain's own length is generous.
     PAIR_FIXTURE();
@@ -3103,7 +3119,7 @@ TEST_CASE("census pair order, Gate 7 M1: a first delivery starved of its order r
     const EventInsertResult res = store.insert_event_classified(e1);
     const auto took = std::chrono::steady_clock::now() - t0;
     CHECK(res.outcome == EventInsertOutcome::Inserted);
-    CHECK(took < std::chrono::milliseconds(2500)); // the bound is 1 s, the margin generous
+    CHECK(took < std::chrono::milliseconds(5000)); // the statement bound is 3 s
     CHECK(repair_outcome_count_text(metrics, "first_delivery", "failed") == "1");
     CHECK(store.census_proj_failures_total() == failures_before + 1);
     CHECK(pending_count(db.dsn()) == "1");           // stored, with pending evidence
@@ -3117,7 +3133,7 @@ TEST_CASE("census pair order, Gate 7 M1: the step's statement timeout is the loc
           PAIR_TAGS) {
     // A trigger on each table records the lock_timeout and statement_timeout in force as its
     // statement runs, as the Repair's QE-2 case does. The step's Ensure and DECIDE writes run under
-    // the 1 s lock bound AND the 1.5 s statement bound; the census write that follows runs under
+    // the 1 s lock bound AND the 3 s statement bound; the census write that follows runs under
     // the pool's own 10 s and 30 s, and so does the commit: neither SET LOCAL leaks past the
     // RELEASE.
     PAIR_FIXTURE();
@@ -3153,7 +3169,7 @@ TEST_CASE("census pair order, Gate 7 M1: the step's statement timeout is the loc
     CHECK(query_scalar(db.dsn(), "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT "
                                  "stage || '=' || lt || '/' || st AS x FROM " +
                                      log + ") t") ==
-          "guardian_agent_order=1s/1500ms,guardian_agent_rule_status=10s/30s");
+          "guardian_agent_order=1s/3s,guardian_agent_rule_status=10s/30s");
     CHECK(lt_at_commit == "10s");
     CHECK(st_at_commit == "30s");
 }

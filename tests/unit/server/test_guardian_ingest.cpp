@@ -815,6 +815,18 @@ std::int64_t pair_rejected_count(yuzu::MetricsRegistry& m, const char* reason) {
 }
 } // namespace
 
+TEST_CASE("guardian ingest: the Repair-shed counter is pre-seeded at 0, unlabelled",
+          "[guardian][ingest][pair]") {
+    yuzu::MetricsRegistry metrics;
+    CHECK(metrics.serialize().find(yuzu::server::detail::kGuardianRepairsShedMetric) ==
+          std::string::npos);
+    yuzu::server::detail::preseed_guardian_repairs_shed_metric(metrics);
+    CHECK(metrics.serialize().find(std::string(yuzu::server::detail::kGuardianRepairsShedMetric) +
+                                   " 0\n") != std::string::npos);
+    CHECK(std::string(yuzu::server::detail::kGuardianRepairsShedMetric) ==
+          "yuzu_server_guardian_repairs_shed_total");
+}
+
 TEST_CASE("guardian ingest: pair_from_wire validates the emit-order pair (UP-14 D5)",
           "[guardian][ingest][pair]") {
     using yuzu::server::detail::pair_from_wire_structural;
