@@ -310,7 +310,7 @@ TEST_CASE("Alerts tab: admin view carries the sub-nav once, the form body in a n
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(count_sub(res->body, "class=\"gp-subnav\"") == 1);
-    CHECK(res->body.find("class=\"on\" hx-get=\"/fragments/dex/alerts") != std::string::npos);
+    CHECK(res->body.find("class=\"on\" aria-current=\"page\" hx-get=\"/fragments/dex/alerts") != std::string::npos);
     CHECK(count_sub(res->body, "id=\"dex-alerts-section\"") == 1);
     // The clamp is stated, and the three forms all target the inner container.
     CHECK(res->body.find("clamped to the nearest limit") != std::string::npos);
@@ -359,4 +359,30 @@ TEST_CASE("Alerts tab: families open when a member is routed, and routed types o
     CHECK(res->body.find("Other routed types") != std::string::npos);
     CHECK(res->body.find("value=\"legacy.gone_signal\" checked") != std::string::npos);
     CHECK(res->body.find("value=\"" + routed_known + "\" checked") != std::string::npos);
+}
+
+// ── #7536: the tab keeps the window the viewer chose ─────────────────────────
+
+// No Postgres fixture needed: an admin with the config store unavailable still gets the sub-navigation.
+TEST_CASE("Alerts tab: the sub-navigation carries the chosen window, and a missing or unknown one is 7d",
+          "[settings][dex][alerts_tab][window]") {
+    DexAlertsHarness h("", /*open_store=*/false);
+    const auto tabs = [](const std::string& body, const std::string& window) {
+        return count_sub(body, "?window=" + window + "\"");
+    };
+    auto thirty = h.sink.Get(std::string(kAlertsFrag) + "?window=30d");
+    REQUIRE(thirty);
+    CHECK(tabs(thirty->body, "30d") == 10); // every one of the ten tabs
+    CHECK(tabs(thirty->body, "7d") == 0);
+    for (const char* target : {"/fragments/dex/alerts", "/fragments/dex/alerts?window=bogus"}) {
+        auto r = h.sink.Get(target);
+        REQUIRE(r);
+        CHECK(tabs(r->body, "7d") == 10);
+        CHECK(tabs(r->body, "30d") == 0);
+    }
+    // Only the sub-navigation differs: the section below it is byte-identical.
+    auto plain = h.sink.Get(kAlertsFrag);
+    REQUIRE(plain);
+    const auto below = [](const std::string& body) { return body.substr(body.find("</div>") + 6); };
+    CHECK(below(thirty->body) == below(plain->body));
 }

@@ -39,6 +39,13 @@ struct OfflineEndpoint {
     /// `OfflineEndpointStore::upsert()` in offline_endpoint_store.hpp).
     std::string agent_version;
     std::string arch;
+    /// Whether the DATABASE says this agent is connected somewhere right now (#7566): a non-blank
+    /// `session_id` whose `last_seen_at` is inside the presence TTL, judged in-SQL on the database
+    /// clock, the same predicate `query_live_ids` and `fleet_state_counts` use. It is the answer
+    /// for an agent connected to ANOTHER replica, which the local session map cannot give. Only
+    /// meaningful when the read was given a non-zero `live_ttl`; otherwise it is `false`, which
+    /// means "not asked", NOT "offline".
+    bool live{false};
 };
 
 /// The typed failure surface of the presence reads `query_live_ids`, `query_stale_within` and

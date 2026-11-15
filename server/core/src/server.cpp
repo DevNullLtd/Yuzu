@@ -126,6 +126,7 @@
 #include "dex_app_version_failures_owner.hpp"
 #include "dex_app_perf_model.hpp"
 #include "offline_endpoint_store.hpp"
+#include "pg/pg_collation_check.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -285,6 +286,7 @@
 #include "leader_elector.hpp"  // WS-3: fenced leader-election primitive (ADR-2002 §3/§6/§10)
 #include "leader_metrics.hpp"  // WS-11 (#4014): yuzu_server_leader_* seed + scrape-time publisher
 #include "pg_reachability_probe.hpp" // WS-8: runtime Postgres reachability for /readyz (ADR-2002 §12)
+#include "pg_collation_recheck.hpp"  // repeat of the collation version check
 #include "shutdown_drain_rules.hpp" // WS-8: stop() drain-wait decision + bounds
 #include "leader_gate.hpp"     // WS-3 3.2: runtime FencedLeaderOnly loop gate over kBackgroundJobs
 #include "policy_evaluator.hpp"
@@ -2217,6 +2219,31 @@ public:
                           "gauge");
         metrics_.describe("yuzu_pg_connect_failed_total",
                           "Total PostgreSQL connection attempts that failed", "counter");
+        // Set at start and rechecked (hourly when settled, every minute when not), only when the
+        // check learned something (absent, not zero, otherwise); an unreadable check leaves it as
+        // it was.
+        metrics_.describe(
+            pg::kCollationMismatchGauge,
+            "1 when the PostgreSQL database's recorded collation version differs from "
+            "the version the operating system reports now (text-keyed index order may "
+            "be stale; ordered reads can skip or repeat rows), 0 when they match; "
+            "absent when not applicable or no check has been able to run",
+            "gauge");
+        metrics_.describe(pg::kCollationCheckCounter,
+                          "Total PostgreSQL collation version checks by result (ok, mismatch, "
+                          "not_applicable, unreadable); unreadable means the facts could not be "
+                          "read or the operating system reported no version",
+                          "counter");
+        metrics_.describe(
+            pg::kCollationLastCompletedGauge,
+            "Unix time in seconds of the latest PostgreSQL collation version check "
+            "that completed with any verdict (unreadable included); absent until the "
+            "first check; a stale value means the recheck loop has stopped completing "
+            "checks",
+            "gauge");
+        // Pre-seeded so every result reads 0, not absent, before it first happens
+        // (docs/observability-conventions.md): the closed set is pg::all_collation_verdicts().
+        pg::seed_collation_metrics(metrics_);
         // HA WS-8 (ADR-2002 §12): the runtime reachability probe behind /readyz.
         metrics_.describe("yuzu_server_pg_reachable",
                           "1 when this replica's dedicated reachability probe can reach a writable "
@@ -3693,14 +3720,26 @@ public:
             "Durable session-store operations that hit a degraded PostgreSQL read/"
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-            "elevate); a validate degrade fails the request closed, and elevate / "
-            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "elevate / account_state, the last being the read of the account store "
+            "that gates a durable local session); a validate degrade fails the request "
+            "closed, and elevate / revoke (via invalidate_user) degrades fail the "
+            "privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
-                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+                        "invalidate_user", "invalidate", "mark_mfa", "elevate", "account_state"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_account_inactive_total",
+                          "Durable local sessions refused at validation because their account "
+                          "is not active (inactive or deleted)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_account_inactive_total");
+        metrics_.describe("yuzu_auth_session_unknown_source_total",
+                          "Durable sessions refused at validation because the stored auth "
+                          "source is not local, oidc or saml",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_unknown_source_total");
         // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
         // shared by every replica) and fail CLOSED on any store failure. This
         // counts each degrade so an operator can tell "agents cannot enroll /
@@ -4367,14 +4406,18 @@ public:
                           "counter");
         metrics_.describe(
             "yuzu_server_guardian_census_proj_failures_total",
-            "Compliance-census (guardian_agent_rule_status) writes that failed "
+            "Compliance-census (guardian_agent_rule_status) writes, and the per-agent "
+            "emit-order step that runs before each first-delivery write, that failed "
             "for a reason other than the rule not existing. The failure of a single "
             "event does not discard it: it stays stored with pending census "
             "evidence, and the pair keeps its previous state "
-            "until a redelivery of that event repairs it or a later event for the pair arrives. A "
+            "until a redelivery of that event repairs the census row or a later event for the "
+            "pair arrives. A repair runs no order step, so an event whose first delivery failed "
+            "that step never reaches the agent's order clock. A "
             "repair that fails is counted here again. >0 means the census may be "
             "stale; the server log line 'census upsert failed' names the agent "
-            "and rule. A write refused because the rule is not defined on this "
+            "and rule (the order step logs 'agent order step failed' with the agent and event). "
+            "A write refused because the rule is not defined on this "
             "server (the census foreign key, SQLSTATE 23503) is a normal "
             "outcome and is not counted; a failure to retire the evidence of "
             "such an event is an ingest error.",
@@ -4389,8 +4432,13 @@ public:
                           "rule is gone (not a fault); failed is a fault that leaves pending "
                           "evidence, except for source batch, whose failure rolls back the whole batch "
                           "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); abandoned aborted the "
-                          "transaction (counted again as an ingest error). Counted when the "
+                          "..._census_proj_failures_total); a failed per-agent emit-order step is "
+                          "also counted failed (on a first delivery the census write is then "
+                          "skipped); abandoned aborted the "
+                          "transaction (counted again as an ingest error); it includes a failed "
+                          "control statement of the emit-order step's savepoint and, on a first "
+                          "delivery, a failed write of the pending evidence after a failed order "
+                          "step. Counted when the "
                           "projection returns, before the transaction commits. Resets on server "
                           "restart.",
                           "counter");
@@ -4406,12 +4454,34 @@ public:
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
+        metrics_.describe(detail::kGuardianPairRejectedMetric,
+                          "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
+                          "withheld at ingest, by reason. half_set: exactly one of the two was "
+                          "set. out_of_range: a set pair had a value of 2^62 or more. The event "
+                          "is still stored, unpaired, and its verdict decision is unaffected (the "
+                          "census row's stored pair becomes NULL when that unpaired verdict is applied); "
+                          "this is not a refusal. "
+                          "Counted once per withheld pair: a redelivery of the same event does "
+                          "not count again. Resets on server restart.",
+                          "counter");
+        for (const char* reason : detail::kGuardianPairRejectReasons)
+            metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
-                          "write failed and no redelivery has repaired it. Not updated while "
+                          "write, or the per-agent emit-order step before it, failed and no "
+                          "redelivery has repaired it. Not updated while "
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
+                          "gauge");
+        metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
+                          "Agents whose latest accepted unpaired census-bearing event is later than "
+                          "the time their pair clock last advanced (an agent that never sent a "
+                          "pair counts; accepted means accepted for ordering). The pair is stored "
+                          "and counted, not yet compared: "
+                          "no verdict depends on it. Not updated while the store cannot answer, "
+                          "and absent until the first answered read. Per-agent detail is the "
+                          "ordering field of the per-device all-guards read.",
                           "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
@@ -4421,16 +4491,21 @@ public:
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
+        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count and the
+        // request-path unordered_agents read behind the status rollup, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
         // rather than fan out empty/stale data); "guardian_census" (#5690) is the
-        // census pending-evidence COUNT read only (the gauge keeps its last value);
+        // census GAUGE reads only (the pending-evidence count and the unordered-agents count;
+        // each gauge keeps its last value);
         // "guardian_census_device" (#7217) is the per-device unrepresented-pending
-        // reads behind the device-compliance and all-guards routes (fail-hard: REST
-        // 503 / MCP error), and is the only source with the extra reason
-        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
-        // retry usually fails identically). Pre-seeded below (same closed
-        // {reason x source} cross-product pre-seed pattern as
+        // read and the per-device emit-order read behind the device-compliance and
+        // all-guards routes (fail-hard: REST 503 / MCP error). The extra reason
+        // "statement_timeout" (SQLSTATE 57014) is counted on two sources:
+        // guardian_census_device (most likely a retained-backlog symptom whose retry usually
+        // fails identically; only the unrepresented-pending read sets a statement timeout, the
+        // order read does not) and guardian_state (the Apps read cancelled at the pool's 30 s
+        // statement timeout; a shorter window or less load clears it). Pre-seeded below (same
+        // closed {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
         // is meaningful before the first degrade ever fires.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
@@ -4439,13 +4514,17 @@ public:
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
                           "concurrency_budget for a guardian_state read refused over its "
                           "in-flight budget, plus statement_timeout for a guardian_census_device "
-                          "read that exceeded its time budget) and source "
+                          "read that exceeded its time budget or a guardian_state Apps read "
+                          "cancelled at the statement timeout) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
-                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "served; guardian_rules = authoritative rule/status reads, including "
+                          "the request-path unordered-agents read, fail-hard, "
                           "push/reconcile aborts rather than fans out empty; guardian_census = "
-                          "the census pending-evidence count read, whose gauge keeps its last "
+                          "the census gauge reads (the pending-evidence count and the "
+                          "unordered-agents count), whose gauges keep their last "
                           "value; guardian_census_device = the per-device unrepresented-pending "
-                          "reads, fail-hard, the device request is refused and a statement_timeout "
+                          "and emit-order reads, fail-hard, the device request is refused and a "
+                          "statement_timeout "
                           "most likely means a large retained pending backlog, which a retry usually "
                           "does not clear). "
                           "A sampled warn accompanies each new degrade episode.",
@@ -4458,9 +4537,12 @@ public:
         // The Apps stability read's in-flight budget refusal (guardian_state only).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "concurrency_budget"}, {"source", "guardian_state"}});
-        // The per-device unrepresented-pending read's statement timeout (guardian_census_device only).
+        // The statement timeout of the per-device unrepresented-pending read (guardian_census_device)
+        // and of the Apps stability read (guardian_state).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "statement_timeout"}, {"source", "guardian_census_device"}});
+        metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                         {{"reason", "statement_timeout"}, {"source", "guardian_state"}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -5403,6 +5485,7 @@ public:
                 // Probe: a live checkout proves reachability and warms one
                 // connection. Bounded by connect_timeout_s; an empty lease means
                 // an invalid DSN or an unreachable database — fail closed.
+                bool pg_probe_ok = false;
                 if (auto probe = pg_pool_->acquire(); !probe) {
                     spdlog::error("[PG] Refusing to start: cannot reach PostgreSQL substrate: {}",
                                   pg_pool_->last_error());
@@ -5410,7 +5493,22 @@ public:
                 } else {
                     spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
                                  pg_pool_->size());
+                    pg_probe_ok = true;
                 }
+                // The probe lease is released here. At start, before any store serves: compare the
+                // database's recorded collation version with the operating system's. Never stops
+                // the server (logs, exports yuzu_pg_collation_version_mismatch), so an operator can
+                // start it to fix the database; a failed check does not either. It gates nothing.
+                // Like every query this constructor runs before the listener binds, it has no
+                // client-side deadline against a backend that is frozen while its connection keeps
+                // acknowledging data (the 5 s bounds are the pool acquire and server-side
+                // statements; see pg_collation_recheck.hpp "LIFETIME"): a start against such a
+                // database waits here until the orchestrator gives up.
+                // The repeat (pg_collation_recheck_) is started in run(), seeded with the state
+                // this call leaves in collation_state_. See pg/pg_collation_check.hpp.
+                if (pg_probe_ok)
+                    pg::report_collation_check(pg::check_collation_version(*pg_pool_), &metrics_,
+                                               collation_state_);
             }
         }
 
@@ -9470,6 +9568,41 @@ public:
                               pg_reachability::reason(v));
             }
             pg_reachability_probe_->start();
+
+            // Repeat of the collation version check, hourly when settled and every minute when not
+            // (ReplicaSafe, per replica). Started here, in run(), for the #1867 reason above: the
+            // constructor-time check has finished and every fail-closed return is behind us, so
+            // ~ServerImpl never has to join a thread that was never started. It borrows pg_pool_
+            // and is joined in stop() before the pool is reset. The first recheck is one wait from
+            // now (one minute when the start-time check left the state unsettled, an hour
+            // otherwise). The assignment and the start hold lifecycle_mu_, the mutex stop() holds
+            // for its whole teardown (the typed-source purge start below explains the same race):
+            // without it a SIGTERM during boot could run stop() between this make_unique and the
+            // start, or race the unique_ptr assignment against stop()'s read of it. Under the lock
+            // either stop() has not begun (it will join this thread) or it has finished (skip).
+            // The recheck thread never takes lifecycle_mu_, so stop()'s join cannot deadlock.
+            {
+                std::lock_guard<std::mutex> life(lifecycle_mu_);
+                if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {
+                    pg_collation_recheck_ = std::make_unique<PgCollationRecheck>(
+                        [this] { return pg::check_collation_version(*pg_pool_); }, &metrics_,
+                        kCollationRecheckInterval, collation_state_,
+                        kCollationUnsettledRecheckInterval);
+                    // The repeat is optional (the start-time check has already reported), so a
+                    // refusal to create its thread (a task or thread limit) degrades instead of
+                    // failing the boot: the check only reports. Without the repeat the last-
+                    // completed gauge stops advancing and YuzuPgCollationCheckStale fires.
+                    try {
+                        pg_collation_recheck_->start();
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[PG] could not start the collation version recheck thread "
+                                     "(continuing with the start-time check only; the repeat will "
+                                     "not run): {}",
+                                     ::yuzu::log_key_token(e.what()));
+                        pg_collation_recheck_.reset();
+                    }
+                }
+            }
         }
 
         // WS-3 (ADR-2002 §3/§6/§10): construct the fenced leader elector and start
@@ -10471,6 +10604,9 @@ public:
                     if (auto pending = guaranteed_state_store_->pending_projection_count_checked())
                         metrics_.gauge("yuzu_server_guardian_census_pending_events")
                             .set(static_cast<double>(*pending));
+                    // Same posture: the unordered-agents count is published only when read.
+                    detail::publish_guardian_census_unordered_gauge(metrics_,
+                                                                    *guaranteed_state_store_);
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
@@ -11079,6 +11215,12 @@ public:
                 software_catalog_rollup_->request_stop();
             if (software_normalization_job_)
                 software_normalization_job_->request_stop();
+            // The collation recheck is told to stop here too, without a join: a check in flight can
+            // take about 15 s in practice (up to about 35 s on a network that drops packets, see the join
+            // below) and signalled now it overlaps the drain and the web server stop instead of
+            // being added after them. Its join is the LAST step before pg_pool_ is reset.
+            if (pg_collation_recheck_)
+                pg_collation_recheck_->request_stop();
             const seconds min_grace{std::clamp(cfg_.shutdown_drain_seconds, 0,
                                                shutdown_drain::kMaxShutdownDrainSeconds)};
             if (min_grace.count() > 0) {
@@ -12393,6 +12535,26 @@ public:
         // workers before any reset), not a reordering within this function.
         if (gateway_service_)
             gateway_service_->set_known_gateway_clusters(nullptr);
+        // Join the collation recheck. It borrows pg_pool_, so it is joined immediately before the
+        // reset, and deliberately LAST: the join can wait out a check in flight, and a wait here
+        // must not be able to hold up the leader-lease release, the audit cleanup or the offload
+        // flush above (an orchestrator kill during the wait would skip them). request_stop() was
+        // called at the start of the drain, so the check has been running alongside the drain and
+        // the rest of teardown; the join waits only for what is left of it. With the pool defaults
+        // that is about 15 s in practice (the 5 s acquire and two 5 s statements,
+        // pg_collation_check.hpp; the BEGIN and SET LOCAL before them run under the pool's 30 s
+        // statement timeout and normally return at once), up to about 35 s if the network drops packets (a new connection
+        // adds the pool's 10 s connect timeout and a silent connection is given up on by
+        // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce;
+        // pg_pool.hpp). It is NOT bounded against a backend that is frozen while its connection
+        // keeps acknowledging data, a host-name lookup that hangs, or a connection string that sets
+        // tcp_user_timeout to 0: libpq has no client-side query deadline here, so such a wait ends
+        // only when the orchestrator kills the process (or a second termination signal hard-exits
+        // it), after everything above has run, before the pools are reset. stop() is
+        // idempotent; the member is also declared after pg_pool_ so its destructor (which stops it
+        // too) runs first.
+        if (pg_collation_recheck_)
+            pg_collation_recheck_->stop();
         gw_mgmt_pool_.reset();
         pg_pool_.reset();
 
@@ -20093,8 +20255,13 @@ private:
             yuzu::server::DexScorePolicyFn dex_policy_fn;
             if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
-                                         std::move(dex_policy_fn));
+            // The observer provider borrows health_store_, which is declared before every holder
+            // of this API (rest_api_v1_, mcp_server_, dex_routes_) and so outlives them.
+            dex_api = make_local_dex_api(
+                guaranteed_state_store_.get(), dex_fleet_fn, std::move(dex_policy_fn),
+                [this](const std::vector<std::string>& ids) {
+                    return health_store_.dex_observer_for(ids, detail::kAgentHealthStaleness);
+                });
         }
         // The Apps tab reads the same DexApi::apps model as REST and MCP (null store: its error panel).
         if (dex_routes_)
@@ -20265,18 +20432,25 @@ private:
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
-            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            // #7566: the same statement says which of the roster's rows are connected now
+            // (`OfflineEndpoint::live`, the `query_live_ids` predicate on the database clock), so
+            // Online/Offline no longer needs a SECOND read (the registry's cached presence read)
+            // that could fail or be truncated on its own and silently turn devices connected to
+            // another replica into Offline. The TTL is the registry's own presence window.
+            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow,
+                                                                   cfg_.session_timeout);
             if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
                 return result;
-            // currently-connected agents (live registry). all_ids() copies only the ids
-            // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
-            // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
-            // all_ids() is this replica's local sessions UNION the cached durable presence
-            // (live_presence(), refreshed at most every kPresenceCacheTtl = 3 s): a device
-            // gracefully departed from another replica can still read online here for up to
-            // that TTL (#5678), after which its cleared session_id drops it from presence.
+            // A device is online if THIS replica holds its session (the one thing the database
+            // can lag on: a session whose row has not recorded a session id yet) or the database
+            // says it is live. local_ids() copies only the ids under the registry lock - NOT
+            // to_json_obj()'s full 5-field-per-agent JSON serialisation under the heartbeat/
+            // dispatch hot-path mutex (gov perf-S2) - and does no presence read, so nothing here
+            // can fail. A device gracefully departed from another replica reads offline as soon
+            // as its cleared session_id is written (#5678); one that dropped without a goodbye
+            // reads online for up to the TTL, the documented residual of the liveness predicate.
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
-            auto online_ids = registry_.all_ids();
+            auto online_ids = registry_.local_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
@@ -20291,7 +20465,7 @@ private:
                 // registry session's copy when the agent is currently online.
                 r.agent_version = e.agent_version;
                 r.arch = e.arch;
-                r.online = online.count(e.agent_id) > 0;
+                r.online = roster_row_online(e, online);
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > kHardwareStaleAfterMs; // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
@@ -20400,7 +20574,10 @@ private:
             }
             if (!offline_endpoint_store_)
                 return std::optional<InventoryDeviceRow>{};
-            const auto ep = offline_endpoint_store_->find_within(agent_id, kHardwareRosterWindow);
+            // #7551: asks the database whether the device is live on ANOTHER replica (no local
+            // session here), which the offline fallback used to hard-code as offline.
+            const auto ep = offline_endpoint_store_->find_within(agent_id, kHardwareRosterWindow,
+                                                                 cfg_.session_timeout);
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
@@ -25192,6 +25369,14 @@ private:
     // /readyz handlers may still be running after web_server_->stop() (they read
     // its snapshot under the probe's own leaf mutex) — never reset() it inside stop().
     std::unique_ptr<PgReachabilityProbe> pg_reachability_probe_;
+
+    /// The collation check's state after the constructor-time report; it seeds the recheck, which
+    /// then owns the evolving state. Constructor-written, run()-read: no lock.
+    pg::CollationState collation_state_;
+    /// The repeat of the collation version check. Declared AFTER pg_pool_ (which its check
+    /// function borrows) so reverse destruction cannot reach a dead pool even if stop() was
+    /// skipped; stop() joins its thread before pg_pool_.reset().
+    std::unique_ptr<PgCollationRecheck> pg_collation_recheck_;
 
     // Periodic reminder when running with --insecure-skip-client-verify (issue #79)
     std::thread insecure_tls_reminder_thread_;

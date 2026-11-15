@@ -4567,6 +4567,9 @@ groups:
   # These alerts carry `for:` windows and are for paging/escalation — they fire
   # AFTER the LB has already reacted, not before. The pool metrics come from
   # the pool's Observer feed; the reachability metrics from the probe.
+  # The three YuzuPgCollation* alerts are the exception: they are not load-balancer or
+  # readiness related (the collation check never changes /readyz), they read the
+  # collation-check series.
   - name: yuzu-postgres
     rules:
       - alert: YuzuServerPostgresUnreachable
@@ -4633,6 +4636,208 @@ groups:
           severity: warning
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
+
+      - alert: YuzuPgCollationVersionMismatch
+        # Checked at server start and then repeated (pg_collation_recheck.hpp): hourly once a
+        # readable Ok or NotApplicable stands, every minute while a Mismatch stands, no check
+        # has concluded yet, or the latest check could not run. 1 when the
+        # database's recorded collation version differs from the one the operating system of
+        # the PostgreSQL server reports, 0 when they match. A check that could not run leaves
+        # the gauge as it was, so a standing 1 keeps firing and the rule cannot clear on
+        # "unknown". The series is ABSENT when no check has learned anything (a libc C/POSIX
+        # collation, a server before PostgreSQL 15, or checks that cannot run): an absent
+        # series means the check could not run or does not apply, NOT that the database is
+        # healthy, and this rule is silent on it: the alert YuzuPgCollationCheckBlind covers
+        # this, and the server log's "[PG] could not check" WARN line names the cause. A
+        # missing scrape is likewise silent here, so keep your own `up == 0` alert on the
+        # server job. The check repeats every minute while it is 1, so after the database is
+        # fixed the next check sets the gauge to 0 and this clears without a restart.
+        # The mismatch is ONE shared pg_database fact, so the alert collapses replicas with
+        # `max by (job)` (docs/observability-conventions.md: alerts over a row shared by every
+        # replica take `max by (job)`): any replica's gauge at 1 fires one alert for the job, and
+        # it carries no instance label. The gauge itself stays per replica (each replica checks
+        # on its own schedule, up to an hour apart at drift onset), so which replicas have
+        # already seen the mismatch is answered by querying the gauge per instance. By contrast
+        # YuzuPgCollationCheckBlind and YuzuPgCollationCheckStale below are genuinely
+        # per-replica conditions and stay per instance.
+        # After a restart during an unreadable spell the gauge is absent until the first
+        # recheck, so on a single-replica job a standing alert can resolve and fire again a
+        # minute or two later (reasoned, not measured).
+        expr: |
+          max by (job) (yuzu_pg_collation_version_mismatch) == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server job {{ $labels.job }}: the PostgreSQL collation version differs from the operating system's"
+          description: >-
+            The database's recorded collation version is not the version the operating
+            system of the PostgreSQL server reports, so text-keyed indexes may be ordered
+            under the old rules. Ordered reads of a text key, such as a keyset page walk,
+            can then skip or repeat rows without any error. The server does not stop or change
+            anything because of this signal: it keeps serving, and the gauge and the log line
+            are the whole report.
+            The mismatch is one shared database fact, so this is one alert for the Yuzu server
+            job {{ $labels.job }}: any replica's gauge at 1 fires it, and it clears when every
+            replica's gauge is 0 or absent (within about a minute of the repair). The gauges are
+            per replica and replicas check on their own schedule, up to an hour apart at drift
+            onset, so which replicas have already seen the mismatch is answered by querying
+            yuzu_pg_collation_version_mismatch per instance.
+            The server log has one "[PG] database ... collation version" error line naming
+            the database and both versions. Remedy, in this order, as a change under your own
+            process with a verified backup first: connect to the affected
+            database; reindex it (REINDEX DATABASE CONCURRENTLY "<name>" on a server that
+            is serving traffic, or REINDEX DATABASE "<name>" with the Yuzu servers
+            stopped); only when the reindex has finished for every index, run ALTER DATABASE
+            "<name>" REFRESH COLLATION VERSION (it records the version and rebuilds nothing,
+            so it clears this alert whether or not the reindex worked; the check compares
+            version strings only, so the reindex is what makes the result certain). The server
+            rechecks every minute while the mismatch stands, so this clears within about a
+            minute and without a restart. If the reindex fails on a duplicate key, stop the
+            servers and resolve the duplicates by hand first (see the runbook). A database
+            created with the C collation has no collation version and is not affected. This
+            rule needs a successful scrape and a check that can run: a server that is down or
+            an unreachable /metrics silences it, and an absent series means the check could not
+            run or does not apply, not that the database is healthy, so keep your own
+            `up == 0` alert; the alert YuzuPgCollationCheckBlind covers a check that cannot
+            run. Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuPgCollationCheckBlind
+        # The companion of YuzuPgCollationVersionMismatch: that rule reads the gauge, and the
+        # gauge is only refreshed by a check that RUNS, so a check that cannot run leaves it
+        # stale (or absent) and the rule above silent. This rule fires on the checks that
+        # keep failing: at least five "unreadable" results in ten minutes, held for five.
+        # Why ten minutes and not the hours the hourly cadence would suggest: the first failed
+        # check puts the replica on the one-minute cadence (so do a standing Mismatch and no
+        # conclusive verdict), so a check that cannot run fails about once a minute (a check is
+        # a 60 s wait plus its own duration, 61 to 75 s), and a window of hours would stay true
+        # for hours after a short outage. Five failures in ten minutes assume a check cycle under
+        # about two minutes; at a slower cadence five failures do not fit in the window.
+        # MEASURED with promtool v3.13.1 (Prometheus 3 left-open range selectors) at exactly one
+        # failure a minute: five failures go pending and never fire (the window ages the first
+        # one out before the 5m hold ends), six fire for one evaluation. REASONED, not
+        # measured: on Prometheus 2.x (closed ranges) five failures would fire; with a
+        # continuous outage the alert fires about ten minutes after the first counted failure at
+        # any scrape interval up to about two minutes, on 2.x or 3.x; and it clears about SIX
+        # minutes after the last failed check (the window keeps at least five events until the
+        # fifth from last ages out; the rule has no keep_firing_for). Whether a burst of
+        # exactly five or six failures that then stops fires depends on the Prometheus version,
+        # the scrape interval and the check duration: do not rely on it; read it as about five to
+        # six failures. A failover blip of a few checks never reaches it. The first failure after a
+        # settled hour waits for the hourly tick, so the alert fires about ten minutes after that
+        # failure, not from the outage start. The shipped docker-compose.yml pins Prometheus
+        # v3.2.1.
+        # Why it keys on the "unreadable" counter and NOT on the absence of "ok" increases:
+        # the start-time check runs in the constructor, before the first scrape, so the "ok"
+        # series is first scraped already at 1 and shows no increase until the first recheck
+        # that concludes: an "ok"-based rule would see no successful check, and false-fire,
+        # after each restart. The counter is created at 0 for every result BEFORE the
+        # start-time check, and the start-time check IS counted, but a series first scraped
+        # already at 1 gives increase() no earlier sample, so this rule cannot see that one
+        # failure; a recheck failure after a healthy start is counted and seen. A check that
+        # cannot read from boot fires about ten to fifteen minutes after boot (reasoned) because
+        # the rechecks that follow run every minute.
+        # KNOWN LIMITS (reasoned): (1) a check stuck mid-query adds no increments, leaves the
+        # gauge as it was and logs nothing, so this rule and the mismatch rule stay silent;
+        # YuzuPgCollationCheckStale covers it after about two hours plus its hold. (2) a replica
+        # that restarts more often than once a minute while the check keeps failing never
+        # rechecks and its counter is born at 1 after each start, so increase() sees nothing
+        # and no counter-based alert from this feature fires: the alert YuzuServerRestartLoop is
+        # the one for a replica that restarts repeatedly, with its own limits (it needs more
+        # than 3 resets of yuzu_server_uptime_seconds in 3 hours and one continuous series per
+        # instance, and a loop faster than the metrics sweep can keep it silent; see its comment).
+        # The 10m window, the threshold of 5 and the 5m hold are claims reasoned from the
+        # cadence, not measured values. This is a genuinely per-replica condition (each replica
+        # exports its own counter and fails on its own), so it stays per instance; with N
+        # replicas one database problem raises N alerts: group the notifications by alertname
+        # and job.
+        expr: |
+          sum by (job, instance) (increase(yuzu_pg_collation_check_total{result="unreadable"}[10m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: the PostgreSQL collation check has been unable to run"
+          description: >-
+            The collation check has failed repeatedly: at least five times in ten minutes and
+            still failing after about five minutes (it runs every minute once it starts failing;
+            at that cadence this takes about five to six failures, which depends on the
+            Prometheus version and the scrape interval; do not rely on the exact count), so
+            yuzu_pg_collation_version_mismatch is stale and says nothing about the database: a
+            mismatch could be present and unreported.
+            Causes: PostgreSQL is down or unreachable, the pool is saturated (a lease cannot be had
+            in time), a catalog read is not allowed, or the database records a collation version
+            while the PostgreSQL host reports none (for example after a base image change under
+            an existing data volume). In that last case the check is permanently unreadable
+            and this alert does not clear: ALTER DATABASE ... REFRESH COLLATION VERSION fails
+            with "invalid collation version change" (measured on PostgreSQL 18.4 only, on a
+            C-locale database with a forced recorded value that has the same facts), so the
+            reindex-then-refresh way out does not apply; see the exits in the runbook. Meanwhile
+            silence this alert for that instance, with an expiry, rather than fleet-wide.
+            Look for the "[PG] could not check the database collation version" WARN line in
+            the server log. Check that PostgreSQL is reachable from this replica, and that
+            pg_database_collation_actual_version() returns a value for the database.
+            The WARN line is logged once, when the failures began, so search the log back
+            to its first occurrence; it names the cause. To check by hand, run: SELECT
+            datcollversion, pg_database_collation_actual_version(oid) FROM pg_database
+            WHERE datname = current_database();
+            With a continuous outage this fires about ten minutes after the first counted
+            failure and clears about six minutes after the last failed check (reasoned, not
+            measured). Each replica exports its own series, so one database problem raises one
+            alert per replica: group the notifications by alertname and job. A check that
+            cannot read from boot fires about ten to fifteen minutes after boot (the failure of
+            the start-time check itself is counted but cannot be seen by increase()).
+            Known limits: a check stuck mid-query is covered by YuzuPgCollationCheckStale, not
+            by this alert; a replica restarting more often than once a minute while the check
+            keeps failing is not seen by this alert (see YuzuServerRestartLoop and your own
+            `up == 0` rule). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
+            version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuPgCollationCheckStale
+        # The third collation alert: no check has COMPLETED (with any verdict, ok, mismatch,
+        # not_applicable or unreadable) for two hours. The server sets
+        # yuzu_pg_collation_check_last_completed_timestamp_seconds on every applied report, the
+        # start-time one included; it is absent only until the first report and never removed.
+        # The settled cadence is one hour, so the rule means: no check completed for two hours,
+        # counted from the last completed check (so about an hour after the hang began when the
+        # cadence is hourly), plus the 10m hold, which rides out scrape or recheck jitter. It
+        # covers what neither of the other two can: a stuck check adds no counter increments,
+        # leaves the mismatch gauge as it was and logs nothing.
+        # An absent series (a process that never finished its boot check, or a scrape gap) is
+        # silent here: keep your own `up == 0` rule. The value is a replica wall-clock time
+        # compared with Prometheus's time(), so a replica clock that is more than about an hour
+        # off moves the threshold, and the hourly wait uses a clock that does not advance while
+        # the host is suspended, so a suspend can also fire it (both reasoned): check the
+        # replica's uptime and clock before treating it as a hang. The 7200 s and the 10m hold
+        # are reasoned from the cadence, not measured; promtool covers the arithmetic only.
+        # A genuinely per-replica condition, so it stays per instance; with N replicas one
+        # database problem raises N alerts: group by alertname and job.
+        expr: |
+          time() - max by (job, instance) (yuzu_pg_collation_check_last_completed_timestamp_seconds) > 7200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: no PostgreSQL collation check has completed for two hours"
+          description: >-
+            The latest completed collation check on {{ $labels.instance }} is more than two
+            hours old: no check completed for two hours, counted from the last completed check
+            (so about an hour after the hang began when the cadence is hourly). The recheck
+            thread is hung (for example a check stuck mid-query) or the process is wedged.
+            While this fires, yuzu_pg_collation_version_mismatch and
+            yuzu_pg_collation_check_total say nothing about the database. Look at the server
+            log and the thread state of the process; restart the replica if the log shows
+            nothing. It can also fire after a host suspend (the hourly wait uses a clock that
+            does not advance while suspended) or when the replica's clock is more than about an
+            hour off the Prometheus server's, so check the replica's uptime and clock before
+            treating it as a hang. An absent series (a process that never finished its boot
+            check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
+            Each replica exports its own series, so one database problem raises one alert per
+            replica: group the notifications by alertname and job. Runbook:
+            docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
   # HA WS-11 (#4014, ADR-2002 §3/§6/§10/§11): the fenced LeaderElector, as each
   # replica reports it on its own /metrics. READ BEFORE EDITING OR COPYING:
@@ -4947,20 +5152,25 @@ groups:
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
       # Four sources on the SAME counter (guardian_census, #5690, covers the
-      # census pending-evidence count read: it serves no empty result, its
-      # gauge keeps its last value; guardian_census_device, #7217, covers the
-      # two per-device unrepresented-pending reads: their degrade is a REST 503 /
-      # MCP error, never an empty result, and does not touch the gauge), each
+      # two census gauge reads, the pending-evidence count and the
+      # unordered-agents count: they serve no empty result, each gauge
+      # keeps its last value; guardian_census_device, #7217, covers the
+      # per-device unrepresented-pending read and the per-device order read:
+      # their degrade is a REST 503 / MCP error, never an empty result, and
+      # does not touch either gauge), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
       # statement_timeout on guardian_census_device for a read that ran past its
-      # 5 s budget, most likely because of a large retained pending backlog): "guardian_state"
+      # 5 s budget, most likely because of a large retained pending backlog, and
+      # on guardian_state for an Apps read cancelled at the 30 s statement
+      # timeout): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
       # is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-      # agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count) - these fail HARD
+      # agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count and the
+      # request-path unordered_agents read) - these fail HARD
       # (a typed error the caller must act on), but a sustained rate here still
       # means the Guardian push/reconcile/status surface is failing, not
       # merely serving stale data. `by (reason, source)` keeps both dimensions
@@ -4983,14 +5193,21 @@ groups:
             - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
-            source="guardian_census" means the census pending-evidence count
-            read failed (#5690), which freezes the
+            reason="statement_timeout" on source="guardian_state" means an Apps
+            read was cancelled at the 30 s statement timeout: choose a shorter
+            window or reduce load on the database.
+            source="guardian_census" means a census gauge read failed: the
+            pending-evidence count (#5690), which freezes the
             yuzu_server_guardian_census_pending_events gauge at its last value (or
-            leaves it absent before the first successful read).
-            source="guardian_census_device" means one of the two per-device
-            unrepresented-pending reads failed (#7217; device-compliance and the
-            per-device guards read): the degrade is a 503 on REST or an MCP
-            error, never an empty result, and the gauge is not affected.
+            leaves it absent before the first successful read), or the
+            unordered-agents count, which does the same to
+            yuzu_server_guardian_census_unordered_agents.
+            source="guardian_census_device" means a per-device census read
+            failed (#7217): the unrepresented-pending read behind
+            device-compliance and the per-device guards read, or the per-device
+            order read behind the per-device guards read: the degrade is a 503
+            on REST or an MCP error, never an empty result, and neither gauge is
+            affected.
             reason="statement_timeout" on that source is not transient: the
             read ran past its 5 s budget, most likely because the retained
             pending backlog is large (a lock wait, a loaded database or an
@@ -5003,7 +5220,8 @@ groups:
             State guide.
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
-            errored_rule_count/uncertain_rule_count) is degrading: the read itself returns a typed
+            errored_rule_count/uncertain_rule_count, or the request-path
+            unordered_agents read behind the fleet status rollup) is degrading: the read itself returns a typed
             error, not a silent empty/stale result — but "returns a typed
             error" does not mean every caller aborts. Most callers DO fail
             closed (abort push/reconcile/status on the typed error), but this
@@ -7357,7 +7575,10 @@ groups:
             the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
             `invalidate_user` degrades fail the privileged op closed, except an
             `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`; a single
+            disable), which leaves the clear in place and ends `partial`;
+            `account_state` (the read of `auth.users` that gates a durable local
+            session) fails the request closed (401), and the failing store for
+            that op is the account store, not session_store; a single
             event does not hold this alert's 10m condition, so look for
             `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
