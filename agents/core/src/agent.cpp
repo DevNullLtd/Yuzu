@@ -3074,11 +3074,13 @@ public:
                               // Group D2 (after D, its own try so it can neither drop an older
                               // tag nor be dropped by one): #4045, the Spark baseline-persist
                               // aggregate (sparse, 0 omits the tag; every channel is listed on
-                              // GuardianEngine::baseline_persist_failures()). Spark path ONLY:
-                              // a legacy FileGuard persist failure is logged, not counted, so
-                              // an absent tag is NOT evidence that baselines persisted. Not
-                              // gated on prefer_spark_ (0 while Spark is inert). This accessor
-                              // takes no lock (the Group B/C accessors above do take mtx_).
+                              // GuardianEngine::baseline_persist_failures()), plus the two
+                              // #5605 tags described below. Spark path ONLY: a legacy
+                              // FileGuard persist failure is logged, not counted, so an absent
+                              // tag is NOT evidence that baselines persisted. The aggregate is
+                              // not gated on prefer_spark_ (0 while Spark is inert). These
+                              // accessors take no lock (the Group B/C accessors above do take
+                              // mtx_).
                               // Deleting THIS call site is not caught by any test, same as
                               // Group D's: the emitter and the accessor are pinned (E10, E15,
                               // E23 and the doc-scrape test), the call itself is verified by

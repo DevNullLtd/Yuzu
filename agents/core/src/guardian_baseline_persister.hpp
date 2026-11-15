@@ -102,12 +102,13 @@
  * HEARTBEAT: failure_signals() and pending_captures() take no lock (atomics only, no mtx_), so
  * reading THESE tags cannot be blocked by a long apply_rules. That is a property of these
  * accessors only: the same heartbeat tick also calls GuardianEngine getters that do take mtx_
- * (policy_generation(), journal_stats(), ...), so the tick as a whole can still wait. The engine reads this object
- * through an atomic pointer published at wire time; the object lives until the engine's
- * destructor, which runs after the heartbeat thread is gone and after the drain worker is
- * joined (agent.cpp declares kv_store_ before guardian_). The runtime's drop counter is held by
- * shared_ptr, as is the runtime's staging-size mirror, so both stay valid regardless of runtime
- * teardown order.
+ * (policy_generation(), journal_stats(), ...), so the tick as a whole can still wait. The
+ * engine reads this object through an atomic pointer published at wire time (a rollback of a
+ * failed wiring unpublishes the pointer, #5605, but never destroys the object); the object
+ * lives until the engine's destructor, which runs after the heartbeat thread is gone and after
+ * the drain worker is joined (agent.cpp declares kv_store_ before guardian_). The runtime's
+ * drop counter is held by shared_ptr, as is the runtime's staging-size mirror, so both stay
+ * valid regardless of runtime teardown order.
  *
  * CALLERS of persist_staged (exactly three, and NEVER only from a connection-gated thread, or
  * a pre-network boot re-arm would lose its capture on a crash): GuardianEngine::apply_rules
