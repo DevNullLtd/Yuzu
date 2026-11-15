@@ -35,6 +35,10 @@
 ///  - A name that cannot be keyed is never remembered and never refused from memory (it is still
 ///    limited, above).
 ///
+/// The NAT64 prefix probe (`ipv4only.arpa`) is exempt from both: the adapter does not call this
+/// class for it, so it takes no lease, is never refused here and never feeds the memory; only the
+/// pool's cap applies to it.
+///
 /// The caller treats a refusal like any other refused lookup: the same `kBusy` status and the
 /// same reason text as a full pool, so no caller learns a new failure kind. Nothing here returns an
 /// address, so a refusal can never become a success.
@@ -139,15 +143,15 @@ public:
     }
 
     /// Whether a lookup for `host` may be started. On `kAdmitted` the lease holds one count for the
-    /// name until it is released. `consult_refusal_memory = false` skips the memory check (the
-    /// NAT64 probe); the per-name limit always applies.
-    [[nodiscard]] Admission admit(std::string_view host,
-                                  bool consult_refusal_memory = true) noexcept {
+    /// name until it is released. Every lookup that reaches this class is checked against both the
+    /// per-name limit and the refusal memory; the NAT64 probe never reaches it (see
+    /// `resolve_host_addresses_status`).
+    [[nodiscard]] Admission admit(std::string_view host) noexcept {
         try {
             const std::string key = normalise_key(host);
             const auto now = now_();
             std::lock_guard lock(mu_);
-            if (consult_refusal_memory && key != unkeyed_name()) {
+            if (key != unkeyed_name()) {
                 if (const auto it = refused_until_.find(key); it != refused_until_.end()) {
                     if (now < it->second)
                         return {Verdict::kRefusedRecent, {}}; // the entry is left as it is

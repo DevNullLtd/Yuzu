@@ -1129,8 +1129,10 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     return true;
 }
 #else
-// Whether a lookup consults, and feeds, the refusal memory. The NAT64 probe bypasses it.
-enum class LookupMemory { kUse, kBypass };
+// Whether a lookup goes through the admission (the per-name limit and the refusal memory). The
+// NAT64 probe is exempt: it takes no lease, is not refused by the admission and does not feed it, so
+// only the pool's cap applies to it, as before the admission existed.
+enum class LookupAdmission { kApply, kExempt };
 
 // The throttled warning for a lookup refused before the pool was asked: a name refused or timed out
 // moments ago, or a name already at its limit of outstanding lookups. The keys are fixed, never
@@ -1174,10 +1176,11 @@ void log_lookup_refused_before_pool(const std::string& host,
 // Reports why a lookup failed (kBusy: nothing was started). kOk with no parsable address is
 // kNotFound. A lookup that admission refuses (the name's limit, or the refusal memory) is kBusy and
 // is counted once, as busy, in the pool's outcomes, and takes no slot (`bounded_resolve` counts
-// every lookup it runs, so the two never both count one call).
+// every lookup it runs, so the two never both count one call). An exempt lookup never reaches the
+// admission, so it is refused only by the pool (full, or no worker).
 net::ResolveStatus resolve_host_addresses_status(const std::string& host, int timeout_sec,
                                                  std::vector<ResolvedAddress>& out,
-                                                 LookupMemory memory = LookupMemory::kUse) {
+                                                 LookupAdmission mode = LookupAdmission::kApply) {
     net::LookupFn lookup;
     std::shared_ptr<net::ResolverPool> pool;
     std::shared_ptr<net::HostLookupAdmission> admission;
@@ -1191,11 +1194,13 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
     // one; with the hook empty the process-wide instance is used.
     if (!admission && !lookup && !pool)
         admission = oidc_lookup_admission_ref();
+    if (mode == LookupAdmission::kExempt)
+        admission.reset(); // no lease, no refusal, no memory: only the pool's cap applies
     if (!pool)
         pool = oidc_resolver_pool_ref();
     const int pool_cap = pool->cap;
     if (admission) {
-        auto admitted = admission->admit(host, memory == LookupMemory::kUse);
+        auto admitted = admission->admit(host);
         if (admitted.verdict != net::HostLookupAdmission::Verdict::kAdmitted) {
             pool->note_outcome(net::ResolveStatus::kBusy);
             log_lookup_refused_before_pool(host, admitted.verdict, admission->limits());
@@ -1213,7 +1218,7 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
     }
     const auto resolved = net::bounded_resolve(host, std::chrono::seconds(timeout_sec),
                                                std::move(lookup), std::move(pool));
-    if (admission && memory == LookupMemory::kUse)
+    if (admission)
         admission->note_outcome(host, resolved.status);
     switch (resolved.status) {
     case net::ResolveStatus::kOk:
@@ -1326,7 +1331,7 @@ ProbeOutcome lookup_ipv4only_answers(int dns_timeout_ms,
         return ProbeOutcome::kFailed;
 #else
     switch (resolve_host_addresses_status(kNat64ProbeName, timeout_sec, resolved,
-                                          LookupMemory::kBypass)) {
+                                          LookupAdmission::kExempt)) {
     case net::ResolveStatus::kOk:
         break;
     case net::ResolveStatus::kBusy:

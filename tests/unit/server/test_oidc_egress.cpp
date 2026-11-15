@@ -2102,7 +2102,8 @@ TEST_CASE("OIDC resolver limit: the count is released when the lookup throws and
     }
 }
 
-TEST_CASE("OIDC resolver limit: the NAT64 probe obeys the per-name limit",
+TEST_CASE("OIDC resolver limit: the NAT64 probe is exempt from the per-name limit and takes no "
+          "lease; only the pool's cap refuses it",
           "[oidc][oidc_egress][oidc_resolver][oidc_name_limit][oidc_nat64]") {
     Nat64CacheReset cache;
     AdmissionClock clock;
@@ -2110,16 +2111,50 @@ TEST_CASE("OIDC resolver limit: the NAT64 probe obeys the per-name limit",
     auto pool = std::make_shared<net::ResolverPool>(4);
     auto st = std::make_shared<LookupState>();
     st->probe_mode.store(kProbeBlock);
+    GateOpener opener(st->gate);
     BoundedLookupGuard guard(make_lookup(st), pool, adm);
-    VetThread holder(st->gate, kLiteralTarget, 10000); // its probe blocks and holds the name
-    REQUIRE(wait_for([&] { return st->probes.load() == 1; }));
+    // The probe's name is at its limit: one lease is held by the case itself.
+    auto held = adm->admit("ipv4only.arpa");
+    REQUIRE(held.verdict == net::HostLookupAdmission::Verdict::kAdmitted);
+    CHECK(adm->admit("ipv4only.arpa").verdict ==
+          net::HostLookupAdmission::Verdict::kRefusedNameLimit);
+
+    // Two probes at once: both are started, and neither took a lease.
+    VetThread first(st->gate, kLiteralTarget, 10000);
+    VetThread second(st->gate, kLiteralTarget, 10000);
+    REQUIRE(wait_for([&] { return st->probes.load() == 2; }));
+    CHECK(pool->in_flight.load() == 2);
+    CHECK(adm->in_flight_for("ipv4only.arpa") == 1); // only the case's own lease
+    CHECK(busy_count(pool) == 0);
+
+    first.finish(); // one shared gate: opens it for both
+    second.finish();
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
     CHECK(adm->in_flight_for("ipv4only.arpa") == 1);
+    CHECK(adm->refusal_entries() == 0);
+    held.lease.release();
+    CHECK(adm->hosts_in_flight() == 0);
+}
+
+TEST_CASE("OIDC resolver limit: a probe refused by the pool is counted once as busy, takes no "
+          "lease and arms nothing",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit][oidc_nat64]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    auto adm = clock.make(name_limits(1));
+    auto pool = std::make_shared<net::ResolverPool>(1);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+    VetThread holder(st->gate, "slow.a.test", 10000); // takes the pool's only slot
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
 
     yuzu::test::LogCapture cap(spdlog::level::warn);
-    (void)vet_name(kLiteralTarget); // its probe is refused: classified without it
+    (void)vet_name(kLiteralTarget); // its probe is refused by the full pool
     cap.stop();
-    CHECK(st->probes.load() == 1);
+    CHECK(st->probes.load() == 0);
     CHECK(busy_count(pool) == 1);
+    CHECK(adm->in_flight_for("ipv4only.arpa") == 0);
+    CHECK(adm->refusal_entries() == 0); // a refused probe is not remembered
     CHECK(cap.text().find("the NAT64 prefix lookup (ipv4only.arpa) was not started") !=
           std::string::npos);
     holder.finish();

@@ -210,16 +210,6 @@ TEST_CASE("HostLookupAdmission: a lookup that ran and ended busy again re-arms t
     CHECK(adm->admit("idp.example").verdict == Verdict::kAdmitted);
 }
 
-TEST_CASE("HostLookupAdmission: a lookup that bypasses the memory is admitted for an armed name",
-          "[resolver_host_admission]") {
-    FakeClock clock;
-    auto adm = make(clock);
-    adm->note_outcome("ipv4only.arpa", ResolveStatus::kBusy);
-    CHECK(adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/true).verdict == Verdict::kRefusedRecent);
-    CHECK(adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false).verdict == Verdict::kAdmitted);
-    CHECK(adm->refusal_entries() == 1); // bypassing neither reads nor changes the entry
-}
-
 TEST_CASE("HostLookupAdmission: the memory is bounded; expired entries go before a live one",
           "[resolver_host_admission]") {
     FakeClock clock;
@@ -410,17 +400,6 @@ TEST_CASE("HostLookupAdmission: a refusal from memory takes no count, and a refu
     CHECK(adm->refusal_entries() == 1);                             // armed.example only
 }
 
-TEST_CASE("HostLookupAdmission: a lookup that skips the memory still obeys the per-name limit",
-          "[resolver_host_admission]") {
-    FakeClock clock;
-    auto adm = make_limited(clock, 1);
-    adm->note_outcome("ipv4only.arpa", ResolveStatus::kBusy);
-    auto first = adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false);
-    CHECK(first.verdict == Verdict::kAdmitted); // an armed name does not stop it
-    auto second = adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false);
-    CHECK(second.verdict == Verdict::kRefusedNameLimit);
-}
-
 TEST_CASE("HostLookupAdmission::Lease: one release per admission, whatever is done to it",
           "[resolver_host_admission]") {
     FakeClock clock;
@@ -581,9 +560,11 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
           "[resolver_host_admission][wiring][lexical]") {
     const std::string flat = squeeze(comment_free_source("oidc_provider.cpp"));
 
-    const auto admit = flat.find("admission->admit(host,memory==LookupMemory::kUse)");
+    const auto exempt = flat.find("if(mode==LookupAdmission::kExempt)admission.reset();");
+    const auto admit = flat.find("admission->admit(host)");
     const auto resolve = flat.find("net::bounded_resolve(host,std::chrono::seconds(timeout_sec),");
     const auto feed = flat.find("admission->note_outcome(host,resolved.status);");
+    REQUIRE(exempt != std::string::npos);
     REQUIRE(admit != std::string::npos);
     REQUIRE(resolve != std::string::npos);
     REQUIRE(feed != std::string::npos);
@@ -591,18 +572,21 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
     const auto wrap = flat.find("net::hold_lease_during(std::move(lookup),std::move(admitted.lease))");
     REQUIRE(wrap != std::string::npos);
     CHECK(count_occurrences(flat, "hold_lease_during(") == 1);
+    // The exemption is decided before the admission is consulted.
+    CHECK(exempt < admit);
     CHECK(admit < wrap);
     CHECK(wrap < resolve);
     CHECK(resolve < feed);
     CHECK(count_occurrences(flat, "admission->admit(") == 1);
     CHECK(count_occurrences(flat, "admission->note_outcome(") == 1);
-    // The memory is fed only for a call that consults it.
-    CHECK(count_occurrences(flat, "if(admission&&memory==LookupMemory::kUse)admission->note_outcome(") == 1);
+    // The memory is fed only through the admission, which an exempt call does not have.
+    CHECK(count_occurrences(flat, "if(admission)admission->note_outcome(") == 1);
     // A refusal made before the pool is counted once, as busy, by the adapter (the pool counts
     // only the lookups it ran).
     CHECK(count_occurrences(flat, "pool->note_outcome(net::ResolveStatus::kBusy);") == 2);
-    // Only the NAT64 probe bypasses the memory.
-    CHECK(count_occurrences(flat, "LookupMemory::kBypass") == 1);
+    // Only the NAT64 probe is exempt: one reset of the admission and one exempt caller.
+    CHECK(count_occurrences(flat, "LookupAdmission::kExempt") == 2);
+    CHECK(count_occurrences(flat, "admission.reset();") == 1);
     CHECK(count_occurrences(flat, "resolve_host_addresses_status(") == 3); // definition + two callers
     // The warnings share one throttle with a small key budget.
     CHECK(count_occurrences(flat, "RefusalLogThrottle(std::chrono::seconds(60),4)") == 1);
