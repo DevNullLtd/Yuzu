@@ -1773,16 +1773,16 @@ flip, with a red-first test each:
     limit); (d) an explicit census resync mechanism for
     server-state loss (loss (1); #5718); (e) a per-mechanism deaf-watch test (watched directory
     deleted and recreated, stale handle) proving each shipped mechanism calls `fault()` (loss (6);
-    #5719); (e) is tracked in #5719, and its tests are #5719 item 5 (not every mechanism is covered: Registry is a parked known gap and the Windows Service mechanism is uncovered; status below); (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
-    **(e) status, #5719 item 5 (per-mechanism deaf-watch cases, one File-mechanism fix and its fault paths; (e) stays OPEN, and not every mechanism is covered).**
+    #5719); (e) is tracked in #5719, and its tests are #5719 item 5 (not every mechanism is covered: the Windows Service mechanism is uncovered; status below); (b) is implemented by #5719 PR-A (inactive in production; observed only on rig-flipped agents, see precondition (b)).
+    **(e) status, #5719 item 5 (per-mechanism deaf-watch cases, one File-mechanism fix and its fault paths, and one Registry-mechanism fix; (e) stays OPEN, and not every mechanism is covered).**
     **Pre-flip requirements at a glance (File fix, #5719 item 5).** This list only points at the detail below; none of
     it is done. Before any `prefer_spark` flip:
-    - #7836: the Registry parent-key rename deaf-watch gap (the parked case) is closed or explicitly accepted.
     - #7874: resource-exhaustion and network open errors (see #7874) no longer count toward the undecided-result
       streak.
     - #7875: a lost path whose cancelled read never drains gets a deadline-driven recovery, or the owner re-accepts
       the residual (it is also in section 5).
-    - #7876: a runtime off switch exists for the Spark File mechanism as a whole.
+    - #7876: a runtime off switch exists for the Spark File mechanism as a whole (the owner widened it to cover the
+      Registry verification of #7836 as well; see item (2) of the File list below, applied by reference).
     - #7877: the umbrella of the remaining File verification residuals is triaged.
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
     - Also below: export of the File debug counters (#7658), the audit, EDR and SMB sign-in check of item (2), and the
@@ -1843,13 +1843,43 @@ flip, with a red-first test each:
     them back off while a decided verify between two losses is not a flap (two cases), and a saturated verification
     lane (10 watches, 4 pinned workers) serves the least recently verified first, counts the starved ones once and never
     refuses.
-    *Registry: a KNOWN GAP, parked.* The case for the parent of the watched key renamed (`RegRenameKey`) is a hidden
-    case tagged `[.][known-gap-5719]` (owner ruling): no default run, shard or CI leg executes it, and run
-    explicitly it is red (the rename succeeds, the watch keeps reporting `Notification` coverage, no `fault()` is
-    called within the bound, and a value write at the recreated original path does not fire). It is the same class as
-    the legacy guard's disclosed residual (`guard_registry.cpp` lines 25-32 describe a rename of the watched KEY; this
-    case renames the key's PARENT), and the legacy guard was not run on this case, so no parity claim is made either
-    way. Tracked as #7836. A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
+    *Registry: the parent-key rename case is now a normal case (#7836).* The case for the parent of the watched key
+    renamed (`RegRenameKey`) was a hidden known gap tagged `[.][known-gap-5719]`; it is now an ordinary
+    `[spark][mechanism][windows][5719]` case and `[known-gap-5719]` lists no case. It is the same class as the legacy
+    guard's disclosed residual (`guard_registry.cpp` lines 25-32 describe a rename of the watched KEY; this case renames
+    the key's PARENT), and the legacy guard was not run on this case, so no parity claim is made either way.
+    *The Registry fix.* An idle, healthy Registry watch in Target mode is verified every `kRegPathVerifyInterval` (5 s in
+    production; a sampled check, not continuous): the sweeper stages it as a Deferred probe (`RegWatch::verify_probe`)
+    that runs on the existing probe lane, F3-counted, with no new thread; the probe re-opens the registered PATH with
+    `KEY_NOTIFY` and arms a throw-away notify on that fresh handle. If the path resolves to no key (the probe falls
+    back to Ancestor mode: the parent was renamed away, or the key deleted before its notification was consumed), the
+    live handle is following a renamed tree and is deaf to the path: the watch is faulted with the reason `registry watch
+    key renamed or replaced`, owes a synthetic fire (`needs_resync`, the observation gap), and re-opens the path on the
+    ordinary backend retry (30 s in production, doubling on repeated failure to a 300 s cap; the retry's commit clears the
+    fault, in Ancestor mode while the path is still absent, in Target mode once it exists again). If the path still
+    resolves to a key the result is discarded and the live handle stays. A verification that could not decide (open
+    refused, notify refused, the probe threw) is counted (`verify_undecided`, a debug counter) and leaves the watch
+    healthy and unfaulted, with no streak. Detection takes at most one interval plus a sweep wake and the probe's own
+    latency, about 5 s in production (the tests shorten the interval; the figure is a bound from the design, not a
+    measurement). A fire that lands while a verification is outstanding consumes the live notification, so that probe is
+    committed as the watch's re-arm (`resolve_probe_locked` checks `armed`), with the ordinary re-arm grace restarted
+    from the fire; a refused or failed verification LAUNCH (lane cap, launch failure) does not mark the watch's coverage
+    None, because its notify is still live.
+    **Open residuals of the Registry fix** (none is claimed as covered): a parent renamed away and a key re-created at
+    the original path BEFORE the next sample is not noticed, because the fresh open succeeds and is not compared with
+    the key the watch holds (a held-handle name check, `NtQueryKey(KeyNameInformation)` on a duplicate of the notify
+    handle, was measured to work on the rig, see the Runs paragraph, and is not implemented: it needs a handle
+    duplication under the pass lock, a decision the owner has not made; a test pins the residual); a rename away and
+    back inside one interval is not noticed; an Ancestor-mode watch whose shelter ancestor is renamed is not verified;
+    a persistent access-denied on the verification open leaves the watch unverified with no fault and no streak (unlike
+    File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to; every
+    watch commits at startup with the same stamp, so N watches launch their verifications together against the 16-slot
+    probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not demote
+    coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified. Cost and audit: one
+    detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
+    closes per watched key per interval, and an object-access audit event on a key that carries an auditing SACL (not
+    measured; no figure is quoted, and the cost statement of item (2) below, the missing off switch and #7876 apply to the
+    Registry verification by reference, which the owner accepted). A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
     that transition, with a coverage oracle rather than a `fault()` oracle. *Windows Service: NOT covered*, by owner
     ruling: deleting a Windows service needs administrator rights. macOS has no File, Registry or Service
     mechanism, so there is nothing to test there.
@@ -2215,6 +2245,40 @@ flip, with a red-first test each:
     counter assertion. No agent re-review covered the rig-run round; the round-9 re-review by cpp-safety,
     security-guardian and quality-engineer found no blocking finding, and the wording and ledger commits after
     `6f10e561f6` were not re-reviewed.
+    **Registry rename fix (#7836), rig bytes and runs.** Rig bytes: `spark_registry.cpp` and `spark_mechanism.hpp` as committed
+    in `d6e800fa53` (the production commit, whole-repo tree `c1895aa3948c56eb0e1cbdc43424d5632a6ae247`; md5
+    `914e7ec8c79d9b59edb61d2b3d77b6d9` and `ededdb067f5044c63e1621d3a9c9bf7b`) and `test_spark_mechanism.cpp` as committed in
+    `0a8a02a1a6` (the test commit, whole-repo tree `d3b08942f9195f9011f8d46e2c67691440f0d696`; md5
+    `c7307d76df93371c0b9649f942e1ed06`). The commits after `0a8a02a1a6` change documentation and the ledger only and were not
+    run on the rig. All of this is author-reported on the weecolin Windows rig (logs not committed, the scripts are not in
+    the tree) and was not part of a CI run. **Phase 0 measurements** (ctypes against an HKCU scratch tree): `NtQueryKey`
+    with `KeyNameInformation` succeeds on a `KEY_NOTIFY`-only handle; after `RegRenameKey` of the PARENT of a held handle
+    the held handle's name is the NEW name and a fresh open of the original path returns `ERROR_FILE_NOT_FOUND`; with the
+    original path re-created, a fresh open's name is the ORIGINAL path while the held handle's is still the renamed one;
+    a held handle whose key was deleted returns `STATUS_KEY_DELETED` (0xC000017C) and no name; `DuplicateHandle` of an
+    `HKEY` works, the duplicate's name tracks the rename, and closing the duplicate does not cancel the original's
+    notify. Consequence: a name compare between the stored name of the fresh handle and a later fresh handle is blind to
+    rename-plus-recreate (both are the path's own name), so it was not implemented; only the HELD handle's name differs,
+    and reading it needs a duplicate made under the pass lock (the never-launched job would close it there too), a design
+    change the owner has not ruled on. **Runs.** Normal build (the weecolin debug-type build without debug info):
+    `[mechanism]` 198 cases (5850 assertions), `[5719]` 73 (2271) and `[4415prA]` 105 (3544) green (before the change 192, 67,
+    105, with the parked case excluded: the parked case moved into the normal count and five cases were added);
+    `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 30 cases (749 assertions) green
+    and the `File spark (real mechanism): *` pattern 54 cases green once; each of the six Registry cases of this change
+    20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer build of
+    the same bytes (`/fsanitize=address /MD`, annotations disabled, `halt_on_error=1`): the Registry pattern 3 times
+    (30 cases each), `[mechanism]` 198, `[5719]` 73, `[4415prA]` 105 and the File pattern (54) green, no AddressSanitizer
+    report in any run. Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green,
+    unchanged. **Mutations** (each built from the restored source and run 3 times per Registry case; the restored md5
+    equalled the committed one): dropping the `next_wake_locked` clause turned all six cases red (the sweeper sleeps to
+    its 1 h ceiling and no verification runs); treating an Ancestor result as healthy turned the rename case and the
+    undecidable case red; treating a not-ok result as lost turned the undecidable case red; dropping `&& w.armed` in
+    `resolve_probe_locked` turned the fire case red; dropping the `defer_admission_locked` guard turned the lane-cap case
+    red; dropping `needs_resync` on loss turned the rename case red at the synthetic-fire check taken before the repair;
+    and dropping the grace restart in `on_fire` turned the fire case red at the check that a parked re-arm is reported
+    faulted. All seven mutations were caught. Not run: any TSan run, the 50, 200 and 500 key cost measurements (no
+    figure is quoted anywhere), the flip-time chaos scenarios, and the object-access audit behaviour on a key with a
+    SACL. No agent review has covered this change yet; it has not been through `/governance`.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then

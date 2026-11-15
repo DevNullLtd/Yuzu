@@ -92,7 +92,7 @@ history:
     **#4676 is NOT resolved by this change** (it is partly addressed: File, local NTFS, sampled);
     still open there: filesystems that give no file id (reported on one FAT32 volume, author-reported,
     to go undetected), SMB and ReFS (untested), an ancestor shelter whose own parent is renamed,
-    a rename away and back between two samples, and the Registry twin (parked, tracked as #7836). The
+    a rename away and back between two samples, and for the Registry twin (#7836, sampled) a rename followed by a re-creation of the path. The
     statement below that a rename of the PARENT is refused while the handle is open rests on the
     2026-09-21 probe (three runs); the File code comment that a handle follows its directory when
     "an ancestor" is renamed is NOT backed by any run and has been reworded.
