@@ -133,6 +133,18 @@ function stateFor(page) {
   if (st) return st;
   st = { rules: [], log: [] };
   stubState.set(page, st);
+  // Requests a `hold` rule is holding, so a cancellation can be attributed to the rule.
+  const held = new Map();
+  page.on('requestfailed', (req) => {
+    const h = held.get(req);
+    if (!h) return;
+    // The page cancelled the request while it was paused (htmx hx-sync, an xhr abort). This event,
+    // not respond() failing, is the signal: the pinned Puppeteer may swallow the protocol error for
+    // a request the page has already cancelled.
+    h.entry.aborted = true;
+    h.rule.aborted = true;
+    h.rule.onAbort();
+  });
   page.on('request', (req) => {
     if (req.isInterceptResolutionHandled()) return;
     const u = new URL(req.url());
@@ -148,12 +160,29 @@ function stateFor(page) {
       return;
     }
     rule.calls.push(entry);
-    req.respond({
+    const answer = () => req.respond({
       status: rule.status,
       contentType: rule.contentType,
       headers: rule.headers,
       body: rule.body,
     });
+    if (!rule.hold) {
+      answer();
+      return;
+    }
+    // A held rule records the call when the request ARRIVES, then answers once `hold` settles. The
+    // wait and the respond share one try/catch: an async handler that throws is an unhandled
+    // rejection and ends the Node process, and answering a request the page already cancelled
+    // throws. A failure of either is noted on the call entry, never raised.
+    held.set(req, { rule, entry });
+    (async () => {
+      try {
+        await rule.hold;
+        await answer();
+      } catch (e) {
+        entry.respondError = String(e && e.message ? e.message : e);
+      }
+    })();
   });
   return st;
 }
@@ -168,13 +197,54 @@ export async function trace(page) {
 // Answers matching requests inside the browser, so nothing reaches the server. Returns the
 // rule; `rule.calls` lists the requests it answered. Must be installed before the request
 // it targets is issued (before goto for a page that fetches on load).
+//
+// `hold` (optional): a promise. The request is recorded in `rule.calls` when it arrives and answered
+// only after `hold` settles, so a test can supersede it first. When the page cancels it while held,
+// the call entry and the rule gain `aborted = true`; `waitAborted(page, rule)` waits for that.
 export async function stub(page, { method = 'GET', path, search = '', status = 200, body = '',
-  contentType = 'application/json', headers = {} }) {
+  contentType = 'application/json', headers = {}, hold = null }) {
   await trace(page);
   const st = stateFor(page);
-  const rule = { method, path, search, status, body, contentType, headers, calls: [] };
+  const rule = { method, path, search, status, body, contentType, headers, hold, calls: [], aborted: false };
+  rule.abortSeen = new Promise((resolve) => { rule.onAbort = resolve; });
   st.rules.push(rule);
+  if (hold) await installAbortProbe(page);
   return rule;
+}
+
+// Fallback abort signal, from the page itself: htmx fires `htmx:xhr:abort` on the element whose
+// request it cancels. Installed with a plain addEventListener (never hx-on, which the CSP blocks),
+// on this document and on every later one. Each abort is logged as the element's hx-get value.
+async function installAbortProbe(page) {
+  const probe = () => {
+    if (window.__yuzuAborts) return;
+    window.__yuzuAborts = [];
+    document.addEventListener('htmx:xhr:abort', (ev) => {
+      const t = ev.target;
+      window.__yuzuAborts.push((t && t.getAttribute && t.getAttribute('hx-get')) || '');
+    }, true);
+  };
+  await page.evaluateOnNewDocument(probe);
+  await page.evaluate(probe);
+}
+
+// Resolves once the held request of `rule` was cancelled by the page: through the browser's
+// request-failed event, or through htmx's abort event for an element whose hx-get names the rule's
+// path. Bounded by WAIT_MS; the error says which signals were missing.
+export async function waitAborted(page, rule) {
+  let timer;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('held request for ' + rule.path +
+      ' was never observed aborted (no request-failed event, no htmx:xhr:abort)')), WAIT_MS);
+  });
+  const viaPage = page.waitForFunction(
+    (p) => (window.__yuzuAborts || []).some((u) => u.split('?')[0] === p), { timeout: WAIT_MS }, rule.path)
+    .then(() => { rule.aborted = true; }, () => new Promise(() => {}));
+  try {
+    await Promise.race([rule.abortSeen, viaPage, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function clearStubs(page) {

@@ -452,6 +452,31 @@ Five classes that used to appear on this list no longer belong on it:
   one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
   all-operators emergency procedure is in
   [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
+
+  **Deactivated local accounts and sessions.** For accounts held in the Yuzu
+  local account store and deactivated through the product, once every server
+  replica runs this release, a session of that account is rejected on every
+  replica within about one second of the deactivation committing on a healthy
+  generation poll, even if the deactivation's session cleanup failed. Limits:
+
+  - Local accounts only. OIDC and SAML sessions are ended by the linked-identity
+    revoke of the deprovision, not by this check; API tokens and MCP tokens are
+    unchanged.
+  - Mixed-version operation and out-of-band SQL changes to `auth.users` are
+    outside the guarantee. An out-of-band change bumps no generation, so a
+    replica with a warm cache can keep serving the session until the next
+    generation change.
+  - Up to about 30 seconds while a replica's generation poll fails.
+  - Deleting an account and recreating it under the same name is keyed on the
+    username only, so a surviving session of the old account is not ended by
+    the check.
+  - The refusal writes no audit row. The evidence is the deactivation's audit
+    row plus the aggregate counter `yuzu_auth_session_account_inactive_total`.
+  - A deactivation can now fail with `503`, leaving the account active, when
+    its session write-generation write cannot complete (see
+    [Auth database recovery](../ops-runbooks/auth-db-recovery.md#scim--dashboard-deprovision-returns-500-sessions_db_error)).
+
+  Details: `docs/auth-architecture.md`, "Account state at session validation".
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a

@@ -610,6 +610,12 @@ TEST_CASE("render: the refused token and the stale banner appear only when set",
     CHECK(has(stale, "changed by someone else"));
     CHECK(has(stale, "reloading discards the edits on screen"));
     CHECK(has(stale, "hx-get=\"/fragments/dex/scoring?window=7d\""));
+    // The Reload button swaps the shared pane, so it carries the stale-response guard like every
+    // other DEX control that targets it: one target, one swap, one sync.
+    CHECK(has(stale, "hx-sync=\"#guardian-detail:replace\""));
+    CHECK(count_of(stale, "hx-target=\"#guardian-detail\"") ==
+          count_of(stale, "hx-sync=\"#guardian-detail:replace\""));
+    CHECK(count_of(stale, "hx-target=\"#guardian-detail\"") == 1);
     for (const auto& t : control_tags(stale)) {
         if (has(t, "hx-get="))
             continue; // the Reload button

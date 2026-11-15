@@ -58,6 +58,8 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::auth::Role;
 using DKind = AccountDeactivationResult::Kind;
 using RKind = LocalRoleChangeResult::Kind;
+// This file exercises the guard, not the session cache: no SessionStore is wired.
+constexpr auto kNoSessionStore = SessionGenerationMode::kNoSessionStore;
 
 namespace {
 
@@ -259,7 +261,7 @@ TEST_CASE("lifecycle guard: regime table (OFF/ON x column/grant floor), and woul
             REQUIRE(advice.ok);
             CHECK(advice.would_strand == (row.expect == DKind::kLastAdministratorRefused));
 
-            const auto got = store.deactivate_account(row.target);
+            const auto got = store.deactivate_account(row.target, kNoSessionStore);
             CHECK(got.err.empty());
             REQUIRE(got.kind == row.expect);
             if (row.expect == DKind::kDeactivated) {
@@ -279,10 +281,10 @@ TEST_CASE("lifecycle guard: a refused deactivation leaves the row present and ac
     LIFECYCLE_FIXTURE(store, auth_db);
     build_world(auth_db, store, /*rbac_on=*/false,
                 {{"adm1", Role::admin}, {"adm2", Role::admin}, {"plain", Role::user}});
-    REQUIRE(store.deactivate_account("adm1").kind == DKind::kDeactivated);
+    REQUIRE(store.deactivate_account("adm1", kNoSessionStore).kind == DKind::kDeactivated);
     CHECK(active_column_admins(auth_db.pool()) == std::vector<std::string>{"adm2"});
 
-    const auto refused = store.deactivate_account("adm2");
+    const auto refused = store.deactivate_account("adm2", kNoSessionStore);
     REQUIRE(refused.kind == DKind::kLastAdministratorRefused);
     CHECK(refused.err.empty());
     // The row is still there, still active, still an admin, and was not touched by the rollback.
@@ -290,7 +292,7 @@ TEST_CASE("lifecycle guard: a refused deactivation leaves the row present and ac
     CHECK(role_column(auth_db.pool(), "adm2") == "admin");
     CHECK(active_column_admins(auth_db.pool()) == std::vector<std::string>{"adm2"});
     // A repeat is still refused (the refusal is stable, not a one-shot).
-    CHECK(store.deactivate_account("adm2").kind == DKind::kLastAdministratorRefused);
+    CHECK(store.deactivate_account("adm2", kNoSessionStore).kind == DKind::kLastAdministratorRefused);
 }
 
 TEST_CASE("lifecycle guard: a ghost grant (no auth.users row) and an inactive holder are not "
@@ -305,7 +307,7 @@ TEST_CASE("lifecycle guard: a ghost grant (no auth.users row) and an inactive ho
 
     // `real` is the only COUNTED holder: the ghost and the retired holder do not rescue it.
     CHECK(store.would_strand_last_administrator("real").would_strand);
-    CHECK(store.deactivate_account("real").kind == DKind::kLastAdministratorRefused);
+    CHECK(store.deactivate_account("real", kNoSessionStore).kind == DKind::kLastAdministratorRefused);
     CHECK(account_active(auth_db.pool(), "real"));
 }
 
@@ -323,8 +325,8 @@ TEST_CASE("lifecycle guard: two deactivations of the last two column admins seri
     hold.lock_rbac_enabled();
     AccountDeactivationResult r1, r2;
     Workers workers([&] { hold.rollback(); });
-    workers.add([&] { r1 = store.deactivate_account("race1"); });
-    workers.add([&] { r2 = store.deactivate_account("race2"); });
+    workers.add([&] { r1 = store.deactivate_account("race1", kNoSessionStore); });
+    workers.add([&] { r2 = store.deactivate_account("race2", kNoSessionStore); });
     // BOTH are parked at the first lock (not yet past it): without the rbac_enabled mutex they
     // would each run their recount against a snapshot that still shows the other as a survivor.
     REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 2).size() >= 2);
@@ -364,12 +366,12 @@ TEST_CASE("lifecycle guard: a burst of paired concurrent deactivations never emp
             workers.add([&] {
                 while (!go.load())
                     std::this_thread::yield();
-                rp = store.deactivate_account("burn_p");
+                rp = store.deactivate_account("burn_p", kNoSessionStore);
             });
             workers.add([&] {
                 while (!go.load())
                     std::this_thread::yield();
-                rq = store.deactivate_account("burn_q");
+                rq = store.deactivate_account("burn_q", kNoSessionStore);
             });
             go = true;
             workers.join_all();
@@ -396,7 +398,7 @@ TEST_CASE("lifecycle guard: a grant that commits between the counted-set lock an
     hold.lock_counted_grants();
     AccountDeactivationResult got;
     Workers workers([&] { hold.rollback(); });
-    workers.add([&] { got = store.deactivate_account("target"); });
+    workers.add([&] { got = store.deactivate_account("target", kNoSessionStore); });
     REQUIRE(wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1).size() >= 1);
     hold.run("DELETE FROM rbac_store.principal_roles WHERE principal_id = 'old_holder' AND "
              "role_name = 'Administrator'");
@@ -432,7 +434,7 @@ TEST_CASE("lifecycle guard: unassign_role vs deactivate_account of the last two 
             const auto start_unassign = [&] {
                 unassigned = store.unassign_role("user", "gB", "Administrator");
             };
-            const auto start_deactivate = [&] { deactivated = store.deactivate_account("gA"); };
+            const auto start_deactivate = [&] { deactivated = store.deactivate_account("gA", kNoSessionStore); };
             Workers workers([&] { hold.rollback(); });
             if (unassign_queued_first) {
                 workers.add(start_unassign);
@@ -483,7 +485,7 @@ TEST_CASE("lifecycle guard: set_enforcement vs deactivation of the sole grant ho
                 std::unexpected(RbacEnforcementError{});
             AccountDeactivationResult deactivated;
             const auto start_toggle = [&] { toggled = store.set_rbac_enforcement(true, "root"); };
-            const auto start_deactivate = [&] { deactivated = store.deactivate_account("root"); };
+            const auto start_deactivate = [&] { deactivated = store.deactivate_account("root", kNoSessionStore); };
             Workers workers([&] { hold.rollback(); });
             if (toggle_queued_first) {
                 workers.add(start_toggle);
@@ -536,7 +538,7 @@ TEST_CASE("lifecycle guard: a lock wait that expires is reported as a store fail
     Workers workers([&] { hold.rollback(); });
     workers.add([&] {
         const auto t0 = std::chrono::steady_clock::now();
-        dres = store.deactivate_account("to_a");
+        dres = store.deactivate_account("to_a", kNoSessionStore);
         d_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
     });
     workers.add([&] {
@@ -564,7 +566,7 @@ TEST_CASE("lifecycle guard: a lock wait that expires is reported as a store fail
     CHECK(role_column(auth_db.pool(), "to_b") == "admin");
     // The pool still works once the lock is gone.
     hold.rollback();
-    CHECK(store.deactivate_account("to_a").kind == DKind::kDeactivated);
+    CHECK(store.deactivate_account("to_a", kNoSessionStore).kind == DKind::kDeactivated);
 }
 
 TEST_CASE("lifecycle guard: the lifecycle lock timeout is clamped into [1 ms, 60 s], so zero does "
@@ -584,7 +586,7 @@ TEST_CASE("lifecycle guard: the lifecycle lock timeout is clamped into [1 ms, 60
         Workers workers([&] { hold.rollback(); });
         workers.add([&] {
             const auto t0 = std::chrono::steady_clock::now();
-            dres = store.deactivate_account("cl_a");
+            dres = store.deactivate_account("cl_a", kNoSessionStore);
             elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0);
         });
@@ -597,7 +599,7 @@ TEST_CASE("lifecycle guard: the lifecycle lock timeout is clamped into [1 ms, 60
     SECTION("negative: the write still works (an unclamped negative value is a statement error)") {
         RbacStore store{auth_db.pool(), std::chrono::milliseconds(-5)};
         REQUIRE(store.is_open());
-        CHECK(store.deactivate_account("cl_b").kind == DKind::kDeactivated);
+        CHECK(store.deactivate_account("cl_b", kNoSessionStore).kind == DKind::kDeactivated);
         CHECK_FALSE(account_active(auth_db.pool(), "cl_b"));
     }
     SECTION("above 2^31 ms: the write still works (an unclamped value is a statement error)") {
@@ -605,13 +607,13 @@ TEST_CASE("lifecycle guard: the lifecycle lock timeout is clamped into [1 ms, 60
         // ceiling (kMaxLifecycleLockTimeout), so the guarded write is not failed by the setting.
         RbacStore store{auth_db.pool(), std::chrono::milliseconds(3'000'000'000LL)};
         REQUIRE(store.is_open());
-        CHECK(store.deactivate_account("cl_c").kind == DKind::kDeactivated);
+        CHECK(store.deactivate_account("cl_c", kNoSessionStore).kind == DKind::kDeactivated);
         CHECK_FALSE(account_active(auth_db.pool(), "cl_c"));
     }
     SECTION("the maximum representable duration is clamped too") {
         RbacStore store{auth_db.pool(), std::chrono::milliseconds::max()};
         REQUIRE(store.is_open());
-        CHECK(store.deactivate_account("cl_c").kind == DKind::kDeactivated);
+        CHECK(store.deactivate_account("cl_c", kNoSessionStore).kind == DKind::kDeactivated);
     }
 }
 
@@ -624,7 +626,7 @@ TEST_CASE("lifecycle guard: a connection lost mid-transaction rolls back cleanly
     hold.lock_rbac_enabled();
     AccountDeactivationResult got;
     Workers workers([&] { hold.rollback(); });
-    workers.add([&] { got = store.deactivate_account("k1"); });
+    workers.add([&] { got = store.deactivate_account("k1", kNoSessionStore); });
     const auto pids = wait_for_blocked_backends(auth_db.dsn(), hold.pid(), 1);
     REQUIRE(pids.size() >= 1);
     hold.run("SELECT pg_terminate_backend(" + std::to_string(pids.front()) + ")");
@@ -635,7 +637,7 @@ TEST_CASE("lifecycle guard: a connection lost mid-transaction rolls back cleanly
     CHECK(account_active(auth_db.pool(), "k1"));
     hold.rollback();
     // Not wedged: the next call runs, and with two admins present it succeeds.
-    CHECK(store.deactivate_account("k1").kind == DKind::kDeactivated);
+    CHECK(store.deactivate_account("k1", kNoSessionStore).kind == DKind::kDeactivated);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -714,7 +716,7 @@ TEST_CASE("lifecycle guard: a demotion racing a deactivation of the last two col
             LocalRoleChangeResult demoted;
             AccountDeactivationResult deactivated;
             const auto start_demote = [&] { demoted = store.set_local_role("m1", Role::user); };
-            const auto start_deactivate = [&] { deactivated = store.deactivate_account("m2"); };
+            const auto start_deactivate = [&] { deactivated = store.deactivate_account("m2", kNoSessionStore); };
             Workers workers([&] { hold.rollback(); });
             if (demotion_queued_first) {
                 workers.add(start_demote);
@@ -1032,7 +1034,7 @@ TEST_CASE("lifecycle guard: a name is_valid_username rejects is NotFound / not a
                                           "iv_admin;--", "oidc:iss#sub"};
     for (const auto& name : bad) {
         CAPTURE(name.size());
-        CHECK(store.deactivate_account(name).kind == DKind::kNotFound);
+        CHECK(store.deactivate_account(name, kNoSessionStore).kind == DKind::kNotFound);
         CHECK(store.set_local_role(name, Role::user).kind == RKind::kNotFound);
         CHECK(store.set_local_role(name, Role::admin).kind == RKind::kNotFound);
         const auto strand = store.would_strand_last_administrator(name);
@@ -1163,7 +1165,7 @@ TEST_CASE("lifecycle guard: both guarded transactions run under the lock and idl
              "CREATE TRIGGER yuzu_test_bound_probe_trg BEFORE UPDATE ON auth.users FOR EACH ROW "
              "EXECUTE FUNCTION public.yuzu_test_bound_probe_fn()");
 
-    REQUIRE(store.deactivate_account("bound_a").kind == DKind::kDeactivated);
+    REQUIRE(store.deactivate_account("bound_a", kNoSessionStore).kind == DKind::kDeactivated);
     REQUIRE(store.set_local_role("bound_b", Role::admin).kind == RKind::kChanged);
 
     const auto idle = query_col(auth_db.pool(), "SELECT idle FROM public.yuzu_test_bound_probe");
@@ -1190,4 +1192,173 @@ TEST_CASE("lifecycle guard: both guarded transactions run under the lock and idl
         REQUIRE(PQntuples(r.get()) == 1);
         CHECK(std::string(PQgetvalue(r.get(), 0, 0)) != "15s");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// The session write-generation in the deactivation transaction (#7223)
+//
+// `deactivate_account` in `SessionGenerationMode::kBumpSessionGeneration` bumps
+// `session_store.session_meta.write_generation` as the LAST statement of the same transaction, so
+// every replica's validate cache is cleared by its next poll whether or not the caller's later
+// durable session wipe succeeds. The cases below pin: exactly one bump per deactivation and none
+// otherwise (T11), a failed bump aborting the whole deactivation (T12 + T-R6), the generation
+// moving although the wipe failed (T3), and a smoke run of the new lock edge (T13).
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr auto kBumpSessionGeneration = SessionGenerationMode::kBumpSessionGeneration;
+
+// The durable write generation, read raw (the test's own oracle; "0" when the row is absent).
+long long session_write_generation(PgPool& pool) {
+    const auto v = query_col(
+        pool, "SELECT value FROM session_store.session_meta WHERE key = 'write_generation'");
+    return v.empty() ? 0 : std::stoll(v.front());
+}
+
+// One text column summarising the MFA state the soft delete rewrites, plus the recovery codes.
+std::string mfa_state(PgPool& pool, const std::string& name) {
+    const auto v = query_col(
+        pool, ("SELECT concat_ws('|', encode(mfa_totp_secret, 'hex'), "
+               "(mfa_enrolled_at IS NOT NULL)::text, mfa_last_counter::text, "
+               "(mfa_disabled_at IS NOT NULL)::text, "
+               "(SELECT count(*) FROM auth.mfa_recovery_codes WHERE username = '" +
+               name + "')::text) FROM auth.users WHERE username = '" + name + "'")
+                  .c_str());
+    REQUIRE(v.size() == 1);
+    return v.front();
+}
+
+} // namespace
+
+TEST_CASE("deactivate_account: the session generation moves exactly once per deactivation and not "
+          "on not-found or a refusal (T11)",
+          "[pg][auth_db][lifecycle_guard][session_generation]") {
+    LIFECYCLE_FIXTURE(store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    build_world(auth_db, store, /*rbac_on=*/false,
+                {{"t11_admin", Role::admin}, {"t11_user", Role::user}, {"t11_user2", Role::user}});
+
+    const long long g0 = session_write_generation(auth_db.pool());
+
+    CHECK(store.deactivate_account("t11_user", kBumpSessionGeneration).kind == DKind::kDeactivated);
+    CHECK(session_write_generation(auth_db.pool()) == g0 + 1);
+
+    // Already inactive, unknown and not-a-possible-name: nothing was written, nothing bumps.
+    CHECK(store.deactivate_account("t11_user", kBumpSessionGeneration).kind == DKind::kNotFound);
+    CHECK(store.deactivate_account("t11_nobody", kBumpSessionGeneration).kind == DKind::kNotFound);
+    CHECK(store.deactivate_account("not a name", kBumpSessionGeneration).kind == DKind::kNotFound);
+    CHECK(session_write_generation(auth_db.pool()) == g0 + 1);
+
+    // A refusal rolls the whole transaction back: the sole active column admin stays, no bump.
+    CHECK(store.deactivate_account("t11_admin", kBumpSessionGeneration).kind ==
+          DKind::kLastAdministratorRefused);
+    CHECK(account_active(auth_db.pool(), "t11_admin"));
+    CHECK(session_write_generation(auth_db.pool()) == g0 + 1);
+
+    // The no-store mode touches no session_store object, so it never bumps.
+    CHECK(store.deactivate_account("t11_user2", kNoSessionStore).kind == DKind::kDeactivated);
+    CHECK(session_write_generation(auth_db.pool()) == g0 + 1);
+}
+
+TEST_CASE("deactivate_account: a failed generation bump aborts the deactivation and leaves the "
+          "account and its MFA state untouched (T12 + T-R6)",
+          "[pg][auth_db][lifecycle_guard][session_generation]") {
+    LIFECYCLE_FIXTURE(store, auth_db);
+    yuzu::server::SessionStore sessions{auth_db.pool()};
+    REQUIRE(sessions.is_open());
+    build_world(auth_db, store, /*rbac_on=*/false,
+                {{"t12_admin", Role::admin}, {"t12_user", Role::user}});
+    // Give the target a TOTP enrollment and a recovery code: the soft delete clears them, so a
+    // half-applied deactivation would show here.
+    exec_raw(auth_db.pool(),
+             "UPDATE auth.users SET mfa_totp_secret = '\\x0102'::bytea, mfa_enrolled_at = now(), "
+             "mfa_last_counter = 7 WHERE username = 't12_user'");
+    exec_raw(auth_db.pool(),
+             "INSERT INTO auth.mfa_recovery_codes (username, code_hash, code_salt) "
+             "VALUES ('t12_user', 'h', 's')");
+    const std::string before = mfa_state(auth_db.pool(), "t12_user");
+    REQUIRE(before == "0102|true|7|false|1");
+
+    {
+        // The session generation table moved aside: the bump (and only the bump) fails.
+        yuzu::test::SqlFault meta_gone{
+            auth_db.pool(), "ALTER TABLE session_store.session_meta RENAME TO session_meta_gone",
+            "ALTER TABLE session_store.session_meta_gone RENAME TO session_meta"};
+        meta_gone.arm();
+        const auto res = store.deactivate_account("t12_user", kBumpSessionGeneration);
+        CHECK(res.kind == DKind::kStoreFailure);
+        CHECK_FALSE(res.err.empty());
+        meta_gone.repair();
+    }
+    CHECK(account_active(auth_db.pool(), "t12_user"));
+    CHECK(mfa_state(auth_db.pool(), "t12_user") == before);
+
+    // Repaired: the same call now succeeds, so the failure above left nothing behind.
+    CHECK(store.deactivate_account("t12_user", kBumpSessionGeneration).kind ==
+          DKind::kDeactivated);
+    CHECK_FALSE(account_active(auth_db.pool(), "t12_user"));
+}
+
+TEST_CASE("AuthManager lifecycle guard: the session generation moves with the deactivation even "
+          "when the durable session wipe fails (T3)",
+          "[pg][auth_db][lifecycle_guard][session_generation][auth]") {
+    ManagerFx f;
+    seed(f.db, "t3_admin", Role::admin);
+    seed(f.db, "t3_user", Role::user);
+    const auto token = f.mgr.create_local_session_for_test("t3_user", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    const auto g0 = f.sessions.read_generation();
+    REQUIRE(g0.has_value());
+
+    f.break_session_wipe();
+    CHECK(f.mgr.remove_user_checked("t3_user") == RemoveUserOutcome::RemovedSessionWipeFailed);
+    f.repair_session_wipe();
+
+    // The wipe bumps nothing when it fails, so the one increment is the deactivation's own.
+    const auto g1 = f.sessions.read_generation();
+    REQUIRE(g1.has_value());
+    CHECK(*g1 == *g0 + 1);
+    CHECK_FALSE(account_active(f.db.pool(), "t3_user"));
+}
+
+TEST_CASE("AuthManager lifecycle guard: concurrent session creates and deactivations finish "
+          "all complete without a lock timeout (T13, smoke only)",
+          "[pg][auth_db][lifecycle_guard][session_generation][auth]") {
+    // SMOKE ONLY. This shows the session_meta row edge does not stall the pair of workloads; it
+    // proves nothing about publication or the lock graph, and the DDL fault trigger is
+    // deliberately not used here.
+    ManagerFx f;
+    seed(f.db, "t13_admin", Role::admin);
+    constexpr int kUsers = 6;
+    for (int i = 0; i < kUsers; ++i)
+        seed(f.db, "t13_u" + std::to_string(i), Role::user);
+
+    std::atomic<int> removed{0};
+    std::atomic<int> other{0};
+    {
+        Workers workers({});
+        for (int i = 0; i < kUsers; ++i) {
+            workers.add([&, i] {
+                const auto outcome = f.mgr.remove_user_checked("t13_u" + std::to_string(i));
+                (outcome == RemoveUserOutcome::Removed ? removed : other)++;
+            });
+        }
+        for (int t = 0; t < 3; ++t) {
+            workers.add([&, t] {
+                for (int n = 0; n < 12; ++n)
+                    (void)f.mgr.create_local_session_for_test(
+                        "t13_u" + std::to_string((t + n) % kUsers), Role::user, false);
+            });
+        }
+        workers.join_all();
+    }
+
+    // Every removal completing with Removed (none timed out into another outcome) IS the check;
+    // a wall-clock bound here would only make the case flaky on a loaded runner.
+    CHECK(removed.load() == kUsers);
+    CHECK(other.load() == 0);
+    for (int i = 0; i < kUsers; ++i)
+        CHECK_FALSE(account_active(f.db.pool(), "t13_u" + std::to_string(i)));
 }

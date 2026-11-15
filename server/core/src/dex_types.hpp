@@ -316,4 +316,39 @@ struct DexHealthResult {
 DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
                                    const std::string& preset);
 
+/// Why a DEX read returned nothing: the closed set behind a degraded read. The token is the one
+/// vocabulary shared by the store's `yuzu_server_guardian_read_degrade_total{reason}` label, the
+/// model's `degraded_reason` and the REST and MCP error text, so a refused read is told apart the
+/// same way everywhere.
+enum class DexReadFault {
+    kStoreNotOpen,
+    kPoolTimeout,
+    kQueryError,
+    kStatementTimeout,
+    kConcurrencyBudget,
+};
+
+/// The token for `f`: store_not_open, pool_acquire_timeout, query_error, statement_timeout or
+/// concurrency_budget.
+[[nodiscard]] constexpr const char* dex_read_fault_token(DexReadFault f) noexcept {
+    switch (f) {
+    case DexReadFault::kStoreNotOpen:
+        return "store_not_open";
+    case DexReadFault::kPoolTimeout:
+        return "pool_acquire_timeout";
+    case DexReadFault::kQueryError:
+        return "query_error";
+    case DexReadFault::kStatementTimeout:
+        return "statement_timeout";
+    case DexReadFault::kConcurrencyBudget:
+        return "concurrency_budget";
+    }
+    return "query_error";
+}
+
+/// What one device's heartbeat says about the agent's crash and hang observer. `NoneReported`
+/// covers an agent that opted out, one on a build with no observer, a stale snapshot and an
+/// unknown id: none of them sends the tag, and the server cannot tell them apart.
+enum class DexObserverState : std::uint8_t { NoneReported, Armed, Disarmed };
+
 } // namespace yuzu::server

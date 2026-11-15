@@ -381,6 +381,21 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "server state") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
+          "[openapi]") {
+    // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits
+    // additionalProperties:false would tell a generated client the opposite.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& schemas = spec["components"]["schemas"];
+    for (const char* name : {"InstructionsDefinitionCreateRequest", "InstructionSetCreateRequest"}) {
+        INFO(name);
+        REQUIRE(schemas.contains(name));
+        REQUIRE(schemas[name].contains("additionalProperties"));
+        CHECK(schemas[name]["additionalProperties"] == false);
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",
           "[openapi][app_usage]") {
     const auto& spec_json = yuzu::server::openapi_spec_json();
@@ -1928,7 +1943,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"49349789b29c5fda\"";
+    static const std::string kOperationIdChecksum = "\"1a09f63aebc10a4a\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2194,7 +2209,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          kOne,
          false,
          {"agent_id", "guards", "total_guards", "unrepresented_pending_guards",
-          "unrepresented_pending_rule_ids"},
+          "unrepresented_pending_rule_ids", "ordering"},
          true,
          "guards",
          {"rule_id", "name", "state", "updated_at", "order_uncertain", "projection_pending"}},
@@ -2202,7 +2217,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          kOne,
          false,
          {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "uncertain_rules",
-          "note"},
+          "unordered_agents", "unordered_agent_ids", "note"},
          false,
          "",
          {}},
@@ -2382,6 +2397,85 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
             CHECK(route->value("description", "").find("ascending byte order") !=
                   std::string::npos);
         }
+    }
+}
+
+// UP-14 server PR A5a: the stored per-agent ordering state. The key sets are pinned above; this
+// pins each new property's type, nullability and bound, and that the description says the pair is
+// stored and counted, not yet compared.
+TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bounded and described",
+          "[openapi][guardian][ordering][pair]") {
+    for (const bool with_guides : {false, true}) {
+        const json spec = json::parse(document_text(with_guides));
+        INFO("form: " << form_name(with_guides));
+
+        // Fleet rollup.
+        const json& sget = spec["paths"].at("/guaranteed-state/status").at("get");
+        const json sdata = resolve_ref(spec, sget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        const json& sprops = sdata.at("properties");
+        REQUIRE(sprops.contains("unordered_agents"));
+        CHECK(sprops["unordered_agents"].value("type", "") == "integer");
+        CHECK(sprops["unordered_agents"].value("minimum", -1) == 0);
+        REQUIRE(sprops.contains("unordered_agent_ids"));
+        const json& ids = sprops["unordered_agent_ids"];
+        CHECK(ids.value("type", "") == "array");
+        // The served literal is bound to the store's cap: a change to one without the other fails here.
+        CHECK(ids.value("maxItems", std::size_t{0}) == yuzu::server::kUnorderedAgentIdCap);
+        CHECK(ids.value("uniqueItems", false));
+        REQUIRE(ids.contains("items"));
+        CHECK(ids["items"].value("type", "") == "string");
+        const std::string sdesc = sget.value("description", "");
+        CHECK(sdesc.find("unordered_agents") != std::string::npos);
+        CHECK(sdesc.find("not yet compared") != std::string::npos);
+
+        // Per-device all-guards read.
+        const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
+        const json gdata = resolve_ref(spec, gget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        REQUIRE(gdata["properties"].contains("ordering"));
+        const json ord = resolve_ref(spec, gdata["properties"]["ordering"]);
+        CHECK(ord.value("nullable", false)); // null when the agent has no order row
+        CHECK(ord.value("type", "") == "object");
+        REQUIRE(ord.contains("properties"));
+        const std::set<std::string> expect{"epoch",          "emit_seq_hwm",    "epoch_recv_ns",
+                                           "retired_epoch",  "unpaired_recv_ns", "currently_unordered",
+                                           "unpaired_events", "unpaired_held",   "pair_regressions",
+                                           "pair_stragglers", "pair_recoveries", "pair_duplicates",
+                                           "retired_events"};
+        CHECK(key_set(ord["properties"]) == expect);
+        REQUIRE(ord.contains("required"));
+        CHECK(std::set<std::string>(ord["required"].begin(), ord["required"].end()) == expect);
+        const json& p = ord["properties"];
+        CHECK(p["currently_unordered"].value("type", "") == "boolean");
+        for (const char* k : {"epoch", "emit_seq_hwm", "epoch_recv_ns", "retired_epoch",
+                              "unpaired_recv_ns"}) {
+            INFO("nullable column: " << k);
+            CHECK(p[k].value("type", "") == "integer");
+            CHECK(p[k].value("nullable", false));
+        }
+        for (const char* k : {"unpaired_events", "unpaired_held", "pair_regressions",
+                              "pair_stragglers", "pair_recoveries", "pair_duplicates",
+                              "retired_events"}) {
+            INFO("counter: " << k);
+            CHECK(p[k].value("type", "") == "integer");
+            CHECK(p[k].value("minimum", -1) == 0);
+            CHECK_FALSE(p[k].value("nullable", false));
+        }
+        const std::string gdesc = gget.value("description", "");
+        CHECK(gdesc.find("ordering") != std::string::npos);
+        CHECK(gdesc.find("not yet compared") != std::string::npos);
+        CHECK(p["pair_duplicates"].value("description", "").find("0 until") != std::string::npos);
+        const std::string g200 = gget.at("responses").at("200").value("description", "");
+        CHECK(g200.find("ordering") != std::string::npos);
     }
 }
 
