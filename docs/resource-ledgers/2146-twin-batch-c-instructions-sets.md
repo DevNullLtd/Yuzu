@@ -195,10 +195,13 @@ throttle, and some value containers. The test-side resources are listed last.
   by `dump(-1, ' ', false, error_handler_t::replace)`.
 - **Release point:** scope exit; the dumped string is a temporary bound to the store's `const
   std::string&` parameter and lives to the end of that call.
-- **Transfer:** never; a body that is not depth-safe JSON, not parseable or not an object is
-  returned unchanged.
+- **Transfer:** never; a body that is not depth-safe or breadth-safe JSON (the value budget), not
+  parseable or not an object is returned unchanged, which is a copy (one more body-sized string is
+  live while the store runs).
 - **Failure cleanup:** parsing uses `allow_exceptions=false` and `json_exceeds_depth` runs first;
-  only a `std::bad_alloc` can throw, bounded by the existing 16 MiB request cap.
+  only a `std::bad_alloc` can throw. The 16 MiB request cap bounds the input, not the parse tree
+  (a body of `[],[],...` built a 258 to 429 MiB tree); the 100000-value budget (`json_exceeds_value_budget`,
+  checked before the parse here, in the store import and in the v1 body parse) bounds the tree.
 
 ### Ownership changes with no resource
 - `Ports::audit` (`mcp_instruction_authoring.hpp`) is a `std::function` that is now left UNSET when
