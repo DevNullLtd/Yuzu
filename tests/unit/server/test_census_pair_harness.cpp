@@ -24,8 +24,9 @@
  * same numbers. The port is held faithful by the case "census pair harness: the C++ port agrees
  * with the Python model": it needs no database, and compares an FNV-1a digest of the first 64
  * seeds' schedules and model traces with digests produced by the Python model (the table
- * `kPythonDigests`, 7-bit ASCII text of the canonical forms below). A model change is a change to
- * the table: regenerate it with the Python model, never edit a digest by hand.
+ * `kPythonDigests`, from the canonical forms `schedule_text` and `snap_text` below, produced by
+ * harness_digests.py beside the Python model). A model change is a change to the table:
+ * regenerate it with the Python model, never edit a digest by hand.
  *
  * SEEDS AND REPLAY. A seed is the Python seed, so seed 17 here is `random.Random(17)` there.
  *   YUZU_TEST_PAIR_HARNESS_SEEDS=N  runs seeds 0..N-1 (default 64; the plan's campaigns use
