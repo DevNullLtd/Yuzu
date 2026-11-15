@@ -230,7 +230,7 @@ constexpr std::size_t kVerifyLaneCap = 4;
 /// exhaustion (handle or memory pressure), so after this many such results a watch whose
 /// handle may still be working is cancelled and dropped and re-established on the ordinary
 /// retry (30 s, doubling to a 300 s cap on repeated failure); excluding resource errors
-/// from the streak is a follow-up.
+/// from the streak is FOLLOW-UP-ISSUE-TBD(verify-streak-resource-errors).
 constexpr unsigned kVerifyUnverifiableFaultStreak = 3;
 /// How long a lost path may wait for its cancelled read's completion before the
 /// wait is counted and warned once (an observation, not an escalation: the sweep
@@ -1820,7 +1820,7 @@ private:
         enum class Verdict { Same, Lost, Unverifiable } v = Verdict::Unverifiable;
         // What the warn below reports for an undecided result; the worker-threw path has
         // no result to read (`stage` is a string literal either way).
-        const char* undecided_stage = "verification worker threw or its result was lost";
+        const char* undecided_stage = "verification worker failure or lost result";
         DWORD undecided_err = 0;
         if (r->has_value()) {
             const FileProbeResult& res = **r;
@@ -3587,6 +3587,12 @@ private:
                         if (!w.io_pending) {
                             w.handle.reset();
                             defer_admission_locked(w, DetachedLaunch::LaunchFailed);
+                            // Same guard as the failed-completion arm above: a lost path's
+                            // retry wait is not a slow establishment, so mark the grace
+                            // spent (else the next sweep counts slow_op_total and overwrites
+                            // fault_reason). Scalar write, noexcept-safe.
+                            if (w.path_lost)
+                                w.grace_counted = true;
                         }
                     }
                 }
