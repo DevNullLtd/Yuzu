@@ -83,14 +83,18 @@ runs it before the live run, and a selftest failure fails the gate. Add a case w
    `app_shell.cpp` means editing that list in the same change.
 2. Overflow: submit controls on the plugin upload form, the add-user dialog and the new-token
    dialog stay inside their form or dialog and the viewport at 1400x900 and 1024x768.
-3. Scenarios, six in all. Five force their own precondition (writes are answered by a request
+3. Scenarios, seven in all. Five force their own precondition (writes are answered by a request
    stub, so none reaches the server): upload rollout percentage and a failing upload, add user,
    the Ctrl+K guard on a focused field, the PKI audit-failed banner and load-error text, and the
-   Engine Principals audit-failed notice. The remaining one is the DEX Apps tab: a live half (the
+   Engine Principals audit-failed notice. The sixth is the DEX Apps tab: a live half (the
    tab opens and a platform chip is pressed from the keyboard) and a golden half (the committed
    `apps__versions.html` is served through a GET stub, so the version expander, the score
    decomposition and a long application name are exercised on every run whatever the stack
-   holds).
+   holds). The seventh is the Find software panel on `/software`: a live half (an Applications
+   search, Copy REST call against a clipboard stub, and the Java chip and back, each answering with
+   a result or a real zero, never the "Inventory store unavailable" banner) and a stub half (a first
+   page and its continuation are served through GET stubs, so Load more and where focus lands are
+   exercised on every run whatever the stack holds).
 
 It does not check: WebGL scenes (the Fleet and Host maps), non-administrator roles, a write that
 really reaches the server, or any route the shell does not link to. The nav list it compares

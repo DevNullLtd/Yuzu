@@ -942,6 +942,8 @@ TEST_CASE("software page: title rows and drill controls are keyboard-operable", 
     REQUIRE(has(sc, "e.target.closest('button')"));
     REQUIRE(has(sc, "e.preventDefault(); el.click();"));  // Space must not scroll the page
     REQUIRE(has(sc, "window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el }"));
+    // The Find panel's Load more rides the same focus path as the devices table's.
+    REQUIRE(has(sc, "act === 'dmore' || act === 'fmore'"));
     REQUIRE(has(sc, "addEventListener('htmx:afterRequest'"));
     REQUIRE(has(sc, "rc.elt !== mo.btn"));
     // Failed Load more: focus goes back to the re-enabled button.
@@ -1292,6 +1294,48 @@ TEST_CASE("find software: Last confirmed and Last synced are separate cells in c
     const std::string n = render_software_find(find_data({r}));
     REQUIRE(has(n, "<span class=\"pill ok\">current</span></td><td><span class=\"inv-grey\">\xE2\x80\x94</span></td>"
                    "<td><span class=\"inv-grey\">5h ago</span></td></tr>"));
+}
+
+TEST_CASE("find software: absent values render as a dash, the OS falls back to the ecosystem, and "
+          "disabled and unrecognised statuses are told apart",
+          "[inventory][ui][find]") {
+    const std::string dash = "<span class=\"inv-grey\">\xE2\x80\x94</span>";
+    const std::string disabled =
+        "<span class=\"pill idle\" title=\"this source is switched off on the device\">disabled</span>";
+    const std::string unconfirmed = "<span class=\"pill warn\" title=\"the last report did not "
+                                    "confirm this install\">unconfirmed</span>";
+    // The cells after the host link of the page's one data row, up to its closing tag (the
+    // version-group header is a different <tr>).
+    const auto cells = [](const SoftwareFindRow& r) {
+        const std::string h = render_software_find(find_data({r}));
+        const auto b = h.find("</a></td>", h.find("<tr><td>")) + std::string_view("</a></td>").size();
+        return h.substr(b, h.find("</tr>", b) - b);
+    };
+    SoftwareFindRow bare;
+    bare.agent_id = "a1";
+    bare.hostname = "host-0188";
+    bare.status = "disabled";
+    // Nothing known but the host and its status: every other cell is a dash, in column order
+    // (OS, version, location, install type, status, last confirmed, last synced).
+    REQUIRE(cells(bare) == "<td>" + dash + "</td><td class=\"inv-mono\">" + dash + "</td><td>" + dash +
+                               "</td><td class=\"inv-mono\">" + dash + "</td><td>" + disabled +
+                               "</td><td>" + dash + "</td><td>" + dash + "</td>");
+
+    // No status, or one the model does not name, is the fail-safe "unconfirmed".
+    bare.status = "";
+    REQUIRE(has(cells(bare), "<td>" + unconfirmed + "</td>"));
+    bare.status = "stale";
+    REQUIRE(has(cells(bare), "<td>" + unconfirmed + "</td>"));
+
+    // The roster's OS names the family; without one the ecosystem's family stands in; an
+    // ecosystem with no OS family (python) and no roster OS has nothing to show.
+    bare.ecosystem = "brew";
+    REQUIRE(cells(bare).starts_with("<td><span class=\"inv-pill mac\">macOS</span></td>"));
+    bare.ecosystem = "python";
+    REQUIRE(cells(bare).starts_with("<td>" + dash + "</td>"));
+    // An OS string that names no known family is shown as the roster wrote it.
+    bare.os = "FreeBSD";
+    REQUIRE(cells(bare).starts_with("<td><span class=\"inv-pill\">FreeBSD</span></td>"));
 }
 
 TEST_CASE("find software: an empty page is told apart by its cursor, so a Load button is only ever "

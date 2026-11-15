@@ -810,8 +810,8 @@ std::string find_panel(bool confined) {
          "role=\"group\" aria-label=\"Kind\">";
     for (const auto& k : kSoftwareFindKinds) {
         h += "<button type=\"button\" class=\"inv-chip\" data-fs-kind=\"" + std::string(k.token) +
-             "\" aria-pressed=\"" + (k.token == "app" ? "true" : "false") + "\">" + std::string(k.label) +
-             "</button>";
+             "\" aria-pressed=\"" + (k.token == kSoftwareFindApp ? "true" : "false") + "\">" +
+             std::string(k.label) + "</button>";
     }
     h += "</div><span class=\"fs-hint\">Java, Python and Node search components found inside "
          "applications</span></div></div></form></div>";
@@ -852,8 +852,10 @@ std::string find_os_cell(const SoftwareFindRow& r) {
         fam = "linux";
     else if (!r.ecosystem.empty())
         fam = eco_family(r.ecosystem);
-    if (!fam.empty())
-        return std::string("<span class=\"inv-pill ") + family_cls(fam) + "\">" + family_name(fam) +
+    // An ecosystem with no OS family ("other": python, middleware) names no OS, so it falls
+    // through to the roster's raw string, else the dash, never an empty pill.
+    if (const std::string_view name = family_name(fam); !name.empty())
+        return std::string("<span class=\"inv-pill ") + family_cls(fam) + "\">" + std::string(name) +
                "</span>";
     if (!r.os.empty())
         return "<span class=\"inv-pill\">" + esc(r.os) + "</span>";
@@ -921,8 +923,9 @@ std::string find_row_html(const SoftwareFindRow& r, bool comp, std::int64_t now)
 // The table body for one page: version groups (newest first, the catalogue's own comparator)
 // within the page, the rows of a group in the order the read returned them, then the Load-more
 // row. The keyset order is name -> device, so a group repeats on a later page. The comparator is a
-// preorder (1.0 and 1.0.0 tie), so a tie breaks on the raw string, the greater first (the
-// catalogue's own tie rule): equal strings stay contiguous and share one group header.
+// preorder (1.0 and 1.0.0 tie), so newer_than() (the catalogue's total order) breaks the tie. Find
+// has no installs figure, so it passes 0 for both and the tie falls through to the raw string, the
+// greater first: equal strings stay contiguous and share one group header.
 std::string find_body(const SoftwareFindData& d) {
     const bool comp = find_is_components(d.f);
     const auto& rows = *d.rows;
@@ -931,8 +934,7 @@ std::string find_body(const SoftwareFindData& d) {
     for (const auto& r : rows)
         order.push_back(&r);
     std::ranges::stable_sort(order, [](const SoftwareFindRow* a, const SoftwareFindRow* b) {
-        const int c = software_catalog::catalog_version_compare(a->version, b->version);
-        return c != 0 ? c > 0 : a->version > b->version;
+        return software_catalog::newer_than(a->version, 0, b->version, 0);
     });
     std::string body;
     const char* noun = comp ? " components" : " installs";

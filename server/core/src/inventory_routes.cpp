@@ -483,16 +483,18 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session)
             return;
         // `kind` is the chip: "app" or a component kind. An absent or blank one is "app".
-        std::string kind = req.has_param("kind") ? req.get_param_value("kind") : "app";
+        std::string kind = req.has_param("kind") ? req.get_param_value("kind")
+                                                 : std::string(kSoftwareFindApp);
         if (kind.empty())
-            kind = "app";
+            kind = kSoftwareFindApp;
         const bool kind_known = std::ranges::any_of(
             kSoftwareFindKinds, [&](const SoftwareFindKind& k) { return k.token == kind; });
         // The audit verb is the model's, as on the REST twins (the denied row included): a
         // component search writes `inventory.components.view`, anything else (an application
         // search, an unknown kind refused below) `inventory.software.query`.
-        const char* const kVerb = kind_known && kind != "app" ? "inventory.components.view"
-                                                              : "inventory.software.query";
+        const char* const kVerb = kind_known && kind != kSoftwareFindApp
+                                      ? "inventory.components.view"
+                                      : "inventory.software.query";
         if (deny_service_scoped(*session, req, res, deps_.audit_fn, kVerb))
             return;
         auto gate = admit(deps_.fleet_read_fn, req, res);

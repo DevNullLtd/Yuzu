@@ -111,22 +111,23 @@ struct SoftwareFindKind {
     std::string_view token;
     std::string_view label;
 };
-inline constexpr std::array<SoftwareFindKind, 4> kSoftwareFindKinds{{{"app", "Applications"},
-                                                                     {"java", "Java"},
-                                                                     {"python", "Python"},
-                                                                     {"node", "Node"}}};
+/// The kind token for an application search (the first chip). Every other token is a component
+/// kind that reads the components model.
+inline constexpr std::string_view kSoftwareFindApp{"app"};
+inline constexpr std::array<SoftwareFindKind, 4> kSoftwareFindKinds{
+    {{kSoftwareFindApp, "Applications"}, {"java", "Java"}, {"python", "Python"}, {"node", "Node"}}};
 
 /// The panel's inputs as the route parsed them. `kind` is "app" (Applications) or a component
 /// kind: "java" | "python" | "node" (kSoftwareFindKinds).
 struct SoftwareFindFilters {
-    std::string name, kind{"app"}, version, version_min, version_max;
+    std::string name, kind{kSoftwareFindApp}, version, version_min, version_max;
     std::string status;  ///< "" | "unconfirmed" (the "show only these" link)
     std::string cursor;  ///< non-empty = a Load-more page: the rows only
 };
 
 /// True when the filters select a component kind (the components model), not applications.
 [[nodiscard]] inline bool find_is_components(const SoftwareFindFilters& f) {
-    return f.kind != "app";
+    return f.kind != kSoftwareFindApp;
 }
 
 /// One table row, resolved by the route (hostname, last poll) so the renderer reads nothing.
