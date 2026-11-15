@@ -293,7 +293,16 @@ change: a notification POST now answers `202` instead of `204`).
   Progress is **best-effort**: even after supplying a token you MUST still be prepared
   to poll (`query_responses` / `get_execution_status`) - a reservation can silently
   degrade to the plain path under load (e.g. the 256-record cap), and zero progress
-  frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
+  frames is indistinguishable from "nothing has happened yet". Progress and terminal
+  counts follow the caller's `Execution:Read` scope, the same projection
+  `GET /api/v1/events` applies (#7817): a caller whose `Execution:Read` is limited to a
+  management group, while it may hold a global `Execution:Execute`, receives **no**
+  progress frames, and its final result carries the real `status` but neither
+  `agents_success` nor `agents_failure`; poll `get_execution_status` for the counts it
+  may see. If that scope cannot be resolved for the request, the bridge uses this
+  restricted view, and a caller that lacks `Execution:Read` also writes one
+  `auth.fleet_read_required` denial row per such call (the dispatch still succeeds); a
+  caller with an unrestricted `Execution:Read` scope is unaffected. `execute_bundle` does
   **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
   ways, and the client chooses per request **on a server that has enabled streamed
   POST** (`--mcp-enable-streamed-post`, on by default): send an SSE-capable `Accept` alongside
@@ -302,15 +311,6 @@ change: a notification POST now answers `202` instead of `204`).
   session's `GET` stream after the POST has already answered. See
   `docs/mcp-server.md` "Streamed POST — SSE on the response" for the response
   shape, the close reasons, and the recovery rules.
-  **Scope-confined dispatchers (#7817).** Progress and terminal counts follow the
-  caller's `Execution:Read` scope, the same projection `GET /api/v1/events` applies.
-  A caller whose `Execution:Read` is limited to a management group (while it may
-  hold a global `Execution:Execute`) receives **no** `notifications/progress` frames,
-  and its final result carries the real `status` but no `agents_success`,
-  `agents_failure` or `agents_responded` keys; poll `get_execution_status` for the
-  counts it is allowed to see. If that scope cannot be resolved for the request, the
-  bridge uses this restricted view. A caller with an unrestricted `Execution:Read`
-  scope is unaffected.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
