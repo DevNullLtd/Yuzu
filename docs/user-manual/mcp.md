@@ -296,12 +296,13 @@ change: a notification POST now answers `202` instead of `204`).
   frames is indistinguishable from "nothing has happened yet". Progress and terminal
   counts follow the caller's `Execution:Read` scope, the same projection
   `GET /api/v1/events` applies (#7817): a caller whose `Execution:Read` is limited to a
-  management group, while it may hold a global `Execution:Execute`, receives **no**
-  progress frames, and its final result carries the real `status` but neither
+  management group, or absent (while it may hold a global `Execution:Execute`), receives
+  **no** progress frames, and its final result carries the real `status` but neither
   `agents_success` nor `agents_failure`; poll `get_execution_status` for the counts it
   may see. If that scope cannot be resolved for the request, the bridge uses this
   restricted view, and a caller that lacks `Execution:Read` also writes one
-  `auth.fleet_read_required` denial row per such call (the dispatch still succeeds); a
+  `auth.fleet_read_required` denial row per such call, streamed or not (the dispatch still
+  succeeds); a
   caller with an unrestricted `Execution:Read` scope is unaffected. `execute_bundle` does
   **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
   ways, and the client chooses per request **on a server that has enabled streamed

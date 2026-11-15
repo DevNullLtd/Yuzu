@@ -2478,7 +2478,8 @@ void McpStreamBridge::sweep() {
                                 // defer below.
                                 std::string term_data = ev->data;
                                 if (oldest->fleet_read_scope.has_value()) {
-                                    const auto parsed = nlohmann::json::parse(ev->data, nullptr, false);
+                                    const auto parsed =
+                                        nlohmann::json::parse(ev->data, nullptr, false);
                                     const bool has_status = parsed.is_object() &&
                                                             parsed.contains("status") &&
                                                             parsed["status"].is_string();

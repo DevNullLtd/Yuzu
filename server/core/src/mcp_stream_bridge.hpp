@@ -551,7 +551,9 @@ public:
     ///
     /// `fleet_read_scope` is the dispatching session's fleet-read scope (see the
     /// confined-projection rule in the banner): nullopt = unrestricted, an engaged
-    /// set = confined. Defaulted only so the existing bridge unit-test call sites stay
+    /// set (empty or not) = confined. Only that fact is kept: the record stores
+    /// `deny_all()` for any engaged value and never the agent ids (see the store in
+    /// the .cpp, pinned by CHECK 9). Defaulted only so the existing bridge unit-test call sites stay
     /// unchanged; the production caller (execute_instruction) always passes it, and
     /// the tripwire's CHECK 9 pins that. A caller that cannot resolve the scope MUST
     /// pass `authz::deny_all()`, never nullopt.

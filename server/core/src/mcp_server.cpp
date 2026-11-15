@@ -2794,9 +2794,9 @@ static const ToolDef kTools[] = {
      "query_responses by execution_id, or list_executions if you never learned one). NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
-     "SCOPE: a caller whose Execution:Read is limited to a management group receives no "
-     "progress notifications and a final result without agents_success/agents_failure; poll "
-     "get_execution_status for the counts it may see. "
+     "SCOPE: a caller whose Execution:Read is limited to a management group (or absent, or "
+     "unresolvable) receives no progress notifications and a final result without "
+     "agents_success/agents_failure; poll get_execution_status for the counts it may see. "
      "FALLBACK when not streaming: poll query_responses with the "
      "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
      "and retry a few times (or call get_execution_status to confirm a terminal state), or "
@@ -22642,8 +22642,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // parked final's build_real_final() parse-merges result_base and
                 // only ADDS top-level status keys, plus agents_success/agents_failure
                 // when the terminal payload carries them (it does not for a
-                // scope-confined dispatcher) (mcp_stream_bridge.cpp), so structuredContent survives into every
-                // final shape unchanged. This is a deliberate, pinned decision, not
+                // scope-confined dispatcher) (mcp_stream_bridge.cpp), so
+                // structuredContent survives into every final shape unchanged.
+                // This is a deliberate, pinned decision, not
                 // an accident of construction order - see the bridge byte-pin test
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
