@@ -97,12 +97,15 @@ It prints, in this order:
   says how many are already released and how many are breaking. An entry a
   release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
   when its first line sits under one `## [X.Y.Z]` heading at `HEAD`, and
-  `[released]` when the version cannot be told (usually the release editorial
-  pass reworded the line; also a line under two versions or before any
-  `## [X]` heading, or `CHANGELOG.md` gone). No marker means no release in the range moved the entry, the usual
-  case for a pull of `dev`. Headings are read as `scripts/assemble-changelog.py`
-  reads them, so a sample heading inside a code fence counts as one. The marker
-  is a reading aid, not release evidence. Each shows its first line, cut at
+  `[released]` when the version cannot be told: the release editorial pass
+  reworded the line (the usual cause), the line is under two versions, under
+  a column-0 `#` or `##` heading that is not `## [X]`, or before any heading,
+  or `CHANGELOG.md` is gone. A line only under `[Unreleased]` has no marker,
+  and neither has an entry no release in the range moved (the usual case for
+  a pull of `dev`). A heading is a column-0 `## [X]` line, as
+  `scripts/assemble-changelog.py` reads it, so a sample heading inside a code
+  fence counts as one. The marker is a reading aid, not release evidence.
+  Each shows its first line, cut at
   200 characters (a marker follows the cut). Security, removed and deprecated entries, and entries starting
   `**Breaking` (in any case), are shown whole, continuation lines included;
   other entries show their continuation lines only with `--full`. A fragment

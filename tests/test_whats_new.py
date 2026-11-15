@@ -2281,6 +2281,11 @@ class MarkerAmbiguity(GitCase):
         sections = WN.release_sections("## [Unreleased]\n- a\n\n## Notes\n- a\n")
         self.assertEqual(sections["- a"], "")
 
+    def test_a_sample_heading_in_a_code_fence_counts_as_a_heading(self):
+        """Documented and out of contract: headings are read like assemble-changelog.py reads them."""
+        sections = WN.release_sections("## [2.0]\n```\n## [9.9]\n```\n- real\n")
+        self.assertEqual(sections["- real"], "9.9")
+
     def test_a_sub_heading_does_not_end_the_section(self):
         repo, old = self.base()
         log = "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n### Added\n\n- **Shipped thing.**\n"
