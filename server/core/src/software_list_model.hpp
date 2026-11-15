@@ -8,7 +8,8 @@
 /// twin later without a second copy of any rule.
 ///
 /// Rules this file owns (each stated once, here):
-///  * VERSION RANGE: `version_min`/`version_max` are inclusive bounds under the catalogue's
+///  * VERSION RANGE: `version_min`/`version_max` (inclusive bounds) and `vers` (a `vers:` range,
+///    vers_range.hpp) are ONE range, evaluated by the one evaluator under the catalogue's
 ///    transitive comparator (`software_catalog::catalog_version_compare`), resolved LIVE against
 ///    the title's distinct versions WITHIN THE CALLER'S SCOPE (the gate's VisibleSet pushed into
 ///    the read; a global caller reads the fleet) into an exact version SET that becomes a SQL
@@ -26,6 +27,7 @@
 ///  * STATUS: one derivation (`derive_status`) pinned to the SQL's kRowStatusCaseSql.
 
 #include "software_catalogue_model.hpp"
+#include "vers_range.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -46,13 +48,13 @@ using Params = software_catalogue::Params;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// kInstallsCsvHeader (14 columns) + the eight lookup columns.
+/// kInstallsCsvHeader (14 columns) + the eight lookup columns + purl.
 inline constexpr std::string_view kListCsvHeader =
     "agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,"
     "signature_status,distro_id,distro_version,source,"
     "hostname,last_seen,status,last_confirmed_at,install_type,install_scope,install_location,"
-    "instance_key";
-inline constexpr std::size_t kListCsvColumns = 22;
+    "instance_key,purl";
+inline constexpr std::size_t kListCsvColumns = 23;
 static_assert(static_cast<std::size_t>(std::ranges::count(kListCsvHeader, ',')) + 1 ==
                   kListCsvColumns,
               "kListCsvColumns must equal the number of columns in kListCsvHeader");
@@ -84,47 +86,55 @@ inline constexpr std::string_view kOmittedBuilding = "building";
 
 // ── Parameters ───────────────────────────────────────────────────────────────
 
-struct ListRequest {
-    software_catalogue::DevicesRequest base; ///< query.match / query.status filled by the parser
+/// The version-range part of a lookup request, carried by both routes' requests (and the parser's
+/// intermediate) as one base so the four fields are declared, moved and tested once.
+struct VersionFilter {
     std::string version_min;
     std::string version_max;
-    [[nodiscard]] bool has_range() const { return !version_min.empty() || !version_max.empty(); }
+    std::string vers; ///< the raw `vers` text (fingerprint and audit); the parsed form is `range`
+    /// The one range the request asks for: parsed `vers`, or `version_min`/`version_max` as a
+    /// generic Range. nullopt = no version-range filter.
+    std::optional<::yuzu::server::vers::Range> range;
+    [[nodiscard]] bool has_range() const { return range.has_value(); }
+};
+
+struct ListRequest : VersionFilter {
+    /// query.match, query.status and query.purl are filled by the parser.
+    software_catalogue::DevicesRequest base;
 };
 
 /// parse_devices_params + `match` (exact|prefix|contains), `status` (current|unconfirmed|
-/// disabled), `version_min`, `version_max`. `version_min` and `version_max` REQUIRE a non-empty
-/// `name` with match=exact; a bare exact `version` is a plain equality predicate and needs no name;
-/// a non-exact `match` requires `name`; `version` cannot be combined with a range. The error is the
-/// 400 message.
+/// disabled), `version_min`, `version_max`, `vers`, `purl`. `version_min`, `version_max` and `vers`
+/// REQUIRE a non-empty `name` with match=exact; a bare exact `version` is a plain equality
+/// predicate and needs no name; a non-exact `match` requires `name`; `version` cannot be combined
+/// with a range, and `vers` cannot be combined with `version_min`/`version_max`. `purl` must start
+/// `pkg:` and is matched by byte equality with the stored canonical purl. The error is the 400
+/// message.
 [[nodiscard]] std::expected<ListRequest, std::string> parse_list_params(const Params& p);
 
-struct ComponentsRequest {
+struct ComponentsRequest : VersionFilter {
     SoftwareComponentQuery query;
     std::string cursor;
     std::string format; ///< "" | "json" | "csv"; non-empty = an export (the TOTAL-rows cap applies)
-    std::string version_min;
-    std::string version_max;
-    [[nodiscard]] bool has_range() const { return !version_min.empty() || !version_max.empty(); }
     /// `version=` (exact) is kept apart so the range/exact exclusion and the fingerprint can
     /// tell it from a resolved range; the parser mirrors it into query.versions.
     std::optional<std::string> version;
 };
 
-/// Keys: kind, name, match, version, version_min, version_max, agent_id, q, status, limit, cursor,
-/// format. Same hygiene, range-requires-exact-name rule (a bare `version` needs no name), limits
+/// Keys: kind, name, match, version, version_min, version_max, vers, agent_id, q, status, limit,
+/// cursor, format. Same hygiene, range-requires-exact-name rule (a bare `version` needs no name), limits
 /// and export cap as the installs parser. A repeated key keeps the FIRST value.
 [[nodiscard]] std::expected<ComponentsRequest, std::string> parse_components_params(const Params& p);
 
 // ── Version range ────────────────────────────────────────────────────────────
 
-/// The members of `distinct_versions` within [min, max] (an empty bound is open) under
-/// catalog_version_compare; the empty version never matches a bound. `distinct_versions` is a
+/// The members of `distinct_versions` inside `range` (vers::contains under
+/// catalog_version_compare); the empty version never matches. `distinct_versions` is a
 /// live read over the caller's scope (see scope_ids) bounded at kCatalogRowCap: a read that
 /// returned that many rows may be cut, so it is refused with kRangeNotResolvable rather than
 /// resolved against a partial set.
 [[nodiscard]] std::expected<std::vector<std::string>, std::string>
-resolve_version_range(const std::vector<std::string>& distinct_versions, std::string_view version_min,
-                      std::string_view version_max);
+resolve_version_range(const std::vector<std::string>& distinct_versions, const vers::Range& range);
 
 /// The gate's scope as the store's `agent_ids` push-down for the distinct-version reads: nullopt
 /// stays nullopt; an engaged set, empty included, is passed whole (no post-filter alternative).
@@ -132,7 +142,7 @@ resolve_version_range(const std::vector<std::string>& distinct_versions, std::st
 
 // ── Fingerprints, audit targets, cursors ─────────────────────────────────────
 
-/// Bound to the request's filters including the RANGE INPUTS (not the resolved set, which is a live
+/// Bound to the request's filters including the RANGE INPUTS and the purl (not the resolved set, which is a live
 /// distinct-version read that changes as devices report). A default-filter request keeps
 /// devices_fingerprint's exact value.
 [[nodiscard]] std::string list_fingerprint(const ListRequest& rq);
@@ -253,7 +263,7 @@ struct TotalsOutcome {
 
 // ── JSON / CSV ───────────────────────────────────────────────────────────────
 
-/// device_row_json fields (unchanged) + hostname (null when the roster does not know the
+/// device_row_json fields (unchanged) + purl (null when empty) + hostname (null when the roster does not know the
 /// device), last_seen (null when never synced), status, last_confirmed_at (null when 0),
 /// install_type, install_scope, install_location, instance_key.
 [[nodiscard]] nlohmann::json list_row_json(const SoftwareFleetRow& r, const DeviceFacts& facts);

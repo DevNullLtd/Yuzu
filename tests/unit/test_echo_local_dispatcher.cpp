@@ -1071,9 +1071,8 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     // the host would not take.
 #ifdef __APPLE__
     if (::geteuid() == 0) {
-        WARN("running as root on macOS: nstat is the primary tcp source and the poll leg under "
-             "test is bypassed -- skipping");
-        return;
+        SKIP("running as root on macOS: nstat is the primary tcp source and the poll leg under "
+             "test is bypassed");
     }
 #endif
     const auto plugin_path = find_echo_plugin();
@@ -1121,8 +1120,7 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     if (expected.empty()) {
         // A sandbox or container that denies process listing: the poll could not have named
         // this process either, so the case has nothing to check. Same idiom as the root skip.
-        WARN("process enumeration cannot name this process -- skipping (restricted environment)");
-        return;
+        SKIP("process enumeration cannot name this process (restricted environment)");
     }
 
     // The client end of a pair: the row whose remote port is the listener's. The listening socket
@@ -1178,9 +1176,8 @@ TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on 
     // primary tcp source and bypasses the poll leg under test, so the case is skipped there.
 #ifdef __APPLE__
     if (::geteuid() == 0) {
-        WARN("running as root on macOS: nstat is the primary tcp source and the poll leg under "
-             "test is bypassed -- skipping");
-        return;
+        SKIP("running as root on macOS: nstat is the primary tcp source and the poll leg under "
+             "test is bypassed");
     }
 #endif
     const auto plugin_path = find_echo_plugin();
@@ -1215,8 +1212,7 @@ TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on 
         if (p.pid == current_pid())
             lists_own_process = true;
     if (!lists_own_process) {
-        WARN("process enumeration cannot see this process -- skipping (restricted environment)");
-        return;
+        SKIP("process enumeration cannot see this process (restricted environment)");
     }
 
     // The accepted end becomes CLOSE_WAIT once the client closes and its FIN has arrived; that
