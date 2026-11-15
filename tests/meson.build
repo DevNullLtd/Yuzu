@@ -1707,6 +1707,7 @@ if build_server
       'unit/server/test_session_store.cpp',
       'unit/server/test_session_dbclock.cpp',
       'unit/server/test_auth_session_store.cpp',
+      'unit/server/test_session_account_active.cpp',
       'unit/server/test_clock_drift_monitor.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
@@ -2068,6 +2069,10 @@ if build_server
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_normalization_pack.cpp',
+      # SAM-23 lifecycle: pure evaluator + rule-file parser + embedded seed (no store, no [pg])
+      'unit/server/test_software_lifecycle_rules.cpp',
+      # SAM-23 lifecycle store (born-on-PG, [pg][store][lifecycle])
+      'unit/server/test_software_lifecycle_store.cpp',
       # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
       'unit/server/test_collection_settings_resolve.cpp',
       # per-group collection settings store (born-on-PG, [pg][store])
@@ -4919,6 +4924,13 @@ test('collection settings wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-23: the lifecycle store's refuse-to-start arms, /readyz row, Deps wiring and stop() reset.
+test('software lifecycle wiring lexical',
+  _python3_test,
+  args: [files('test_software_lifecycle_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
 # register_routes(); an unset function leaves every hostname null with no other signal.
 test('software lookup wiring lexical',
@@ -5009,6 +5021,15 @@ test('no conn-less libpq escape references',
 test('rbac cross-schema query-owner seam',
   _python3_test,
   args: [files('test_rbac_query_owner_seam.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #7223: the durable-session account gate wiring (the soft-delete literal, the owner's session
+# generation bump, the mode ternary, the gate position and the cache epoch guard) keeps its shape.
+test('session account gate wiring (#7223)',
+  _python3_test,
+  args: [files('test_session_account_gate_wiring.py')],
   suite: 'docs',
   timeout: 30,
 )

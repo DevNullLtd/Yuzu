@@ -429,16 +429,20 @@ public:
     void touch_last_login(const std::string& username);
 
     /// UNGUARDED fixture primitive: production must use AuthManager::remove_user_checked (#4966).
-    /// This writes the soft delete WITHOUT the last-Administrator guard. tests/test_rbac_query_owner_seam.py
-    /// scans server/core/src and server/core/include for calls through a receiver whose name
-    /// contains `db` (or a `(*...)` dereference) outside auth_db.cpp; it is a textual tripwire
-    /// for those spellings, not a proof that no other path reaches this method.
+    /// This writes the soft delete WITHOUT the last-Administrator guard.
+    /// tests/test_rbac_query_owner_seam.py scans server/core/src and server/core/include for calls
+    /// through a receiver whose name contains `db` (or a `(*...)` dereference) outside auth_db.cpp;
+    /// it is a textual tripwire for those spellings, not a proof that no other path reaches this
+    /// method.
     ///
     /// Soft-delete a user (sets is_active = false), clears MFA enrollment
     /// state (SOC 2 CC6.8 credential revocation on termination). Does NOT
     /// touch sessions (no session surface on this class — see file header;
     /// AuthManager wipes its own in-memory `sessions_` map for this
-    /// username).
+    /// username). `AuthDB::remove_user` itself never bumps the session write-generation; only
+    /// `RbacAdminAuthorityOwner::deactivate_account` (the production soft delete, no production
+    /// caller of this method) does, in its own transaction and only when a SessionStore is
+    /// wired (`SessionGenerationMode::kBumpSessionGeneration`).
     std::expected<bool, AuthDBError> remove_user(const std::string& username);
 
     /// Check if a user exists (active only).

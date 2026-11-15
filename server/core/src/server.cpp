@@ -250,6 +250,7 @@
 #include "hardware_section_integrity.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
+#include "software_lifecycle_store.hpp"
 #include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
@@ -686,6 +687,23 @@ public:
                                                  .burst = 2.0 * cfg_.principal_rate_limit}) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_server_software_lifecycle_store_read_degrade_total",
+                          "Software lifecycle store reads that could not be answered, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error/corrupt_row/row_cap)",
+                          "counter");
+        metrics_.describe("yuzu_server_software_lifecycle_store_write_degrade_total",
+                          "Software lifecycle store writes that failed, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error/txn_failed)",
+                          "counter");
+        // Pre-seed every reason so the first degrade reads as an increase from 0.
+        for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                   "corrupt_row", "row_cap"})
+            metrics_.counter("yuzu_server_software_lifecycle_store_read_degrade_total",
+                             {{"reason", reason}});
+        for (const char* reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "txn_failed"})
+            metrics_.counter("yuzu_server_software_lifecycle_store_write_degrade_total",
+                             {{"reason", reason}});
         metrics_.describe("yuzu_server_revocation_source_degrade_total",
                           "CRL source registrations refused for a retryable reason, by reason "
                           "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
@@ -3735,14 +3753,26 @@ public:
             "Durable session-store operations that hit a degraded PostgreSQL read/"
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-            "elevate); a validate degrade fails the request closed, and elevate / "
-            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "elevate / account_state, the last being the read of the account store "
+            "that gates a durable local session); a validate degrade fails the request "
+            "closed, and elevate / revoke (via invalidate_user) degrades fail the "
+            "privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
-                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+                        "invalidate_user", "invalidate", "mark_mfa", "elevate", "account_state"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_account_inactive_total",
+                          "Durable local sessions refused at validation because their account "
+                          "is not active (inactive or deleted)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_account_inactive_total");
+        metrics_.describe("yuzu_auth_session_unknown_source_total",
+                          "Durable sessions refused at validation because the stored auth "
+                          "source is not local, oidc or saml",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_unknown_source_total");
         // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
         // shared by every replica) and fail CLOSED on any store failure. This
         // counts each degrade so an operator can tell "agents cannot enroll /
@@ -8679,6 +8709,43 @@ public:
             }
         }
 
+        // SoftwareLifecycleStore - software lifecycle rules and host-declared facts (SAM-23).
+        // Authoritative reference data, so construction and the seed load are fail-closed like the
+        // product registry (ADR-0012 s1): the seed is build-embedded, so a parse failure is a
+        // defective build and a load failure is a database fault; either refuses the boot, and a
+        // newer binary's seed replaces the stored shipped rules in one transaction. No reader
+        // exists yet (SAM-24); /readyz alone borrows it.
+        if (pg_pool_ && !startup_failed_) {
+            software_lifecycle_store_ = std::make_unique<SoftwareLifecycleStore>(*pg_pool_);
+            if (!software_lifecycle_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software lifecycle store migration/open "
+                              "failed (database reachable but the software_lifecycle_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                software_lifecycle_store_->set_metrics(&metrics_);
+                auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed,
+                                                      LifecycleSource::shipped);
+                if (!seed) {
+                    spdlog::error("[PG] Refusing to start: embedded software lifecycle seed is "
+                                  "invalid: {}",
+                                  seed.error());
+                    startup_failed_ = true;
+                } else if (seed->empty()) {
+                    // A header-only seed parses cleanly and would delete every shipped rule.
+                    spdlog::error("[PG] Refusing to start: embedded software lifecycle seed has "
+                                  "no rules");
+                    startup_failed_ = true;
+                } else if (auto loaded = software_lifecycle_store_->replace_rules(
+                               LifecycleSource::shipped, *seed);
+                           !loaded) {
+                    spdlog::error("[PG] Refusing to start: software lifecycle seed load failed: {}",
+                                  loaded.error());
+                    startup_failed_ = true;
+                }
+            }
+        }
+
         // SoftwareCollectionSettingsStore - per-management-group software collection settings
         // (SAM-34). Authoritative configuration, so construction is fail-closed like the
         // product registry (ADR-0012 s1): a database that cannot create or open the schema
@@ -11913,6 +11980,9 @@ public:
         // SAM-34 collection settings store: its routes capture it and are served only until
         // web_server_->stop(); drop it ahead of the pool with the other born-on-PG stores.
         software_collection_settings_store_.reset();
+        // SAM-23 lifecycle store: only /readyz borrows it (HealthRoutes deps), and that server is
+        // stopped above; drop it ahead of the pool.
+        software_lifecycle_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -17780,6 +17850,7 @@ private:
                              .product_registry_store = product_registry_store_.get(),
                              .software_collection_settings_store =
                                  software_collection_settings_store_.get(),
+                             .software_lifecycle_store = software_lifecycle_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
@@ -25324,6 +25395,9 @@ private:
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
     std::unique_ptr<SoftwareCollectionSettingsStore> software_collection_settings_store_;
+    // SAM-23 software lifecycle rules + host-declared facts. Declared after pg_pool_ so it
+    // destructs before the pool; no route or job reads it yet (only /readyz borrows it).
+    std::unique_ptr<SoftwareLifecycleStore> software_lifecycle_store_;
     // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
     // resets them explicitly before the stores and pool.
     std::unique_ptr<SoftwareTitleDimension> software_title_dimension_;
