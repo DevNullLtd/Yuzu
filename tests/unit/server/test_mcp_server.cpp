@@ -53605,5 +53605,5 @@ TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, require
     CHECK(gdesc.size() < 4096);
     CHECK(gdesc.find("ordering") != std::string::npos);
     CHECK(gdesc.find("pair_duplicates") != std::string::npos);
-    CHECK(gdesc.find("not yet compared") != std::string::npos);
+    CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
 }
