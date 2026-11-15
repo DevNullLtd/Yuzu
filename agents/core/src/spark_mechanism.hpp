@@ -659,11 +659,16 @@ struct FileMechanismDebugCounters {
     std::uint64_t verify_same{0};
     std::uint64_t verify_lost{0};
     std::uint64_t verify_unverifiable{0};
-    std::uint64_t verify_refused{0};       ///< verify launches refused by a full lane (retried)
+    std::uint64_t verify_refused{0};       ///< verify launches refused by a full lane (expected 0:
+                                           ///< admission is room-aware, so a nonzero value is a tripwire)
     std::uint64_t verify_launch_failed{0}; ///< verify launches attempted and failed to start a thread
                                            ///< (retried); a launch never attempted is not counted
     std::uint64_t path_lost_stuck{0};      ///< lost paths whose drain outlasted the stuck deadline
     std::uint64_t path_lost_drained_ok{0}; ///< lost-path drains whose completion carried `ok`
+    std::uint64_t path_lost_flaps{0};      ///< path losses with no decided verify since the re-establishment
+                                           ///< (the retry doubles 30 s to 300 s across them)
+    std::uint64_t verify_starved{0};       ///< due verifications not launched for 3 intervals (once per episode)
+    std::uint64_t sweep_passes{0};         ///< sweep passes run (debug: a test asserts the sweep does not spin)
 };
 
 /// Returns true if `mech` is the Windows File mechanism and the controls were
