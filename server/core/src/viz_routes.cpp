@@ -46,6 +46,7 @@
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "http_route_sink.hpp"
 #include "offline_endpoint_store.hpp"
+#include "offline_endpoint_types.hpp" // kOfflineRosterRowCap (static_assert below)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <yuzu/metrics.hpp>
@@ -58,6 +59,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+// #5712: the fleet-topology merge runs BEFORE the machines_max gate, and the offline roster it merges
+// is capped at kOfflineRosterRowCap, so a truncated merge is at least that many machines. That makes
+// it a 413 at any machines_max below the ceiling ONLY while the two are equal; the design note and
+// docs/fleet-viz-invariants.md state it that way. If you change either constant, revisit them.
+static_assert(yuzu::server::VizRoutes::kMachinesMaxCeiling == yuzu::server::kOfflineRosterRowCap,
+              "viz machines_max ceiling must equal the offline roster cap (#5712 / #7550)");
 
 namespace yuzu::server {
 
@@ -267,12 +275,19 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // machines_max cap counts the merged total.
     // #5531: a FAILED read renders live-only (never hard-fails the request) and
     // is flagged `offline_roster_degraded` in the envelope + audit detail.
+    // #5712: a roster past the store's row cap is a typed PARTIAL, served and flagged
+    // `offline_roster_truncated` (and audited, on the 413 path too), never an error. The flag is
+    // reachable as a 200 only at machines_max == the ceiling AND with every live host inside the
+    // roster: that ceiling equals the roster cap, so a truncated merge is >= cap machines and is
+    // gated 413 at any smaller machines_max (and above the cap whenever a live host is outside it).
     bool offline_degraded = false;
+    bool offline_truncated = false;
     if (offline_roster_fn_) {
         auto persisted = offline_roster_fn_(std::chrono::seconds(kOfflineStaleWindowSecs));
         if (persisted) {
+            offline_truncated = persisted->truncated;
             const auto before = snap->machines.size();
-            snap = merge_offline_topology(std::move(snap), *persisted);
+            snap = merge_offline_topology(std::move(snap), persisted->rows);
             const auto merged_count = snap->machines.size() - before;
             if (merged_count > 0 && metrics_)
                 metrics_->counter("yuzu_viz_offline_hosts_total")
@@ -291,7 +306,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
                       "oversize machines=" + std::to_string(snap->machines.size()) +
-                          " cap=" + std::to_string(machines_max));
+                          " cap=" + std::to_string(machines_max) +
+                          (offline_truncated ? " offline_roster_truncated=1" : ""));
         if (metrics_)
             metrics_->counter("yuzu_viz_oversize_response_total").increment();
         return;
@@ -301,6 +317,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     nlohmann::json j = *snap;
     if (offline_degraded)
         j["offline_roster_degraded"] = true;
+    if (offline_truncated)
+        j["offline_roster_truncated"] = true;
     // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): dump_topology_safe()
     // (fleet_topology_types.hpp) substitutes U+FFFD instead of throwing on a
     // byte-clamped multi-byte codepoint - clamp_field() truncates by byte
@@ -334,7 +352,8 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
                   "machines=" + std::to_string(snap->machines.size()) +
                       " include_vuln=" + (include_vuln ? "1" : "0") + (fresh ? " fresh=1" : "") +
                       (as_fragment ? " fragment=1" : "") +
-                      (offline_degraded ? " offline_roster_degraded=1" : ""));
+                      (offline_degraded ? " offline_roster_degraded=1" : "") +
+                      (offline_truncated ? " offline_roster_truncated=1" : ""));
     }
 
     if (metrics_) {

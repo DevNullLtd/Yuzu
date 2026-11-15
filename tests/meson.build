@@ -1395,6 +1395,7 @@ echo_test_exe = executable(
     'unit/test_echo_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
     'unit/test_echo_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_echo_registry_source.cpp',         # PR11.8: registry source -- pure core (diff/dirty table/codecs) + injected-reader lifecycle + [windows] live cases
+    'unit/test_echo_registry_bam_live.cpp',       # #6898: [windows][bam] live check of the bam\State exclusion (empty TU off Windows)
     'unit/test_echo_fold.cpp',                    # roll-up substrate: bucket math, deltas, merge ops, DDL/view parity, fold writer, replay ring, GC, authorizer
     'unit/test_echo_fold_sizing.cpp',             # roll-up substrate: bytes-per-row ceilings ([fold_sizing], split into its own test() below)
     'unit/test_echo_v10_migration.cpp',           # schema v10: seeded v9 database over all 17 sources, differential per-source check, rollback, free-space refusal, retired names
@@ -1493,6 +1494,7 @@ if build_server
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired as the post-read stage (registry + HttplibRouteSink wrapper), over a real httplib::Server (no PG)
       'unit/server/test_post_read_stage.cpp', # PostReadStageRegistry + HttplibRouteSink handler wrapper: order, short-circuit, install guards, unwrapped servers (no PG)
+      'unit/server/test_http_response_policy.cpp', # HEAD refusal + measured-quality brotli composed into HttplibRouteSink (pure, no socket, no PG)
       'unit/server/test_model_param_to_params.cpp', # model_detail::to_params: key-sorted copy of httplib params for the pure parsers (no PG)
       'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
@@ -1536,6 +1538,8 @@ if build_server
       'unit/server/test_audit_store.cpp',
       'unit/server/test_background_jobs.cpp',
       'unit/server/test_pg_retention_guard.cpp',
+      'unit/server/test_pg_collation_check.cpp',
+      'unit/server/test_pg_collation_recheck.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
       'unit/server/test_audit_token_hostile_bytes.cpp',
@@ -1703,6 +1707,7 @@ if build_server
       'unit/server/test_session_store.cpp',
       'unit/server/test_session_dbclock.cpp',
       'unit/server/test_auth_session_store.cpp',
+      'unit/server/test_session_account_active.cpp',
       'unit/server/test_clock_drift_monitor.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
@@ -1878,6 +1883,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
+      'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
       'unit/server/test_rest_management_group_detail_degrade.cpp', # #1762 governance round-1: GET /management-groups/{id} fails closed on a degraded member read
       'unit/server/test_engine_aware_visibility.cpp', # #6204: the engine rule in the username-keyed visibility/dispatch resolvers, against real stores
@@ -1897,6 +1903,7 @@ if build_server
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
       'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
+      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, scanned from server.cpp at test run time
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -1905,6 +1912,8 @@ if build_server
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_command_v1_routes.cpp', # POST /api/v1/commands (#2146): exact send sets over a real AgentRegistry, destructive gate, zero-reach table, audit fail-closed
       'unit/server/test_instruction_execute.cpp', # #2146: the shared instruction-definition execute core + the v1 REST twin; every store is a Ports seam (the [pg]-tagged wedge cases alone use a real ExecutionTracker + reaper)
+      'unit/server/test_instruction_authoring_routes.cpp', # #2146 batch C: the v1 instruction-definition and instruction-set authoring twins + the shared request builders (the [pg]-tagged cases use a real InstructionStore)
+      'unit/server/test_mcp_instruction_authoring.cpp', # #2146 batch C: the nine MCP authoring twins via tools/call on a real McpServer (the [pg]-tagged cases use a real InstructionStore + ApprovalManager)
       'unit/server/test_dispatch_zero_reach.cpp', # classify_zero_reach: pure cause priority, protective suppression, tokens, retryable (new v1 routes / MCP tools)
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
       'unit/server/test_plugin_result_audit.cpp', # registry.write audit extraction from mutating-action output frames (pure) + live ingest on both frame paths
@@ -2043,6 +2052,7 @@ if build_server
       'unit/server/test_software_catalog_rules.cpp',
       'unit/server/test_software_catalogue_model.cpp',   # pure shared REST+MCP catalogue model
       'unit/server/test_software_list_model.cpp',        # pure SAM-17 lookup list model (totals, status, range)
+      'unit/server/test_vers_range.cpp',                 # pure vers: parser + interval core (SAM-43)
       'unit/server/test_crypto_cbom.cpp',                # /crypto CBOM export: CycloneDX 1.7 shaper + goldens
       'unit/server/test_crypto_library_model.cpp',       # /crypto slice 1: curated table + shared model
       'unit/server/test_crypto_api.cpp',                 # /crypto slice 1: local CryptoApi over the real store
@@ -2055,6 +2065,10 @@ if build_server
       'unit/server/test_product_normalize.cpp',
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_normalization_pack.cpp',
+      # SAM-23 lifecycle: pure evaluator + rule-file parser + embedded seed (no store, no [pg])
+      'unit/server/test_software_lifecycle_rules.cpp',
+      # SAM-23 lifecycle store (born-on-PG, [pg][store][lifecycle])
+      'unit/server/test_software_lifecycle_store.cpp',
       # pure per-group collection settings resolver (collection_settings_resolve.hpp): no store, no I/O, no [pg]
       'unit/server/test_collection_settings_resolve.cpp',
       # per-group collection settings store (born-on-PG, [pg][store])
@@ -3472,6 +3486,29 @@ test('agent-only release lint',
   timeout: 30,
 )
 
+# Agent-bundle release verification (#7529): build-agent-bundle.sh must verify
+# SHA256SUMS' cosign signature (exact identity per signing era) before use and
+# match each file to its OWN line. Runs `--verify-only` against stub gh/cosign,
+# asserts cosign's argv, and mutation-tests itself on a scratch copy of the script.
+test('agent bundle release verification',
+  _python3_test,
+  args: [files('test_build_agent_bundle_verify.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
+# The `server` feature option (ADR-0035 ladder step 3): auto turns the server
+# off on a non-Linux target, enabled there is an error, the deprecated
+# `build_server` boolean stays declared and honoured. Lexical pins with a
+# mutation self-test, plus a real configure of this tree for Windows, macOS
+# and Linux targets (skipped without meson and a compiler).
+test('server feature option lint',
+  _python3_test,
+  args: [files('test_server_feature_option.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -3595,6 +3632,14 @@ test('changelog promote append',
   args: [files('test_assemble_changelog_append.py')],
   suite: 'docs',
   timeout: 60,
+)
+# scripts/whats-new.py: collated "what changed since my last pull" view (version bumps +
+# changelog.d fragments). Builds throwaway git repositories. Stdlib only.
+test('whats-new script',
+  _python3_test,
+  args: [files('test_whats_new.py')],
+  suite: 'docs',
+  timeout: 180,
 )
 test('changelog order',
   _python3_test,
@@ -4119,6 +4164,21 @@ if _bash_test.found()
       suite: 'docs',
       timeout: 60,
     )
+    # #7538: scripts/integration-test.sh's lost-port-race classifier (the bind errno, the
+    # web-listener line with a foreign owner, or a foreign listener on a stack port after
+    # start-up is a retryable lost race; a TLS/key start failure is not), the attempt loop,
+    # its process-ownership guard and its monotonic clock. Hermetic: helpers
+    # sourced from the script, fake ss, real throwaway sleep children; no stack, Postgres or
+    # root. LINUX ONLY: its assertions read /proc and need GNU `timeout`, so several of them fail
+    # by construction on macOS; the no-/proc path is covered on Linux through NOPROC_DIR.
+    if host_machine.system() == 'linux'
+      test('integration-test.sh port-retry classifier (#7538)',
+        _bash_test,
+        args: [files('shell/test_integration_port_retry.sh')],
+        suite: 'docs',
+        timeout: 120,
+      )
+    endif
     # #5333: start-UAT.sh kill_stale signals only PIDs it recorded and refuses on
     # foreign port holders. Sources the script with kill/ps/pgrep/lsof/docker
     # replaced by functions; spawns and signals nothing. The decoy command line
@@ -4326,6 +4386,17 @@ test('guardian_backend reader wiring lexical gate (#2240)',
   timeout: 60,
 )
 
+# DEX Apps page wiring (#7520, #7519): server.cpp hands DexRoutes the DexApi make_local_dex_api returned,
+# and that call passes an observer provider reading health_store_.dex_observer_for. Static lexical gate
+# with its own in-memory mutation self-test; no build required. Suite 'docs' for the same reason as the
+# gate above.
+test('DEX Apps wiring lexical gate (#7520, #7519)',
+  _python3_test,
+  args: [files('test_dex_apps_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-decommission cascade wiring (#5675): every field of AgentDecommissionStores must be handed a
 # live store pointer in ServerImpl::decommission_agent (server.cpp). A store registered in the
 # cascade but never wired there is Skipped for every operator decommission, and no unit test sees
@@ -4378,6 +4449,19 @@ test('settings engine session belt lexical gate',
 test('typed-source purge wiring lexical gate (2a-1b)',
   _python3_test,
   args: [files('test_typed_purge_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The PostgreSQL collation version check must stay wired in at both ends: the constructor-time call
+# in the ServerImpl constructor's substrate block (fed by the check, guarded by the probe, not tied
+# to startup_failed_) AND the recheck's construction, start and stop (run() / stop(), before
+# pg_pool_.reset()). Source-text only; suite 'docs' as the gates above; carries delete/move/`#if 0`
+# self-tests. Remaining limit: it cannot see `if (false)`, an uncalled lambda, or a start() in a
+# branch that never runs.
+test('pg collation check wiring lexical gate',
+  _python3_test,
+  args: [files('test_pg_collation_check_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -4541,6 +4625,18 @@ test('OpenAPI literal segment size lexical gate',
   timeout: 30,
 )
 
+# Lexical gate: the OpenAPI authoring mistakes test_openapi_spec_completeness.cpp reports one kind
+# per full build (no operationId, an ill-formed or duplicate one, the operationId checksum pin, a
+# success response left untyped and not in kUntyped) are all reported together, before any build.
+# Reads the same literal chain as the segment gate above and the constants out of the C++ test.
+# Carries its own in-memory mutation self-test. No build required. Suite 'docs' as above.
+test('OpenAPI operation authoring lexical gate',
+  _python3_test,
+  args: [files('test_openapi_operation_authoring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Lexical gate: the OpenAPI x-yuzu-unavailable markers agree with the stores server.cpp passes to
 # register_routes (a store passed as nullptr <=> its group is marked). Carries its own in-memory
 # mutation self-test. No build required.
@@ -4634,9 +4730,10 @@ endif
 # Postgres): the unit suite covers the probe's rules and transport, only this proves main.cpp
 # runs it before any server init. `yuzu_server_exe` is bound in server/core/meson.build.
 # platform: OS-contract test (docs is OS-independent and Linux-only since 2026-10-21). It is registered
-# only when build_server is on, so since ADR-0035 ladder step 1 (Windows and macOS CI configure with
-# -Dbuild_server=false) it runs on the Linux legs only; its `.exe` probe, MSYS2_ARG_CONV_EXCL and cygpath
-# handling now serve local Windows builds alone. Suite 'platform', not a bare 'server':
+# only when build_server is on, which since ADR-0035 ladder step 3 means a Linux target only (the
+# `server` feature option is off for any other target), so it runs on the Linux legs only; its `.exe`
+# probe, MSYS2_ARG_CONV_EXCL and cygpath handling serve no supported build now and can go when the
+# server's Windows code is removed (ADR-0035 step 4). Suite 'platform', not a bare 'server':
 # scripts/ci/assert-suite-cover.py has no bare 'server' entry in its --suite lists, so a gate labelled
 # only 'server' would fail that check on any leg that registers it.
 if _bash_test.found() and meson.can_run_host_binaries() and build_server
@@ -4821,6 +4918,13 @@ test('collection settings wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-23: the lifecycle store's refuse-to-start arms, /readyz row, Deps wiring and stop() reset.
+test('software lifecycle wiring lexical',
+  _python3_test,
+  args: [files('test_software_lifecycle_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
 # register_routes(); an unset function leaves every hostname null with no other signal.
 test('software lookup wiring lexical',
@@ -4902,6 +5006,15 @@ test('no conn-less libpq escape references',
 test('rbac cross-schema query-owner seam',
   _python3_test,
   args: [files('test_rbac_query_owner_seam.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #7223: the durable-session account gate wiring (the soft-delete literal, the owner's session
+# generation bump, the mode ternary, the gate position and the cache epoch guard) keeps its shape.
+test('session account gate wiring (#7223)',
+  _python3_test,
+  args: [files('test_session_account_gate_wiring.py')],
   suite: 'docs',
   timeout: 30,
 )

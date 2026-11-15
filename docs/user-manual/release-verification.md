@@ -9,6 +9,14 @@ All examples assume you have downloaded the release assets from
 <https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
 that the tag under verification is `v0.11.0`. Substitute as needed.
 
+> **Warning: older release pages show a wildcard command.** The GitHub release
+> pages for v0.7.0-rc1 to v0.15.0 (18 of the 22 pages published in that range,
+> all published before the fix in #7529) print a `cosign verify-blob` command
+> whose identity is a wildcard (`--certificate-identity-regexp '.*'`); the other
+> 4 carry no cosign command. A wildcard accepts a signature from
+> any GitHub repository, so it proves almost nothing. Do not copy it: use the
+> exact, tag-bound commands on this page.
+
 ## Which owner applies to your release
 
 Yuzu moved from the personal account `Tr3kkR` to the `DevNullLtd` organisation
@@ -46,7 +54,7 @@ certificate at build time and cannot be restamped.
 | Platform archives | `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` (the Windows and macOS archives hold the agent only, and were named `yuzu-windows-x64.zip` / `yuzu-macos-arm64.tar.gz` in earlier releases) | `sha256sum -c SHA256SUMS` |
 | Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuAgent-*.pkg` (`YuzuServerSetup-*.exe` was discontinued: the server runs on Linux only, ADR-0035) | `sha256sum -c SHA256SUMS` |
 | Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
-| Cosign bundle | `SHA256SUMS.sigstore` (legacy: `SHA256SUMS.bundle` for releases ≤ v0.11.0) | Sigstore OIDC identity |
+| Cosign bundle | `SHA256SUMS.sigstore` (legacy filename `SHA256SUMS.bundle`: the only name on v0.7.x; v0.11.0-rc1 to v0.11.0 carry both) | Sigstore OIDC identity |
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
@@ -60,7 +68,7 @@ certificate at build time and cannot be restamped.
 #   macOS:         brew install gh
 #   Windows:       winget install --id GitHub.cli
 
-# cosign for Sigstore signature verification
+# cosign v2.6.2 or later, for Sigstore signature verification
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
 #   macOS:         brew install cosign
 #   Windows:       winget install --id Sigstore.Cosign
@@ -91,35 +99,36 @@ prove authenticity — use the cosign step below for that.
 was signed by the GitHub Actions workflow that produced this release.
 
 ```bash
+# TAG is the exact tag of the release you downloaded
+TAG=v0.11.0
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```
 
+The identity is an exact match, bound to the tag: a signature from a
+different tag of the same repository (an older or a downgraded release)
+does not verify. Use the `SIGNER_REPO` for your release's era (the table
+above); never take it from an error message.
+
 On success: `Verified OK`. Combined with step 1, this proves every
 listed asset is exactly what the workflow produced.
-
-**Tighter identity matching.** If you know the exact tag, substitute the
-regex for a literal match:
-
-```bash
-  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v0.11.0"
-```
 
 ## 3. Verify Docker image signatures (cosign)
 
 ```bash
+# same TAG as step 2
 cosign verify \
-  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/${OWNER}/yuzu-server:0.11.0
+  ghcr.io/${OWNER}/yuzu-server:${TAG#v}
 
 cosign verify \
-  --certificate-identity-regexp "https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*" \
+  --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/${OWNER}/yuzu-gateway:0.11.0
+  ghcr.io/${OWNER}/yuzu-gateway:${TAG#v}
 ```
 
 Output includes the signing certificate's SAN
@@ -169,13 +178,15 @@ and SPDX formats. Use whichever your procurement or SCA tool consumes.
 
 **Known limitations of the platform SBOMs.** They are generated from the whole
 build workspace (the vcpkg ports tree and build trees included), not from the
-archive alone, so they list thousands of components the archive does not ship
-or load; the Windows and macOS agent SBOMs include the server's dependencies,
-such as `libpq`, `drogon` and `xmlsec`. A finding in a component the archive
-does not contain does not apply to it. Separately, the Windows agent archive
-still contains `libpq.dll`, `drogon.dll`, `trantor.dll` and the `libxmlsec1` DLLs, which the agent never loads, until a later
-release removes the server's dependencies from the Windows build (ADR-0035
-step 3).
+archive alone, so they can list components the archive does not ship or load.
+A finding in a component the archive does not contain does not apply to it.
+Since ADR-0035 step 3 the Windows and macOS builds install only the agent's
+dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`) are no
+longer installed on those build machines and the Windows agent archive carries
+none of their DLLs (the Windows release build's "Verify the agent runs from the packaged archive" step
+refuses an archive that does; it has not yet run on a real release tag). What a
+given release's SBOM lists beyond the archive is not asserted here: inspect the
+SBOM of the release you verify.
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
@@ -221,7 +232,7 @@ VERSION="${1:?usage: verify.sh <version, e.g. 0.11.0>}"
 OWNER="${OWNER:-tr3kkr}"                   # devnullltd for releases after 2026-09-28
 SIGNER_REPO="${SIGNER_REPO:-Tr3kkR/Yuzu}"  # DevNullLtd/Yuzu for the same
 
-IDENTITY_RE="https://github.com/${SIGNER_REPO}/\.github/workflows/release\.yml@refs/tags/v[0-9].*"
+IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v${VERSION#v}"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 echo "→ sha256sum -c SHA256SUMS"
@@ -230,14 +241,14 @@ sha256sum -c SHA256SUMS
 echo "→ cosign verify-blob (SHA256SUMS)"
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore \
-  --certificate-identity-regexp "$IDENTITY_RE" \
+  --certificate-identity "$IDENTITY" \
   --certificate-oidc-issuer "$OIDC_ISSUER" \
   SHA256SUMS
 
 echo "→ cosign verify (Docker images)"
 for img in server gateway; do
   cosign verify \
-    --certificate-identity-regexp "$IDENTITY_RE" \
+    --certificate-identity "$IDENTITY" \
     --certificate-oidc-issuer "$OIDC_ISSUER" \
     "ghcr.io/${OWNER}/yuzu-${img}:${VERSION}" >/dev/null
   echo "  ghcr.io/${OWNER}/yuzu-${img}:${VERSION} OK"
@@ -265,17 +276,28 @@ echo "✓ all checks passed for v${VERSION}"
 
 ## Troubleshooting
 
-**`cosign verify-blob: no matching signatures`** — the release you are
-verifying predates signing, or the `--certificate-identity-regexp` is
-too strict for the tag format. Widen to `--certificate-identity-regexp
-'.*'` to diagnose, then tighten once you have confirmed the identity.
+**`cosign verify-blob: no matching signatures` / `certificate identity
+mismatch`** — do NOT widen the identity to a wildcard; that accepts a
+signature from any workflow. Check, in order: the release carries no signature
+file (v0.8.0-rc0 to v0.10.0 have neither a `.sigstore` nor a `.bundle`); `TAG` is not exactly the
+tag you downloaded; or `SIGNER_REPO` is wrong for the era (`Tr3kkR/Yuzu` up to
+0.13.x, `DevNullLtd/Yuzu` after). The only legitimate signers are those two
+repositories: if the default for the release's era fails, treat the download
+as suspect (wrong source or tampered), and never set `SIGNER_REPO` to the
+subject cosign prints. A network error reaching Sigstore's TUF root usually
+clears on a re-run (cosign needs network access to the TUF root, or a local
+`--trusted-root`; there is no offline mode in `scripts/build-agent-bundle.sh`); if
+it persists for about an hour, or cosign reports an expired or unverifiable
+trusted root, update cosign (v2.6.2 or later) instead of waiting.
 
-**`SHA256SUMS.sigstore: no such file`** — releases up to and including
-v0.11.0 ship the same bundle under the legacy filename
-`SHA256SUMS.bundle`. Both files contain a byte-identical Sigstore bundle
-and either can be passed to `cosign verify-blob --bundle`. v0.11.0 and
-v0.11.0-rc2 carry both names side-by-side; v0.12.0 onwards ship only
-the canonical `.sigstore` filename.
+**`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
+bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to
+v0.10.0 ship neither file (no signature to verify). v0.11.0-rc1, -rc2 and
+v0.11.0 carry both names side-by-side (byte-identical bundles, either can be
+passed to `cosign verify-blob --bundle`); v0.12.0 onwards ship only the
+canonical `.sigstore` filename. `scripts/build-agent-bundle.sh` performs the
+same exact-identity check on `SHA256SUMS.sigstore` and refuses any release
+without it (see [the agent bundle guide](../agent-bundle.md)).
 
 **`gh attestation verify: no attestations found`** — run `gh auth login`
 first; the GitHub CLI must be able to query

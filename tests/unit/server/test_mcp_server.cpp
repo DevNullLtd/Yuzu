@@ -41,6 +41,7 @@
 #include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
@@ -521,6 +522,31 @@ TEST_CASE("MCP Policy: supervised requires approval for destructive ops", "[mcp]
     CHECK_FALSE(requires_approval("", "Workflow", "Execute"));
     CHECK_FALSE(requires_approval("readonly", "Workflow", "Execute"));
     CHECK_FALSE(requires_approval("operator", "Workflow", "Execute"));
+
+    // #2146 batch C (owner ruling): an unticketed definition update can downgrade approval_mode or
+    // repoint plugin/action, so the write is the ticketed step. A set carries no authorization
+    // consumer (not gated); validate_definition_yaml is Read (not gated). The negatives only fail if
+    // the rule is hoisted out of the supervised branch.
+    CHECK(requires_approval("supervised", "InstructionDefinition", "Write"));
+    CHECK(requires_approval("supervised", "InstructionDefinition", "Delete"));
+    CHECK_FALSE(requires_approval("supervised", "InstructionDefinition", "Read"));
+    CHECK_FALSE(requires_approval("supervised", "InstructionSet", "Write"));
+    CHECK(requires_approval("supervised", "InstructionSet", "Delete")); // any Delete
+    CHECK_FALSE(requires_approval("", "InstructionDefinition", "Write"));
+    CHECK_FALSE(requires_approval("readonly", "InstructionDefinition", "Write"));
+    CHECK_FALSE(requires_approval("operator", "InstructionDefinition", "Write"));
+    CHECK_FALSE(tier_allows("operator", "InstructionDefinition", "Write")); // operator tier is denied
+
+    // ProductPack:Write (POST /api/product-packs): a pack install creates definitions with a
+    // pack-supplied approval_mode, plugin and action, so unticketed it bypasses the
+    // InstructionDefinition:Write rule above (owner ruling, batch C fix round). Read stays open,
+    // Delete is already gated, and the rule lives in the supervised branch only.
+    CHECK(requires_approval("supervised", "ProductPack", "Write"));
+    CHECK(requires_approval("supervised", "ProductPack", "Delete"));
+    CHECK_FALSE(requires_approval("supervised", "ProductPack", "Read"));
+    CHECK_FALSE(requires_approval("", "ProductPack", "Write"));
+    CHECK_FALSE(requires_approval("readonly", "ProductPack", "Write"));
+    CHECK_FALSE(requires_approval("operator", "ProductPack", "Write"));
 
     // Delete on any type
     CHECK(requires_approval("supervised", "Tag", "Delete"));
@@ -5388,7 +5414,8 @@ TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner a
     grant.principal_type = "user";
     grant.principal_id = "test-user";
     grant.role_name = "ITServiceOwner";
-    REQUIRE(mgmt.assign_role(grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this mint arm.
+    yuzu::test::plant_group_role_row(db.dsn(), grant);
 
     yuzu::test::ApprovalManagerPg allowed_appr_bundle;
     yuzu::server::ApprovalManager& allowed_appr = *allowed_appr_bundle;
@@ -11483,10 +11510,28 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
     CHECK(payload["policy"]["fault"].is_null());
     CHECK(payload["policy"]["tiers"].contains("poor"));
     CHECK(payload["apps"][0]["profile"] == "default");
+    // #7504, #7519: the confidence level, the resolved tier name and the live observer split.
+    CHECK(payload["policy"]["interval_confidence"].get<double>() == Catch::Approx(0.95));
+    CHECK(payload["apps"][0]["score"].contains("tier"));
+    REQUIRE(payload.contains("observer_state")); // null here: no observer source in this harness
+    CHECK(payload["observer_state"].is_null());
     // Fleet aggregate — only the generic tool-call audit, never a domain verb.
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.app.view") == std::string::npos);
+
+    // The served payload validates against the output schema the tool declares. The schema is
+    // fetched from tools/list and must be an object, so the check can never pass vacuously.
+    {
+        auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7504})");
+        REQUIRE(listed);
+        nlohmann::json schema;
+        for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"])
+            if (t["name"] == "list_dex_apps")
+                schema = t["outputSchema"];
+        REQUIRE(schema.is_object());
+        CHECK(yuzu::test::schema_violation(schema, payload) == "");
+    }
 
     // Rule 1: the MCP payload's key sets equal the shared serializer's.
     yuzu::server::DexAppsModel one;
@@ -11533,9 +11578,38 @@ TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an 
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["code"] == kInternalError);
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    // The message ends with the cause token (#7520): a dropped table is a query error.
+    CHECK(body["error"]["message"].get<std::string>().ends_with("(query_error)"));
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.list_dex_apps|success");
+}
+
+TEST_CASE("MCP DEX: list_dex_apps declares the new payload fields and the coverage wording",
+          "[mcp][integration][dex][a5]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7519})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "list_dex_apps")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto& props = (*tool)["outputSchema"]["properties"];
+    CHECK(props.contains("observer_state"));
+    CHECK(props["policy"]["properties"].contains("interval_confidence"));
+    CHECK(props["apps"]["items"]["properties"]["score"]["properties"].contains("tier"));
+    CHECK(props["apps"]["items"]["properties"]["versions"]["items"]["properties"]["score"]["properties"]
+              .contains("tier"));
+    const auto required = (*tool)["outputSchema"]["required"].dump();
+    CHECK(required.find("observer_state") != std::string::npos);
+    // The description says what crash_source_coverage is, and what observer_state is.
+    const auto d = (*tool)["description"].get<std::string>();
+    CHECK(d.find("shipped design") != std::string::npos);
+    CHECK(d.find("not live collector health") != std::string::npos);
+    CHECK(d.find("observer_state is the live count") != std::string::npos);
 }
 
 TEST_CASE("MCP DEX: list_dex_apps names an unreadable score policy in its error",
@@ -11736,11 +11810,13 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
-              nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
-                                     "crash_source_coverage", "apps_total", "apps_truncated"}));
+              nlohmann::json::array({"window", "apps", "policy", "observer_state", "population",
+                                     "population_basis", "crash_source_coverage", "apps_total",
+                                     "apps_truncated"}));
         CHECK(out["properties"].contains("crash_source_coverage"));
         const auto& policy = out["properties"]["policy"];
-        CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
+        CHECK(policy["required"] ==
+              nlohmann::json::array({"source", "revision", "fault", "interval_confidence", "tiers"}));
         CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));
         CHECK(policy["properties"]["fault"]["type"] == nlohmann::json::array({"string", "null"}));
         // The tier block is typed, not a bare object: four tiers, each a numeric edge and a string name.
@@ -26795,6 +26871,47 @@ TEST_CASE("MCP query_installed_software: a wide-scope cursor never names an out-
     CHECK_FALSE(unflagged.contains("audit_persisted"));
 }
 
+TEST_CASE("MCP query_installed_software: a cursor whose skip passes the wide-scope ceiling is "
+          "invalid params; the ceiling itself is served",
+          "[mcp][pg][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::vector<yuzu::server::SoftwareEntry> rows = {{"A", "1.0", "", ""}};
+    REQUIRE(store.apply_installed_software(
+                "agent-1", yuzu::server::SoftwareInventoryStore::canonical_hash(rows), rows, 1000) ==
+            yuzu::server::InventoryIngestOutcome::kStored);
+    McpTestServer ts;
+    ts.software_inventory_store_for_test = &store;
+    ts.start();
+
+    namespace swc = yuzu::server::software_catalogue;
+    // A well-formed cursor for the unfiltered query whose only defect is its skip.
+    const auto with_skip = [&](std::int64_t skip) {
+        const auto token = swc::encode_devices_cursor(
+            {yuzu::server::SoftwareCursor{}, skip},
+            swc::devices_fingerprint(yuzu::server::SoftwareFleetQuery{}));
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+                           R"("params":{"name":"query_installed_software","arguments":)"
+                           R"({"limit":1,"cursor":")" +
+                           token + R"("}}})");
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body);
+    };
+
+    const auto past = with_skip(swc::kWideScopeMaxSkip + 1);
+    REQUIRE(past.contains("error"));
+    CHECK(past["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(past["error"]["message"].get<std::string>() ==
+          swc::cursor_error_message(swc::CursorError::kScanLimit));
+
+    // Honest paging is untouched: a skip AT the ceiling is still served.
+    const auto at = with_skip(swc::kWideScopeMaxSkip);
+    CHECK_FALSE(at.contains("error"));
+}
+
 TEST_CASE("MCP query_installed_software: an explicit out-of-scope agent_id is audited as one denied "
           "row",
           "[mcp][pg][inventory][security]") {
@@ -29204,7 +29321,8 @@ TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallbac
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user"; // matches McpTestServer's default mock_username
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
@@ -29255,7 +29373,8 @@ TEST_CASE("MCP list_management_group_roles: ManagementGroup:Read leading gate de
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user";
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
@@ -29305,6 +29424,108 @@ TEST_CASE("MCP list_management_group_roles: neither UserManagement:Read nor "
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["message"] == "forbidden");
+}
+
+// One owner-arm predicate (mgmt_group_owner_gate.hpp), MCP surface: the tier is left to the tool
+// ladder (every /mcp/v1/ session has one), a service-scoped or engine-classed session never
+// reaches the ITServiceOwner-of-this-group arm. The engine cases are harness-only: a real engine
+// token is also stopped by the tier ladder and the engine belt before it gets here.
+TEST_CASE("MCP management-group roles tools: the owner arm refuses an engine-classed session "
+          "and still admits a human session at the same tier",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Owner Arm Engine Group";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    yuzu::server::GroupRoleAssignment owner_grant;
+    owner_grant.group_id = *created;
+    owner_grant.principal_type = "user";
+    owner_grant.principal_id = "test-user";
+    owner_grant.role_name = "ITServiceOwner";
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
+    // assign_management_group_role needs a non-null rbac_store and never dereferences it on this
+    // path (see the happy-path case below).
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    const std::string list_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,)"
+        R"("params":{"name":"list_management_group_roles","arguments":{"group_id":")" +
+        *created + R"("}}})";
+    const std::string assign_call =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,)"
+        R"("params":{"name":"assign_management_group_role",)"
+        R"("arguments":{"group_id":")" +
+        *created + R"(","principal_id":"alice","role_name":"Operator"}}})";
+
+    SECTION("list: readonly-tier engine session holding ITServiceOwner is refused") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &store;
+        ts.mock_principal_kind = "engine";
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "UserManagement" && op == "Read");
+        };
+        ts.start("readonly");
+        auto res = ts.call(list_call);
+        REQUIRE(res);
+        // The owner arm's own refusal: a JSON-RPC permission error in a 200 response.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] == "forbidden");
+    }
+
+    SECTION("assign: engine session holding ITServiceOwner is refused, nothing written") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &store;
+        ts.rbac_store_for_test = &closed_rbac;
+        ts.mock_principal_kind = "engine";
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write");
+        };
+        ts.start();
+        auto res = ts.call(assign_call);
+        REQUIRE(res);
+        // The owner arm's own refusal: a JSON-RPC permission error in a 200 response.
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+        CHECK(body["error"]["message"] == "forbidden");
+        CHECK(store.get_group_roles(*created).size() == 1); // only the owner row
+    }
+
+    SECTION("a human owner is still admitted on both tools") {
+        McpTestServer ts;
+        ts.mgmt_store_for_test = &store;
+        ts.rbac_store_for_test = &closed_rbac;
+        ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+            return !((securable == "UserManagement" && op == "Read") ||
+                     (securable == "ManagementGroup" && op == "Write"));
+        };
+        ts.start();
+        auto listed = ts.call(list_call);
+        REQUIRE(listed);
+        REQUIRE(listed->status == 200);
+        auto listed_body = nlohmann::json::parse(listed->body);
+        CHECK(listed_body.contains("result"));
+        auto assigned = ts.call(assign_call);
+        REQUIRE(assigned);
+        REQUIRE(assigned->status == 200);
+        auto assigned_body = nlohmann::json::parse(assigned->body);
+        CHECK(assigned_body.contains("result"));
+        CHECK(store.get_group_roles(*created).size() == 2);
+    }
 }
 
 TEST_CASE("MCP assign_management_group_role: happy path grants Operator, idempotent",
@@ -33243,6 +33464,16 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (a stored definition,
         // not execute_instruction's raw plugin.action); gated by the same Execution:Execute rule.
         {"execute_instruction_definition", nlohmann::json::parse(R"({"definition_id":"d"})")},
+        // #2146 batch C: InstructionDefinition:Write (owner ruling: an unticketed update can flip
+        // approval_mode to auto) and every Delete (InstructionDefinition, InstructionSet) are
+        // supervised-tier gated. create_instruction_set (InstructionSet:Write) is deliberately NOT.
+        {"create_definition",
+         nlohmann::json::parse(R"({"name":"n","type":"question","plugin":"os_info"})")},
+        {"update_definition", nlohmann::json::parse(R"({"id":"d1"})")},
+        {"delete_definition", nlohmann::json::parse(R"({"id":"d1"})")},
+        {"import_definition", nlohmann::json::parse(R"({"document":{"id":"d1"}})")},
+        {"save_definition_yaml", nlohmann::json::parse(R"({"yaml_source":"kind: x"})")},
+        {"delete_instruction_set", nlohmann::json::parse(R"({"id":"s1"})")},
         // ADR-0070 R1 (slice 2b-1a): the four RevocationSource:Write mutations are gated at the
         // supervised tier by the deliberate requires_approval() entry (removal, reset and
         // registration are all a Write, never a Delete).
@@ -37974,8 +38205,7 @@ TEST_CASE("MCP get_fleet_topology: a failed offline-roster read answers live-onl
     McpTestServer ts;
     ts.fleet_topology_store_for_test = &store;
     ts.offline_roster_fn_for_test = [](std::chrono::seconds) {
-        return std::expected<std::vector<yuzu::server::OfflineEndpoint>,
-                             yuzu::server::PresenceReadError>(
+        return yuzu::server::OfflineRosterRead(
             std::unexpected(yuzu::server::PresenceReadError::StoreUnavailable));
     };
     ts.start();
@@ -38013,9 +38243,8 @@ TEST_CASE("MCP get_fleet_topology: a healthy offline roster merges the stale hos
         ep.agent_id = "agent-off";
         ep.hostname = "host-off";
         ep.os = "linux";
-        return std::expected<std::vector<yuzu::server::OfflineEndpoint>,
-                             yuzu::server::PresenceReadError>(
-            std::vector<yuzu::server::OfflineEndpoint>{ep});
+        return yuzu::server::OfflineRosterRead(
+            yuzu::server::OfflineRoster{{ep}, /*truncated=*/false});
     };
     ts.start();
 
@@ -38034,6 +38263,63 @@ TEST_CASE("MCP get_fleet_topology: a healthy offline roster merges the stale hos
     CHECK_FALSE(payload.contains("offline_roster_degraded"));
     REQUIRE(ts.audit_details.size() == 1);
     CHECK(ts.audit_details[0].find("offline_roster_degraded") == std::string::npos);
+    CHECK_FALSE(payload.contains("offline_roster_truncated"));
+    CHECK(ts.audit_details[0].find("offline_roster_truncated") == std::string::npos);
+}
+
+// #5712. A roster past the store's row cap is a typed partial: merged, served, and flagged
+// offline_roster_truncated (body + audit), NOT degraded and NOT an error. The closure is injected;
+// the 100k-row fleet that really produces the flag is the store's own [pg] test.
+// Kills: dropping the flag, reading the partial as a failure (live-only + degraded), no audit marker,
+// and the 413 oversize path losing the marker (the viz ceiling equals the roster cap, so a truncated
+// merge is mostly reachable only there).
+TEST_CASE("MCP get_fleet_topology: a truncated offline roster is merged and flagged "
+          "offline_roster_truncated, not degraded",
+          "[mcp][integration][viz][roster_truncated]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
+                             /*ttl=*/std::chrono::seconds(60),
+                             /*fetch_deadline=*/std::chrono::milliseconds(50),
+                             /*max_snapshot_bytes=*/0};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.offline_roster_fn_for_test = [](std::chrono::seconds) {
+        yuzu::server::OfflineEndpoint a;
+        a.agent_id = "off-1";
+        a.os = "linux";
+        yuzu::server::OfflineEndpoint b;
+        b.agent_id = "off-2";
+        b.os = "linux";
+        return yuzu::server::OfflineRosterRead(
+            yuzu::server::OfflineRoster{{a, b}, /*truncated=*/true});
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["machines"].is_array());
+    CHECK(payload["machines"].size() == 3); // the live host + both merged offline rows
+    REQUIRE(payload.contains("offline_roster_truncated"));
+    CHECK(payload["offline_roster_truncated"] == true);
+    CHECK_FALSE(payload.contains("offline_roster_degraded"));
+    REQUIRE(ts.audit_details.size() == 1);
+    CHECK(ts.audit_details[0].find("offline_roster_truncated=1") != std::string::npos);
+
+    // The oversize refusal's audit row carries the marker too.
+    auto big = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{"machines_max":2}}})");
+    REQUIRE(big);
+    // It IS the oversize refusal (an error naming machines_max), not a 200 that happens to be audited.
+    const auto big_body = nlohmann::json::parse(big->body);
+    REQUIRE(big_body.contains("error"));
+    CHECK(big_body["error"]["message"].get<std::string>().find("machines_max") != std::string::npos);
+    REQUIRE(ts.audit_details.size() == 2);
+    CHECK(ts.audit_details[1].find("offline_roster_truncated=1") != std::string::npos);
 }
 
 TEST_CASE("MCP get_fleet_topology: kill switch answers before Response:Read is even "
@@ -45499,6 +45785,9 @@ TEST_CASE("MCP runtime config: the administrator-only keys are refused with a de
     auto owned = set_runtime_config_call(ts, "dex_score_policy", "{}");
     REQUIRE(owned.contains("error"));
     CHECK(owned["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    // The refusal points an MCP caller at the MCP tool, not only at the REST route.
+    CHECK(owned["error"]["message"].get<std::string>().find("set_dex_score_policy") !=
+          std::string::npos);
     for (const auto& entry : ts.audit_log)
         CHECK_FALSE(entry.starts_with("config.update"));
 }
@@ -53130,4 +53419,245 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
         CHECK((*child)->agents_failed == 2);
         CHECK((*child)->agents_unanswered == 3);
     }
+}
+
+// ── UP-14 server PR A5a: the stored per-agent ordering state on the two MCP twins ──
+// get_guardian_status gains unordered_agents / unordered_agent_ids (scoped by the same
+// require_list_read gate as errored_rules); get_guardian_device_guards gains the `ordering` block.
+// Stored and counted, not yet compared.
+namespace {
+
+void mcp_seed_paired(GuaranteedStateStore& store, const std::string& event_id,
+                     const std::string& agent, const std::string& rule_id, std::int64_t epoch,
+                     std::int64_t seq, const std::string& ts) {
+    GuaranteedStateEventRow e;
+    e.event_id = event_id;
+    e.rule_id = rule_id;
+    e.agent_id = agent;
+    e.event_type = "guard.compliant";
+    e.severity = "info";
+    e.timestamp = ts;
+    e.agent_ns = yuzu::test::iso8601_to_ns(ts);
+    e.boot_epoch = epoch;
+    e.emit_seq = seq;
+    REQUIRE(store.insert_event(e).has_value());
+}
+
+constexpr const char* kMcpStatusCall =
+    R"({"jsonrpc":"2.0","method":"tools/call","id":7301,"params":{"name":"get_guardian_status"}})";
+
+std::string mcp_device_guards_call(const std::string& agent) {
+    return R"({"jsonrpc":"2.0","method":"tools/call","id":7302,"params":{"name":"get_guardian_device_guards",)"
+           R"("arguments":{"agent_id":")" +
+           agent + R"("}}})";
+}
+
+} // namespace
+
+TEST_CASE("MCP Guardian: get_guardian_status reports the unordered agents, scoped by the list-read "
+          "gate, with the ids capped",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "U2", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_status(store, "e2", "U1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_paired(store, "e3", "P", "r1", 5, 10, "2026-06-20T10:01:00Z");
+
+    // The gate's answer is read at call time, so each section sets the scope it wants.
+    std::optional<std::vector<std::string>> scope; // nullopt = the whole fleet
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.list_read_fn_for_test = [&scope](const httplib::Request&, httplib::Response&,
+                                        const std::string&,
+                                        const std::string&) -> yuzu::server::ListReadGate {
+        return {true, scope, std::nullopt};
+    };
+    ts.start("readonly");
+
+    SECTION("the whole fleet") {
+        const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+        CHECK(d["unordered_agents"].get<int>() == 2);
+        CHECK(mcp_string_array(d["unordered_agent_ids"]) == std::vector<std::string>{"U1", "U2"});
+    }
+    SECTION("a confined caller: a hidden unordered agent neither appears nor counts") {
+        scope = std::vector<std::string>{"U1", "P"};
+        const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+        CHECK(d["unordered_agents"].get<int>() == 1);
+        CHECK(mcp_string_array(d["unordered_agent_ids"]) == std::vector<std::string>{"U1"});
+        auto res = ts.call(kMcpStatusCall);
+        REQUIRE(res);
+        CHECK(res->body.find("U2") == std::string::npos);
+    }
+    SECTION("an engaged-empty scope answers zero") {
+        scope = std::vector<std::string>{};
+        const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+        CHECK(d["unordered_agents"].get<int>() == 0);
+        REQUIRE(d["unordered_agent_ids"].is_array());
+        CHECK(d["unordered_agent_ids"].empty());
+    }
+}
+
+TEST_CASE("MCP Guardian: get_guardian_status caps the unordered ids at 50 and keeps the exact count",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    constexpr int kAgents = 55;
+    for (int i = kAgents - 1; i >= 0; --i)
+        mcp_seed_status(store, "e" + std::to_string(i), std::format("ag{:03}", i), "r1",
+                        "guard.compliant", "2026-06-20T10:01:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.start("readonly");
+    const auto d = mcp_ok_payload(ts, kMcpStatusCall);
+    CHECK(d["unordered_agents"].get<int>() == kAgents);
+    const auto ids = mcp_string_array(d["unordered_agent_ids"]);
+    REQUIRE(ids.size() == yuzu::server::kUnorderedAgentIdCap);
+    CHECK(ids.front() == "ag000");
+    CHECK(ids.back() == "ag049");
+}
+
+TEST_CASE("MCP Guardian: get_guardian_device_guards carries the ordering block, equal to the REST "
+          "data, null for an agent with no order row",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "U", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    mcp_seed_paired(store, "e2", "P", "r1", 5, 10, "2026-06-20T10:01:00Z");
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    GuardianRestTwin rest(&store, /*bl=*/nullptr);
+
+    const auto url = [](const std::string& id) {
+        return "/api/v1/guaranteed-state/agents/" + id + "/rules";
+    };
+
+    const auto u = mcp_ok_payload(ts, mcp_device_guards_call("U").c_str());
+    REQUIRE(u["ordering"].is_object());
+    CHECK(u["ordering"]["currently_unordered"] == true);
+    CHECK(u["ordering"]["epoch"].is_null());
+    CHECK(u["ordering"]["unpaired_events"] == 1);
+    CHECK(rest_twin_data(rest, url("U").c_str()) == u);
+
+    const auto p = mcp_ok_payload(ts, mcp_device_guards_call("P").c_str());
+    REQUIRE(p["ordering"].is_object());
+    CHECK(p["ordering"]["currently_unordered"] == false);
+    CHECK(p["ordering"]["epoch"] == 5);
+    CHECK(p["ordering"]["emit_seq_hwm"] == 10);
+    CHECK(rest_twin_data(rest, url("P").c_str()) == p);
+
+    const auto none = mcp_ok_payload(ts, mcp_device_guards_call("nobody").c_str());
+    REQUIRE(none.contains("ordering"));
+    CHECK(none["ordering"].is_null());
+    CHECK(rest_twin_data(rest, url("nobody").c_str()) == none);
+}
+
+TEST_CASE("MCP Guardian: a failed order read is a retryable error on both twins, never a zero",
+          "[pg][mcp][integration][guardian][ordering][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "U", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE")};
+        REQUIRE(r.ok());
+    }
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+    for (const std::string call : {std::string(kMcpStatusCall), mcp_device_guards_call("U")}) {
+        INFO(call);
+        auto res = ts.call(call);
+        REQUIRE(res);
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].get<int>() ==
+              yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(res->body.find("unordered_agents") == std::string::npos);
+        CHECK(res->body.find("\"ordering\"") == std::string::npos);
+    }
+}
+
+TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, required, typed and bounded",
+          "[mcp][integration][guardian][ordering][pair]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7303})");
+    REQUIRE(list);
+    const auto tools = nlohmann::json::parse(list->body)["result"]["tools"];
+    const auto tool = [&](const char* name) -> nlohmann::json {
+        for (const auto& t : tools)
+            if (t["name"] == name)
+                return t;
+        FAIL("no tool " << name);
+        return nlohmann::json{};
+    };
+    const auto required_has = [](const nlohmann::json& schema, const char* k) {
+        for (const auto& r : schema["required"])
+            if (r == k)
+                return true;
+        return false;
+    };
+
+    const auto status = tool("get_guardian_status");
+    const auto& ss = status["outputSchema"];
+    for (const char* k : {"unordered_agents", "unordered_agent_ids"}) {
+        INFO(k);
+        REQUIRE(ss["properties"].contains(k));
+        CHECK(required_has(ss, k));
+    }
+    CHECK(ss["properties"]["unordered_agents"]["type"] == "integer");
+    CHECK(ss["properties"]["unordered_agents"]["minimum"] == 0);
+    const auto& ids = ss["properties"]["unordered_agent_ids"];
+    CHECK(ids["type"] == "array");
+    CHECK(ids["maxItems"] == yuzu::server::kUnorderedAgentIdCap); // bound to the store's cap
+    CHECK(ids["uniqueItems"] == true);
+    CHECK(ids["items"]["type"] == "string");
+    const std::string sdesc = status["description"].get<std::string>();
+    CHECK(sdesc.size() < 4096);
+    CHECK(sdesc.find("unordered_agents") != std::string::npos);
+    CHECK(sdesc.find("not yet compared") != std::string::npos);
+
+    const auto guards = tool("get_guardian_device_guards");
+    const auto& gs = guards["outputSchema"];
+    REQUIRE(gs["properties"].contains("ordering"));
+    CHECK(required_has(gs, "ordering"));
+    const auto& ord = gs["properties"]["ordering"];
+    const auto types = ord["type"].dump();
+    CHECK(types.find("object") != std::string::npos);
+    CHECK(types.find("null") != std::string::npos);
+    for (const char* k : {"epoch", "emit_seq_hwm", "epoch_recv_ns", "retired_epoch",
+                          "unpaired_recv_ns", "currently_unordered", "unpaired_events",
+                          "unpaired_held", "pair_regressions", "pair_stragglers", "pair_recoveries",
+                          "pair_duplicates", "retired_events"}) {
+        INFO(k);
+        CHECK(ord["properties"].contains(k));
+        CHECK(required_has(ord, k));
+    }
+    CHECK(ord["properties"]["currently_unordered"]["type"] == "boolean");
+    CHECK(ord["properties"]["unpaired_events"]["minimum"] == 0);
+    const std::string gdesc = guards["description"].get<std::string>();
+    CHECK(gdesc.size() < 4096);
+    CHECK(gdesc.find("ordering") != std::string::npos);
+    CHECK(gdesc.find("pair_duplicates") != std::string::npos);
+    CHECK(gdesc.find("not yet compared") != std::string::npos);
 }

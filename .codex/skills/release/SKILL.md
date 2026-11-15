@@ -80,7 +80,7 @@ Preflight checks:
 
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
-Windows and macOS releases are agent-only (ADR-0035 ladder step 2): `release.yml` builds no Windows or macOS server and no `YuzuServerSetup`, and the Windows and macOS archives are `yuzu-agent-windows-x64.zip` and `yuzu-agent-macos-arm64.tar.gz`. `tests/test_release_agent_only.py` (Docs Lint and `meson test`) fails if a server build or an old archive name comes back, or if the archive names in `release.yml`, `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree, so there is no hand check left for this. The first release after step 2 is also the first real run of the changed Windows and macOS jobs: watch them, especially the Windows "Verify the agent runs from the packaged archive" step.
+Windows and macOS releases are agent-only (ADR-0035 ladder step 2): `release.yml` builds no Windows or macOS server and no `YuzuServerSetup`, and the Windows and macOS archives are `yuzu-agent-windows-x64.zip` and `yuzu-agent-macos-arm64.tar.gz`. `tests/test_release_agent_only.py` (Docs Lint and `meson test`) fails if a server build or an old archive name comes back, or if the archive names in `release.yml`, `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree, so there is no hand check left for this. The first release after step 2 is also the first real run of the changed Windows and macOS jobs: watch them, especially the Windows "Verify the agent runs from the packaged archive" step. Step 3 (`-Dserver`, agent-only vcpkg) adds a refusal of any server-port DLL (`libpq`, `libecpg`, `libpgtypes`, `drogon`, `trantor`, `jsoncpp`, `*xmlsec*`) in that step and makes every image-publish job wait for the builds; its first real run is the first release tag after it (an RC by plan), so watch that step and the six publish legs' start time on that run (the first-RC checks are tracked in #7597).
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
 
@@ -140,25 +140,25 @@ echo "Release workflow: https://github.com/DevNullLtd/Yuzu/actions/runs/$RUN_ID"
 The jobs run with a partial DAG (simplified; the full list follows):
 
 ```
-build-linux ─┬─ build-gateway ─┐
-             │                  ├─ docker-publish ─┐
-build-windows (parallel)        │                   │
-build-macos (parallel)          │                   ├─ release
-build-linux ────────────────────┴───────────────────┘
+release-guard ─┬─ build-linux ─── build-gateway ─┐
+               ├─ build-windows ─────────────────┼─ docker-publish (2 legs) ───────┐
+               └─ build-macos ───────────────────┤  docker-publish-chisel (3 legs) ┼─ release ─ docker-publish-agent-bundle
+                                                 └─ docker-publish-postgres ───────┘
 ```
+Every image-publish job before the release (`docker-publish`, `docker-publish-chisel`, `docker-publish-postgres`) needs ALL FOUR builds (`build-linux`, `build-gateway`, `build-windows`, `build-macos`), so the images start only after the slowest build (Windows, ~40 min); `release` needs every build and every publish job.
 
 - **release-guard** (ubuntu-24.04, seconds) — fails the run if the tag already has a published release, or if the ref is not a `vX.Y.Z[-rcN]` tag (#5282); every other job waits for it
 - **build-linux** (self-hosted Linux, ~25 min) — meson release + .deb + .rpm
 - **build-gateway** (self-hosted Linux, ~10 min, needs build-linux) — rebar3 release + .deb + .rpm
-- **build-windows** (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool
-- **build-macos** (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary
-- **docker-publish** (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push
-- **docker-publish-postgres** (~1 min) — the `yuzu-postgres` image the composes pin
-- **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux + build-gateway) — the `*-chisel` images and their SBOMs
+- **build-windows** (self-hosted Windows, ~40 min) — MSVC + InnoSetup + signtool
+- **build-macos** (self-hosted macOS, BigMags, ~30 min) — clang + codesign + notary
+- **docker-publish** (matrix server+gateway, ~15 min each, needs all four builds) — buildx + GHCR push
+- **docker-publish-postgres** (~1 min, needs all four builds as a success gate, not as an input: it holds no build artifact) — the `yuzu-postgres` image the composes pin
+- **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux, build-gateway, build-windows + build-macos) — the `*-chisel` images and their SBOMs
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
 - **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
 
-Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any job the release needs fails or is cancelled (a build job, `docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed): no GitHub release is created, but every image leg that reached its push step has already pushed `:X.Y.Z` (and `:X.Y` and `:latest` on a stable tag).
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any job the release needs fails or is cancelled (a build job, `docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed): no GitHub release is created, but every image leg that reached its push step has already pushed `:X.Y.Z` (and `:X.Y` and `:latest` on a stable tag). A failed build job is not such a case: all three image-publish jobs wait for all four builds, so a failed build, including a failed agent packaging step, pushes no versioned image (cost: the images start only after the slowest build, ~40 min, and a failed or cancelled Windows or macOS build blocks every image and the release; there is no sanctioned images-only publish path today, tracked in #7596). The chisel publish legs sit in a ref-and-image-keyed `cancel-in-progress: true` concurrency group with no SHA in the key, so a stale run's late chisel leg can cancel the newer run's leg for the same tag: another reason to cancel in-flight runs first. To recover, fix the cause and re-tag (cancel in-flight runs first), or "Re-run failed jobs" on the newest run.
 
 **Recovery: "Re-run failed jobs" on the NEWEST run for the tag. A fresh run is the fallback, not the default.** Re-running the newest run keeps every image digest and artifact its succeeded jobs already produced; only the failed jobs and those skipped behind them execute again, and every publishing step re-checks that the tag still points at this run's commit before it pushes (#5282), so a run whose tag has moved away refuses. That re-check cannot see a tag moved away and back again while two runs are in flight (#5478): **cancel every in-flight release run for a tag before you re-tag it.** "Newest run" means the newest run that got past `release-guard`; a run the guard refused has nothing to re-run. Never re-run an OLDER run (#5242): a newer run may have pushed different images, and a re-run does not repeat `release-guard`. Two cases:
 - **The `release` job did not run or failed** (a build, publish or Create Release failure): no release exists. "Re-run failed jobs" finishes the run in minutes. A fresh run also passes the guard but rebuilds and re-pushes everything with new digests (40+ min) — use it only when the newest run cannot be re-run. (Exception: when `Create Release`'s artifact gate rejects a stale package a self-hosted build job uploaded, re-running only the `release` job downloads the same file again; clear the runner workspace and start a fresh run — `docs/ci-architecture.md`, Release artifact gate.)
@@ -239,8 +239,10 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `Run EUnit tests` fails with `::error::EUnit printed no recognisable test summary` | rebar3 failed before any test ran (compile/dependency error), or its summary wording changed | Read the eunit.log head for the rebar3 error; if the wording changed, update `scripts/gateway_test_summary.py` (all gateway test gates share it). |
 | `Run EUnit tests` fails with `::error::EUnit executed zero tests` | Every EUnit set was cancelled or nothing was discovered (`Failed: 0.  Skipped: 0.  Passed: 0.`). Before #4800 this passed with only a `::warning::` | **Intentional hard fail — do not work around it.** Nothing was tested. Find the setup that crashes in every module (paste the eunit.log head) or the moved test dir. |
 | `Linking target agents/core/yuzu-agent` (or `yuzu_agent_core.dll`) fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then "Re-run failed jobs" on the newest run; see Recovery. Long-form: see `.codex/agents/build-ci.md` "Windows MSVC static-link history and #375". |
-| `Verify the agent runs from the packaged archive` fails on `build-windows` | The Windows agent archive lacks a DLL the agent or `yuzu_agent_core.dll` imports (exit `-1073741515`, STATUS_DLL_NOT_FOUND), lacks plugin DLLs, contains `yuzu-server.exe`, or the agent hung (the step kills it after 60 s) | Read the step log. A transient cause (a hang, a runner problem): "Re-run failed jobs" on the newest run, as in Recovery above. A real packaging defect needs a commit, then re-tag as Recovery describes. No GitHub Release exists yet, but the docker-publish jobs do not wait for `build-windows`, so this tag's images may already be pushed |
-| `Notarize binaries` fails with "notarization status is 'Invalid'" on `build-macos` | Apple rejected the agent binary or a dylib (only once `MACOS_SIGNING_CERT` is set; macOS signing is dormant until then) | `xcrun notarytool log <id>` with the id printed in the step log (the step prints the notarization result). Fix the signing with a commit, then re-tag as Recovery describes. No GitHub Release exists yet, but this tag's images may already be pushed |
+| `Verify the agent runs from the packaged archive` fails on `build-windows` | The Windows agent archive lacks a DLL the agent or `yuzu_agent_core.dll` imports (exit `-1073741515`, STATUS_DLL_NOT_FOUND), lacks plugin DLLs, contains `yuzu-server.exe`, contains a server-port DLL (log line `server-only DLLs in the agent archive: <names>`: a manifest, install-profile or port change that pulled a server dependency in), or the agent hung (the step kills it after 60 s) | Read the step log. A server-port DLL refusal is deterministic: the release job installs from a clean checkout, so re-running the same tag refuses again. Fix the cause (the manifest, the install line or a port at the pinned baseline) and re-tag. "Re-run failed jobs" on the newest run is only for a transient failure such as a runner or network fault (a hang), as in Recovery above. A real packaging defect needs a commit, then re-tag as Recovery describes. No GitHub Release exists yet, and all three image-publish jobs wait for `build-windows`, so no versioned image was pushed |
+| `Notarize binaries` fails with "notarization status is 'Invalid'" on `build-macos` | Apple rejected the agent binary or a dylib (only once `MACOS_SIGNING_CERT` is set; macOS signing is dormant until then) | `xcrun notarytool log <id>` with the id printed in the step log (the step prints the notarization result). Fix the signing with a commit, then re-tag as Recovery describes. No GitHub Release exists yet, and all three image-publish jobs wait for `build-macos`, so no versioned image was pushed |
+| `docker-publish-agent-bundle` fails in `scripts/build-agent-bundle.sh` with `cosign verify-blob FAILED`, `no SHA256SUMS.sigstore`, `legacy SHA256SUMS.bundle`, `hash MISMATCH`, `malformed hash`, `no line for <file>`, `ambiguous`, `no <.deb/.rpm/.pkg/Windows> installer asset`, `no SHA256SUMS on`, `no Windows archive on` / `no macOS archive on`, `cannot determine the GitHub repo slug`, `cannot derive the signer repo`, `download missing or empty`, `need cosign`, `malformed --version`, `malformed --signer-repo`, `cannot create a staging dir` or `cannot read/hash/copy` (#7529) | The script authenticates the release's `SHA256SUMS` with cosign (exact identity `https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`, issuer `https://token.actions.githubusercontent.com`) before reading it, then matches each download to ITS OWN `SHA256SUMS` line. In CI the signer is `--signer-repo ${{ github.repository }}`; by hand it comes from a fixed table (<= 0.13.x `Tr3kkR/Yuzu`, later `DevNullLtd/Yuzu`). The ONLY legitimate signers are `Tr3kkR/Yuzu` (<= 0.13.x) and `DevNullLtd/Yuzu` (after): a `cosign verify-blob FAILED` on the default path means a tampered release or the wrong download source, NOT a signer to override. Rule out first: cosign older than v2.6.2, a wrong clock, or a Sigstore/TUF network failure in cosign's output. There is no offline mode: check proxy/DNS and re-run; if it persists for about an hour, or cosign reports an expired or unverifiable trusted root, treat it as permanent and update cosign. `SHA256SUMS.sigstore` missing means a release before v0.11.0-rc1 (v0.8.0-rc0 to v0.10.0 carry neither signature file) or one assembled by hand (see Known limitations); `legacy SHA256SUMS.bundle` means a v0.7.x release (verify by hand with the exact tag-bound `--certificate-identity`); `hash MISMATCH`/`no line for` means a corrupt or tampered asset; an installer error means the release has none (or several) for the requested version (the script picks each installer by exact version-derived name, so a leftover earlier-rc installer on the same release is ignored, never bundled) | Reproduce without docker with `bash scripts/build-agent-bundle.sh --verify-only --version X.Y.Z` (needs `gh`, cosign v2.6.2 or later, `sha256sum` or `shasum`, and a git checkout; `--signer-repo owner/repo` overrides the table and prints a `[!!]` warning when it differs; **never set it to the subject cosign reports**). **Never skip the check or edit the script to get past it** and there is no skip flag by design; confirm with the operator before publishing a bundle for a release whose manifest does not verify. A transient download failure: "Re-run failed jobs" on the newest run. |
+| The `release` job's `Sign SHA256SUMS (keyless)` step fails at its own `cosign verify-blob` (#7529) | The just-made signature did not verify with the exact tag-bound `release.yml` identity. State left behind: the images are already pushed and signed (including `:latest` on a stable tag), the tag exists, NO GitHub Release was created and the agent-bundle job is skipped | "Re-run failed jobs" on the newest run (a deterministic SAN mismatch will fail again: find the cause, e.g. a changed workflow path or a moved tag). **Never widen the check to a `--certificate-identity-regexp`**; confirm with the operator before publishing a release whose manifest does not verify. |
 
 For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed ("Re-run failed jobs" on the newest run; see Recovery — or a fix and re-tag, or abort).
 
@@ -324,16 +326,19 @@ fi
 gh release download "vX.Y.Z" --pattern 'SHA256SUMS*'
 sha256sum -c SHA256SUMS
 
-# cosign: verify the keyless signature on SHA256SUMS + both images
+# cosign: verify the keyless signature on SHA256SUMS + both images, with the EXACT
+# tag-bound identity (never a wildcard). Signer = the repo that ran release.yml.
+# Tr3kkR/Yuzu only for releases <= 0.13.x
+SIGNER_REPO=DevNullLtd/Yuzu
 if command -v cosign >/dev/null 2>&1; then
   cosign verify-blob \
     --bundle SHA256SUMS.sigstore \
-    --certificate-identity-regexp '.*' \
+    --certificate-identity "https://github.com/$SIGNER_REPO/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     SHA256SUMS
   for img in yuzu-server yuzu-gateway; do
     cosign verify \
-      --certificate-identity-regexp '.*' \
+      --certificate-identity "https://github.com/$SIGNER_REPO/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       "ghcr.io/$OWNER/$img:X.Y.Z"
   done
@@ -345,8 +350,6 @@ if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 50 ) ]]; then
   gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo DevNullLtd/Yuzu
 fi
 ```
-
-**Tighten the identity regex for an auditor-grade check** (optional but recommended once you trust the infra): replace `'.*'` with `'https://github\.com/DevNullLtd/Yuzu/\.github/workflows/release\.yml@refs/tags/vX\.Y\.Z'` — that assertion fails if the signer was anything other than this repo's release workflow on this exact tag.
 
 ## Phase 5 — Compose Wizard verification
 
@@ -431,7 +434,7 @@ Releases that hit unfamiliar failure modes (the v0.10.0 download-artifact bug) h
 - **Self-hosted runner required for Linux + Windows + gateway.** The workflow assumes the self-hosted pools (`yuzu-bigtam-linux`, `yuzu-weetam-windows`, `yuzu-bigmags-macos`) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as `status=queued` for >5 min — escalate by waking the runner.
 - **No rollback.** Once `gh release create` runs, the release is public. Untagging is technically possible but discouraged once consumers exist. Prefer a follow-up patch release (vX.Y.Z+1) over rollback.
 - **Compose Wizard requires the tag's commit to have `tools/compose-wizard/`.** PR #405 merged to `main` directly. If a future release is cut from a branch that hasn't reconciled with main, the wizard won't be in the source tree and the workflow step will skip it. Preflight does NOT currently check for this — consider adding.
-- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.sigstore` will be missing and operators must verify integrity via `sha256sum -c SHA256SUMS` only.
+- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.sigstore` will be missing, `scripts/build-agent-bundle.sh` refuses such a release (it never trusts an unsigned `SHA256SUMS`), and operators must say so plainly: `sha256sum -c SHA256SUMS` alone shows the files match an UNAUTHENTICATED list, not that the release is genuine.
 
 ## Files this skill touches
 

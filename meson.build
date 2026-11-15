@@ -116,7 +116,30 @@ vcs_tag(
 
 # ── Feature summary ───────────────────────────────────────────────────────────
 build_agent    = get_option('build_agent')
-build_server   = get_option('build_server')
+# The server is Linux-only (ADR-0035 Decision 4). `server` is a feature option:
+# auto builds it on a Linux TARGET (a Linux-target cross build from any machine
+# stays legal) and skips it on any other, enabled on a non-Linux target is an
+# error, disabled never builds it. The deprecated boolean `build_server` is
+# still honoured as an extra off-switch, because build dirs and branches from
+# before ADR-0035 step 3 store or pass -Dbuild_server=false; a stored true
+# cannot turn the server on off Linux. Pinned by tests/test_server_feature_option.py.
+# These checks must stay before the first vcpkg/dependency lookup below, so a
+# non-Linux misconfiguration fails here with the ADR-0035 message.
+# Meson keeps a cross file's `system = 'Linux'` verbatim, so compare a lowercased copy.
+_server_host = host_machine.system().to_lower()
+_server_opt = get_option('server').disable_auto_if(_server_host != 'linux')
+if _server_opt.enabled() and _server_host != 'linux'
+  error('-Dserver=enabled: the Yuzu server is Linux-only and cannot be built for a ' + _server_host + ' target (ADR-0035). Build the agent here, and the server on Linux.')
+endif
+if _server_opt.enabled() and not get_option('build_server')
+  error('-Dserver=enabled contradicts the deprecated -Dbuild_server=false passed or stored for this build dir (ADR-0035 step 3). Delete the build dir and configure again (`--wipe` replays the stored options, so it does not clear this), or pass -Dbuild_server=true as well.')
+endif
+build_server   = _server_opt.allowed() and get_option('build_server')
+if not build_server and _server_host != 'linux'
+  message('Server: off (the Yuzu server is Linux-only, ADR-0035; this ' + _server_host + ' build is agent-only)')
+elif _server_opt.allowed() and not build_server
+  message('Server: off because the deprecated -Dbuild_server=false is set (use -Dserver=disabled; ADR-0035 step 3)')
+endif
 build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
 
@@ -352,13 +375,15 @@ endif
 
 # libpq — Postgres client library for the server storage substrate (ADR-0006/
 # ADR-0008). Server-only: the agent stays SQLite (ADR-0006), so agent-only
-# (-Dbuild_server=false) and cross builds must not require libpq at configure.
+# configures (-Dserver=disabled, or any non-Linux target) and cross builds must
+# not require libpq at configure.
 #
 # Linkage per platform: static .a on Linux/macOS (vcpkg static triplets);
 # **dynamic DLL on Windows** — triplets/x64-windows.cmake's base linkage is
 # dynamic and its static override is scoped to the grpc stack only, so vcpkg
-# produces libpq.dll + import lib, same as sqlite3/openssl. The release zip's
-# vcpkg-DLL sweep (release.yml `Get-ChildItem $vcpkgBin *.dll`) bundles it.
+# produces libpq.dll + import lib, same as sqlite3/openssl. Since ADR-0035 step 3
+# the release install is agent-only, so libpq is not installed there and the release
+# zip's vcpkg-DLL sweep no longer sees it (release.yml refuses it in the archive).
 # Static libpq (unix) needs the companion libpgcommon/libpgport archives
 # (scram/auth helpers) that neither cmake's FindPostgreSQL nor any imported
 # target carries — only libpq.pc's Libs.private lists them, and pkg-config
@@ -741,7 +766,7 @@ if _gw_otp_bin != ''
   # back if Linux kernel semantics ever change. `test_gateway.py`
   # honors REBAR_BASE_DIR when computing the ebin wipe path.
   #
-  # EUnit runs as SHARDS (`gateway eunit shard A`, `... shard B`), each a
+  # EUnit runs as SHARDS (`gateway eunit shard A`, `... B`, `... C`), each a
   # deterministic share of the top-level apps/yuzu_gw/test modules
   # (`test_gateway.py ... eunit --shard K/N`; partition, and why the shards
   # together run exactly what `rebar3 eunit --dir apps/yuzu_gw/test` does,
@@ -750,7 +775,11 @@ if _gw_otp_bin != ''
   # the Windows MSVC leg at 56f3e0df6 (85% of the wrapper's 540s deadline)
   # and then exceeded it as PR #5695 added modules (runs 39078203756,
   # 39103378230); compile is ~14s of that, the rest is test time (#2093:
-  # split the suite). Adding a shard: add an entry here (next letter,
+  # split the suite). On the Linux CI leg the two shards then took about
+  # 250s and 200s (2026-11); turning cover off in the shards (most of the
+  # cut), measured weights and this third shard bring the expected cost to
+  # about 100s each (measurements in scripts/gateway_eunit_shards.py).
+  # Adding a shard: add an entry here (next letter,
   # K/N with the new N on EVERY entry, its own _build_eunit_<K>) and to
   # REQUIRED in scripts/ci/assert-gateway-tests.py; the self-test checks
   # the entries stay consistent. Each shard compiles the whole test dir
@@ -767,11 +796,12 @@ if _gw_otp_bin != ''
   # the Linux cheap-suites invocation (about 111 to 122 s unsharded over eleven
   # runs on the self-hosted Linux runner, 2026-10-24) and, defined last, it used
   # to start last. 120 sits between the pg shards (160-260, a sparse rank
-  # scale) and the non-pg shards (10-50) in tests/meson.build, so both eunit
+  # scale) and the non-pg shards (10-50) in tests/meson.build, so the eunit
   # shards start first and overlap the other entries instead of trailing them.
   # Priority only orders starts: it moves no case and cannot change the total
   # work (at --num-processes 1 the order changes, the wall time does not).
-  _gw_eunit_shards = {'A': '1/2', 'B': '2/2'}
+  # `gateway ct` below carries the same priority for the same reason.
+  _gw_eunit_shards = {'A': '1/3', 'B': '2/3', 'C': '3/3'}
   foreach _gw_shard_name, _gw_shard_spec : _gw_eunit_shards
     test('gateway eunit shard ' + _gw_shard_name,
       _python3,
@@ -790,11 +820,18 @@ if _gw_otp_bin != ''
   # 2026-09-23 with the suites actually running (52 cases, cold _build_ct,
   # self-hosted CI concurrently busy on the same host): 65s Windows, 44s
   # Linux. Change this and the wrapper's value together.
+  #
+  # priority 120, as the eunit shards: at the default 0, and defined after
+  # every tests/meson.build entry, `gateway ct` (about 130s on the Linux CI
+  # leg) is queued behind the whole cheap-suites invocation, and it was the
+  # last entry of that invocation to finish in all 22 Linux CI runs sampled
+  # in 2026-11. Started with the eunit shards, it overlaps them instead.
   test('gateway ct',
     _python3,
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 600,
+    priority: 120,
     env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   message('Erlang gateway: enabled, ' + _gw_otp_desc)

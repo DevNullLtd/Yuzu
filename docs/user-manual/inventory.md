@@ -444,8 +444,8 @@ database.
   formulae and casks carry one; the other ecosystems have no registered Package-URL type, so
   their `purl` is empty, and so is the Homebrew presence row. The server stores it only from the
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
-  value is indexed, and the store can look up the devices carrying exactly one `purl`; the
-  dashboard and the API do not return it yet.
+  value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
+  installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -798,6 +798,15 @@ curl -H "Authorization: Bearer $TOKEN" \
 # The same for a component bundled inside applications (empty until agents report components):
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software/components?name=log4j-core&version_min=2.0&version_max=2.14.1"
+# The same range as a vers: string (percent-encoded: >= is %3E%3D, | is %7C, < is %3C), which can
+# also express several intervals and exclusions. Rows come back identical to version_min/version_max:
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&vers=vers:generic/%3E%3D3.0.0%7C%3C%3D3.0.6"
+# Who runs exactly this package? Search by Package URL (the canonical form, qualifiers and all,
+# matched exactly). The purl holds `?` and `&`, so let curl URL-encode it:
+curl -G -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'purl=pkg:deb/debian/openssl@3.0.11-1?arch=amd64&distro=debian-12' \
+  "$SERVER/api/v1/inventory/software"
 # Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
 curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
@@ -806,20 +815,36 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
   `ecosystem`, `source` (exact), `match` (`exact`, `prefix` or `contains` for `name`),
-  `version_min` / `version_max` (inclusive version range), `status`, `limit` (max 1000; 10000
+  `version_min` / `version_max` (inclusive version range), `vers` (the same range as a
+  `vers:<scheme>/...` string), `purl` (exact Package URL), `status`, `limit` (max 1000; 10000
   with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
   `agent_id` for a fleet-wide scan. The full parameter and error tables are in
   [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
   `cursor` is REST-only (the MCP tool takes only those).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
-  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 22 fields: the 14
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
   release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
   ecosystem does not store them (see the availability matrix above); `source` is the
   `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
-  `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
-  `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
+  `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
+  `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
+  tool's rows keep the 14 package fields until its twin catches up.
+- **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
+  purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
+  so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
+  turns `totals` off (`totals_omitted: "filters"`). `vers=` is the
+  same range as `version_min` / `version_max`, written `vers:<scheme>/<constraint>|...` with
+  comparators `=` `!=` `<` `<=` `>` `>=` (`*` alone matches every version that has one); a row
+  with an empty version is outside every range, `*` and a `!=`-only range included, and is
+  selected with a present-empty `version=`. It needs `name` with
+  `match=exact` and is not combined with `version`, `version_min` or `version_max`. The
+  schemes `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are accepted and are **all
+  compared with the one catalogue comparator**, so a scheme's own edge ordering (Maven
+  qualifiers, PyPI post and dev releases, written epochs) can differ from the scheme's rules;
+  `deb` and `rpm` are refused by name and any other scheme is a `400`. The components route
+  takes `vers` too; it has no `purl`.
 - **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
   (install rows and distinct devices); a management-group-confined caller gets its rows and
   `totals: null` with `totals_omitted: "scope"`: **null means not shown, never zero**. The
@@ -871,7 +896,7 @@ the last row you were served and skips the rows already scanned (a row inserted 
 that span, or a scope that widens between pages, can make a walk miss or repeat a row, the
 same class as the `install_id` churn noted for a concurrent resync). A continuation's skip is
 a position count, so a long run of out-of-scope rows costs proportionally more to resume, and
-a statement timeout there degrades the page to a 503 (tracked in #5698). Keep paging until
+a statement timeout there degrades the page to a 503 (tracked in #5698). A continuation that would pass over more than 100 000 out-of-scope rows since the last row served is refused (the dashboard shows the same text as a notice) (`cursor refused: more than 100000 rows outside the caller's scope were passed since the last row served; narrow the filter (name, version or agent_id) and restart from the first page, or page with a scope of at most 10000 devices`): in page mode that is 25 consecutive empty pages of the maximum size, and an export, which reads up to 10 000 rows per request, reaches it after a few continuations. The limit is checked when a cursor is presented, so a `next_cursor` the server handed out can itself be refused on use; narrow the filter and restart from the first page, or page with a scope of at most 10 000 devices. Keep paging until
 `next_cursor` is `null`.
 
 ### REST: software title catalogue
@@ -925,6 +950,26 @@ place, **Hardware** and **Software**, each its own page:
   unavailable"** / **"Tags unavailable"** banner (never silently "no CI"/"no tags") —
   distinct from a single device that simply hasn't synced yet, which still shows a plain
   `—` placeholder in just that cell.
+
+  **Online** on the Hardware list means the device holds a session on the
+  server answering the request, or the database says it is connected to some server (it has
+  recorded a session and been seen within the presence window, the server's session timeout,
+  90 seconds by default). The database half is read in the same statement as the roster, so
+  there is no second read to fail: on a deployment with more than one server replica a device
+  connected to another replica reads Online, on the list, the per-device record, `GET
+  /api/v1/hardware/{id}` and MCP `get_hardware_ci` alike, and the Online/Offline filter, the
+  status sort and the Online and Offline tiles agree with it. Limits that remain: a device that
+  drops without saying goodbye reads Online until the window passes; a device that has just
+  connected or reconnected to one replica (its first heartbeat there has not recorded a session
+  yet, at most one heartbeat interval, 30 seconds by default) reads Offline on the other
+  replicas until it does; and a device connected to another replica reads Online but is not
+  reachable from this one, so actions that need a connection to the answering server, such as
+  **Sync now**, stay unavailable on its record (the sync route answers 503, "agent is not
+  connected"). The Hardware list reads the session timeout as currently configured; the
+  registry's own presence read, which the Home figure uses whenever it can answer (and the
+  Home page caches that figure for 60 seconds), keeps the value the server started
+  with until it is restarted, so the two can differ after a runtime change of
+  `heartbeat_timeout`.
 
   **Click a device** (or visit `/hardware/ci?id=`) for its record — a seven-tab CI
   record, gated per device on `Inventory:Read` for the device's management group
@@ -1142,13 +1187,45 @@ synced yet") / degraded (an explicit "CI record unavailable" banner) are never
 conflated.
 
 The Hardware list and its KPI strip serve at most the 100,000 most recently seen
-endpoints within the 30-day window; a fleet above that sees a capped list without a
-warning (a truncation signal is tracked in #5712). The cap counts distinct enrolled
+endpoints within the 30-day window. A fleet above that sees a **"Partial list"** notice
+above the table (and `roster_truncated: true` with `roster_cap: 100000` in the REST and
+MCP bodies): the list is still served, it holds the newest 100,000, and everything that
+counts it is a lower bound. The KPI counts (Total, Online, Offline, Stale) are shown as
+"at least" (`≥`), the REST `total_matching`, `pagination.total`, `devices_omitted` and
+`kpis.*` are lower bounds, and a search or filter that finds nothing does **not** prove a
+device does not exist. Open the device's record, or call `get_hardware_ci` /
+`GET /api/v1/hardware/{id}`, to confirm one device: that read goes straight to the
+device's row and is exact at any fleet size (for a device seen within the roster window). The notice is worked out afresh on every
+read, so it disappears by itself when the fleet is back under the cap; the list is never
+refused because of it. The Dashboard's device estate for a caller with fleet-wide read is
+an exact count of every endpoint in the window, so it can read higher than the Hardware
+list's "at least" figure on a fleet over the cap; a caller confined to a scope sees the same
+"at least" label on the Dashboard. The cap counts distinct enrolled
 `agent_id`s seen in the window: a device that disconnects cleanly stays listed as
 Offline for the full 30 days (#5678), and a device re-enrolled under a new `agent_id`
 appears as two rows until the old one ages out. The per-device record's offline
-identity fallback reads the same capped set, so an offline device outside it shows no
-identity and, with nothing else synced, reads as not found.
+identity fallback is a direct lookup by `agent_id` within the same 30-day window, so an
+offline device outside the newest 100,000 still shows its identity. The Software and
+Quarantine pages' hostname column is display-only and reads the same capped roster: a
+device outside it shows its `agent_id` in place of the hostname.
+
+The KPI strip's other figures are derived from the same capped roster: the CI-coverage count,
+the manufacturer counts and "Showing a-b of N" are lower bounds too, while the median memory
+and the CI-coverage ratio describe only the listed devices. The notice says so, though only the
+four count tiles carry the `≥` mark.
+
+### Known limits above 100,000 devices
+
+The roster cap is a display and read cap, not a tested capacity. Above it:
+
+- The Hardware CI columns come from a separate read with its own 100,000-row cap (ordered by
+  hostname), so CI columns can be blank for devices that are listed (#7549).
+- Fleet topology answers `413` above the ceiling and cannot be raised past it (#7550).
+- The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
+  the Software page, show only devices inside the capped roster (a host outside it appears as
+  its `agent_id`, or not at all in the type-ahead).
+- Search, filter and sort run over the capped set, and there is no way to page past the cap
+  (#7567). A device seen within the window is always reachable by its id.
 
 A decommissioned device is removed from the roster when `DELETE /api/v1/sle/agents/{id}`
 deletes its stored record (#5682); a still-enrolled agent that heartbeats again re-creates
@@ -1512,7 +1589,7 @@ rollout) are not counted, so a zero there does not rule out a skipping collector
 
 **A Windows device's installed-application rows are marked unconfirmed although the agent is healthy.** Since the #4711 hardening, an Uninstall registry root that cannot be opened or enumerated to the end, or one application subkey whose open fails (access denied above all) or whose name exceeds 255 characters, makes `list_inventory` return rc 1, and the daily sync reports a status-only `installed_apps.list_inventory` section rather than committing a shorter inventory as authoritative; the server keeps the device's last good application rows, shown as unconfirmed, and every other source is still sent. `list` and `query` return the `error|` row with rc 1 for the same condition. The agent log carries both halves: `installed_apps: Uninstall root <HKLM-64|HKLM-32|HKCU> could not be fully read -- the collection is degraded` and `sync: installed_apps.list_inventory rc=1 — reported constrained`. Fix the ACL (the agent runs as LocalSystem) and the next 24 h cycle re-collects and a full section confirms the rows. The section's token and the unconfirmed marker are the signals; there is no skip counter for this condition, because the report is still sent.
 
-**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed.
+**The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed. A fleet with more than 100,000 endpoints in the window is **not** this fault: it shows the "Partial list" notice with the table, and `yuzu_server_agent_presence_roster_truncated_total` counts each truncated read (a steady state on such a fleet, so it has no alert). The per-device record's identity lookup counts its own failures under `op="find_within"` of the same failure counter.
 
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
@@ -1545,6 +1622,19 @@ The server turns every distinct installed-software title into a stable identity 
 - **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no vendor (a `via:` label: `git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
 - **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
 - **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
+
+### Software lifecycle (server store)
+
+The server keeps the dates after which a software title or an operating system version is past support, so a later software view can say whether an installed version is supported. Only the store and the evaluator exist so far: nothing reads it yet (no REST route, MCP tool, page or background job), and no host reports lifecycle dates yet.
+
+- **Two tables, no stored state.** Rules (`lifecycle_rule`) carry a product key, a version prefix, an event (`end_of_support` or `end_of_life`), a date and the public page the date came from. Host-declared facts (`lifecycle_declared`) carry a product key, one exact version, an event, a date and when a host last repeated it. A fact is global: one row per distinct date, never one per host. The state of a version is computed on every read from those two tables, so changing a rule or correcting a date never leaves an old answer behind.
+- **Keys.** A software title is `product:` plus its registry key (for example `product:postgresql:postgresql`). An operating system is `os:<distro id>` on Linux (the version is the distro version), or `os:windows` / `os:macos` with the OS version.
+- **States.** `end_of_life` once the end-of-life date has arrived, else `end_of_support` once the end-of-support date has, else `supported` when at least one date is known and it is still ahead, else `unknown`. A version with no rule and no fact is always `unknown`, never `supported`. Every answer names the date and source of each event it resolved; an answer from a rule also names the public page its date was read from, and a host-declared date has no page.
+- **Which date wins.** Per event: a host-declared date that a host repeated in the last 48 hours first; then `external`, then `imported`, then `shipped` rules; then, only when nothing else exists, a declared date no host has repeated lately, reported as `unconfirmed`. If current declared dates differ, the earliest wins and the answer is flagged as a conflict. A rule tier that disagrees with the winner also raises the conflict flag and is listed. Inside one tier the longest dot-component version prefix wins (`3.8` covers `3.8.10`, not `3.80`; an empty prefix covers every version).
+- **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
+- **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
+- **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
+- **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)
 

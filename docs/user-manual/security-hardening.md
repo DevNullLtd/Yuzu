@@ -452,6 +452,31 @@ Five classes that used to appear on this list no longer belong on it:
   one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
   all-operators emergency procedure is in
   [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
+
+  **Deactivated local accounts and sessions.** For accounts held in the Yuzu
+  local account store and deactivated through the product, once every server
+  replica runs this release, a session of that account is rejected on every
+  replica within about one second of the deactivation committing on a healthy
+  generation poll, even if the deactivation's session cleanup failed. Limits:
+
+  - Local accounts only. OIDC and SAML sessions are ended by the linked-identity
+    revoke of the deprovision, not by this check; API tokens and MCP tokens are
+    unchanged.
+  - Mixed-version operation and out-of-band SQL changes to `auth.users` are
+    outside the guarantee. An out-of-band change bumps no generation, so a
+    replica with a warm cache can keep serving the session until the next
+    generation change.
+  - Up to about 30 seconds while a replica's generation poll fails.
+  - Deleting an account and recreating it under the same name is keyed on the
+    username only, so a surviving session of the old account is not ended by
+    the check.
+  - The refusal writes no audit row. The evidence is the deactivation's audit
+    row plus the aggregate counter `yuzu_auth_session_account_inactive_total`.
+  - A deactivation can now fail with `503`, leaving the account active, when
+    its session write-generation write cannot complete (see
+    [Auth database recovery](../ops-runbooks/auth-db-recovery.md#scim--dashboard-deprovision-returns-500-sessions_db_error)).
+
+  Details: `docs/auth-architecture.md`, "Account state at session validation".
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
@@ -488,7 +513,7 @@ The agent deduplicates commands by `command_id` so a captured or redelivered com
   - **How you see it.** The agent logs an error naming the quarantined file, increments the agent-local counter `yuzu_agent_dedup_quarantined_total`, and reports the `yuzu.dedup_quarantined` heartbeat tag. `yuzu.dedup_degraded` stays `0` because protection is active again. The tag is a per-process value, so it returns to 0 when the agent restarts even though the quarantined files remain; the log line and the files themselves are the lasting record.
   - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery. They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
   - **What is not replaced.** A file that still opens but has a few damaged pages is deliberately **not** replaced (that would discard commands that are still running); the agent keeps using it and only the commands that hit a damaged page run undeduplicated, counted in `yuzu.dedup_claim_errors`.
-  - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
+  - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory, or a data directory on a filesystem without hard links, for example exFAT, or a network share whose server does not provide them: the quarantine claims its name with a hard link and never falls back to a plain rename), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions, move the data directory to a filesystem with hard links (NTFS, ReFS, ext4, xfs or APFS), or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
   - **Unsupported.** Running two agent processes against one data directory is not supported; recovery protects the quarantined evidence from being overwritten, not the live store from the other process.
 
 No configuration is required — replay protection is on by default (see Degraded mode and Corrupt store recovery for the cases where it is not in force).
