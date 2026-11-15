@@ -66,6 +66,14 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   scores), Score, Crashes, Hangs, Devices affected, Share affected, Rate per 1,000 and Last seen.
   The application name links to the per-application blast-radius drill-down, which counts every
   platform; with a platform selected the page says so under the table.
+- **Keyboard.** The sub-navigation tabs, the filter chips and the text links (an application name,
+  the drill-down and back links, the link to Scoring) are native buttons: each takes focus in the
+  normal tab order, opens with Enter or Space, and shows a focus ring. They look the same as before.
+  The per-version "devices" link on the App Performance trend is a native button too. These
+  controls on the DEX pages are still pointer-only: the cards (the Overview's explore cards, its
+  hardware cards and the Catalogue's family cards), the clickable rows (a signal row in a
+  Catalogue family, and a signal-history row on a device), and the text links on the Network tab
+  (its drill-down links and its back link).
 - **Platform and window.** Native buttons (keyboard-reachable) choose All platforms, Windows,
   macOS or Linux (default All platforms) and 24h, 7d, 30d or All. Every figure is restricted to the
   selected platform; share, rate and score use the devices online now, while crashes, hangs,
@@ -80,13 +88,25 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   [Scoring](#scoring) tab). With nothing stored the policy line reads `default, revision default`,
   which are the shipped policy's own source and revision. The lowest tier has no stored edge, so
   it prints as `below` the Fair edge. A stored policy that was refused is named in a warning, with
-  the shipped defaults in force. The interval confidence level is shown on the page only; it has
-  no key in the Apps API payload.
+  the shipped defaults in force. The interval confidence level is the payload's
+  `policy.interval_confidence`, and the page prints the model's value.
 - **What complete and partial mean.** The caption states what the agent is built to collect on
-  each platform (`complete` on Windows, `partial` on Linux and macOS), not a live check of each
-  device. A host running with `--dex-disable` (`YUZU_AGENT_DEX_DISABLE`), or whose observer is not
-  armed (counted by `yuzu_fleet_agents_dex_observer_disarmed`), reports nothing, stays in the
-  online population, and the list cannot show that.
+  each platform (`complete` on Windows, `partial` on Linux and macOS) by design, not a live check of
+  each device. The live half is a count beside it, `Observers now`, per platform in scope: how many
+  of the devices online now report the crash and hang observer **armed**, **not armed** (it failed
+  to arm, or a channel went deaf) or **not reporting**. A device counts as not reporting when it
+  sends no observer state: the agent runs with `--dex-disable` (`YUZU_AGENT_DEX_DISABLE`), it is on a
+  build with no observer, or the server has no recent heartbeat for it (older than 90 seconds); these
+  cases cannot be told apart. Armed means the device's observer is running with at least one source;
+  it does not confirm that every crash source on the device is readable. When any device is not
+  armed or not reporting, the caption adds that such a device may not be sending all of its crash
+  and hang signals (collection can be incomplete or unavailable), so a quiet list does not cover
+  it. The counts come
+  from the same snapshot the population is counted from, so the rows add up to the population
+  (under All: Windows, Linux, macOS and Other platforms, the last for any operating system the server
+  does not recognise). When no observer source is wired the caption has no `Observers now` sentence
+  and the payload's `observer_state` is `null`: unknown, never zero. The fleet total of not-armed
+  devices is also `yuzu_fleet_agents_dex_observer_disarmed`.
 - **Share and rate.** Share affected is the affected online devices out of the population, with
   its interval and the count it was divided by. Rate per 1,000 is the online events per 1,000
   online devices, with its interval and the population. A share on fewer than 20 affected online
@@ -105,9 +125,9 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   application with no name reads `<unknown>` and has no drill-down link.
 - **Score.** The chip shows the tier name from the policy in force, coloured by the tier position,
   and opens in place to the named deductions (breadth, crashes, hangs, regression) and the score.
-  An override row shows the override's own tier name; the Apps payload does not carry it (it has
-  the global tier names and `profile: override`), and it is in
-  `GET /api/v1/dex/score-policy`. Regression always reads `not assessed` here, because the Apps
+  An override row shows the override's own tier name; the payload's `score.tier` carries the
+  name each score reads as, resolved once under the policy that scored the row (null when the score is
+  withheld). Regression always reads `not assessed` here, because the Apps
   read has no per-version exposure to compare, and it is never printed as 0 points. A withheld
   score reads `Withheld` and says why in words: some affected devices are offline, no population
   to score against, counts that disagree, a faulty score policy, or below the reporting floor
@@ -117,17 +137,46 @@ no `agent_id` and, like the REST and MCP reads of the same model, it is not audi
   `unknown version`; an application with none says `version not collected`). Up to 20 versions per
   application and 100 applications are listed, those with the most devices affected, and a note
   gives the numbers when either list is cut. The page reads the model once; the expanders open
-  without another request.
-- **Failures.** A read that could not be completed (the store unavailable or busy, or the stored
-  score policy unreadable for longer than the 60-second last-good window) is an error panel that
-  shows no population, coverage, policy or interval line and no table; it is never an empty
-  list. The panel prints the reason when the read names one; with none (a busy or unavailable
-  store) it suggests a shorter window, since 30d and All are the slowest reads, except at 24h,
-  the shortest window, where it makes no such suggestion. In both cases it points to PostgreSQL
-  health if the failure persists. A stored policy that is present but
+  without another request. An opened expander also exposes one sentence, visually hidden, to assistive
+  technology (the version rows follow in the table), so the opened region is never empty. A closed
+  one exposes only its summary.
+- **Failures.** A read that could not be completed is an error panel that shows no population,
+  coverage, policy or interval line and no table; it is never an empty list. The panel's wording
+  follows the cause, and the cause is printed as a code token for every cause except `invalid_scope`,
+  whose panel names the platform filter instead. The REST `503` and the MCP error carry the same
+  token. The page answers `200` for every cause so the panel is shown.
+
+  | Reason | What the page says | What to do |
+  |---|---|---|
+  | `concurrency_budget` | Application stability is busy: the server is running as many of these reads as it allows. | Try again in a moment (at most four run at once). |
+  | `pool_acquire_timeout` | The same busy panel. | Try again in a moment; if it persists the database pool is saturated. |
+  | `statement_timeout` | The read took too long for this window; choose a shorter window (30d and All are the slowest). At 24h: this is already the shortest window; check PostgreSQL health. | Choose a shorter window; at 24h check PostgreSQL. The database cancelled the statement (an administrator cancel reads the same). |
+  | `score_policy_unavailable`, `score_policy_invalid` | The stored score policy could not be used; check it in Scoring. | Open [Scoring](#scoring). The stored policy was unreadable for longer than the 60-second last-good window, or failed validation. |
+  | `store_not_open`, `query_error` | The database read failed; check PostgreSQL health. | Check PostgreSQL health. |
+  | `not_wired` | The generic panel with the token: no DexApi is wired for the page. | A server configuration fault; the server logs it. |
+  | `internal_error` | The generic panel with the token: the handler failed unexpectedly. | The server logs the cause (one line per minute). |
+  | `invalid_scope` | Unknown platform: choose a platform above. | Pick All platforms, Windows, macOS or Linux. |
+  | none | The generic panel; it suggests a shorter window except at 24h, and points to PostgreSQL health. | As above. |
+
+  A stored policy that is present but
   refused is not a failure: the page scores under the shipped defaults and a warning names why. A
   healthy read with nothing recorded says `Nothing recorded`, and on a platform whose crash
   sources are partial that an empty list is not proof of stability.
+- **Marked characters.** An application, process, version, module, cohort, management group or
+  device name that contains a bidirectional control or a zero-width character prints that character
+  as visible text, `<U+202E>` for example, instead of acting on it, so two names that differ only
+  by an invisible character never look identical, and a right-to-left override cannot reverse the
+  text around it.
+  The set is exactly U+061C, U+200B to U+200F, U+202A to U+202E, U+2060 to U+2064, U+2066 to U+2069 and
+  U+FEFF. Ordinary spaces (U+00A0, U+2000 to U+200A, U+2028, U+2029, U+3000) are not marked. A name is
+  marked, never stripped. Only text the page prints is marked: tooltips, the application search box
+  and the values of the filter, scope and cohort drop-downs keep the exact bytes, because the browser sends
+  them back and a marker there would stop the filter matching its own entry. A legitimate zero-width
+  joiner (an emoji sequence, Persian text) also prints as a marker. A management group's name is
+  marked in the App Performance Scope selector and in the page subtitle. This covers the DEX pages
+  only (Overview, Apps, Catalogue and its drill-downs, Performance, App Performance, the app and
+  device drill-downs); the Network tab (the cohort and device names it prints), the device,
+  inventory, software and Echo pages do not mark these characters yet.
 
 The page reads from the shared Apps model, not from the Overview's top-apps aggregation, and
 adds no agent collection. The app detail page cross-links to per-version CPU & memory
@@ -137,7 +186,7 @@ exact match, not a name-normalized guess. Attribution of repository/install/serv
 originating app is a follow-on slice; the Apps tab scopes to crash and hang signals only.
 The Apps API (`GET /api/v1/dex/apps`) now also carries per-version
 figures, the devices in the chosen platform scope online now as the population, exact intervals and the stability score with its
-decomposition (the share and rate count only affected devices that are online now, so one population on both sides, while the crash and device counts cover the whole window; the score is withheld as `offline_affected` when any affected device is offline, which on a fleet with laptops or off-hours devices will be the common case for applications with several affected devices; the figures vary with the time of day, so read the share and rate against `distinct_devices_online` / `distinct_devices`, see #5894 for an offline-aware score). The API names the score policy in force on every response (`policy`: source, revision, the four tier edges and names, and a `fault` when a stored policy document was refused), and marks each application whose tiers, weights or model parameters a per-application override changed (`profile`). The policy also carries the scoring model parameters: the per-device event cap (default 5) and the regression full-weight and start ratios (defaults 3.0 and 1.0), each also settable per application, and the interval confidence level (default 0.95, global only), which sets the level of the Apps share and rate intervals. A policy document is written as version 2 only when one of them differs from its default or a per-application override sets one; every other policy keeps its version 1 text. An invalid stored policy scores under the shipped defaults and says so, never half-applied. When the stored policy cannot be read, the last good one is used for up to 60 seconds; once it is older than that (at once when there is none) the read fails instead of scoring under a guess. Write the policy with [`PUT /api/v1/dex/score-policy`](rest-api.md#get--put--delete-apiv1dexscore-policy) (and remove it with `DELETE`); the [Scoring](#scoring) tab edits the same document, and an agentic worker uses the MCP tools `get_dex_score_policy`, `set_dex_score_policy` and `reset_dex_score_policy` (#6087; `set` and `reset` need a supervised-tier token and `reset` needs an approval ticket, see the [MCP guide](mcp.md)). Until one is written every response reports the shipped defaults, unless the `dex_score_policy` row was written directly in the database. The API takes a `platform` scope (`all`, `windows`, `macos`, `linux`; default `all`, so a caller that wants the former Windows-only figures passes `platform=windows`) and carries a `crash_source_coverage` object saying whether the crash sources for each platform in scope are `complete` (Windows) or `partial` (Linux and macOS, so an empty list there is not proof of stability). `all` covers every connected device, including any whose reported operating system is not recognised, and a subject seen on several operating systems is one row, so the `all` figures can exceed the sum of the per-platform results. `crash_source_coverage` states the shipped design of the crash sources, not live collector health. On a small Linux or macOS estate a single-platform scope can show one device's application figures at the one-device floor; the figures carry no agent identity and the floor is a standing decision. The API keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), lists per-version rows, and scores over the devices online now, the same figures the tab shows. The App Performance tab's per-version crash and hang series
+decomposition (the share and rate count only affected devices that are online now, so one population on both sides, while the crash and device counts cover the whole window; the score is withheld as `offline_affected` when any affected device is offline, which on a fleet with laptops or off-hours devices will be the common case for applications with several affected devices; the figures vary with the time of day, so read the share and rate against `distinct_devices_online` / `distinct_devices`, see #5894 for an offline-aware score). The API names the score policy in force on every response (`policy`: source, revision, the confidence level of every interval as `interval_confidence`, the four tier edges and names, and a `fault` when a stored policy document was refused), carries the tier name each score reads as (`score.tier`, null when withheld) and the live observer counts (`observer_state`, per platform: `armed`, `disarmed`, `none_reported`; null when no observer source is wired), and marks each application whose tiers, weights or model parameters a per-application override changed (`profile`). The policy also carries the scoring model parameters: the per-device event cap (default 5) and the regression full-weight and start ratios (defaults 3.0 and 1.0), each also settable per application, and the interval confidence level (default 0.95, global only), which sets the level of the Apps share and rate intervals. A policy document is written as version 2 only when one of them differs from its default or a per-application override sets one; every other policy keeps its version 1 text. An invalid stored policy scores under the shipped defaults and says so, never half-applied. When the stored policy cannot be read, the last good one is used for up to 60 seconds; once it is older than that (at once when there is none) the read fails instead of scoring under a guess. Write the policy with [`PUT /api/v1/dex/score-policy`](rest-api.md#get--put--delete-apiv1dexscore-policy) (and remove it with `DELETE`); the [Scoring](#scoring) tab edits the same document, and an agentic worker uses the MCP tools `get_dex_score_policy`, `set_dex_score_policy` and `reset_dex_score_policy` (#6087; `set` and `reset` need a supervised-tier token and `reset` needs an approval ticket, see the [MCP guide](mcp.md)). Until one is written every response reports the shipped defaults, unless the `dex_score_policy` row was written directly in the database. The API takes a `platform` scope (`all`, `windows`, `macos`, `linux`; default `all`, so a caller that wants the former Windows-only figures passes `platform=windows`) and carries a `crash_source_coverage` object saying whether the crash sources for each platform in scope are `complete` (Windows) or `partial` (Linux and macOS, so an empty list there is not proof of stability). `all` covers every connected device, including any whose reported operating system is not recognised, and a subject seen on several operating systems is one row, so the `all` figures can exceed the sum of the per-platform results. `crash_source_coverage` states the shipped design of the crash sources, not live collector health; `observer_state` is the live count. On a small Linux or macOS estate a single-platform scope can show one device's application figures at the one-device floor; the figures carry no agent identity and the floor is a standing decision. The API keeps the 100 applications affecting the most devices (`apps_total` and `apps_truncated` report the cut), lists per-version rows, and scores over the devices online now, the same figures the tab shows. The App Performance tab's per-version crash and hang series
 (`GET /api/v1/dex/perf/app`) is separate from the per-version figures this tab shows: see
 "Fleet-wide application performance" under Drill-downs.
 
@@ -334,6 +383,8 @@ platform coverage, and the privacy model are on the
 **Window selector.** `24h / 7d / 30d / All` rescopes every signal view.
 Drill-downs opened from a panel inherit the window you were viewing, so the
 numbers match.
+The Scoring and Alerts tabs open on the window you chose. The Network tab has no window of
+its own, so leaving it, and the Scoring **Reload** button, still return to 7d.
 
 ## Drill-downs
 

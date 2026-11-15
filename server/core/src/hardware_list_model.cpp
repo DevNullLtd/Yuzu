@@ -928,6 +928,10 @@ void apply_tag_read(InventoryDevicesResult& result,
             r.tags.assign(it->second.begin(), it->second.end());
 }
 
+bool roster_row_online(const OfflineEndpoint& e, const std::unordered_set<std::string>& local_ids) {
+    return e.live || local_ids.count(e.agent_id) > 0;
+}
+
 std::expected<std::optional<InventoryDeviceRow>, PresenceReadError>
 offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
                      std::string (*human_age)(std::int64_t)) {
@@ -942,11 +946,15 @@ offline_identity_row(const OfflineEndpointRead& ep, std::int64_t now_ms,
     r.os = e.os;
     r.agent_version = e.agent_version;
     r.arch = e.arch;
-    r.online = false;
+    // #7551: `live` is the database's answer (a non-blank session whose last_seen_at is inside the
+    // presence TTL), so a device connected to ANOTHER replica reads online here instead of being
+    // hard-coded offline. It is only set when the point read was given a TTL; a read without one
+    // leaves it false, which this maps to offline exactly as before.
+    r.online = e.live;
     const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
-    r.stale = age_ms > kHardwareStaleAfterMs;
-    r.last_seen = human_age(age_ms);
-    r.last_seen_ms = e.last_heartbeat_ms;
+    r.stale = age_ms > kHardwareStaleAfterMs; // the same test the list applies
+    r.last_seen = r.online ? std::string("now") : human_age(age_ms);
+    r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
     return std::optional<InventoryDeviceRow>{std::move(r)};
 }
 

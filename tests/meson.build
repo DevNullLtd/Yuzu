@@ -1493,6 +1493,7 @@ if build_server
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired as the post-read stage (registry + HttplibRouteSink wrapper), over a real httplib::Server (no PG)
       'unit/server/test_post_read_stage.cpp', # PostReadStageRegistry + HttplibRouteSink handler wrapper: order, short-circuit, install guards, unwrapped servers (no PG)
+      'unit/server/test_http_response_policy.cpp', # HEAD refusal + measured-quality brotli composed into HttplibRouteSink (pure, no socket, no PG)
       'unit/server/test_model_param_to_params.cpp', # model_detail::to_params: key-sorted copy of httplib params for the pure parsers (no PG)
       'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
@@ -1536,6 +1537,8 @@ if build_server
       'unit/server/test_audit_store.cpp',
       'unit/server/test_background_jobs.cpp',
       'unit/server/test_pg_retention_guard.cpp',
+      'unit/server/test_pg_collation_check.cpp',
+      'unit/server/test_pg_collation_recheck.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
       'unit/server/test_audit_token_hostile_bytes.cpp',
@@ -1898,6 +1901,7 @@ if build_server
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
       'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
+      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, scanned from server.cpp at test run time
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -1906,6 +1910,8 @@ if build_server
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_command_v1_routes.cpp', # POST /api/v1/commands (#2146): exact send sets over a real AgentRegistry, destructive gate, zero-reach table, audit fail-closed
       'unit/server/test_instruction_execute.cpp', # #2146: the shared instruction-definition execute core + the v1 REST twin; every store is a Ports seam (the [pg]-tagged wedge cases alone use a real ExecutionTracker + reaper)
+      'unit/server/test_instruction_authoring_routes.cpp', # #2146 batch C: the v1 instruction-definition and instruction-set authoring twins + the shared request builders (the [pg]-tagged cases use a real InstructionStore)
+      'unit/server/test_mcp_instruction_authoring.cpp', # #2146 batch C: the nine MCP authoring twins via tools/call on a real McpServer (the [pg]-tagged cases use a real InstructionStore + ApprovalManager)
       'unit/server/test_dispatch_zero_reach.cpp', # classify_zero_reach: pure cause priority, protective suppression, tokens, retryable (new v1 routes / MCP tools)
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
       'unit/server/test_plugin_result_audit.cpp', # registry.write audit extraction from mutating-action output frames (pure) + live ingest on both frame paths
@@ -4365,6 +4371,17 @@ test('guardian_backend reader wiring lexical gate (#2240)',
   timeout: 60,
 )
 
+# DEX Apps page wiring (#7520, #7519): server.cpp hands DexRoutes the DexApi make_local_dex_api returned,
+# and that call passes an observer provider reading health_store_.dex_observer_for. Static lexical gate
+# with its own in-memory mutation self-test; no build required. Suite 'docs' for the same reason as the
+# gate above.
+test('DEX Apps wiring lexical gate (#7520, #7519)',
+  _python3_test,
+  args: [files('test_dex_apps_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-decommission cascade wiring (#5675): every field of AgentDecommissionStores must be handed a
 # live store pointer in ServerImpl::decommission_agent (server.cpp). A store registered in the
 # cascade but never wired there is Skipped for every operator decommission, and no unit test sees
@@ -4417,6 +4434,19 @@ test('settings engine session belt lexical gate',
 test('typed-source purge wiring lexical gate (2a-1b)',
   _python3_test,
   args: [files('test_typed_purge_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The PostgreSQL collation version check must stay wired in at both ends: the constructor-time call
+# in the ServerImpl constructor's substrate block (fed by the check, guarded by the probe, not tied
+# to startup_failed_) AND the recheck's construction, start and stop (run() / stop(), before
+# pg_pool_.reset()). Source-text only; suite 'docs' as the gates above; carries delete/move/`#if 0`
+# self-tests. Remaining limit: it cannot see `if (false)`, an uncalled lambda, or a start() in a
+# branch that never runs.
+test('pg collation check wiring lexical gate',
+  _python3_test,
+  args: [files('test_pg_collation_check_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
