@@ -35,6 +35,7 @@
 #include "test_auth_db_rbac_pg_template.hpp"
 #include "test_principal_lock_gate.hpp" // SessionWipeFaultAfterDeactivation, SqlFault
 #include "test_route_sink.hpp"
+#include "totp.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -871,6 +872,76 @@ TEST_CASE("reactivation removes the sessions that existed, and a later sign-in w
     REQUIRE_FALSE(fresh.empty());
     CHECK(b.validate_session(fresh).has_value());
     CHECK(c.validate_session(fresh).has_value());
+}
+
+TEST_CASE("reactivation of an ENROLLED account: a bound MFA proof does not survive a faulted wipe "
+          "(T6b, #6079)",
+          "[auth][session_store][account_active][reactivation][mfa_binding][pg]") {
+    // The composition the two features meet at: dev's account gate and wipe-first reactivation
+    // (#7223) against this PR's factor-generation binding. Every other case here uses an
+    // un-enrolled account, whose sessions carry no bound proof.
+    AcctFx f;
+    auto& a = f.add();
+    auto& b = f.add();
+    f.seed_world("alice");
+
+    // Enrol alice, so a session minted with a verified factor carries a BOUND proof.
+    {
+        auto init = f.db->mfa_init_enrollment("alice", "Yuzu", std::nullopt);
+        REQUIRE(init.has_value());
+        auto bytes = yuzu::server::mfa::base32_decode(init->secret_base32);
+        REQUIRE(bytes.has_value());
+        const std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+        const auto code = yuzu::server::mfa::generate(
+            raw, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+        REQUIRE(f.db->mfa_verify_enrollment("alice", code, std::nullopt).has_value());
+    }
+    const auto enrolled = f.db->mfa_status("alice");
+    REQUIRE(enrolled.has_value());
+    REQUIRE(enrolled->enrolled);
+    const auto bound_gen = enrolled->factor_gen;
+    REQUIRE(bound_gen > 0);
+
+    const auto old_token = a.create_local_session_for_test("alice", Role::user, true);
+    REQUIRE_FALSE(old_token.empty());
+    REQUIRE(a.validate_session(old_token).has_value());
+    REQUIRE(b.validate_session(old_token).has_value()); // warm on both replicas
+    const auto stored = a.read_durable_mfa_proof(old_token, "alice");
+    REQUIRE(stored.source == yuzu::server::auth::DurableMfaProof::Source::kRow);
+    CHECK(stored.mfa_verified_ms != 0);
+    CHECK(stored.mfa_factor_gen == bound_gen); // the stored proof is bound to the live factor
+
+    // Deactivate with the durable wipe faulted: the account is inactive, the row (and with it
+    // the bound proof) survives, and only the account gate can refuse the session now.
+    f.deactivate_leaving_session(a, "alice");
+    CHECK_FALSE(poll_and_validate(b, old_token).has_value());
+    check_stays_refused(b, old_token);
+    check_stays_refused(a, old_token);
+    auto& cold = f.add();
+    CHECK_FALSE(cold.validate_session(old_token).has_value());
+
+    // Reactivation removes the row, and the account comes back UN-enrolled at a NEW factor
+    // generation: a deactivation clears the factor, and the generation trigger redraws on every
+    // change of the enrolment, so a proof bound to the old generation could never be honoured
+    // even if a row had survived.
+    REQUIRE(a.reactivate_user("alice"));
+    CHECK(f.durable_sessions_of("alice") == 0);
+    const auto after = f.db->mfa_status("alice");
+    REQUIRE(after.has_value());
+    CHECK_FALSE(after->enrolled);
+    CHECK(after->factor_gen != bound_gen);
+    CHECK(a.read_durable_mfa_proof(old_token, "alice").source ==
+          yuzu::server::auth::DurableMfaProof::Source::kAbsent);
+    check_stays_refused(b, old_token);
+    check_stays_refused(cold, old_token);
+
+    // A sign-in after the reactivation inherits no proof.
+    const auto fresh = a.create_local_session_for_test("alice", Role::user, false);
+    REQUIRE_FALSE(fresh.empty());
+    const auto fresh_seen = b.validate_session(fresh);
+    REQUIRE(fresh_seen.has_value());
+    CHECK(fresh_seen->steady_mfa_verified.time_since_epoch().count() == 0);
+    CHECK(a.read_durable_mfa_proof(fresh, "alice").mfa_verified_ms == 0);
 }
 
 TEST_CASE("reactivation is refused when the session wipe does not persist (T7)",
