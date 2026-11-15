@@ -2145,7 +2145,7 @@ TEST_CASE("census pair order, UP-9: an implausible pair is dropped at ingest and
         CHECK(verdict(db.dsn(), "a", "r1") == "C F 5/10"); // held, and the doubt is flagged
         CHECK(order_text(db.dsn(), "a") == "5|10|-|1|1|0|0|0|0|0");
     }
-    SECTION("a stale pair clock: the unpaired event replaces the paired verdict by the key rule") {
+    SECTION("a stale pair clock: the unpaired event replaces the paired verdict by arrival") {
         for (const char* agent : {"a", "u"}) {
             REQUIRE(
                 store
@@ -2425,8 +2425,8 @@ TEST_CASE("census pair order, A1: a refused-regression Repair never retires its 
 
 // ── P-1: the census statements' plans, and the Repair's statement bound ──────────────────────────
 
-TEST_CASE("census plan, P-1: the seen-events max of the census upsert and fold never scans "
-          "idx_gse_ingest_seq backward",
+TEST_CASE("census pair order, P-1 plan: the seen-events max of the census upsert and fold never "
+          "scans idx_gse_ingest_seq backward",
           PAIR_TAGS) {
     // `max(s.ingest_seq)` over `event_id = ANY($8)` can be planned as a BACKWARD scan of
     // idx_gse_ingest_seq with a heap filter on event_id, which reads every event newer than the
