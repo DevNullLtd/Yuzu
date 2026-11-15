@@ -37,7 +37,9 @@ Unreleased changes are only collated into `CHANGELOG.md` at release. After `git 
 ```bash
 python3 scripts/whats-new.py                          # since your last pull
 python3 scripts/whats-new.py --since "2 weeks ago"    # or a tag, branch, commit or YYYY-MM-DD
+python3 scripts/whats-new.py --versions               # only version bumps, redeploy notes and Docker image bumps
 ```
+On Windows use the launcher, `py -3 scripts\whats-new.py`. The header counts `**Breaking` entries, and an entry a release in the range already moved into `CHANGELOG.md` ends `[released X.Y.Z]`.
 It lists version bumps first (project version, plugin ABI, vcpkg baseline and dependencies, gateway packages, latest released changelog version), the surfaces that may need a rebuild (a vcpkg change means re-running the setup script above, with `--wipe` if a library version does not update), `build(deps)`/`chore(deps)` dependency bumps, then the `changelog.d/` fragments the range adds. A fresh clone, a new branch or an expired reflog has no pull to read; pass `--since` there. Details: `changelog.d/README.md`.
 
 ### Manual configure

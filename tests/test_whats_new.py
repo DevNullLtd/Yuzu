@@ -222,7 +222,7 @@ class Fragments(GitCase):
         self.put(repo, "changelog.d/sub/8-nested.added.md", "- **Nested.**\n")
         self.commit(repo, "fragments")
         out = self.ok(repo, "--since", old)
-        self.assertIn("Changelog entries added (6)", out)
+        self.assertRegex(out, r"Changelog entries added \(6[,)]")
         positions = [out.index(s) for s in ("Security (1)", "Removed (1)", "Changed (1)", "Added (2)", "Fixed (1)")]
         self.assertEqual(positions, sorted(positions))
         long_line = next(line for line in out.splitlines() if line.startswith("- **Long.**"))
@@ -251,7 +251,7 @@ class Fragments(GitCase):
         self.commit(repo, "fragments")
         out = self.ok(repo, "--since", old)
         self.assertIn("! 1 fragment with no '- ' bullet, not summarised: 2-prose.added.md", out)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
 
     def test_rename_with_rewording_is_listed_once_with_the_final_text(self):
         repo = self.init()
@@ -781,7 +781,7 @@ class FragmentSelection(GitCase):
         self.commit(repo, "same text")
         out = self.ok(repo, "--since", old)
         self.assertEqual(out.count("**Twice.**"), 1)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
 
     def test_removed_deprecated_and_breaking_entries_are_shown_whole(self):
         repo = self.init()
@@ -816,7 +816,7 @@ class FragmentSelection(GitCase):
         self.put(repo, "server/q.txt", "x\n")
         self.commit(repo, "build(deps): bump x\x0bdeploy/docker/Dockerfile")
         out = self.ok(repo, "--since", old)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
         self.assertIn("0 Docker images, 1 other", out)
 
 
@@ -1119,7 +1119,7 @@ class PromotedFragments(GitCase):
             self.assertIn(text, out, text)
         self.assertNotIn("\r", out)
         self.assertNotIn("?", out.split("Changelog entries added")[1])  # no stray control marks
-        self.assertIn("Changelog entries added (4)", out)
+        self.assertRegex(out, r"Changelog entries added \(4[,)]")
 
     def test_promotion_listing_survives_hostile_git_config(self):
         repo, old = self.promoted("2-p.added.md", "- **Promoted under config.**\n")
@@ -1348,7 +1348,7 @@ class RenamedFragments(GitCase):
         promote(repo)
         self.commit(repo, "release")
         out = self.ok(repo, "--since", old, "--full")
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
         self.assertIn("but this one is new and longer", out)
 
     def test_an_unchanged_rename_is_not_new_but_an_edited_one_is(self):
@@ -1440,7 +1440,7 @@ class PromotedFragmentLives(GitCase):
         self.put(repo, "changelog.d/9-b.fixed.md", "- **Bump flaky timeout.**\n")
         self.commit(repo, "the same words, a new change")
         out = self.ok(repo, "--since", old)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
         self.assertIn("Bump flaky timeout", out)
 
     def test_a_deletion_and_an_identical_addition_in_separate_commits_is_not_a_rename(self):
@@ -1479,7 +1479,7 @@ class PromotedFragmentLives(GitCase):
         out = self.ok(repo, "--since", old)
         self.assertIn("Final title", out)
         self.assertNotIn("Early title", out)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
 
     def test_a_rename_that_changes_the_section_then_promoted_shows_the_final_section(self):
         repo = self.init()
@@ -1582,7 +1582,7 @@ class FragmentLivesAndHostileText(GitCase):
         out = self.ok(repo, "--since", old)
         self.assertIn("Second text", out)
         self.assertNotIn("First text", out)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
 
     def test_a_path_promoted_twice_lists_both_lives_when_neither_was_the_readers(self):
         repo, old = self.promoted_twice(False)
@@ -1590,7 +1590,7 @@ class FragmentLivesAndHostileText(GitCase):
         self.assertIn("First text", out)
         self.assertIn("Second text", out)
         self.assertNotIn("Already there", out)
-        self.assertIn("Changelog entries added (2)", out)
+        self.assertRegex(out, r"Changelog entries added \(2[,)]")
 
     def test_a_name_reused_after_a_rename_and_promoted_lists_both_entries(self):
         repo = self.init()
@@ -1618,7 +1618,7 @@ class FragmentLivesAndHostileText(GitCase):
         promote(repo)
         self.commit(repo, "release")
         out = self.ok(repo, "--since", old)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
         self.assertIn("Cycle entry", out)
 
     def test_a_promoted_line_polished_after_the_release_is_still_listed(self):
@@ -1636,7 +1636,7 @@ class FragmentLivesAndHostileText(GitCase):
         out = self.ok(repo, "--since", old)
         self.assertIn("Breaking", out)
         self.assertIn("Plain Y", out)
-        self.assertIn("Changelog entries added (2)", out)
+        self.assertRegex(out, r"Changelog entries added \(2[,)]")
 
     def test_a_rename_into_security_or_removed_is_a_reclassification_and_is_listed(self):
         repo = self.init()
@@ -1837,7 +1837,7 @@ class FragmentEdgeCases(GitCase):
         # Not recognised as the entry the reader had (the rename went through a name that is not a
         # fragment name), so it is listed, once: an extra line, never a missing one.
         self.assertEqual(out.count("Already there"), 1)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
 
     def test_a_misnamed_file_renamed_then_promoted_is_listed_once(self):
         repo = self.init()
@@ -1870,7 +1870,7 @@ class FragmentEdgeCases(GitCase):
         out = self.ok(repo, "--since", old)
         for entry in ("Topic feature", "Dev fix A", "Dev feature B"):
             self.assertIn(entry, out)
-        self.assertIn("Changelog entries added (3)", out)
+        self.assertRegex(out, r"Changelog entries added \(3[,)]")
 
     def test_a_release_that_also_adds_a_similar_fragment_still_promotes_the_deleted_one(self):
         repo = self.init()
@@ -2012,6 +2012,136 @@ class FragmentEdgeCases(GitCase):
                 check(self.ok(repo, "--since", old))
 
 
+class VersionsFlagAndMarkers(GitCase):
+    """--versions, the **Breaking count in the header, and the [released X] marker."""
+
+    def released_repo(self):
+        """A fragment added then promoted into 1.3.0, then a second fragment still pending."""
+        repo = self.init()
+        self.seed(repo)
+        old = self.git(repo, "rev-parse", "HEAD")
+        self.put(repo, "changelog.d/2-rel.added.md", "- **Shipped thing.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        self.put(repo, "changelog.d/3-pend.fixed.md", "- **Pending thing.**\n")
+        self.commit(repo, "pending")
+        return repo, old
+
+    def test_a_promoted_entry_names_its_release_and_a_pending_one_is_unmarked(self):
+        repo, old = self.released_repo()
+        out = self.ok(repo, "--since", old)
+        self.assertRegex(out, r"Changelog entries added \(2, 1 already released\)")
+        self.assertIn("- **Shipped thing.**  [released 1.3.0]", out)
+        self.assertIn("- **Pending thing.**\n", out)
+        self.assertEqual(out.count("[released"), 1)
+
+    def test_nothing_is_marked_when_no_release_is_in_the_range(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Only pending.**\n")
+        self.commit(repo, "add")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (1)", out)
+        self.assertNotIn("released", out.split("Changelog entries added")[1].split("Added (1)")[1])
+
+    def test_an_entry_polished_after_its_release_is_marked_without_a_version(self):
+        repo, old = self.released_repo()
+        text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.put(repo, "CHANGELOG.md", text.replace("- **Shipped thing.**", "- **Shipped thing, polished.**"))
+        self.commit(repo, "polish the release notes")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**  [released]", out)
+        self.assertNotIn("[released 1.3.0]", out)
+
+    def test_an_entry_whose_line_sits_under_unreleased_is_not_marked(self):
+        repo, old = self.released_repo()
+        text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.put(repo, "CHANGELOG.md", text.replace("## [1.3.0] - 2026-10-30", "## [Unreleased]"))
+        self.commit(repo, "the release was backed out")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Shipped thing", out)
+        self.assertNotIn("[released", out)
+        self.assertRegex(out, r"Changelog entries added \(2\)")
+
+    def test_the_marker_survives_truncation_and_whole_entry_display(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-long.added.md", "- **Long.** " + "x" * 400 + "\n")
+        self.put(repo, "changelog.d/3-sec.security.md", "- **Sec.** first\n  second line\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertRegex(out, r"- \*\*Long\.\*\* x+\.\.\.  \[released 1\.3\.0\]\n")
+        self.assertIn("- **Sec.** first  [released 1.3.0]\n      second line", out)  # the fragment's own 2 spaces, plus 4
+
+    def test_the_header_counts_breaking_entries_with_the_right_plural(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Plain.**\n")
+        self.commit(repo, "plain")
+        self.assertNotIn("Breaking  ", self.ok(repo, "--since", old))
+        self.put(repo, "changelog.d/3-b.changed.md", "- **Breaking: one.**\n")
+        self.commit(repo, "one")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Breaking  1 changelog entry marked **Breaking (listed below)", out)
+        self.assertRegex(out, r"Changelog entries added \(2, 1 breaking\)")
+        self.put(repo, "changelog.d/4-c.removed.md", "- **breaking, removed.**\n")
+        self.commit(repo, "two")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Breaking  2 changelog entries marked **Breaking (listed below)", out)
+        # The header line comes before the first section, with the other header lines.
+        self.assertLess(out.index("Breaking  2"), out.index("Version bumps"))
+
+    def test_versions_prints_bumps_and_image_bumps_but_no_entries(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "meson.build", MESON_NEW)
+        self.put(repo, "deploy/docker/Dockerfile.x", "FROM busybox\n")
+        self.commit(repo, "build(deps): bump busybox from `fd7dc98` to `a46257e` in /deploy/docker")
+        self.put(repo, ".github/workflows/ci.yml", "a\n")
+        self.commit(repo, "build(deps): bump docker/login-action")
+        self.put(repo, "changelog.d/2-a.added.md", "- **A pending entry.**\n")
+        self.put(repo, "changelog.d/3-b.changed.md", "- **Breaking: pending.**\n")
+        self.commit(repo, "fragments")
+        out = self.ok(repo, "--since", old, "--versions")
+        self.assertIn("Version bumps", out)
+        self.assertIn("~ project version (meson.build)", out)
+        self.assertIn("Docker image bumps (1)", out)
+        self.assertIn("busybox", out)
+        self.assertIn("+ 1 other dependency bump (workflows, pip, npm); --full lists them", out)
+        self.assertNotIn("Changelog entries added", out)
+        self.assertNotIn("A pending entry", out)
+        # The count stays in the header, and says where the entries went.
+        self.assertIn("Breaking  1 changelog entry marked **Breaking (run without --versions to read them)", out)
+        full = self.ok(repo, "--since", old, "--versions", "--full")
+        self.assertIn("docker/login-action", full)
+
+    def test_versions_with_nothing_to_show_still_says_so(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "server/x.cpp", "x\n")
+        self.commit(repo, "fix: x")
+        out = self.ok(repo, "--since", old, "--versions")
+        self.assertIn("none of the tracked versions changed", out)
+        self.assertNotIn("Changelog", out)
+
+    def test_release_sections_maps_lines_to_the_heading_above_them(self):
+        sections = WN.release_sections(
+            "# Changelog\n\n## [Unreleased]\n\n- **Pending.**\n\n## [1.3.0] - 2026-10-30\n\n### Added\n- **New.**\n"
+            "- **Twice.**\n\n## [1.2.0] - 2026-09-01\n\n- **Old.**\n- **Twice.**\n")
+        self.assertIsNone(sections["- **Pending.**"])
+        self.assertEqual(sections["- **New.**"], "1.3.0")
+        self.assertEqual(sections["- **Old.**"], "1.2.0")
+        self.assertEqual(sections["- **Twice.**"], "1.3.0")  # the first occurrence wins
+        self.assertEqual(WN.release_sections(None), {})
+
+    def test_versions_is_in_the_help(self):
+        res = self.run_script(self.dir, "--help")
+        self.assertIn("--versions", res.stdout)
+
+
 class RoundEight(GitCase):
     """Merge commits that finish a release, bounded reads, odd repository paths, wording."""
 
@@ -2047,7 +2177,7 @@ class RoundEight(GitCase):
         out = self.ok(repo, "--since", old)
         self.assertIn("Release fix A", out)
         self.assertIn("Merge-only fix B", out)
-        self.assertIn("Changelog entries added (2)", out)
+        self.assertRegex(out, r"Changelog entries added \(2[,)]")
 
     def test_a_fragment_reworded_before_a_merge_commit_release_is_listed_with_the_promoted_wording(self):
         repo = self.init()
@@ -2101,7 +2231,7 @@ class RoundEight(GitCase):
         self.commit(repo, "the same text under a new name")
         self.git(repo, "merge", "-q", "--no-ff", "-m", "merge side", "side")
         out = self.ok(repo, "--since", old)
-        self.assertIn("Changelog entries added (1)", out)
+        self.assertRegex(out, r"Changelog entries added \(1[,)]")
         self.assertIn("Already there", out)
 
     def test_a_file_replacing_a_gitlink_under_a_fragment_name_is_listed(self):

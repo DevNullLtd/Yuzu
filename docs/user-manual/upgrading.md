@@ -2,6 +2,8 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+Running `dev` between releases? The entries below cover released versions. For what a `git pull` of `dev` changed, run `python3 scripts/whats-new.py` (`--versions` for just the version bumps); see `changelog.d/README.md`.
+
 ## ⚠️ Breaking: result sets that are pending, failed or incomplete are refused where they could be misread
 
 **What changed.**

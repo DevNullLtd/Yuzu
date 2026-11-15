@@ -291,6 +291,10 @@ See [`docs/roadmap.md`](docs/roadmap.md) for the full development roadmap — 17
 
 See [`docs/capability-map.md`](docs/capability-map.md) for the live capability inventory and progress.
 
+## Following `dev`
+
+Unreleased changes are collated into `CHANGELOG.md` only at release. After `git pull` on `dev`, `python3 scripts/whats-new.py` (on Windows, `py -3 scripts\whats-new.py`) prints the version bumps, rebuild notes, dependency bumps and changelog entries since your last pull; `--versions` shows just the bumps. See [`changelog.d/README.md`](changelog.d/README.md).
+
 ## Contributing
 
 Pull requests welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md) — it covers the build, branch naming (`feature/*`, `fix/*`), the governance-gated PR workflow, C++23 coding standards, observability conventions, and the plugin SDK. Architectural and release context lives in [CLAUDE.md](CLAUDE.md). All participants are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).

@@ -63,7 +63,19 @@ python3 scripts/whats-new.py                          # since your last pull
 python3 scripts/whats-new.py --since v0.15.0          # since a tag, branch or commit
 python3 scripts/whats-new.py --since "2 weeks ago"    # or YYYY-MM-DD
 python3 scripts/whats-new.py --full                   # whole bullets, every dependency bump
+python3 scripts/whats-new.py --versions               # only the version bumps (see below)
 ```
+
+On Windows, where `python3` is often not on `PATH`, use the launcher:
+`py -3 scripts\whats-new.py`. The script uses only the standard library and
+needs `git` on `PATH`.
+
+The header counts the entries that start `**Breaking` (a `Breaking` line,
+shown only when there are some), so you see them before reading further.
+`--versions` prints that header, the version bumps, the rebuild / redeploy
+notes and the Docker image bumps, and leaves out the changelog entries and
+the other dependency bumps (`--full` lists those); it is the short form for
+"do I need to rebuild?".
 
 It prints, in this order:
 
@@ -76,7 +88,14 @@ It prints, in this order:
   Dockerfile and compose bumps are listed; the rest (workflows, pip, npm) are
   counted, and `--full` lists them.
 - **Changelog entries:** the fragments this range adds, grouped security,
-  removed, deprecated, changed, added, fixed. Each shows its first line, cut at
+  removed, deprecated, changed, added, fixed. The heading counts them, and
+  says how many are already released and how many are breaking. An entry a
+  release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`,
+  the version section its first line sits under at `HEAD`; it ends `[released]`
+  when that line was edited since, so the version cannot be found, and has no
+  marker when the line is under `[Unreleased]`. Every other entry is
+  unreleased, which is the usual case for a pull of `dev`, so unreleased
+  entries carry no marker. Each shows its first line, cut at
   200 characters. Security, removed and deprecated entries, and entries starting
   `**Breaking` (in any case), are shown whole, continuation lines included;
   other entries show their continuation lines only with `--full`. A fragment
