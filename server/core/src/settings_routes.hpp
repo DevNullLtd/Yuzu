@@ -11,6 +11,9 @@
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
 #include "deprovision_erasure.hpp"
+#include "dex_read_model.hpp"         // DexAppsModel / DexPolicyInForce (Scoring tab preview seam)
+#include "dex_score_policy_form.hpp"   // DexFormValues / DexScoringView (Scoring tab, pure)
+#include "dex_score_policy_writer.hpp" // DexScorePolicyWriteDeps (Scoring tab)
 #include "engine_principal_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -104,6 +107,26 @@ public:
     /// handlers then persist without the live apply.
     void set_dex_alert_apply_fn(std::function<void()> fn) { dex_alert_apply_fn_ = std::move(fn); }
 
+    /// The DEX Scoring tab's write seam: the SAME deps object RestApiV1 holds for
+    /// PUT/DELETE /api/v1/dex/score-policy (store reader, compare-and-set/remove, provider),
+    /// with `audit` left empty here - each POST binds its own session-stamped audit closure.
+    /// Wired by server.cpp inside the `dex_score_policy_provider_` block, after
+    /// register_routes and before the listener starts; the member is read per request. Left
+    /// unset (no runtime-config store, tests) the tab answers "Config store unavailable".
+    void set_dex_score_policy_writer(DexScorePolicyWriteDeps deps) {
+        dex_score_policy_writer_ = std::move(deps);
+    }
+
+    /// Scores the Apps model (7 days, all platforms) under the policy in force (nullopt: the
+    /// provider's cache, which can trail another replica's write by a refresh interval, used for
+    /// the suggestions only) or under an explicit one (a value; the preview scores both its
+    /// sides this way): the production scorer, never a recomputation here.
+    /// Feeds the image-name suggestions and the pre-save tier-change preview. Set only where
+    /// the signals store exists; with it unset the tab still edits, without suggestions and
+    /// with the preview answering "unavailable".
+    using DexAppsFn = std::function<DexAppsModel(const std::optional<DexPolicyInForce>&)>;
+    void set_dex_apps_fn(DexAppsFn fn) { dex_apps_fn_ = std::move(fn); }
+
     /// Quiet admin gate for the three auto-loading enrolment GET fragments (tokens, pending,
     /// auto-approve). The Groups page loads all three on every view and the pending panel
     /// reloads on every SSE arrival, so the loud `admin_fn` (require_admin) wrote an
@@ -113,6 +136,21 @@ public:
     /// keeps the loud `admin_fn`. Left unset (tests, other callers) those three GETs fall back
     /// to `admin_fn`, so an unwired probe can only be louder, never weaker.
     void set_read_admin_fn(AdminFn fn) { read_admin_fn_ = std::move(fn); }
+
+    /// Quiet permission gate for the auto-loading Engine Principals panel
+    /// (`GET /fragments/settings/engine-principals`, #5882). The panel applies the same
+    /// permission test (`EnginePrincipal:Read`) as its REST twin (`GET /api/v1/engine-principals`);
+    /// its seven differences, none of which admits a caller the route refuses, are listed once,
+    /// in docs/user-manual/upgrading.md, and numbered the same way in the handler comment in
+    /// settings_routes.cpp. It loads on every /settings view, so a caller who lacks the grant
+    /// must not write an `auth.permission_required` row per view. server.cpp binds
+    /// `AuthRoutes::probe_permission` here: the same decision as `perm_fn` with the 401/403 kept
+    /// on the response and the denial row withheld for an interactive cookie session only (a
+    /// token or engine caller keeps it). The panel also asks it for `AuditLog:Read` (the revoke
+    /// Detail), lazily, only when a revoked row exists. Left unset (tests, other callers) the
+    /// panel falls back to `perm_fn`, so an unwired probe can only be louder, never weaker. No
+    /// other route reads it.
+    void set_read_perm_fn(PermFn fn) { read_perm_fn_ = std::move(fn); }
 
     /// Audit writer for a session the handler already resolved (#6079): `mfa.disable` ends the
     /// actor's own session before it writes its row, so the request-resolving `AuditFn` would
@@ -297,6 +335,21 @@ private:
     /// dex_signal_groups() catalogue) + the blast-radius alert-shape trio.
     /// State lives in runtime_config; applied live via dex_alert_apply_fn_.
     std::string render_dex_alerts_fragment();
+    /// The DEX Scoring tab body (no wrapper id; GET adds #dex-scoring-section). `posted`
+    /// non-null re-renders the submitted values (a refusal or a preview) instead of `in_force`.
+    /// `editable` = the caller holds Infrastructure:Write (the REST write gate); false renders every
+    /// control disabled. `suggestions` non-null supplies the image suggestions (the preview path
+    /// already holds the "now" model); null reads them, unless the page is locked (read-only or a
+    /// stale refusal), which has no use for them.
+    std::string render_dex_scoring_section(const DexPolicyInForce& in_force, bool editable,
+                                           const std::string& if_match, const DexFormValues* posted,
+                                           std::optional<DexFormError> error,
+                                           std::optional<DexTierPreview> preview,
+                                           const std::string& refused,
+                                           const std::vector<std::string>* suggestions = nullptr);
+    /// POST /api/settings/dex-scoring/{save,preview,reset} share this body.
+    void dex_scoring_post(const httplib::Request& req, httplib::Response& res,
+                          DexScorePolicyWriteRequest::Op op, bool dry_run);
     std::string render_mcp_fragment();
     std::string render_nvd_fragment();
     /// The OIDC SSO form. `message` renders INSIDE #oidc-feedback (an out-of-band
@@ -318,11 +371,31 @@ private:
     /// A roster that cannot be read renders an "unavailable" notice instead of a
     /// table; a credential count that cannot be read renders "unavailable" and the
     /// row offers neither Mint nor Rotate.
-    /// Revoked rows surface the `superseded_by` linkage AND the revocation
-    /// reason explicitly (design doc §3.1) — never a merged history that
-    /// hides that a revocation occurred. Admin-only; a null
-    /// `engine_principal_store_` renders an inert "not configured" panel.
-    std::string render_engine_principals_fragment();
+    /// Revoked rows surface the `superseded_by` linkage AND the recorded revoke detail
+    /// explicitly (design doc §3.1), never a merged history that hides that a revocation
+    /// occurred. The detail is the audit trail's text, so it is looked up and shown only when
+    /// `may_read_audit` (the quiet AuditLog:Read probe) answers yes; otherwise the cell says it is
+    /// withheld, hedged as the Access tokens panel hedges it (the probe also answers no when the
+    /// permission read could not be confirmed). `may_read_audit` is called LAZILY, at most once
+    /// and only when a revoked row exists, so a roster with none issues no probe (a token caller
+    /// would otherwise write a denial row for a view with nothing to withhold); an empty one
+    /// means no. The cell is labelled "Detail (earliest retained record)": the oldest committed
+    /// success in the bounded read (`committed_revoke_detail`, shared with the Access tokens
+    /// panel), never a failed attempt or a later retry while an older success survives, but not
+    /// necessarily the revocation's own record (retention can prune it, a failed audit write can
+    /// leave a later retry of the same revoke as the first success, an MCP revoke without a reason
+    /// has an empty detail and reads "(not recorded)").
+    /// It carries that panel's truncation caveat when more than its window of revoke events
+    /// exists. After the first failed audit read the remaining revoked rows are not queried and
+    /// read "(unavailable)".
+    /// `roster_count`, when given, is set to the number of principals rendered ONLY when the
+    /// roster was actually read: the caller writes the `engine_principal.list` success row
+    /// from it, and an absent store or an unreadable roster leaves it empty (no row).
+    /// The route gates the caller (EnginePrincipal:Read); a null `engine_principal_store_` renders an
+    /// inert "not configured" panel.
+    std::string render_engine_principals_fragment(
+        const std::function<bool()>& may_read_audit,
+        std::optional<std::size_t>* roster_count = nullptr);
 
     /// Render the Access Reviews Settings fragment (SOC 2 CC6.2) — a
     /// CONVENIENCE dashboard surface only; the REST endpoints under
@@ -356,14 +429,33 @@ private:
         return read_admin_fn_ ? read_admin_fn_(req, res) : admin_fn_(req, res);
     }
     PermFn perm_fn_;
+    PermFn read_perm_fn_; // see set_read_perm_fn(); empty -> perm_fn_
+    bool read_perm(const httplib::Request& req, httplib::Response& res, const std::string& type,
+                   const std::string& op) const {
+        return read_perm_fn_ ? read_perm_fn_(req, res, type, op) : perm_fn_(req, res, type, op);
+    }
     AuditFn audit_fn_;
     AuditAsSessionFn audit_as_session_fn_;
     AuditReadFn audit_read_fn_; // #4028 — fail-closed REST audit hook, see AuditReadFn doc comment
     std::function<void()> dex_alert_apply_fn_; // F1 live-apply hook (may be empty)
+    std::optional<DexScorePolicyWriteDeps> dex_score_policy_writer_; // Scoring tab; see setter
+    DexAppsFn dex_apps_fn_;                                           // Scoring tab; may be empty
     std::filesystem::path cert_dir_override_;  // test seam; empty = auth::default_cert_dir()
     std::function<void()> stamp_fault_hook_;   // test seam; empty in production
     RetentionEnforcedFn retention_enforced_fn_; // may be empty -> every window "Unknown"
     nlohmann::json retention_view() const;      // build_data_retention_settings + enforced
+    /// The engine-session belt of the Settings fragments (#6744, extending the Engine Principals
+    /// panel's G1 belt): an engine-classed session (`Session::is_engine()`) is refused with a 403
+    /// A4 body and an audited `denied` row (`engine_session_denied`) under `verb`, as the REST
+    /// twins' `deny_engine_session`. `also_mcp_tier` adds the Engine Principals panel's MCP-tier
+    /// refusal (`mcp_session_denied`, #520). Call AFTER the permission gate and the session
+    /// check, BEFORE any store read. ONE copy in this file: extend it, never inline another.
+    /// Returns true (the response is written) when the caller must stop.
+    [[nodiscard]] bool refuse_engine_session(const httplib::Request& req, httplib::Response& res,
+                                             const auth::Session& session, const char* verb,
+                                             const char* securable,
+                                             const std::string& target_id = "",
+                                             bool also_mcp_tier = false) const;
     /// Same-site gate for a page-called write (`browser_write_is_cross_site`): token callers are
     /// exempt, a cookie session must name this site in Origin/Referer. Defence in depth: the
     /// server-wide pre-routing gate answers a cookie-session write first. Call AFTER the

@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -260,7 +261,31 @@ struct SessionLoss {
 struct RegistryReader {
     /// One bounded read of `root`. Must not throw. `deadline` is an absolute now_ts() value.
     std::function<SubtreeRead(const std::string& root, std::int64_t deadline)> read_subtree;
-    std::function<std::vector<std::string>()> loaded_sids; // subkey names under HKEY_USERS
+    /// Subkey names under HKEY_USERS, from a walk that ended without an error, or a throw. A
+    /// failed or part-way enumeration throws `IncompleteCaptureError` (collect() lets it
+    /// propagate and keeps the cursor, the watches and the dirty marks; start() arms nothing
+    /// and the first collect() asks again), because a partial list reads a loaded user as
+    /// logged off.
+    std::function<std::vector<std::string>()> loaded_sids;
+    /// The profiles whose hive is NOT loaded, from the profile list, classified against collect's
+    /// own `loaded_sids` for this tick (never a second HKU enumeration). Asked on an HKU
+    /// name-watch mark, on the full re-read and on a re-baseline, while the known list is empty,
+    /// and while the last walk was incomplete or a known profile has no path yet (see collect());
+    /// asked a second time in one tick only to confirm a change to a known profile's scope: its
+    /// removal, or a path first learned or changed for it (one with no path yet, or that was
+    /// loaded last tick, included).
+    /// `complete == false` means "keep what you knew" (and add what the walk did list), never
+    /// "nothing exists" (see reconcile_offline). Must not throw.
+    std::function<OfflineDiscovery(const std::vector<std::string>& loaded_sids)> offline_profiles;
+    /// Mounts one offline hive through the shared guarded ladder and reads every root in
+    /// `roots` (this hive's logical `HKU\<sid>\...` roots) from that one mount. Called
+    /// at most once per hive per tick, only for a hive with a due root and a known path, and
+    /// only after every loaded root has had its turn at the tick's budget. `attempted == false`
+    /// means the mount was not tried (retried next tick). Must not throw; `deadline` is an
+    /// absolute now_ts() value.
+    std::function<OfflineHiveRead(const std::string& sid, const std::string& path,
+                                  const std::vector<std::string>& roots, std::int64_t deadline)>
+       read_offline_hive;
     std::function<std::int64_t()> now_ts;                  // FILETIME, the ETW header's clock
     std::function<bool()> etw_running;         // the write-event session is delivering
     std::function<SessionLoss()> session_loss; // the session's own loss counters
@@ -272,6 +297,10 @@ struct RegistryReader {
     std::function<void()> stop;            // idempotent
     std::shared_ptr<RegistryDirtyTable> dirty; // shared with the watcher
     std::shared_ptr<RegistryEtwBuffer> buffer; // shared with the ETW callback
+    /// Optional observer, null in production: called with the rows of every tick whose fold and
+    /// cursor committed. The roll-up tier keeps no writer pid, attribution detail or source, so a
+    /// test reads what a tick decided here, not from the database.
+    std::function<void(const std::vector<RegistryEvent>&)> committed;
 };
 
 class RegistryCursorSource final : public CursorSource {
@@ -306,6 +335,8 @@ private:
     bool was_disabled_{false};
 
     std::vector<std::string> armed_roots_;
+    // The last profile discovery was incomplete (warn once per transition).
+    bool offline_incomplete_{false};
 
     // Loss accounting; advanced only after a successful commit, so a failed commit
     // re-derives and re-reports the same loss on the next tick.
@@ -331,6 +362,16 @@ RegistryReader make_windows_registry_reader();
 /// The name of the ETW session this process opens (the live tests look it up to prove
 /// stop() leaves none behind).
 std::wstring registry_etw_session_name();
+
+/// Unloads the `YUZU_HIVE_*` mounts a previous run left in HKEY_USERS (an agent killed mid-mount,
+/// or an unload that failed): until one is released it keeps its profile's NTUSER.DAT locked.
+/// Non-forced, so a mount something still holds open is retained, never yanked. Takes the
+/// process-wide offline-hive lock for the whole sweep, which is what makes it safe against this
+/// process's own mounts (each holds that lock from load to unload), and SeRestorePrivilege.
+/// `prefix` narrows the names (see select_stale_hive_mounts). Blocks on that lock: production
+/// reaches it only through the bounded worker in echo_registry_source.cpp; this is exposed for
+/// the live tests.
+HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix = kHiveMountPrefix);
 #endif
 
 /// Test factory: any scope over any reader.

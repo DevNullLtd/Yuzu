@@ -11,7 +11,9 @@
  *              following rows five escape-aware fields. Mutation: removing the
  *              run_linux -> run_linux_at wiring leaves the stub `unsupported` row
  *              and fails the never-unsupported status assertion.
- *   macOS / Windows -- exactly `status|<action>|unsupported|<os>:planned`.
+ *   macOS / Windows -- `dotnet` and `jvm`: exactly `status|<action>|unsupported|<os>:planned`.
+ *   python (every host) -- a status row first (supported or constrained, never unsupported) and
+ *              five-field `python|<flavour>|...` rows; no host-specific count or version.
  * No host-specific count or name assertion for dotnet or jvm: CI runners are
  * unknown hosts where those runtimes may legitimately be absent. The populated
  * rows are asserted host-independently in test_runtimes_linux_parsers.cpp
@@ -135,12 +137,11 @@ std::optional<LoadedPlugin> load_runtimes_plugin() {
     return LoadedPlugin{std::move(*loaded), d};
 }
 
-constexpr const char* kActions[] = {"dotnet", "jvm"};
+constexpr const char* kActions[] = {"dotnet", "jvm", "python"};
 
-#if defined(_WIN32)
-constexpr const char* kPlannedToken = "windows:planned";
-#elif defined(__APPLE__)
-constexpr const char* kPlannedToken = "macos:planned";
+#if defined(_WIN32) || defined(__APPLE__)
+// The actions whose macOS / Windows legs were once planned placeholders (all three ship now).
+constexpr const char* kPlannedActions[] = {"dotnet", "jvm"};
 #endif
 
 #if !defined(_WIN32) && !defined(__APPLE__)
@@ -148,6 +149,7 @@ constexpr const char* kPlannedToken = "macos:planned";
 bool is_flavour(const std::string& action, const std::string& f) {
     if (action == "dotnet") return f == "core" || f == "sdk" || f == "unmodelled";
     if (action == "jvm") return f == "jdk" || f == "jre" || f == "unmodelled";
+    if (action == "python") return f == "cpython" || f == "unmodelled";
     return false;
 }
 #endif
@@ -208,9 +210,39 @@ TEST_CASE("runtimes plugin: an unknown action is refused, not silently ignored",
     CHECK(split_fields_escape_aware(hrows[0]).size() == 1);
 }
 
+TEST_CASE("runtimes plugin: python is read on every host and never reports unsupported",
+          "[runtimes][actions][python]") {
+    auto plugin = load_runtimes_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "python");
+    CHECK(result.rc == 0);
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    const auto st = split_fields_escape_aware(rows[0]);
+    REQUIRE(st.size() == 4);
+    CHECK(st[0] == "status");
+    CHECK(st[1] == "python");
+    // Host-independent: a CI runner may or may not have a python.org / distro interpreter at the
+    // standard roots, so only the grammar is asserted (the populated rows are pinned in
+    // test_runtimes_python_parsers.cpp and test_runtimes_linux_parsers.cpp over fixtures).
+    CHECK((st[2] == "supported" || st[2] == "constrained"));
+    CHECK(rows[0].find(":planned") == std::string::npos);
+    for (std::size_t i = 1; i < rows.size(); ++i) {
+        INFO("row: " << rows[i]);
+        const auto f = split_fields_escape_aware(rows[i]);
+        REQUIRE(f.size() == 5);
+        CHECK(f[0] == "python");
+        CHECK((f[1] == "cpython" || f[1] == "unmodelled"));
+    }
+}
+
 #if defined(_WIN32) || defined(__APPLE__)
 
-TEST_CASE("runtimes plugin: the planned legs emit exactly the planned status row",
+TEST_CASE("runtimes plugin: the dotnet and jvm legs read the host and no longer report planned",
           "[runtimes][actions]") {
     auto plugin = load_runtimes_plugin();
     if (!plugin) {
@@ -218,17 +250,20 @@ TEST_CASE("runtimes plugin: the planned legs emit exactly the planned status row
         return;
     }
     yuzu::agent::LocalDispatcher dispatcher;
-    for (const char* a : kActions) {
+    for (const char* a : kPlannedActions) {
         INFO("action: " << a);
         auto result = dispatcher.run(plugin->descriptor, a);
         CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0] == std::string{"status|"} + a + "|unsupported|" + kPlannedToken);
-        // The typed status seam agrees: UNAVAILABLE / PARTIAL, the token as provenance.
-        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
-        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-        CHECK(result.result_provenance == kPlannedToken);
+        REQUIRE_FALSE(rows.empty());
+        // Host-independent: only the grammar is asserted; populated rows are pinned over
+        // fixtures in the per-OS parser tests.
+        const auto st = split_fields_escape_aware(rows[0]);
+        REQUIRE(st.size() == 4);
+        CHECK(st[0] == "status");
+        CHECK(st[1] == a);
+        CHECK((st[2] == "supported" || st[2] == "constrained"));
+        CHECK(rows[0].find(":planned") == std::string::npos);
     }
 }
 

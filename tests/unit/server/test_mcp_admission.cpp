@@ -330,8 +330,9 @@ struct RoutesHarness {
     /// What the stub resolver returns; nullopt makes it behave as an unauthenticated caller.
     std::optional<yuzu::server::auth::Session> resolved;
     int resolver_calls{0};
-    /// perm_fn invocations: a tool handler reaches it (list_agents asks Infrastructure:Read)
-    /// only after admission, so 0 here proves no tool ran for a refused caller.
+    /// perm_fn / fleet_read_fn invocations: a tool handler reaches them (list_agents asks
+    /// Infrastructure:Read through fleet_read_fn since #4041) only after admission, so 0 here
+    /// proves no tool ran for a refused caller.
     int tool_gate_calls{0};
     /// The factory's audit-budget clock (ms), injected so a test moves the window by hand.
     std::int64_t now_ms{1'000};
@@ -379,6 +380,13 @@ struct RoutesHarness {
             ++tool_gate_calls;
             return true;
         };
+        // list_agents (the probe tool) gates on fleet_read_fn_ since #4041; count it like perm_fn.
+        mcp.set_fleet_read_fn([this](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&)
+                                  -> yuzu::server::authz::FleetReadGate {
+            ++tool_gate_calls;
+            return {true, std::nullopt};
+        });
         yuzu::server::mcp::McpServer::AgentsJsonFn agents_fn = []() -> nlohmann::json {
             return nlohmann::json::array();
         };

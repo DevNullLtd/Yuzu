@@ -14,7 +14,7 @@
 /// (#2407).
 ///
 /// THE DEFECT: an unauthenticated caller can make the server buffer up to
-/// httplib's 100 MiB default (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`, httplib.h:130)
+/// httplib's 100 MiB default (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`, httplib.h v0.59.0:130)
 /// on every route except `/mcp/`, which `server.cpp`'s pre-routing handler
 /// already caps at 4 MiB (#2437, `mcp_body_exceeds_cap`/`mcp_body_unmeasurable`
 /// in `web_utils.hpp`). This header generalizes that per-path cap into one
@@ -62,12 +62,15 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// four classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// six classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
 /// costs a conforming client nothing), `upload_session`, `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
-/// callers) and `dex_score_policy` (one JSON document, capped by its handler). Every other
+/// callers), `dex_score_policy` (one JSON document, capped by its handler),
+/// `dex_score_policy_form` (the DEX Scoring tab's three form POSTs, the same reason) and `commands`
+/// (`POST /api/v1/commands`, a new route whose MCP twin `execute_instruction` already requires a
+/// measurable body, so a REST caller is held to the same contract). Every other
 /// class below — public REST (bundles), SCIM, certificate import (REST + dashboard), the
 /// plugin trust bundle, product-pack/workflow authoring, and the OTA upload — keeps it
 /// OFF and falls back to httplib's 100 MiB backstop for a body it cannot
@@ -77,24 +80,28 @@
 ///
 /// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
 /// default above, a chunked or Content-Length-less body is NOT refused BEFORE
-/// BEING READ on any class but `/mcp/` — this table's pre-routing chokepoint
+/// BEING READ on any class that keeps `requires_measurable` off (all but the
+/// five listed above); this table's pre-routing chokepoint
 /// admits it, up to httplib's own 100 MiB backstop, without checking this
 /// table's cap at all. A comment or doc that says chunked bodies are
-/// "refused" without naming `/mcp/` as the sole PRE-READ exception is wrong.
+/// "refused" without naming all five classes that require a measurable body is wrong.
 /// This is a recorded adjudication, not an oversight — see the paragraph
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
 ///
-/// That gap is narrower than it once was: `server.cpp`'s `set_pre_request_
-/// handler` (body-cap-post-read-stage) is a SECOND chokepoint, driven by the
+/// That gap is narrower than it once was: the post-read stage (body-cap-post-read-stage,
+/// `step_up_wiring.hpp`'s `run_post_read_stage`) is a SECOND chokepoint, driven by the
 /// SAME `resolve_body_cap` table, that runs after httplib has read the body
 /// into `req.body` but before the route handler runs — so a chunked body
 /// that turns out to be over this table's cap is still refused, just after
 /// being buffered rather than before. It closes "reaches a handler
-/// uncapped", not "gets buffered uncapped" — see that handler's own doc
-/// comment for what it does and does not cover (notably: it cannot see a
+/// uncapped", not "gets buffered uncapped" — see the comment at its install
+/// in `server.cpp` for what it does and does not cover (notably: it cannot see a
 /// multipart request's body at all, since httplib never copies multipart
-/// content into `req.body`).
+/// content into `req.body`). It is installed through `PostReadStageRegistry`
+/// (`post_read_stage.hpp`) and run by `HttplibRouteSink`'s handler wrapper, NOT as
+/// `httplib::Server::set_pre_request_handler`: from cpp-httplib v0.47.0 that handler
+/// runs BEFORE the body is read, so a body-size check hung there would always see 0 bytes.
 ///
 ///
 /// ROUTED-CONCERN ROW: `.claude/routed-concerns-access-control.md`, which
@@ -200,7 +207,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
     // ANY method: only the chunk PUT carries a large body, but scoping to PUT
     // would silently drop every sibling verb on this prefix to the catch-all
-    // (rule 4 in the routed-concern row — prefer any-method rows). Cap = the
+    // (rule 4 in the routed-concern row: a mutating route needs its own entry or a
+    // reviewed catch-all decision). Any-method rows are preferred. Cap = the
     // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
     // (upload_grant_parsers.hpp; bound by a static_assert in
     // file_retrieval_routes.cpp so the two cannot drift). requires_measurable
@@ -226,7 +234,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // POST /api/settings/updates/upload — OTA agent binary upload
     // (settings_routes.cpp:5146 handler start, :5206 the unbounded file
     // read). No route-local limit exists today; keep httplib's own 100 MiB
-    // default (httplib.h:130, CPPHTTPLIB_PAYLOAD_MAX_LENGTH) as the outer
+    // default (httplib.h v0.59.0:130, CPPHTTPLIB_PAYLOAD_MAX_LENGTH) as the outer
     // backstop rather than squeeze a legitimate multi-ten-MB installer
     // binary. This entry exists so the class is an explicit, reviewed
     // decision rather than an accidental fallthrough to the catch-all.
@@ -544,7 +552,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // while keeping an unauthenticated flood against this subtree (whose
     // gates all run in the handler, after httplib buffers the body) 256x
     // under the 4 MiB catch-all it previously fell to. ANY method: the
-    // bodyless siblings share the prefix (rule 4 in the routed-concern row).
+    // bodyless siblings share the prefix.
     // requires_measurable stays OFF per the file-header default.
     {kBodyCapAnyMethod, "/api/v1/users", 16u * 1024, false, "users"},
 
@@ -557,21 +565,74 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // same-site gate runs earlier, pre-routing), so an unmeasurable (chunked) body must be
     // refused here (the hardware row's reasoning).
     {kBodyCapAnyMethod, "/api/v1/dex/score-policy", 320u * 1024, true, "dex_score_policy"},
+    // /api/settings/dex-scoring: the DEX Scoring tab's three POSTs (settings_routes.cpp). The
+    // body is the whole policy as a urlencoded form, and Save, Preview and Reset each submit all
+    // of it. Worst case from the document's own limits: 200 override rows (kDexPolicyMaxOverrides)
+    // of 15 fields plus the Remove box, each with a 260-byte key (kDexPolicyMaxKeyBytes) of
+    // punctuation that percent-encodes to 3 bytes a character (780 B), four 24-byte names
+    // (288 B encoded), 17-digit numbers, and field names whose brackets are encoded too
+    // (`overrides%5B199%5D.`): about 1.8 KB a row, so about 360 KB with the globals. 512 KiB holds
+    // that with ~1.45x headroom and stays 8x under the 4 MiB catch-all; test_body_cap_policy.cpp
+    // rebuilds the worst case and pins it under this cap. The REST row above stays 320 KiB: its
+    // body is the 256 KiB JSON document. requires_measurable = true for the same reason as the
+    // REST row: the permission gate runs in the handler, after httplib buffers the body.
+    {kBodyCapAnyMethod, "/api/settings/dex-scoring", 512u * 1024, true, "dex_score_policy_form"},
     // /api/v1/crypto — the /crypto REST v1 subtree. The only body-bearing route is
     // PUT /api/v1/crypto/dashboard/layout {"widgets":[ids]}: at most 64 catalogue ids of at most
     // 64 bytes (crypto_widget_catalogue.hpp kMaxLayoutWidgets / kWidgetIdMaxBytes), about 4.4 KiB
     // even fully escaped. Mirrors the handler's own kLayoutBodyMaxBytes (16 KiB) exactly - the
     // ca_revoke two-authority-split precedent. ANY method: every sibling is a bodyless GET and
-    // shares the prefix (rule 4 in the routed-concern row).
+    // shares the prefix.
     {kBodyCapAnyMethod, "/api/v1/crypto", 16u * 1024, false, "crypto"},
 
     // /api/v1/config — the runtime-configuration REST v1 twin. The only body-bearing route is
     // PUT /api/v1/config/{key} {"value": ...}: one scalar (an integer, a flag, a log level, a
     // tag key, an OIDC client secret or a short JSON array of routed observation types), well
     // under 16 KiB. The legacy PUT /api/config/{key} keeps the catch-all (kDefaultIsCorrectFor).
-    // ANY method: the sibling GET is bodyless and shares the prefix (rule 4 in the routed-concern
-    // row).
+    // ANY method: the sibling GET is bodyless and shares the prefix.
     {kBodyCapAnyMethod, "/api/v1/config", 16u * 1024, false, "config"},
+
+    // /api/v1/inventory/software/normalization/ — the software-title curation REST v1 routes
+    // (software_curation_routes.cpp). The body-bearing routes are POST .../aliases (one JSON
+    // object of at most eight strings, each capped at 256 bytes by the handler) and POST
+    // .../queue/{key}/reject (bodyless); the GETs (status, queue) are bodyless. 64 KiB is
+    // generous headroom over that shape while holding an unauthenticated flood 64x under the
+    // 4 MiB catch-all (the admission gate runs in the handler, after httplib buffers the body).
+    // ANY method: the GET siblings share the prefix (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/", 64u * 1024, false,
+     "software_curation"},
+    // POST /api/v1/inventory/software/normalization/pack — the alias-pack CSV upload. The raw
+    // body IS the CSV, which parse_normalization_pack refuses over kMaxPackBytes (1 MiB,
+    // software_normalization_pack.hpp), so the cap mirrors that bound exactly (the ca_revoke
+    // two-authority precedent). Longer literal prefix than the row above, so it wins there.
+    // ANY method; no sibling verb carries a body on this path.
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/normalization/pack", 1u * 1024 * 1024,
+     false, "software_alias_pack"},
+    // /api/v1/inventory/software/collection-settings — the per-group collection settings REST
+    // v1 routes (software_collection_settings_routes.cpp). The only body-bearing route is PUT
+    // .../{group_id}: one small JSON object (an interval, a window, a zone name, six boolean
+    // switches, a priority and a version), well under 16 KiB. ANY method: the GET siblings
+    // share the prefix.
+    {kBodyCapAnyMethod, "/api/v1/inventory/software/collection-settings", 16u * 1024, false,
+     "software_collection_settings"},
+    // /api/v1/commands -- POST: the REST v1 twin of MCP execute_instruction (command_v1_routes.cpp).
+    // The same 4 MiB as the `/mcp/` row because the same worst case rides it: a maximal request
+    // (10000 agent ids, 32 parameters of 64 KiB, an 8 KiB scope) is `kExecInstrWorstCaseBody`,
+    // about 3.3 MiB, which test_command_v1_routes.cpp pins against THIS entry. `requires_measurable`
+    // is true like the MCP row: an unmeasurable (chunked) body would otherwise bypass the pre-routing
+    // cap on this route while the twin refuses it. ANY method: the segment-boundary match keeps a
+    // future sibling under this prefix capped too (rule 4 in the routed-concern row).
+    {kBodyCapAnyMethod, "/api/v1/commands", 4u * 1024 * 1024, true, "commands"},
+    // /api/v1/crypto/revocation-sources — registered CRL sources (ADR-0070 R1, revocation_source_
+    // routes.cpp): POST / PUT carry {name, ca_certificates (<= 8 PEM, 16 KiB each), crl_urls (<= 8
+    // x 2,048 bytes)}, so 192 KiB (the largest valid body, JSON-escaped, is about 151 KiB) mirrors revocation_source::kBodyMaxBytes exactly (a
+    // static_assert in the routes TU pins the pair). The gates (administrator predicate,
+    // securable) run in the handler after httplib buffered the body, so without its own entry the
+    // path would take the 16 KiB `/api/v1/crypto` row and refuse a legitimate 8-certificate body.
+    // Longest match: it outranks the `/api/v1/crypto` row above for this subtree only. ANY method:
+    // a verb-scoped row would drop the whole prefix to the shorter row (rule 4).
+    {kBodyCapAnyMethod, "/api/v1/crypto/revocation-sources", 192u * 1024, false,
+     "crypto_revocation_sources"},
 
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
@@ -714,11 +775,26 @@ struct BodyCapDecision {
 /// PRODUCTION combination (an inverted condition, a swapped status, a
 /// dropped branch) had no test that could see it: the fixture's own,
 /// separately-written combination still matched its own separately-written
-/// expectations. Routing both call sites through this one function makes
-/// that divergence structurally impossible instead of something to keep
-/// re-verifying by hand — see `docs/postgres-store-playbook.md`-style
-/// reasoning applied to a chokepoint rather than a store: EXTEND this
-/// function, never fork it.
+/// expectations. Routing both call sites through this one function shares
+/// the combination of predicates, so it need not be re-verified by hand
+/// (the same reasoning as `docs/postgres-store-playbook.md`, applied to a
+/// chokepoint rather than a store): EXTEND this function, never fork it.
+///
+/// The caller supplies the arguments, and every header-derived one MUST agree
+/// with what httplib's own reader acts on, taken through a named accessor and
+/// never a raw `get_header_value` first-line read: `content_length_for_body_cap(req)`
+/// and `transfer_encoding_for_body_cap(req)` (web_utils.hpp; the latter is the
+/// first line, or a "present" marker when that line is empty but the header
+/// exists, because the gate only tests non-emptiness),
+/// `content_encoding_for_body_cap(req)` (body_cap_httplib.hpp, the combined
+/// value httplib decodes against) and `is_chunked_for_body_cap(req)`
+/// (body_cap_httplib.hpp, httplib's own chunked decision). An empty first
+/// `Transfer-Encoding` or `Content-Encoding` line hides a later one that httplib
+/// still honours. `has_content_length` comes from `has_content_length_for_body_cap(req)`
+/// (body_cap_httplib.hpp: the presence of any `Content-Length` line), whose body
+/// test_body_cap_policy.cpp pins. `server.cpp`'s one call is pinned in full (the whole
+/// argument list, in order) by test_step_up_wiring.cpp; the test fixture uses the same
+/// accessors.
 ///
 /// Composes `resolve_body_cap` (this header) with the framing/encoding
 /// predicates in `web_utils.hpp` (`has_non_identity_content_encoding`,
@@ -740,13 +816,13 @@ struct BodyCapDecision {
 ///
 /// NO `httplib::Request` IN THE SIGNATURE, deliberately, even though every
 /// production caller has one at hand: `is_chunked` MUST come from httplib's
-/// own `httplib::detail::is_chunked_transfer_encoding(req.headers)` (see
+/// own chunked decision, `is_chunked_for_body_cap(req)` (see
 /// `content_length_is_authoritative`'s doc comment for why re-deciding that
 /// bit from the raw header text was a live bypass, twice). Accepting
 /// `const httplib::Request&` here would tempt a future caller to re-derive
 /// `is_chunked` (or `content_length`, or `has_content_length`) INSIDE this
 /// function from the request instead of from the caller's own
-/// `content_length_for_body_cap`/`is_chunked_transfer_encoding` calls — at
+/// `content_length_for_body_cap`/`is_chunked_for_body_cap` calls, at
 /// which point the production call site and the test fixture below are back
 /// to two independent implementations of the same httplib quirk, which is
 /// precisely the class of defect #2407 R2 was. Taking the already-extracted
@@ -762,7 +838,7 @@ struct BodyCapDecision {
 /// The header-comment requirement in `server.cpp` to "CONTAIN THE WHOLE
 /// BLOCK" in a `try`/`catch(...)` still applies to the WIRING around this
 /// call — extracting the request's `Content-Length`/`Transfer-Encoding`/
-/// `Content-Encoding` header VALUES (`req.get_header_value*`) can throw, and
+/// `Content-Encoding` header VALUES (`req.get_header_value*`, the accessors above) can throw, and
 /// that extraction happens at the caller, before this function is invoked —
 /// this function itself is not the boundary that containment protects, the
 /// caller's header reads are.

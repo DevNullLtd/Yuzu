@@ -43,7 +43,7 @@ RESOLVE_LINE = "auto session = auth_routes_->resolve_session(req);\n"
 STASH_LINE = "detail::tls_engine_principal() = session->is_engine();\n"
 TOP_RESET = "detail::tls_engine_principal() = false;\n"
 PRE_ROUTING = "web_server_->set_pre_routing_handler("
-PRE_REQUEST = "web_server_->set_pre_request_handler("
+STAGE_INSTALL = "PostReadStageRegistry::instance().install("
 
 
 def once(src, anchor):
@@ -163,7 +163,7 @@ def m_remove_include(s):
 
 def m_stage_before_gate(s):
     m = gate_stmt(s)
-    return s[:m.start()] + "run_pre_request_stage(req, res, {});\n" + s[m.start():]
+    return s[:m.start()] + "run_post_read_stage(req, res, {});\n" + s[m.start():]
 
 
 def m_consume_pass_after_resolve(s):
@@ -266,9 +266,23 @@ def m_step_up_allowance_too_late(s):
 
 
 def m_stage_twice(s):
-    at = lambda_open_brace(s, PRE_REQUEST)
-    s = s[:at + 1] + "\nrun_pre_request_stage(req, res, kNone);\n" + s[at + 1:]
-    return s + "\nvoid f() { run_pre_request_stage(req, res, kNone); }\n"
+    at = lambda_open_brace(s, STAGE_INSTALL)
+    s = s[:at + 1] + "\nrun_post_read_stage(req, res, kNone);\n" + s[at + 1:]
+    return s + "\nvoid f() { run_post_read_stage(req, res, kNone); }\n"
+
+
+def m_install_twice(s):
+    return s + "\nvoid g() { PostReadStageRegistry::instance().install(nullptr, {}); }\n"
+
+
+def m_install_renamed(s):
+    once(s, STAGE_INSTALL)
+    return s.replace(STAGE_INSTALL, "PostReadStageRegistry::instance().install_(", 1)
+
+
+def m_install_after_first_route(s):
+    # The stage is read by the sink at registration: a route registered first is left unwrapped.
+    return insert_before(s, STAGE_INSTALL, "HttplibRouteSink early_sink{*web_server_};\n")
 
 
 def m_second_pre_routing_registration(s):
@@ -605,7 +619,7 @@ MUTATIONS = [
     ("*session replaced by req", m_session_replaced_by_req, "arguments are not exactly"),
     ("duplicated gate call", m_duplicate_call, "exactly one apply_same_site_write_gate("),
     ("include removed", m_remove_include, "no longer has #include"),
-    ("step-up stage before the gate", m_stage_before_gate, "run_pre_request_stage( must not"),
+    ("step-up stage before the gate", m_stage_before_gate, "run_post_read_stage( must not"),
     ("step-up pass consumed after resolve", m_consume_pass_after_resolve, "step-up token"),
     ("extra gate argument", m_extra_argument, "arguments are not exactly"),
     ("TLS flag argument dropped", m_tls_flag_dropped, "arguments are not exactly"),
@@ -630,6 +644,10 @@ MUTATIONS = [
     ("step-up allowance after the first early return", m_step_up_allowance_too_late,
      "must sit before the first early Unhandled"),
     ("step-up stage called twice", m_stage_twice, "must occur exactly once"),
+    ("stage install called twice", m_install_twice, "must be called exactly once"),
+    ("stage install renamed away", m_install_renamed, "must be called exactly once"),
+    ("stage install after the first route", m_install_after_first_route,
+     "must precede the first route"),
     ("second pre-routing registration", m_second_pre_routing_registration,
      "exactly one set_pre_routing_handler("),
     ("gate survives only in a string literal", m_gate_in_string_literal,
@@ -770,12 +788,12 @@ MUTATIONS = [
 
 # --- positive cases: must stay clean -----------------------------------------------------------
 
-# The step-up stage is wired into the server (the branch that adds `run_pre_request_stage(` has
-# merged). Three positives below insert tokens that the real file already carries once, and the
-# gate (checks 8 and 9) allows each of them exactly once, so on a wired tree they normalise the
-# existing occurrence first; a second pre_request registration is no longer harmless there and
-# moves to the mutation rows. On a tree without the stage the original insertions apply as-is.
-STEP_UP_WIRED = "run_pre_request_stage(" in SERVER_CPP.read_text(encoding="utf-8")
+# The post-read stage is wired into the server through `PostReadStageRegistry::install`. Three
+# positives below insert tokens that the real file already carries once, and the gate (checks 8
+# and 9) allows each of them exactly once, so on a wired tree they normalise the existing
+# occurrence first; ANY `set_pre_request_handler(` registration is a violation there (httplib runs
+# it before the body is read from v0.47.0) and moves to the mutation rows. On a tree without the stage the original insertions apply as-is.
+STEP_UP_WIRED = "run_post_read_stage(" in SERVER_CPP.read_text(encoding="utf-8")
 
 
 def without_clear_step_up_pass(src):
@@ -796,7 +814,7 @@ def p_literals_and_comments_with_tokens(s):
         'const char* k = "}{\'";\n'
         "char c = '{';\n"
         "// return httplib::Server::HandlerResponse::Unhandled; apply_same_site_write_gate(\n"
-        "/* run_pre_request_stage( stepUp { */\n")
+        "/* run_post_read_stage( stepUp { */\n")
 
 
 def p_optional_clear_step_up_pass_at_top(s):
@@ -809,12 +827,12 @@ def p_qualified_clear_step_up_pass_at_top(s):
 
 
 def p_stage_inside_pre_request_handler(s):
-    if "run_pre_request_stage(" in s:
+    if "run_post_read_stage(" in s:
         # Already wired: the single occurrence is the pinned one; vary its spelling instead.
-        assert s.count("detail::run_pre_request_stage(") == 1, "stage spelling changed (stale)"
-        return s.replace("detail::run_pre_request_stage(", "run_pre_request_stage(", 1)
-    at = lambda_open_brace(s, PRE_REQUEST)
-    return s[:at + 1] + "\nrun_pre_request_stage(req, res, kNone);\n" + s[at + 1:]
+        assert s.count("detail::run_post_read_stage(") == 1, "stage spelling changed (stale)"
+        return s.replace("detail::run_post_read_stage(", "run_post_read_stage(", 1)
+    at = lambda_open_brace(s, STAGE_INSTALL)
+    return s[:at + 1] + "\nrun_post_read_stage(req, res, kNone);\n" + s[at + 1:]
 
 
 def p_unqualified_gate_spelling(s):
@@ -872,7 +890,7 @@ POSITIVES = [
     ("literals and comments carrying pinned tokens", p_literals_and_comments_with_tokens),
     ("optional clear_step_up_pass at the top", p_optional_clear_step_up_pass_at_top),
     ("qualified clear_step_up_pass at the top", p_qualified_clear_step_up_pass_at_top),
-    ("run_pre_request_stage only in the pre_request lambda", p_stage_inside_pre_request_handler),
+    ("run_post_read_stage only in the install lambda", p_stage_inside_pre_request_handler),
     ("unqualified gate spelling", p_unqualified_gate_spelling),
     ("reflowed call", p_reflowed_call),
     ("hash and flow tokens inside literals", p_hash_and_flow_tokens_inside_literals),
@@ -886,7 +904,7 @@ POSITIVES = [
 if STEP_UP_WIRED:
     MUTATIONS.append(("second pre_request handler registration (the stage is wired)",
                       p_second_pre_request_handler_registration,
-                      "set_pre_request_handler( is not registered exactly once"))
+                      "must not register set_pre_request_handler("))
 else:
     POSITIVES.insert(0, ("second pre_request handler registration",
                          p_second_pre_request_handler_registration))
@@ -898,6 +916,8 @@ else:
 FULL_FILE_ROWS = {
     "delete the gate call", "duplicated gate call", "include removed",
     "audit sink not wired to the audit log", "step-up stage called twice",
+    "stage install called twice", "stage install renamed away",
+    "stage install after the first route",
     "second pre-routing registration", "registration wrapped in #if 0",
     "gate hidden by a comment line splice", "__builtin_unreachable() before the gate",
     "second registration with a space before the paren", "registration name used without a call",
@@ -931,7 +951,7 @@ def trimmed_fixture(raw):
     assert len(inc) == 1, "include line not unique/present (stale fixture)"
     spans = [(inc[0], inc[0])]
     for marker, end in (("web_server_->set_pre_routing_handler(", r"^ {8}\}\);\s*$"),
-                        ("web_server_->set_pre_request_handler(", r"^ {8}\}\);\s*$"),
+                        (STAGE_INSTALL, r"^ {8}\}\);\s*$"),
                         ("SameSitePrincipalAuditFn same_site_audit_fn_ =", r"^ {8}\};\s*$")):
         spans.append(statement_lines(lines, marker, end))
     spans.sort()

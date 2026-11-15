@@ -165,7 +165,7 @@ heartbeat facts.
 A separate **`netqual`** Echo capture source can record per-connection TCP
 quality — smoothed RTT, jitter, and current-loss counters per ESTABLISHED
 connection, joined to the owning process — into the agent's **local edge
-warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
+warehouse** as `$NetQual_Hourly`. It is governed independently of the heartbeat:
 
 - **On by default.** Set the agent Echo config key **`netqual_enabled = false`**
   to disable it on a host (mirrors `procperf_enabled`).
@@ -174,8 +174,8 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
   at the collector edge and **never persisted**. The owning process is recorded
   as its image name only.
 - **On-device.** These rows stay in the local warehouse (queryable via the
-  Execute-gated Echo SQL surface as `$NetQual_Live`); they are not shipped to the
-  server. A per-tick top-N cap and a row-count retention ceiling bound storage.
+  Execute-gated Echo SQL surface as `$NetQual_Hourly`); they are not shipped to the
+  server. A per-tick top-N cap and a per-tier age limit bound storage.
 - **Linux, Windows, and macOS.** Linux reads netlink INET_DIAG; Windows reads
   TCP ESTATS (ADR-0020) and **requires an elevated agent** — non-elevated it
   records nothing and `echo.status` reports `netqual_capture_method|none`.
@@ -199,7 +199,7 @@ warehouse** as `$NetQual_Live`. It is governed independently of the heartbeat:
 - **Retrospective companions (ADR-0020).** `$NetQual_Boot` records one row per
   boot from since-boot OS counters — a coarse "network quality before Echo was
   running this boot" baseline — and the separate **`netconn`** source
-  (`$NetConn_Live`, `netconn_enabled`) backfills OS-retained connectivity
+  (`$NetConn_Hourly`, `netconn_enabled`) backfills OS-retained connectivity
   transitions (connect/disconnect, internet-capability changes, Wi-Fi drops with
   reason codes) reaching days-to-weeks before Echo existed on the box, storing
   enum tokens and reason codes only.

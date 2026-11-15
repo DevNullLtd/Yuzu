@@ -56,7 +56,7 @@
 ///     HTTPS listener is not bound or has exited. The guarantee is "bound
 ///     and not yet exited", NOT "accepting": after a fatal accept error httplib
 ///     closes the listening socket but `is_running()` stays true until
-///     already-accepted requests drain (httplib.h:11307-11330, 11269), so the
+///     already-accepted requests drain (httplib.h v0.59.0:14040-14052, 14071, 13995-13996), so the
 ///     gate can answer 200 for that drain window; new connections are refused
 ///     throughout it. The gate exists because the redirect listener runs on its
 ///     own thread and would otherwise report healthy for a server whose only
@@ -220,10 +220,12 @@ class EnablementStore;
 class AppUsageStore;
 class CertificateInventoryStore;
 class ProductRegistryStore;
+class SoftwareCollectionSettingsStore;
 class ProductPackStore;
 class ScimStore;
 class AnalyticsEventStore;
 class CryptoDashboardLayoutStore; // /readyz "degraded" notice only (ADR-0071 degrade posture)
+class RevocationSourceStore;      // /readyz GATING check (ADR-0070 R1: fail-closed registered CRL sources)
 
 // /metrics ONLY.
 class NvdDatabase;
@@ -289,13 +291,16 @@ namespace health {
 
 /// True for a request the plaintext redirect listener serves instead of
 /// redirecting: GET or HEAD on an exact probe path that declares no body.
-/// HEAD is admitted because httplib dispatches it to the GET handlers
-/// (httplib.h:11420) and omits the body on write (httplib.h:10822, 10836), so
+/// HEAD is admitted because httplib dispatches it to the GET handlers and omits the body on
+/// write (httplib.h v0.59.0:14171-14172, 13495), so
 /// no second registration is needed. A probe carrying Content-Length or
 /// Transfer-Encoding stays a 301: httplib runs the pre-routing handler BEFORE it
-/// reads a body (httplib.h:11337-11413), so declining those keeps the plaintext
-/// listener from ever buffering one. That ordering is a dependency on httplib
-/// 0.37.1 — a version that read the body first would invalidate this reasoning.
+/// reads a body (httplib.h v0.59.0:14079-14080, read_content at 14209), so declining those keeps
+/// the plaintext listener from ever buffering one. That ordering is a dependency on httplib; a
+/// version that read the body first would invalidate this reasoning. It is pinned by
+/// test_body_cap_policy.cpp's "Pre-routing answer" and "a pre-routing refusal closes the
+/// connection" cases, which declare a body they never complete and go red if httplib waits for
+/// it before answering.
 /// Because no body is ever admitted here, this listener needs no row in
 /// `body_cap_policy.hpp`'s table (the #2407 routed-concerns row).
 [[nodiscard]] inline bool is_plaintext_probe_request(const httplib::Request& req) {
@@ -461,6 +466,7 @@ struct Deps {
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     CertificateInventoryStore* certificate_inventory_store{nullptr}; // slice-2 PR 2a-2a
     ProductRegistryStore* product_registry_store{nullptr};
+    SoftwareCollectionSettingsStore* software_collection_settings_store{nullptr}; // SAM-34
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};
     AnalyticsEventStore* analytics_store{nullptr};
@@ -468,6 +474,9 @@ struct Deps {
     /// server boots without saved layouts), so null here means "did not open" - reported under
     /// /readyz's "degraded", never in failed_stores.
     CryptoDashboardLayoutStore* crypto_dashboard_layout_store{nullptr};
+    /// Gating (ADR-0070 R1): registered CRL sources are operator-authored security configuration,
+    /// so construction is fail-closed and this store IS in the /readyz conjunction.
+    RevocationSourceStore* revocation_source_store{nullptr};
 
     // ---- /metrics ONLY ----
     NvdDatabase* nvd_db{nullptr};

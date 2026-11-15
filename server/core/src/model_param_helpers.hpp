@@ -2,10 +2,11 @@
 
 /// @file model_param_helpers.hpp
 /// Query-parameter and cursor-payload helpers shared by the pure REST/MCP read models
-/// (`software_catalogue_model.cpp`, `crypto_library_model.cpp`). Both models parse the same
-/// `std::multimap` parameter bag, refuse the same unbindable text, and encode their keyset
-/// cursors with the same length-prefixed payload and FNV-1a filter fingerprint, so the helpers
-/// live ONCE here (review #6056 A10) rather than as two copies that could drift.
+/// (`software_catalogue_model.cpp`, `crypto_library_model.cpp`, `software_list_model.cpp`). The
+/// models parse the same `std::multimap` parameter bag, refuse the same unbindable text, and
+/// encode their keyset cursors with the same length-prefixed payload and FNV-1a filter
+/// fingerprint, so the helpers live ONCE here (review #6056 A10) rather than as copies that
+/// could drift.
 ///
 /// Pure: no httplib, no MCP, no libpq, no store types. Every function is `inline` (header-only),
 /// so both translation units see one definition.
@@ -33,6 +34,18 @@ inline constexpr char kSep = '\x1f';
 
 using Params = std::multimap<std::string, std::string>;
 
+/// Copy of an HTTP layer's query-parameter container as a key-sorted `Params`. The pure parsers in
+/// this directory take a `std::multimap`, and `httplib::Params` stopped being one (cpp-httplib
+/// 0.59 made it an insertion-ordered multimap), so a route hands the parsers this copy: it is
+/// needed for TYPE compatibility, and it keeps iteration SORTED by key, which the output order of
+/// some callers depends on. Through 0.37.1 the source WAS a `std::multimap`, so the copy was
+/// value-identical there; on 0.59 it re-sorts by key and keeps equal keys in wire order. Convert at the route boundary rather than
+/// teach the pure parsers about httplib.
+template <class Src>
+[[nodiscard]] Params to_params(const Src& src) {
+    return Params(src.begin(), src.end());
+}
+
 /// True for text Postgres can bind: strict UTF-8 and no NUL. Anything else would surface as a
 /// store error (SQLSTATE 22021) and be reported as a retryable 503 instead of a caller 400.
 [[nodiscard]] inline bool valid_text(std::string_view v) {
@@ -51,6 +64,28 @@ using Params = std::multimap<std::string, std::string>;
         return nullptr;
     }
     return &lo->second;
+}
+
+/// The raw routes' legacy rule: a repeated key keeps the FIRST value (nullptr when absent).
+/// lower_bound is the first equal element (multimap::find may return any of them).
+[[nodiscard]] inline const std::string* first_param(const Params& p, const std::string& key) {
+    const auto it = p.lower_bound(key);
+    return it != p.end() && it->first == key ? &it->second : nullptr;
+}
+
+/// `s` split on every `d` (an empty input is one empty field). The views point into `s`.
+[[nodiscard]] inline std::vector<std::string_view> split(std::string_view s, char d) {
+    std::vector<std::string_view> out;
+    std::size_t start = 0;
+    for (;;) {
+        const auto pos = s.find(d, start);
+        if (pos == std::string_view::npos) {
+            out.push_back(s.substr(start));
+            return out;
+        }
+        out.push_back(s.substr(start, pos - start));
+        start = pos + 1;
+    }
 }
 
 /// Full-consume signed decimal; nullopt on any defect (empty, sign-only, trailing bytes, range).

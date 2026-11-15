@@ -133,7 +133,9 @@
 %%%
 %%% The held and waiting counts of each class are published in an atomics
 %%% array behind a persistent_term, so snapshot/0 and the pressure sampler read
-%%% them without a call.
+%%% them without a call. The counts are written before a grant is delivered, on
+%%% both the immediate path and the queued one (serve/2), so a caller that holds
+%%% a permit and then reads snapshot/0 always finds it counted.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_upstream_regulator).
@@ -463,6 +465,12 @@ free(replay, #st{held = H, limit = L} = St) ->
 
 hold(Tag, Pid, Class, Deadline, Asked, #st{entries = E, mons = M, held = H} = St) ->
     Mon = erlang:monitor(process, Pid),
+    %% observe_wait/2 fires permit_wait BEFORE emit/2 publishes the new count;
+    %% yuzu_gw_upstream_stream_limit_tests:grant_publishes_held_before_it_replies/0
+    %% relies on that gap to hold the count back, so keep this order. Telemetry
+    %% handlers run here, in the regulator, and delay every grant: keep them
+    %% fast, and never have one call ask/2 or refuse_all/0 (a call into the
+    %% regulator from inside it stalls or exits calling_self).
     observe_wait(Class, Asked),
     St1 = St#st{entries = E#{Tag => #entry{pid = Pid, mon = Mon, class = Class,
                                            deadline = Deadline, asked = Asked, from = held}},
@@ -538,8 +546,16 @@ serve(Tag, #st{entries = E, mons = M, waiting = W} = St) ->
                     emit(Class, St1),
                     St1;
                 false ->
+                    %% Take the permit (hold/6 publishes the new held count to the
+                    %% snapshot/0 cell and the gauge) BEFORE telling the caller it
+                    %% has it. Replying first let a caller that read snapshot/0 the
+                    %% moment its grant arrived see the count from before its own
+                    %% permit (#6945). handle_call/3's immediate grant already has
+                    %% this order: it returns hold/6's state, and the reply goes
+                    %% out after.
+                    St2 = hold(Tag, Pid, Class, Deadline, Asked, St1),
                     gen_server:reply(From, granted),
-                    hold(Tag, Pid, Class, Deadline, Asked, St1)
+                    St2
             end
     end.
 

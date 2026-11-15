@@ -1,19 +1,26 @@
 #pragma once
 
 /**
- * echo_aggregator.hpp -- Rollup aggregation and retention for Echo warehouse
+ * echo_aggregator.hpp -- Retention, the byte budget and the source enable gates for Echo
  *
- * Aggregates live table data into hourly/daily/monthly summary tables.
- * Each rollup is idempotent: tracks last-processed timestamp in echo_config
- * and only processes new data on each invocation.
+ * ROLL-UP IS THE ONLY STORAGE MODEL. The fold (echo_fold.hpp) writes every event into every
+ * hourly / daily / monthly tier as it arrives, so there is no aggregation pass any more:
+ * what this file keeps is the pruning of those tiers by age (clock-guarded retention) and by
+ * size (the byte budget), plus the per-source enable gates.
  */
 
 #include "echo_db.hpp"
 
+#include <yuzu/echo_retention_tick.hpp> // kEchoDbBudgetBytesDefault / kEchoDbBudgetBytesMin
+
 #include <yuzu/audit_retention_rules.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <expected>
+#include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -73,15 +80,6 @@ inline constexpr std::size_t kMaxPatternConfigBytes = 128 * 1024;
 [[nodiscard]] std::optional<std::vector<std::string>>
 parse_pattern_config(std::string_view json_text, bool require_min_core_len = false);
 
-/**
- * Run all pending aggregations for all sources.
- * Reads rollup marks from echo_config, processes new data, updates marks.
- * @param db        The Echo database.
- * @param now_epoch Current epoch seconds.
- * @return Total number of aggregation operations performed.
- */
-int run_aggregation(EchoDatabase& db, int64_t now_epoch);
-
 // ── Retention clock guard (#2361) ─────────────────────────────────────────────
 //
 // Time-based retention deletes rows older than `now - retention_default`, with
@@ -124,6 +122,12 @@ inline constexpr int64_t kMaxEchoDeletesPerTablePerPass = 5000;
 // It leaves a deliberate dead band: a forward error smaller than 30 days does not
 // fire on a table whose own window is shorter. The per-pass cap still bounds it.
 inline constexpr int64_t kEchoMinBigStepSec = 30 * 86400;
+
+/// UPPER bound only on a plausible caller clock (a negative reading is the legitimate dead-CMOS
+/// case). Shared by run_retention (which refuses to persist a larger one as its anchor) and
+/// run_budget (whose floors are all derived from `now`): a reading above it is never trusted
+/// to delete anything.
+inline constexpr int64_t kEchoMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
 
 /**
  * Per-table clock-guard state for time-based retention. Owned by the plugin and
@@ -191,21 +195,36 @@ struct RetentionGuardState {
     /// "this table is not being retained", which is why the status surface sums
     /// them into one total.
     std::map<std::string, int64_t> delete_failures;
+    /// Byte-budget passes skipped because a retention pass above saw the clock refused. Not a
+    /// table and not a verdict of its own: it is a consequence of a decline or failure already
+    /// counted above, so it is surfaced as `retention_guard|__budget__|<n>` and counts toward
+    /// neither status total (counting it would double a clock decline and turn a failures-only
+    /// event into a non-zero declines total).
+    int64_t budget_skips{0};
 };
 
 /// Snapshot of the operator-facing counters, taken under `RetentionGuardState::mu`.
 struct RetentionGuardCounters {
     std::map<std::string, int64_t> declines;
     std::map<std::string, int64_t> failures;
+    int64_t budget_skips{0};
 };
 
 [[nodiscard]] RetentionGuardCounters retention_guard_counters(const RetentionGuardState& guard);
+
+/// Running total of the events that say the retention pass could not trust this pass's clock:
+/// clock declines plus probe-read and `__clock_state__` failures. Delete failures are NOT
+/// counted: the guard admitted the clock and only a DELETE failed, which says nothing about the
+/// reading the byte budget derives its floors from. The budget pass compares this total before
+/// and after `run_retention` and skips when it rose.
+[[nodiscard]] int64_t retention_clock_events(const RetentionGuardState& guard);
 
 /// The exact `echo status` lines for the retention guard, in emission order:
 /// a `retention_guard|<table>|<declines>` line per table that has declined, a
 /// `retention_guard_failed|<table>|<failures>` line per table whose probes OR
 /// deletes have failed (the two are merged -- both mean "not being retained"),
-/// then the always-present totals. Split out from `do_status` purely so
+/// then, when non-zero, `retention_guard|__budget__|<n>` (excluded from both totals), then the
+/// always-present totals. Split out from `do_status` purely so
 /// the operator-facing format has a test seam -- `EchoPlugin` is a
 /// translation-unit-local class and cannot be reached from a test.
 [[nodiscard]] std::vector<std::string>
@@ -213,8 +232,9 @@ format_retention_guard_lines(const RetentionGuardState& guard);
 
 /**
  * Run retention cleanup for all warehouse tables.
- * Enforces row-count limits on live tables and time-based retention on
- * aggregated tables.
+ * Enforces row-count limits on the plain row-count tables (netqual_boot, usage_live) and
+ * time-based retention on every roll-up tier, by bucket start, over the tier's physical
+ * `<src>_<tier>_r` table.
  *
  * Row-count retention is unguarded but no longer unbounded: it still only trims
  * the excess over a fixed ceiling, so no clock reading can make it delete more than it was
@@ -344,5 +364,195 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
  * `source_enabled_state()`.
  */
 [[nodiscard]] bool source_enabled(EchoDatabase& db, std::string_view source);
+
+// ── Byte budget (echo.db size cap) ────────────────────────────────────────────
+//
+// `db_budget_bytes` caps what echo.db holds: used pages plus the WAL file. The cap is HARD for
+// eligible data pages (the pass stops only at the target) and SOFT for the WAL:
+// journal_size_limit only truncates the WAL when a checkpoint resets it, and a long echo.sql
+// read on the read-only query connection can pin it, so data + WAL can sit above the budget
+// until that reader ends. Rows that are never evicted (the newest 48 h of hourly rows, 5 d for
+// per-app performance; daily and monthly rows; the usage tables and netqual_boot; paused or
+// errored sources) can hold used pages above the target. The overage is measured whenever
+// `status` runs and surfaced as `budget_over_bytes`, never hidden.
+//
+// Only the HOURLY tier is ever evicted. There is no raw tier: the fold stores the roll-ups
+// only, so there is nothing "cheaper to lose" to take first, and the daily and monthly tiers
+// that carry the same events at a coarser grain are never touched.
+
+/// Default and minimum `db_budget_bytes` (250 MiB and 32 MiB), shared with the server through
+/// common/include/yuzu/echo_retention_tick.hpp. Eviction targets the budget less
+/// kEchoWalAllowanceBytes (echo_db.hpp) of data pages.
+using yuzu::kEchoDbBudgetBytesDefault;
+using yuzu::kEchoDbBudgetBytesMin;
+/// Rows per eviction batch; one batch is one transaction and one hold of the database lock.
+inline constexpr int64_t kBudgetBatchRows = 1000;
+/// Hourly rows newer than this are never evicted. Daily and monthly rows are never evicted.
+inline constexpr int64_t kBudgetHourlyFloorSec = 172800;
+/// The same floor for procperf_hourly, which the daily app-perf sync re-reads for the last two
+/// completed UTC days plus today (sync_source_app_perf.cpp) and the server overwrites those
+/// days from whatever it receives: evicting an hour the sync will still re-send would shrink an
+/// already-correct daily aggregate. 5 d = 2 completed days + today + slack.
+inline constexpr int64_t kBudgetProcPerfHourlyFloorSec = 432000;
+/// Steady-state wall-clock budget for one eviction pass, checked between batches.
+inline constexpr int64_t kBudgetPassDeadlineMs = 2000;
+
+/// echo_config keys written by the budget engine (the first is a cumulative counter).
+inline constexpr std::string_view kBudgetEvictedHourlyKey = "budget_evicted_hourly_rows_total";
+inline constexpr std::string_view kDbBudgetKey = "db_budget_bytes";
+inline constexpr std::string_view kAutoVacuumDeferredKey = "auto_vacuum_deferred_at";
+
+struct BudgetPassResult {
+    int64_t evicted_hourly{0};
+    int64_t data_bytes_after{0};
+    /// Still over target and nothing evictable is left (the 48 h floors, the exemptions and the
+    /// paused sources leave no eligible row).
+    bool exhausted{false};
+    /// The pass ran out of time with eligible rows left.
+    bool deadline_hit{false};
+    /// Something stopped or skipped part of the pass (the cause is logged): the storage size
+    /// was unreadable, the clock reading was implausible, or a probe/delete on one table
+    /// failed -- that table is skipped for the rest of the pass and the others carry on. Never
+    /// retried in-pass; never combined with `exhausted` (a failed table may still hold
+    /// eligible rows).
+    bool failed{false};
+};
+
+/**
+ * Evict hourly roll-up rows until used data pages are at or under `target_bytes`.
+ *
+ * The oldest hourly bucket of the table holding the most rows goes first; an hourly row newer
+ * than 48 h (5 d for procperf_hourly, kBudgetProcPerfHourlyFloorSec) is never eligible. Daily,
+ * monthly, `usage_*` and netqual_boot are never touched. Paused and errored sources are exempt.
+ *
+ * Each batch (kBudgetBatchRows) is one transaction that also bumps the persisted eviction
+ * counter, so a crash never loses a count. `time_left` is consulted before every batch.
+ *
+ * Trust in the inputs: an unreadable storage size and an implausible clock (above
+ * kEchoMaxPlausibleNow; every floor derives from `now_epoch`) both fail the pass with nothing
+ * evicted. The pass also stops, without arming a catch-up, when a batch leaves the WAL above
+ * kEchoWalAllowanceBytes -- a reader is pinning it and further batches could not be recycled
+ * -- and the next maintenance pass retries.
+ */
+[[nodiscard]] BudgetPassResult run_budget(EchoDatabase& db, int64_t now_epoch,
+                                          int64_t target_bytes,
+                                          const std::function<bool()>& time_left);
+
+/// The table-ranking probe SQL: rows-by-id-span as two separate extrema probes (each is an
+/// O(log n) b-tree edge lookup; the combined MAX-MIN aggregate scans). Exposed for the
+/// query-plan test.
+[[nodiscard]] std::string budget_rank_probe_sql(std::string_view table);
+
+/// Sources whose `<src>_hourly` rows the budget may ever evict, derived from the roll-up
+/// declarations (structure only: the enabled flag and the floors decide eligibility at run
+/// time). A new capture source joins this set automatically, so the unit test pins it to a
+/// literal list: adding one must be a deliberate decision about whether its hourly rows may go.
+[[nodiscard]] std::vector<std::string> budget_hourly_eligible_sources();
+
+/// Whether the fast tick should run another eviction slice, and with which clock. A pass that
+/// ran out of time with rows left to evict arms a catch-up; every slice of that drain then runs
+/// with the reading the ARMING pass was admitted with (the retention clock guard had a verdict
+/// on it): a slice has no guard contact of its own, so a clock that stepped FORWARD since would
+/// widen every floor with nothing to refuse it. A clock that stepped BACKWARD is the opposite
+/// hazard -- the admitted reading is now ahead of real time and its floors land above rows
+/// stamped after the step -- which budget_slice_clock refuses. `admitted_now` is only
+/// meaningful when `armed` (and is 0 otherwise); it is a separate field, not a sentinel, because
+/// a reading <= 0 is the legitimate dead-CMOS case (see kEchoMaxPlausibleNow).
+struct BudgetCatchUp {
+    bool armed{false};
+    int64_t admitted_now{0};
+};
+
+/// The catch-up decision after a pass: armed only when the pass ended on its deadline with rows
+/// still eligible and data still over target. A failed pass is retried by the next maintenance
+/// pass, not hammered; an exhausted one has nothing left to take. A slice re-arms through this
+/// same function with the same `admitted_now`, so a drain never acquires a newer clock until a
+/// guarded maintenance pass admits one.
+[[nodiscard]] constexpr BudgetCatchUp budget_catch_up_after(const BudgetPassResult& res,
+                                                            int64_t target_bytes,
+                                                            int64_t admitted_now) noexcept {
+    if (res.deadline_hit && !res.exhausted && !res.failed && res.data_bytes_after > target_bytes)
+        return {true, admitted_now};
+    return {};
+}
+
+/// The clock a catch-up slice may run with, or nullopt to DISARM it. `fresh_now` is the wall
+/// clock read at the slice. A slice that finds it BELOW the reading it was admitted with has
+/// seen the clock step backward: the admitted reading's floors (`now - 48 h`) would sit above
+/// rows written since the step, and the slice would delete them (#6889 review B1: a probe
+/// deleted two). The drain stops; the next maintenance pass admits, or refuses, a new reading.
+[[nodiscard]] constexpr std::optional<int64_t> budget_slice_clock(const BudgetCatchUp& c,
+                                                                  int64_t fresh_now) noexcept {
+    if (!c.armed || fresh_now < c.admitted_now)
+        return std::nullopt;
+    return c.admitted_now;
+}
+
+/// Bytes data + WAL sit above the budget; 0 within it. Depends only on the measured sizes,
+/// never on how the last eviction pass ended.
+[[nodiscard]] constexpr int64_t budget_over_bytes(int64_t data_bytes, int64_t wal_bytes,
+                                                  int64_t budget_bytes) noexcept {
+    return std::max<int64_t>(0, data_bytes + wal_bytes - budget_bytes);
+}
+
+enum class VacuumAction { kSkip, kRun, kDefer };
+
+/// Everything vacuum_decision reads, by NAME (nine adjacent integers are easy to transpose at a
+/// call site, and a transposed pair compiles).
+struct VacuumInputs {
+    int64_t auto_vacuum{0};      ///< PRAGMA auto_vacuum: 0 none, 1 full, 2 incremental
+    int64_t data_bytes{0};       ///< used pages
+    int64_t target_bytes{0};     ///< the eviction target
+    int64_t freelist_bytes{0};
+    int64_t file_bytes{0};
+    int64_t free_disk_bytes{0};  ///< free on the volume holding the database
+    int64_t deferred_at{0};      ///< the conversion-deferral marker (deferred_marker_reading)
+    int64_t now{0};
+    bool eviction_exhausted{false};
+};
+
+/// Gate for the one-off conversion VACUUM (auto_vacuum -> incremental). Run only when the file is
+/// not already incremental, eviction has brought data under target (or has nothing left to
+/// evict -- `eviction_exhausted`, otherwise a database whose remainder is exempt would wait
+/// for a shrink that can never come), the freelist is large (at least 32 MiB and a quarter of
+/// the file), the volume has twice the used size free, and no deferral was recorded in the
+/// last 24 h. A marker ahead of `now` (written during a forward clock excursion) is stale,
+/// never a reason to wait. Too little free disk is kDefer (the caller records the time and
+/// reports `deferred`); every other unmet condition is kSkip.
+///
+/// After the v10 migration this is the RETRY path only: the migration runs the conversion
+/// itself, once, at open; a database it converted is incremental and skipped here.
+[[nodiscard]] VacuumAction vacuum_decision(const VacuumInputs& in) noexcept;
+
+/// The conversion-deferral time to feed vacuum_decision. `failed_write_copy` is the in-memory
+/// attempt time kept ONLY while the most recent marker write failed (a later successful write
+/// clears it to 0), and the marker has a single writer, so when it is non-zero it is the newest
+/// attempt this process knows of and the persisted `stored` value can only be older: a stale
+/// positive `stored` must not hide it, or a database that cannot store the marker would repeat a
+/// failed conversion every pass instead of daily. Not max(): a persisted marker ahead of the
+/// clock (written during a forward excursion) would outrank a sane copy and then be discarded
+/// by vacuum_decision's future-marker rule, re-admitting every pass.
+[[nodiscard]] constexpr int64_t deferred_marker_reading(int64_t stored,
+                                                        int64_t failed_write_copy) noexcept {
+    return failed_write_copy > 0 ? failed_write_copy : stored;
+}
+
+/// Parse a `db_budget_bytes` value: decimal digits only, fits int64, >= kEchoDbBudgetBytesMin.
+[[nodiscard]] std::optional<int64_t> parse_budget_bytes(std::string_view text);
+
+/// The effective budget from a tri-state config read. A failed read is nullopt ("unreadable"):
+/// the caller must not substitute the default, because a raised budget silently reverting to
+/// 250 MiB would delete down to the smaller target. The same holds for a stored value that is
+/// PRESENT but unusable (not a whole number, trailing text, below the minimum): a row edited or
+/// damaged outside the plugin says nothing about the operator's intent, so it is "unknown" too and
+/// the pass is skipped (#6900) rather than deleting down to a default nobody chose. Only an ABSENT
+/// row is the default; a valid one is itself.
+[[nodiscard]] std::optional<int64_t>
+budget_from_config(const std::expected<std::optional<std::string>, std::string>& stored);
+
+/// True iff the stored value is present but unusable (what budget_from_config reads as unknown
+/// for a reason other than a failed read): the caller says so in the log and in `status`.
+[[nodiscard]] bool
+budget_setting_invalid(const std::expected<std::optional<std::string>, std::string>& stored);
 
 } // namespace yuzu::echo

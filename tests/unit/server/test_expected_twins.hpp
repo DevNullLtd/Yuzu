@@ -45,6 +45,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_discovered_devices", "Infrastructure", "Read", true},
     // The MCP twin of POST /api/v1/hardware/sync (same Execution:Execute gate).
     {"sync_hardware_software", "Execution", "Execute", false},
+    // #2146: the MCP twin of POST /api/v1/instructions/{id}/execute (and the legacy
+    // POST /api/instructions/{id}/execute): the same plain Execution:Execute gate.
+    {"execute_instruction_definition", "Execution", "Execute", false},
     // #4030: executions/workflows/schedules read-twin programme.
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
@@ -60,6 +63,17 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_definitions", "InstructionDefinition", "Read", true},
     {"get_definition", "InstructionDefinition", "Read", true},
     {"export_definition", "InstructionDefinition", "Read", true},
+    // #2146 batch C: the instruction-definition / instruction-set authoring twins, pinned against
+    // instruction_authoring_routes.cpp (the v1 routes) and mcp_instruction_authoring.cpp.
+    {"create_definition", "InstructionDefinition", "Write", false},
+    {"update_definition", "InstructionDefinition", "Write", false},
+    {"delete_definition", "InstructionDefinition", "Delete", false},
+    {"import_definition", "InstructionDefinition", "Write", false},
+    {"save_definition_yaml", "InstructionDefinition", "Write", false},
+    {"validate_definition_yaml", "InstructionDefinition", "Read", true},
+    {"list_instruction_sets", "InstructionSet", "Read", true},
+    {"create_instruction_set", "InstructionSet", "Write", false},
+    {"delete_instruction_set", "InstructionSet", "Delete", false},
     // #4029: product-pack read twins, pinned against product_pack_model.hpp /
     // the new GET /api/v1/product-packs* routes.
     {"list_product_packs", "ProductPack", "Read", true},
@@ -226,12 +240,27 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // /api/config routes do. The per-key administrator-only refusal is config::write_refusal's.
     {"get_runtime_config", "Infrastructure", "Read", true},
     {"set_runtime_config", "Infrastructure", "Write", false},
+    // DEX score policy (#6087): twins of GET/PUT/DELETE /api/v1/dex/score-policy. reset is the
+    // distinct operation Infrastructure:Delete so the supervised tier's approval rule applies.
+    {"get_dex_score_policy", "GuaranteedState", "Read", true},
+    {"set_dex_score_policy", "Infrastructure", "Write", false},
+    {"reset_dex_score_policy", "Infrastructure", "Delete", false},
     // get_me, the twin of GET /api/v1/me (ledger row get.api-me). The REST route has no
     // permission gate (auth_fn only), so this row pins the MCP side alone:
     // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it
     // (the check_permission pattern), and a service-scoped token is refused at the generic
     // MCP gate. No arguments, so it is a kNoArgTools entry in test_operator_surface_twins.cpp.
     {"get_me", "Infrastructure", "Read", true},
+    // get_rbac_enforcement, the twin of GET /api/v1/rbac/enforcement (ledger row
+    // get.fragments-access-enforcement, #6033). Like get_me, the REST route and the HTML
+    // fragment have no permission gate (session only), so this row pins the MCP side alone:
+    // Infrastructure:Read drives MCP tier classification only, with no RBAC check behind it,
+    // and a service-scoped token is refused at the generic MCP gate. No arguments. It is also
+    // listed in kNoArgTools in test_operator_surface_twins.cpp, but that entry is inert today:
+    // the check it exempts rejects only the exact schema literal {"type":"object","properties":{}},
+    // and this tool's input schema also carries additionalProperties:false, so it passes with or
+    // without the entry. The input schema itself is pinned in test_rbac_enforcement_read_mcp.cpp.
+    {"get_rbac_enforcement", "Infrastructure", "Read", true},
 };
 
 } // namespace yuzu::server::twin_table

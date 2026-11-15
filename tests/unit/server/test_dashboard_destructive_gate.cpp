@@ -127,9 +127,14 @@ struct ExecHarness {
 
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
+    /// #3619: false = the audit store refuses every row (both callbacks read it live).
+    bool audit_ok{true};
 
     /// What `resolve_fn` maps the typed instruction to. Set per test.
     std::pair<std::string, std::string> resolve_to{};
+    /// #7114: when set, the fake seam refuses every dispatch with this denial (`denied` set,
+    /// nothing sent), as `ServerImpl::dispatch_confined` does when the chokepoint refuses.
+    std::optional<yuzu::server::detail::DispatchDenial> deny;
 
     /// @param mg  the visible-agent store; nullptr exercises the fail-closed
     ///            arm (an absent store reads as "nobody visible", never
@@ -146,15 +151,22 @@ struct ExecHarness {
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
+        // ONE sink behind both callbacks, as production wires ONE `audit_log` (server.cpp).
         auto audit_fn = [this](const httplib::Request&, const std::string& a,
                                const std::string& r, const std::string&, const std::string&,
-                               const std::string& d) { audits.push_back({a, r, d}); };
+                               const std::string& d) {
+            audits.push_back({a, r, d});
+            return audit_ok;
+        };
+        routes.set_persist_audit_fn(audit_fn);
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
                    const std::unordered_map<std::string, std::string>&,
                    const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope, ids});
+            if (deny) // #7114: what dispatch_confined returns when the chokepoint refuses
+                return {.command_id = "cmd-" + std::to_string(calls.size()), .denied = deny};
             return {.sent = 1, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
@@ -313,6 +325,23 @@ TEST_CASE("dashboard execute: a ReadOnly action is unaffected on every fan-out s
     }
 }
 
+TEST_CASE("dashboard execute: a chokepoint denial on the outcome is reported as not permitted, "
+          "never as no agents connected (#7114)",
+          "[server][dashboard][execute][security][7114]") {
+    ExecHarness h;
+    h.resolve_to = {kReadOnly.first, kReadOnly.second};
+    h.deny = yuzu::server::detail::DispatchDenial{
+        yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Execution",
+        yuzu::server::authz::Operation::Execute};
+    auto res = h.post("instruction=version");
+    REQUIRE(h.calls.size() == 1);
+    CHECK(contains(res->body, "Not permitted: approval_required"));
+    CHECK(contains(res->body, "data-reason=\"approval_required\""));
+    CHECK(!contains(res->body, "No agents connected"));
+    CHECK(h.audits_with("reason=dispatch_denied dispatch_reason=approval_required") == 1);
+    CHECK(h.audits_with("no_agents_reached") == 0);
+}
+
 TEST_CASE("dashboard execute: a Mutating action is unaffected on every fan-out shape",
           "[server][dashboard][execute][destructive][regression]") {
     SECTION("__all__ broadcast") {
@@ -456,4 +485,33 @@ TEST_CASE("dashboard execute: the gate reads the DECODED scope param, not the ra
     CHECK(contains(res->body, std::string(yuzu::server::kDestructiveNoVisibleAgentMessage)));
     CHECK(!contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
     CHECK(h.rejected_metric() == 0.0);
+}
+
+// ── (#3619) A refusal row the store does not persist ────────────────────────
+
+TEST_CASE("dashboard execute audit (#3619): a Destructive refusal whose denied row is not stored "
+          "is still refused, never dispatched, and is flagged on the response",
+          "[server][dashboard][execute][destructive][audit][security][3619]") {
+    ExecHarness h;
+    h.resolve_to = {kDestructive.first, kDestructive.second};
+    h.audit_ok = false;
+
+    auto res = h.post("instruction=purge&scope=__all__");
+
+    CHECK(h.calls.empty());
+    CHECK(contains(res->body, std::string(yuzu::server::kDestructiveUntargetedMessage)));
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("dashboard execute audit (#3619): an unwired classifier refusal whose denied row is not "
+          "stored is flagged on the response",
+          "[server][dashboard][execute][destructive][audit][3619]") {
+    ExecHarness h(/*mg=*/nullptr, /*wire_classifier=*/false);
+    h.resolve_to = {kReadOnly.first, kReadOnly.second};
+    h.audit_ok = false;
+
+    auto res = h.post("instruction=version&scope=agent-1");
+
+    CHECK(h.calls.empty());
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }

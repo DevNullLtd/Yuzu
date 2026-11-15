@@ -8,8 +8,12 @@
 
 #include "echo_netqual_nstat.hpp"
 
-#include "echo_netqual.hpp" // nq_delta_clamped
+#include "echo_collectors.hpp" // tcp_state_is_closing
+#include "echo_netqual.hpp"   // nq_delta_clamped
 
+#include <macos_socket_walk.hpp> // socket_walk_tcp_state: pure TCPS_* -> name, shared with the libproc walk
+
+#include <algorithm>
 #include <cstring>
 #include <format>
 
@@ -231,6 +235,7 @@ std::optional<DecodedTcpDesc> nstat_decode_tcp_src_desc(std::span<const std::byt
     // process); there is no effective-process name field at this OS floor, so
     // this is the single available process identity.
     out.process_name = cstr_from_fixed(desc.pname, sizeof(desc.pname));
+    out.state = std::string{yuzu::shared::detail::socket_walk_tcp_state(static_cast<int>(desc.state))};
     return out;
 }
 
@@ -287,6 +292,7 @@ NstatFlowEvent nstat_build_open_event(std::int64_t ts_unix, const DecodedTcpDesc
     ev.remote_port = desc.remote_port;
     ev.pid = desc.pid;
     ev.process_name = desc.process_name;
+    ev.state = desc.state;
     return ev;
 }
 
@@ -302,6 +308,52 @@ NstatFlowEvent nstat_build_close_event(std::int64_t ts_unix, const FlowState& la
     ev.pid = last_known.pid;
     ev.process_name = last_known.process_name;
     return ev;
+}
+
+NetworkEvent network_event_from_nstat_flow(const NstatFlowEvent& e, std::int64_t snapshot_id) {
+    NetworkEvent ev;
+    ev.ts = e.ts_unix;
+    ev.snapshot_id = snapshot_id;
+    ev.action = e.is_open ? "connected" : "disconnected";
+    ev.proto = e.proto;
+    ev.local_addr = e.local_addr;
+    ev.local_port = e.local_port;
+    ev.remote_addr = e.remote_addr;
+    ev.remote_port = e.remote_port;
+    // An open event keeps the descriptor's state only when the socket is already ending
+    // (TIME_WAIT, CLOSE_WAIT, ...), so the stored row says what the socket was. Every other
+    // state a live flow can report (SYN_SENT, SYN_RCVD, LISTEN, an unresolved one) stays the
+    // ESTABLISHED label this stream always stored, because the fleet-snapshot reader keeps only
+    // ESTABLISHED rows and nstat never upgrades a row. The closing-socket hourly de-duplication
+    // is NOT applied here: it runs before conversion, in nstat_dedupe_closing_opens, at the
+    // plugin's drain site, and covers OPEN events only, so a repeated subscription dump of flows
+    // already in TIME_WAIT stores one `connected` row per (process, remote) per hour. Close
+    // events are never filtered (the poll leg stores no close for such a socket; this leg does).
+    ev.state = !e.is_open ? std::string{"CLOSED"}
+                          : (tcp_state_is_closing(e.state) ? e.state : std::string{"ESTABLISHED"});
+    ev.pid = e.pid;
+    ev.process_name = e.process_name;
+    return ev;
+}
+
+std::vector<NstatFlowEvent> nstat_dedupe_closing_opens(std::vector<NstatFlowEvent> events,
+                                                       HourlySeenSet& seen) {
+    std::erase_if(events, [&seen](const NstatFlowEvent& e) {
+        if (!e.is_open || !tcp_state_is_closing(e.state))
+            return false;
+        return !seen.first_this_hour(
+            e.ts_unix, tcp_closing_key(e.process_name, e.remote_addr, e.remote_port));
+    });
+    return events;
+}
+
+void nstat_release_closing_keys(const NetworkEvent* first, const NetworkEvent* last,
+                                HourlySeenSet& seen) {
+    for (; first != last; ++first) {
+        if (first->action == "connected" && tcp_state_is_closing(first->state))
+            seen.release(tcp_closing_key(first->process_name, first->remote_addr,
+                                         first->remote_port));
+    }
 }
 
 TcpQualitySample nstat_build_quality_sample(const FlowState& flow) {

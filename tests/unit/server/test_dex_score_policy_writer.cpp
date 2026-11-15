@@ -35,12 +35,13 @@ std::string doc_with_excellent(double e) {
 
 const std::string kPrefixedError = std::string(kDbErrorPrefix) + "database write failed";
 
-// The recovery hint of every unknown-outcome 503, pinned whole: the OpenAPI text and the
-// rest-api.md runbook repeat it.
+// The recovery hint of every unknown-outcome 503, pinned whole as the live response body. Its
+// first branch is worded as state, like the served OpenAPI text and the rest-api.md runbook: a
+// write that applied and was then restored to the revision you sent also reads as that revision.
 const std::string kUnknownRemediation =
     "GET /api/v1/dex/score-policy and compare its revision: if it is the If-Match revision you "
-    "sent, the write did not apply; if it is any other revision, review the policy before "
-    "changing it again";
+    "sent, the policy is as it was before your request; if it is any other revision, review the "
+    "policy before changing it again";
 
 // The lost-race 409: it names no revision (the store was not re-read).
 const std::string kLostRaceMessage = "the stored policy changed while this write was being made";
@@ -332,6 +333,7 @@ TEST_CASE("writer: the Apps projection is refused with a remediation naming tier
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "unparseable at tiers.excellent: unknown key");
     CHECK(r.remediation.find("tiers.edges") != std::string::npos);
+    CHECK(r.remediation.find("model") != std::string::npos);
     REQUIRE(w.rows.size() == 1);
     CHECK(w.rows[0].detail["field"] == "tiers.excellent");
     CHECK(w.cas_calls == 0);
@@ -383,6 +385,40 @@ TEST_CASE("writer: a validator refusal names its token and group", "[dex][score_
     const auto r = w.put("default", R"({"tiers":{"edges":{"excellent":50,"good":60,"fair":40}}})");
     CHECK(r.status == St::Invalid);
     CHECK(r.message == "edges_not_descending at tiers.edges");
+}
+
+TEST_CASE("writer: model refusals name the model group and the override index",
+          "[dex][score_policy_writer]") {
+    struct Case {
+        const char* body;
+        const char* message;
+        const char* field;
+    };
+    const Case cases[] = {
+        {R"({"version":2,"model":{"per_device_event_cap":0}})", "event_cap_out_of_range at model",
+         "model"},
+        {R"({"version":2,"model":{"interval_confidence":0.3}})",
+         "interval_confidence_out_of_range at model", "model"},
+        // The inherited global full ratio (3.0) is below this override's start: the write path
+        // validates the override as merged onto the global policy.
+        {R"({"version":2,"overrides":[{"image":"a.exe","model":{"regression_start_ratio":5}}]})",
+         "regression_ratios_not_ascending at overrides[0].model", "overrides[0].model"},
+        {R"({"version":2,"overrides":[{"image":"a.exe","model":{"interval_confidence":0.9}}]})",
+         "unparseable at overrides[0].model.interval_confidence: unknown key",
+         "overrides[0].model.interval_confidence"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.body);
+        World w;
+        const auto r = w.put("default", c.body);
+        CHECK(r.status == St::Invalid);
+        CHECK(r.message == c.message);
+        CHECK(r.remediation.empty());
+        REQUIRE(w.rows.size() == 1);
+        CHECK(w.rows[0].result == "denied");
+        CHECK(w.rows[0].detail["field"] == c.field);
+        CHECK(w.cas_calls == 0);
+    }
 }
 
 TEST_CASE("writer: a read failure is 503 with no audit row and no store write",
@@ -672,6 +708,20 @@ TEST_CASE("writer: the attempted row is refused with 503 and no store call",
     CHECK_FALSE(w.stored);
 }
 
+TEST_CASE("writer: a refused denied row keeps the refusal's own status",
+          "[dex][score_policy_writer]") {
+    // The denied row is best effort: the refusal does not depend on it, so a row the audit store
+    // refuses leaves the 428 and the store untouched.
+    World w;
+    w.refuse_results = {"denied"};
+    const auto r = w.put(std::nullopt, doc_with_excellent(95.0));
+    CHECK(r.status == St::IfMatchMissing);
+    CHECK(w.refused == 1);
+    CHECK(w.rows.empty());
+    CHECK(w.cas_calls == 0);
+    CHECK_FALSE(w.stored);
+}
+
 TEST_CASE("writer: a throwing audit hook is a refused row", "[dex][score_policy_writer]") {
     World w;
     w.audit_throws = 1;
@@ -818,6 +868,72 @@ TEST_CASE("writer: DELETE with a stale If-Match is 409", "[dex][score_policy_wri
     REQUIRE(w.rows.size() == 1);
     CHECK(w.rows[0].result == "denied");
     CHECK(w.car_calls == 0);
+}
+
+TEST_CASE("writer: a retry with the old If-Match is applied again only while the stored policy "
+          "is at that revision",
+          "[dex][score_policy_writer]") {
+    // The served PUT/DELETE texts state this rule: 409 unless the stored policy is again at the
+    // revision sent, otherwise applied again (a PUT writes the document, a DELETE removes it).
+    const std::string original = doc_with_excellent(90.0);
+    const std::string original_rev = dex_score_policy_revision(original);
+    const std::string mine = doc_with_excellent(95.0);
+
+    SECTION("PUT of the text already stored is applied again with the same revision") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.put(original_rev, original).status == St::Ok);
+        const auto r = w.put(original_rev, original);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.in_force.revision == original_rev);
+        CHECK(w.stored == original);
+        CHECK(w.cas_calls == 2); // the retry reaches the store, it is not skipped as a no-op
+    }
+    SECTION("PUT retry is refused while the first PUT stands") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.put(original_rev, mine).status == St::Ok);
+        const auto r = w.put(original_rev, mine);
+        CHECK(r.status == St::Stale);
+        CHECK(w.stored == mine);
+    }
+    SECTION("PUT retry after another writer restored the original overwrites it") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.put(original_rev, mine).status == St::Ok);
+        w.stored = original; // another writer puts the original text back
+        const auto r = w.put(original_rev, mine);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.previous_revision == original_rev);
+        CHECK(r.in_force.revision == dex_score_policy_revision(mine));
+        CHECK(w.stored == mine);
+    }
+    SECTION("PUT sent with default is applied again after another writer removed the policy") {
+        World w;
+        REQUIRE(w.put("default", mine).status == St::Ok);
+        w.stored.reset(); // another writer removes it
+        const auto r = w.put("default", mine);
+        REQUIRE(r.status == St::Ok);
+        CHECK(w.stored == mine);
+    }
+    SECTION("DELETE retry is refused while the first DELETE stands") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.del(original_rev).status == St::Ok);
+        CHECK(w.del(original_rev).status == St::Stale);
+        CHECK_FALSE(w.stored);
+    }
+    SECTION("DELETE retry after another writer restored the original removes it") {
+        World w;
+        w.stored = original;
+        REQUIRE(w.del(original_rev).status == St::Ok);
+        w.stored = original; // another writer puts the original text back
+        const auto r = w.del(original_rev);
+        REQUIRE(r.status == St::Ok);
+        CHECK(r.in_force.revision == "default");
+        CHECK_FALSE(w.stored);
+        CHECK(w.car_calls == 2);
+    }
 }
 
 // ── outcome unknown ─────────────────────────────────────────────────────────

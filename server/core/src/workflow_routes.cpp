@@ -1,4 +1,5 @@
 #include "workflow_routes.hpp"
+#include "model_param_helpers.hpp"
 
 #include "command_capability.hpp"        // CommandCapability / ClassificationError / CommandCapabilityRegistry
 #include "compliance_eval.hpp"
@@ -13,9 +14,11 @@
 #include "execution_event_scope.hpp"
 #include "execution_scope_rules.hpp" // execution_visible / confined_projection (shared with GET /api/v1/executions)
 #include "http_route_sink.hpp"
+#include "instruction_execute.hpp" // instruction_execute::definition_needs_approval (#7110 post-row recheck)
 #include "instruction_param_schema.hpp" // ParamValidatorCache: stored parameter_schema enforcement
 #include "name_lookup_memo.hpp"  // Operate O1: one render's definition-name lookups
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "mcp_policy.hpp"  // mcp::requires_approval (approval_gated_hint)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
@@ -26,10 +29,12 @@
 #include "web_utils.hpp"
 #include "schedule_model.hpp" // ADR-0031 WS-A4 (seventh family): schedule_row_json, split out of workflow_model.hpp
 #include "workflow_execution_list_model.hpp" // shared REST+MCP parser/row builder for the run list
+#include "workflow_execute_routes.hpp" // #2146 batch B: POST /api/v1/workflows/{id}/execute
 #include "workflow_model.hpp" // #4030: shared workflow/workflow-execution row builders
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_token (the post-row recheck's audit detail and log lines)
 
 #include <algorithm>
 #include <cctype>
@@ -60,6 +65,17 @@ void fragment_note(httplib::Response& res, const char* attr, std::string_view te
     res.set_content(std::string("<div class=\"empty-state\" data-") + attr + "=\"true\">" +
                         html_escape(std::string(text)) + "</div>",
                     "text/html; charset=utf-8");
+}
+
+// A render hint must not become a denial. A supervised-tier MCP token holds the grant yet is
+// approval-gated on every non-MCP transport (mcp::requires_approval, the predicate
+// AuthRoutes::require_tier_policy applies), so probing it through the gate would write one
+// auth.approval_required row per probe per render. This answers from the session alone: no gate
+// call, no row. A hint only; the action routes keep their own gate.
+[[nodiscard]] bool approval_gated_hint(const std::optional<auth::Session>& session,
+                                       std::string_view securable_type, std::string_view operation) {
+    return session && !session->mcp_tier.empty() &&
+           mcp::requires_approval(session->mcp_tier, securable_type, operation);
 }
 
 // Operate Executions page (`detail?view=page`): the collapsed responses list of the devices
@@ -146,9 +162,12 @@ void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
                      "(HTTP 400). reason=schema_invalid: the stored schema cannot be prepared, so "
                      "the call fails closed (HTTP 500).",
                      "counter");
-    for (const char* reason : kParamRejectReasons)
-        metrics.counter("yuzu_server_instruction_param_rejected_total",
-                        {{"route", kParamRejectRoute}, {"reason", reason}});
+    // The v1 REST twin shares the legacy route's label (same capability); the MCP twin
+    // (execute_instruction_definition) uses the `mcp` label. See instruction_execute.hpp.
+    for (const char* route : {kParamRejectRoute, "mcp"})
+        for (const char* reason : kParamRejectReasons)
+            metrics.counter("yuzu_server_instruction_param_rejected_total",
+                            {{"route", route}, {"reason", reason}});
 }
 
 // #4029: `product_pack_error_status`/`product_pack_client_message` moved to
@@ -233,6 +252,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto persist_audit_fn = std::move(deps.persist_audit_fn); // #4990
     auto probe_perm_fn = std::move(deps.probe_perm_fn);
     auto emit_fn = std::move(deps.emit_fn);
+    auto emit_event_fn = std::move(deps.emit_event_fn);
     auto scope_fn = std::move(deps.scope_fn);
     auto* workflow_engine = deps.workflow_engine;
     auto* execution_tracker = deps.execution_tracker;
@@ -1775,9 +1795,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             operate_pages::ScheduleListView view;
             view.truncated = result->truncated;
             // Render hints, probed once per render and never a gate (an unwired probe offers
-            // no control). Each refused grant writes one auth.permission_required audit row.
+            // no control). Each refused grant writes one auth.permission_required audit row,
+            // except a supervised-tier token's approval-gated pairs, which are decided from the
+            // session without probing (approval_gated_hint) and so write none.
             auto probe = [&](const char* type, const char* op) {
-                return probe_perm_fn && probe_perm_fn(req, type, op);
+                return !approval_gated_hint(session, type, op) && probe_perm_fn &&
+                       probe_perm_fn(req, type, op);
             };
             view.can_write = probe("Schedule", "Write");
             view.can_enable = probe("Execution", "Execute");
@@ -1865,7 +1888,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // does not imply. Reads one past the 100 shown so truncation is known, not guessed.
     // list_workflows loads every row's yaml_source and steps (one query per row under one
     // lease), so the page limit stays at 101 and the YAML is never rendered.
-    sink.Get("/fragments/workflows", [perm_fn, probe_perm_fn, instruction_store, workflow_api](
+    sink.Get("/fragments/workflows", [auth_fn, perm_fn, probe_perm_fn, instruction_store, workflow_api](
                                          const httplib::Request& req, httplib::Response& res) {
         // htmx drops 4xx/5xx bodies: every refusal and degrade is a 200 note, and nothing from
         // the gate's own body (reason, role or permission names) reaches the fragment.
@@ -1896,10 +1919,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         view.truncated = result->size() > shown;
         // Render hints, probed once per render and never a gate (every write route keeps its
         // own perm_fn). An unwired probe cannot decide, so no control is offered. The probe
-        // writes one auth.permission_required audit row per refused grant (disclosed).
+        // writes one auth.permission_required audit row per refused grant (disclosed), except a
+        // supervised-tier token's approval-gated pairs (Execute, Delete): those are decided from
+        // the session without probing (approval_gated_hint) and write no auth.approval_required
+        // row per render. Run then says why it is off: the token needs the MCP ticket flow.
+        std::optional<auth::Session> session;
+        if (auth_fn) {
+            httplib::Response scratch; // perm_fn already authenticated; nothing here is sent
+            session = auth_fn(req, scratch);
+        }
         auto probe = [&](const char* type, const char* op) {
-            return probe_perm_fn && probe_perm_fn(req, type, op);
+            return !approval_gated_hint(session, type, op) && probe_perm_fn &&
+                   probe_perm_fn(req, type, op);
         };
+        view.run_approval_gated = approval_gated_hint(session, "Workflow", "Execute");
         view.can_run = probe("Workflow", "Execute");
         view.can_write = probe("Workflow", "Write");
         view.can_delete = probe("Workflow", "Delete");
@@ -1971,7 +2004,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                       "latest_per_workflow"};
         std::vector<RawParam> raw;
         raw.reserve(req.params.size());
-        for (const auto& kv : req.params) {
+        for (const auto& kv : model_detail::to_params(req.params)) {
             if (std::find(std::begin(kKnown), std::end(kKnown), kv.first) == std::end(kKnown)) {
                 run_note(res, "invalid", operate_pages::kRunsInvalidNote);
                 return;
@@ -2079,6 +2112,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto agents = confined_workflow_agent_ids_json(exec.agent_ids_json, gate.scope);
         if (agents.is_array())
             view.device_count = static_cast<int>(agents.size());
+        // A truncated stored copy undercounts an unconfined viewer's run: show what it named.
+        if (!confined)
+            if (const auto total = stored_agent_ids_total(exec.agent_ids_json))
+                view.device_count = static_cast<int>(
+                    std::min<std::int64_t>(*total, std::numeric_limits<int>::max()));
 
         // The definition supplies step labels and the workflow name; a deleted or unreadable
         // definition just leaves the instruction ids.
@@ -2399,7 +2437,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                     workflow_engine, instruction_store,
                                                     cmd_dispatch, cmd_dispatch_concurrency,
                                                     caller_fn, approval_manager,
-                                                    capability_registry, metrics](  // BR2-001/BR3-001
+                                                    capability_registry, metrics,
+                                                    stream_budget = deps.stream_budget,
+                                                    draining = deps.draining,
+                                                    run_budget = deps.workflow_run_budget](  // BR2-001/BR3-001
                                                         const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -2443,6 +2484,32 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             caller_fn ? caller_fn(req)
                       : yuzu::server::DispatchCaller{
                             .exec_visible = yuzu::server::authz::deny_all()};
+
+        // The run's clock starts here (everything below, the reads included, counts against it).
+        const auto run_deadline = std::chrono::steady_clock::now() +
+            run_budget.value_or(std::chrono::milliseconds{yuzu::server::kWorkflowSyncBudget});
+
+        // ADMISSION (#2146 op-3): this handler holds a worker for the whole synchronous run, so it
+        // takes the SAME lease through the SAME admit_workflow_run() as POST /api/v1/workflows/
+        // {id}/execute and MCP execute_workflow, keyed by the same principal: walking to this route
+        // must not escape the per-principal or global cap, or a draining server's refusal. Placed
+        // before the workflow and instruction reads below. A stack local, so every return and a
+        // throw release it. A refusal wrote and read nothing: no audit row (the counter is its
+        // record), nothing dispatched.
+        auto admission = yuzu::server::admit_workflow_run(stream_budget, draining,
+                                                          caller.principal, metrics);
+        if (admission.refusal) {
+            const auto& refused = *admission.refusal;
+            res.status = refused.status == yuzu::server::WorkflowExecuteStatus::kDraining ? 503 : 429;
+            res.set_header(
+                "Retry-After",
+                std::to_string((yuzu::server::kWorkflowRunCapRetryAfterMs + 999) / 1000));
+            detail::A4ErrorOpts opts;
+            opts.retry_after_ms = yuzu::server::kWorkflowRunCapRetryAfterMs;
+            opts.remediation = refused.remediation;
+            res.set_content(detail::a4_error(res, refused.message, opts), "application/json");
+            return;
+        }
 
         // --- Pre-validate approval gates on all workflow steps ---------------
         // If any instruction in the workflow requires approval, reject the
@@ -2660,7 +2727,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller,
              capability_registry, &late_targeting_denied, &late_targeting_reason](  // BR2-001/BR4-001
                 const std::string& instruction_id, const std::string& agent_ids_json,
-                const std::string& parameters_json) -> std::expected<std::string, std::string> {
+                const std::string& parameters_json)
+            -> std::expected<std::string, yuzu::server::StepDispatchError> {
             // Look up the instruction definition to get plugin + action
             if (!instruction_store || !instruction_store->is_open())
                 return std::unexpected<std::string>("instruction store not available");
@@ -2755,7 +2823,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     // see the capture-site comment above).
                     late_targeting_denied = true;
                     late_targeting_reason = std::string(gate.refusal_reason);
-                    return std::unexpected<std::string>(std::string(gate.refusal_message));
+                    // Permanent: a targeting refusal repeats on every retry, so the engine
+                    // records the step failed without the retry sleeps.
+                    return std::unexpected(yuzu::server::StepDispatchError{
+                        std::string(gate.refusal_message), /*permanent=*/true});
                 }
             }
 
@@ -2794,7 +2865,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return evaluate_compliance_bool(expression, fields);
         };
 
-        auto result = workflow_engine->execute(workflow_id, agent_ids, dispatch_fn, condition_fn);
+        // Bounded like the v1 twin: no dispatch attempt starts at or after the deadline and no
+        // retry delay runs past it; the engine then closes the execution `failed` (remaining steps
+        // skipped). Nothing else of the v1 sequence applies here (no prepare split, no
+        // reauthorize, no sleep precheck); the hook only records that the bound was what stopped
+        // the run, so the audit row can say so.
+        bool deadline_hit = false;
+        yuzu::server::WorkflowRunControl control;
+        control.deadline = run_deadline;
+        control.stored_copy_first = [&caller](const std::string& id) {
+            return authz::in_scope(caller.exec_visible, id);
+        };
+        control.before_attempt = [&deadline_hit, run_deadline] {
+            if (std::chrono::steady_clock::now() < run_deadline)
+                return true;
+            deadline_hit = true;
+            return false;
+        };
+        auto result = workflow_engine->execute(workflow_id, agent_ids, dispatch_fn, condition_fn,
+                                               control);
 
         if (!result) {
             if (yuzu::server::is_generic_db_error(result.error())) {
@@ -2840,7 +2929,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      "reason=" + late_targeting_reason + " (late; execution_id=" + *result + ")");
         } else {
             audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
-                     "execution_id=" + *result);
+                     "execution_id=" + *result +
+                         (deadline_hit ? " (run stopped: deadline_exceeded)" : ""));
         }
         emit_fn("workflow.executed", req);
         res.set_header(
@@ -2850,6 +2940,39 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(nlohmann::json({{"execution_id", *result}, {"status", "running"}}).dump(),
                         "application/json");
     });
+
+    // POST /api/v1/workflows/:id/execute -- the REST v1 twin of the route above (#2146 batch B).
+    // Its own file: a different, fail-closed sequence shared with MCP `execute_workflow`
+    // (workflow_execute.hpp); nothing above is routed through it.
+    register_workflow_execute_v1_route(
+        sink,
+        WorkflowExecuteRouteDeps{
+            .perm_fn = perm_fn,
+            .audit_fn = audit_fn,
+            .persist_audit_fn = persist_audit_fn,
+            .workflow_api = workflow_api,
+            .workflow_run = deps.workflow_run,
+            .workflow_idempotency_lookup = deps.workflow_idempotency_lookup,
+            .instruction_store_open =
+                [instruction_store] { return instruction_store && instruction_store->is_open(); },
+            .approval_gate_available = [approval_manager] { return approval_manager != nullptr; },
+            .lookup = make_instruction_lookup(instruction_store),
+            .classify =
+                capability_registry
+                    ? WorkflowClassifyFn{[capability_registry](std::string_view plugin,
+                                                               std::string_view action) {
+                          return capability_registry->classify(plugin, action);
+                      }}
+                    : WorkflowClassifyFn{},
+            .authorize = deps.authorize_dispatch,
+            .revalidate = deps.revalidate,
+            .command_dispatch_fn = cmd_dispatch,
+            .command_dispatch_fn_concurrency = cmd_dispatch_concurrency,
+            .caller_fn = caller_fn,
+            .metrics = metrics,
+            .stream_budget = deps.stream_budget,
+            .draining = deps.draining,
+            .emit_event_fn = emit_event_fn});
 
     // GET /api/workflow-executions/:id -- get execution status
     sink.Get(R"(/api/workflow-executions/([^/]+))", [fleet_read_fn,
@@ -2938,17 +3061,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                  {"attempt", sr.attempt}});
         }
 
-        res.set_content(nlohmann::json({{"id", exec.id},
-                                        {"workflow_id", exec.workflow_id},
-                                        {"status", exec.status},
-                                        {"agent_ids", confined_workflow_agent_ids_json(
-                                                          exec.agent_ids_json, gate.scope)},
-                                        {"current_step", exec.current_step},
-                                        {"started_at", exec.started_at},
-                                        {"completed_at", exec.completed_at},
-                                        {"steps", steps_arr}})
-                            .dump(),
-                        "application/json");
+        nlohmann::json detail({{"id", exec.id},
+                               {"workflow_id", exec.workflow_id},
+                               {"status", exec.status},
+                               {"agent_ids", confined_workflow_agent_ids_json(exec.agent_ids_json,
+                                                                              gate.scope)},
+                               {"current_step", exec.current_step},
+                               {"started_at", exec.started_at},
+                               {"completed_at", exec.completed_at},
+                               {"steps", steps_arr}});
+        add_agent_ids_bound(detail, exec.agent_ids_json, static_cast<bool>(gate.scope));
+        res.set_content(detail.dump(), "application/json");
     });
 
     // -- REST v1 twins (#4030: executions/workflows/schedules read-twin programme) --
@@ -3093,7 +3216,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 auto gate = fleet_read_fn(req, res, "Workflow", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the response.
-                std::vector<RawParam> raw(req.params.begin(), req.params.end());
+                const auto sorted_params = model_detail::to_params(req.params);
+                std::vector<RawParam> raw(sorted_params.begin(), sorted_params.end());
                 auto query = parse_workflow_execution_list_params(raw);
                 if (!query) {
                     res.status = 400;
@@ -3756,6 +3880,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 execution_id = *created;
             }
         }
+        // Closes the row above for a command that was never sent (a recheck refusal, a
+        // dispatch that threw, a dispatch that reached nobody); a failed cancel is logged and
+        // counted like every other mark_cancelled failure (#4982 Fix 5). A throwing cancel is a
+        // failed cancel, as on the v1 twins: this lambda also runs inside the dispatch catch
+        // below, where a second throw would escape the handler and leave the row `running`.
+        const auto cancel_execution_row = [&] {
+            if (!execution_tracker || execution_id.empty())
+                return;
+            bool cancelled = false;
+            try {
+                cancelled = execution_tracker->mark_cancelled(execution_id, session->username);
+            } catch (...) {
+                cancelled = false;
+            }
+            if (cancelled)
+                return;
+            spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
+                          execution_id);
+            if (metrics)
+                metrics
+                    ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
+                              {{"op", "mark_cancelled"}, {"surface", "workflow"}})
+                    .increment();
+        };
 
         // Dispatch
         std::string command_id;
@@ -3785,14 +3933,72 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
                                                    ? std::string(kBroadcastScope)
                                                    : scope_expr;
+            // #7110: the execution row above is this route's last own write before the send,
+            // and the route gate and the definition's `approval_mode` were decided on the
+            // entry session; a grant, or the administrator standing a `role-gated` definition
+            // requires (a JIT elevation), can lapse while that row is written. The chokepoint
+            // re-decides only the pair's own gate on `caller`, so decide both again here on the
+            // fresh caller, with the predicate the v1 twins use (instruction_execute.cpp 8b).
+            // The row exists, so a refusal closes it; it never queues an approval. A grant
+            // moving inside the chokepoint's own provenance write is not caught here (the
+            // recorded limit of the dispatch chokepoint, docs/user-manual/rest-api.md
+            // 'Refused after the audit row').
+            // The `denied` row is a raw `audit_fn` call on purpose: this file's AuditFn is
+            // void-returning (see the #4030 note on the detail route above), the handler
+            // writes no `requested` row, and every other row it writes is the same raw
+            // call, so there is no `Sec-Audit-Failed` posture here to keep.
+            const auto refuse_after_row = [&](const std::string& gate) {
+                if (audit_fn)
+                    audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                             "reason=permission_revoked gate=" + gate +
+                                 " execution_id=" + execution_id);
+                cancel_execution_row();
+                res.status = 403;
+                res.set_content(
+                    detail::a4_error(res, "permission revoked after the request was recorded",
+                                     {.remediation = "this request was not dispatched; the "
+                                                     "permission or administrator standing it "
+                                                     "needs was withdrawn while it was being "
+                                                     "recorded. Retrying will not help until it "
+                                                     "is granted again"}),
+                    "application/json");
+            };
             // K-R7-02 / PLAN-006: confine to AND identify the operator via the
             // shared dispatch_confined seam. `session` is already resolved
             // above; re-derive from the request (fail CLOSED on visibility if
             // the callback is unwired — present-empty set → reaches nobody).
-            const yuzu::server::DispatchCaller caller =
-                caller_fn ? caller_fn(req)
-                          : yuzu::server::DispatchCaller{
-                                .exec_visible = yuzu::server::authz::deny_all()};
+            // The derivation and both decisions are one recheck: a throw inside any of
+            // them (a store fault) is a withdrawn permission, refused like the twins
+            // (`gate=exception` on the row), never the generic 500 of the dispatch catch
+            // below, which would close the row with no audit row. Only the decisions sit
+            // in this try (the refusal is written after it, as the twins do), so a fault
+            // while writing the refusal is not re-labelled `gate=exception` and written twice.
+            std::optional<std::string> withdrawn_gate; // the gate that refused; empty == both held
+            yuzu::server::DispatchCaller caller;
+            try {
+                caller = caller_fn ? caller_fn(req)
+                                   : yuzu::server::DispatchCaller{
+                                         .exec_visible = yuzu::server::authz::deny_all()};
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    withdrawn_gate = "route";
+                else if (instruction_execute::definition_needs_approval(
+                             def.approval_mode, caller.principal_is_admin))
+                    withdrawn_gate = "approval_mode mode=" + ::yuzu::log_token(def.approval_mode);
+            } catch (const std::exception& e) {
+                spdlog::error("instruction execute: the post-row recheck threw for '{}' "
+                              "execution_id={}; refused as permission_revoked: {}",
+                              ::yuzu::log_token(def_id), execution_id, e.what());
+                withdrawn_gate = "exception";
+            } catch (...) {
+                spdlog::error("instruction execute: the post-row recheck threw for '{}' "
+                              "execution_id={}; refused as permission_revoked: unknown exception",
+                              ::yuzu::log_token(def_id), execution_id);
+                withdrawn_gate = "exception";
+            }
+            if (withdrawn_gate) {
+                refuse_after_row(*withdrawn_gate);
+                return;
+            }
             // ADR-1007: per-device concurrency gate, when wired.
             const auto dispatch_outcome =
                 cmd_dispatch_concurrency
@@ -3817,36 +4023,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // forever on dispatch failure. mark_cancelled records the
             // attempt for forensic audit instead of orphaning it as a
             // phantom in-flight run that the LIST handler keeps showing.
-            if (execution_tracker && !execution_id.empty() &&
-                !execution_tracker->mark_cancelled(execution_id, session->username)) {
-                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
-                              execution_id);
-                // #4982 fix round 2 (Fix 5): log-only swallowed the failure with
-                // no observable signal — count it alongside the log line,
-                // matching Part A's REST/MCP instrumentation pattern.
-                if (metrics)
-                    metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
-                        .increment();
-            }
+            cancel_execution_row();
             res.status = 500;
             res.set_content(detail::a4_error(res, "dispatch failed"), "application/json");
             return;
         }
 
         if (sent == 0) {
-            if (execution_tracker && !execution_id.empty() &&
-                !execution_tracker->mark_cancelled(execution_id, session->username)) {
-                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
-                              execution_id);
-                // #4982 fix round 2 (Fix 5)
-                if (metrics)
-                    metrics
-                        ->counter("yuzu_exec_tracker_bookkeeping_failed_total",
-                                  {{"op", "mark_cancelled"}, {"surface", "workflow"}})
-                        .increment();
-            }
+            cancel_execution_row();
             // #881/#3424/#3511: "no agents reached" covers several distinct
             // causes this route did not used to discriminate — every target
             // withheld by quarantine, the containment gate failing closed

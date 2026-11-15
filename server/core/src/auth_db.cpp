@@ -39,9 +39,12 @@
 #include <atomic>
 #include <cctype> // std::isalnum / std::toupper
 #include <chrono>
+#include <cstdint>
 #include <cstdlib> // std::strtoll
 #include <span>
+#include <stdexcept> // std::runtime_error: the salt-draw catch (#6995)
 #include <thread>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -458,7 +461,17 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
     std::vector<std::string> raw_codes;
     raw_codes.reserve(kRecoveryCodeCount);
     for (int i = 0; i < kRecoveryCodeCount; ++i) {
-        auto code = mfa::random_recovery_code();
+        auto minted = mfa::random_recovery_code();
+        if (!minted.has_value()) {
+            // #4763: CSPRNG failure — fail closed. Returning unexpected makes the
+            // caller roll back the txn, so the DELETE above is undone and the
+            // user keeps their existing codes; no partial set is ever issued.
+            spdlog::error("regenerate_recovery_codes: CSPRNG failure minting a recovery code "
+                          "for '{}' — refusing to issue recovery codes",
+                          username);
+            return std::unexpected(AuthDBError::EntropyUnavailable); // #6995: not a store fault
+        }
+        auto code = std::move(*minted);
         std::string norm;
         norm.reserve(code.size());
         for (char c : code) {
@@ -466,7 +479,25 @@ regenerate_recovery_codes_locked(PGconn* conn, const std::string& username) {
                 continue;
             norm += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         }
-        auto salt = auth::AuthManager::random_bytes(16);
+        // #6995 (gov UP-1/CO-1): the per-code salt is drawn through AuthManager::random_bytes,
+        // which THROWS (std::runtime_error) when the CSPRNG fails, unlike the typed
+        // mfa::random_recovery_code draw above. Left uncaught it unwinds through the txn
+        // callback (PgTxn still rolls back) into httplib, which installs no exception handler:
+        // a bare 500 with NO audit row, NO event and NO counter, for the very fault class this
+        // follow-up exists to make visible. Catch it HERE, inside the callback's helper, so the
+        // rollback is unchanged and the fault takes the same audited EntropyUnavailable path.
+        std::vector<std::uint8_t> salt;
+        try {
+            salt = auth::AuthManager::random_bytes(16);
+        } catch (const std::runtime_error& e) {
+            // runtime_error is all random_bytes throws for an entropy failure (RAND_bytes or
+            // BCryptGenRandom); a std::bad_alloc is NOT an entropy fault and must propagate rather
+            // than be audited and counted as one.
+            spdlog::error("regenerate_recovery_codes: CSPRNG failure drawing a recovery-code salt "
+                          "for '{}' ({}) - refusing to issue recovery codes",
+                          username, e.what());
+            return std::unexpected(AuthDBError::EntropyUnavailable);
+        }
         auto salt_hex = auth::AuthManager::bytes_to_hex(salt);
         auto hash = auth::AuthManager::pbkdf2_sha256(norm, salt, kRecoveryCodePbkdfIters);
 
@@ -1670,7 +1701,16 @@ AuthDB::mfa_init_enrollment(const std::string& username, std::string_view issuer
         }
 
         // Fresh secret, encrypted under this row's id (the SecretId AAD).
-        auto secret_bytes = mfa::random_secret();
+        auto minted_secret = mfa::random_secret();
+        if (!minted_secret.has_value()) {
+            // #4763: CSPRNG failure — never enroll a zero/partial secret. Nothing
+            // has been encrypted or written at this point.
+            spdlog::error("mfa_init_enrollment: CSPRNG failure minting TOTP secret for '{}' — "
+                          "refusing enrollment",
+                          username);
+            return std::unexpected(AuthDBError::EntropyUnavailable); // #6995: not a store fault
+        }
+        auto secret_bytes = std::move(*minted_secret);
         auto secret_view = std::string_view(reinterpret_cast<const char*>(secret_bytes.data()),
                                             secret_bytes.size());
         auto secret_b32 = mfa::base32_encode(secret_view);
@@ -2031,8 +2071,16 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
             return std::unexpected(AuthDBError::WriteFailed);
         pg::PgResult res = pg::exec_params(
             lease.get(),
-            "SELECT id, code_hash, code_salt FROM auth.mfa_recovery_codes "
-            "WHERE username = $1 AND consumed_at IS NULL",
+            // #4058, defence in depth: an inactive account has no usable recovery
+            // codes, mirroring mfa_verify_login_code's `is_active = TRUE` filter.
+            // remove_user already deletes the codes with the soft-delete; this
+            // covers an account deactivated outside that path (a direct database
+            // edit). Lock-free by design — holding the user-row lock
+            // across the PBKDF2 walk below is the hazard
+            // mfa_regenerate_recovery_codes documents.
+            "SELECT c.id, c.code_hash, c.code_salt FROM auth.mfa_recovery_codes c "
+            "WHERE c.username = $1 AND c.consumed_at IS NULL "
+            "AND EXISTS (SELECT 1 FROM auth.users u WHERE u.username = c.username AND u.is_active = TRUE)",
             std::vector<std::string>{username});
         if (res.status() != PGRES_TUPLES_OK)
             return std::unexpected(AuthDBError::WriteFailed);
@@ -2074,13 +2122,22 @@ AuthDB::mfa_consume_recovery_code(const std::string& username, std::string_view 
         return std::unexpected(AuthDBError::WriteFailed);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE auth.mfa_recovery_codes SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL "
-        "RETURNING id",
+        // Same is_active guard as the candidate SELECT: an account whose
+        // deactivation committed before this statement started must not have a
+        // code consumed. The EXISTS reads this statement's snapshot (READ
+        // COMMITTED re-reads only the target code row), so a deactivation
+        // committing mid-statement is indistinguishable from the consume
+        // landing first. The login caller is covered by its post-mint recheck;
+        // the step-up caller has no recheck, but a product-path deactivation
+        // sweeps the session that step-up would stamp.
+        "UPDATE auth.mfa_recovery_codes c SET consumed_at = now() WHERE c.id = $1 AND c.consumed_at IS NULL "
+        "AND EXISTS (SELECT 1 FROM auth.users u WHERE u.username = c.username AND u.is_active = TRUE) "
+        "RETURNING c.id",
         std::vector<std::string>{std::to_string(matched_id)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(AuthDBError::WriteFailed);
     if (PQntuples(res.get()) == 0)
-        return false; // a concurrent consume won the race
+        return false; // a concurrent consume won the race, or the account was deactivated before the UPDATE ran
     return true;
 }
 

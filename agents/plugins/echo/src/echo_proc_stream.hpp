@@ -6,7 +6,7 @@
  * The `ProcEvent` value type and the `ProcEventRing` producer/consumer bridge are
  * shared by every gap-free process collector: the Windows ETW collector
  * (`echo_proc_etw.hpp`) and the macOS Endpoint Security collector
- * (`echo_proc_es.hpp`). Both feed the same Echo `process_live` schema, so the event
+ * (`echo_proc_es.hpp`). Both feed the same Echo `ProcessEvent` shape, so the event
  * shape and the backpressure idiom live here, once, with no platform headers.
  *
  * Keeping these out of the per-platform collector headers lets the macOS build
@@ -26,7 +26,7 @@
 namespace yuzu::echo {
 
 /// One process lifecycle event decoded from a streaming source. Fields mirror the
-/// Echo `process_live` schema (ts/action/pid/ppid/name/user) plus exit_code — which
+/// Echo `ProcessEvent` shape (ts/action/pid/ppid/name/user) plus exit_code — which
 /// a streaming source carries on the stop event and a poll never can.
 ///
 /// `image_name` is the executable basename only; the full command line is NOT

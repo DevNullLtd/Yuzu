@@ -564,12 +564,6 @@ struct RouteRow {
     /// operator re-home) — the NEXT `announce_connected` binds it (TOFU). See
     /// the file header "AGENT<->CLUSTER AFFINITY" note.
     std::optional<std::string> home_cluster_id;
-    /// Echo rename, upgrade window (removed with the other legacy-name shims; the column
-    /// stays): the agent registered with the pre-rename plugin name `tar`.
-    /// `lookup_route`/`lookup_routes` fill it; it exists so the HA directory dispatch path,
-    /// which has no AgentSession, can still write the legacy plugin name on the wire. Written
-    /// only by `register_fresh`.
-    bool legacy_echo_wire_name{false};
 };
 
 /// A route paired with the `routable` verdict computed by `lookup_routes`.
@@ -608,8 +602,7 @@ public:
     /// forward a superseded connection's cluster/node/home-id until its own
     /// CONNECTED confirms them.
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
-    register_fresh(std::string_view agent_id, std::string_view session_id,
-                   bool legacy_echo_wire_name = false);
+    register_fresh(std::string_view agent_id, std::string_view session_id);
 
     /// Record that `session_id`'s connection is fully established on
     /// `cluster_id`/`gateway_node`, with a lease valid for `lease_ttl_secs`.

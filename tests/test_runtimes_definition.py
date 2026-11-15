@@ -19,7 +19,7 @@ DEFINITION = REPO_ROOT / "content" / "definitions" / "runtimes.yaml"
 # reuses the first four columns. The server decoder keeps field 0 as the row's discriminator
 # (row_kind), so it must lead.
 EXPECTED_COLUMNS = ["row_kind", "flavour", "version", "install_path", "vendor"]
-ACTIONS = ["dotnet", "jvm"]
+ACTIONS = ["dotnet", "jvm", "python"]
 
 
 def _definitions() -> dict:

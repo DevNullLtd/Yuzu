@@ -133,40 +133,60 @@ class PgTxn {
 public:
     explicit PgTxn(PGconn* conn) noexcept : conn_(conn) {}
     ~PgTxn() {
-        if (conn_ && !committed_)
+        if (conn_ && !committed_ && !rolled_back_)
             PgResult rollback{PQexec(conn_, "ROLLBACK")};
     }
 
     PgTxn(const PgTxn&) = delete;
     PgTxn& operator=(const PgTxn&) = delete;
-    PgTxn(PgTxn&& o) noexcept : conn_(o.conn_), committed_(o.committed_) { o.conn_ = nullptr; }
+    PgTxn(PgTxn&& o) noexcept
+        : conn_(o.conn_), committed_(o.committed_), rolled_back_(o.rolled_back_) {
+        o.conn_ = nullptr;
+    }
     PgTxn& operator=(PgTxn&& o) noexcept {
         if (this != &o) {
-            if (conn_ && !committed_)
+            if (conn_ && !committed_ && !rolled_back_)
                 PgResult rollback{PQexec(conn_, "ROLLBACK")};
             conn_ = o.conn_;
             committed_ = o.committed_;
+            rolled_back_ = o.rolled_back_;
             o.conn_ = nullptr;
         }
         return *this;
     }
 
-    /// Run `COMMIT`; on success disarm the rollback. On failure the guard
-    /// stays armed and the destructor rolls back. Calling again after a
-    /// successful commit is a no-op returning true.
+    /// Run `COMMIT`; on success disarm the rollback. If the COMMIT itself
+    /// fails the guard stays armed and the destructor rolls back. Calling
+    /// again after a successful commit is a no-op returning true.
     ///
-    /// Postgres nuance: `COMMIT` inside an ABORTED transaction (a prior
-    /// statement failed) completes as a rollback yet still reports
-    /// `PGRES_COMMAND_OK` — so commit() returns true and the connection is
-    /// clean, but nothing persisted. Callers that need to distinguish must
-    /// check their statements' results (or `PQtransactionStatus`) before
-    /// committing — same discipline as checking `sqlite3_step` before
-    /// `SqliteTxn::commit()`.
+    /// An ABORTED transaction (a prior statement failed, including a bound
+    /// parameter `exec_params` refused for a NUL byte) is rolled back here and
+    /// commit() returns false: Postgres would complete `COMMIT` as a rollback
+    /// and still answer `PGRES_COMMAND_OK`, which used to read as success for
+    /// work that did not persist. The rollback is issued at once and, once it
+    /// takes effect, the guard is disarmed: the connection is idle when
+    /// commit() returns and the destructor cannot roll back a transaction the
+    /// caller started later. (If the ROLLBACK itself did not take effect the
+    /// guard stays armed and the destructor retries it.)
+    /// A failed statement the caller recovered from with `ROLLBACK TO
+    /// SAVEPOINT` leaves the transaction usable and still commits. A
+    /// transaction that is already idle (the caller ended it) takes the
+    /// previous path.
     bool commit() noexcept {
         if (!conn_)
             return false;
         if (committed_)
             return true;
+        if (rolled_back_)
+            return false;
+        if (PQtransactionStatus(conn_) == PQTRANS_INERROR) {
+            PgResult rollback{PQexec(conn_, "ROLLBACK")};
+            // Disarm the destructor once the transaction has ended (or the connection is
+            // gone). If the ROLLBACK did not take effect the connection is still aborted,
+            // no later transaction can have started on it, and the destructor retries.
+            rolled_back_ = PQtransactionStatus(conn_) != PQTRANS_INERROR;
+            return false;
+        }
         PgResult res{PQexec(conn_, "COMMIT")};
         if (res.status() == PGRES_COMMAND_OK)
             committed_ = true;
@@ -176,6 +196,7 @@ public:
 private:
     PGconn* conn_{nullptr};
     bool committed_{false};
+    bool rolled_back_{false}; // commit() rolled back an aborted transaction and the ROLLBACK took effect
 };
 
 } // namespace yuzu::server::pg

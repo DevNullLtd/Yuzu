@@ -267,6 +267,46 @@ TEST_CASE("dispatch record: an unlatched (operator) dispatch keeps the ordinary 
     CHECK(f.degrades() == 1.0); // only the latched write above degraded
 }
 
+// #3678: the outbox redelivery horizon is measured on a SHARED dispatch sequence that only
+// advances when a record is WRITTEN. A command whose record failed or was skipped is still sent and
+// still takes an agent dedup-ring slot, so the failure sites must count it -- in the tracker's
+// separate process-local term -- or the horizon freezes exactly while the ring fills.
+TEST_CASE("dispatch record: a failed or skipped record is counted in the unrecorded term and "
+          "leaves the shared sequence alone (#3678)",
+          "[pg][server][dispatch_record][3678]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_record_tpl);
+    Fixture f(db.dsn());
+    constexpr std::size_t kAgents = 20;
+
+    const auto p0 = f.tracker->current_dispatch_position();
+    REQUIRE(p0.has_value());
+    {
+        auto held = f.exhaust();
+        DispatchRecordLatch latch{"sequence loop"};
+        for (std::size_t i = 0; i < kAgents; ++i)
+            f.svc.record_command_dispatch(Fixture::id_of("seqa", i), kPlugin, "", &latch);
+        // One real write attempt failed and the rest were skipped: none was written.
+        CHECK(latch.tripped());
+        CHECK(latch.skipped() == kAgents - 1);
+    }
+    const auto p1 = f.tracker->current_dispatch_position();
+    REQUIRE(p1.has_value());
+    // Every one of the 20 commands is counted even though no record reached the database...
+    CHECK(p1->unrecorded - p0->unrecorded == static_cast<std::int64_t>(kAgents));
+    // ...and the shared sequence did not move: it lives in the database that was not written.
+    CHECK(p1->shared == p0->shared);
+    for (std::size_t i = 0; i < kAgents; ++i)
+        CHECK_FALSE(f.recorded(Fixture::id_of("seqa", i)));
+
+    // A healthy record moves only the shared term, so a recovered process is not double-counted.
+    f.svc.record_command_dispatch(Fixture::id_of("seqb", 0), kPlugin, "", nullptr);
+    const auto p2 = f.tracker->current_dispatch_position();
+    REQUIRE(p2.has_value());
+    CHECK(p2->shared - p1->shared == 1);
+    CHECK(p2->unrecorded == p1->unrecorded);
+    CHECK(f.recorded(Fixture::id_of("seqb", 0)));
+}
+
 TEST_CASE("dispatch record: no tracker wired trips the latch and counts every write",
           "[pg][server][forensics_tier][provenance][dispatch_record]") {
     YUZU_REQUIRE_PG_DB_TPL(db, dispatch_record_tpl);

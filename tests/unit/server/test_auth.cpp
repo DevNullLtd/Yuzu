@@ -775,6 +775,8 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
     REQUIRE(mgr_b.remove_user("cora"));
 
     REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value());
+    // #4068: a genuine miss reports NotFound on the error channel, never DbError.
+    REQUIRE(mgr_a.get_user_role("cora").error() == AuthManager::GetUserRoleError::NotFound);
     // A genuine UserNotFound is NOT a store error - must not fire the
     // store-error counter (Gate 5 CH-3 re-review follow-up: this discrimination
     // is exactly what would drown the real signal if it ever regressed).
@@ -784,11 +786,13 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
     // username is a rejected-shape input, not a store health signal - #4020's
     // own get_user()/is_valid_principal fix, bucketed with UserNotFound).
     REQUIRE_FALSE(mgr_a.get_user_role(std::string("cor") + '\0' + "a").has_value());
+    CHECK(mgr_a.get_user_role(std::string("cor") + '\0' + "a").error() ==
+          AuthManager::GetUserRoleError::NotFound);
     CHECK(metrics.counter("yuzu_auth_get_user_role_store_error_total").value() == 0);
 }
 
 TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-saturated",
-          "[pg][auth][cold_cache]") {
+          "[pg][auth][cold_cache][store-error]") {
     // The critical negative case: a DB-backed manager must NEVER fall back to
     // a stale cached role on a store error - that would silently reopen the
     // exact gap this fix closes, at the one moment (a degraded store) it
@@ -809,7 +813,10 @@ TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-sat
         held.push_back(std::move(lease));
     }
 
-    REQUIRE_FALSE(mgr.get_user_role("cora").has_value()); // NOT Role::admin from cache
+    const auto saturated = mgr.get_user_role("cora"); // ONE call: each one bumps the counter
+    REQUIRE_FALSE(saturated.has_value());             // NOT Role::admin from cache
+    // #4068: and the error channel says WHY - a store error, not "not found".
+    CHECK(saturated.error() == AuthManager::GetUserRoleError::DbError);
     // Gate 5 chaos-injector CH-3/UP-6 follow-up: the ONE caller-visible signal
     // that a legacy-token-authenticated request is about to be floored to
     // Role::user must fire, not just a log line invisible under load.
@@ -827,6 +834,7 @@ TEST_CASE("get_user_role stays cache-only in config-file (no AuthDB) mode",
     mgr->upsert_user("alice", "secret123456", Role::admin);
     REQUIRE(mgr->get_user_role("alice") == Role::admin);
     REQUIRE_FALSE(mgr->get_user_role("nobody").has_value());
+    CHECK(mgr->get_user_role("nobody").error() == AuthManager::GetUserRoleError::NotFound);
 }
 
 TEST_CASE("authenticate mints a session at the CURRENT role after a cross-manager demotion "

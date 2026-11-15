@@ -156,6 +156,11 @@ static void ensure_xmlsec_initialized() {
 /// reject what it accepts — they were two different loaders (OpenSSL
 /// PEM_read_bio_X509 vs xmlsec's PEM_read_bio_X509_AUX), which false-rejected a
 /// `BEGIN TRUSTED CERTIFICATE` file and false-accepted an Ed25519 certificate.
+/// A key whose type the verifier's allowlist does not enable (RSA and EC key data
+/// only, see validate_response step 10.5) is refused HERE, not by the signature
+/// check: xmlsec 1.3.12 adopts Ed25519 and Ed448 keys that 1.3.9 refused, and without
+/// this check the probe would report such a certificate usable while every assertion
+/// failed verification.
 /// Returns an OWNED key (caller must xmlSecKeyDestroy or hand it to a context),
 /// or nullptr. Precondition: ensure_xmlsec_initialized() has succeeded.
 /// The xmlSecSize narrowing is safe because server.cpp caps the certificate
@@ -164,11 +169,19 @@ static void ensure_xmlsec_initialized() {
 static xmlSecKeyPtr load_idp_key(const std::string& idp_cert_pem) {
     constexpr std::size_t kMaxPemBytes = 1u << 20; // 1 MiB, far above any real certificate
     if (idp_cert_pem.empty() || idp_cert_pem.size() > kMaxPemBytes) return nullptr;
-    return xmlSecOpenSSLAppKeyLoadMemory(
+    xmlSecKeyPtr key = xmlSecOpenSSLAppKeyLoadMemory(
         reinterpret_cast<const xmlSecByte*>(idp_cert_pem.data()),
         static_cast<xmlSecSize>(idp_cert_pem.size()),
         xmlSecKeyDataFormatCertPem,
         nullptr, nullptr, nullptr);
+    if (!key) return nullptr;
+    const xmlSecKeyDataPtr data = xmlSecKeyGetValue(key);
+    if (!data || !(xmlSecKeyDataCheckId(data, xmlSecOpenSSLKeyDataRsaId) ||
+                   xmlSecKeyDataCheckId(data, xmlSecOpenSSLKeyDataEcId))) {
+        xmlSecKeyDestroy(key);
+        return nullptr;
+    }
+    return key;
 }
 
 // ── Standard base64 codec (not URL-safe) ────────────────────────────────────

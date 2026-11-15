@@ -611,7 +611,7 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
                 continue;
             }
             if (is_retired_plugin_name(plugin_name)) {
-                // Upgrade-window guard (removed with the other legacy-name shims): a stale
+                // Pre-rename install guard (kept while a stale tar plugin can still exist): a stale
                 // pre-rename plugin beside the renamed one must not load. The handle destructs
                 // here and dlcloses the library.
                 spdlog::error("Plugin {} declares the retired pre-rename name '{}' - rejecting; "

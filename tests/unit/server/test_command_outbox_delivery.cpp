@@ -11,6 +11,7 @@
 //     re-resolved caller (#1398);
 //   * not-leader (elector resigned) → the loop no-ops (nothing dispatched).
 
+#include "audit_store.hpp"
 #include "command_outbox_delivery.hpp"
 #include "command_outbox_store.hpp"
 #include "execution_tracker.hpp"
@@ -30,6 +31,8 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -59,6 +62,7 @@ struct DispatchProbe {
     std::string last_action;
     ApprovalProvenance last_provenance{ApprovalProvenance::None};
     ConfinedDispatchOutcome next{}; // returned each call; test sets .sent etc.
+    std::function<void()> on_call;  // #3678: runs INSIDE dispatch_fn, to observe state at send time
 };
 
 class DeliveryPg {
@@ -94,13 +98,83 @@ public:
     std::int64_t epoch() const { return epoch_; }
     static std::string lock() { return kServerBackgroundLeaderLock; }
 
+    // #3678 (R4): the fleet-wide dispatch sequence the delivery loop reads. `seq` is what the
+    // tests advance; nullopt models an unreadable sequence; `seq_wired=false` models a server
+    // that never wired the reader (the loop must HOLD, not send).
+    std::optional<std::int64_t> seq{1000};
+    bool seq_wired{true};
+    // Runs INSIDE the sequence read, i.e. between list_pending's snapshot and the stamp write:
+    // lets a test model another writer stamping the row first.
+    std::function<void()> before_seq_read;
+    // The reading process's own unrecorded-dispatch count (the second term of the position).
+    std::int64_t unrecorded{0};
+    CommandOutboxDelivery::DispatchSeqFn seq_fn() {
+        if (!seq_wired)
+            return {};
+        return [this]() -> std::optional<yuzu::server::DispatchPosition> {
+            if (before_seq_read)
+                before_seq_read();
+            if (!seq)
+                return std::nullopt;
+            return yuzu::server::DispatchPosition{*seq, unrecorded};
+        };
+    }
+    // Overwrite a row's stamp directly (models a stamp written by an earlier term/process).
+    void set_stamp(const std::string& occ, std::int64_t shared, std::int64_t unrec,
+                   std::int64_t epoch) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    conn.get(),
+                    "UPDATE command_outbox_store.outbox SET dispatch_seq_first_sent=$2::bigint, "
+                    "dispatch_unrecorded_first_sent=$3::bigint, dispatch_stamp_epoch=$4::bigint "
+                    "WHERE occurrence_id=$1",
+                    std::vector<std::string>{occ, std::to_string(shared), std::to_string(unrec),
+                                             std::to_string(epoch)})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    yuzu::server::pg::PgPool& pool() { return *pool_; }
+
+    // Make a backed-off pending row due again (reschedule pushes next_attempt_at out by 30 s).
+    void make_due(const std::string& occ) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    conn.get(),
+                    "UPDATE command_outbox_store.outbox SET next_attempt_at = now() "
+                    "WHERE occurrence_id=$1",
+                    std::vector<std::string>{occ})
+                    .status() == PGRES_COMMAND_OK);
+    }
+
+    // Raw read of one text/bigint column; "<null>" for SQL NULL, "<absent>" for no such row.
+    std::string raw_col(const std::string& occ, const char* column) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql = std::string("SELECT ") + column +
+                                " FROM command_outbox_store.outbox WHERE occurrence_id=$1";
+        yuzu::server::pg::PgResult r =
+            yuzu::server::pg::exec_params(conn.get(), sql.c_str(), std::vector<std::string>{occ});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        if (PQntuples(r.get()) != 1)
+            return "<absent>";
+        return PQgetisnull(r.get(), 0, 0) ? std::string("<null>")
+                                           : std::string(PQgetvalue(r.get(), 0, 0));
+    }
+
     // Build a delivery loop whose dispatch/arming seams the test controls.
     // `metrics` is optional (defaulted) - most tests here assert on the
     // OutboxCommand state machine, not on observability, and don't need it.
     CommandOutboxDelivery make_delivery(DispatchProbe& probe, bool arming_allow,
-                                        yuzu::MetricsRegistry* metrics = nullptr) {
+                                        yuzu::MetricsRegistry* metrics = nullptr,
+                                        std::int64_t horizon =
+                                            yuzu::kMaxOutboxRedeliveryHorizonCommands,
+                                        yuzu::server::AuditStore* audit = nullptr) {
         CommandOutboxDelivery::Deps d;
         d.outbox = store_.get();
+        d.audit_store = audit;
+        d.dispatch_seq_fn = seq_fn(); // #3678 R4: required, fail-closed
+        d.redelivery_horizon_commands = horizon;
         d.leader = elector_.get();
         d.metrics = metrics;
         d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
@@ -113,6 +187,8 @@ public:
             probe.last_plugin = plugin;
             probe.last_action = action;
             probe.last_provenance = caller.approval_provenance;
+            if (probe.on_call)
+                probe.on_call();
             auto out = probe.next;
             out.command_id = command_id;
             return out;
@@ -490,6 +566,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -568,6 +645,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: an already-terminal execution reaching "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -671,6 +749,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) com
 
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
@@ -800,6 +879,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine dispatch whose target-count writ
 
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.dispatch_fn = [&probe](const std::string& plugin, const std::string& action,
@@ -891,6 +971,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: a redrive to sent==0 does NOT cancel an "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -979,6 +1060,7 @@ TEST_CASE("CommandOutboxDelivery[pg]: authority denied at redelivery does NOT "
     yuzu::MetricsRegistry metrics;
     CommandOutboxDelivery::Deps d;
     d.outbox = &fx.store();
+    d.dispatch_seq_fn = fx.seq_fn(); // #3678 R4: required, fail-closed
     d.leader = &fx.elector();
     d.execution_tracker = &tracker;
     d.metrics = &metrics;
@@ -1014,4 +1096,620 @@ TEST_CASE("CommandOutboxDelivery[pg]: authority denied at redelivery does NOT "
     // The occurrence itself is still durably marked failed — the denial is
     // permanent at the outbox level regardless of the exec-cancel decision.
     CHECK(fx.raw_state("occ-denied-with-response") == "failed");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// #3678 (R4): the redelivery horizon. A stable command_id re-sent after the agent's dedup ring
+// could have evicted it re-executes, so a redrive is bounded by a COUNT of dispatch calls (the
+// sequence ExecutionTracker exposes), stamped on the row before its first attempt.
+// What these prove: the gate's decisions against a FAKE sequence and fake dispatch. What they do
+// NOT prove: that a real agent absorbs a redrive at the production ring size -- that is the
+// bound argued in command_replay_horizon.hpp, not something a unit test can observe.
+//
+// A retry that KEEPS its stamp is modelled as `route_unreadable` with `sent > 0` (some agents
+// were reached, so the stamp guards a real send). `containment_unreadable` reaches nobody, so the
+// stamp it wrote is cleared (tested separately).
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+void make_partial_send(DispatchProbe& probe) {
+    probe.next.route_unreadable = true;
+    probe.next.sent = 3;
+}
+} // namespace
+
+TEST_CASE("CommandOutboxDelivery[pg]: the first send stamps the dispatch sequence BEFORE dispatch "
+          "(#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-stamp", "cmd-stamp"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+    CHECK(fx.raw_col("occ-stamp", "dispatch_seq_first_sent") == "<null>");
+
+    DispatchProbe probe;
+    std::string stamp_seen_at_send;
+    probe.on_call = [&] { stamp_seen_at_send = fx.raw_col("occ-stamp", "dispatch_seq_first_sent"); };
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    CHECK(stamp_seen_at_send == "1000"); // committed before the wire send, not after
+    CHECK(fx.raw_col("occ-stamp", "dispatch_stamp_epoch") == std::to_string(fx.epoch()));
+    CHECK(fx.raw_col("occ-stamp", "dispatch_unrecorded_first_sent") == "0");
+    CHECK(fx.raw_state("occ-stamp") == "sent");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a redrive is sent while inside the horizon (including with "
+          "NO dispatch in between) and dead-lettered, audited and never sent AT the horizon "
+          "(#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    yuzu::server::AuditStore audit{fx.pool()};
+    REQUIRE(audit.is_open());
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-h", "cmd-h", "abcdef0123456789"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    make_partial_send(probe); // first attempt: reaches some agents, retried -- the stamp stays
+    yuzu::MetricsRegistry metrics;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics, kHorizon, &audit);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    REQUIRE(fx.raw_state("occ-h") == "pending");
+    REQUIRE(fx.raw_col("occ-h", "dispatch_seq_first_sent") == "1000");
+
+    // The common production case: a quiet fleet, so the sequence has NOT moved. Still sent.
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_state("occ-h") == "pending");
+
+    // One short of the horizon: still redriven (and the stamp is NOT moved).
+    fx.seq = 1000 + kHorizon - 1;
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 3);
+    CHECK(fx.raw_state("occ-h") == "pending");
+    CHECK(fx.raw_col("occ-h", "dispatch_seq_first_sent") == "1000");
+
+    // At the horizon: dead-lettered, dispatch_fn NOT called again, one audit row, one count.
+    fx.seq = 1000 + kHorizon;
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 3);
+    CHECK(fx.raw_state("occ-h") == "failed");
+    CHECK(fx.raw_col("occ-h", "note") == "redelivery_horizon_exceeded");
+    CHECK(metrics.counter("yuzu_server_command_outbox_deliver_horizon_exceeded_total").value() ==
+          1);
+    yuzu::server::AuditQuery q;
+    q.action = "command.outbox_delivered";
+    auto rows = audit.query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1); // the partial-send retries wrote none: only the dead-letter did
+    CHECK((*rows)[0].result == "failure");
+    CHECK((*rows)[0].detail.find("redelivery_horizon_exceeded first_seq=1000 current_seq=1010 "
+                                 "local_delta=0 horizon=10 execution_id=exec-1 "
+                                 "approval_id=abcdef01 (") != std::string::npos);
+    // An approval id is a bearer capability: only an 8-character prefix is recorded.
+    CHECK((*rows)[0].detail.find("abcdef0123456789") == std::string::npos);
+
+    // Terminal: a further tick never re-drives it, and writes no second row.
+    fx.make_due("occ-h");
+    loop.tick();
+    CHECK(probe.calls == 3);
+    auto rows2 = audit.query(q);
+    REQUIRE(rows2.has_value());
+    CHECK(rows2->size() == 1);
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a sequence that went BACKWARDS dead-letters the redrive "
+          "under its own reason (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-back", "cmd-back"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe);
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+
+    fx.seq = 5; // e.g. a restore from backup (only the shared term is judged for regression)
+    fx.make_due("occ-back");
+    loop.tick();
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-back") == "failed");
+    CHECK(fx.raw_col("occ-back", "note") == "redelivery_sequence_regressed");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a first attempt that provably reached NO agent clears its "
+          "stamp, so a row blocked by an unreadable gate is never aged toward a dead-letter "
+          "(#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-clr", "cmd-clr"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    probe.next.containment_unreadable = true; // reaches nobody (sent == 0)
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, nullptr, kHorizon);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    REQUIRE(fx.raw_state("occ-clr") == "pending");
+    CHECK(fx.raw_col("occ-clr", "dispatch_seq_first_sent") == "<null>"); // cleared in the reschedule
+    CHECK(fx.raw_col("occ-clr", "dispatch_unrecorded_first_sent") == "<null>");
+    CHECK(fx.raw_col("occ-clr", "dispatch_stamp_epoch") == "<null>");
+
+    // The fleet dispatches far more than the horizon while the gate stays unreadable. The row
+    // never reached an agent, so it must still be sent (and re-stamped from the NEW origin).
+    fx.seq = 1000 + 100 * kHorizon;
+    probe.next = {};            // gate readable again; no agents currently in scope
+    fx.make_due("occ-clr");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_col("occ-clr", "dispatch_seq_first_sent") == std::to_string(*fx.seq));
+    CHECK(fx.raw_state("occ-clr") == "sent");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a stamp that PREDATES the attempt is never cleared, even by a "
+          "retry that reaches nobody (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-keep", "cmd-keep"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe); // attempt 1 really sent to some agents; the stamp guards that
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+    REQUIRE(fx.raw_col("occ-keep", "dispatch_seq_first_sent") == "1000");
+
+    probe.next = {};
+    probe.next.containment_unreadable = true; // attempt 2 reaches nobody
+    fx.seq = 1002;
+    fx.make_due("occ-keep");
+    loop.tick();
+    REQUIRE(probe.calls == 2);
+    REQUIRE(fx.raw_state("occ-keep") == "pending");
+    CHECK(fx.raw_col("occ-keep", "dispatch_seq_first_sent") == "1000"); // origin NOT moved
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: an unreadable or unwired dispatch sequence HOLDS every row and "
+          "ends the tick after ONE log and one count -- no send, no stamp, no reschedule (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-a", "cmd-a"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-b", "cmd-b"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    yuzu::MetricsRegistry metrics;
+    auto hold_cause = [&](const char* cause) {
+        return metrics
+            .counter("yuzu_server_command_outbox_deliver_hold_cause_total", {{"cause", cause}})
+            .value();
+    };
+
+    SECTION("sequence unreadable") {
+        fx.seq = std::nullopt;
+        auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics);
+        loop.tick();
+        CHECK(probe.calls == 0);
+        for (const char* occ : {"occ-a", "occ-b"}) {
+            CHECK(fx.raw_state(occ) == "pending");
+            CHECK(fx.raw_col(occ, "dispatch_seq_first_sent") == "<null>");
+            CHECK(fx.raw_col(occ, "attempts") == "0");
+        }
+        // Two rows were pending but the SYSTEMIC hold ended the tick at the first.
+        CHECK(hold_cause("sequence_unreadable") == 1);
+        CHECK(metrics.counter("yuzu_server_command_outbox_deliver_degrade_total").value() == 1);
+
+        // Held, not lost: once the sequence is readable again both are delivered.
+        fx.seq = 1000;
+        loop.tick();
+        CHECK(probe.calls == 2);
+        CHECK(fx.raw_state("occ-a") == "sent");
+        CHECK(fx.raw_state("occ-b") == "sent");
+    }
+    SECTION("reader never wired (fail closed like an unset arming_check)") {
+        fx.seq_wired = false;
+        auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics);
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-a") == "pending");
+        CHECK(fx.raw_col("occ-a", "dispatch_seq_first_sent") == "<null>");
+        CHECK(hold_cause("sequence_unwired") == 1);
+    }
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a first-send stamp that cannot commit HOLDS the row -- the "
+          "delivery loop sends nothing (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-pre", "cmd-pre"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    yuzu::MetricsRegistry metrics;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, &metrics);
+
+    // Another writer (a second replica, or a leader handover) stamps the row between
+    // list_pending's snapshot -- which showed it unstamped -- and this loop's own stamp write.
+    bool raced = false;
+    fx.before_seq_read = [&] {
+        if (raced)
+            return;
+        raced = true;
+        auto other = fx.store().stamp_first_send("occ-pre", fx.lock(), fx.epoch(), 1000, 0);
+        REQUIRE(other.has_value());
+        REQUIRE(*other);
+    };
+    loop.tick();
+
+    CHECK(probe.calls == 0); // the stamp write returned "already stamped" => HOLD, not send
+    CHECK(fx.raw_state("occ-pre") == "pending");
+    CHECK(fx.raw_col("occ-pre", "attempts") == "0");
+    CHECK(metrics
+              .counter("yuzu_server_command_outbox_deliver_hold_cause_total",
+                       {{"cause", "stamp_not_committed"}})
+              .value() == 1);
+
+    // Next tick sees the committed stamp (1000) and the sequence inside the horizon: delivered.
+    loop.tick();
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-pre") == "sent");
+}
+
+TEST_CASE("CommandOutboxStore[pg]: stamp_first_send is epoch-fenced and first-stamp-wins (#3678)",
+          "[command_outbox][pg][store][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-fence", "cmd-fence"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // A stale ex-leader presents an older epoch: the fenced stamp matches no row.
+    auto stale = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch() - 1, 1000, 0);
+    REQUIRE(stale.has_value());
+    CHECK_FALSE(*stale);
+    CHECK(fx.raw_col("occ-fence", "dispatch_seq_first_sent") == "<null>");
+
+    // The true leader stamps; a second stamp (any epoch) cannot move the origin.
+    auto first = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch(), 1000, 7);
+    REQUIRE(first.has_value());
+    CHECK(*first);
+    auto again = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch(), 9999, 0);
+    REQUIRE(again.has_value());
+    CHECK_FALSE(*again);
+    CHECK(fx.raw_col("occ-fence", "dispatch_seq_first_sent") == "1000");
+    // All three columns are written together, by the same UPDATE, from the winning stamp.
+    CHECK(fx.raw_col("occ-fence", "dispatch_unrecorded_first_sent") == "7");
+    CHECK(fx.raw_col("occ-fence", "dispatch_stamp_epoch") == std::to_string(fx.epoch()));
+
+    // A negative sequence is refused, never written.
+    auto neg = fx.store().stamp_first_send("occ-fence", fx.lock(), fx.epoch(), -1, 0);
+    CHECK_FALSE(neg.has_value());
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a horizon dead-letter keeps the approval ticket spent and "
+          "leaves the execution row alone (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    DeliveryPg fx;
+
+    yuzu::server::pg::PgPool tracker_pool{{.conninfo = fx.dsn(), .size = 2}};
+    REQUIRE(tracker_pool.valid());
+    ExecutionTracker tracker{tracker_pool};
+    REQUIRE(tracker.is_open());
+    Execution exec;
+    exec.definition_id = "power_health.report";
+    exec.status = "running";
+    exec.dispatched_by = "svc-scheduler";
+    auto exec_id = tracker.create_execution(exec);
+    REQUIRE(exec_id.has_value());
+
+    auto req = fx.req("occ-ticket", "cmd-ticket", /*approval=*/"appr-1");
+    req.execution_id = *exec_id;
+    REQUIRE(fx.store().claim_and_enqueue(req, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    make_partial_send(probe); // the stamp is kept: attempt 1 reached some agents
+    CommandOutboxDelivery::Deps d;
+    d.outbox = &fx.store();
+    d.leader = &fx.elector();
+    d.execution_tracker = &tracker;
+    d.dispatch_seq_fn = fx.seq_fn();
+    d.redelivery_horizon_commands = 5;
+    d.dispatch_fn = [&probe](const std::string&, const std::string&,
+                             const std::vector<std::string>&, const std::string&,
+                             const std::unordered_map<std::string, std::string>&,
+                             const std::string&, const DispatchCaller&, const std::string& cid) {
+        probe.calls++;
+        auto out = probe.next;
+        out.command_id = cid;
+        return out;
+    };
+    d.resolve_caller = [](const std::string& p) {
+        DispatchCaller c;
+        c.principal = p;
+        return c;
+    };
+    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+        return true;
+    };
+    CommandOutboxDelivery loop{std::move(d)};
+
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    fx.seq = 1000 + 5;
+    fx.make_due("occ-ticket");
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-ticket") == "failed");
+    // `failed` is NOT a state filter on the spent-ticket ledger: the first attempt happened.
+    auto spent = fx.store().occurrences_for_approval("appr-1");
+    REQUIRE(spent.has_value());
+    CHECK(*spent == std::vector<std::string>{"occ-ticket"});
+    // An earlier attempt may have reached agents: the execution row is NOT force-cancelled.
+    auto after = tracker.get_execution(*exec_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "running");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: in the SAME leadership term the unrecorded count is "
+          "differenced; the shared sequence never moves it (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-term", "cmd-term"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe); // keeps the stamp
+    // Large PRE-EXISTING unrecorded history in this process must not count against the row.
+    fx.unrecorded = 500;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, nullptr, kHorizon);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    REQUIRE(fx.raw_col("occ-term", "dispatch_unrecorded_first_sent") == "500");
+
+    // Same term: only the unrecorded dispatches AFTER the stamp count. 9 < 10 => still sent.
+    fx.unrecorded = 509;
+    fx.make_due("occ-term");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_state("occ-term") == "pending");
+
+    // 10 unrecorded since the stamp reaches the horizon even though the shared sequence is flat:
+    // those dispatches took ring slots and never reached the database.
+    fx.unrecorded = 510;
+    fx.make_due("occ-term");
+    loop.tick();
+    CHECK(probe.calls == 2);
+    CHECK(fx.raw_state("occ-term") == "failed");
+    CHECK(fx.raw_col("occ-term", "note") == "redelivery_horizon_exceeded");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a stamp from ANOTHER leadership term is compared on the "
+          "shared sequence plus the reader's WHOLE local count -- never differenced against a "
+          "count from another process (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-x", "cmd-x"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe);
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, nullptr, kHorizon);
+
+    SECTION("KNOWN RESIDUAL (characterisation, not a guarantee): a previous process's post-stamp "
+            "unrecorded dispatches are FORGOTTEN, so the row reads young and is SENT") {
+        // The old leader stamped when ITS count was 12,000, and may have gone on to make any number
+        // of unrecorded dispatches before it restarted. This process starts near zero and has no
+        // way to know. A summed encoding would instead have read 3 as 11,997 BELOW the stamp (the
+        // scale-mixing defect the redesign removed); the separate encoding reads 0 shared + 3
+        // local, which is SAFE FROM THAT DEFECT but is an UNDER-count for the forgotten failures.
+        // The sound close is agent-side (refuse ids older than the ring): see
+        // command_replay_horizon.hpp, "an earlier process lifetime". This test pins today's
+        // behaviour so it cannot change silently in either direction.
+        fx.set_stamp("occ-x", 1000, 12000, fx.epoch() - 1);
+        fx.unrecorded = 3;
+        loop.tick();
+        CHECK(probe.calls == 1); // elapsed = 0 + 3 < 10: sent
+        CHECK(fx.raw_state("occ-x") == "pending");
+    }
+    SECTION("the DISCRIMINATOR: the same numbers dead-letter in another term and are sent in the "
+            "same term") {
+        // stamp unrecorded = 5, reader unrecorded = 10, horizon 10.
+        //   another term  -> the reader charges its WHOLE count: 10 >= 10 -> dead-letter
+        //   the same term -> differenced: 10 - 5 = 5 < 10 -> sent
+        // If the epoch comparison were deleted (every stamp treated as same-term) the first half
+        // would be sent, which is exactly the scale-mixing defect: every other section in this
+        // test happens to give the same verdict either way.
+        fx.set_stamp("occ-x", 1000, 5, fx.epoch() - 1);
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+        CHECK(fx.raw_col("occ-x", "note") == "redelivery_horizon_exceeded");
+    }
+    SECTION("the same numbers inside ONE term are differenced and the row is sent") {
+        fx.set_stamp("occ-x", 1000, 5, fx.epoch());
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 1);
+        CHECK(fx.raw_state("occ-x") == "pending");
+    }
+    SECTION("an EQUAL count inside one term differences to zero and the row is sent") {
+        // The boundary of the `unrecorded_now >= unrecorded_stamp` guard: equal is still same-term.
+        // With `>` instead of `>=` the row would be charged its whole count (500 >= 10) and refused.
+        fx.set_stamp("occ-x", 1000, 500, fx.epoch());
+        fx.unrecorded = 500;
+        loop.tick();
+        CHECK(probe.calls == 1);
+        CHECK(fx.raw_state("occ-x") == "pending");
+    }
+    SECTION("a huge local count with the shared sequence advanced dead-letters instead of "
+            "wrapping negative") {
+        fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);
+        fx.seq = 1005;
+        fx.unrecorded = std::numeric_limits<std::int64_t>::max();
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+        CHECK(fx.raw_col("occ-x", "note") == "redelivery_horizon_exceeded");
+    }
+    SECTION("a local count that went DOWN inside one epoch is charged whole, not clamped to zero") {
+        // Cannot happen unless an epoch were reused (the elector documents that as not covered),
+        // but clamping the difference to zero would then silently under-count.
+        fx.set_stamp("occ-x", 1000, 500, fx.epoch());
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+    }
+    SECTION("this process's whole local count is charged (an over-count of its own history; not a bound on what another process missed)") {
+        fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);
+        fx.unrecorded = 10; // 10 >= horizon, even though they may all predate the stamp
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+        CHECK(fx.raw_col("occ-x", "note") == "redelivery_horizon_exceeded");
+    }
+    SECTION("a stamp missing its companion columns is treated as another term, conservatively") {
+        fx.set_stamp("occ-x", 1000, 0, fx.epoch());
+        yuzu::server::pg::PgConn conn{PQconnectdb(fx.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    conn.get(),
+                    "UPDATE command_outbox_store.outbox SET dispatch_unrecorded_first_sent = NULL "
+                    "WHERE occurrence_id='occ-x'",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        fx.unrecorded = 10;
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_state("occ-x") == "failed");
+    }
+    SECTION("only the SHARED sequence going backwards is 'regressed'; a smaller local count is not") {
+        fx.set_stamp("occ-x", 1000, 0, fx.epoch() - 1);
+        fx.seq = 999;
+        loop.tick();
+        CHECK(probe.calls == 0);
+        CHECK(fx.raw_col("occ-x", "note") == "redelivery_sequence_regressed");
+    }
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a REAL leadership change (resign then re-acquire) is "
+          "another term -- the reader charges its whole unrecorded count (#3678)",
+          "[command_outbox][pg][delivery][3678]") {
+    constexpr std::int64_t kHorizon = 10;
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-flap", "cmd-flap"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe); // keeps the stamp
+    fx.unrecorded = 500;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true, nullptr, kHorizon);
+    loop.tick();
+    REQUIRE(probe.calls == 1);
+    REQUIRE(fx.raw_col("occ-flap", "dispatch_stamp_epoch") == std::to_string(fx.epoch()));
+
+    // The same process loses and regains leadership: a genuinely NEW epoch from the real elector.
+    const std::int64_t old_epoch = fx.epoch();
+    fx.elector().resign();
+    REQUIRE(fx.elector().try_acquire());
+    REQUIRE(fx.elector().epoch().has_value());
+    REQUIRE(*fx.elector().epoch() != old_epoch);
+
+    // 9 unrecorded dispatches since the stamp would be 509 - 500 = 9 < 10 if differenced (same
+    // term). Across a term change the reader charges its whole count, 509 >= 10, and refuses --
+    // a safe-direction early dead-letter, which is the documented cost of using the epoch as the
+    // "same process" discriminator (a boot nonce would avoid it; a follow-up).
+    fx.unrecorded = 509;
+    fx.make_due("occ-flap");
+    loop.tick();
+    CHECK(probe.calls == 1);
+    CHECK(fx.raw_state("occ-flap") == "failed");
+    CHECK(fx.raw_col("occ-flap", "note") == "redelivery_horizon_exceeded");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: KNOWN RESIDUAL (characterisation, not a guarantee): a stale "
+          "leader acting on an old snapshot still sends a row a peer has just dead-lettered (#3678)",
+          "[command_outbox][pg][delivery][3678][residual]") {
+    // The send happens BEFORE any fenced write for the sent path (see the "ORDERING" comment in
+    // deliver()), so a replica that read the row as stamped-and-inside-the-horizon can send it even
+    // though a peer dead-lettered it in between. Only the bookkeeping is fenced out. That is the
+    // pre-existing ADR-2002 section 6 gap, absorbed by the agent's dedup UNLESS the id has been
+    // evicted -- which is exactly the case the horizon exists for, so this is worth pinning.
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-stale", "cmd-stale"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+    DispatchProbe probe;
+    make_partial_send(probe);
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick(); // attempt 1: stamps, partial send, rescheduled
+    REQUIRE(probe.calls == 1);
+    fx.make_due("occ-stale");
+
+    // A peer dead-letters the row between this replica's list_pending snapshot and its decision.
+    fx.before_seq_read = [&] {
+        auto peer = fx.store().mark_failed("occ-stale", fx.lock(), fx.epoch(),
+                                           "redelivery_horizon_exceeded");
+        REQUIRE(peer.has_value());
+        REQUIRE(*peer);
+    };
+    loop.tick();
+
+    CHECK(fx.raw_state("occ-stale") == "failed"); // the peer's verdict stands in the store...
+    CHECK(probe.calls == 2);                      // ...but this replica still sent on its snapshot
+}
+
+TEST_CASE("CommandOutboxStore[pg]: the stamp-clear only touches a stamp written in THIS term "
+          "(#3678)",
+          "[command_outbox][pg][store][3678]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-c", "cmd-c"), fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // A stamp from an EARLIER term: asking for the clear must leave it alone.
+    fx.set_stamp("occ-c", 1000, 4, fx.epoch() - 1);
+    auto kept = fx.store().reschedule("occ-c", fx.lock(), fx.epoch(), std::chrono::seconds(30),
+                                      /*clear_first_send_stamp=*/true);
+    REQUIRE(kept.has_value());
+    CHECK(*kept); // the reschedule itself happened
+    CHECK(fx.raw_col("occ-c", "dispatch_seq_first_sent") == "1000");
+    CHECK(fx.raw_col("occ-c", "dispatch_unrecorded_first_sent") == "4");
+    CHECK(fx.raw_col("occ-c", "dispatch_stamp_epoch") == std::to_string(fx.epoch() - 1));
+
+    // A stamp from THIS term: cleared, all three columns together.
+    fx.set_stamp("occ-c", 1000, 4, fx.epoch());
+    auto cleared = fx.store().reschedule("occ-c", fx.lock(), fx.epoch(), std::chrono::seconds(30),
+                                         /*clear_first_send_stamp=*/true);
+    REQUIRE(cleared.has_value());
+    CHECK(fx.raw_col("occ-c", "dispatch_seq_first_sent") == "<null>");
+    CHECK(fx.raw_col("occ-c", "dispatch_unrecorded_first_sent") == "<null>");
+    CHECK(fx.raw_col("occ-c", "dispatch_stamp_epoch") == "<null>");
+
+    // And without the flag a same-term stamp is kept.
+    fx.set_stamp("occ-c", 1000, 4, fx.epoch());
+    auto noclear = fx.store().reschedule("occ-c", fx.lock(), fx.epoch(), std::chrono::seconds(30),
+                                         /*clear_first_send_stamp=*/false);
+    REQUIRE(noclear.has_value());
+    CHECK(fx.raw_col("occ-c", "dispatch_seq_first_sent") == "1000");
+}
+
+TEST_CASE("CommandOutboxDelivery: the constructor clamps a Deps horizon into [1, the ring-derived "
+          "constant] (#3678)",
+          "[command_outbox][delivery][3678]") {
+    // No database needed: the clamp is constructor-local. (tick() never runs.)
+    auto horizon_after = [](std::int64_t requested) {
+        CommandOutboxDelivery::Deps d;
+        d.redelivery_horizon_commands = requested;
+        CommandOutboxDelivery loop{std::move(d)};
+        return loop.redelivery_horizon_for_test();
+    };
+    CHECK(horizon_after(yuzu::kMaxOutboxRedeliveryHorizonCommands * 100) ==
+          yuzu::kMaxOutboxRedeliveryHorizonCommands);
+    CHECK(horizon_after(0) == 1);
+    CHECK(horizon_after(-7) == 1);
+    CHECK(horizon_after(42) == 42);
 }

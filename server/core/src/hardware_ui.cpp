@@ -8,6 +8,7 @@
 
 #include "device_data_render.hpp"
 #include "hardware_routes.hpp"
+#include "offline_endpoint_types.hpp" // kOfflineRosterRowCap (the partial-list notice)
 
 #include "device_containment_render.hpp"
 #include "device_estate_render.hpp"
@@ -197,12 +198,32 @@ std::string kpi(const char* label, std::string value, const char* extra_class = 
            std::move(value) + "</div><div class=\"l\">" + label + "</div></div>";
 }
 
-std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
+/// 100000 -> "100,000" (the roster cap, worded in the partial-list notice from the store's own constant).
+/// Unsigned: a count, never negative (a signed overload would put the comma before the sign).
+std::string with_thousands(unsigned long long n) {
+    std::string digits = std::to_string(n);
+    std::string out;
+    int run = 0;
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        if (run == 3) {
+            out.insert(out.begin(), ',');
+            run = 0;
+        }
+        out.insert(out.begin(), *it);
+        ++run;
+    }
+    return out;
+}
+
+std::string kpis_html(const HardwareKpis& k, bool ci_degraded, bool lower_bound) {
+    // #5712: over a truncated roster every count is a floor, so it is marked "at least" rather
+    // than shown as the fleet. The marker is a plain entity (no JS, no tooltip dependency).
+    const std::string lb = lower_bound ? "&ge;&nbsp;" : "";
     std::string h = "<div class=\"gp-tiles\">";
-    h += kpi("Total CIs", std::to_string(k.total));
-    h += kpi("Online", std::to_string(k.online));
-    h += kpi("Offline", std::to_string(k.offline));
-    h += kpi("Stale", std::to_string(k.stale), k.stale > 0 ? "warn" : "");
+    h += kpi("Total CIs", lb + std::to_string(k.total));
+    h += kpi("Online", lb + std::to_string(k.online));
+    h += kpi("Offline", lb + std::to_string(k.offline));
+    h += kpi("Stale", lb + std::to_string(k.stale), k.stale > 0 ? "warn" : "");
     h += kpi("CI coverage", ci_degraded ? "&mdash;" : (std::to_string(k.with_ci) + " / " + std::to_string(k.total)));
     // Readouts over the scoped roster: hidden when no device has synced the figure, and
     // when the CI columns themselves are degraded (a blank would read as "none").
@@ -229,6 +250,11 @@ std::string kpis_html(const HardwareKpis& k, bool ci_degraded) {
     return h;
 }
 
+/// One newest-wins sync scope for the list's requests: the search box (`this:replace` on #hw-q)
+/// and every sort header / pager button (`#hw-q:replace`) share #hw-q's xhr slot. `this:abort`
+/// dropped a request issued while another was in flight, losing the operator's latest click.
+constexpr std::string_view kHwSyncScope = "#hw-q:replace";
+
 std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuery& q) {
     const bool active = parse_hw_sort_key(q.sort) == key;
     const bool next_desc = active ? !q.desc : false;
@@ -239,7 +265,7 @@ std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuer
     std::string indicator = active ? (q.desc ? " &#9660;" : " &#9650;") : "";
     return std::string("<th class=\"sortable\" hx-get=\"") + esc(list_url(nq, false, true)) +
            "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-           "hx-sync=\"this:abort\">" + label + indicator + "</th>";
+           "hx-sync=\"" + std::string{kHwSyncScope} + "\">" + label + indicator + "</th>";
 }
 
 std::string chip(const char* label, const std::string& value, const HardwareListQuery& q,
@@ -318,13 +344,13 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
         pq.offset = q.offset >= q.limit ? q.offset - q.limit : 0;
         h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(pq, false, true)) +
              "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-             "hx-sync=\"this:abort\">Prev</button>";
+             "hx-sync=\"" + std::string{kHwSyncScope} + "\">Prev</button>";
     }
     if (q.offset + q.limit < total_matching) {
         HardwareListQuery nq = q; nq.offset = q.offset + q.limit;
         h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(nq, false, true)) +
              "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
-             "hx-sync=\"this:abort\">Next</button>";
+             "hx-sync=\"" + std::string{kHwSyncScope} + "\">Next</button>";
     }
     h += "</div>";
     return h;
@@ -437,6 +463,19 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
     if (tags_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
              "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
+    // #5712: a partial roster is SERVED, with this notice — never a refusal (#5371). It lives in
+    // the swap target beside the degrade banners so every htmx re-render keeps it, and it is
+    // rendered in the empty-result state too: a search that finds nothing proves nothing here.
+    if (page.roster_truncated)
+        h += "<div id=\"hw-roster-truncated\" class=\"gp-banner hw-partial\"><b>Partial list.</b> More than " +
+             with_thousands(kOfflineRosterRowCap) + " devices were seen in the last " + std::to_string(std::chrono::duration_cast<std::chrono::days>(kHardwareRosterWindow).count()) + " days, so this list "
+             "shows the " + with_thousands(kOfflineRosterRowCap) + " most recently seen. Older devices are "
+             "not listed and the list cannot be paged past this limit. Every device count on this page "
+             "(including the page total) is a lower bound, and the median describes only the listed "
+             "devices. On a fleet this large the CI columns, and so the CI-coverage ratio, can also be "
+             "blank or low for listed devices even when no CI warning shows. A search that finds "
+             "nothing does not prove a device does not exist &mdash; open a device's record to check "
+             "it directly.</div>";
     if (page.containment_ui && page.quarantine_degraded)
         h += "<div class=\"gp-banner hw-degrade\"><b>Quarantine state unavailable.</b> The quarantine "
              "records could not be read or checked &mdash; a row without a Quarantined pill here is "
@@ -504,8 +543,8 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
                                           bool tags_degraded) {
     constexpr const char* kRosterBanner =
         "<div class=\"gp-banner hw-degrade\"><b>Hardware roster unavailable.</b> The device roster could "
-        "not be read. This is <b>not</b> \"no devices\" &mdash; reads here are authoritative, so "
-        "this banner is shown instead of an empty table. Retry shortly.</div>";
+        "not be read. This is <b>not</b> \"no devices\" &mdash; a failed read is shown as this "
+        "banner, never as an empty table. Retry shortly.</div>";
     // #5531: the banner must also replace a results_only re-render, keeping the
     // #hw-results swap target (and its data-url) alive for the next retry.
     if (roster_unavailable && results_only)
@@ -525,7 +564,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
         return h;
     }
 
-    h += kpis_html(page.kpis, ci_degraded);
+    h += kpis_html(page.kpis, ci_degraded, page.roster_truncated);
 
     const HardwareListQuery& q = page.query;
     h += "<section class=\"hw-panel\"><div class=\"hw-hd\"><h2>Hardware inventory</h2><div class=\"hw-end\">";
@@ -535,6 +574,7 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     // keystroke. `changed`/`delay:` are plain token parsing (no eval), so they degrade
     // safely instead of silently. The input also lives OUTSIDE `#hw-results`, targeted
     // by every other control via `hx-include`, so its own swap can never destroy it.
+    // hx-sync="this:replace" is this element's side of kHwSyncScope: th/pager requests sync on #hw-q.
     h += "<input id=\"hw-q\" type=\"search\" class=\"hw-search\" name=\"q\" value=\"" + esc(q.q) +
          "\" placeholder=\"Search hostname, serial, model, CPU&hellip;\" hx-get=\"" +
          esc(list_url([&] { HardwareListQuery nq = q; nq.offset = 0; return nq; }(), false, true)) +
@@ -559,7 +599,7 @@ std::string render_hardware_not_found(const std::string& agent_id) {
 
 std::string render_hardware_roster_unreadable(const std::string& agent_id) {
     return hw_style() + "<div class=\"hw-wrap\"><div class=\"gp-placeholder\"><b>Device roster "
-           "unreadable.</b> The device roster could not be read, so '" + esc(agent_id) +
+           "unreadable.</b> The device's stored record could not be read, so '" + esc(agent_id) +
            "' cannot be looked up &mdash; this is not \"not found\". Retry shortly.</div></div>";
 }
 
@@ -630,8 +670,8 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
             h += "<div><span class=\"ci-lab\">Architecture</span>" + ci_disp(arch) + "</div>";
             h += "</div></div>";
         } else if (detail.identity_degraded) {
-            h += "<div class=\"gp-banner hw-degrade\"><b>Device identity unavailable.</b> The device roster "
-                 "could not be read &mdash; the agent id is shown in place of the hostname, OS is "
+            h += "<div class=\"gp-banner hw-degrade\"><b>Device identity unavailable.</b> The device's stored "
+                 "record could not be read &mdash; the agent id is shown in place of the hostname, OS is "
                  "omitted and last-seen is unknown; this is not \"not found\".</div>";
         }
         if (!detail.ci.has_value()) {

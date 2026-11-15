@@ -73,8 +73,14 @@
 #   scripts/ci/check-plugin-spawn-lexical.sh              # scan the real tree
 #   scripts/ci/check-plugin-spawn-lexical.sh --selftest    # fixture self-test
 #
-# Exit status: 0 = clean (or selftest passed), 1 = a raw spawn token was
-# found outside the allowlist (or selftest failed), 2 = usage error.
+# Exit status: 0 = clean (or selftest passed); 1 = at least one finding -- a
+# raw spawn token outside the allowlist, or a scan error reported in the same
+# findings list (`<unreadable: ...>` for a file that could not be read,
+# `<unterminated-literal>` for a lexer desync; both fail closed) -- or the
+# selftest failed; 2 = usage error, no working python interpreter, or the base
+# ref (--base / LEXICAL_GATE_BASE, default origin/dev) cannot be resolved. An
+# uncaught Python exception (a traceback) also exits 1, so a red run with a
+# traceback is a bug in the lint, not a finding.
 
 set -euo pipefail
 
@@ -1071,6 +1077,60 @@ def run_selftest():
         if rf_new:
             print(f"SELFTEST FAILED: K-R5-02 -- a pure reflow of a frozen call false-positived: {rf_new}")
             return 1
+
+        # Exit-code contract of run_full_scan (header "Exit status"): each
+        # code is asserted so the documented set cannot drift from the code.
+        import contextlib
+        import io
+        global base_ref
+        saved_base_ref = base_ref
+        try:
+            ec_root = os.path.join(tmp, "exitcodes")
+            ec_dir = os.path.join(ec_root, "agents", "plugins", "ec_plugin", "src")
+            os.makedirs(ec_dir)
+            ec_file = os.path.join(ec_dir, "ec.cpp")
+            sink = io.StringIO()
+
+            # 0: clean tree, no base requested (warning path, stderr only).
+            with open(ec_file, "w") as f:
+                f.write("int ok() { return 0; }\n")
+            base_ref = ""
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = run_full_scan(ec_root)
+            if rc != 0:
+                print(f"SELFTEST FAILED: exit-code contract -- clean tree returned {rc}, expected 0")
+                return 1
+
+            # 1: a seeded raw spawn token.
+            with open(ec_file, "w") as f:
+                f.write('void bad() { system("x"); }\n')
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = run_full_scan(ec_root)
+            if rc != 1:
+                print(f"SELFTEST FAILED: exit-code contract -- seeded spawn returned {rc}, expected 1")
+                return 1
+
+            # 1: a scan error (unterminated literal) is also exit 1.
+            with open(ec_file, "w") as f:
+                f.write('const char* s = "never closed;\n')
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                rc = run_full_scan(ec_root)
+            if rc != 1:
+                print(f"SELFTEST FAILED: exit-code contract -- scan error returned {rc}, expected 1")
+                return 1
+
+            # 2: a REQUESTED base that cannot be resolved hard-fails.
+            with open(ec_file, "w") as f:
+                f.write("int ok() { return 0; }\n")
+            base_ref = "refs/does-not-exist"
+            err = io.StringIO()
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(err):
+                rc = run_full_scan(ec_root)
+            if rc != 2 or "could not be resolved" not in err.getvalue():
+                print(f"SELFTEST FAILED: exit-code contract -- unresolvable base returned {rc}, expected 2")
+                return 1
+        finally:
+            base_ref = saved_base_ref
 
         print("check-plugin-spawn-lexical --selftest: all fixtures behaved as expected.")
         return 0

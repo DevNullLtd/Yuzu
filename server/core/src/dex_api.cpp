@@ -7,8 +7,11 @@
 #include "refusal_log_throttle.hpp"    // bounds the policy-unavailable warning
 #include "runtime_config_store.hpp"    // dex_score_policy_store_reader
 
+#include <yuzu/log_token.hpp> // log_key_token: neutralise and cap an exception's text
+
 #include <spdlog/spdlog.h>
 
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -26,8 +29,12 @@ namespace yuzu::server {
 /// degrades to an empty/`-1` model; the builder-less reads guard on it).
 class LocalDexApi final : public DexApi {
 public:
-    LocalDexApi(GuaranteedStateStore* store, FleetFn fleet_fn, DexScorePolicyFn policy_fn)
-        : store_(store), fleet_fn_(std::move(fleet_fn)), policy_fn_(std::move(policy_fn)) {}
+    LocalDexApi(GuaranteedStateStore* store, FleetFn fleet_fn, DexScorePolicyFn policy_fn,
+                DexObserverFn observer_fn)
+        : store_(store),
+          fleet_fn_(std::move(fleet_fn)),
+          policy_fn_(std::move(policy_fn)),
+          observer_fn_(std::move(observer_fn)) {}
 
     LocalDexApi(const LocalDexApi&) = delete;
     LocalDexApi& operator=(const LocalDexApi&) = delete;
@@ -68,6 +75,9 @@ public:
             m.window = window;
             m.degraded = true;
             m.degraded_reason = "invalid_scope";
+            // Constant text, never the caller's token; one line per interval.
+            if (refusal_warn_throttle_.should_warn("invalid_scope"))
+                spdlog::warn("DexApi::apps: platform scope refused (invalid_scope)");
             return m;
         }
         // The policy next: an unavailable policy answers without a fleet snapshot, and a
@@ -78,7 +88,7 @@ public:
             if (!p) {
                 // One line per interval, not per request: an unreadable store would
                 // otherwise write one warning for every Apps read.
-                if (policy_warn_throttle_.should_warn("score_policy_unavailable"))
+                if (refusal_warn_throttle_.should_warn("score_policy_unavailable"))
                     spdlog::warn("DexApi::apps: score policy unavailable: {}", p.error());
                 else
                     spdlog::debug("DexApi::apps: score policy unavailable: {}", p.error());
@@ -93,10 +103,36 @@ public:
         // Absent FleetFn = unknown population (nullopt), not zero. The population
         // is the scope's connected agents' own ids, so the store draws the share
         // numerators from the same set it is divided by.
+        std::optional<DexFleet> fleet;
         std::optional<std::vector<std::string>> online;
-        if (fleet_fn_)
-            online.emplace(dex_apps_online_ids(fleet_fn_(), scope));
-        return build_dex_apps_model(store_, window, since_of(window), scope, online, in_force);
+        if (fleet_fn_) {
+            fleet.emplace(fleet_fn_());
+            online.emplace(dex_apps_online_ids(*fleet, scope));
+        }
+        DexAppsModel m = build_dex_apps_model(store_, window, since_of(window), scope, online, in_force);
+        // The live observer split is read only after a successful read, from the same snapshot and
+        // the same ids the population was counted from, so the split and the population cannot
+        // disagree. A refused or failed read never pays the pass; no observer source = unknown.
+        // The split is an optional addition to a read that already succeeded, so a provider that
+        // throws is contained here, once for the REST, MCP and page callers alike: the model keeps
+        // every figure and `observer_state` stays unset, the same as no source wired.
+        if (!m.degraded && online && observer_fn_) {
+            const auto failed = [this](const std::string& what) {
+                // One line per interval, not per request.
+                if (refusal_warn_throttle_.should_warn("observer_unavailable"))
+                    spdlog::warn("DexApi::apps: observer state unavailable: {}", what);
+                else
+                    spdlog::debug("DexApi::apps: observer state unavailable: {}", what);
+            };
+            try {
+                m.observer_state = dex_apps_observer_split(*fleet, scope, observer_fn_(*online));
+            } catch (const std::exception& e) {
+                failed(::yuzu::log_key_token(e.what()));
+            } catch (...) {
+                failed("non-standard exception");
+            }
+        }
+        return m;
     }
 
     [[nodiscard]] DexCatalogueModel catalogue(const std::string& os_filter,
@@ -171,12 +207,14 @@ private:
     GuaranteedStateStore* store_; ///< nullable — builders degrade; builder-less reads guard
     FleetFn fleet_fn_;
     DexScorePolicyFn policy_fn_;
-    mutable RefusalLogThrottle policy_warn_throttle_; ///< bounds the policy-unavailable warning
+    DexObserverFn observer_fn_;
+    mutable RefusalLogThrottle refusal_warn_throttle_; ///< bounds the repeated warnings (score_policy_unavailable, invalid_scope, observer_unavailable)
 };
 
 std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store, FleetFn fleet_fn,
-                                           DexScorePolicyFn policy_fn) {
-    return std::make_shared<LocalDexApi>(store, std::move(fleet_fn), std::move(policy_fn));
+                                           DexScorePolicyFn policy_fn, DexObserverFn observer_fn) {
+    return std::make_shared<LocalDexApi>(store, std::move(fleet_fn), std::move(policy_fn),
+                                         std::move(observer_fn));
 }
 
 DexScorePolicyProvider::ReadFn dex_score_policy_store_reader(RuntimeConfigStore& store) {

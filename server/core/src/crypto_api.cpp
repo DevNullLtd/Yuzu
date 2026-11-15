@@ -322,7 +322,7 @@ public:
 
         std::unordered_map<std::string, std::string> hostnames;
         if (devices_ && !page->rows.empty())
-            for (auto& d : devices_->list_devices())
+            for (auto& d : devices_->list_devices_basic()) // hostnames only: no health read
                 hostnames.emplace(std::move(d.agent_id), std::move(d.hostname));
 
         CryptoDevicesPage out;

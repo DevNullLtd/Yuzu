@@ -51,6 +51,94 @@ groups:
             that ramp: a restart disconnects every agent the node holds.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/gateway.md#what-happens-when-the-server-restarts"
 
+      # Agent command-dedup store (HA WS-0, #3663). yuzu_fleet_agents_dedup_store_degraded is
+      # the number of agents whose durable dedup store never OPENED (heartbeat tag
+      # yuzu.dedup_degraded = 1): they keep running commands but without replay protection, so a
+      # redelivered command may execute twice.
+      #
+      # WHAT THIS ALERT COVERS, AND WHAT IT DOES NOT. It covers ONLY a store that failed to open.
+      # A store that opened and later fails writes (a disk filling after boot) shows only on the
+      # latched yuzu_fleet_agents_dedup_claim_erroring / _record_erroring / _release_erroring
+      # gauges, which have NO alert: they count agents whose per-process counter is > 0 "since
+      # its last restart", so an alert on them could not clear on recovery (tracked in #6932).
+      # The population is agents with a heartbeat in the last 90 s (server staleness window), so
+      # an agent that is offline or heartbeats slower than 90 s drops out of every count. It is a
+      # best-effort, agent-self-reported indicator, NOT a complete detective control for "this
+      # agent lacks replay protection". Like every rule in this file it is a SAMPLE: it is a
+      # control only once the file is loaded into Prometheus and severity=warning is routed in
+      # Alertmanager.
+      #
+      # THE EXPRESSION. `sum by (job) (max_over_time(...[5m]))`, not the bare gauge. The health
+      # store is per core replica (each replica exports the agents attached to it), the series is
+      # recomputed from a 90 s staleness window, and `for:` restarts whenever the series breaks:
+      # with the bare gauge a replica restart, an agent moving to another replica (a new
+      # `instance` label) or a heartbeat interval that lets the agent age out between beats
+      # (the series flaps 1/0) each reset the 15 m clock, so a persistently degraded agent never
+      # alerted. max_over_time[5m] bridges any gap shorter than the window (the cases exercise
+      # gaps of one to two minutes), and sum by (job) drops `instance` from the alert identity.
+      # The promtool cases pin the width itself: every window from 1m to 20m other than 5m
+      # fails at least one of them.
+      #
+      # Effects, measured with promtool: the window carries the condition 5 minutes past the
+      # last degraded sample, so a degradation spanning MORE than 10 minutes (first to last
+      # degraded sample) fires and one spanning 10 minutes or less never does; at a 1 m scrape
+      # interval that is 12 samples versus 11 (cases I and J), and it is the scrape interval,
+      # not the rule evaluation interval, that sets the sample spacing. That boundary is
+      # Prometheus 3.x behaviour (3.0 made range selectors left-open); on 2.x the window is
+      # closed on the left, so the boundary likely moves by one sample (not tested).
+      #
+      # The alert resolves about 5 minutes after the condition clears, so it can fire shortly
+      # after an agent was fixed; and across a failover the sum counts one agent on two replicas
+      # for up to about 6 minutes, so the text says "about N". Do NOT widen the window: it adds
+      # directly to the effective `for:`. Keep `--heartbeat` below 90 s, preferably 60 s or
+      # less: at 90 s or more the agent can age out between beats and every yuzu_fleet_* gauge
+      # flaps, not only this one.
+      #
+      # The `job` label is the only identity the alert keeps: unrelated Yuzu deployments that
+      # share one Prometheus need distinct `job`s (as for the yuzu-ha-leader rules), or their
+      # counts merge into one alert. Revisit `sum by (job)` as `max by (job)` if AgentHealthStore
+      # ever becomes shared across replicas (ADR-2002 7a states that intent): every replica
+      # would then publish the whole fleet and the sum would multiply it by the replica count.
+      #
+      # severity=warning, deliberately NOT critical: the value is agent-self-reported inside the
+      # heartbeat trust boundary, so ONE forged or buggy agent can set it to 1 (same reasoning as
+      # YuzuSparkBootFailed) - a warning routes to a ticket, not a page. One forged agent also
+      # keeps the alert firing, so a later genuine degradation changes only $value.
+      # Pair it with yuzu_fleet_agents_dedup_reporting when reading a quiet graph: 0 degraded is
+      # only reassuring when agents are reporting at all.
+      - alert: YuzuDedupStoreDegraded
+        expr: |
+          sum by (job) (max_over_time(yuzu_fleet_agents_dedup_store_degraded[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command-dedup store could not be opened on about {{ $value }} agent(s)"
+          description: >-
+            For more than 10 minutes, about {{ $value }} agent(s) (summed across core
+            replicas, so a failover can count one twice for a few minutes) have reported that
+            their durable command-dedup store (command_dedup.db) never opened. They still run
+            commands, but a command redelivered to such an agent may execute a second time
+            (at-least-once, fail-open by design). The server does not yet list which endpoints
+            are affected (tracked in #6931): check the agent log on suspect endpoints for "Failed
+            to open command dedup store" (the usual causes are a full or read-only data
+            directory or a permissions fault on command_dedup.db), fix the cause and restart the
+            agent. The count drops within about 45 seconds of the restart (the first heartbeat
+            comes one interval, 30 s by default, after the agent starts, then up to one 15 s
+            sweep) and the alert resolves about 5 minutes after that, so it can still fire for
+            an agent that was just fixed. An agent that stays offline for more than 90 seconds
+            leaves the count without having been fixed. A restart does not re-send an in-flight
+            operator command to a store-less agent (by code reading; a run to measure it is
+            tracked in #6935), but any redelivery by another path (a gateway forward is tried
+            up to three times with the same command id; the scheduled-command backlog is
+            visible as yuzu_server_command_outbox_pending, which counts all undelivered
+            occurrences and does not identify re-drives) is not absorbed while the store is
+            missing, and you cannot see from the product whether one is in flight, so do not
+            delay the fix for it. This alert covers ONLY a store that failed to open: a
+            store that opened and then failed writes shows only on the
+            yuzu_fleet_agents_dedup_claim_erroring gauge, which has no alert (tracked in #6932).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#fleet-monitoring-of-the-dedup-store"
+
   - name: yuzu-commands
     rules:
       - alert: YuzuHighCommandFailureRate
@@ -141,8 +229,8 @@ groups:
 
       # #1422 mgmt-plane peer authorization, every rejection reason EXCEPT
       # pin_mismatch (that one has its own rule below, because a routine
-      # server-leaf rotation in pin mode produces a few of it). None of these
-      # reasons is produced by a rotation: missing_server_auth_eku, bad_peer_cert
+      # server-leaf rotation in pin mode produces a few of it). Rotation produces
+      # none of these except the CRL reasons described below: missing_server_auth_eku, bad_peer_cert
       # = a CA-cert holder that is not the server reached the command plane (or
       # the server presents a leaf without the serverAuth EKU); no_pins_resolved,
       # no_pins_configured, bad_pin_config = the gateway's pin configuration
@@ -160,7 +248,13 @@ groups:
       # reach this rule only when no pin is configured or the mode is identity
       # (identity mode reports the identity's reason); identity_unresolved (a
       # gateway configuration defect) and revoked are reported as themselves in
-      # every mode. internal_error = a defect. Each one needs a
+      # every mode. The CRL (#6016 PR 4b) adds crl_revoked (the CA's CRL lists the
+      # peer's serial), revocation_unknown (a CRL source is set and no usable CRL is
+      # held) and revocation_stale (the held CRL is past nextUpdate plus grace);
+      # crl_revoked CAN follow a server re-issue: the re-issue revokes the old serial
+      # as superseded, so a replica still presenting it is refused until it restarts
+      # (in identity mode it is refused no_uri_san first, if its old certificate had
+      # no identity). internal_error = a defect. Each one needs a
       # person, so no `for:`. The name is the pre-split rule's, so existing
       # silences and routes keep applying to the non-rotation reasons.
       - alert: YuzuGatewayMgmtAuthRejected
@@ -185,10 +279,29 @@ groups:
             to mgmt_peer_pins in sys.config applies only at the next gateway
             restart, which disconnects every agent on the node, and agents
             without the #5183 fix stay wedged after it); no_uri_san means the
-            peer's certificate has no server identity URI (in identity mode
-            the server's built-in certificate has not been re-issued with it:
-            check yuzu_server_identity_uri_present on the server, and keep
-            mgmt_peer_auth_mode at pin or identity_or_pin until it reads 1);
+            peer's certificate has no server identity URI; read
+            yuzu_server_identity_uri_present on the server: 0 means the
+            in-place re-issue was skipped or failed (see
+            YuzuServerIdentityUriAbsent: fix the cause, then restart the
+            server so it re-issues); 1 means the certificate the server
+            presents to the gateway is not default-server.pem (it has its own
+            --cert/--key): set {yuzu_gw, mgmt_peer_auth_mode} to pin with that
+            certificate's pin; absent means either the server runs a release
+            that does not mint the identity or is not being scraped (upgrade
+            the server first so it re-issues its certificate, THEN restart the
+            gateway only if it is not already on the shipped identity config
+            and only if its agents can take the disconnect, because agents
+            without the #5183 fix stay wedged; a gateway already on identity
+            needs only the server upgrade and restart) or no surface
+            uses the default certificates (own certificates: set
+            mgmt_peer_auth_mode to pin with your pin). Do not put a gateway in
+            identity mode until the server is upgraded and the gauge reads 1;
+            a gateway already in identity mode that refuses with no_uri_san
+            needs the server to re-issue, or your server certificate's pin
+            added with identity_or_pin set until it does (mgmt_peer_auth_mode
+            is read at boot: applying it restarts the gateway, only if its
+            agents can take the disconnect, because agents without the #5183
+            fix stay wedged after it);
             identity_mismatch means the certificate names another install or
             another role (a certificate of a different CA, or an agent-style
             URI): treat as a security incident unless the server was just
@@ -199,17 +312,267 @@ groups:
             revoked means the peer presented a certificate whose serial is in
             mgmt_peer_denied: the server is still using a withdrawn
             certificate, re-key it, or a holder of that certificate is
-            connecting. mgmt_peer_auth_mode, mgmt_peer_identity and
-            mgmt_peer_denied are read at boot: a change to them applies only
+            connecting; crl_revoked means the peer presented a certificate
+            whose serial is on the CA's CRL: the server is still using a
+            certificate the CA withdrew (a re-issue supersedes the old serial,
+            so first check that every server replica has reloaded the new
+            certificate), or a holder of that certificate is connecting;
+            revocation_unknown means this gateway has a mgmt_crl_source but no
+            usable CRL for the peer's issuer (see YuzuGatewayMgmtCrlNotLoaded,
+            and the gateway log's mgmt_crl_source: line for the fetch or verification
+            cause; a server whose 8443 certificate is not issued by the
+            install CA needs the {url, Url, #{cacertfile => Path}} form of
+            mgmt_crl_source or a {file, Path} source); revocation_stale means
+            the loaded CRL is past its nextUpdate plus mgmt_crl_grace_s (see
+            YuzuGatewayMgmtCrlStale: restore the CRL fetch, or check that the
+            server is publishing a CRL at all). mgmt_peer_auth_mode, mgmt_peer_identity,
+            mgmt_peer_denied and mgmt_crl_source are read at boot: a change to them applies only
             if the gateway is restarted, which disconnects every agent on the
             node, and agents without the #5183 fix stay wedged after it;
             internal_error is a gateway defect (collect the gateway log and
-            report it). Rotation never produces these reasons, except identity_unresolved in
+            report it). no_uri_san, identity_mismatch, revocation_unknown,
+            revocation_stale and crl_revoked with no admission at all
+            in the same five minutes also raise YuzuGatewayMgmtIdentityOutage
+            (critical). Rotation does not produce these reasons, except crl_revoked from a
+            server replica still presenting a superseded certificate that a configured pin
+            admits (in identity mode with no pin it is refused no_uri_san first), and identity_unresolved in
             identity_or_pin with an unresolved identity. With pins
             configured in identity_or_pin, no_uri_san and identity_mismatch
             are reported as pin_mismatch instead and raise
             YuzuGatewayMgmtPinMismatch, not this alert; identity_unresolved
             and revoked are always reported as themselves.
+
+      # The identity outage (#6016, release N+1). YuzuGatewayMgmtAuthRejected
+      # above is warning-grade because most of its reasons are a person's
+      # to-do. Some of them are a total command outage under the shipped
+      # identity configs: no_uri_san (the server presents a certificate with
+      # no identity: its own --cert/--key or a bring-your-own certificate on
+      # the pin-less shipped config, or a built-in certificate that has not
+      # been re-issued) and identity_mismatch (another install or role).
+      # pin_mismatch, the same outage under a pin, is already critical, so
+      # these two page too, and only when the gateway ADMITTED NOTHING in the
+      # same five minutes: a stray rejection amid normal traffic (a probe, the
+      # gateway's own leaf) stays warning-only, and a server that is working
+      # for most commands is not an outage. The admitted counter is created at
+      # 0 for both methods, so a gateway that never admitted anything still has
+      # the series; `unless on (job, instance)` is per gateway. In
+      # identity_or_pin with pins configured these reasons are reported as
+      # pin_mismatch and raise YuzuGatewayMgmtPinMismatch instead. Both this
+      # alert and YuzuGatewayMgmtAuthRejected fire for the same cause; there is
+      # no inhibit rule in this repository, so expect the pair (gateway.md shows
+      # an operator-side inhibit_rules snippet). `for: 1m` absorbs a scrape and
+      # evaluation race at the edge of the window; a gateway that was healthy
+      # pages about six minutes after the refusals begin (the five-minute window
+      # has to age its last admission out, then the minute). It needs a scrape
+      # interval of about 2m or less (Prometheus 3 range selectors are left-open,
+      # so increase() needs two samples inside the window): a 3m scrape makes it
+      # flap and a 5m scrape makes it blind; the 15-30 s the other gateway rules
+      # assume is ample. Known limit: it cannot tell an idle gateway from a dead
+      # one, and one un-re-issued server replica among several that still admit
+      # stays warning-only.
+      - alert: YuzuGatewayMgmtIdentityOutage
+        expr: |
+          sum by (job, instance, reason) (
+            increase(yuzu_gw_mgmt_auth_rejected_total{reason=~"no_uri_san|identity_mismatch|revocation_unknown|revocation_stale|crl_revoked"}[5m])
+          ) > 0
+          unless on (job, instance)
+          sum by (job, instance) (increase(yuzu_gw_mgmt_auth_admitted_total[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway refuses the server's identity and admits nothing ({{ $labels.instance }}, {{ $labels.reason }})"
+          description: >-
+            The gateway's :50063 management listener refused the server's
+            certificate with reason {{ $labels.reason }} and admitted nothing
+            in the same five minutes: every command the server forwards to
+            this gateway's agents is failing as gateway_unauthenticated (the
+            server does not retry). Under the shipped identity config this is
+            almost always one of two causes. (1) The server's certificate has
+            no server identity: read yuzu_server_identity_uri_present on the
+            server; 0 means the in-place re-issue was skipped or failed (see
+            YuzuServerIdentityUriAbsent: fix the cause and restart the server,
+            which needs no gateway restart); absent means the server runs a
+            release that does not mint the identity or is not being scraped
+            (upgrade the server first). (2) The server uses its own
+            certificates (bring-your-own, --no-default-certs, or its own
+            --cert/--key), which carry no identity: set {yuzu_gw,
+            mgmt_peer_auth_mode} to pin with that certificate's pin. That
+            change is read at boot, so it applies only when the gateway is
+            restarted, which disconnects every agent on the node; do it only
+            if they can take the disconnect, because agents without the #5183
+            fix stay wedged after it. identity_mismatch means the certificate
+            names another install or another role: treat it as a security
+            incident unless the server was just re-keyed under another CA or
+            the CA was re-rooted while this gateway kept running (it derives
+            its identity from the CA file at boot, so it refuses the new
+            certificate until it is restarted or given the new
+            mgmt_peer_identity; see the gateway guide, "During a CA re-root";
+            a restart disconnects the node's agents, and agents without the
+            #5183 fix stay wedged after it). If the gauge
+            yuzu_server_identity_uri_present reads 1, the certificate the
+            server presents is not default-server.pem: it has its own
+            --cert/--key, so set mgmt_peer_auth_mode to pin.
+            crl_revoked means the CA's CRL lists the certificate the server
+            presents: the server must be given a current certificate (a
+            re-issue supersedes the old serial; check every server replica
+            has reloaded it) before this gateway will admit it. If the
+            certificate was revoked BY HAND (any reason but the automatic
+            superseded), the server will not re-certify that key: re-key the
+            default certificate set by renaming default-marker.json aside
+            (every default leaf gets a new key, so update any gateway
+            mgmt_peer_pins at the same time), then restart every server
+            replica (docs/user-manual/upgrading.md, "already revoked").
+            revocation_unknown or revocation_stale means the gateway cannot
+            vouch for the CRL (none loaded, or past nextUpdate plus
+            mgmt_crl_grace_s): see YuzuGatewayMgmtCrlNotLoaded and
+            YuzuGatewayMgmtCrlStale, and restore the CRL fetch from the
+            server's 8443 (or the {file, Path} source). A CRL source change
+            is read at boot, which disconnects the node's agents, and agents
+            without the #5183 fix stay wedged after it.
+            YuzuGatewayMgmtAuthRejected fires for the same cause (warning) and
+            lists every other reason.
+
+      # The CRL (#6016 PR 4b). The gateway reads the CA's CRL (mgmt_crl_source)
+      # and refuses a listed server certificate (crl_revoked), and refuses
+      # every peer when it cannot vouch for the CRL. Two gauges drive two
+      # alerts. CrlNotLoaded is the total outage: a source is configured and no
+      # CRL has verified, so every stream is refused as revocation_unknown (the
+      # gateway fails closed; it does not admit while it cannot check). It is
+      # critical because the identity outage rule above only pages when a
+      # rejection is counted, and a gateway nothing is connecting to is silent.
+      # CrlStale is the early warning: the loaded CRL is past its nextUpdate,
+      # but the gateway keeps admitting until nextUpdate plus mgmt_crl_grace_s
+      # (default 24 h), so a person has that long to restore the fetch before
+      # revocation_stale refuses everything. Both are per gateway and have no
+      # `unless` on admission: they describe the gateway's own CRL state, not
+      # traffic. Neither is part of any readiness probe: a gateway that cannot
+      # reach the server's CRL URL must not be taken out of rotation by it.
+      # NotLoaded waits ten minutes: a server that needs a few minutes to come up
+      # (Postgres first) refuses the gateway's first fetches for that long, and
+      # that is a cold start, not an outage; a real outage is also visible sooner
+      # through YuzuGatewayMgmtIdentityOutage once traffic exists. RefreshStalled
+      # covers what neither can see: a CRL that is still valid but is no longer
+      # being refreshed (a wedged watcher, or a fetch that keeps failing), which
+      # would otherwise be silent until CrlStale at nextUpdate, up to 48 hours.
+      # It reads the gauge the watcher advances only on a successful read.
+      - alert: YuzuGatewayMgmtCrlNotLoaded
+        expr: |
+          yuzu_gw_mgmt_crl_enforced == 1
+          and on (job, instance)
+          yuzu_gw_mgmt_crl_loaded == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway has a CRL source but no usable CRL ({{ $labels.instance }})"
+          description: >-
+            This gateway has a mgmt_crl_source configured and has not loaded a
+            CRL that verifies against its management listener's CA, so it
+            refuses every management stream as revocation_unknown and the
+            server's commands to this gateway's agents fail. Read the
+            gateway log's mgmt_crl_source: lines for the cause and
+            yuzu_gw_mgmt_crl_rejected_total{reason} for its class: fetch_tls
+            means the TLS to the server's 8443 failed: its certificate is not
+            issued by the CA the gateway verifies it with (a bring-your-own
+            dashboard certificate needs the {url, Url, #{cacertfile => Path}}
+            form of mgmt_crl_source, or a {file, Path} source) OR the host in
+            the URL is not one of that certificate's names (--cert-san);
+            fetch_connect means the server is unreachable; fetch_timeout means
+            it did not answer in time; fetch_status means it answered with a
+            status other than 200 (503 is "CRL not yet published": the server
+            is still starting or its CA is unavailable); malformed or
+            too_large means the bytes are not a usable CRL; unsupported means
+            a well-formed CRL the gateway refuses by policy (not the issuer's
+            complete base list: a delta, a scoped or indirect one, or one
+            with an extension the gateway cannot process; the Yuzu server
+            publishes none of these, a corporate CA feed can);
+            validity_too_long means the CRL's nextUpdate is further past its
+            thisUpdate than mgmt_crl_max_validity_s allows (the same refused
+            bytes are counted once in a row and again once an hour, not once
+            per refresh, so read the gateway log and the state gauges, or
+            increase() over a long window, rather than the rate; this applies
+            to malformed, unsupported, unverified, issuer_mismatch and
+            validity_too_long, while future_dated, replay, the fetch reasons
+            and a fetch-reported too_large count every attempt); unverified or
+            issuer_mismatch means the CRL was not signed by the CA the
+            management listener trusts, or by a CA whose key type the
+            gateway cannot bind (RSA, EC and EdDSA are supported); future_dated means the CRL is dated
+            more than an hour ahead of THIS gateway's clock (check the clock
+            here and on the server); file_unreadable means a {file, Path}
+            source or a cacertfile cannot be read. A change to
+            mgmt_crl_source is read at boot, which disconnects the node's
+            agents, and agents without the #5183 fix stay wedged after it;
+            do it only if they can take the disconnect.
+
+      - alert: YuzuGatewayMgmtCrlStale
+        expr: |
+          time() > yuzu_gw_mgmt_crl_next_update_timestamp_seconds
+          and on (job, instance)
+          yuzu_gw_mgmt_crl_loaded == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway's loaded CRL is past its nextUpdate ({{ $labels.instance }})"
+          description: >-
+            The CRL this gateway holds is past its nextUpdate. The gateway
+            still admits the server until nextUpdate plus mgmt_crl_grace_s
+            (default 24 hours), then refuses every stream as
+            revocation_stale. The CRL is not being refreshed: the server
+            stopped publishing, this gateway cannot fetch it, or it fetches
+            a CRL it refuses because of its bytes (malformed, unsupported,
+            unverified, issuer_mismatch or validity_too_long). Check
+            yuzu_gw_mgmt_crl_rejected_total{reason} for the failing class
+            (refused bytes are counted once in a row and again once an hour,
+            so read the value or increase() over a long window, not the rate)
+            and the server's own CRL publication (the elected server leader
+            republishes when under 24 hours remain, so a period with no
+            leader stops it, and so does a server that cannot reach the CA
+            key; restarting a server replica republishes at startup); restore
+            the fetch before the grace ends. The rule compares the
+            Prometheus clock with the CRL's nextUpdate, which the server's
+            clock set, while the gateway refuses on its own clock, so keep
+            all three on NTP.
+
+      - alert: YuzuGatewayMgmtCrlRefreshStalled
+        expr: |
+          (time() - yuzu_gw_mgmt_crl_last_success_timestamp_seconds > 1800)
+          and on (job, instance)
+          yuzu_gw_mgmt_crl_loaded == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway has not read its CRL source for over 30 minutes ({{ $labels.instance }})"
+          description: >-
+            This gateway holds a CRL but has not read its source successfully
+            for more than 30 minutes (default refresh: 5 seconds), so a
+            revocation the CA publishes now will not reach it, and nothing
+            else alerts until the held CRL passes its nextUpdate (up to 48
+            hours). Either the watcher cannot read its source or every fetch
+            is failing: read yuzu_gw_mgmt_crl_rejected_total{reason} and the
+            gateway log's mgmt_crl_source: lines. fetch_tls, fetch_connect,
+            fetch_timeout and fetch_status point at the server's 8443;
+            file_unreadable means a {file, Path}
+            source or a cacertfile on a dead mount that has stopped
+            answering; malformed and too_large mean the bytes are not a
+            usable CRL; unsupported means a well-formed delta, scoped or
+            indirect CRL, or one with an unprocessable critical extension,
+            from a feed that is not the Yuzu server's; validity_too_long
+            means a CRL wider than mgmt_crl_max_validity_s; unverified,
+            issuer_mismatch, replay and future_dated
+            mean the server is serving a CRL this gateway will not take. The
+            same refused bytes are counted once in a row and again once an hour,
+            not once per refresh (replay, future_dated, too_large and the
+            fetch reasons count every attempt), so a quiet counter behind
+            this alert is expected for a CRL that is refused for the same
+            reason on every refresh. A
+            watcher process that is itself wedged shows no new rejections and
+            no new log lines. The rule compares the Prometheus clock with the
+            gateway's clock, so keep both on NTP. If you raised
+            mgmt_crl_refresh_ms above 15 minutes, raise the 1800 in this rule
+            with it.
 
       # pin_mismatch: the peer's key is not the pinned key. A routine rotation
       # produces a few: the server presents its new leaf up to one
@@ -358,8 +721,9 @@ groups:
       # Threshold: increase() >= 10 over 10m, i.e. about ten increases. One
       # request that fails to encode, or one oversized daily-sync batch, counts
       # once and must not warn; a systematic encoder fault (every Register failing)
-      # reaches 10 on a gateway fronting about 5 or more agents (one agent
-      # retries about 2.3 times per 10m at its steady 256 s backoff). A small
+      # reaches 10 on a gateway fronting about 3 or more agents (one agent
+      # retries about 4 times per 10m at its steady backoff, a mean wait of about
+      # 135 s under the agent's decorrelated jitter). A small
       # gateway, or a low-rate RPC (inventory, notify_stream, guardian: the
       # series is per rpc_name, there is no sum), can fault without reaching it:
       # for those use the log line "Upstream RPC ... raised" and
@@ -509,13 +873,15 @@ groups:
       # READS: op="session_lookup" (HA WS-5 batched session_id resolution) and
       # op="cluster_affinity_check" (#4669). Same counter, same pool-health
       # root cause, so one rule covers reads and writes.
-      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
-      # fresh-registration branch returns UNAVAILABLE on this); the other
-      # five writer SITES (announce_connected, both ProxyRegister renew
-      # branches, BatchHeartbeat's renew, deregister) — which collapse to
-      # three fail-OPEN `op` label values (announce_connected, renew_leases,
-      # deregister; see the label set in docs/user-manual/metrics.md) — are
-      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # The fail-CLOSED sites (the RPC returns UNAVAILABLE) are ProxyRegister's
+      # fresh-registration branch (`op="register_fresh"`) and both of its
+      # replay-adopt branches (`op="renew_leases"` and
+      # `op="reclaim_tombstoned_session"`). The three writer SITES —
+      # announce_connected, BatchHeartbeat's renew_leases and deregister — are
+      # deliberately fail-OPEN and use the `op` label values announce_connected,
+      # renew_leases and deregister (see the label
+      # set in docs/user-manual/metrics.md), so a rate here can mean silent
+      # directory drift even with
       # no visible RPC failure. INITIAL / conservative threshold — no fleet
       # background-rate data exists yet to tune against (same lesson as the
       # #913 OTA-bounds alert thresholds, the single largest source of
@@ -632,6 +998,101 @@ groups:
             and docs/user-manual/metrics.md's Command outbox delivery / Gateway
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
+
+      # #3678 -- the command outbox's REDELIVERY HORIZON. Three states, deliberately different rules.
+      #
+      # YuzuOutboxHeld: the delivery loop could not read the dispatch counters (or no reader is
+      # wired), so it HOLDS every pending occurrence and ends the tick -- nothing is sent, nothing
+      # fails, no audit row. All scheduled work stalls silently until the read recovers.
+      # `yuzu_server_command_outbox_pending` is the documented stall signal but nothing watched it.
+      # A hold repeats every ~5 s tick for as long as it lasts, so `increase()` stays positive
+      # throughout. The expression then stays true for the hold PLUS the 10m window, so with
+      # `for: 15m` a hold of roughly 7 minutes or more fires it (verified: 6 minutes does not,
+      # 7 does) and it keeps firing for about 10 minutes after recovery. It is a "stalled for
+      # several minutes" rule, not a 15-minute one. `stamp_not_committed` is excluded here (it
+      # also occurs for seconds at every leader handover); a PERSISTENT one is YuzuOutboxStampFailing
+      # below. The series are pre-seeded at 0 in CommandOutboxDelivery's constructor, so the first
+      # hold is a 0->1 step.
+      - alert: YuzuOutboxHeld
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_hold_cause_total{cause=~"sequence_unwired|sequence_unreadable"}[10m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The command outbox is holding all scheduled work on {{ $labels.instance }}"
+          description: >-
+            For several minutes (roughly 7 or more) the command outbox delivery loop on
+            {{ $labels.instance }} has been unable to read the dispatch counts its retry
+            limit needs (cause sequence_unreadable) or has no reader wired (sequence_unwired), so
+            it sends and fails NOTHING: every pending scheduled occurrence is held and no audit row
+            is written. The alert keeps firing for about 10 minutes after the read recovers.
+            FIRST check PostgreSQL reachability and pool health on that instance (the counters
+            live in the execution_tracker schema, the same database as the outbox), then that the
+            execution_tracker.dispatch_seq sequence exists and the server role can read it.
+            Occurrences that were never attempted are sent late once the read recovers. One that
+            was ALREADY being retried keeps counting dispatches during the hold and may be
+            dead-lettered when the read recovers (see YuzuOutboxDeadLettered). See
+            docs/user-manual/instructions.md "Execution semantics" and docs/user-manual/metrics.md
+            (yuzu_server_command_outbox_deliver_hold_cause_total).
+
+      # #3678 -- YuzuOutboxStampFailing: the first-attempt stamp keeps failing to commit
+      # (cause stamp_not_committed) -- a schema missing the outbox's stamp columns, a role without
+      # UPDATE on the outbox, or a store that cannot write. Like a hold it stalls scheduled work
+      # with a throttled log line and no audit row, but it is excluded from YuzuOutboxHeld because
+      # it also occurs for a few seconds at every leader handover. `for: 1h` over a 30m window
+      # fires after a failure of roughly 35 to 45 minutes (31m does not, 45m does) and keeps
+      # firing for up to 30 minutes after recovery: a persistent failure, not a handover.
+      - alert: YuzuOutboxStampFailing
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_hold_cause_total{cause="stamp_not_committed"}[30m])) > 0
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The command outbox cannot record first-attempt stamps on {{ $labels.instance }}"
+          description: >-
+            For roughly 35 to 45 minutes or more the command outbox delivery loop on {{ $labels.instance }} has
+            been unable to commit the stamp it must write before a scheduled occurrence's first
+            attempt, so those occurrences are HELD (not sent, not failed, no audit row). Likely
+            causes: the command_outbox_store schema is missing the dispatch stamp columns (check its
+            schema_meta version), the server role lacks
+            UPDATE on the outbox, or Postgres is rejecting writes. Check the server log line
+            "held: stamp_not_committed" and the outbox's schema_meta version.
+
+      # #3678 -- YuzuOutboxDeadLettered: a scheduled occurrence was refused a retry because the
+      # dispatch count advanced by the redelivery horizon (or went backwards) since its first
+      # attempt, and was marked failed instead of being re-sent. That is the control working AND a
+      # lost scheduled run, so it is worth surfacing, but it is a WARNING, not a page: a single very
+      # large Guardian / asset-tag / sync push legitimately ends every waiting occurrence at once,
+      # and the count is only an estimate (docs/command-dedup.md). No `for:`: each dead-letter is
+      # one terminal row, and a lone one must be visible. The series is pre-seeded at 0, but
+      # `increase()` ignores a series' FIRST sample, so a dead-letter on the first leader tick
+      # after a restart (which can land inside one scrape interval) would create the series
+      # already at N>0 and never fire. The second clause covers that: a series that is non-zero
+      # now and had no sample at all between 7 hours and 1 hour ago (a range lookup, not a point
+      # lookup: a scrape gap of up to 6 hours must not make a long-lived series look newborn).
+      - alert: YuzuOutboxDeadLettered
+        expr: |
+          increase(yuzu_server_command_outbox_deliver_horizon_exceeded_total[1h]) > 0
+            or (yuzu_server_command_outbox_deliver_horizon_exceeded_total > 0
+                unless on (job, instance)
+                  last_over_time(yuzu_server_command_outbox_deliver_horizon_exceeded_total[6h] offset 1h))
+        labels:
+          severity: warning
+        annotations:
+          summary: "A scheduled run was dead-lettered by the redelivery limit on {{ $labels.instance }}"
+          description: >-
+            At least one scheduled occurrence on {{ $labels.instance }} was marked failed in the
+            last hour because retrying it would have re-sent a command the agent may have already
+            forgotten (redelivery_horizon_exceeded), or because the shared dispatch sequence went
+            backwards (redelivery_sequence_regressed). The occurrence MAY OR MAY NOT have reached
+            any agent. Find it in the audit log (action command.outbox_delivered, result failure),
+            check the agents' responses for its command ID, and re-run it by hand if it did not
+            complete; an approval ticket it used is spent. A likely benign cause is a very large
+            fan-out push (Guardian, asset-tag, sync) that counted one dispatch per target; a
+            suspicious one is rows stuck for hours (see yuzu_server_command_outbox_deliver_retry_cause_total).
+            See docs/user-manual/instructions.md "Execution semantics".
 
       # HA WS-5 slice 2 (ADR-2002 §7f) — a presented gateway session_id that
       # matches MORE than one live directory row. No `for:` (same reasoning as
@@ -874,13 +1335,18 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Gateway mgmt-plane peer pin rejected this server ({{ $value }} in 1h)"
+          summary: "Gateway mgmt-plane peer authorization rejected this server ({{ $value }} in 1h)"
           description: >-
             forward_gateway_pending's SendCommand RPC was rejected
             UNAUTHENTICATED by a gateway's mgmt-plane peer pin (#1422) — the
             certificate this server presents does not satisfy that gateway's
             configured pin. Command forwarding to that gateway's agents is
-            DOWN until the pin and the server's leaf certificate agree. See
+            DOWN until the pin and the server's leaf certificate agree. Under
+            mgmt_peer_auth_mode identity (the shipped config) the refusal is the
+            server identity URI and no pin is involved: read
+            yuzu_gw_mgmt_auth_rejected_total{reason} on the gateway (no_uri_san
+            or identity_mismatch) and see YuzuGatewayMgmtAuthRejected for the
+            action. See
             ADR-2002 §7e and docs/user-manual/server-admin.md's `#4672`
             vNEXT entry for the `gateway_unauthenticated` reason code.
             Caveat: an occurrence in the ~1h window right after this
@@ -2046,6 +2512,62 @@ groups:
             scim provenance-denial audit row for the calling IdP/client.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-provenance-denied"
 
+      # #6836 / #6835: a SCIM request could not READ the store it needed and
+      # answered a retryable 503 instead of acting. Distinct from
+      # YuzuScimProvenanceDenied above: nothing was refused. `guard` is the
+      # closed set provenance|role (the deprovision / revive guards, #6836) and
+      # bearer|resource (the SCIM token check and the User / Group lookups,
+      # #6835), pre-seeded to 0. Before these changes the same faults were
+      # reported to the IdP as a 404 (and counted as a provenance denial, so
+      # YuzuScimProvenanceDenied fired for an outage by accident) or as a 401
+      # (a credential failure); this rule replaces that signal.
+      - alert: YuzuScimGuardStoreUnavailable
+        expr: |
+          increase(yuzu_scim_guard_store_unavailable_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "SCIM could not read the store for a {{ $labels.guard }} check (retryable 503)"
+          description: >-
+            yuzu_scim_guard_store_unavailable_total{guard="{{ $labels.guard }}"}
+            moved: a SCIM request could not read the store behind its
+            {{ $labels.guard }} check and answered 503 with Retry-After
+            instead of acting. guard=bearer is the SCIM token check (the
+            request could not be authenticated, so no SCIM verb was served),
+            guard=resource is a User or Group lookup, guard=provenance and
+            guard=role are the deprovision and revive guards (the role guard
+            includes the role re-check of a POST that revives a removed
+            account). Nothing was refused and the failed read changed nothing,
+            but the IdP has to retry for the work to complete, so a sustained
+            rate means provisioning, and above all leavers' deactivations, are
+            running late. This is not a credential failure or a provenance
+            denial (YuzuScimProvenanceDenied is the refusal signal). Check
+            /readyz, the yuzu_pg_* pool and connect alerts, and the server
+            ERROR log lines "ScimRoutes: bearer validation", "ScimRoutes: user
+            lookup", "ScimRoutes: group lookup", "ScimRoutes: provenance check",
+            "ScimRoutes: deprovision role check" and "ScimRoutes: revive role
+            check"; then confirm in the IdP's provisioning log that the retries
+            succeed. The counter is in memory, so it moves while the database
+            is down, but this rule only fires once Prometheus manages to scrape
+            /metrics. Do not rely on it to page DURING a full database outage:
+            a remote scrape of the authenticated /metrics resolves its session
+            or API token against Postgres (it can fail, except for a localhost
+            scrape, --metrics-no-auth, or a still-cached token) and the
+            handler itself reads Postgres. YuzuServerPostgresUnreachable and
+            YuzuPgConnectFailing need a working scrape too, so they are not an
+            honest backstop for a TOTAL outage either; the backstops for that
+            case are the /readyz readiness probe and an operator-defined
+            `up == 0` (scrape target down) alert on the server job (none
+            ships in this file). This rule then fires after recovery from the
+            increase over the gap, or at once when the fault is partial. If
+            the audit store is down as well, the audit row of a mutating
+            request's 503 (scim.user.provisioned, scim.user.updated,
+            scim.user.deleted, scim.group.created, scim.group.updated or
+            scim.group.deleted with result failure) may be missing and
+            YuzuScimAuditWriteFailures can fire for a request that changed
+            nothing.
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-guard-store-unavailable"
+
       # Audit-write-failures: a committed SCIM mutation (create/update/patch/
       # delete/deprovision) lost its audit evidence write. This is an evidence
       # INTEGRITY gap on an already-committed change, not a rejected request —
@@ -2074,7 +2596,17 @@ groups:
             advance) — a truly isolated first failure of a given `action`
             may lag up to one evaluation cycle before this rule fires;
             treat a single fresh occurrence with that in mind, and rely on
-            recurrence/sustained failures for confident detection.
+            recurrence/sustained failures for confident detection. This
+            rule may also fire for a request that changed nothing: a SCIM
+            request whose User or Group lookup could not read the store
+            answers 503 and is audited, best effort, under its own verb
+            (scim.user.provisioned, scim.user.updated, scim.user.deleted,
+            scim.group.created, scim.group.updated or scim.group.deleted)
+            with result failure and a detail beginning "store_unavailable:";
+            when the audit store is down too, that failure row is lost and
+            this counter moves for a 503 that mutated nothing. Read
+            yuzu_scim_guard_store_unavailable_total alongside it before
+            treating the gap as lost evidence of a committed change.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-audit-write-failures"
 
   - name: yuzu-mcp
@@ -2677,7 +3209,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "POST /api/command's audit sink or a post-dispatch helper is throwing, not degrading cleanly"
+          summary: "A dispatch surface's audit sink, post-dispatch helper or dispatch call itself threw, not degrading cleanly"
           description: >-
             yuzu_server_dispatch_fanout_throw_total is non-zero on
             {{ $labels.route }} (phase={{ $labels.phase }}).
@@ -2691,17 +3223,248 @@ groups:
             specific post-dispatch helper in command_routes.cpp's guarded()
             wrapper that threw instead — e.g. phase=forward_gateway_pending
             means the gateway-forward step itself threw, not the audit sink;
-            check the named helper, not AuditStore, for that case. Either way
-            a well-behaved sink/helper should report failure via its own
-            return value, not an exception; a non-zero rate here points at a
-            bug in that specific sink/helper (e.g. an allocation failure
-            surfacing as bad_alloc, or a logic error) rather than at ordinary
-            store degradation. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
+            check the named helper, not AuditStore, for that case. phase=dispatch
+            counts the dispatch call ITSELF throwing, on route=command_v1
+            (POST /api/v1/commands), route=instruction_execute
+            (POST /api/v1/instructions/{id}/execute), route=mcp
+            (execute_instruction_definition) and route=workflow
+            (POST /api/v1/workflows/{id}/execute and MCP execute_workflow). For
+            route=workflow, read the paragraph beginning "Runbook for route=workflow"
+            below INSTEAD of the runbook after it: a workflow run is not an
+            executions-ledger row. On the other routes the execution row was left
+            running, NOT cancelled, because some agents may already hold the command.
+            Runbook for route=workflow: a workflow run threw after its `requested`
+            audit row, so steps may already have been sent. Its id is a WORKFLOW
+            execution id, and cancel_execution does not apply to it. Find the closing
+            workflow.execute failure audit row (reason=dispatch_exception; it names
+            execution_id when the engine had admitted the run, and agents_sent, a lower
+            bound) and the server log line naming the exception. Read the run with
+            GET /api/v1/workflow-executions/{id} (MCP get_workflow_execution): a step
+            recorded pending or skipped may still have been sent, so check the audit
+            and response stores by plugin and time before re-running. A run still
+            `running` well past its 60 second budget is an orphan (see
+            YuzuWorkflowFinalizeFailed). A repeat of the call with the same
+            idempotency key replays the run's answer and sends nothing; do NOT start
+            another run with a new key until you have read this one. The count of such
+            runs is yuzu_server_workflow_run_outcome_total{outcome="failed",
+            reason="dispatch_exception"}.
+            Runbook for the other routes, phase=dispatch: find the dispatch_exception failure audit
+            row (it names the execution_id and, when known, agents_sent, a lower
+            bound) and the server log line naming the exception; check that
+            execution's per-agent results (the error body carries it as
+            error.execution_id, error.data.execution_id on MCP). Four cases for
+            the row: (1) agents_sent is above 0 and its targeted count was stored,
+            so the answers of those agents complete it; (2) agents_sent is above 0
+            but the targeted count could NOT be stored
+            (yuzu_exec_tracker_bookkeeping_failed_total{op="set_agents_targeted"}),
+            and an agent HAS answered: the row stays running and will not close by
+            itself (the stuck sweep never closes a row an agent has answered), so
+            close it with cancel_execution (POST /api/v1/executions/{id}/cancel);
+            (3) no send was accepted, or none is known, and no agent has answered:
+            the row closes by itself, or close it with cancel_execution; (4)
+            agents_sent is above 0, its targeted count was NOT stored, and no agent
+            has answered YET: the stuck sweep can mark that row cancelled after
+            about 30 minutes although agents may still be running the command (a
+            swept row means no agent answered, not that none received it), so
+            check the devices before trusting a cancelled status. In every case
+            do NOT blindly re-run the command, because an agent may already be
+            running it. For the audit-sink and post-dispatch-helper phases
+            (success, denial, a named helper) a well-behaved sink/helper should
+            report failure via its own return value, not an exception, so a
+            non-zero rate there points at a bug in that specific sink/helper
+            (e.g. an allocation failure surfacing as bad_alloc, or a logic error)
+            rather than at ordinary store degradation; for phase=dispatch the
+            exception came from the dispatch call itself, so look at the
+            exception the server log names (a bad_alloc, a store or send-path
+            fault), not at a sink. BE PRECISE ABOUT for: 2m (governance round 1, SRE-2):
             it delays the page by two minutes, it does NOT require a
             sustained episode. increase()[15m] stays true for ~15 minutes
             after a single increment, so one throw still pages, two minutes
             later. The delay exists so a self-resolving blip clears before
             anyone is woken, not so a single throw is ignored.
+
+      # Workflow-run saturation and integrity (#2146). Series each rule reads, and where the code
+      # emits them: yuzu_http_held_open_responses / yuzu_http_held_open_capacity (gauges set in
+      # server.cpp; the budget every streaming surface and every synchronous workflow run leases
+      # from), yuzu_server_workflow_finalize_failed_total (workflow_engine.cpp, pre-seeded),
+      # yuzu_server_workflow_run_refused_total{reason} and
+      # yuzu_server_workflow_run_idempotent_total{outcome} (workflow_execute.hpp's closed sets,
+      # pre-seeded by seed_workflow_run_metrics). tests/test_workflow_run_metrics_wiring_lexical.py
+      # checks every metric name and label value below against that source.
+      #
+      # Deliberately NOT alerted: a per_principal_stream_cap refusal (one caller already holds its
+      # 2 runs: a client pacing itself, not a server fault) and a draining refusal (a shutdown is
+      # not an incident). yuzu_server_workflow_run_outcome_total is a dashboard series, not an
+      # alert: an aborted or failed run is the control working as often as a defect.
+      - alert: YuzuHeldOpenUtilisationHigh
+        expr: |
+          yuzu_http_held_open_responses / yuzu_http_held_open_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Held-open responses are above 80% of the capacity the HTTP worker pool is sized for"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
+          description: >-
+            yuzu_http_held_open_responses is above 80% of yuzu_http_held_open_capacity
+            on {{ $labels.instance }} for 5 minutes. Every streaming surface and every
+            synchronous workflow run leases from this ONE budget (MCP GET and streamed
+            POST, /api/v1/events, the dashboard executions drawer, the legacy /events
+            stream, and POST /api/v1/workflows/{id}/execute, MCP execute_workflow and the
+            legacy POST /api/workflows/{id}/execute), and each lease pins one HTTP worker
+            thread. At 100% the next stream or workflow run is refused with a 429
+            (yuzu_server_workflow_run_refused_total{reason="global_stream_cap"} for a
+            workflow run). Read yuzu_server_workflow_runs_in_flight for the workflow
+            share (a run holds its slot for up to 60 seconds, at most 2 per caller), and
+            yuzu_mcp_streams_active / yuzu_mcp_post_streams_active for the MCP share.
+            Both gauges are sampled on the server's maintenance tick (about every 15
+            seconds), so a burst shorter than that can be missed; the 5 minute window is
+            a level, not a count. The remedy is a higher --max-sse-streams (the worker
+            pool follows it; see docs/adr/0034) or fewer concurrent clients, not a
+            restart.
+
+      - alert: YuzuWorkflowFinalizeFailed
+        expr: |
+          sum by (instance) (increase(yuzu_server_workflow_finalize_failed_total[1h])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A workflow run's final status write failed twice and left its execution row running"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#a-workflow-run-left-running"
+          description: >-
+            yuzu_server_workflow_finalize_failed_total moved on {{ $labels.instance }}:
+            a workflow run finished its steps but the final status write failed twice (a
+            lease timeout or a failed statement, then one retry), so its execution row
+            stays running and nothing closes it. The server log names the execution id at
+            error. Read the run with GET /api/v1/workflow-executions/{id} (MCP
+            get_workflow_execution): a step recorded pending or skipped may still have
+            been sent, so check the audit and response stores by plugin and time before
+            re-running. A call with an idempotency key already bound to that run answers
+            indeterminate once the row is older than 180 seconds (see
+            YuzuWorkflowIndeterminateReplays). A healthy server never increments this, so
+            the rule is increase()[1h] > 0 with for: 2m: one orphan pages two minutes
+            after it happens and stays visible for an hour. A server killed mid-run
+            (SIGKILL, power loss) leaves the same orphan WITHOUT moving this counter; the
+            signal for those is a replay of the run's key answering indeterminate.
+
+      - alert: YuzuWorkflowRunGlobalCapRefused
+        expr: |
+          sum by (instance) (rate(yuzu_server_workflow_run_refused_total{reason="global_stream_cap"}[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workflow runs are being refused because the server's held-open budget is full"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#server-cli-flags"
+          description: >-
+            Workflow runs on {{ $labels.instance }} have been refused with reason
+            global_stream_cap, a refusal rate above zero over the last 5 minutes, for 10
+            minutes running: the shared held-open budget is full, so a caller got a 429
+            (MCP -32012) with Retry-After 5, no workflow or instruction was read, and nothing was sent or audited. A
+            single refusal does not fire it (the 5 minute rate window cannot stay true for
+            10 minutes on one event); a sustained one means the saturation
+            YuzuHeldOpenUtilisationHigh warns about has arrived. Check
+            yuzu_http_held_open_responses against yuzu_http_held_open_capacity, then
+            yuzu_server_workflow_runs_in_flight for the workflow share. The reasons
+            per_principal_stream_cap and draining are deliberately excluded: one caller
+            holding its 2 runs is a client pacing itself, and a draining server is
+            shutting down. Callers retry after 5 seconds; a call that was refused sent
+            nothing, so repeating it is safe.
+
+      - alert: YuzuWorkflowIndeterminateReplays
+        expr: |
+          sum by (instance) (increase(yuzu_server_workflow_run_idempotent_total{outcome="indeterminate"}[15m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A workflow-run idempotency key was repeated and the run it is bound to cannot be proven"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#a-workflow-run-left-running"
+          description: >-
+            yuzu_server_workflow_run_idempotent_total{outcome="indeterminate"} moved on
+            {{ $labels.instance }}: a client repeated an idempotency key and the run it is
+            bound to answered indeterminate, which means the stored rows cannot prove how
+            it ended (a step row still pending or running under a completed run, an
+            unknown status, or no rows) or the run has been running for more than 180
+            seconds, past its 60 second budget. Either way the caller cannot know whether
+            the steps were sent, and the answer tells it not to retry. The usual causes
+            are a server that died mid-run (SIGKILL, power loss: nothing counts that one
+            except this series) or a final status write that failed twice
+            (YuzuWorkflowFinalizeFailed). Find the execution id in the workflow.execute
+            audit rows (idempotent_replay=true run_status=indeterminate carries it), read
+            the run with GET /api/v1/workflow-executions/{id}, and check the audit and
+            response stores by plugin and time before re-running with a new key. The
+            counter moves once per repeat, so a looping client raises it quickly: the
+            rule is increase()[15m] > 0 with for: 2m, not a rate.
+
+      # Workflow run table growth (#2146, ADR-1005 residual 13). Run rows are never pruned, and a
+      # run row is bounded but not small: agent_ids_json stores at most 1,000 distinct ids and at
+      # most 131,072 bytes of JSON text (1,000 ids of 128 bytes, quoted and comma-separated, is
+      # 131,001 bytes), on every route, before TOAST compression. 100,000 rows is therefore up to
+      # about 13 GB if every row were at that worst case and about 130 MB at a typical 10-device
+      # run (about 1.3 KB). The series is yuzu_server_workflow_executions_rows
+      # (WorkflowEngine::refresh_table_size_metrics, planner estimate, sampled about every 15 s);
+      # every replica reads the same table, so the rule collapses the replicas with max by (job).
+      - alert: YuzuWorkflowExecutionsTableLarge
+        expr: |
+          max by (job) (yuzu_server_workflow_executions_rows) > 100000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The workflow run table has passed 100,000 rows and nothing prunes it"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#workflow-run-records-are-not-pruned-2146"
+          description: >-
+            workflow_engine.workflow_executions holds an estimated {{ $value | humanize }}
+            rows (yuzu_server_workflow_executions_rows, job {{ $labels.job }}) and has been
+            above 100,000 for 30 minutes. Run rows are never deleted, so the table only
+            grows, on the same Postgres that holds the audit, auth and session tables. A
+            row stores at most 1,000 distinct device ids and 131,072 bytes of them
+            (before compression), so 100,000 rows is about 130 MB if a typical run names 10
+            devices and up to about 13 GB if every run filled that column. Read
+            yuzu_server_workflow_executions_bytes for the real size (heap, TOAST and
+            indexes), then find the caller: a looping client shows up as many rows in
+            GET /api/v1/workflow-executions and as workflow.execute audit rows from one
+            principal. Stop the loop, and size or grow the Postgres volume; there is no
+            supported delete route, so reclaiming space is a DBA decision (see the
+            runbook). The count is a planner estimate (the larger of reltuples and
+            n_live_tup), and the step results table is not included. The
+            threshold is a sizing claim, not tuned against fleet data.
+
+      # Approval-gated execute and ticket-mint refusals (#2146). The counter is pre-seeded to 0 at
+      # boot for every reason, so increase() > 0 is meaningful. Only the two reasons that are
+      # CAPACITY signals are alerted: approval_queue_full (the global 1000-row pending queue is
+      # full, so nobody can submit until a reviewer decides) and approval_cap_reached (one
+      # principal holds about 25 pending approvals). approval_unavailable and
+      # approval_submit_failed are storage or wiring faults the Postgres and store-degrade rules
+      # already cover. DELIBERATELY the simplest shape: ANY refusal in 15 minutes, a warning, with
+      # no rate threshold. How many refusals a healthy fleet sees is not known, so a rate
+      # threshold would be an invented number; this rule is a claim only that a refusal means a
+      # human or a looping client needs to look. Each replica counts its own, so the rule is
+      # per series (instance, reason). No gauge of the pending count or the oldest pending
+      # age exists yet; that is a follow-up.
+      - alert: YuzuApprovalSubmitRefused
+        expr: |
+          increase(yuzu_server_approval_submit_refused_total{reason=~"approval_queue_full|approval_cap_reached"}[15m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Approval submissions are being refused ({{ $labels.reason }})"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#approval-submissions-refused-queue-full-or-per-principal-cap-2146"
+          description: >-
+            yuzu_server_approval_submit_refused_total{reason="{{ $labels.reason }}"} moved on
+            {{ $labels.instance }} in the last 15 minutes: an approval-gated execute call or an
+            MCP supervised-tier ticket mint was refused and no approval row was created.
+            approval_queue_full means the shared 1000-row pending queue is full, so NOBODY can
+            submit until a reviewer decides pending approvals or the 7-day expiry clears them
+            (a retry loop cannot help). approval_cap_reached means one principal, typically a
+            looping agentic worker or script, holds its whole share of about 25 pending
+            approvals. The per-event evidence is the denied audit row whose detail carries
+            reason=approval_cap_reached (instruction.execute, mcp.execute_instruction_definition
+            or mcp.<tool>). This alert fires on any refusal in 15 minutes, not on a rate: the
+            threshold is not tuned against fleet data.
 
   - name: yuzu-tls
     rules:
@@ -2860,10 +3623,12 @@ groups:
             and file permissions are correct (chmod 600 on Unix).
 
   # ── yuzu-pki — internal CA (ca_store, ADR-0053) ─────────────────────────────
-  # All three counters below are bare/pre-seeded to 0 at boot (server.cpp), so
-  # increase(x[window]) > 0 catches even the FIRST occurrence — see the
-  # yuzu-scim group's header comment for why absent() would be the wrong shape
-  # here.
+  # The three counter rules below read counters that are bare/pre-seeded to 0 at
+  # boot (server.cpp), so increase(x[window]) > 0 catches even the FIRST
+  # occurrence — see the yuzu-scim group's header comment for why absent() would
+  # be the wrong shape here. The two CRL-expiry rules read GAUGES that are
+  # deliberately NOT pre-seeded (0 would read as a CRL that expired in 1970):
+  # the series is absent while no CRL exists, and then neither rule fires.
   - name: yuzu-pki
     rules:
       - alert: YuzuCaCrlPublishFailing
@@ -2893,6 +3658,128 @@ groups:
             ca_store.ca_crl_versions, and CA key loadability on the leader. See
             docs/pki-architecture.md "CRL distribution".
           runbook_url: "https://docs.yuzu.io/runbooks/ca-crl-publish-failing"
+
+      # CRL expiry headroom (#6527). The gauge is an absolute nextUpdate, so the
+      # remaining time is `- time()`. A healthy server republishes when less than
+      # 24 hours remain (kCrlRepublishThreshold, 15 s tick), so headroom under
+      # 12 hours means the freshness pass has not succeeded for half a day: the
+      # leader is wedged or absent, or publishing keeps failing (see
+      # YuzuCaCrlPublishFailing). Every replica exports the same shared row, so
+      # both rules take `max by (job)`: one page per deployment (one job per
+      # deployment is assumed, as for the yuzu-ha-leader group), and a replica
+      # whose reads keep failing holds an older value that the freshest replica
+      # masks. The two bands are disjoint (docs/observability-conventions.md).
+      # The series is ABSENT while no CRL exists, the CA store is closed (an
+      # install with its own certificates has no internal CA), or the scrape
+      # fails; these rules need a successful scrape, so they share the
+      # `up == 0` caveat of the yuzu-ha-leader group. Nothing here alerts on a
+      # never-published CRL (that state is only visible as a 503 on
+      # GET /api/v1/ca/crl, YuzuLeaderNoLeader, or YuzuCaCrlPublishFailing).
+      - alert: YuzuCaCrlNearExpiry
+        expr: |
+          (max by (job) (yuzu_server_ca_crl_next_update_timestamp_seconds) - time()) < 43200
+          and
+          (max by (job) (yuzu_server_ca_crl_next_update_timestamp_seconds) - time()) >= 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The internal-CA CRL expires in under 12 hours"
+          description: >-
+            yuzu_server_ca_crl_next_update_timestamp_seconds minus the current
+            time is under 12 hours. The leader's freshness pass republishes the
+            CRL when less than 24 hours remain, so it has not succeeded for
+            about half a day. Check, in this order: whether a replica leads
+            (yuzu_server_leader_is_leader; YuzuLeaderNoLeader and its runbook in
+            docs/user-manual/server-admin.md), why publishes fail
+            (yuzu_server_ca_crl_publish_failure_reason_total{reason} and
+            YuzuCaCrlPublishFailing), and whether the leader's clock is correct
+            (a clock far from real time makes the freshness pass act on the wrong
+            time). Restart only the single wedged or leaderless replica, never
+            all of them, and not while Postgres is unreachable (the server fails
+            closed at boot without it); see "CRL near expiry or expired" in
+            docs/pki-architecture.md. Once the CRL passes its nextUpdate,
+            relying parties that check freshness (a reverse proxy reading
+            GET /api/v1/ca/crl) refuse certificates from this CA. This rule
+            needs a successful scrape: a server that is down or an unreachable
+            /metrics silences it, so keep your own `up == 0` alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-near-expiry-or-expired"
+
+      - alert: YuzuCaCrlExpired
+        expr: |
+          (max by (job) (yuzu_server_ca_crl_next_update_timestamp_seconds) - time()) < 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "The internal-CA CRL is past its nextUpdate"
+          description: >-
+            The newest published CRL is past its nextUpdate and no newer one
+            has been published, so relying parties that enforce CRL freshness
+            are already refusing certificates from this CA. Restore publishing
+            now: the causes and the safe actions (never restart every replica,
+            never while Postgres is unreachable) are the ones in
+            YuzuCaCrlNearExpiry and in "CRL near expiry or expired" in
+            docs/pki-architecture.md. The server's own mTLS revocation check
+            (is_revoked) reads the database, not the CRL, and is unaffected.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-near-expiry-or-expired"
+
+      # A CRL dated in the future (#7097). The `published` gauge is the publishing
+      # replica's clock at build time (published_at), and the CRL's thisUpdate is
+      # 300 s earlier (the publisher backdates it), so a healthy newest CRL has
+      # `published - time()` at or below zero. If that replica's clock was ahead
+      # of real time when it published, the CRL is future-dated: relying parties
+      # refuse it as not yet valid (the gateway tolerates a thisUpdate 3600 s
+      # ahead, yuzu_gw_mgmt_crl:max_future_s/0, which is `published - time()` of
+      # 3900 s; a strict verifier such as OpenSSL refuses any future thisUpdate),
+      # while the two expiry rules above see more than 48 hours of headroom and
+      # stay silent. The timing, stated exactly: `published - time()` falls by one
+      # second per second, and `for: 2m` needs it above 3600 s throughout, so the
+      # rule fires for every CRL published more than 3720 s (62 minutes) ahead,
+      # 2 minutes after the first scrape. A gateway refuses once the gap passes
+      # 3900 s, so every CRL a gateway refuses alerts within about 2 minutes
+      # (3720 s is below 3900 s); a CRL published 3600 to 3720 s ahead is accepted
+      # by gateways and never alerts. `for:` is short on purpose: the input is a
+      # stored row, so there is no transient to filter, and a long `for:` only
+      # delays the real case (docs/observability-conventions.md). A
+      # republish at the correct time supersedes the row, but the freshness pass
+      # does not do that by itself until under 24 hours of the future-dated
+      # nextUpdate remain (see "CRL dated in the future" in
+      # docs/pki-architecture.md for the restart that does). `max by (job)`
+      # follows the newest row, which every replica exports, so a replica holding
+      # an older value cannot hide it and one deployment gives one page. The
+      # reverse holds too, and is the price of `max`: after the fix, a replica whose
+      # reads keep failing keeps the OLD future-dated value, `max` selects it, and
+      # the alert stays firing until that replica's reads recover or it restarts.
+      # Same `up == 0` caveat as the two rules above. Nothing else detects this
+      # today: #6916 (still open) covers only the opposite direction, a clock
+      # stepped back.
+      - alert: YuzuCaCrlFutureDated
+        expr: |
+          (max by (job) (yuzu_server_ca_crl_published_timestamp_seconds) - time()) > 3600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The newest internal-CA CRL was published more than an hour ahead of now"
+          description: >-
+            yuzu_server_ca_crl_published_timestamp_seconds (the publishing
+            replica's clock when it built the newest CRL; the CRL's thisUpdate
+            is 300 seconds earlier) is more than an hour ahead of the current
+            time. A CRL is dated by the clock of the replica that published it,
+            so that clock was ahead of real time at publish. Relying parties
+            refuse a CRL that is not yet valid (the gateway tolerates a
+            thisUpdate up to one hour ahead and refuses beyond that, so this
+            fires within about two minutes of every CRL a gateway refuses;
+            OpenSSL-style verifiers refuse any future thisUpdate),
+            and YuzuCaCrlNearExpiry and YuzuCaCrlExpired stay silent because
+            nextUpdate is also in the future. Nothing records which replica
+            published, so check the clock (NTP state) of every replica and
+            correct the one that is wrong, then restart one replica with a
+            correct clock (never all of them, and not while Postgres is
+            unreachable) so its boot publish replaces the CRL; see "CRL dated
+            in the future" in docs/pki-architecture.md. This rule needs a successful
+            scrape, so keep your own `up == 0` alert.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-dated-in-the-future"
 
       - alert: YuzuCaRevocationSweepReadFailing
         expr: |
@@ -2942,8 +3829,15 @@ groups:
             unreachable. A gateway in mgmt_peer_auth_mode pin or
             identity_or_pin still admits this server by its pin (when it has
             one), so nothing is failing; a gateway in identity mode refuses
-            it (no_uri_san). Do not move a gateway to identity mode until this
-            reads 1 on every server replica. The gauge is set once, at server
+            it (no_uri_san). Do not move a gateway to identity mode until the
+            server is upgraded and this reads 1 on every server replica. A
+            gateway already in identity mode that refuses with no_uri_san
+            needs the server to re-issue (fix the cause above, then restart
+            the server), or your server certificate's pin added with
+            mgmt_peer_auth_mode set to identity_or_pin until it does (read at
+            boot: applying it restarts the gateway, only if its agents can take
+            the disconnect, because agents without the #5183 fix stay wedged
+            after it). The gauge is set once, at server
             boot, so it stays 0 until the server is restarted after the cause
             is fixed. It describes the file default-server.pem: a server given
             its own --cert/--key presents that certificate to the gateway,
@@ -2990,7 +3884,7 @@ groups:
       # drop rather than being summed together.
       - alert: YuzuResponseIngestDrops
         expr: |
-          sum(rate(yuzu_server_response_ingest_dropped_total{reason!="malformed_identity_field"}[5m])) by (reason) > 0
+          sum(rate(yuzu_server_response_ingest_dropped_total{reason!~"malformed_identity_field|per_agent_cap|unverified_registry_overflow"}[5m])) by (reason) > 0
         for: 10m
         labels:
           severity: warning
@@ -2999,9 +3893,12 @@ groups:
           description: >-
             The response store fail-soft-dropped command results for 10m
             (reason label = store_not_open / pool_acquire_timeout / query_error
-            — malformed_identity_field excluded, that's an agent sending a
-            malformed identity field, not store unhealth; see
-            YuzuResponseMalformedIdentityDrops for that case).
+            — malformed_identity_field and per_agent_cap excluded, those are
+            agent behaviour, not store unhealth; see
+            YuzuResponseMalformedIdentityDrops and
+            YuzuResponsePerAgentCapDrops for those cases;
+            unverified_registry_overflow is reported by
+            YuzuUnverifiedFrameRecordOverflow).
             The executions ladder still tracks the commands, but drawer/Echo
             result history is lossy — check PostgreSQL pool saturation / health.
 
@@ -3027,6 +3924,82 @@ groups:
             is the guard working correctly, not store unhealth; investigate
             the reporting agent if this recurs (a well-behaved agent never
             triggers it).
+
+      # Companion, informational (#561): per_agent_cap is the per-(command,
+      # agent) row cap working as intended -- a flooding or legitimately very
+      # chatty agent, not store unhealth -- so it is excluded from
+      # YuzuResponseIngestDrops above for the same reason as the malformed
+      # identity case.
+      - alert: YuzuResponsePerAgentCapDrops
+        expr: |
+          increase(yuzu_server_response_ingest_dropped_total{reason="per_agent_cap"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "An agent exceeded the per-command response row cap"
+          description: >-
+            ResponseStore refused at least one response frame because an
+            agent already had the maximum rows stored for that command
+            (--response-max-rows-per-agent, default 256). This is the cap
+            working, not store unhealth. Investigate the reporting agent;
+            raise the flag only if a command legitimately streams more than
+            about cap * 64 KiB (about 16 MiB at the default) of output per
+            device. A redelivered terminal frame on a command and device
+            already at the cap also counts here. Attribute with a server log
+            grep for "per-agent row cap (" (one line carries the cap, the instruction and the agent).
+
+      # Companion: the in-memory record of answers that may be missing
+      # (unverified_frame_registry.hpp) evicted an entry, or refused an
+      # over-long agent id. It fails closed, so
+      # no answer is lost from a result set's completeness, but the affected
+      # sets read partial. Excluded from YuzuResponseIngestDrops above: no
+      # store remediation applies. No long `for`: one increase already means
+      # sets were reported partial.
+      - alert: YuzuUnverifiedFrameRecordOverflow
+        expr: |
+          sum(increase(yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}[1h])) by (reason) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The record of answers that may be missing overflowed"
+          description: >-
+            The server could not keep every record of an answer that may be
+            missing from the response store, so it reported more answers as
+            not fully stored. The record holds two kinds of answer: a
+            streaming frame whose provenance lookup failed (evidence:
+            yuzu_server_response_provenance_total{outcome="lookup_degraded"}),
+            and an answer the store did not keep (for example per_agent_cap,
+            malformed_identity_field, a failed terminal finalize) whose
+            tracker write failed (closed, or failed twice). Evidence for the
+            second: yuzu_server_response_ingest_dropped_total by reason and,
+            for a write that failed twice only, the server log line "upsert
+            failed twice" (a closed tracker, or a response store that is not
+            open, logs nothing and leaves only the store_not_open count); a
+            failed terminal
+            finalize is counted in no ingest_dropped reason, and its evidence
+            is the finalize_terminal_status log line. Check PostgreSQL
+            health and yuzu_exec_correlation_read_degrade_total{reason}
+            first. One agent sending many streaming
+            frames while the read is degraded only amplifies it. Effect: an
+            agent past its own share is marked, and that agent's answers read
+            as not fully stored for an hour after the last eviction, so
+            result sets it contributes to read partial. When the record as a
+            whole is full, the evicted entry's command is
+            remembered and every agent's answer to it reads as not fully
+            stored. When the marker set or the command set is full, the
+            oldest member is dropped and a global latch is set; an agent id
+            longer than 256 bytes (Register and ProxyRegister refuse one) also
+            sets it. For an hour after the last eviction (or after the
+            over-long agent id) that set the latch, every
+            terminal answer ingested reads as not fully stored, so result sets
+            filled from those answers read partial (sets already filled are
+            not changed), and NOT, LEN and STARTSWITH scopes over those sets
+            are refused with no retry hint. Re-run the affected
+            commands once the cause is resolved. The server log names the
+            agent when its marker is first set (at most once per 10 minutes
+            per agent) and when the latch first sets ("unverified-frame
+            record"); otherwise this counter is the evidence.
 
       - alert: YuzuResponseReadDegrade
         expr: |
@@ -3594,6 +4567,9 @@ groups:
   # These alerts carry `for:` windows and are for paging/escalation — they fire
   # AFTER the LB has already reacted, not before. The pool metrics come from
   # the pool's Observer feed; the reachability metrics from the probe.
+  # The three YuzuPgCollation* alerts are the exception: they are not load-balancer or
+  # readiness related (the collation check never changes /readyz), they read the
+  # collation-check series.
   - name: yuzu-postgres
     rules:
       - alert: YuzuServerPostgresUnreachable
@@ -3661,6 +4637,208 @@ groups:
         annotations:
           summary: "Yuzu PostgreSQL pool acquire p99 > 200ms"
 
+      - alert: YuzuPgCollationVersionMismatch
+        # Checked at server start and then repeated (pg_collation_recheck.hpp): hourly once a
+        # readable Ok or NotApplicable stands, every minute while a Mismatch stands, no check
+        # has concluded yet, or the latest check could not run. 1 when the
+        # database's recorded collation version differs from the one the operating system of
+        # the PostgreSQL server reports, 0 when they match. A check that could not run leaves
+        # the gauge as it was, so a standing 1 keeps firing and the rule cannot clear on
+        # "unknown". The series is ABSENT when no check has learned anything (a libc C/POSIX
+        # collation, a server before PostgreSQL 15, or checks that cannot run): an absent
+        # series means the check could not run or does not apply, NOT that the database is
+        # healthy, and this rule is silent on it: the alert YuzuPgCollationCheckBlind covers
+        # this, and the server log's "[PG] could not check" WARN line names the cause. A
+        # missing scrape is likewise silent here, so keep your own `up == 0` alert on the
+        # server job. The check repeats every minute while it is 1, so after the database is
+        # fixed the next check sets the gauge to 0 and this clears without a restart.
+        # The mismatch is ONE shared pg_database fact, so the alert collapses replicas with
+        # `max by (job)` (docs/observability-conventions.md: alerts over a row shared by every
+        # replica take `max by (job)`): any replica's gauge at 1 fires one alert for the job, and
+        # it carries no instance label. The gauge itself stays per replica (each replica checks
+        # on its own schedule, up to an hour apart at drift onset), so which replicas have
+        # already seen the mismatch is answered by querying the gauge per instance. By contrast
+        # YuzuPgCollationCheckBlind and YuzuPgCollationCheckStale below are genuinely
+        # per-replica conditions and stay per instance.
+        # After a restart during an unreadable spell the gauge is absent until the first
+        # recheck, so on a single-replica job a standing alert can resolve and fire again a
+        # minute or two later (reasoned, not measured).
+        expr: |
+          max by (job) (yuzu_pg_collation_version_mismatch) == 1
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server job {{ $labels.job }}: the PostgreSQL collation version differs from the operating system's"
+          description: >-
+            The database's recorded collation version is not the version the operating
+            system of the PostgreSQL server reports, so text-keyed indexes may be ordered
+            under the old rules. Ordered reads of a text key, such as a keyset page walk,
+            can then skip or repeat rows without any error. The server does not stop or change
+            anything because of this signal: it keeps serving, and the gauge and the log line
+            are the whole report.
+            The mismatch is one shared database fact, so this is one alert for the Yuzu server
+            job {{ $labels.job }}: any replica's gauge at 1 fires it, and it clears when every
+            replica's gauge is 0 or absent (within about a minute of the repair). The gauges are
+            per replica and replicas check on their own schedule, up to an hour apart at drift
+            onset, so which replicas have already seen the mismatch is answered by querying
+            yuzu_pg_collation_version_mismatch per instance.
+            The server log has one "[PG] database ... collation version" error line naming
+            the database and both versions. Remedy, in this order, as a change under your own
+            process with a verified backup first: connect to the affected
+            database; reindex it (REINDEX DATABASE CONCURRENTLY "<name>" on a server that
+            is serving traffic, or REINDEX DATABASE "<name>" with the Yuzu servers
+            stopped); only when the reindex has finished for every index, run ALTER DATABASE
+            "<name>" REFRESH COLLATION VERSION (it records the version and rebuilds nothing,
+            so it clears this alert whether or not the reindex worked; the check compares
+            version strings only, so the reindex is what makes the result certain). The server
+            rechecks every minute while the mismatch stands, so this clears within about a
+            minute and without a restart. If the reindex fails on a duplicate key, stop the
+            servers and resolve the duplicates by hand first (see the runbook). A database
+            created with the C collation has no collation version and is not affected. This
+            rule needs a successful scrape and a check that can run: a server that is down or
+            an unreachable /metrics silences it, and an absent series means the check could not
+            run or does not apply, not that the database is healthy, so keep your own
+            `up == 0` alert; the alert YuzuPgCollationCheckBlind covers a check that cannot
+            run. Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuPgCollationCheckBlind
+        # The companion of YuzuPgCollationVersionMismatch: that rule reads the gauge, and the
+        # gauge is only refreshed by a check that RUNS, so a check that cannot run leaves it
+        # stale (or absent) and the rule above silent. This rule fires on the checks that
+        # keep failing: at least five "unreadable" results in ten minutes, held for five.
+        # Why ten minutes and not the hours the hourly cadence would suggest: the first failed
+        # check puts the replica on the one-minute cadence (so do a standing Mismatch and no
+        # conclusive verdict), so a check that cannot run fails about once a minute (a check is
+        # a 60 s wait plus its own duration, 61 to 75 s), and a window of hours would stay true
+        # for hours after a short outage. Five failures in ten minutes assume a check cycle under
+        # about two minutes; at a slower cadence five failures do not fit in the window.
+        # MEASURED with promtool v3.13.1 (Prometheus 3 left-open range selectors) at exactly one
+        # failure a minute: five failures go pending and never fire (the window ages the first
+        # one out before the 5m hold ends), six fire for one evaluation. REASONED, not
+        # measured: on Prometheus 2.x (closed ranges) five failures would fire; with a
+        # continuous outage the alert fires about ten minutes after the first counted failure at
+        # any scrape interval up to about two minutes, on 2.x or 3.x; and it clears about SIX
+        # minutes after the last failed check (the window keeps at least five events until the
+        # fifth from last ages out; the rule has no keep_firing_for). Whether a burst of
+        # exactly five or six failures that then stops fires depends on the Prometheus version,
+        # the scrape interval and the check duration: do not rely on it; read it as about five to
+        # six failures. A failover blip of a few checks never reaches it. The first failure after a
+        # settled hour waits for the hourly tick, so the alert fires about ten minutes after that
+        # failure, not from the outage start. The shipped docker-compose.yml pins Prometheus
+        # v3.2.1.
+        # Why it keys on the "unreadable" counter and NOT on the absence of "ok" increases:
+        # the start-time check runs in the constructor, before the first scrape, so the "ok"
+        # series is first scraped already at 1 and shows no increase until the first recheck
+        # that concludes: an "ok"-based rule would see no successful check, and false-fire,
+        # after each restart. The counter is created at 0 for every result BEFORE the
+        # start-time check, and the start-time check IS counted, but a series first scraped
+        # already at 1 gives increase() no earlier sample, so this rule cannot see that one
+        # failure; a recheck failure after a healthy start is counted and seen. A check that
+        # cannot read from boot fires about ten to fifteen minutes after boot (reasoned) because
+        # the rechecks that follow run every minute.
+        # KNOWN LIMITS (reasoned): (1) a check stuck mid-query adds no increments, leaves the
+        # gauge as it was and logs nothing, so this rule and the mismatch rule stay silent;
+        # YuzuPgCollationCheckStale covers it after about two hours plus its hold. (2) a replica
+        # that restarts more often than once a minute while the check keeps failing never
+        # rechecks and its counter is born at 1 after each start, so increase() sees nothing
+        # and no counter-based alert from this feature fires: the alert YuzuServerRestartLoop is
+        # the one for a replica that restarts repeatedly, with its own limits (it needs more
+        # than 3 resets of yuzu_server_uptime_seconds in 3 hours and one continuous series per
+        # instance, and a loop faster than the metrics sweep can keep it silent; see its comment).
+        # The 10m window, the threshold of 5 and the 5m hold are claims reasoned from the
+        # cadence, not measured values. This is a genuinely per-replica condition (each replica
+        # exports its own counter and fails on its own), so it stays per instance; with N
+        # replicas one database problem raises N alerts: group the notifications by alertname
+        # and job.
+        expr: |
+          sum by (job, instance) (increase(yuzu_pg_collation_check_total{result="unreadable"}[10m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: the PostgreSQL collation check has been unable to run"
+          description: >-
+            The collation check has failed repeatedly: at least five times in ten minutes and
+            still failing after about five minutes (it runs every minute once it starts failing;
+            at that cadence this takes about five to six failures, which depends on the
+            Prometheus version and the scrape interval; do not rely on the exact count), so
+            yuzu_pg_collation_version_mismatch is stale and says nothing about the database: a
+            mismatch could be present and unreported.
+            Causes: PostgreSQL is down or unreachable, the pool is saturated (a lease cannot be had
+            in time), a catalog read is not allowed, or the database records a collation version
+            while the PostgreSQL host reports none (for example after a base image change under
+            an existing data volume). In that last case the check is permanently unreadable
+            and this alert does not clear: ALTER DATABASE ... REFRESH COLLATION VERSION fails
+            with "invalid collation version change" (measured on PostgreSQL 18.4 only, on a
+            C-locale database with a forced recorded value that has the same facts), so the
+            reindex-then-refresh way out does not apply; see the exits in the runbook. Meanwhile
+            silence this alert for that instance, with an expiry, rather than fleet-wide.
+            Look for the "[PG] could not check the database collation version" WARN line in
+            the server log. Check that PostgreSQL is reachable from this replica, and that
+            pg_database_collation_actual_version() returns a value for the database.
+            The WARN line is logged once, when the failures began, so search the log back
+            to its first occurrence; it names the cause. To check by hand, run: SELECT
+            datcollversion, pg_database_collation_actual_version(oid) FROM pg_database
+            WHERE datname = current_database();
+            With a continuous outage this fires about ten minutes after the first counted
+            failure and clears about six minutes after the last failed check (reasoned, not
+            measured). Each replica exports its own series, so one database problem raises one
+            alert per replica: group the notifications by alertname and job. A check that
+            cannot read from boot fires about ten to fifteen minutes after boot (the failure of
+            the start-time check itself is counted but cannot be seen by increase()).
+            Known limits: a check stuck mid-query is covered by YuzuPgCollationCheckStale, not
+            by this alert; a replica restarting more often than once a minute while the check
+            keeps failing is not seen by this alert (see YuzuServerRestartLoop and your own
+            `up == 0` rule). Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation
+            version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuPgCollationCheckStale
+        # The third collation alert: no check has COMPLETED (with any verdict, ok, mismatch,
+        # not_applicable or unreadable) for two hours. The server sets
+        # yuzu_pg_collation_check_last_completed_timestamp_seconds on every applied report, the
+        # start-time one included; it is absent only until the first report and never removed.
+        # The settled cadence is one hour, so the rule means: no check completed for two hours,
+        # counted from the last completed check (so about an hour after the hang began when the
+        # cadence is hourly), plus the 10m hold, which rides out scrape or recheck jitter. It
+        # covers what neither of the other two can: a stuck check adds no counter increments,
+        # leaves the mismatch gauge as it was and logs nothing.
+        # An absent series (a process that never finished its boot check, or a scrape gap) is
+        # silent here: keep your own `up == 0` rule. The value is a replica wall-clock time
+        # compared with Prometheus's time(), so a replica clock that is more than about an hour
+        # off moves the threshold, and the hourly wait uses a clock that does not advance while
+        # the host is suspended, so a suspend can also fire it (both reasoned): check the
+        # replica's uptime and clock before treating it as a hang. The 7200 s and the 10m hold
+        # are reasoned from the cadence, not measured; promtool covers the arithmetic only.
+        # A genuinely per-replica condition, so it stays per instance; with N replicas one
+        # database problem raises N alerts: group by alertname and job.
+        expr: |
+          time() - max by (job, instance) (yuzu_pg_collation_check_last_completed_timestamp_seconds) > 7200
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: no PostgreSQL collation check has completed for two hours"
+          description: >-
+            The latest completed collation check on {{ $labels.instance }} is more than two
+            hours old: no check completed for two hours, counted from the last completed check
+            (so about an hour after the hang began when the cadence is hourly). The recheck
+            thread is hung (for example a check stuck mid-query) or the process is wedged.
+            While this fires, yuzu_pg_collation_version_mismatch and
+            yuzu_pg_collation_check_total say nothing about the database. Look at the server
+            log and the thread state of the process; restart the replica if the log shows
+            nothing. It can also fire after a host suspend (the hourly wait uses a clock that
+            does not advance while suspended) or when the replica's clock is more than about an
+            hour off the Prometheus server's, so check the replica's uptime and clock before
+            treating it as a hang. An absent series (a process that never finished its boot
+            check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
+            Each replica exports its own series, so one database problem raises one alert per
+            replica: group the notifications by alertname and job. Runbook:
+            docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
   # HA WS-11 (#4014, ADR-2002 §3/§6/§10/§11): the fenced LeaderElector, as each
   # replica reports it on its own /metrics. READ BEFORE EDITING OR COPYING:
   #
@@ -3678,11 +4856,17 @@ groups:
   #  - `yuzu_server_leader_is_leader` is the replica's BELIEF (the attempt gate),
   #    not proof. Correctness for a leader-driven claim is the epoch fence in
   #    its WRITE (leader_elector.hpp), never this gauge. The fence is PER
-  #    DATABASE (see YuzuLeaderSplitBrain) and assumes no committed transaction
-  #    is lost on a promotion (synchronous replication, the shipped quorum
-  #    default): under asynchronous replication, or a degraded non-strict quorum,
-  #    a lagging promotion could re-mint an epoch, and "fenced claims remain
-  #    safe" below is NOT claimed for that case.
+  #    DATABASE (see YuzuLeaderSplitBrain). Since #6535 the epoch carries the
+  #    Postgres timeline (and the stored epoch is a floor), so a lossy promotion
+  #    of a streaming standby no longer lets a paused ex-leader's epoch equal the
+  #    new leader's; claim rows lost in an asynchronous promotion are the RPO, not
+  #    the fence. NOT claimed for: two primaries accepting writes at once, a
+  #    restore that loses leader_state, a lossy promotion while a restored row pins
+  #    a higher timeline, same-timeline loss, a physical snapshot restored without
+  #    archive recovery, promotion tooling that skips the previous timeline's
+  #    history or a PITR that reuses a timeline, or a rolling upgrade/downgrade
+  #    across #6535 (the canonical list is ADR-2002 section 3; ha-postgres.md
+  #    mirrors it).
   #  - Single replica (the supported default): SplitBrain cannot fire (one
   #    series), NoLeader fires only if the elector never leads (loops paused),
   #    Flapping usually does NOT see a single replica's restart loop (see that
@@ -3749,8 +4933,10 @@ groups:
             replicas share one database is the stale one the replica whose
             yuzu_server_leader_epoch differs from
             leader_elector.leader_state.current_leader_epoch; restart it. Within
-            one database (with synchronous replication) fenced claims remain
-            safe and the unfenced background passes may be running twice.
+            one database the epoch fence holds across a standby promotion (what it
+            does not cover is listed in docs/user-manual/ha-postgres.md); a paused
+            ex-leader is NOT caught by this alert, and the unfenced background
+            passes may be running twice.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#leader-election-metrics-and-alerts-ha-ws-11"
 
       - alert: YuzuLeaderNoLeader
@@ -3965,14 +5151,26 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Two sources on the SAME counter, both keyed by reason
+      # Four sources on the SAME counter (guardian_census, #5690, covers the
+      # two census gauge reads, the pending-evidence count and the
+      # unordered-agents count: they serve no empty result, each gauge
+      # keeps its last value; guardian_census_device, #7217, covers the
+      # per-device unrepresented-pending read and the per-device order read:
+      # their degrade is a REST 503 / MCP error, never an empty result, and
+      # does not touch either gauge), each
+      # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
-      # on guardian_state for the Apps list's in-flight budget): "guardian_state"
+      # on guardian_state for the Apps list's in-flight budget, and
+      # statement_timeout on guardian_census_device for a read that ran past its
+      # 5 s budget, most likely because of a large retained pending backlog, and
+      # on guardian_state for an Apps read cancelled at the 30 s statement
+      # timeout): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
       # is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-      # agent_rule_statuses*/rule_names*/errored_rule_count) - these fail HARD
+      # agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count and the
+      # request-path unordered_agents read) - these fail HARD
       # (a typed error the caller must act on), but a sustained rate here still
       # means the Guardian push/reconcile/status surface is failing, not
       # merely serving stale data. `by (reason, source)` keeps both dimensions
@@ -3995,9 +5193,35 @@ groups:
             - callers keep serving an empty/partial result, so this counter and the sampled
             warn log are the only external tell; do not read a "healthy"
             device compliance score as authoritative while this fires (#4855).
+            reason="statement_timeout" on source="guardian_state" means an Apps
+            read was cancelled at the 30 s statement timeout: choose a shorter
+            window or reduce load on the database.
+            source="guardian_census" means a census gauge read failed: the
+            pending-evidence count (#5690), which freezes the
+            yuzu_server_guardian_census_pending_events gauge at its last value (or
+            leaves it absent before the first successful read), or the
+            unordered-agents count, which does the same to
+            yuzu_server_guardian_census_unordered_agents.
+            source="guardian_census_device" means a per-device census read
+            failed (#7217): the unrepresented-pending read behind
+            device-compliance and the per-device guards read, or the per-device
+            order read behind the per-device guards read: the degrade is a 503
+            on REST or an MCP error, never an empty result, and neither gauge is
+            affected.
+            reason="statement_timeout" on that source is not transient: the
+            read ran past its 5 s budget, most likely because the retained
+            pending backlog is large (a lock wait, a loaded database or an
+            administrator cancel is reported the same way), the REST 503
+            carries retry_after_ms null and the MCP error is non-retryable, and
+            the remediation in both says a retry usually fails identically
+            until the cause clears; compare
+            max(yuzu_server_guardian_census_pending_events) and see "When a
+            verdict is flagged or does not move", step 5, in the Guaranteed
+            State guide.
             source="guardian_rules" means an AUTHORITATIVE rule/status read
             (get_rule/list_rules/agent_rule_statuses/rule_names/
-            errored_rule_count) is degrading: the read itself returns a typed
+            errored_rule_count/uncertain_rule_count, or the request-path
+            unordered_agents read behind the fleet status rollup) is degrading: the read itself returns a typed
             error, not a silent empty/stale result — but "returns a typed
             error" does not mean every caller aborts. Most callers DO fail
             closed (abort push/reconcile/status on the typed error), but this
@@ -4140,7 +5364,7 @@ groups:
         labels:
           severity: critical
         annotations:
-          summary: "Audit events failing to persist — behavioural-data routes are 503ing"
+          summary: "Audit events failing to persist — behavioural-data routes and audit-first mutations are 503ing"
           description: >-
             yuzu_server_audit_emit_failed_total is rising. Every REST route that uses
             fail-closed audit-on-open (guardian.device.view, dex.device.view,
@@ -4168,8 +5392,17 @@ groups:
             throw in the audit pipeline fails closed the same way but does NOT bump this
             counter (it is catch-logged only) — correlate with a spike in 503s on the
             behavioural routes. The audit-first admin writes (webhooks, offload targets,
-            directory sync, group mappings, MCP settings) 503 the same way. Upload-grant revoke
-            refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
+            directory sync, group mappings, MCP settings), the seven instruction definition
+            and instruction set writes of the REST v1 and MCP twins (instruction.create,
+            instruction.update, instruction.delete, instruction.import, instruction_set.create
+            and instruction_set.delete, six audit actions because the YAML save audits as
+            instruction.create or instruction.update: nothing is created, changed or deleted while the
+            "attempted" row cannot be stored) and workflow execution (workflow.execute: nothing
+            is sent while its "requested" row cannot be stored) 503 the same way, and so do four
+            dashboard mutations (#3619): every console send (POST /api/dashboard/execute),
+            group-from-results, and the Echo retention-paused re-enable and purge, which send,
+            create or purge nothing while their "attempted" row cannot be stored. Upload-grant
+            revoke refuses on both REST (503) and MCP (retryable -32603), so a leaked grant stays
             redeemable until the outage ends or its TTL expires, whichever is first (#6169).
             Approval approve and reject (approval.approve, approval.reject) 503 with
             Sec-Audit-Failed when the "attempted" row fails; then the decision is not applied
@@ -4847,7 +6080,11 @@ groups:
             Postgres outage (self-heals via the next sync + weekly full-floor); if
             uncorrelated it is likely one or more devices whose payload the store
             keeps rejecting — grep the warn-level SoftwareInventoryStore logs for
-            the agent_id.
+            the agent_id. A blob-v3 call applies all of its sections in ONE
+            transaction, so any one failing statement (a statement timeout or a lost
+            connection under load, for example) answers error for every section of that
+            call that was not refused and rolls the whole call back; the next sync resends it. The warn line
+            to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
         expr: |
@@ -4867,11 +6104,97 @@ groups:
             one-time need_full by design, phase-spread across the daily sync window,
             self-healing; check release notes for a recent contract change before
             treating this as an incident. A sustained ratio with no such change
-            suggests hash drift or agents stuck in a resend cycle.
+            suggests hash drift or agents stuck in a resend cycle. Blob-v3 agents
+            add one more source of need_full: a delta section whose base the server
+            does not hold (for example after a restore from backup, or after the
+            facet was last reported as a status-only section) is answered need_full
+            and the agent resends that facet in full. A delta or component section that
+            did not verify is answered need_full too, so it raises this ratio; its own
+            per-section count and alert are outcome=mismatch and
+            YuzuInventorySectionDeltaMismatch.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventorySectionIngestRefused
+        # Blob v3 (ADR-0016 Update 2026-11-04): a section the server refuses is nacked
+        # per section (`installed_software:<facet>`), and the other sections of the call
+        # still apply. outcome=rejected is a GRAMMAR refusal: the agent resends the same
+        # bytes and never self-heals, so it is its own alert; a refused section also counts
+        # toward YuzuInventoryHighNeedFullRatio (it is answered need_full), but that ratio
+        # alone cannot say that the cause is a grammar break. outcome=mismatch is NOT here: a
+        # delta or component section that did not verify is rolled back and the agent resends in
+        # full, which repairs a delta that went out of step; it has its own rule
+        # (YuzuInventorySectionDeltaMismatch) below.
+        # increase over a day with NO hold (the YuzuCertInventoryReportsRejected shape): one
+        # refused section per sync cycle is enough, and a rate()-with-for would never fire for a
+        # low-cadence refusal. The series are pre-seeded at 0 (seed_section_ingest_series), so the
+        # first refusal is a real increase.
+        expr: |
+          sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="rejected"}[1d])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software v3 sections being refused"
+          description: >-
+            yuzu_inventory_section_ingest_total{outcome="rejected"} increased in the
+            last day for the facet label. rejected = the section broke the blob v3
+            grammar (an unknown status, rows in a status-only section, a record whose
+            source is not the facet, a record holding a NUL byte or missing its
+            terminator, a cap) - it NEVER self-heals, the agent resends the same bytes
+            and the server keeps the facet's previously held rows and section hash (on a
+            device's first v3 call that applies a section its v2 rows are already replaced,
+            so there are none to keep), so fix the agent (grep the warn-level "v3 section(s) ... refused"
+            server log line for the agent_id and the refusal reason). facet="unknown"
+            is the exception: the server does not know the facet name, which is a
+            version-skew incident to fix by reprovisioning matching builds.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventorySectionDeltaMismatch
+        # A delta or component_inventory section that did not verify is rolled back alone
+        # (the facet keeps its previously held rows and hash) and nacked, so the agent
+        # resends that facet in full, which repairs a delta that went out of step. An isolated
+        # mismatch is expected (an agent restored from a snapshot, a report racing a
+        # decommission) and must not page; a SUSTAINED one means the agent's section writer and
+        # the server disagree about the row set (a contract defect) and the fleet is quietly
+        # paying for full resends. A component section that repeats a kind and path (two
+        # components of one kind with an empty path among them) fails on every resend and does
+        # not repair itself. A device reports about once a day, so a rate() over a short window
+        # never holds for 1h: this reads a day of increases, which stays over the threshold
+        # for hours once crossed. Both clauses must hold: at least 5 mismatches AND more than
+        # 5% of the facet's sections, so a large fleet's background noise does not fire it.
+        expr: |
+          (
+            sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="mismatch"}[1d])) >= 5
+          )
+          and
+          (
+            sum by (facet) (increase(yuzu_inventory_section_ingest_total{outcome="mismatch"}[1d]))
+            > 0.05 * sum by (facet) (increase(yuzu_inventory_section_ingest_total[1d]))
+          )
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Installed-software v3 deltas failing verification"
+          description: >-
+            yuzu_inventory_section_ingest_total{outcome="mismatch"} increased by at least 5
+            in the last day for the facet label and is more than 5% of that facet's
+            sections, for 1h. A delta or component section named a row the server does not
+            hold, added a row whose key collides with a held one, would leave the facet over
+            the per-call record cap, repeated a component kind and path (two components of
+            one kind with an empty path among them), or left the facet with a section hash
+            other than the agent's own post-apply hash, so the server rolled that section
+            back and asked for a full one. The full section the agent sends in answer repairs
+            a delta that went out of step. A repeated component kind and path is the
+            exception: it fails on every cycle and does not repair itself, and the fix is in
+            the agent's component writer. A persistent share means the agent and server
+            disagree about the row set: grep the warn-level "did not verify" server line
+            for the agent_id (that line is sampled, about 1 in 100, so the search can
+            come back empty even while mismatches are happening) and compare the agent's
+            writer against the server's canonical section hash.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryDroppedBlobs
-        # outcome=dropped = a blob over the 3 MiB cap was rejected + nacked. UNLIKE
-        # outcome=error this NEVER self-heals: the agent resends the same over-cap
+        # outcome=dropped = a blob over the 3 MiB cap, or a blob-v3 blob that cannot be
+        # attributed to sections (a record before any section, no section after the header,
+        # an unusable S record, over 32 sections), was rejected + nacked. UNLIKE
+        # outcome=error this NEVER self-heals: the agent resends the same
         # payload and backs off forever (the agent's own cap should prevent reaching
         # here, so a non-zero rate signals agent/server cap drift after a version
         # skew, or a non-conforming agent). Deliberately a SEPARATE alert — folding
@@ -4886,14 +6209,15 @@ groups:
           summary: "Installed-software ingest dropping over-cap blobs"
           description: >-
             yuzu_inventory_ingest_total{outcome="dropped"} is non-zero: one or more
-            agents are sending an installed-software blob over the 3 MiB cap (the label
-            source says which; source="certificate_inventory" also counts an unknown
+            agents are sending an installed-software blob over the 3 MiB cap, or a blob-v3
+            blob the server cannot split into sections (the warn-level "unusable v3 ...
+            blob" line names the reason) (the label source says which; source="certificate_inventory" also counts an unknown
             major version or an unparseable header, which are NOT resent - see
             YuzuCertInventoryReportsRejected for those), which
             is dropped + nacked and will NOT self-heal (the agent resends the same
             payload). Likely an agent/server cap-constant drift after a version skew,
             or a non-conforming agent — check the agent version and the warn-level
-            "oversized ... blob" server logs for the agent_id.
+            "oversized ... blob" or "unusable v3 ... blob" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryReportRejected
         # outcome=rejected = a whole report carrying too many sources (content_hashes /
@@ -4995,8 +6319,10 @@ groups:
         # dashboard-invisible: the store-agnostic yuzu_pg_acquire_timeout_total
         # moves but nothing inventory-specific does (#1675).
         # reason = store_not_open | pool_acquire_timeout | query_error, plus
-        # admission_full (source=installed_software or ca_issued): a /crypto read
-        # refused by its per-process in-flight bound BEFORE any store call. The
+        # sections_query_error (source=device_ci: the hardware record read answered but its
+        # sections did not) and admission_full (source=installed_software or ca_issued):
+        # a /crypto read refused by its per-process in-flight bound BEFORE any store call.
+        # The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
         # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
@@ -5023,7 +6349,11 @@ groups:
             fleet vulnerability query ("which devices run <CVE>") reads as degraded,
             NOT "installed nowhere" - do not trust a zero-result inventory answer while
             one of those fires. admission_full is a shed: a refused /crypto read is an
-            error response, never a zero-result answer. A source=installed_software
+            error response, never a zero-result answer. sections_query_error
+            (source=device_ci) means the hardware record read answered but its v2
+            sections did not, so the REST record route answered 503 (the MCP tool, a
+            retryable error): check yuzu_pg_* and the DeviceInventoryStore warning in
+            the server log. A source=installed_software
             query_error that fires together with YuzuInventoryCatalogRollupStale or
             YuzuInventoryCatalogRollupFailing is the /crypto live name scan exceeding
             its 5s bound (too many distinct package names): retrying will not help, fix
@@ -5433,10 +6763,12 @@ groups:
         # into le=15/20/30/45/60 rather than collapsing into +Inf — the
         # +Inf-minus-le=10 complement below is an honest count of full ingests over
         # 10s, and histogram_quantile over the tail now yields a real p99. Fires
-        # ahead of YuzuInventoryReadDegraded (sre).
+        # ahead of YuzuInventoryReadDegraded (sre). phase=v3 (a blob-v3 call: up to 32
+        # sections in one transaction on one connection) is the heaviest hold and is
+        # matched with phase=full, or it would be invisible to this rule.
         expr: |
-          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="+Inf"}[10m]))
-          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase="full",le="10"}[10m]))
+          sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase=~"full|v3",le="+Inf"}[10m]))
+          - sum(rate(yuzu_inventory_ingest_duration_seconds_bucket{phase=~"full|v3",le="10"}[10m]))
           > 0.1
         for: 10m
         labels:
@@ -5444,9 +6776,11 @@ groups:
         annotations:
           summary: "Installed-software full-payload ingests exceeding 10s"
           description: >-
-            More than ~6/min full-payload inventory ingests are holding a Postgres
-            connection >10s — a leading indicator of pool saturation under a
-            need_full herd, ahead of read-path degradation. Correlate with
+            More than ~6/min full-payload inventory ingests (phase full, or v3 - a
+            blob-v3 call applies every section in one transaction on one connection,
+            the heaviest hold) are holding a Postgres connection >10s — a leading
+            indicator of pool saturation under a need_full herd, ahead of read-path
+            degradation. Correlate with
             yuzu_pg_pool_waiters and yuzu_pg_acquire_wait_seconds.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # Recording rule (#1686): now that yuzu_inventory_ingest_duration_seconds
@@ -5541,6 +6875,125 @@ groups:
             (yuzu_inventory_catalog_rollup_duration_seconds vs the 60s budget).
             While it fires, /crypto reads its package names live (slower) if the shared
             catalogue is also older than two hours; alerts are per replica, the catalogue is shared.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryComponentRollupStale
+        # The software components rollup (component_rollup, the totals of
+        # GET /api/v1/inventory/software/components; SAM-17) rides the catalogue rollup thread
+        # on the same hourly, completion-spaced cadence, so this is the
+        # YuzuInventoryCatalogRollupStale shape: the gauge is seeded to 0 at thread start, the
+        # `> 0` guard skips that "building" window (a refresh that has never succeeded is the
+        # Failing rule's case below), and 7200 is twice the cadence.
+        expr: |
+          (time() - yuzu_inventory_component_rollup_last_success_timestamp) > 7200
+          and yuzu_inventory_component_rollup_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software components rollup is stale"
+          description: >-
+            The components rollup has not refreshed in over 2h (cadence is 1h). Keep-last-good is
+            serving an aging rollup: the `as_of` of the components totals ages and recent
+            component changes are not counted. Check
+            yuzu_inventory_component_rollup_total{outcome="error"} and the SoftwareCatalogRollup
+            thread log (Postgres outage, or the single GROUP BY over software_components past its
+            60s statement limit at scale; the recorded upgrade path is a per-(kind, name, agent)
+            pre-aggregate). Rows and version-filtered totals are live and unaffected.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryComponentRollupFailing
+        # The never-succeeded / ongoing-failure case the Stale rule's `> 0` guard skips. The
+        # refresh is HOURLY and adds ONE error increment per failed tick, so this is the
+        # YuzuSoftwareNormalizationFailing shape below (increase()[3h] >= 2, for 10m: two failed
+        # ticks within 3h fire, one isolated failure stays quiet, and a sustained outage at a
+        # period a little over an hour stays firing), not the rate()[15m] of
+        # YuzuInventoryCatalogRollupFailing, whose window ages an hourly increment out before its
+        # hold elapses. Both outcome series are seeded at 0 when the thread starts, so the first
+        # failure is already an increase.
+        expr: |
+          sum by (instance) (increase(yuzu_inventory_component_rollup_total{outcome="error"}[3h])) >= 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software components rollup refreshes are failing"
+          description: >-
+            Two or more hourly components rollup refreshes failed within 3h. If
+            yuzu_inventory_component_rollup_last_success_timestamp is still 0 the rollup has never
+            populated and the components totals read "building"; otherwise they are frozen at the
+            last good rollup (its `as_of` ages). Investigate Postgres availability and
+            yuzu_inventory_component_rollup_duration_seconds against the 60s statement limit (the
+            single GROUP BY over software_components meets it near 11M rows; the recorded upgrade
+            path is a per-(kind, name, agent) pre-aggregate). Rows and version-filtered totals are
+            live and unaffected.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSoftwareNormalizationStale
+        # The title normalisation job (SoftwareNormalizationJob) ticks hourly (after a full
+        # capped tick, or one that found the catalogue rollup's title_triples not yet filled,
+        # it ticks again in 60 s; a failed tick always waits the hour) and stamps
+        # yuzu_software_normalization_last_success_timestamp
+        # on a tick with no failed pass. If ticks stop succeeding, the title dimension and
+        # curation queue stop following the fleet. `> 0` GUARD IS LOAD-BEARING: the gauge is
+        # seeded to 0 when the job is constructed, so a naive `now - ts` fires on every cold
+        # boot; the guard skips the building window. A job that has NEVER succeeded is the
+        # Failing rule's case. 7200 s is twice the hourly cadence
+        # (kCatalogueRefreshIntervalSeconds), as for the sibling
+        # YuzuInventoryCatalogRollupStale.
+        expr: |
+          (time() - yuzu_software_normalization_last_success_timestamp) > 7200
+          and yuzu_software_normalization_last_success_timestamp > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software title normalisation is stale"
+          description: >-
+            The software title normalisation job has not completed a clean tick in over 2h
+            (cadence is 1h). The title dimension and curation queue are frozen at their last
+            good state. Check yuzu_software_normalization_pass_total{outcome="error"} and the
+            server log lines prefixed "Software normalisation:" and "SoftwareTitleDimension:"
+            (Postgres availability, the 60 s per-pass budget). Its candidate source is the
+            catalogue rollup's title_triples table, which this alert cannot watch: if
+            YuzuInventoryCatalogRollupStale or YuzuInventoryCatalogRollupFailing is also
+            firing, fix the rollup first, because a clean tick over a stalled rollup does
+            not alert here.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuSoftwareNormalizationFailing
+        # Sized to the HOURLY cadence. The job adds at most ONE error increment per tick (a
+        # failed tick is never re-armed early), and the wait is measured from the END of a
+        # tick, so a sustained outage's period is 3600 s PLUS the tick's own duration, always
+        # a little over an hour. A rate()/15m window with a 15m hold (the sibling
+        # YuzuInventoryCatalogRollupFailing shape) can never observe that: the single
+        # increment ages out of a 15m window long before `for` elapses. A 2h window is too
+        # tight as well: with a period over 60 min it holds only ONE increment for a couple
+        # of minutes of every period, the expression drops below 2 and `for` resets, so the
+        # alert would go quiet once an hour in a sustained outage. increase()[3h] >= 2 always
+        # holds at least two increments while the period is under 90 min, fires on the second
+        # failed tick and stays firing through the outage; one isolated failure followed by a
+        # success stays quiet. The threshold is >= 2, not > 1: increase() extrapolates to the
+        # window edges (factor >= 1, never below), so a SINGLE increment on a non-zero
+        # baseline (an earlier failure that has aged out of the window) reads a little above 1
+        # (~1.01 on a 1m scrape) for the whole time it stays in the window, while two
+        # increments read >= 2. That holds while the scrape interval is far below 3h. A job
+        # that never succeeded
+        # (the case the Stale rule's `> 0` guard skips) fires at its second failed tick: both
+        # outcome series are seeded at 0 when the job is constructed, so the first failure is
+        # already an increase.
+        expr: |
+          sum by (instance) (increase(yuzu_software_normalization_pass_total{outcome="error"}[3h])) >= 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Software title normalisation ticks are failing"
+          description: >-
+            Two or more hourly software title normalisation ticks failed within 3h. If
+            yuzu_software_normalization_last_success_timestamp is still 0 the job has never
+            completed a tick; otherwise the dimension is frozen at its last good state.
+            Investigate Postgres availability and the server log lines prefixed
+            "Software normalisation:" and "SoftwareTitleDimension:" (a pass over its 60 s
+            budget, a missing alias pack, a failed queue reconcile). The catalogue rollup that
+            fills title_triples has its own alerts (YuzuInventoryCatalogRollupStale and
+            YuzuInventoryCatalogRollupFailing); check them as the upstream cause.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       # YuzuInventoryStaleAgents — SHIPPED DISABLED. The freshness gauge
       # (yuzu_inventory_stale_agents{source}) is exported and graphable, but there
@@ -6122,7 +7575,10 @@ groups:
             the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
             `invalidate_user` degrades fail the privileged op closed, except an
             `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`; a single
+            disable), which leaves the clear in place and ends `partial`;
+            `account_state` (the read of `auth.users` that gates a durable local
+            session) fails the request closed (401), and the failing store for
+            that op is the account store, not session_store; a single
             event does not hold this alert's 10m condition, so look for
             `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
@@ -6561,7 +8017,10 @@ groups:
             yuzu_exec_correlation_write_degrade_total and the server log line "pool
             exhausted for command_id" (at most one per minute per cause). The responses
             already stored unverified are not repaired when the store recovers; re-run the
-            affected commands.
+            affected commands. While this fires the WS-3 command outbox's redelivery
+            horizon (#3678) counts those dispatches only on the instance that failed to
+            write them; treat the protection against re-sending an old scheduled command
+            as weakened until it clears.
 
       # #4990: the READ side of the same record. A response frame whose record lookup
       # fails twice (one retry) is stored `~unverified` with the same consequences. Only
@@ -6771,6 +8230,96 @@ groups:
             (one persistent data directory per replica; an ephemeral one makes
             the mechanism inert).
 
+  - name: yuzu-echo
+    # No alert on the echo.status registry_* keys yet (no fleet gauge); decision and follow-up in
+    # docs/observability-conventions.md (#6521).
+    rules:
+      # The gauge counts agents once per sweep, so a rise is a net rise in the agents reporting a
+      # quarantine history, not an event count (limits spelled out in the description). It is a gauge, so `delta`, not `increase`: an
+      # agent that leaves and returns takes the count down and back up, and `increase` would
+      # read the return as a rise. `for: 0m`: a rise is an event, a sustained condition would
+      # never clear. Warning, not critical: the value is agent-self-reported inside the
+      # heartbeat trust boundary, so one forged or buggy agent can raise it.
+      #
+      # THE RESTART GUARD. The server publishes the gauge every sweep, 0 included, over agents
+      # with a live heartbeat, so a restarted replica starts at 0 and ramps back to N as agents
+      # reconnect. About an hour later the 1h window start slides into that ramp and
+      # `delta(...[1h]) > 0` fires with no new corruption (the same happens on a series younger
+      # than 1h). `unless ... (yuzu_server_uptime_seconds < 3900)` suppresses the rule for the
+      # first 65 minutes of a replica's life: the 1h window plus a 5 minute reconnect ramp. A
+      # real rise stays visible to `delta[1h]` for an hour, so the guard loses a rise inside the
+      # first ~5 minutes of a boot and delays one later in the first 65. If agents take longer than 5 minutes to
+      # reconnect, the tail of the ramp can still leak. An absent uptime series suppresses
+      # nothing. The join is `on (job, instance)` because the guard is about one replica's own
+      # uptime (both series must come from the same scrape job and target, as the shipped scrape
+      # config does; otherwise the guard silently never matches): any label a scrape attaches to only one of the two series would otherwise
+      # defeat the join and silence the guard, and `on (job)` alone would let a young sibling
+      # replica silence an old one (pinned by the two-replica case). The 1h any-rise threshold
+      # is the #5065 starting default, not sized from fleet data.
+      - alert: YuzuEchoDbCorruptionDetected
+        expr: |
+          delta(yuzu_fleet_echo_db_corruption_agents[1h]) > 0
+            unless on (job, instance) (yuzu_server_uptime_seconds < 3900)
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The count of agents with a quarantined Echo database rose in the last hour"
+          description: >-
+            At least one more agent than an hour ago reports that its Echo database failed its
+            integrity check and was quarantined. This is a net rise in the agents reporting a
+            quarantine history, not an event count: the gauge counts agents once per sweep, so an
+            agent returning from offline with an old quarantine raises it, a repeat quarantine on
+            an agent already counted does not, and an agent leaving in the same window can mask
+            one arriving. A rise seen while the reporting replica has been up under 65 minutes is
+            held until the guard lifts. A failover, a rolling upgrade, agents returning after a
+            site or gateway outage, or ordinary endpoint churn can all raise it with no new
+            corruption, once per replica that gains agents; treat it as a ticket, not a page. The
+            signal is agent-self-reported, so one agent can raise or mask it; the
+            echo.db.corruption_quarantined audit rows name the affected agents but corroborate
+            rather than prove it.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/echo.md#corrupt-database-quarantine"
+
+      # DECISION (#6696): one generic rule keyed on the plugin label, not an Echo-only twin; the
+      # description carries the Echo remedy. The plugin label is bounded to the server's own
+      # plugin catalogue: the server labels a reported name only when the catalogue knows it and
+      # sums every other well-formed name under plugin="unknown", so an agent cannot push a real
+      # plugin out of its own label (yuzu_fleet_plugin_init_failed_rejected counts the agents
+      # sending names that were not labelled). Whether a listed plugin really failed is still
+      # the agent's word. The family is absent-not-zero, so a clean fleet
+      # returns no series and the rule stays quiet (max_over_time over an absent series is
+      # absent too).
+      #
+      # Same expression and effects as YuzuDedupStoreDegraded (#3663,
+      # docs/observability-conventions.md); do not widen the window.
+      - alert: YuzuPluginInitFailed
+        expr: |
+          sum by (job, plugin) (max_over_time(yuzu_fleet_plugin_init_failed[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "About {{ $value }} agent(s) report plugin {{ $labels.plugin }} failed to initialise"
+          description: >-
+            For more than 10 minutes, about {{ $value }} agent(s) (summed across core replicas,
+            so a failover can count one twice for a few minutes) have reported that plugin
+            {{ $labels.plugin }} failed init (heartbeat tag yuzu.plugins_failed); it is loaded
+            but not running, as distinct from not installed. plugin="unknown" sums the
+            well-formed names the server's plugin catalogue does not know, counted as reported
+            names (tokens), so one agent can add several (the agent log names them;
+            yuzu_fleet_plugin_init_failed_rejected counts the agents sending them). The
+            runbook link is the Echo upgrade note; for any other plugin the agent log
+            is the source. For plugin="echo" the usual causes are a failed tar.db adoption after
+            the rename (including a sidecar present under both names) and a corrupt echo.db that
+            could not be moved aside; the upgrade notes cover adoption under 'Two cases the
+            agent refuses, and what to do', and the corrupt-database case is under
+            Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack
+            of free space is not counted here (#7290). The value and the plugin label are
+            agent-self-reported: the server bounds the label to its catalogue, so an agent
+            cannot displace a real plugin, but it can still report a real plugin's name as
+            failed, or not report a failure, so the signal is not authoritative.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
+
   - name: yuzu-web-writes
     # Cookie-session requests refused by the pre-routing same-site gate
     # (yuzu_server_csrf_denied_total{path_class,reason}). Every path_class x
@@ -6828,3 +8377,79 @@ groups:
             evidence. Look for
             the gate warning in the server log; a persistent error means
             cookie-session requests are failing for every operator.
+
+  - name: yuzu-delivery
+    # Webhook and offload-target delivery backlog. Each store hands deliveries to its own
+    # bounded worker pool; a delivery that arrives when the pool's queue is full is dropped and
+    # counted (yuzu_server_webhook_delivery_dropped_total / yuzu_server_offload_delivery_dropped_total,
+    # reason = queue_full | quiescing, both members zero-seeded at boot).
+    #
+    # Only reason="queue_full" is alerted: a "quiescing" drop is a delivery refused while the
+    # server is shutting down, which is not an incident. The firing rules use a rate over 5m held
+    # for 10m, so a single dropped delivery never pages; a backlog that keeps refusing does.
+    # YuzuDeliveryPoolBacklogHigh is the early signal (pending against capacity, both published
+    # on the server's 15 s maintenance tick). 80% of capacity leaves 52 deliveries of headroom, so a
+    # fast backlog can reach the first drop before its 5 minutes have passed.
+    #
+    # Known blind spot: a short burst of drops that ends within the 5 minute rate window never
+    # satisfies the 10 minute hold, and a pool that drains within 5 minutes never satisfies the
+    # ratio rule. The counter and one server log warning per drop are the record of such a burst.
+    #
+    # These rules read counters and gauges only. They say that deliveries are backing up on this
+    # server, not why; the description names where to look.
+    rules:
+      - alert: YuzuWebhookDeliveriesDropped
+        expr: |
+          sum by (instance) (
+            rate(yuzu_server_webhook_delivery_dropped_total{reason="queue_full"}[5m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Webhook deliveries are being dropped because the delivery queue is full"
+          description: >-
+            yuzu_server_webhook_delivery_dropped_total{reason="queue_full"} has been
+            increasing on {{ $labels.instance }} for 10 minutes: the webhook delivery
+            queue is full and new deliveries are refused (the event is not retried).
+            Check yuzu_server_delivery_pool_pending{store="webhook"} against
+            yuzu_server_delivery_pool_capacity{store="webhook"}, then the failing or slow
+            targets with GET /api/webhooks/{id}/deliveries. Drops with
+            reason="quiescing" are a shutdown and are not counted here.
+
+      - alert: YuzuOffloadDeliveriesDropped
+        expr: |
+          sum by (instance) (
+            rate(yuzu_server_offload_delivery_dropped_total{reason="queue_full"}[5m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Offload-target deliveries are being dropped because the delivery queue is full"
+          description: >-
+            yuzu_server_offload_delivery_dropped_total{reason="queue_full"} has been
+            increasing on {{ $labels.instance }} for 10 minutes: the offload-target
+            delivery queue is full and new deliveries are refused (the event is not
+            retried). Check yuzu_server_delivery_pool_pending{store="offload"} against
+            yuzu_server_delivery_pool_capacity{store="offload"}, then the failing or slow
+            targets with GET /api/v1/offload-targets/{id}/deliveries. Drops with reason="quiescing" are
+            a shutdown and are not counted here.
+
+      - alert: YuzuDeliveryPoolBacklogHigh
+        expr: |
+          yuzu_server_delivery_pool_pending / yuzu_server_delivery_pool_capacity > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A webhook or offload delivery pool is above 80% of its capacity"
+          description: >-
+            yuzu_server_delivery_pool_pending is above 80% of
+            yuzu_server_delivery_pool_capacity for the {{ $labels.store }} store on
+            {{ $labels.instance }} for 5 minutes. Pending counts queued plus running
+            deliveries; at 100% the next delivery is dropped (see
+            YuzuWebhookDeliveriesDropped and YuzuOffloadDeliveriesDropped). Check the
+            store's failing or slow targets first. Both gauges are sampled on the server's
+            maintenance tick (about every 15 seconds), so a burst shorter than that can be
+            missed; the 5 minute window is deliberate.

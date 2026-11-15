@@ -667,24 +667,28 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
         } else if (!exec_opt) {
-            // #3789 + PR #3842: this existence check gives an unknown id a
-            // clean 404. It was originally load-bearing because
-            // `mark_cancelled` reported PGRES_COMMAND_OK (a false "cancelled"
-            // 200) on an UPDATE matching zero rows (Sol/gpt-5.6-sol review);
-            // PR #3842's `RETURNING id` + terminal-status guard now makes
-            // mark_cancelled return FALSE for an unknown OR already-terminal
-            // execution, so this check is now defense-in-depth — it keeps the
-            // common unknown-id case a 404 rather than the 503 a bare
-            // mark_cancelled-false would produce below (a not-found/terminal-
-            // vs-degrade refinement of that 503 is tracked in #3845). A
-            // confined caller's existence check is folded into the branch above.
+            // #3789 + PR #3842 + #3845: this existence check is what gives an
+            // unknown id its 404, BEFORE any write. It is load-bearing: the
+            // guarded UPDATE matches zero rows for an unknown id exactly as it
+            // does for an already-terminal one, so `mark_cancelled_checked`
+            // reports BOTH as `kNoOp`, which the switch below answers 409
+            // "already finished". Without this check an unknown id would get a
+            // 409. (It was first added because `mark_cancelled` reported
+            // PGRES_COMMAND_OK, a false "cancelled" 200, on a zero-row UPDATE;
+            // Sol/gpt-5.6-sol review.) One residual: a row that goes terminal
+            // between this read and the guarded UPDATE (the stuck-execution
+            // reaper flips it to `cancelled`, or a late agent response
+            // completes it) is a `kNoOp` too, i.e. a 409 "already finished",
+            // which is true. Nothing deletes execution rows, so it is never
+            // "gone". A confined caller's existence check is folded into the
+            // branch above.
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
             return;
         }
 
-        // mark_cancelled_checked keeps "nothing to cancel" (already terminal, or the row
-        // vanished between the read above and the guarded UPDATE) apart from a store failure:
+        // mark_cancelled_checked keeps "nothing to cancel" (already terminal, or it went terminal
+        // between the read above and the guarded UPDATE) apart from a store failure:
         // the first is a state-guard refusal (409, audited `denied`), only the second is a 503.
         using Outcome = ExecutionTracker::MarkCancelledOutcome;
         switch (deps.execution_tracker->mark_cancelled_checked(id, user)) {

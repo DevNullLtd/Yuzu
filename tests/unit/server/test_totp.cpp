@@ -7,13 +7,18 @@
  *   - generate() — RFC 6238 Appendix B SHA-1 vectors (truncated to 6 digits)
  *   - verify_window() — drift tolerance and replay protection
  *   - otpauth_uri() — shape + percent-encoding
+ *   - random_secret() / random_recovery_code() — success shape and fail-closed
+ *     on a CSPRNG failure (#4763)
  */
 
+#include "../../../server/core/src/secure_random.hpp"
 #include "../../../server/core/src/totp.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -136,14 +141,38 @@ TEST_CASE("otpauth_uri formats correctly", "[mfa][totp][uri]") {
 
 TEST_CASE("random_secret has the right length", "[mfa][totp][secret]") {
     auto s = random_secret();
-    REQUIRE(s.size() == 20);
+    REQUIRE(s.has_value());
+    REQUIRE(s->size() == 20);
     // Two consecutive calls should differ with overwhelming probability.
     auto s2 = random_secret();
-    REQUIRE(s != s2);
+    REQUIRE(s2.has_value());
+    REQUIRE(*s != *s2);
+}
+
+TEST_CASE("random_secret is never all-zero on success (#4763)", "[mfa][totp][secret]") {
+    // P(20 uniform bytes all zero) = 2^-160. A zero vector is exactly what the
+    // pre-fix Windows path returned when BCryptGenRandom failed.
+    for (int i = 0; i < 50; ++i) {
+        auto s = random_secret();
+        REQUIRE(s.has_value());
+        REQUIRE(std::any_of(s->begin(), s->end(), [](uint8_t b) { return b != 0; }));
+    }
+}
+
+TEST_CASE("random_secret fails closed on a CSPRNG failure (#4763)", "[mfa][totp][secret]") {
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+    auto s = random_secret();
+    REQUIRE_FALSE(s.has_value());
+    REQUIRE(s.error() == yuzu::server::SecureRandomError::prng_failure);
+    // One-shot: the hook is consumed, so the next call succeeds.
+    REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+    REQUIRE(random_secret().has_value());
 }
 
 TEST_CASE("random_recovery_code formatted 4-4-4-4 (80 bits)", "[mfa][totp][recovery]") {
-    auto code = random_recovery_code();
+    auto minted = random_recovery_code();
+    REQUIRE(minted.has_value());
+    const auto& code = *minted;
     REQUIRE(code.size() == 19); // 4 + '-' + 4 + '-' + 4 + '-' + 4
     REQUIRE(code[4] == '-');
     REQUIRE(code[9] == '-');
@@ -155,4 +184,26 @@ TEST_CASE("random_recovery_code formatted 4-4-4-4 (80 bits)", "[mfa][totp][recov
         bool ok = (c >= 'A' && c <= 'Z') || (c >= '2' && c <= '7');
         REQUIRE(ok);
     }
+}
+
+TEST_CASE("random_recovery_code fails closed on a CSPRNG failure (#4763)",
+          "[mfa][totp][recovery]") {
+    yuzu::server::test_hooks::force_next_failure_for_this_thread();
+    auto code = random_recovery_code();
+    REQUIRE_FALSE(code.has_value());
+    REQUIRE(code.error() == yuzu::server::SecureRandomError::prng_failure);
+    REQUIRE(random_recovery_code().has_value()); // hook was one-shot
+}
+
+TEST_CASE("random_recovery_code: consecutive codes are distinct (#4763)",
+          "[mfa][totp][recovery]") {
+    // The pre-fix failure mode read the same uninitialised stack slot for all
+    // ten codes of a set; a healthy CSPRNG never repeats an 80-bit code.
+    std::set<std::string> seen;
+    for (int i = 0; i < 10; ++i) {
+        auto code = random_recovery_code();
+        REQUIRE(code.has_value());
+        seen.insert(*code);
+    }
+    REQUIRE(seen.size() == 10);
 }

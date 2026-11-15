@@ -1,28 +1,28 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-27 · euid 501 · leg-hash c78d09361368
+captured: macos macOS 27.0.1 arm64 · bare-metal · 2026-11-03 · euid 501; serial and UUID replaced with synthetic values · leg-hash f7b5dcc7d853
 == action=manufacturer
 manufacturer|Apple Inc.
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=model
-model|Mac16,10
+model|Mac17,8
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=bios
 bios_vendor|Apple
-bios_version|18000.161.10
+bios_version|20457.1.29
 bios_date|N/A
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=processors
-cpu|0|Apple M4|10|10|0|-|-
+cpu|0|Apple M5 Pro|18|18|0|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=memory
-dimm|total|32768|unknown|0|-|-|-
+dimm|total|24576|unknown|0|-|-|-
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=disks
-disk|0|APPLE SSD AP0512Z|465|SSD|NVMe
+disk|0|APPLE SSD AP1024Z|931|SSD|NVMe
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=drivers
@@ -49,4 +49,8 @@ status|swap|unsupported|macos:planned
 == action=machine_id
 status|machine_id|unsupported|macos:planned
 [result_status] UNAVAILABLE / UNKNOWN / macos:planned
+
+== action=drivers_inventory
+status|drivers_inventory|unsupported|macos:no_enumeration_api
+[result_status] UNAVAILABLE / PARTIAL / macos:no_enumeration_api
 

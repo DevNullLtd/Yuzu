@@ -30,6 +30,16 @@ rationale lives here and in docs/ci-architecture.md.
 
 Effective attempts for a flaky case = original in-suite run + one enumeration
 re-run (to find which cases failed) + up to --retries isolated re-runs.
+
+Concurrent invocations in ONE build dir (ci.yml's Linux test step runs its
+non-pg and pg halves at the same time): pass meson's own `--logbase NAME`
+through the `--` args. This wrapper reads it back (`meson_logbase`) and keys
+every file it touches in meson-logs/ on it — the junit it classifies
+(`NAME.junit.xml`), its retry report and its preserved enumeration junit (both
+prefixed `NAME-`), and the stale-file sweep (only its own prefix) — so two
+invocations with distinct logbases never read, overwrite or delete each
+other's files. Without `--logbase` every path is exactly the historical one
+(`testlog.junit.xml`, `flake-retry.json`, `flake-retry-enum-*.catch2.xml`).
 """
 import argparse
 import os
@@ -53,6 +63,39 @@ CATCH2_EXE = re.compile(r"yuzu_\w+_tests(\.exe)?$", re.IGNORECASE)
 # never be combined with the retried case name).
 CATCH2_TAG_SPEC = re.compile(r"^(~?\[[^\[\]]+\])+(,(~?\[[^\[\]]+\])+)*$")
 VALID_PLATFORMS = {"windows", "linux", "macos", "all"}
+DEFAULT_LOGBASE = "testlog"  # meson test's own --logbase default
+
+
+def meson_logbase(meson_args):
+    """The `--logbase` the passthrough meson args select (last one wins, as in
+    meson's argparse), or meson's default. Both `--logbase X` and
+    `--logbase=X` spellings are recognised."""
+    logbase = DEFAULT_LOGBASE
+    args = list(meson_args or [])
+    for i, a in enumerate(args):
+        if a == "--logbase" and i + 1 < len(args):
+            logbase = args[i + 1]
+        elif a.startswith("--logbase="):
+            logbase = a[len("--logbase="):]
+    return logbase or DEFAULT_LOGBASE
+
+
+def artifact_prefix(logbase):
+    """Filename prefix for this wrapper's own meson-logs/ files: empty for the
+    default logbase (historical names, unchanged), `<logbase>-` otherwise."""
+    return "" if logbase == DEFAULT_LOGBASE else f"{logbase}-"
+
+
+def junit_path(builddir, logbase=DEFAULT_LOGBASE):
+    return os.path.join(builddir, "meson-logs", f"{logbase}.junit.xml")
+
+
+def retry_report_name(logbase=DEFAULT_LOGBASE):
+    return f"{artifact_prefix(logbase)}flake-retry.json"
+
+
+def enum_junit_name(slug, logbase=DEFAULT_LOGBASE):
+    return f"{artifact_prefix(logbase)}flake-retry-enum-{slug}.catch2.xml"
 
 
 def detect_os():
@@ -162,23 +205,23 @@ def _failed_testcase_names(xml_path):
     return failed
 
 
-def meson_failed_suites(builddir):
+def meson_failed_suites(builddir, logbase=DEFAULT_LOGBASE):
     """Suite-level: which meson test()s failed (names from meson's junit)."""
-    xml_path = os.path.join(builddir, "meson-logs", "testlog.junit.xml")
+    xml_path = junit_path(builddir, logbase)
     if not os.path.exists(xml_path):
         return None  # no junit -> caller treats as unclassifiable
     return _failed_testcase_names(xml_path)
 
 
-def _entry_durations(builddir):
-    """{meson-junit testcase name: wall seconds} from testlog.junit.xml.
+def _entry_durations(builddir, logbase=DEFAULT_LOGBASE):
+    """{meson-junit testcase name: wall seconds} from <logbase>.junit.xml.
 
     Meson writes one <testcase> per test() entry with a per-entry `time`
     attribute (the <testsuite> nodes carry aggregates we ignore). Defensive
     by design — this feeds pure reporting (#2093), so a missing file, parse
     error, or absent/garbled time attr degrades to "no row", never a crash.
     Duplicate names are summed."""
-    xml_path = os.path.join(builddir, "meson-logs", "testlog.junit.xml")
+    xml_path = junit_path(builddir, logbase)
     if not os.path.exists(xml_path):
         return {}
     try:
@@ -211,13 +254,13 @@ def budget_rows(durations, tests):
     return rows
 
 
-def report_suite_budgets(builddir, tests, warn_frac=0.8):
+def report_suite_budgets(builddir, tests, warn_frac=0.8, logbase=DEFAULT_LOGBASE):
     """#2093: degrade duration creep toward a suite's meson timeout into a
     visible ::warning instead of a discontinuous red wall (the server suite
     crept 448s -> 512s/600 in green runs with zero signal before the
     2026-07-12 timeouts). Runs on every invocation — green included, that is
     the entire point — and never changes pass/fail semantics."""
-    rows = budget_rows(_entry_durations(builddir), tests)
+    rows = budget_rows(_entry_durations(builddir, logbase), tests)
     if not rows:
         return
     for name, secs, budget, frac in rows:
@@ -339,7 +382,7 @@ def _suite_slug(test):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-") or "unknown"
 
 
-def _clear_stale_enum_junit(builddir):
+def _clear_stale_enum_junit(builddir, logbase=DEFAULT_LOGBASE):
     """Best-effort: remove any flake-retry-enum-*.catch2.xml left over from a
     PRIOR invocation before this one writes its own (#4580 review finding).
     `build-linux-*`/`build-windows-*` dirs are NOT wiped between ordinary CI
@@ -363,19 +406,27 @@ def _clear_stale_enum_junit(builddir):
     fail-misleading (evidence silently absent, never wrong-run evidence
     silently present as current), so left as a documented follow-up rather
     than blocking this fix: stamping the preserved filename with
-    GITHUB_RUN_ID would close it."""
+    GITHUB_RUN_ID would close it. (ci.yml's Linux leg now gives each of
+    those invocations its own --logbase, which scopes this sweep to that
+    invocation's own prefix and so closes the limitation THERE; the Windows
+    leg's two invocations still share the default logbase and keep it.)
+
+    Scope: only files carrying THIS invocation's logbase prefix
+    (`enum_junit_name`) are swept, so a concurrent invocation in the same build
+    dir under a different --logbase never loses its evidence to this one."""
     if not builddir:
         return
     import glob
 
-    for stale in glob.glob(os.path.join(builddir, "meson-logs", "flake-retry-enum-*.catch2.xml")):
+    pattern = enum_junit_name("*", logbase)
+    for stale in glob.glob(os.path.join(builddir, "meson-logs", pattern)):
         try:
             os.remove(stale)
         except OSError:
             pass
 
 
-def _preserve_enum_junit(builddir, test, xml_path):
+def _preserve_enum_junit(builddir, test, xml_path, logbase=DEFAULT_LOGBASE):
     """Best-effort: copy a failed suite's enumeration re-run junit XML into
     meson-logs/ instead of letting it be deleted (#4580) — it rides the
     existing meson-logs CI artifact upload, so a future occurrence is
@@ -389,14 +440,14 @@ def _preserve_enum_junit(builddir, test, xml_path):
     try:
         logs = os.path.join(builddir, "meson-logs")
         os.makedirs(logs, exist_ok=True)
-        dest = os.path.join(logs, f"flake-retry-enum-{_suite_slug(test)}.catch2.xml")
+        dest = os.path.join(logs, enum_junit_name(_suite_slug(test), logbase))
         with open(xml_path, "rb") as src, open(dest, "wb") as dst:
             dst.write(src.read())
     except OSError:
         pass
 
 
-def catch2_failed_cases(test, this_os, builddir=None):
+def catch2_failed_cases(test, this_os, builddir=None, logbase=DEFAULT_LOGBASE):
     """Re-run a failed Catch2 suite with the junit reporter; return failed case
     names, or None if it isn't a classifiable Catch2 run (non-Catch2 / crash /
     hang). `timeout` mirrors the suite's own meson-configured timeout (falsy ->
@@ -430,7 +481,7 @@ def catch2_failed_cases(test, this_os, builddir=None):
         if not os.path.getsize(xml_path):
             return None  # crash/timeout before any reporter output -> unclassifiable
         cases = _failed_testcase_names(xml_path)
-        _preserve_enum_junit(builddir, test, xml_path)
+        _preserve_enum_junit(builddir, test, xml_path, logbase)
         return cases
     except (ET.ParseError, OSError, subprocess.TimeoutExpired):
         return None
@@ -455,12 +506,12 @@ def retry_case(test, case, retries, builddir=None):
     return 0
 
 
-def write_retry_report(builddir, this_os, recovered, blocked):
+def write_retry_report(builddir, this_os, recovered, blocked, logbase=DEFAULT_LOGBASE):
     """Persist retry evidence without changing the test process' result."""
     import json
 
     logs = os.path.join(builddir, "meson-logs")
-    path = os.path.join(logs, "flake-retry.json")
+    path = os.path.join(logs, retry_report_name(logbase))
     tmp = path + f".{os.getpid()}.tmp"
     payload = {
         "platform": this_os,
@@ -511,6 +562,7 @@ def main(argv=None):
         ap.error("--builddir is required (unless --selftest)")
 
     this_os = detect_os()
+    logbase = meson_logbase(args.meson_args)
     # Validate the list up front (fail-fast on a malformed list).
     try:
         flaky = load_known_flaky(args.known_flaky, this_os, args.stale_days)
@@ -521,7 +573,7 @@ def main(argv=None):
     # 0. Clear any stale enumeration-junit evidence from a prior invocation in
     #    this same (persisted) build dir, before this run gets a chance to
     #    write its own (#4580) — see _clear_stale_enum_junit's docstring.
-    _clear_stale_enum_junit(args.builddir)
+    _clear_stale_enum_junit(args.builddir, logbase)
 
     # 1. Run meson test normally.
     rc = subprocess.run(["meson", "test", "-C", args.builddir] + args.meson_args).returncode
@@ -534,19 +586,19 @@ def main(argv=None):
     tests = []
     try:
         tests = introspect_tests(args.builddir)
-        report_suite_budgets(args.builddir, tests)
+        report_suite_budgets(args.builddir, tests, logbase=logbase)
     except Exception as ex:  # noqa: BLE001 — watchdog is reporting-only by contract
         # `tests` keeps whatever introspect managed to return ([] if it was
         # introspect itself that threw) — the failure path below re-uses it.
         gh("warning", f"suite-budget watchdog failed (reporting only, run unaffected): {ex}")
 
     if rc == 0:
-        write_retry_report(args.builddir, this_os, [], [])
+        write_retry_report(args.builddir, this_os, [], [], logbase)
         return 0
 
     gh("notice", "meson test failed — checking whether every failure is a known flake")
 
-    failed_suites = meson_failed_suites(args.builddir)
+    failed_suites = meson_failed_suites(args.builddir, logbase)
     if not failed_suites:
         gh("error", "test failed but no per-suite junit to classify — failing (no masking)")
         write_retry_report(
@@ -554,6 +606,7 @@ def main(argv=None):
             this_os,
             [],
             ["test failed but no per-suite junit to classify"],
+            logbase,
         )
         return rc or 1
     blocked = []      # case names that must fail the job
@@ -563,7 +616,7 @@ def main(argv=None):
         if test is None:
             blocked.append(f"{suite_name} (could not map to a binary)")
             continue
-        cases = catch2_failed_cases(test, this_os, args.builddir)
+        cases = catch2_failed_cases(test, this_os, args.builddir, logbase)
         if cases is None:
             blocked.append(f"{suite_name} (not a classifiable Catch2 run — crash/non-Catch2)")
             continue
@@ -593,7 +646,7 @@ def main(argv=None):
                "cases in a separate solo run of the whole suite, not a replay of "
                "the original invocation — the original failure may not be among "
                "these names (#4580). Assertion detail preserved at "
-               f"meson-logs/flake-retry-enum-{_suite_slug(test)}.catch2.xml")
+               f"meson-logs/{enum_junit_name(_suite_slug(test), logbase)}")
         for case in sorted(cases):
             entry = flaky.get(case)
             if entry is None:
@@ -607,7 +660,7 @@ def main(argv=None):
                 blocked.append(f"{case} (listed flake but failed all {args.retries} retries)")
 
     # Report.
-    write_retry_report(args.builddir, this_os, recovered, blocked)
+    write_retry_report(args.builddir, this_os, recovered, blocked, logbase)
     for case, cross, _attempts in recovered:
         if cross:
             gh("warning", f"CROSS-PLATFORM flake recovered on retry (needs urgent fix): {case}")
@@ -779,6 +832,46 @@ def _selftest():
         os.makedirs(empty_builddir)
         _clear_stale_enum_junit(empty_builddir)  # must not raise
         _clear_stale_enum_junit(None)  # must not raise
+
+    # --logbase scoping (concurrent invocations in one build dir).
+    check(meson_logbase([]) == "testlog", "logbase: meson default when absent")
+    check(meson_logbase(["--print-errorlogs", "--logbase", "testlog-pg", "--suite", "x"])
+          == "testlog-pg", "logbase: two-token spelling")
+    check(meson_logbase(["--logbase=testlog-nonpg"]) == "testlog-nonpg", "logbase: = spelling")
+    check(meson_logbase(["--logbase", "a", "--logbase=b"]) == "b", "logbase: last one wins")
+    check(meson_logbase(["--logbase"]) == "testlog", "logbase: dangling flag -> default")
+    check(junit_path("b") == os.path.join("b", "meson-logs", "testlog.junit.xml")
+          and retry_report_name() == "flake-retry.json"
+          and enum_junit_name("s") == "flake-retry-enum-s.catch2.xml",
+          "logbase: default paths are byte-identical to the historical names")
+    check(junit_path("b", "testlog-pg") == os.path.join("b", "meson-logs", "testlog-pg.junit.xml")
+          and retry_report_name("testlog-pg") == "testlog-pg-flake-retry.json"
+          and enum_junit_name("s", "testlog-pg") == "testlog-pg-flake-retry-enum-s.catch2.xml",
+          "logbase: non-default paths carry the logbase")
+    with tempfile.TemporaryDirectory() as d:
+        logs = os.path.join(d, "meson-logs")
+        os.makedirs(logs)
+        mine = os.path.join(logs, enum_junit_name("a", "testlog-pg"))
+        theirs = os.path.join(logs, enum_junit_name("b", "testlog-nonpg"))
+        legacy = os.path.join(logs, enum_junit_name("c"))
+        for f_ in (mine, theirs, legacy):
+            with open(f_, "w") as f:
+                f.write("<testsuites/>")
+        _clear_stale_enum_junit(d, "testlog-pg")
+        check(not os.path.exists(mine) and os.path.exists(theirs) and os.path.exists(legacy),
+              "clear-stale: a logbase sweeps only its own prefix")
+        _clear_stale_enum_junit(d)
+        check(os.path.exists(theirs) and not os.path.exists(legacy),
+              "clear-stale: the default sweep never touches a logbase-prefixed file")
+        write_retry_report(d, "linux", [], [], "testlog-pg")
+        check(os.path.exists(os.path.join(logs, "testlog-pg-flake-retry.json"))
+              and not os.path.exists(os.path.join(logs, "flake-retry.json")),
+              "retry report: written under the logbase name only")
+        with open(junit_path(d, "testlog-pg"), "w") as f:
+            f.write('<testsuites><testsuite><testcase name="P"><failure>x</failure></testcase>'
+                    '</testsuite></testsuites>')
+        check(meson_failed_suites(d, "testlog-pg") == {"P"} and meson_failed_suites(d) is None,
+              "junit: classified from the logbase's own file, never testlog.junit.xml")
 
     # duration extraction + budget rows (#2093).
     with tempfile.TemporaryDirectory() as d:

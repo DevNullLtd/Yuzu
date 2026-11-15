@@ -41,6 +41,11 @@ the Windows event log shows one of these, and they mean different things:
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
+A server that is **running** and `/readyz` is green but refuses MFA enrolment or recovery-code
+regeneration with a `503` "Authentication store is temporarily unavailable" is a different case: the
+host's random-number generator may have failed, not the database. See
+[MFA enrolment refused: random-number failure](#mfa-enrolment-refused-random-number-failure-503).
+
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
 within `StartLimitIntervalSec=60`, then enters `failed`:
 
@@ -266,18 +271,21 @@ lockout state of that moment, so sessions revoked since the dump (a password
 change, **Sign out everywhere**, an admin force-logout) become valid again
 until they expire. A failover to a standby that was behind loses the same recent changes. After any restore of the auth schema, or such a failover:
 
-1. **Restart every server replica.** A
-   running replica adopts the session write-generation from the database only when
-   the value is strictly greater than the one it already holds. After a
-   point-in-time restore, or a failover to a standby that was behind, the counter
-   can be lower than a replica's cached value, so that replica does not see later
-   revocations as changes and keeps serving the sessions it cached. A restart
-   empties the cache and the replica then rebuilds each session from its row.
-   Until every replica has restarted, or the counter climbs back past the highest
-   value any replica cached, revoking a session (a password change, **Sign out
+1. **Restart every server replica.** A running replica polls the session
+   write-generation about once a second and drops its whole session cache when
+   the stored value differs from the one it holds, a lower value included. After
+   a point-in-time restore, or a failover to a standby that was behind, the
+   counter can be lower than a replica's cached value; in the common case the
+   replica notices at its next poll and rebuilds each session from its row, so a
+   revocation takes effect within about that interval. The restart stays as
+   defence in depth for the case the poll cannot see: a counter that is exactly
+   equal to the replica's cached value at its next poll (restored to that value,
+   or regressed and climbed back to it between two polls) looks unchanged, and
+   that replica keeps serving the sessions it cached. A restart empties the cache. Until every
+   replica has restarted, revoking a session (a password change, **Sign out
    everywhere**, an admin force-logout, or the SQL below) is not guaranteed to
-   take effect on all replicas; the worst case is bounded by the 8-hour absolute
-   session lifetime.
+   take effect on all replicas in that case; the worst case is bounded by the
+   8-hour absolute session lifetime.
 2. Revoke every operator session (`DELETE /api/v1/sessions?username=<name>` per
    account, or the SQL in [Sessions are durable](#sessions-are-durable)). Do it
    straight after the restarts: a session row restored from the dump is valid
@@ -389,7 +397,11 @@ then clear this replica's cache. If the response body reports
 `db_error=true`), only this replica's cache was cleared. The rows survive, and
 any replica that misses its cache, including this one after a restart, will
 rebuild those sessions from them. Retry the revoke once the database is
-healthy.
+healthy. A session whose local account is inactive or deleted is refused at
+validation regardless, so a surviving row of a deactivated account does not
+serve once each replica's generation poll has run (about one second on a healthy
+poll, at most about 30 seconds while a replica's poll fails; see
+`docs/auth-architecture.md`, "Account state at session validation").
 
 API tokens are a separate credential class. The admin `?username=` call does
 **not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
@@ -412,8 +424,8 @@ DELETE FROM session_store.sessions;
 -- Bump the write-generation exactly as SessionStore does, so every
 -- replica that tracks this counter drops its cached sessions on its next
 -- generation poll (~1s). After a restore or a failover to a lagging standby
--- this is not guaranteed; restart every replica as well (see "A restore
--- rolls credentials and sessions back" above).
+-- a replica still notices a changed counter, but restart every replica as
+-- well (see "A restore rolls credentials and sessions back" above).
 INSERT INTO session_store.session_meta (key, value) VALUES ('write_generation', '1')
 ON CONFLICT (key) DO UPDATE SET value = (session_store.session_meta.value::bigint + 1)::text;
 COMMIT;
@@ -422,13 +434,17 @@ SQL
 
 The generation bump is required. A running replica serves a cached session
 without re-reading its row, and clears its cache only when it sees the
-write-generation advance. A bare `DELETE` therefore leaves every cached
+write-generation change. A bare `DELETE` therefore leaves every cached
 session valid on the replica that holds it, until some later session change
-advances the generation, the session expires, or that replica restarts.
-The same limit applies to the bump itself after a point-in-time restore or a
-failover to a standby that was behind: a replica adopts the generation only when
-it is strictly greater than its cached value, so restart every server replica
-to be sure the revocation reaches all of them.
+moves the generation, the session expires, or that replica restarts.
+After a point-in-time restore or a failover to a standby that was behind, a
+replica also clears its cache when the counter is lower than the value it
+cached, so the bump reaches it within about the poll interval. The exception is
+a counter that is exactly equal to the replica's cached value at its next poll:
+that looks unchanged and is not detected. The bump moves the counter by one, so
+if the restored value was one below a replica's cached value, the bump lands
+exactly on it. Restart every server replica to be sure the revocation reaches
+all of them.
 
 `ON_ERROR_STOP` makes `psql` exit non-zero if any statement fails, in which
 case the whole transaction has rolled back and nothing changed. Afterwards,
@@ -549,9 +565,9 @@ also clears the account's lockout, recording `auth.lockout.cleared`
 (`detail=password_reset`) only when there was a lockout to clear. There
 is no MCP tool for either (#5357 tracks a temporary-password reset tool).
 
-**Re-running the Windows server installer is not a reset.** On an upgrade it
-refuses `/ADMIN_PASS=` (and the removed `/OPERATOR_PASS=`) with exit code 11
-(the config file it would write only seeds an empty database).
+**Re-running an installer is not a reset.** The config file seeds an empty
+database only. (The Windows server installer, discontinued by ADR-0035,
+refused `/ADMIN_PASS=` on an upgrade with exit code 11 for that reason.)
 
 **Fallback — direct SQL**, when no administrator can sign in at all (the only
 admin forgot their password). This writes no audit row and revokes no
@@ -621,6 +637,54 @@ Then sign in, revoke the account's old sessions
 (`DELETE /api/v1/sessions?username=admin`, or **Sign out everywhere**), and
 consider enrolling a second administrator so the in-product reset is
 available next time.
+
+## SCIM / dashboard deprovision returns 500 (`sessions_db_error`)
+
+**What it means.** Deprovisioning a person (SCIM `PATCH`/`PUT` with `active:false`, SCIM `DELETE` of an active user, or the dashboard user delete) first revokes their API tokens and deletes their durable cookie-session rows, then deactivates the account. If either revoke did not persist, the call answers `500` and leaves the account active; for SCIM the resource and identity links are untouched. Credentials whose revoke did persist stay revoked (a sessions-only failure leaves the API tokens already revoked, and in a multi-principal call the other principals' sessions stay deleted). The audit row has result `partial` and a detail with `api_tokens_db_error=true` and/or `sessions_db_error=true`. The usual cause is a Postgres brownout or failover; see [Sessions are durable](#sessions-are-durable) and [Postgres substrate unreachable](#postgres-substrate-unreachable).
+
+**There is no break-glass.** While the session store is degraded a deprovision cannot complete. Do not disable the identity provider connector's retry. Wait for Postgres to recover, then let the connector retry or run the deprovision again (for the dashboard, delete the user again). Until it completes, treat the person's Yuzu sessions as live.
+
+**Finding the affected accounts.** `YuzuSessionStoreDegraded` is `increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held `for: 10m`, with no `op` filter (any operation counts), so a short outage may never fire it. The audit rows are the interim signal. This query lists the last seven days of deprovisions that did not complete:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT to_timestamp(timestamp) AT TIME ZONE 'UTC' AS at_utc, principal, action, result, target_id, detail
+     FROM audit_store.audit_events
+    WHERE action IN ('scim.user.deactivated', 'scim.user.deleted', 'scim.user.provisioned', 'user.delete')
+      AND ((result = 'partial' AND (detail LIKE '%sessions_db_error=true%' OR detail LIKE '%api_tokens_db_error=true%'))
+           OR detail LIKE '%durable session wipe failed%'
+           OR detail LIKE 'account_state=unknown%'
+           OR detail LIKE 'store_failure%')
+      AND timestamp >= extract(epoch FROM now() - interval '7 days')
+    ORDER BY timestamp DESC;"
+```
+
+`target_id` is the username for `user.delete` and the SCIM id for the three SCIM actions; the username is in `scim_store.scim_resources` (`SELECT username FROM scim_store.scim_resources WHERE scim_id = '<target_id>';`). A `scim.user.provisioned` row is a `POST /Users` with `active:false`: the account already exists and the IdP's retry meets `409`, so deactivate it by a `PATCH` with `active:false` (or from the dashboard) once the store has recovered. A `scim.user.provisioned` `success` row with `session_leg_backstopped=true` is not a failure: the account removal's own session wipe covered the delete. A `failure` row with `account deactivated; durable session wipe failed` means the account is down and its session row may survive; the row is not served once each replica's generation poll has run (a session whose local account is inactive is rejected at validation: about one second after the deactivation commits on a healthy poll, at most about 30 seconds while a replica's poll fails), and you can remove it with `DELETE /api/v1/sessions?username=<name>`. `yuzu_auth_session_account_inactive_total` counts those refusals; it is not evidence of a failed wipe, because a healthy deactivation can increment it too. That call writes to the same session store, so it works only once PostgreSQL is healthy; it needs `UserManagement:Write` and asks for an MFA step-up only when the caller is a session whose account has an enrolled factor (see "Ending the sessions by hand" below).
+
+A `failure` row whose detail starts `account_state=unknown` (SCIM, `503`) or `store_failure` (dashboard `user.delete`, `503`) means the guarded deactivation did not complete and the account may still be active; the response does not tell you why. Besides a lock wait on the `rbac_enabled`, grant or account rows, the cause can be the deactivation's own write of the session write-generation: the transaction takes the fleet-shared `session_store.session_meta` row last, and it aborts (the account stays active) when that row cannot be locked within the 2000 ms lifecycle lock timeout (a stuck or slow-committing session writer holds it) or when the session store cannot be reached from the owner's pool. That cause cannot be told apart from a lock timeout in the response. Retry once the store is healthy. While it persists, deactivations keep failing; a session writer's transaction sets no timeout of its own and runs under the pool's default lock timeout (10 seconds unless the DSN sets its own) and statement timeout (30 seconds).
+
+**Confirming it converged.** After the retry succeeds, the matching `scim.user.deactivated`, `scim.user.deleted` or `user.delete` row has result `success`, and no session row is left for the account:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT count(*) FROM session_store.sessions WHERE username = 'alice';"
+```
+
+The count must be 0. For a person who signs in through OIDC or SAML, also check the linked principal names (`oidc:...`, `saml:...`; they are listed in the success row's `revoked_principals=` detail). If the count is not 0, end the sessions with `DELETE /api/v1/sessions?username=<name>` and run the check again.
+
+### Sessions of deactivated accounts
+
+A durable session row of a deactivated local account can linger (a failed wipe, or a deactivation by SQL). This query lists them by username:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT s.username, count(*) FROM session_store.sessions s
+     JOIN auth.users u USING (username)
+    WHERE NOT u.is_active AND s.auth_source = 'local'
+    GROUP BY 1;"
+```
+
+For a deactivation made through the product, these rows are refused at validation once each replica's generation poll has run (about one second on a healthy poll, at most about 30 seconds while a replica's poll fails; see `docs/auth-architecture.md`, "Account state at session validation"). A deactivation made by direct SQL bumps no generation, so a replica with a warm cache keeps serving the session until the next generation change, and only a cold read refuses it: end those users' sessions with `DELETE /api/v1/sessions?username=<name>` or restart the replicas. The reaper removes these rows at expiry, and you can remove them at once with the same `DELETE`. The query matches local sessions of accounts that still have an `auth.users` row; a hard-deleted account has none. Returning to an earlier build is not supported, and an earlier build does not refuse these rows; if it happens regardless, run the query and end those sessions first (see `docs/user-manual/upgrading.md`, "Rollback").
 
 ## Emergency MFA disable (break-glass)
 
@@ -771,12 +835,17 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
 The count must be 0. A session the user opens after the reset (a fresh sign-in) shows
 as a new row, so run the check straight after the delete. The delete bumps the session
 write-generation, and each replica polls that counter about once a second
-(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it advances, so
-the account is signed out on every replica within about a second. If a replica's poll
-is failing, it trusts its cache for at most 30 seconds from its last successful poll
-(`kSessionGenStaleServeBoundMs`) and then falls back to the store, which no longer
-holds the row. After a restore or a failover to a lagging standby this bound does not
-hold; see [Sessions are durable](#sessions-are-durable).
+(`kSessionGenRefreshMs`, 1000 ms) and drops its cached sessions when it
+changes (a lower value after a restore or failover included), so the account is
+signed out on every replica within about a second. If a replica's poll is
+failing, it trusts its cache for at most 30 seconds from its last successful
+poll (`kSessionGenStaleServeBoundMs`) and then falls back to the store, which no
+longer holds the row. After a restore or a failover to a lagging standby a lower
+counter is also detected at the next poll; only a counter exactly equal to a
+replica's cached value goes undetected. The poll must read the primary: a
+reader answered by nodes holding different counters clears the cache on every
+flip, at most once per replica per second; see
+[Sessions are durable](#sessions-are-durable).
 
 **Finding a partial result.** A failed session delete from Settings increments
 `yuzu_auth_session_store_degrade_total{op="invalidate_user"}`, but a single event
@@ -1117,6 +1186,83 @@ sudo systemctl restart yuzu-server
 ```
 
 To enrol a non-admin approver deliberately (rather than recover from a lockout), see the next section.
+
+**Security note for this procedure.** While the flag is relaxed, every account that has no enrolled second
+factor, administrators included, signs in with its password alone, and an attacker holding such a password
+can enrol their own authenticator. Do it for the shortest possible window, from a restricted network, with
+the security owner's approval and a ticket recording the start and end time (no audit row covers the
+window), enrol the affected administrators first, and afterwards review the `auth.login` and
+`mfa.enroll.verified` rows from the window for accounts you did not expect. Enforcement is read per replica
+at startup, so restart every replica.
+
+If new enrolments are being refused under `--mfa-enforcement=required` and the cause is the host's
+random-number generator (not a misconfiguration), do **not** start here: see
+[MFA enrolment refused: random-number failure](#mfa-enrolment-refused-random-number-failure-503), because
+relaxing the flag does not help when the fault is host-wide.
+
+## MFA enrolment refused: random-number failure (503)
+
+The server draws random values for MFA secrets, recovery codes and their salts, and for session and
+sign-in tokens. When the host's random source fails you will see one of two shapes.
+
+**Shape 1: the MFA secret or recovery-code draws fail (audited, counted).** MFA enrolment (sign-in under
+`--mfa-enforcement`, or Settings → Security and sign-in → Two-factor sign-in) or **Regenerate recovery
+codes** is refused. The operator sees "Authentication store is temporarily unavailable — retry shortly"
+(a `503` at sign-in), but the database is fine:
+
+- `/readyz` is green, and `yuzu_auth_secret_unavailable_total` and `yuzu_auth_read_degrade_total` are flat;
+- `yuzu_secure_random_failure_total{site="mfa_enroll"}` (the TOTP secret) or `{site="mfa_recovery"}`
+  (a recovery code or its salt) is rising;
+- the audit row (`mfa.enroll.required` at sign-in enrolment, `mfa.enroll.initiated` or `mfa.enroll.failed`
+  in Settings, `mfa.enroll.failed` at the sign-in confirm step, or `mfa.recovery_codes.generated`) has a
+  `detail` starting `csprng_unavailable: `. Only the sign-in confirm step also emits the
+  `mfa.enroll.failed` event, with `reason=csprng_unavailable`; a refusal at sign-in enrol-init is audit-only;
+- the server log has a `CSPRNG failure` line.
+
+Nothing was issued or changed: no TOTP secret, no recovery codes and no partial enrolment, and stored
+enrolments and recovery codes are untouched.
+
+**Shape 2: the whole random source is dead (not audited, not counted).** The same source also mints sign-in
+pending tokens and session tokens, and those draws are not covered by the counter or the audit trail. If the
+source is wholly dead, sign-in itself, including for already-enrolled accounts, fails with a bare `500`, and
+you will see **no audit row for the failure and flat counters**. A bare `500` at sign-in with the
+`RAND_bytes failed` log line is this shape. These draws are tracked follow-ups (#6996, #7018); until then
+the signals are the sign-in 5xx rate and that log line. If `site=api_token`, `device_token` or
+`engine_principal` is moving as well, the fault is host-wide and not specific to MFA.
+
+One ordering matters: at the sign-in enrolment confirm step the session-token draw runs *after* the
+enrolment has committed and its success audit rows (`mfa.enroll.verified`, `mfa.recovery_codes.generated`)
+have been written. If that draw fails the account is enrolled, the user never saw the recovery codes, and
+the response is a bare `500`; once the host recovers, the user signs in and regenerates the codes from
+Settings (#7018). PBKDF2 hashing of a recovery code can also throw (a provider failure, not a random draw;
+#7012).
+
+**Cause.** The host's random source failed: `getrandom` or `/dev/urandom` blocked or denied in a container
+(seccomp, a read-only `/dev`), a FIPS or OpenSSL provider that did not initialise, or an entropy shortage
+in a very early boot or a freshly cloned VM. Check as the service user:
+
+```bash
+openssl rand -hex 8                      # must print 16 hex characters
+python3 -c "import os; os.getrandom(8)"  # must not raise (Linux)
+```
+
+**Fix: restore the entropy source first.** Do not restart the server until `openssl rand -hex 8` works for
+the service user: a server whose random source is dead can fail to boot as well, which turns a degraded
+server into an outage. Once the source is back, retry; no change to the auth store is needed.
+
+**Keeping sign-in working under `--mfa-enforcement=required`.** While the fault lasts no *new* account can
+enrol, and under `required` an un-enrolled account cannot sign in. `--mfa-reset` does **not** help: it clears
+an enrolment, and the blocked account has none. Relaxing `--mfa-enforcement` can help only in Shape 1, when
+sign-in itself still works. If sign-in returns `500` (Shape 2), no flag change helps: restore entropy.
+If you do use the lever, follow the security note in
+[Locked out by MFA enforcement misconfiguration](#locked-out-by-mfa-enforcement-misconfiguration)
+(shortest possible window, approval, restricted network, enrol administrators first, restart every
+replica, review the window's `auth.login` and `mfa.enroll.verified` rows afterwards).
+
+**During a rolling upgrade.** Counters are per replica. An un-upgraded replica still reports a Shape 1
+fault as `yuzu_auth_secret_unavailable_total{route="mfa_enroll"}` (and at sign-in also
+`yuzu_auth_read_degrade_total{route="login"}`) with a `store_unavailable` audit detail. Alert on both signals
+until every replica runs the same build.
 
 ## Enrolling a non-admin approver
 
@@ -1469,7 +1615,7 @@ one of the two paths above.
 
 ## Step-up returns 503 while the authentication store is unavailable
 
-The 37 routes that need a fresh MFA step-up (token, session, engine-principal,
+The 41 routes that need a fresh MFA step-up (token, session, engine-principal,
 RBAC and Guardian writes, password reset and the others listed in the
 [REST API reference](../user-manual/rest-api.md#step-up-envelope-on-high-risk-endpoints))
 check the caller's MFA state before the route runs. Other mutating routes and all
@@ -1688,7 +1834,7 @@ authentication store or reset the affected account. Know its limits:
   elevation still asks for a fresh proof and still fails if the store cannot be
   read.
 - **SAML sessions pass too.** The window check precedes the SAML denial, so while
-  the window is `0` or less a SAML session reaches the 37 central routes instead of
+  the window is `0` or less a SAML session reaches the 41 central routes instead of
   getting its `403`, except approve and reject (`POST /api/approvals/{id}/approve` and
   `/reject`), which keep their own gate whatever this value is (next bullet).
 - **Approval approve and reject keep a gate of their own.** The approver gate

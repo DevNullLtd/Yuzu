@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""test_disk_actions_definition.py -- pins the definition YAML contract of the two planned
-disk_actions actions (partitions, topology) against the literals below, so a gather block added
-to an on-demand definition, a renamed or reordered result column, or a changed platform set
+"""test_disk_actions_definition.py -- pins the definition YAML contract of the two on-demand
+disk_actions actions that are not read on every OS (partitions: read on Windows only, topology:
+planned everywhere) against the literals below, so a gather block added to an on-demand definition, a renamed or reordered result column, or a changed platform set
 fails here rather than only in a dashboard or in the regenerate-to-pass plugin_doc_gen gate. It
 compares the YAML with the literals below; it does not read the C++.
 
@@ -54,7 +54,7 @@ class DiskActionsPlannedDefinitions(unittest.TestCase):
                 self.assertEqual(spec["execution"]["action"], action)
                 self.assertEqual(spec["platforms"], ALL_OSES)
                 self.assertEqual(spec["type"], "question")  # read-only: the catalogue gate relies on it
-                self.assertNotIn("gather", spec)  # on-demand until a sync is wired; planned rows are not worth gathering
+                self.assertNotIn("gather", spec)  # on-demand until a sync is wired; the section actions are dispatched in-process by the daily sync, not gathered
 
     def test_row_kind_leads_and_the_columns_match_the_wire_row(self):
         for action, (_, expected, _) in PLANNED.items():

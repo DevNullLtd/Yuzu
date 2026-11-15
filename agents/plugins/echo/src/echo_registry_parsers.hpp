@@ -9,7 +9,7 @@
 //   Layer 1 (WHAT changed): a RegNotifyChangeKeyValue subtree watch marks a root
 //     dirty; a budgeted subtree read is diffed against the root's persisted
 //     BASELINE (echo_state `registry:<root>`), giving added/changed/removed values
-//     with old and new data (diff_registry_snapshot).
+//     with their new data and the old value's type and size (diff_registry_snapshot).
 //   Layer 2 (WHO): a write-only Kernel-Registry ETW session (SetValueKey |
 //     DeleteValueKey | DeleteKey, mask 0x4300). Those events carry the writer's
 //     pid and the VALUE NAME, but the key-name field is empty on most of them, so
@@ -55,6 +55,21 @@
 // than guessed: loss -> attr:degraded, session down -> attr:off, buffer lost across a
 // restart/pause -> attr:lost-restart, two or more pids -> attr:ambiguous:<n>, none ->
 // attr:none.
+//
+// OFFLINE HIVES. A profile whose hive is not loaded (a logged-off user) keeps its per-user
+// roots in scope under the SAME root names as when it is loaded (`HKU\<sid>\<suffix>`), so
+// one baseline carries across logoff and logon. Such a root has no key watch and no ETW
+// attribution: it is read on the HOURLY tick (not on a restart's full re-read) by mounting the
+// hive file through the shared guarded ladder, once per hive, and its rows carry source=offline and
+// detail=attr:offline -- an unloaded hive is written by file-level tools or by another
+// process's mount, never by a registry call this session could attribute, so nothing is
+// correlated and nothing is held. An offline root never advances window_base and takes no part
+// in the retention floor; when a root goes offline its live window_base is reset and its stale
+// notify is consumed, so nothing from its loaded life pins the ETW buffer. When it is loaded
+// again its first loaded read happens at once and diffs against the offline baseline. A failed
+// mount is an Unreadable read with a named reason (one gap row per transition); an INCOMPLETE
+// profile discovery keeps the known offline list (reconcile_offline); removing a known profile
+// or taking a new path for it needs two agreeing walks in one tick (collect() confirms).
 
 #include "echo_db.hpp" // RegistryEvent
 
@@ -68,10 +83,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -81,8 +98,7 @@ namespace yuzu::echo {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-inline constexpr std::size_t kRegistryDataCap = 4096;       // rendered new value, bytes of text
-inline constexpr std::size_t kBaselineRenderCap = 512;      // rendered prefix kept in the baseline
+inline constexpr std::size_t kRegistryDataCap = 512;        // rendered new value, bytes of text
 inline constexpr std::size_t kBaselineValueCap = 50000;     // values per root read
 inline constexpr std::size_t kBaselineKeyCap = 20000;       // keys per root read
 inline constexpr std::size_t kBaselineDepthCap = 16;
@@ -109,17 +125,40 @@ inline constexpr std::int64_t kFiletimeUnixDelta100ns = 116444736000000000LL; //
 
 // ── Scope ────────────────────────────────────────────────────────────────────
 
+/// A profile whose hive file can be mounted: its SID and the directory holding its NTUSER.DAT
+/// (the ProfileList path). The roots read from it are named exactly like the loaded ones.
+struct OfflineProfile {
+    std::string sid, path;
+    bool operator==(const OfflineProfile&) const = default;
+};
+
+/// What one profile-list walk found. `complete == false` means the walk was cut short or a
+/// source could not be opened: it says nothing about what does NOT exist, so the caller keeps
+/// what it knew. `partial` names sids whose ProfileList record exists but whose path could
+/// not be read this walk (their previous entry stands even on a complete walk).
+struct OfflineDiscovery {
+    bool complete{true};
+    std::vector<std::string> partial;
+    std::vector<OfflineProfile> profiles;
+};
+
 /// The curated watch list: HKLM roots, plus suffixes applied to every loaded
-/// per-user hive. A root is a normalised path with a leading hive token:
-/// `HKLM\<path>` or `HKU\<sid>\<path>`.
+/// per-user hive and, by the same names, to every offline one. A root is a normalised path
+/// with a leading hive token: `HKLM\<path>` or `HKU\<sid>\<path>`.
 struct RegistryScope {
     std::vector<std::string> hklm;       // HKLM-relative paths
     std::vector<std::string> hku_suffix; // appended after the HKU sid component
 
-    /// Concrete roots for the loaded hive names under HKEY_USERS. Only SID-named hives
-    /// are user profiles (see is_user_hive_name); every other name is skipped.
+    /// Concrete roots for the loaded hive names under HKEY_USERS, then the offline profiles'.
+    /// Only SID-named hives are user profiles (see is_user_hive_name); every other name is
+    /// skipped. A sid present in both lists is emitted once, from the loaded list.
     [[nodiscard]] std::vector<std::string>
-    roots_for(const std::vector<std::string>& hku_subkeys) const;
+    roots_for(const std::vector<std::string>& hku_subkeys,
+              const std::vector<OfflineProfile>& offline) const;
+    [[nodiscard]] std::vector<std::string>
+    roots_for(const std::vector<std::string>& hku_subkeys) const {
+        return roots_for(hku_subkeys, {});
+    }
 };
 
 /// A loaded user profile's HKEY_USERS key is its SID: "S-1-" and then digits and dashes.
@@ -135,17 +174,67 @@ struct RegistryScope {
                        [](char c) { return (c >= '0' && c <= '9') || c == '-'; });
 }
 
+/// The start of every temporary hive mount agents/shared/win_reg_handle.hpp's
+/// unique_hive_mount_name() mints: `YUZU_HIVE_<sid>_<16 hex>_<n>`. It is the whole definition of a
+/// mount the start-up sweep may unload, and no profile hive (a SID), `.DEFAULT` or
+/// `<sid>_Classes` carries it.
+inline constexpr std::string_view kHiveMountPrefix = "YUZU_HIVE_";
+
+/// The HKEY_USERS subkeys the start-up sweep may unload: the names that start with `prefix`.
+/// `prefix` only NARROWS the set (the live test salts it with its own fake sid so that it never
+/// touches another process's mount on a shared runner); one that does not itself start with
+/// kHiveMountPrefix selects nothing, so no argument can reach a profile hive.
+[[nodiscard]] inline std::vector<std::string>
+select_stale_hive_mounts(const std::vector<std::string>& hku_subkeys,
+                         std::string_view prefix = kHiveMountPrefix) {
+    std::vector<std::string> out;
+    if (!prefix.starts_with(kHiveMountPrefix))
+        return out;
+    for (const auto& n : hku_subkeys)
+        if (n.starts_with(prefix))
+            out.push_back(n);
+    return out;
+}
+
+/// What a sweep did with each mount it was handed.
+struct HiveSweepResult {
+    std::vector<std::string> released; // unloaded
+    // the unload was refused or failed (a holder has it open, it was already gone, or the
+    // privilege was not held)
+    std::vector<std::string> retained;
+};
+
+/// Offers every name to `unload` (true = the mount is gone), in order. A refusal is recorded and
+/// the rest are still attempted, so one held hive never keeps another leaked mount loaded.
+/// `unload` must not force: a refusal is how a hive that is in use stays safe. The caller must
+/// have selected the names (select_stale_hive_mounts); this applies no name test of its own.
+[[nodiscard]] inline HiveSweepResult
+sweep_hive_mounts(const std::vector<std::string>& names,
+                  const std::function<bool(const std::string&)>& unload) {
+    HiveSweepResult r;
+    for (const auto& n : names)
+        (unload(n) ? r.released : r.retained).push_back(n);
+    return r;
+}
+
 inline std::vector<std::string>
-RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys) const {
+RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys,
+                         const std::vector<OfflineProfile>& offline) const {
     std::vector<std::string> out;
     for (const auto& p : hklm)
         out.push_back("HKLM\\" + p);
-    for (const auto& sid : hku_subkeys) {
-        if (!is_user_hive_name(sid))
-            continue;
+    std::vector<std::string> seen;
+    const auto add = [&](const std::string& sid) {
+        if (!is_user_hive_name(sid) || std::find(seen.begin(), seen.end(), sid) != seen.end())
+            return;
+        seen.push_back(sid);
         for (const auto& s : hku_suffix)
             out.push_back("HKU\\" + sid + "\\" + s);
-    }
+    };
+    for (const auto& sid : hku_subkeys)
+        add(sid);
+    for (const auto& o : offline)
+        add(o.sid);
     return out;
 }
 
@@ -210,6 +299,175 @@ RegistryScope::roots_for(const std::vector<std::string>& hku_subkeys) const {
     if (b == std::string_view::npos)
         return {std::string(full), {}};
     return {std::string(full.substr(0, b)), std::string(full.substr(b + 1))};
+}
+
+/// The sid component of a `HKU\<sid>\...` root, empty for any other root.
+[[nodiscard]] inline std::string hku_sid_of(std::string_view root) {
+    constexpr std::string_view kHku = "HKU\\";
+    if (!root.starts_with(kHku))
+        return {};
+    const auto rest = root.substr(kHku.size());
+    return std::string(rest.substr(0, rest.find('\\')));
+}
+
+/// Is `root` one of an offline profile's (sid component match, not a prefix)? Takes the SET of
+/// offline sids: collect() asks it for every root of every profile each tick.
+[[nodiscard]] inline bool is_offline_root(std::string_view root,
+                                          const std::set<std::string>& offline_sids) {
+    const std::string sid = hku_sid_of(root);
+    return !sid.empty() && offline_sids.contains(sid);
+}
+
+/// A virtual service account's SID (NT SERVICE\\*, IIS app pools, virtual machines, the Window
+/// Manager and Font Driver Host accounts). Their profile hives are loaded by the service that owns
+/// them, so an hourly exclusive mount from here could race that load; they are not logged-off
+/// users either, so offline discovery never lists them. Deliberately a prefix list, NOT "only
+/// S-1-5-21-": Entra-joined users are S-1-12-1-. A loaded hive of one of these is still watched
+/// like any loaded hive.
+[[nodiscard]] inline bool is_virtual_service_sid(std::string_view sid) {
+    constexpr std::array<std::string_view, 5> kPrefixes{"S-1-5-80-", "S-1-5-82-", "S-1-5-83-",
+                                                         "S-1-5-90-", "S-1-5-96-"};
+    return std::any_of(kPrefixes.begin(), kPrefixes.end(),
+                       [&](std::string_view p) { return sid.starts_with(p); });
+}
+
+/// The offline profile list after a discovery: the ONE rule collect() and the tests share.
+/// A complete walk replaces the known list (keeping the entry of a sid it could not read the
+/// path for); an incomplete walk keeps it whole and ADDS the profiles it did list (never removes:
+/// removal needs a complete walk, so a host with more profiles than the walk's cap still gets the
+/// ones the walk reaches). A loaded sid is never offline.
+///
+/// `prev_loaded` is the loaded list the previous tick committed. A sid that was loaded then and
+/// is not now has just logged off: it is a known profile whose path is not yet known, so it
+/// joins `known` as `{sid, ""}` before the rules above run. A real `known` entry wins (first
+/// seen); an incomplete walk carries it; a complete walk carries it only when it names the sid
+/// in `partial` or lists it in `profiles` (which supplies the path). A complete walk that names
+/// it nowhere still drops it from THIS list, and a listed path for a known sid is taken here as
+/// the walk gave it; collect() confirms both with a second walk of the same tick: a removal
+/// needs both complete walks to omit the profile, and a path first learned or changed for a known
+/// profile is taken only when both walks list the SAME path, otherwise the profile reverts to
+/// its previous entry (a pathless one stays pathless). Only SID-named hives count
+/// (`.DEFAULT` and `<sid>_Classes` leave HKU too, and are not profiles), and a virtual service
+/// SID or a well-known system SID that unloads is not a logged-off user either: it is never
+/// carried, so it costs no confirming walk and leaves no entry behind.
+///
+/// A sid the walk flagged `partial` keeps its known path when it has one, even if the same walk
+/// also lists it: the pair `S` + `S.bak` is the temporary-profile signature, and a listed `S` then
+/// points at the TEMP folder, whose hive must never be diffed against the real baseline. Such a
+/// profile keeps being read from its known path while the pair persists; one with no path yet (a
+/// known pathless entry, or a sid first seen beside a stale `.bak`) has none to read.
+[[nodiscard]] inline std::vector<OfflineProfile>
+reconcile_offline(const std::vector<OfflineProfile>& known_in,
+                  const std::vector<std::string>& prev_loaded,
+                  const std::vector<std::string>& loaded, const OfflineDiscovery& d) {
+    std::vector<OfflineProfile> known = known_in;
+    for (const auto& sid : prev_loaded)
+        if (is_user_hive_name(sid) && !is_virtual_service_sid(sid) &&
+            !yuzu::profiles::is_system_sid(sid) &&
+            std::find(loaded.begin(), loaded.end(), sid) == loaded.end())
+            known.push_back({sid, {}});
+    std::vector<OfflineProfile> out;
+    const auto is_loaded = [&](const std::string& sid) {
+        return std::find(loaded.begin(), loaded.end(), sid) != loaded.end();
+    };
+    const auto push = [&](const OfflineProfile& p) {
+        const bool seen = std::any_of(out.begin(), out.end(),
+                                      [&](const OfflineProfile& o) { return o.sid == p.sid; });
+        if (is_loaded(p.sid) || seen)
+            return;
+        out.push_back(p);
+    };
+    if (d.complete) {
+        const auto is_partial = [&](const std::string& sid) {
+            return std::find(d.partial.begin(), d.partial.end(), sid) != d.partial.end();
+        };
+        for (const auto& k : known) // a known real path outranks a listed one for a partial sid
+            if (!k.path.empty() && is_partial(k.sid))
+                push(k);
+        for (const auto& p : d.profiles)
+            push(p);
+        for (const auto& k : known) // a pathless one comes after, so a listed path can fill it
+            if (is_partial(k.sid))
+                push(k);
+    } else {
+        for (const auto& k : known) {
+            OfflineProfile e = k;
+            if (e.path.empty()) // a known profile with no path yet takes the one this walk did list
+                if (const auto it = std::find_if(d.profiles.begin(), d.profiles.end(),
+                                                 [&](const OfflineProfile& p) { return p.sid == k.sid; });
+                    it != d.profiles.end())
+                    e.path = it->path;
+            push(e);
+        }
+        for (const auto& p : d.profiles)
+            push(p); // additive: a sid already known keeps its entry
+    }
+    return out;
+}
+
+/// One ProfileList walk, classified: the pure half of the Windows shell's discovery (which only
+/// gathers the three walk facts, the merged profile list and the sids whose record failed to
+/// read). A loaded profile is not offline. A profile whose path could not be read or is empty
+/// is `partial` (its previous cursor entry stands), as is a sid whose record failed outright (a
+/// failed `<sid>.bak` record by its base sid, as a listed one is).
+/// A failed ProfileList open walked nothing: incomplete, with no profiles. A walk cut short or
+/// stopped at the profile cap is incomplete too, but the profiles it did list are returned.
+/// A `<sid>.bak` record (the leftover of a temporary-profile event) proves its base sid exists
+/// and is mid-rename: the base sid is `partial` (its known entry stands) and the record is never
+/// a profile, so it is never mounted under the `.bak` name. The base sid's OWN record is then not
+/// listed either: beside a `.bak` it names the temporary profile's folder, whose hive must never
+/// be mounted against the real baseline, so the pair is `partial`: a known profile with a
+/// non-empty path is still read from that path (reconcile_offline pushes it), and one with no
+/// path yet is not read until the `.bak` is gone (a known pathless entry is counted by
+/// registry_offline_roots_deferred; a first-seen sid is reported by nothing). A virtual service
+/// SID is skipped outright (is_virtual_service_sid).
+[[nodiscard]] inline OfflineDiscovery
+classify_offline_discovery(bool walk_complete, bool root_failed, bool truncated,
+                           std::span<const yuzu::profiles::ProfileInfo> profiles,
+                           std::span<const std::string> failed_sids) {
+    OfflineDiscovery d;
+    if (root_failed) {
+        d.complete = false;
+        return d;
+    }
+    d.complete = walk_complete && !truncated;
+    const auto add_partial = [&](const std::string& sid) {
+        if (std::find(d.partial.begin(), d.partial.end(), sid) == d.partial.end())
+            d.partial.push_back(sid);
+    };
+    // A `<sid>.bak` record, listed or failed, names its BASE sid, never the `.bak` text.
+    std::set<std::string> has_backup; // base sids that have a `.bak` sibling in this walk
+    const auto add_backup_base = [&](const std::string& record) {
+        const std::string base = record.substr(0, record.size() - 4);
+        if (is_user_hive_name(base) && !is_virtual_service_sid(base)) {
+            add_partial(base);
+            has_backup.insert(base);
+        }
+    };
+    for (const auto& p : profiles)
+        if (p.state != yuzu::profiles::HiveState::loaded &&
+            yuzu::profiles::is_profile_backup_entry(p.sid))
+            add_backup_base(p.sid);
+    for (const auto& sid : failed_sids)
+        if (yuzu::profiles::is_profile_backup_entry(sid))
+            add_backup_base(sid);
+    for (const auto& p : profiles) {
+        if (p.state == yuzu::profiles::HiveState::loaded ||
+            yuzu::profiles::is_profile_backup_entry(p.sid))
+            continue;
+        if (is_virtual_service_sid(p.sid))
+            continue;
+        if (has_backup.contains(p.sid))
+            continue; // beside its `.bak`: the temporary profile's record, partial only
+        if (p.profile_path_unreadable || p.profile_path.empty())
+            add_partial(p.sid);
+        else
+            d.profiles.push_back({p.sid, p.profile_path});
+    }
+    for (const auto& sid : failed_sids) // a record that failed to read is not "gone"
+        if (!yuzu::profiles::is_profile_backup_entry(sid) && !is_virtual_service_sid(sid))
+            add_partial(sid);
+    return d;
 }
 
 // ── Value rendering ─────────────────────────────────────────────────────────
@@ -385,12 +643,41 @@ struct SubtreeRead {
     RegistryReadStatus status{RegistryReadStatus::Unreadable};
     std::map<std::string, std::map<std::string, RegistryValueRead>> keys;
     std::vector<std::string> skipped;
+    /// Empty for an ordinary read. An Unreadable read can name its cause, which the gap row
+    /// quotes: an offline read that could not mount its hive carries the refusal
+    /// (`offline:<token>`), and a live read whose whole hive was unloaded under it carries
+    /// `hive_unloaded`.
+    std::string reason;
+    /// key -> its LastWriteTime (FILETIME 100 ns) as the reader saw it. A row's time is the
+    /// moment the key was written, not the end of the read that noticed it.
+    std::map<std::string, std::int64_t> written;
+};
+
+/// One offline hive mounted once and read for all its due roots (keyed by logical root).
+/// `attempted == false` means the mount was never tried (the shared gate was closed, or an
+/// earlier mount this tick timed out): nothing is learned about the hive, so the caller
+/// retries next tick instead of writing a baseline or a gap row.
+struct OfflineHiveRead {
+    bool attempted{true};
+    std::string reason;
+    std::map<std::string, SubtreeRead> roots;
 };
 
 /// True when `key` is `prefix` itself or a descendant of it (on a path-separator
 /// boundary, so `...\Run2` is not under `...\Run`).
 [[nodiscard]] inline bool registry_key_under(std::string_view key, std::string_view prefix) {
     return key.starts_with(prefix) && (key.size() == prefix.size() || key[prefix.size()] == '\\');
+}
+
+/// True for `HKLM\SYSTEM\CurrentControlSet\Services\bam\State` and everything beneath it
+/// (ASCII case-insensitive, on a separator boundary). The Background Activity Moderator rewrites
+/// a per-user value for every program launch, so its subtree is not configuration: it would
+/// produce a row per launch and, because its key times keep moving during a read, leave the
+/// whole Services root partial. The reader does not open it and the diff ignores it.
+[[nodiscard]] inline bool registry_path_excluded(std::string_view full) {
+    constexpr std::string_view kBam = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\bam\\State";
+    return yuzu::profiles::iequals_ascii(full.substr(0, kBam.size()), kBam) &&
+           (full.size() == kBam.size() || full[kBam.size()] == '\\');
 }
 
 /// Pure budget accounting for the production reader (R9): one place decides when
@@ -409,8 +696,10 @@ private:
 };
 
 /// What the baseline remembers about a value: type, full stored size, a hash of
-/// every byte read (R8: a change anywhere in the value shows), a rendered prefix
-/// for the old-value column, and `dt` = the value exceeded kBaselineValueReadCap, so
+/// every byte read (R8: a change anywhere in the value shows), `d` (a rendered prefix of the
+/// old value, no longer filled: the old value is not stored in a row, so keeping it in every
+/// baseline only grew echo_state; the field is still written, empty, so a rolled-back build
+/// decodes the baseline), and `dt` = the value exceeded kBaselineValueReadCap, so
 /// `h` covers only what the reader returned (nothing, from the Windows API, which has
 /// no partial read) and a change that keeps the type and size is not detected.
 struct BaselineEntry {
@@ -432,7 +721,6 @@ struct BaselineEntry {
     yuzu::shared::Sha256 sha;
     sha.update(bytes.data(), bytes.size());
     e.h = sha.hex_digest().substr(0, 32); // 128 bits
-    e.d = render_reg_data(type, bytes, kBaselineRenderCap).text;
     e.dt = truncated;
     return e;
 }
@@ -511,8 +799,9 @@ struct RegistryCandidate {
     std::string prev_data;
     bool prev_truncated{false};
     std::int64_t observed_at{0}; // FILETIME of the read that saw it
+    std::int64_t key_written{0}; // the key's LastWriteTime when read (FILETIME); 0 = unknown
     std::int64_t window_lo{0}, window_hi{0}; // (lo, hi]: when the write must have happened
-    std::string source;                      // notify | reconcile
+    std::string source;                      // notify | reconcile | offline
 };
 
 struct DiffResult {
@@ -563,17 +852,23 @@ struct DiffResult {
         c.window_lo = window.lo;
         c.window_hi = window.hi;
         c.source = std::string(source);
+        // Known only for a key the read visited; a vanished key keeps 0.
+        if (read.keys.contains(key))
+            if (const auto w = read.written.find(key); w != read.written.end())
+                c.key_written = w->second;
         return c;
     };
     auto set_prev = [](RegistryCandidate& c, const BaselineEntry& e) {
         c.has_prev = true;
         c.prev_type = e.t;
         c.prev_size = e.s;
-        c.prev_data = e.d;
-        c.prev_truncated = e.dt || e.d.size() >= kBaselineRenderCap;
+        c.prev_data = e.d; // empty for any baseline this build wrote; a legacy one may carry text
+        c.prev_truncated = e.dt;
     };
 
     for (const auto& [key, values] : read.keys) {
+        if (registry_path_excluded(key))
+            continue;
         auto& out_vals = r.baseline.keys[key];
         const auto bk = base.keys.find(key);
         for (const auto& [name, v] : values) {
@@ -606,7 +901,7 @@ struct DiffResult {
             });
         };
         for (const auto& [key, values] : base.keys) {
-            if (read.keys.contains(key))
+            if (read.keys.contains(key) || registry_path_excluded(key))
                 continue;
             if (under_skipped(key)) {
                 r.baseline.keys[key] = values; // not readable now: nothing proves it is gone
@@ -626,7 +921,7 @@ struct DiffResult {
         // Values removed from a key that survived.
         for (const auto& [key, values] : read.keys) {
             const auto bk = base.keys.find(key);
-            if (bk == base.keys.end() || suppress)
+            if (bk == base.keys.end() || suppress || registry_path_excluded(key))
                 continue;
             for (const auto& [name, e] : bk->second) {
                 if (values.contains(name))
@@ -639,6 +934,8 @@ struct DiffResult {
     }
     // A Capped read started from a copy of the baseline: what it did not return
     // (it may simply be past the cap) stays, and only what it visited is updated.
+    // An excluded key a legacy baseline still holds is dropped, once, with no rows.
+    std::erase_if(r.baseline.keys, [](const auto& kv) { return registry_path_excluded(kv.first); });
     r.changed = !(r.baseline == base);
     return r;
 }
@@ -819,7 +1116,11 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
                             std::int64_t snapshot_id) {
     RegistryEvent ev;
     const auto ms = filetime_to_unix_ms(c.observed_at);
-    ev.ts = ms / 1000;
+    // Row time is when the key was written, when the read saw a plausible stamp (after 1601 and
+    // not after the read that observed it); else the end of the read. observed_at and the
+    // record key stay on the read, so replay de-duplication is unchanged.
+    const bool key_time_ok = c.key_written > 0 && c.key_written <= c.observed_at;
+    ev.ts = (key_time_ok ? filetime_to_unix_ms(c.key_written) : ms) / 1000;
     ev.snapshot_id = snapshot_id;
     auto [hive, rest] = split_hive(c.key);
     ev.hive = std::move(hive);
@@ -834,9 +1135,10 @@ registry_row_from_candidate(const RegistryCandidate& c, std::uint32_t actor_pid,
     }
     if (c.has_prev) {
         ev.prev_data_type = std::string(yuzu::profiles::reg_type_name(c.prev_type));
-        ev.prev_data = c.prev_data;
+        // The old value is not stored (it would double every changed row); its type and size
+        // are kept, and prev_data_truncated = 1 reads "there was a value, not stored".
         ev.prev_data_size = static_cast<std::int64_t>(c.prev_size);
-        ev.prev_data_truncated = c.prev_truncated ? 1 : 0;
+        ev.prev_data_truncated = c.prev_size > 0 ? 1 : 0;
     }
     ev.actor_pid = actor_pid;
     ev.actor_image = actor_image;
@@ -865,6 +1167,15 @@ stitch_registry_tick(const std::vector<RegistryCandidate>& candidates,
                      std::int64_t now, std::int64_t snapshot_id) {
     StitchResult out;
     for (const auto& c : candidates) {
+        if (c.source == "offline") {
+            // An unloaded hive's change was not a registry write this session could attribute
+            // (a file-level edit, or another process's mount), so it is never correlated and
+            // never held: the marker cannot depend on a later event.
+            ++out.counters.none;
+            out.rows.push_back(
+               registry_row_from_candidate(c, 0, {}, "attr:offline", snapshot_id));
+            continue;
+        }
         const bool lost_restart = c.window_lo < flags.events_since;
         const bool off = !flags.etw_running;
         if (!lost_restart && !off && now - c.window_hi < kEtwSettle100ns) {
@@ -918,6 +1229,10 @@ struct RegistryRootState {
     std::string status; // complete | absent | unreadable | capped | due
     bool armed{true};
     std::vector<std::string> skipped; // denied child keys (sorted; a Capped read only adds): a new member is a gap
+    // Offline scheduling marker, separate from `status`: a refused hive the read budget
+    // deferred keeps status "unreadable" (one gap row per transition) and is still retried
+    // next tick.
+    bool deferred{false};
     bool operator==(const RegistryRootState&) const = default;
 };
 
@@ -964,7 +1279,8 @@ retention_watermark(const std::map<std::string, RegistryRootState>& roots,
 
 /// The cursor row is a content store: besides positions it holds the HELD candidates --
 /// changes the key watch saw whose attribution is not final yet -- with their rendered
-/// old and new values, for up to one settle interval. It is written as version 2
+/// new value (and the old one only when the baseline came from an older build), for up to
+/// one settle interval. It is written as version 2
 /// whenever it holds a candidate or a loss epoch, else as version 1: a build that
 /// predates `held` ignores the field and would re-encode the cursor without it, dropping
 /// changes whose baseline already advanced with no gap row. Such a build only reads
@@ -978,6 +1294,10 @@ struct RegistryCursor {
     std::vector<RegistryCandidate> held;
     std::vector<LossEpoch> loss;
     std::vector<std::string> hku;
+    // Known unloaded profiles, as [sid, ProfileImagePath] (the path names the user). Not
+    // version-gated like `held`: an older build has no offline coverage to lose, so it ignores
+    // the field and its leave-scope path drops those roots; a re-upgrade re-baselines them silently.
+    std::vector<OfflineProfile> offline;
     std::string ccs; // ControlSetNNN the machine was on when the baselines were taken
 };
 
@@ -988,8 +1308,8 @@ inline nlohmann::json candidate_to_json(const RegistryCandidate& c) {
             {"a", c.action},       {"t", c.type},         {"s", c.size},
             {"d", c.data},         {"dtr", c.data_truncated}, {"hp", c.has_prev},
             {"pt", c.prev_type},   {"ps", c.prev_size},   {"pd", c.prev_data},
-            {"ptr", c.prev_truncated}, {"o", c.observed_at}, {"lo", c.window_lo},
-            {"hi", c.window_hi},   {"src", c.source}};
+            {"ptr", c.prev_truncated}, {"o", c.observed_at}, {"kw", c.key_written},
+            {"lo", c.window_lo},   {"hi", c.window_hi},   {"src", c.source}};
 }
 
 inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
@@ -1008,6 +1328,9 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     c.prev_data = j.at("pd").get<std::string>();
     c.prev_truncated = j.at("ptr").get<bool>();
     c.observed_at = j.at("o").get<std::int64_t>();
+    // Optional: a candidate held by an earlier build has no key time (the row then takes the
+    // end of its read).
+    c.key_written = std::max<std::int64_t>(0, j.value("kw", std::int64_t{0}));
     // Clamped: now - window_hi is signed arithmetic, and a corrupt or tampered row must
     // not make it overflow. A valid window is non-negative and ordered.
     c.window_lo = std::max<std::int64_t>(0, j.at("lo").get<std::int64_t>());
@@ -1023,6 +1346,12 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     if (!json)
         return cur; // absent: a first-ever tick, not a lost cursor
     cur.present = true;
+    const auto lost_cursor = [] {
+        RegistryCursor lost;
+        lost.present = true;
+        lost.malformed = true;
+        return lost;
+    };
     try {
         const auto j = nlohmann::json::parse(*json);
         const int v = j.is_object() ? j.at("v").get<int>() : 0;
@@ -1043,6 +1372,7 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
             st.status = r.at("status").get<std::string>();
             st.armed = r.at("armed").get<bool>();
             st.skipped = r.value("skipped", std::vector<std::string>{});
+            st.deferred = r.value("deferred", false);
             cur.roots.emplace(name, std::move(st));
         }
         // Optional: a cursor written before held/loss existed has neither, and holds no
@@ -1055,12 +1385,18 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
                 cur.loss.push_back({e.at(0).get<std::int64_t>(), e.at(1).get<std::int64_t>()});
         for (const auto& s : j.at("hku"))
             cur.hku.push_back(s.get<std::string>());
+        // Optional: absent before offline hives existed. An element that is not a [sid, path]
+        // pair of strings is malformed, like a bad `held` element.
+        if (const auto it = j.find("offline"); it != j.end()) {
+            for (const auto& e : it->get<std::vector<nlohmann::json>>()) {
+                if (!e.is_array() || e.size() != 2)
+                    return lost_cursor();
+                cur.offline.push_back({e.at(0).get<std::string>(), e.at(1).get<std::string>()});
+            }
+        }
         // An unknown field is ignored, so a later build can add state to this cursor.
     } catch (const nlohmann::json::exception&) {
-        RegistryCursor lost;
-        lost.present = true;
-        lost.malformed = true;
-        return lost;
+        return lost_cursor();
     }
     return cur;
 }
@@ -1071,11 +1407,14 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     j["tick"] = cur.tick;
     j["ccs"] = cur.ccs;
     auto roots = nlohmann::json::object();
-    for (const auto& [name, st] : cur.roots)
+    for (const auto& [name, st] : cur.roots) {
         roots[name] = {{"baselined", st.baselined},   {"window_base", st.window_base},
                        {"read_start", st.read_start}, {"read_end", st.read_end},
                        {"status", st.status},         {"armed", st.armed},
                        {"skipped", st.skipped}};
+        if (st.deferred)
+            roots[name]["deferred"] = true; // optional on decode: only written when set
+    }
     j["roots"] = std::move(roots);
     auto held = nlohmann::json::array();
     for (const auto& c : cur.held)
@@ -1086,6 +1425,12 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
         loss.push_back(nlohmann::json::array({e.lo, e.hi}));
     j["loss"] = std::move(loss);
     j["hku"] = cur.hku;
+    if (!cur.offline.empty()) { // optional on decode: an older build ignores it
+        auto offline = nlohmann::json::array();
+        for (const auto& o : cur.offline)
+            offline.push_back(nlohmann::json::array({o.sid, o.path}));
+        j["offline"] = std::move(offline);
+    }
     // A registry value can hold bytes that are not valid UTF-8 after rendering;
     // never let that decide whether the cursor can be written.
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
@@ -1139,6 +1484,43 @@ struct DecodedBaseline {
         out.malformed = true;
     }
     return out;
+}
+
+// ── Walking an index-driven OS list (RegEnumKeyExW and its kin) ─────────────────────
+
+/// What an index-driven enumerator answers for one index.
+enum class ListStep { Item, End, Error };
+
+/// The result of walking such a list. `error` is empty exactly when the walk ended at the
+/// list's end. A walk that ended on an error is a FAILED READ, never a short list: `names` is
+/// then empty, so a partial list cannot be mistaken for a complete one.
+struct ListWalk {
+    std::vector<std::string> names;
+    std::string error; // "index <i> (<the detail the step supplied>)" when the walk failed
+};
+
+/// Walk `step(i, name, err)` from index 0: it fills `name` and answers Item, answers End at
+/// the end of the list, or fills `err` and answers Error. Only End completes a walk. (An
+/// index-driven walk can still skip a hive that loads or unloads while it runs, with no
+/// error code; the next name-watch or hourly pass lists it.)
+template <class Step>
+[[nodiscard]] ListWalk walk_enumeration(Step&& step) {
+    ListWalk walk;
+    for (unsigned i = 0;; ++i) {
+        std::string name;
+        std::string err;
+        switch (step(i, name, err)) {
+        case ListStep::Item:
+            walk.names.push_back(std::move(name));
+            break;
+        case ListStep::End:
+            return walk;
+        case ListStep::Error:
+            walk.names.clear();
+            walk.error = "index " + std::to_string(i) + " (" + err + ")";
+            return walk;
+        }
+    }
 }
 
 } // namespace yuzu::echo

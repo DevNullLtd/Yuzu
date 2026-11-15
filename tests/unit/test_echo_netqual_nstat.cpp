@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace yuzu::echo;
@@ -391,6 +392,82 @@ TEST_CASE("nstat_decode_tcp_src_desc decodes an IPv4 flow", "[echo][netqual][nst
     REQUIRE(decoded->remote_port == 443);
     REQUIRE(decoded->pid == 4321);
     REQUIRE(decoded->process_name == "testproc");
+}
+
+TEST_CASE("nstat_decode_tcp_src_desc decodes the descriptor's TCP state into the open event",
+          "[echo][netqual][nstat]") {
+    const auto decode = [](std::uint32_t state) {
+        TcpDescriptor desc{};
+        desc.local = make_v4({10, 0, 0, 5}, 1);
+        desc.remote = make_v4({10, 0, 0, 6}, 2);
+        desc.state = state;
+        auto decoded = nstat_decode_tcp_src_desc(build_src_desc_msg(7, kNstatProviderTcp, desc));
+        REQUIRE(decoded.has_value());
+        return *decoded;
+    };
+    // TCPS_* values: 4 ESTABLISHED, 10 TIME_WAIT, 1 LISTEN, 5 CLOSE_WAIT.
+    CHECK(decode(4).state == "ESTABLISHED");
+    CHECK(decode(10).state == "TIME_WAIT");
+    CHECK(decode(1).state == "LISTEN");
+    CHECK(decode(5).state == "CLOSE_WAIT");
+    CHECK(decode(99).state == "UNKNOWN"); // never fabricated into a real state
+
+    // The open event carries it, so a socket first reported already closing is not labelled
+    // ESTABLISHED by the plugin.
+    CHECK(nstat_build_open_event(1'700'000'000, decode(10)).state == "TIME_WAIT");
+    CHECK(nstat_build_open_event(1'700'000'000, decode(4)).state == "ESTABLISHED");
+}
+
+TEST_CASE("network_event_from_nstat_flow keeps an ending descriptor state and labels every other "
+          "open state ESTABLISHED",
+          "[echo][netqual][nstat]") {
+    NstatFlowEvent open;
+    open.ts_unix = 1'700'000'123;
+    open.is_open = true;
+    open.proto = "tcp6";
+    open.local_addr = "::1";
+    open.local_port = 5000;
+    open.remote_addr = "2001:db8::1";
+    open.remote_port = 443;
+    open.pid = 321;
+    open.process_name = "curl";
+
+    // The state the descriptor reported is what is stored, not a hard-coded ESTABLISHED.
+    open.state = "TIME_WAIT";
+    const auto closing = network_event_from_nstat_flow(open, 42);
+    CHECK(closing.state == "TIME_WAIT");
+    CHECK(closing.action == "connected");
+    CHECK(closing.ts == 1'700'000'123);
+    CHECK(closing.snapshot_id == 42);
+    CHECK(closing.proto == "tcp6");
+    CHECK(closing.local_addr == "::1");
+    CHECK(closing.local_port == 5000);
+    CHECK(closing.remote_addr == "2001:db8::1");
+    CHECK(closing.remote_port == 443);
+    CHECK(closing.remote_host.empty()); // a lifecycle stream does not resolve names
+    CHECK(closing.pid == 321);
+    CHECK(closing.process_name == "curl");
+
+    // A descriptor that never resolved a state falls back to ESTABLISHED.
+    open.state.clear();
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+
+    // Only an ending state is kept: a live flow in any other state keeps the ESTABLISHED label
+    // the fleet-snapshot reader (which keeps only ESTABLISHED rows) expects.
+    open.state = "SYN_SENT";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+    open.state = "LISTEN";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "ESTABLISHED");
+    open.state = "CLOSE_WAIT";
+    CHECK(network_event_from_nstat_flow(open, 42).state == "CLOSE_WAIT");
+
+    // A close event is stored CLOSED with the disconnected action, whatever it carried.
+    NstatFlowEvent close = open;
+    close.is_open = false;
+    close.state = "ESTABLISHED";
+    const auto closed = network_event_from_nstat_flow(close, 42);
+    CHECK(closed.state == "CLOSED");
+    CHECK(closed.action == "disconnected");
 }
 
 TEST_CASE("nstat_decode_tcp_src_desc decodes the pname process identity",
@@ -804,4 +881,188 @@ TEST_CASE("nstat_stream_is_stalled measures idle from the later of last-event/st
     REQUIRE_FALSE(nstat_stream_is_stalled(0, 0, 9'999, threshold));
     // Backward clock step (now < since) -> negative delta -> not stalled (benign).
     REQUIRE_FALSE(nstat_stream_is_stalled(last, start, last - 500, threshold));
+}
+
+// -- #6899: closing-state opens follow the poll leg's once-per-hour rule ------
+
+namespace {
+
+NstatFlowEvent closing_open(std::int64_t ts, const char* proc, const char* remote, int port,
+                            const char* state = "TIME_WAIT") {
+    NstatFlowEvent e;
+    e.ts_unix = ts;
+    e.is_open = true;
+    e.proto = "tcp";
+    e.local_addr = "10.0.0.2";
+    e.local_port = 50000;
+    e.remote_addr = remote;
+    e.remote_port = port;
+    e.pid = 7;
+    e.process_name = proc;
+    e.state = state;
+    return e;
+}
+
+} // namespace
+
+TEST_CASE("nstat_dedupe_closing_opens: two TIME_WAIT opens for one process and remote in an hour "
+          "store one row and the next hour stores another",
+          "[echo][netqual][nstat]") {
+    constexpr std::int64_t hour0 = 1'700'000'400; // inside one hour
+    HourlySeenSet seen;
+
+    std::vector<NstatFlowEvent> batch{closing_open(hour0, "curl", "203.0.113.9", 443),
+                                      closing_open(hour0 + 5, "curl", "203.0.113.9", 443)};
+    auto kept = nstat_dedupe_closing_opens(std::move(batch), seen);
+    REQUIRE(kept.size() == 1);
+    // Stored through the same conversion the plugin uses: one row, the ending state kept.
+    CHECK(network_event_from_nstat_flow(kept[0], 1).state == "TIME_WAIT");
+
+    // The next hour records the pair again.
+    std::vector<NstatFlowEvent> later{closing_open(hour0 + 3600, "curl", "203.0.113.9", 443)};
+    CHECK(nstat_dedupe_closing_opens(std::move(later), seen).size() == 1);
+}
+
+TEST_CASE("nstat_dedupe_closing_opens: the key is process plus remote address plus remote port and "
+          "only closing-state opens are filtered",
+          "[echo][netqual][nstat]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    auto live = closing_open(ts, "curl", "203.0.113.9", 443, "ESTABLISHED");
+    // A close keeps the flow's last-known closing state, so only `is_open` tells it from the
+    // deduplicated open: deleting the `!e.is_open` arm would filter it.
+    auto close = closing_open(ts, "curl", "203.0.113.9", 443);
+    close.is_open = false;
+
+    std::vector<NstatFlowEvent> batch{
+        closing_open(ts, "curl", "203.0.113.9", 443),   // first: kept
+        closing_open(ts, "curl", "203.0.113.9", 8443),  // other port: kept
+        closing_open(ts, "wget", "203.0.113.9", 443),   // other process: kept
+        closing_open(ts, "curl", "203.0.113.10", 443),  // other remote: kept
+        closing_open(ts, "curl", "203.0.113.9", 443),   // repeat: dropped
+        live, live,                                      // not closing: never filtered
+        close, close,                                    // closes: never filtered
+    };
+    const auto kept = nstat_dedupe_closing_opens(std::move(batch), seen);
+    CHECK(kept.size() == 8);
+    // Order is preserved: the first four are the distinct closing opens.
+    CHECK(kept[1].remote_port == 8443);
+    CHECK(kept[2].process_name == "wget");
+    CHECK_FALSE(kept[6].is_open);
+    CHECK_FALSE(kept[7].is_open);
+}
+
+TEST_CASE("nstat_release_closing_keys: a dropped closing-state row gives its hourly key back so "
+          "the next sighting in the hour is stored",
+          "[echo][netqual][nstat]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    auto kept = nstat_dedupe_closing_opens({closing_open(ts, "curl", "203.0.113.9", 443)}, seen);
+    REQUIRE(kept.size() == 1);
+    // The typed row the plugin would have inserted, then dropped from its retry backlog.
+    std::vector<NetworkEvent> dropped{network_event_from_nstat_flow(kept[0], 1)};
+
+    // Still admitted: a re-sighting is a repeat.
+    CHECK(nstat_dedupe_closing_opens({closing_open(ts + 5, "curl", "203.0.113.9", 443)}, seen)
+              .empty());
+
+    nstat_release_closing_keys(dropped.data(), dropped.data() + dropped.size(), seen);
+    CHECK(nstat_dedupe_closing_opens({closing_open(ts + 10, "curl", "203.0.113.9", 443)}, seen)
+              .size() == 1);
+
+    // Rows that hold no key (a live open, a close) release nothing: the key just re-admitted
+    // stays and the next re-sighting is still a repeat.
+    auto close = closing_open(ts, "curl", "203.0.113.9", 443);
+    close.is_open = false;
+    std::vector<NetworkEvent> keyless{
+        network_event_from_nstat_flow(closing_open(ts, "curl", "203.0.113.9", 443, "ESTABLISHED"),
+                                      1),
+        network_event_from_nstat_flow(close, 1)};
+    nstat_release_closing_keys(keyless.data(), keyless.data() + keyless.size(), seen);
+    CHECK(nstat_dedupe_closing_opens({closing_open(ts + 15, "curl", "203.0.113.9", 443)}, seen)
+              .empty());
+}
+
+// -- #6895: the seen set undoes a failed commit without a whole-set copy ------
+
+TEST_CASE("HourlySeenSet batch: a rollback erases only the keys the batch admitted",
+          "[echo][netqual][dedup]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    constexpr int kExisting = 20000 - 3;
+    for (int i = 0; i < kExisting; ++i)
+        REQUIRE(seen.first_this_hour(ts, "old" + std::to_string(i)));
+    REQUIRE(seen.size() == static_cast<std::size_t>(kExisting));
+
+    seen.begin_batch();
+    CHECK(seen.first_this_hour(ts, "new1"));
+    CHECK(seen.first_this_hour(ts, "new2"));
+    CHECK_FALSE(seen.first_this_hour(ts, "old5")); // already stored: not part of the batch
+    CHECK(seen.first_this_hour(ts, "new3"));
+    // Count-based cost: the undo list holds the 3 admitted keys, not a copy of 19,997 strings.
+    CHECK(seen.batch_admitted() == 3);
+
+    seen.rollback_batch();
+    CHECK(seen.batch_admitted() == 0);
+    CHECK(seen.size() == static_cast<std::size_t>(kExisting));
+    CHECK_FALSE(seen.first_this_hour(ts, "old5"));  // pre-existing keys survive
+    CHECK(seen.first_this_hour(ts, "new1"));        // the failed batch's keys are admissible again
+    CHECK(seen.overflows() == 0);
+}
+
+TEST_CASE("HourlySeenSet batch: a commit keeps the keys and an unfinished batch is rolled back "
+          "by the next begin",
+          "[echo][netqual][dedup]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+
+    seen.begin_batch();
+    REQUIRE(seen.first_this_hour(ts, "kept"));
+    seen.commit_batch();
+    CHECK_FALSE(seen.first_this_hour(ts, "kept"));
+
+    seen.begin_batch();
+    REQUIRE(seen.first_this_hour(ts, "abandoned")); // e.g. an exception before commit
+    seen.begin_batch();                              // the next tick starts a new batch
+    CHECK(seen.first_this_hour(ts, "abandoned"));    // so the abandoned key was erased
+    CHECK_FALSE(seen.first_this_hour(ts, "kept"));
+
+    // Outside a batch nothing is recorded.
+    seen.commit_batch();
+    CHECK(seen.first_this_hour(ts, "plain"));
+    CHECK(seen.batch_admitted() == 0);
+}
+
+TEST_CASE("BatchScope: leaving the scope without a commit rolls the batch back and a commit "
+          "keeps it",
+          "[echo][netqual][dedup]") {
+    constexpr std::int64_t ts = 1'700'000'400;
+    HourlySeenSet seen;
+    {
+        BatchScope batch{seen};
+        REQUIRE(seen.first_this_hour(ts, "abandoned")); // e.g. an exception before the commit
+    }
+    CHECK(seen.batch_admitted() == 0);
+    CHECK(seen.first_this_hour(ts, "abandoned")); // erased by the destructor: admissible again
+
+    {
+        BatchScope batch{seen};
+        REQUIRE(seen.first_this_hour(ts, "kept"));
+        batch.commit();
+    }
+    CHECK_FALSE(seen.first_this_hour(ts, "kept"));
+
+    {
+        BatchScope batch{seen};
+        REQUIRE(seen.first_this_hour(ts, "undone"));
+        batch.rollback();
+        // After a rollback the scope is closed: a key admitted now is not journaled, and the
+        // commit and the destructor that follow have nothing to keep or to undo.
+        REQUIRE(seen.first_this_hour(ts, "after_rollback"));
+        CHECK(seen.batch_admitted() == 0);
+        batch.commit();
+    }
+    CHECK(seen.first_this_hour(ts, "undone"));
+    CHECK_FALSE(seen.first_this_hour(ts, "after_rollback"));
+    CHECK(seen.batch_admitted() == 0);
 }

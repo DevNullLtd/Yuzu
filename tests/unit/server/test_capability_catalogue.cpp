@@ -36,6 +36,7 @@
 #include "capability_decls/plugin_action_catalogue_update_source_trust.hpp"
 #include "capability_decls/plugin_action_catalogue_app_control.hpp"
 #include "capability_decls/plugin_action_catalogue_firmware_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_middleware.hpp"
 #include "capability_decls/plugin_action_catalogue_runtimes.hpp"
 #include "capability_decls/plugin_action_catalogue_platform_security.hpp"
 #include "capability_decls/plugin_action_catalogue_browser_inventory.hpp"
@@ -45,6 +46,7 @@
 #include "capability_decls/plugin_action_catalogue_pkg_inventory.hpp"
 #include "capability_decls/plugin_action_catalogue_mgmt_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
+#include "capability_decls/plugin_action_catalogue_virtualization.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "command_capability.hpp"
 #include "forensics_plugin_set.hpp"
@@ -170,6 +172,8 @@ struct LabeledSpan {
         {"mgmt_posture", capdecls::plugin_action_catalogue_mgmt_posture(), false},
         {"shares", capdecls::plugin_action_catalogue_shares(), false},
         {"remote_access_audit", capdecls::plugin_action_catalogue_remote_access_audit(), false},
+        {"middleware", capdecls::plugin_action_catalogue_middleware(), false},
+        {"virtualization", capdecls::plugin_action_catalogue_virtualization(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -178,7 +182,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, twenty-nine sources exactly as a live composition site would use.
+    // literally, thirty-one sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -208,6 +212,8 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_mgmt_posture(),
         capdecls::plugin_action_catalogue_shares(),
         capdecls::plugin_action_catalogue_remote_access_audit(),
+        capdecls::plugin_action_catalogue_middleware(),
+        capdecls::plugin_action_catalogue_virtualization(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -402,9 +408,9 @@ TEST_CASE("capability catalogue: mgmt_posture.posture pins its exact classificat
 }
 
 /// Exact-row pin for `shares.list`. A read-only listing of the shares the host serves (as
-/// configured on Linux, live Server-service state on Windows) under `Infrastructure`:Read with
-/// no execute gate. Pinning it directly means a silent drift to a mutating class, a different
-/// securable, or a gate on a facts-only read fails here.
+/// configured on Linux and macOS, live Server-service state on Windows) under
+/// `Infrastructure`:Read with no execute gate. Pinning it directly means a silent drift to a
+/// mutating class, a different securable, or a gate on a facts-only read fails here.
 TEST_CASE("capability catalogue: shares.list pins its exact classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_shares();
@@ -419,6 +425,85 @@ TEST_CASE("capability catalogue: shares.list pins its exact classification",
     CHECK(row.risk_tier == authz::RiskTier::Low);
     CHECK(row.system_reserved == false);
     CHECK(row.execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.host`. A read-only device-facts read (VM or not, which
+/// hypervisor, container membership) under `Inventory`:Read with no execute gate, checked on the
+/// fragment AND as the composed registry classifies it, so neither a fragment edit nor a
+/// composition change can drift a facts-only read into a mutating class or behind a gate.
+TEST_CASE("capability catalogue: virtualization.host pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[0];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "host");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "host");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::None);
+}
+
+/// Exact-row pin for `virtualization.wsl`. A per-user, read-only list of WSL distributions (the
+/// offline arm mounts a logged-off profile's hive through the shared helper), classified exactly
+/// like `installed_apps.list_per_user`: `Inventory`:Read behind `AdminOrApproval`, checked on the
+/// fragment AND as the composed registry classifies it.
+TEST_CASE("capability catalogue: virtualization.wsl pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[1];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "wsl");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::AdminOrApproval);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "wsl");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Inventory");
+    CHECK(classified->execute_gate == ExecuteGate::AdminOrApproval);
+}
+
+/// Exact-row pin for `virtualization.runtime_posture`. Linux-only container-runtime posture read
+/// (an opt-in, operator-provided read-only socket; four fixed GET requests) under `Security`:Read
+/// like `system_hardening`, no execute gate (owner decision 2026-11-08), checked on the fragment
+/// AND as the composed registry classifies it so neither a fragment edit nor a composition change
+/// can move it to a broader reader set or behind a gate silently.
+TEST_CASE("capability catalogue: virtualization.runtime_posture pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_virtualization();
+    REQUIRE(rows.size() == 3);
+    const auto& row = rows[2];
+    CHECK(row.plugin == "virtualization");
+    CHECK(row.action == "runtime_posture");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Security");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
+
+    const auto registry = build_registry(all_labeled_sources());
+    const auto classified = registry.classify("virtualization", "runtime_posture");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == "Security");
+    CHECK(classified->execute_gate == ExecuteGate::None);
 }
 
 /// Exact-row pin for `remote_access_audit.list` (Wave 11, Forensics-class): per-account SSH key
@@ -587,12 +672,12 @@ TEST_CASE("capability catalogue: firmware_posture classifies `firmware` and refu
 /// class, so without this pin a silent change to `Mutating` or `Security`
 /// ships green (an orchestrator probe confirmed it). Appended at the end of
 /// the file so sibling plugins' pins do not collide textually.
-TEST_CASE("capability catalogue: runtimes.dotnet and runtimes.jvm pin their exact "
+TEST_CASE("capability catalogue: runtimes.dotnet, runtimes.jvm and runtimes.python pin their exact "
           "classification",
           "[server][dispatch][capability]") {
     const auto rows = capdecls::plugin_action_catalogue_runtimes();
-    REQUIRE(rows.size() == 2);
-    for (const auto action : {"dotnet", "jvm"}) {
+    REQUIRE(rows.size() == 3);
+    for (const auto action : {"dotnet", "jvm", "python"}) {
         const auto it =
             std::find_if(rows.begin(), rows.end(), [&](const auto& r) { return r.action == action; });
         REQUIRE(it != rows.end());
@@ -771,4 +856,23 @@ TEST_CASE("capability catalogue: no plugin name can collide with the unverified 
     }
     CHECK(rows > 0);
     CHECK(kUnverifiedProvenanceLabel.front() == '~');
+}
+
+/// Exact-row pin for `middleware.ibm_mq`: ReadOnly/None on the `Inventory` securable (an
+/// installed-software fact, not a posture fact). The generic invariants accept ANY seeded
+/// securable and ANY dispatch class, so without this pin a silent re-typing ships green.
+TEST_CASE("capability catalogue: middleware.ibm_mq pins its exact classification",
+          "[server][dispatch][capability]") {
+    const auto rows = capdecls::plugin_action_catalogue_middleware();
+    REQUIRE(rows.size() == 1);
+    const auto& row = rows.front();
+    CHECK(row.plugin == "middleware");
+    CHECK(row.action == "ibm_mq");
+    CHECK(row.dispatch_class == DispatchClass::ReadOnly);
+    CHECK(row.mutability == Mutability::None);
+    CHECK(row.securable == "Inventory");
+    CHECK(row.operation == authz::Operation::Read);
+    CHECK(row.risk_tier == authz::RiskTier::Low);
+    CHECK(row.system_reserved == false);
+    CHECK(row.execute_gate == ExecuteGate::None);
 }

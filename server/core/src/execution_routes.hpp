@@ -86,8 +86,9 @@
 ///     with NO audit call at all; only a genuine SUCCESS is audited.
 ///   - `cancel`: the confined-mutation-denied branch audits `"denied"`; the
 ///     unconfined + unknown-id 404 branch is NOT audited (mirrors the GET
-///     routes' unconfined-404 rule); `mark_cancelled` returning `false`
-///     audits `"failure"` (503); success audits `"success"`.
+///     routes' unconfined-404 rule); `mark_cancelled_checked` returning
+///     `kFailed` audits `"failure"` (503) and `kNoOp` (already terminal) audits
+///     `"denied"` (409, #3845); success audits `"success"`.
 ///   - **Target-type casing split (pre-existing, not this move's doing):**
 ///     the GET routes' denial rows use PascalCase `"Execution"` as
 ///     `target_type`; `rerun`/`cancel`'s rows use lowercase `"execution"`.

@@ -20,7 +20,7 @@ The default enrollment mode. When an agent connects without a token, it enters a
 yuzu-agent --server server.example.com:50051
 ```
 
-The agent will attempt registration, receive a "pending" status, and retry with an increasing delay (2 s, doubling, up to 256 s) until approved.
+The agent will attempt registration, receive a "pending" status, and retry with a randomised delay that tends to grow (a random wait between 1 s and three times the previous wait, at most 300 s, the first retry after 1 to 3 s) until approved.
 
 **Server side (dashboard):** Navigate to **Estate > Groups and enrolment** (panel **Agents waiting for approval**) or **Settings > Pending Agent Approvals**; both show the same queue. The page is named "Groups and enrolment" (UK spelling); the Settings panels keep their existing US-spelling names. Each entry shows the agent's hostname, OS, architecture, version and the time it first asked to join (UTC). Click **Approve**, **Deny**, or **Forget** (`DELETE /api/settings/pending-agents/{id}`, audited as `enrollment.remove`; it removes a waiting request, and the agent is queued again the next time it asks to join). A denied agent stays listed as **Denied** ("denial recorded") with no button. The page offers no way to reverse a denial and the product has no reinstate action today (see below); the **Deny** and **Deny all** confirmations say "This page offers no way to reverse a denial." **Approve all** and **Deny all** act on every waiting agent, including any that arrive after the page loaded, and their confirmation gives the total and the first ten hostnames. At most 200 rows are listed (waiting agents first, then denied). When more than 200 agents are waiting, the panel says "Showing 200 of N" and the two bulk buttons are disabled, because they would also act on the agents not shown; when every waiting agent is listed but denied ones are cut off, it says how many denied agents are not listed.
 
@@ -236,8 +236,9 @@ Every enrolled agent reports identity attributes during registration and heartbe
 | `arch` | CPU architecture | `x86_64`, `aarch64` |
 | `os_version` | OS version string | `Windows 11 Pro 10.0.26200` |
 | `agent_version` | Running agent binary version | `0.9.3` |
+| `guardian_backend` | Guardian detection backend from the heartbeat: `legacy`, `spark`, `spark_failed`, `unwired`, or `null` when not reported (never assumed `legacy`). Served on the device REST and MCP surfaces (`GET /api/v1/devices[/{id}]`, `list_agents`, `get_agent_details`), not on the legacy `/api/agents` list | `legacy` |
 
-These fields are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping.
+These fields, except `guardian_backend`, are used by the [Scope Engine](scope-engine.md) for device targeting and by [Management Groups](management-groups.md) for access scoping; `guardian_backend` is read-only posture and is not usable in a scope expression.
 
 ---
 
@@ -259,9 +260,11 @@ Every per-device route is scoped to the device's management group (a global gran
 |---|---|---|
 | **Device info** | Identity (agent ID, OS, arch, version), tags, group membership. | `Infrastructure:Read`, scoped to the device |
 | **DEX** | Per-device DEX score + a summary of recent signal observations, with a link to the full DEX drill-down (which carries an *Application performance over time* panel — retained daily per-app-version CPU/memory from the central store, no live query, no `Execute`). | `GuaranteedState:Read`, scoped to the device. Signal-history view audited as `dex.device.view`; the app-perf panel audited as `dex.device.app_perf.view` (separate verb) |
-| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
+| **Guardian** | Per-guard compliance state for the device (guard, state, last evaluated). The compliance tile is not shown as clean while any guard's ordering is uncertain or has an unreflected event: the tile counts them and the guard row carries an "ordering uncertain" marker. The tile and a notice also account for pending evidence that has no census row yet: when a guard has recorded events that are not yet reflected in the compliance census, the notice says how many (and lists the first identifiers, as the device reported them), and the tile never shows the all-compliant state. A lens whose guards are all compliant but with uncertain verdicts or pending evidence that has no census row yet labels the tile "Compliant, ordering uncertain" instead of "Compliant". | `GuaranteedState:Read`, scoped to the device (audited as `guardian.device.view`) |
 
-A device with zero reported guards renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
+A device with zero reported guards and no pending evidence renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
+
+A device with no census rows but with pending evidence renders the notice and "No guards in the compliance census" instead. If the pending-evidence read itself times out (most likely a large retained pending backlog; a lock wait, a loaded database or an administrator cancel can also cause it), the tab shows "Guardian pending-evidence read timed out" and says reloading usually will not help until the cause clears; any other store failure shows "Guardian store degraded.". A failed read of the device's emit-order state is such a failure: the tab shows "Guardian store degraded." instead of the guard rows (the tab does not render ordering), and the failed read is counted on `yuzu_server_guardian_read_degrade_total{source="guardian_census_device"}`. Either way the open is audited as `guardian.device.view` with result `failure`.
 
 #### Get live info
 
@@ -280,7 +283,7 @@ Each card has its own audit verb so a usage-class read (what a person is running
 | **Listening ports** | `network_diag/listening` | `device.live.listening` | all |
 | **Active connections** | `network_diag/connections` | `device.live.connections` | all |
 | **Logged-in users** | `users/logged_on` | `device.live.users` | all |
-| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state + `$`-table + live row count); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
+| **Capture sources** — read-only view of which Echo warehouse sources are capturing locally (toggle state, the `$<Source>_Hourly` table and its row count; a dash when the device reports no row count); configure on the Echo page | `echo/status` | `device.live.capture_sources` | all |
 | **Disk space** — free/used for the root volume with a colour-coded usage bar (>=90% used or <5 GiB free = red) | `disk_space/free` | `device.live.disk` | all |
 
 Every card requires **`Execution:Execute`** in addition to `GuaranteedState:Read`, each scoped to the device's management group; without Execute the card shows an explanatory note rather than failing silently, and a device outside your scope cannot be live-queried at all. The process tree, connections, logged-in-user, and **DNS-cache** reads are **usage-class behavioral telemetry** (a person's running software, active connections, sessions, and resolved names) and are individually audit-logged; the remaining kinds (uptime, services, adapters/IP, listening ports, ARP, capture sources, disk space) are machine-health reads.
@@ -380,8 +383,23 @@ The full set of agent command-line flags:
 | `--log-max-files` | Number of rotated log files kept. Applies whenever the agent writes a log file, otherwise ignored (env `YUZU_LOG_MAX_FILES`) | `5` |
 | `--debug` | Sets the agent's `debug_mode` configuration value to `true`. In this release it enables no extra behaviour: the only effect is that the `status` plugin's `connection` output reports `debug_mode` as `true`. It does not change the log level; use `--log-level debug` or `--verbose` for more logging. No environment variable | off |
 | `--update-check-interval` | Seconds between OTA update checks. Values are clamped to between 1 second and 8,760 hours (one year); the startup log line `OTA update checker started (interval=…s)` shows the effective value. Ignored with `--no-auto-update` (env `YUZU_UPDATE_CHECK_INTERVAL`) | `21600` (6 hours) |
+| `--container-runtime-endpoint` | Linux only. Absolute path of ONE read-only unix socket the operator provides in front of the container runtime, used by the `virtualization` plugin's `runtime_posture` action to read container state. Unset, the plugin never opens a socket. The endpoint must admit only the four read-only requests the plugin sends (see [Container runtime posture endpoint](#container-runtime-posture-endpoint-linux-opt-in)). The runtime's own default sockets are refused even when named here. The packaged service unit never sets it; contract and recipes: `docs/virtualization-runtime-posture-design.md` (env `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT`) | (none) |
 
 Agent logging is asynchronous (#4666 PR-2): a producer thread enqueues a formatted line onto a fixed-size 8192-slot queue and returns; one dedicated worker thread does the actual sink I/O, so a stalled log destination no longer blocks the agent. Under sustained overload the queue silently drops the oldest still-queued lines (`overrun_oldest`) rather than growing or blocking. There is no `--log-sync` flag to opt back into synchronous logging. A shutdown that cannot tear this logger down within an internal 2-second grace, or that fails outright while doing so, self-exits with a new code, 5 (distinct from the existing 1/3/4); see "Stopping a wedged agent" in [Server Administration](server-admin.md) for the full exit-code reference and the async-logging behavior details, and "If log volume matters" in the same page for the level-gating consequence for the SIGINT/SIGTERM shutdown log line (it goes silent at `--log-level warn` or above).
+
+### Container runtime posture endpoint (Linux, opt-in)
+
+The `virtualization` plugin's `runtime_posture` action (instruction `Container Runtime Posture`) reports which container runtimes a Linux host has and how they are set up. It lists the containers, and their risky settings (privileged, network mode, a runtime socket mounted into the container), only when you give the agent an endpoint. Without one it reads file and socket metadata only and never opens a socket. The agent is never added to the `docker` group and never connects to a runtime's own socket: `/run/docker.sock`, `/var/run/docker.sock`, `/run/podman/podman.sock` and `/run/containerd/containerd.sock` are refused as an endpoint.
+
+To set it up:
+
+1. Run a request-filtering proxy in front of the runtime, as root, under its own systemd unit that owns the socket directory (`RuntimeDirectory=yuzu-agent`). It listens on `/run/yuzu-agent/runtime.sock` and forwards to the runtime's socket.
+2. Make that socket owned by root, group the agent's group (`yuzu-agent` on the packaged unit), mode `0660`, and keep every parent directory root-owned and not writable by group or other. A socket under `/tmp` or a home directory, or a symbolic link, is refused.
+3. Configure the proxy to admit only these four requests, matched byte for byte on every request of a connection (not only the first), and to refuse everything else: `GET /version`, `GET /info`, `GET /containers/json?all=1` and `GET /containers/{id}/json`, where `{id}` is 12 to 64 lowercase hexadecimal digits. The proxy filters requests, not responses: whatever it admits comes back unchanged, and a permissive proxy lets a compromised agent reach whatever the proxy permits.
+4. Set `YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT=/run/yuzu-agent/runtime.sock` in `/etc/yuzu-agent/yuzu-agent.env` and restart the agent. The startup log then says `container runtime endpoint: configured` (the path itself is never logged).
+5. Run the `Container Runtime Posture` instruction on the host and check that the `endpoint` row reads `ok`. Any other state names the reason on that row (`endpoint_refused` carries the refusal reason, `permission_denied` means the agent could not connect, `unreachable` means nothing answered) and the result is `CONSTRAINED`.
+
+The contract, the bounds and the security review are in the [design note](../virtualization-runtime-posture-design.md); the rows and tokens are in the plugin README (`agents/plugins/virtualization/README.md`).
 
 ### Per-agent mTLS auto-provisioning (PKI)
 
@@ -499,6 +517,19 @@ curl -s -X POST http://localhost:8080/api/settings/updates/upload \
 | `rollout_pct` | No | Rollout percentage, 0--100 (default: `100`). An empty value is the default; a malformed value (`0x5`, `5abc`, `1e1`) is `400` and nothing is stored, it never becomes `100`; an out-of-range integer is clamped to 0--100 |
 | `mandatory` | No | Whether agents must apply this update (`true`/`false`, default: `false`) |
 
+The `platform`, `arch` and file name must not contain a NUL or other control byte, and must be valid UTF-8; otherwise the upload is refused with `400` (audited `ota.package.uploaded`, `result=denied`, `detail=invalid_package_field`) before anything is written. If the registry write fails after the files were published, the answer is `503`, the new files are removed and, when the upload replaced a package of the same file name, the earlier binary and signature sidecar are put back. To make that possible the previous files are kept as copies named `<file>.yuzu_prev_<suffix>` in the update directory until the write succeeds (a hard link where the filesystem allows, otherwise a copy; the live file name is never absent). A write that reports failure but whose row is found stored with this upload's SHA-256 counts as a success.
+
+A process crash between keeping a copy and finishing the upload can leave a `*.yuzu_prev_*` copy behind, and nothing removes it. Do not delete or restore these by age: compare the live file and the copy with the registry row's SHA-256 first, as "Leftover `*.yuzu_prev_*` files" in the server administration guide describes, and exclude them from file-level backups of the update directory.
+
+When the registry write fails and the row cannot be read back to tell whether it was written, the upload answers `503` "The registry did not confirm whether the package was recorded" (audit `result=failure`, `detail=outcome_unknown`): the new files and the kept copies are left in place, and repeating the same upload is safe. The upload can also answer `500`, and in each case the page shows the message:
+
+| Message | Meaning |
+|---|---|
+| `Could not prepare the package directory. Nothing was changed; retry the upload.` | A non-regular file (for example a directory) sits at the binary or signature path, or no copy of the previous file could be made. Nothing was written. |
+| `The upload failed and the previous package could not be fully restored. The previous file is kept as <file>; see the server log.` | A step of the upload failed and putting the previous files back also failed. Any `<file>.yuzu_prev_<suffix>` copy it names is the previous file; the text says only "see the server log" when no copy is involved. Apply the checksum rule in the server administration guide before renaming a copy back. |
+| `The old signature could not be removed, so the upload was rolled back. Retry the upload.` | An unsigned re-upload could not remove the earlier signature file; the previous package is back as it was. |
+
+
 ### View Available Updates
 
 ```bash
@@ -533,6 +564,8 @@ curl -s -X DELETE http://localhost:8080/api/settings/updates/linux/x86_64/0.9.4 
   -H "Origin: http://localhost:8080" \
   -b "$COOKIE"
 ```
+
+A platform, architecture or version containing a control byte or invalid UTF-8 is refused with `400` (`result=denied`, `detail=invalid_package_field`). If the registry cannot be read or the row cannot be deleted, the answer is `503` (`result=failure`, `detail=store_error`) and the binary and signature sidecar are left in place.
 
 ---
 
@@ -707,3 +740,9 @@ curl -s http://localhost:8080/api/deployment-jobs/{job_id} \
 curl -s -X DELETE http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+## Routed-concern invariants
+
+Moved verbatim from the `Device pages` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Device pages (`/devices` + `/device?id=`) — SHARED device surface: Device info / DEX / Guardian lens tabs + "Get live info" dispatch-and-poll snapshot; every kind has its own `device.live.<kind>` audit verb — usage-class reads stay separately countable (works-council). CRITICAL: (1) ALL behavioural-PII access-audit funnels through `server/core/src/rest_audit.hpp` (`emit_behavioral_audit`, #1647) — REST fail-closed 503 + `Sec-Audit-Failed`, dashboard HTML + MCP set-and-proceed; NEVER reintroduce an inline bool-capture on a new PII route (last un-migrated: `device.live.*` REST; #1703). (2) Result polls scoped at the store seam — `ResponsesFn` threads `agent_id` into `ResponseQuery{.agent_id}` (#1634); post-filter is defense-in-depth only.

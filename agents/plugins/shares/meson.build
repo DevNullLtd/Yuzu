@@ -1,11 +1,13 @@
-# shares -- what this host serves over SMB/NFS (read-only; Linux configured, Windows live).
+# shares -- what this host serves over SMB/NFS (read-only; Linux and macOS configured, Windows live).
 # Multi-TU shape follows agents/plugins/mgmt_posture/meson.build: one portable plugin TU
 # plus three per-OS leg TUs, each #ifdef-gated internally for its own target so all four are
 # listed unconditionally. The Linux leg reads config files in-process; the Windows leg calls
-# NetShareEnum (netapi32); the macOS leg is a PLANNED placeholder that reads nothing.
+# NetShareEnum (netapi32); the macOS leg reads /etc/exports in-process and runs
+# /usr/sbin/sharing through the bounded runner. nlohmann_dep: shares_parsers.hpp parses the
+# tool's JSON and is included by the plugin TU on every OS.
 # yuzu_agent_core_dep supplies the host context symbols the SDK wrapper links against
 # (yuzu_ctx_write_output and friends).
-shares_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+shares_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, nlohmann_dep]
 if host_machine.system() == 'windows'
   shares_deps += cxx.find_library('netapi32')
 endif

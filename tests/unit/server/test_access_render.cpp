@@ -96,6 +96,12 @@ AssignmentsView view_of(std::vector<PrincipalRole> rows, std::string self = "ali
     return v;
 }
 
+AssignmentsView unconfirmed_view_of(std::vector<PrincipalRole> rows) {
+    auto v = view_of(std::move(rows), "alice", /*can_assign=*/false, {});
+    v.admin_unconfirmed = true;
+    return v;
+}
+
 std::string assign_html(AssignmentsView v, std::size_t cap = kAssignmentsRenderCap) {
     return render_assignments(std::move(v), cap);
 }
@@ -117,7 +123,8 @@ std::string roles_html(std::vector<RbacRole> roles) {
 /// Every rendered state of both panels, for the corpus-wide hygiene cases.
 std::vector<std::string> every_output() {
     return {
-        list_html({user("alice", auth::Role::admin), user("bob"), user("oidc:https://x/y#sub", auth::Role::user, "oidc")}),
+        list_html({user("alice", auth::Role::admin), user("bob"),
+                   user("oidc:https://x/y#sub", auth::Role::user, "oidc")}),
         list_html({}),
         render_users_list(Unavailable{}),
         detail_html(user("bob")),
@@ -128,16 +135,21 @@ std::vector<std::string> every_output() {
         render_select_user(),
         roles_html({role("Operator", "Run things"), role("Op/erator", "x")}),
         render_roles_list(Unavailable{}),
-        render_role_permissions(RolePerms{"Operator", {perm("Tag", "Read"), perm("Tag", "Write", "deny")}}),
+        render_role_permissions(
+            RolePerms{"Operator", {perm("Tag", "Read"), perm("Tag", "Write", "deny")}}),
         render_role_permissions(RolePerms{"Operator", {}}),
         render_role_permissions(NotFound{}),
         render_role_permissions(Unavailable{}, "/fragments/access/roles/permissions?role=Operator"),
         render_select_role(),
-        render_enforcement(EnforcementView{true, false, true}),
-        render_enforcement(EnforcementView{false, false, false}),
-        render_enforcement(EnforcementView{true, true, true}),
+        render_enforcement(EnforcementView{.enabled = true, .degraded = false, .may_toggle = true}),
+        render_enforcement(
+            EnforcementView{.enabled = false, .degraded = false, .may_toggle = false}),
+        render_enforcement(EnforcementView{.enabled = true, .degraded = true, .may_toggle = true}),
+        render_enforcement(EnforcementView{
+            .enabled = true, .degraded = false, .may_toggle = false, .admin_unconfirmed = true}),
         render_enforcement(Unavailable{}),
         assign_html(view_of({grant("user", "bob", "Viewer"), grant("group", "ops", "Operator")})),
+        assign_html(unconfirmed_view_of({grant("user", "bob", "Viewer")})),
         assign_html(view_of({})),
         render_assignments(Unavailable{}),
         render_your_account("alice", "local"),
@@ -556,6 +568,21 @@ TEST_CASE("access assignments: a viewer who cannot administer sees the table and
     CHECK_THAT(html, ContainsSubstring("<td class=\"long\">bob</td>"));
 }
 
+TEST_CASE("access assignments: an unconfirmed authority check disables Assign with the reason, never hides it",
+          "[access][render]") {
+    const auto html = assign_html(unconfirmed_view_of({grant("user", "bob", "Viewer")}));
+    CHECK_THAT(html, ContainsSubstring("<button type=\"button\" class=\"btn sm\" disabled title=\"" +
+                                       std::string(kAdminUnconfirmed) + "\">Assign role</button>"));
+    CHECK_THAT(html, !ContainsSubstring("data-act="));
+    CHECK_THAT(html, ContainsSubstring("<td class=\"long\">bob</td>"));
+    // A confirmed refusal still draws nothing, so the two states stay distinguishable.
+    CHECK_THAT(assign_html(view_of({}, "alice", /*can_assign=*/false)), !ContainsSubstring("Assign role"));
+    // can_assign wins if both were ever set: the live control is never replaced by the reason.
+    auto both = view_of({}, "alice", true, {"Viewer"});
+    both.admin_unconfirmed = true;
+    CHECK_THAT(assign_html(both), ContainsSubstring("data-act=\"assign\""));
+}
+
 TEST_CASE("access assignments: the Assign button carries exactly the offered roles, or is disabled",
           "[access][render]") {
     const auto with = assign_html(view_of({}, "alice", true, {"Operator", "Viewer"}));
@@ -623,36 +650,6 @@ TEST_CASE("access derived cells: the Users and Roles tables ship 'Not shown' hoo
     CHECK_THAT(roles, ContainsSubstring("<th class=\"r\">Assigned</th>"));
 }
 
-TEST_CASE("access hint: may_attempt_rbac_admin follows the base role on a local cookie session only",
-          "[access][render]") {
-    auto s = [](auth::Role role, std::string source = "local") {
-        auth::Session x;
-        x.role = role;
-        x.auth_source = std::move(source);
-        return x;
-    };
-    CHECK(may_attempt_rbac_admin(s(auth::Role::admin)));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::user)));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "oidc")));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "saml")));
-    CHECK_FALSE(may_attempt_rbac_admin(s(auth::Role::admin, "api_token")));
-    auto scoped = s(auth::Role::admin);
-    scoped.token_scope_service = "payments";
-    CHECK_FALSE(may_attempt_rbac_admin(scoped));
-    auto mcp = s(auth::Role::admin);
-    mcp.mcp_tier = "operator";
-    CHECK_FALSE(may_attempt_rbac_admin(mcp));
-    auto engine = s(auth::Role::admin);
-    engine.principal_kind = "engine";
-    CHECK_FALSE(may_attempt_rbac_admin(engine));
-    // A JIT elevation makes the EFFECTIVE role admin but not the base role: no hint.
-    auto elevated = s(auth::Role::user);
-    elevated.elevated_until = std::chrono::system_clock::now() + std::chrono::hours(1);
-    elevated.steady_elevated_until = std::chrono::steady_clock::now() + std::chrono::hours(1);
-    REQUIRE(auth::effective_role(elevated) == auth::Role::admin); // the fixture really is elevated
-    CHECK_FALSE(may_attempt_rbac_admin(elevated));
-}
-
 // ── Your account ─────────────────────────────────────────────────────────────
 
 TEST_CASE("access account: Change password only for a local account; the disabled control carries a reason",
@@ -683,19 +680,22 @@ TEST_CASE("access account: the username is escaped", "[access][render]") {
 
 TEST_CASE("access enforcement: the switch reflects the state and is live only for an administrator hint",
           "[access][render]") {
-    const auto on = render_enforcement(EnforcementView{true, false, true});
+    const auto on =
+        render_enforcement(EnforcementView{.enabled = true, .degraded = false, .may_toggle = true});
     CHECK_THAT(on, ContainsSubstring("role=\"switch\" aria-label=\"RBAC enforcement\" checked data-act=\"enforce\">"));
     CHECK_THAT(on, ContainsSubstring("On: access follows each person&#39;s RBAC roles."));
     CHECK_THAT(on, !ContainsSubstring("disabled"));
 
-    const auto off = render_enforcement(EnforcementView{false, false, true});
+    const auto off = render_enforcement(
+        EnforcementView{.enabled = false, .degraded = false, .may_toggle = true});
     CHECK_THAT(off, ContainsSubstring("aria-label=\"RBAC enforcement\" data-act=\"enforce\">"));
     CHECK_THAT(off, !ContainsSubstring("checked"));
     CHECK_THAT(off, ContainsSubstring("Off. Turning it on needs a fleet-wide Administrator grant"));
 
     for (const bool enabled : {true, false}) {
         INFO(enabled);
-        const auto ro = render_enforcement(EnforcementView{enabled, false, false});
+        const auto ro = render_enforcement(
+            EnforcementView{.enabled = enabled, .degraded = false, .may_toggle = false});
         CHECK_THAT(ro, ContainsSubstring(" disabled title=\"Only a durable Administrator can change this.\">"));
         CHECK_THAT(ro, !ContainsSubstring("data-act="));
         CHECK_THAT(ro, ContainsSubstring(enabled ? "On. Only a durable Administrator can change this."
@@ -703,11 +703,28 @@ TEST_CASE("access enforcement: the switch reflects the state and is live only fo
     }
 }
 
+TEST_CASE("access enforcement: an unconfirmed authority check disables the switch with the reason",
+          "[access][render]") {
+    for (const bool enabled : {true, false}) {
+        INFO(enabled);
+        const auto html = render_enforcement(EnforcementView{
+            .enabled = enabled, .degraded = false, .may_toggle = false, .admin_unconfirmed = true});
+        CHECK_THAT(html, ContainsSubstring(" disabled title=\"" + std::string(kAdminUnconfirmed) + "\">"));
+        CHECK_THAT(html, ContainsSubstring(std::string(enabled ? "On. " : "Off. ") + std::string(kAdminUnconfirmed)));
+        CHECK_THAT(html, !ContainsSubstring("data-act="));
+        CHECK_THAT(html, !ContainsSubstring("Only a durable Administrator can change this."));
+        CHECK(count_of(html, "checked") == (enabled ? 1u : 0u));
+    }
+}
+
 TEST_CASE("access enforcement: a degraded view is Unconfirmed whatever the cached flag says",
           "[access][render]") {
-    const auto a = render_enforcement(EnforcementView{true, true, true});
-    const auto b = render_enforcement(EnforcementView{false, true, true});
-    const auto c = render_enforcement(EnforcementView{false, true, false});
+    const auto a =
+        render_enforcement(EnforcementView{.enabled = true, .degraded = true, .may_toggle = true});
+    const auto b =
+        render_enforcement(EnforcementView{.enabled = false, .degraded = true, .may_toggle = true});
+    const auto c = render_enforcement(
+        EnforcementView{.enabled = false, .degraded = true, .may_toggle = false});
     CHECK(a == b); // a failed read is never drawn as On or as Off
     CHECK(a == c); // and a read-only caller sees the same thing
     CHECK_THAT(a, ContainsSubstring("<span class=\"pill warn\">Unconfirmed</span>"));
@@ -728,9 +745,13 @@ TEST_CASE("access enforcement: an unreadable store is a red box, not Off", "[acc
 
 TEST_CASE("access enforcement: every live state ends with the status region the script writes into",
           "[access][render]") {
-    for (const auto& html : {render_enforcement(EnforcementView{true, false, true}),
-                             render_enforcement(EnforcementView{false, false, false}),
-                             render_enforcement(EnforcementView{true, true, true})})
+    for (const auto& html :
+         {render_enforcement(
+              EnforcementView{.enabled = true, .degraded = false, .may_toggle = true}),
+          render_enforcement(
+              EnforcementView{.enabled = false, .degraded = false, .may_toggle = false}),
+          render_enforcement(
+              EnforcementView{.enabled = true, .degraded = true, .may_toggle = true})})
         CHECK_THAT(html, ContainsSubstring("data-slot=\"out\" role=\"status\" aria-live=\"polite\"></div>"));
 }
 

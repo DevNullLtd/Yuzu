@@ -34,6 +34,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -150,9 +151,22 @@ struct Selector {
 
 /// Bounded rendering of caller text for an audit row. `log_token` neutralises control bytes,
 /// DEL, space, '=' and ',' (CWE-117), so a hostile expression cannot start a new line or forge
-/// a neighbouring `key=value` field such as `reached=0` in `audit_detail`.
+/// a neighbouring `key=value` field such as `reached=0` in `audit_detail`, and folds the Unicode
+/// line separators and maps bytes that are not well-formed UTF-8 to '_' (log_token.hpp).
+/// The cut is on a CODE POINT boundary: when `max_len` falls inside a multi-byte character the
+/// whole character is dropped (the result is up to 3 bytes shorter than `max_len`), never half
+/// of it kept.
 [[nodiscard]] inline std::string audit_token(std::string_view s, std::size_t max_len = kAuditTokenMax) {
-    std::string out = ::yuzu::log_token(s.substr(0, max_len));
+    std::size_t cut = std::min(s.size(), max_len);
+    // s[cut] is the first byte EXCLUDED from the head. A continuation byte there means the head
+    // ends mid-sequence: step back (at most 3 bytes, the longest sequence minus its lead) onto
+    // the lead byte, which is then excluded too. Stray continuation bytes in garbage input just
+    // stop the walk after 3 steps; log_token maps whatever invalid bytes remain to '_'.
+    for (int back = 0; back < 3 && cut > 0 && cut < s.size() &&
+                       (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80;
+         ++back)
+        --cut;
+    std::string out = ::yuzu::log_token(s.substr(0, cut));
     if (s.size() > max_len)
         out += "...";
     return out;

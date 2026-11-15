@@ -22,7 +22,6 @@
 #pragma once
 
 #ifdef __APPLE__
-
 #include <arpa/inet.h>
 #include <libproc.h>
 #include <sys/proc_info.h>
@@ -31,26 +30,17 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#endif
 
-namespace yuzu::shared {
+#include <string_view>
 
-struct SocketInfo {
-    pid_t pid{};
-    std::string proto; // "tcp" | "tcp6" | "udp" | "udp6"
-    std::string local_addr;
-    uint16_t local_port{};
-    std::string remote_addr;
-    uint16_t remote_port{};
-    std::string state; // TCP state name; empty for UDP (no meaningful state — never a
-                        // fabricated "LISTEN")
-};
+namespace yuzu::shared::detail {
 
-namespace detail {
-
+// Pure and cross-platform (no libproc): the nstat TCP descriptor decoder in Echo shares it, and
+// its unit tests run on every OS. TSI_S_* / TCPS_* values from <netinet/tcp_fsm.h>.
 constexpr std::string_view socket_walk_tcp_state(int st) noexcept {
     // TSI_S_* constants from <netinet/tcp_fsm.h> (included via sys/proc_info.h)
     switch (st) {
@@ -80,6 +70,25 @@ constexpr std::string_view socket_walk_tcp_state(int st) noexcept {
         return "UNKNOWN";
     }
 }
+
+} // namespace yuzu::shared::detail
+
+#ifdef __APPLE__
+
+namespace yuzu::shared {
+
+struct SocketInfo {
+    pid_t pid{};
+    std::string proto; // "tcp" | "tcp6" | "udp" | "udp6"
+    std::string local_addr;
+    uint16_t local_port{};
+    std::string remote_addr;
+    uint16_t remote_port{};
+    std::string state; // TCP state name; empty for UDP (no meaningful state — never a
+                        // fabricated "LISTEN")
+};
+
+namespace detail {
 
 inline std::string socket_walk_addr4(const struct in_addr& addr) {
     char buf[INET_ADDRSTRLEN]{};

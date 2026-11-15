@@ -76,3 +76,16 @@ host:      Docker Desktop VM (Linux 7.0.12-linuxkit aarch64); a privileged alpin
            named volume) at /mnt/nfs
 command:   mount -t nfs4 -o vers=4,proto=tcp,port=2049 <server>:/ /mnt/nfs ; cat /proc/self/mountinfo
 date:      2026-09-24
+
+-- python entries in tree.manifest --
+status:    REAL CAPTURE of names, types and link targets (file contents are empty placeholders)
+image:     debian:bookworm (Debian 12.15), after `apt-get update` and
+           `apt-get install -y python3-minimal` (python3-minimal 3.11.2-1+b1)
+host:      Docker Desktop (linux/arm64 containers) on macOS, root in the container,
+           command-only `docker run --rm`, 2026-10-28
+commands:  ls -l /usr/bin | grep -i python      (pdb3.11 -> ../lib/python3.11/pdb.py,
+                                                 py3versions -> ../share/python3/py3versions.py,
+                                                 python3 -> python3.11, python3.11 regular file)
+           ls -la /usr/local/bin                (empty directory)
+note:      the macOS framework fixture has its own provenance header in
+           ../macos/python_framework.manifest.

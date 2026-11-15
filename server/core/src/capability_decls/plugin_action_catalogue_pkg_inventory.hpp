@@ -13,22 +13,27 @@
 /// `securable`/`operation` reuse an EXISTING `RbacStore` `types[]`/`ops[]`
 /// entry; none is minted here.
 ///
-/// All three actions are ReadOnly/None. Every leg is a zero-subprocess
-/// filesystem read (open/openat/readdir/readlinkat with O_NOFOLLOW over Homebrew
-/// Library/Taps, Cellar and Caskroom directory names, and the Linux snap and
-/// flatpak stores; see pkg_inventory_macos_parsers.hpp and
-/// pkg_inventory_linux_parsers.hpp); nothing spawns a package manager, and nothing writes, installs, or
-/// removes a package.
+/// All three actions are ReadOnly/None. Every leg is a zero-subprocess read:
+/// on macOS and Linux a filesystem read (open/openat/readdir/readlinkat with
+/// O_NOFOLLOW over Homebrew Library/Taps, Cellar and Caskroom directory names,
+/// and the Linux snap and flatpak stores; see pkg_inventory_macos_parsers.hpp
+/// and pkg_inventory_linux_parsers.hpp); on Windows registry key reads
+/// (Reg*W over the HKLM Appx store keys, 64-bit view), a Chocolatey lib
+/// directory listing (FindFirstFileExW) and one bounded CreateFileW read per
+/// package nuspec (see pkg_inventory_win_parsers.hpp). Nothing spawns a package
+/// manager, and nothing writes, installs, or removes a package.
 ///
 ///   `managers` — which package managers are present on this host, plus
-///                manager-level configuration facts (machine scope only).
+///                manager-level configuration facts (machine scope only);
+///                on Windows Chocolatey and winget presence.
 ///   `packages` — macOS Homebrew formulae and casks (Cellar/Caskroom
-///                directory names). Linux is UNSUPPORTED by construction
-///                (`installed_apps` owns the Linux roster); Windows is a
-///                PLANNED placeholder.
+///                directory names) and Windows Chocolatey packages (lib
+///                nuspec versions). Linux is UNSUPPORTED by construction
+///                (`installed_apps` owns the Linux roster).
 ///   `store_packages` — Linux snaps and flatpak apps/runtimes from the system
-///                stores. macOS is UNSUPPORTED by design (`installed_apps`
-///                owns the application list); Windows is PLANNED.
+///                stores, and the Windows Appx/MSIX all-user roster from the
+///                HKLM Appx store keys. macOS is UNSUPPORTED by design
+///                (`installed_apps` owns the application list).
 ///
 /// Grouped under the existing `Inventory` securable — the same
 /// read-only-fact-collection precedent `peripherals.*` and

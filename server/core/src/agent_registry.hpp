@@ -13,6 +13,8 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -29,6 +31,8 @@
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
+#include "dex_types.hpp" // DexObserverState (pure enum)
+#include "dispatch_denial.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
 #include "scope_eval_error.hpp" // #4981 PR-1: ScopeEvalError, evaluate_scope's typed failure surface
@@ -74,86 +78,6 @@ inline constexpr std::string_view kGatewayWireCapabilityDispatchTagV1{"command_d
 // `encode_dispatch_tag` is a public, pure helper — so the guarantee below is
 // a TYPE invariant (`ClassifiedCommand`'s private constructor), never a
 // string check alone.
-
-/// Why `ServerImpl::build_classified_command` refused a dispatch. Every
-/// value is counted separately by the caller (ADR-0033 §2: "never a
-/// permissive default") — `Unclassified`/`Ambiguous` mirror
-/// `ClassificationError` 1:1; `AnonymousOperator`/`Forbidden` are this
-/// package's own authorization arm.
-enum class DispatchDenialReason : uint8_t {
-    Unclassified,      ///< No `CommandCapability` row matches `plugin.action`
-                       ///< (also raised for a row whose `execute_gate` parsed
-                       ///< as `ExecuteGate::Unspecified` — #1398 defense in
-                       ///< depth; see `command_capability.hpp`. That should be
-                       ///< IMPOSSIBLE by construction — every fragment's own
-                       ///< compile-time sweep makes an omitted `.execute_gate`
-                       ///< a build failure — so reaching this arm at runtime
-                       ///< means that sweep itself is broken, not that this
-                       ///< row is merely unclassified in the ordinary sense).
-    Ambiguous,         ///< Two+ fragments independently declared the same row.
-    AnonymousOperator, ///< `caller.system == false` with an empty `principal`.
-    Forbidden,         ///< Classified, but `caller` may not issue it — either an
-                       ///< operator lacking the resolved securable/operation, or
-                       ///< ANY operator attempting a `system_reserved` row.
-    ApprovalRequired,  ///< #1398: classified and RBAC-authorized, but `cap
-                       ///< .execute_gate` requires proof of an approval
-                       ///< decision (`DispatchCaller::approval_provenance`)
-                       ///< the caller does not carry — `AdminOrApproval`
-                       ///< additionally admits an effective-admin caller with
-                       ///< no provenance at all; `AlwaysApproval` never does.
-                       ///< Deliberately AFTER `Forbidden` in evaluation order:
-                       ///< approval is never a substitute for a missing RBAC
-                       ///< grant, only for the ADDITIONAL gate on top of one.
-    KillSwitched,      ///< Classified and authorized, but the per-action kill
-                       ///< switch is OFF for this `plugin.action` (or the config
-                       ///< store is degraded, which `action_allowed` reports as
-                       ///< disabled — never as enabled; never a protective
-                       ///< action — `yuzu::protective`). Deliberately DISTINCT
-                       ///< from `Forbidden`: this is an operator-thrown
-                       ///< emergency stop, not an authorization verdict, and an
-                       ///< incident review needs to tell the two apart.
-};
-
-/// A refused dispatch. `securable`/`operation` are populated only once
-/// classification itself succeeded — `Unclassified`/`Ambiguous` carry no
-/// resolved securable, there is nothing to name yet (a caller
-/// logging/auditing a denial must branch on `reason` before trusting
-/// `securable`). `AnonymousOperator` and `Forbidden` are raised AFTER
-/// classification resolved, so both DO name the securable the caller failed
-/// to satisfy — that is what makes the audit line actionable.
-///
-/// `securable` owns its characters rather than viewing `CommandCapability`'s
-/// static storage: a denial is the exceptional path, and the consumers
-/// concatenate it into operator-facing messages.
-struct DispatchDenial {
-    DispatchDenialReason reason;
-    std::string securable;
-    authz::Operation operation{authz::Operation::Read};
-};
-
-/// The ONE string form of a `DispatchDenialReason` — snake_case, matching
-/// the existing `yuzu_server_dispatch_denied_total{reason=...}` metric label
-/// values (unchanged by #1398; this function only deduplicates the mapping,
-/// it does not relabel anything already in production dashboards/alerts).
-/// Used for BOTH the metric label and the route-local audit detail
-/// (`server.cpp`'s `/api/command` handler) — an incident review needs the
-/// SAME string in both places to correlate a metric spike with the audit
-/// rows that produced it, and a single source avoids the two silently
-/// drifting apart the way a hand-duplicated switch invites. No `default:`
-/// case (see `authz::to_string` in `authz_model.hpp` for the same pattern)
-/// so `-Werror=switch` catches a future `DispatchDenialReason` enumerator
-/// added here without a matching label.
-[[nodiscard]] constexpr std::string_view to_string(DispatchDenialReason reason) {
-    switch (reason) {
-        case DispatchDenialReason::Unclassified: return "unclassified";
-        case DispatchDenialReason::Ambiguous: return "ambiguous";
-        case DispatchDenialReason::AnonymousOperator: return "anonymous_operator";
-        case DispatchDenialReason::Forbidden: return "forbidden";
-        case DispatchDenialReason::ApprovalRequired: return "approval_required";
-        case DispatchDenialReason::KillSwitched: return "kill_switched";
-    }
-    return "";
-}
 
 /// The pure classify+authorize DECISION `ServerImpl::build_classified_command`
 /// is built around, extracted so it is directly unit-testable without a live
@@ -375,19 +299,6 @@ private:
     std::unordered_set<std::string> kill_switched_os_;
 };
 
-/// Upgrade-window shim, removed with the other legacy-name shims. The wire command for a
-/// session that registered the pre-rename plugin name `tar` must carry `tar`, not `echo`, or the
-/// agent reports plugin-not-found. Returns the command unchanged (a copy) for every other
-/// session and every other plugin. dispatch_tag is deliberately left as computed: the agent
-/// never reads it.
-[[nodiscard]] inline pb::CommandRequest wire_for(bool legacy_echo_wire_name,
-                                                 const ClassifiedCommand& cmd) {
-    pb::CommandRequest out = cmd.wire();
-    if (legacy_echo_wire_name && out.plugin() == "echo")
-        out.set_plugin("tar");
-    return out;
-}
-
 /// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
 /// `finalize_classified_command` applies (below), extracted to its own
 /// function for the IDENTICAL reason `finalize_classified_command` itself was
@@ -565,10 +476,6 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
-    /// Upgrade-window shim, removed with the other legacy-name shims: the agent registered the
-    /// pre-rename plugin name `tar` (normalised to `echo` in plugin_names/plugin_meta). Commands
-    /// for `echo` are written to it as `tar` (see wire_for). Set only by register_agent.
-    bool legacy_echo_wire_name = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -963,11 +870,8 @@ public:
     // `send_to` is the sole path for that (this method has no capability
     // advertisement to check, because there is no session to have
     // advertised one).
-    /// `legacy_wire` (Echo-rename upgrade window, removed with the other legacy-name shims) is
-    /// the directory row's `legacy_echo_wire_name`: the target agent registered the pre-rename
-    /// plugin name `tar`.
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
-                            const std::string& cluster_id, bool legacy_wire);
+                            const std::string& cluster_id);
 
     struct GatewayPendingCmd {
         std::string agent_id;
@@ -1038,6 +942,14 @@ public:
     // precedence, no id is ever duplicated. Unconfigured (no presence store
     // wired), this is byte-identical to the pre-WS-5 local-only behavior.
     std::vector<std::string> all_ids() const;
+
+    // The ids of the sessions held ON THIS REPLICA only, under the same lock all_ids() takes, and
+    // with NO presence read at all: nothing here can fail, be truncated or hit Postgres. The
+    // Hardware list uses it for the part of "online" the database cannot know (a session whose
+    // row has not recorded a session id yet) and takes the rest of "online" from the roster read
+    // itself (#7566), so a failed or truncated presence read can no longer turn connected devices
+    // into Offline. Everything that must see other replicas' agents keeps using all_ids().
+    [[nodiscard]] std::vector<std::string> local_ids() const;
 
     // Count of `all_ids()` (local sessions UNION cached durable presence)
     // without materialising the id list. Unlike `all_ids()`, a degraded
@@ -1471,6 +1383,54 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 // -- AgentHealthStore ---------------------------------------------------------
 // Aggregates per-agent heartbeat status_tags into fleet-wide Prometheus metrics.
 
+/// The ONE staleness window for every read of AgentHealthStore's per-agent heartbeat data: the
+/// 15 s sweep's prune (recompute_metrics), perf_snapshot, net_snapshot and the per-device
+/// guardian_backend accessors. An agent whose last heartbeat is older than this is not counted
+/// anywhere, so a gauge and the device field that mirrors it apply the same freshness test
+/// (#2240; the POPULATIONS still differ, see guardian_backend_for). A literal at each site is the
+/// drift this constant removes.
+inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
+
+/// Bulk guardian_backend_for takes mu_ in slices of kGuardianBackendSlice ids and pauses
+/// kGuardianBackendPause between slices with the lock RELEASED, so a heartbeat upsert waits for one
+/// slice and not the whole list. That bounds the stall caused by THIS accessor only: the 15 s
+/// recompute_metrics sweep, perf_snapshot and net_snapshot still hold mu_ for a whole pass
+/// (recompute_metrics about 1.2 s at 500k).
+/// MEASURED on a prototype copy of this logic (not the committed code): 500k ids, 30 tags per
+/// agent, the two production files built -O2 on Linux, idle 32-core box, ONE closed-loop writer.
+/// Unsliced, one call held mu_ about 150-200 ms and stalled an upsert by about as long. Slices
+/// alone did NOT help (std::mutex is unfair: the releasing thread re-takes it before the woken
+/// writer runs) and neither did yield(). Slices plus a 50 us sleep took the worst upsert stall to
+/// 2-4 ms for about 15-20 ms more per call; that sleep actually lasted about 100 us (Linux timer
+/// slack). A separate model with 16-64 open-loop writers at the heartbeat rate gave a worst stall
+/// of 9-20 ms. The pause is therefore load-bearing: do not remove it as a dead sleep.
+/// PLATFORM: only Linux was measured; other non-Windows builds (macOS) sleep unmeasured. MSVC
+/// rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in the server raises the timer
+/// resolution, which would add up to about 1.9 s per call at 500k, so _WIN32 busy-waits on
+/// steady_clock instead (about 6 ms of CPU per 500k call, a true 50 us window). On Linux the same
+/// spin measured somewhat worse than the sleep (worst stall about 9-22 ms at 16-64 writers).
+/// WINDOWS (MSVC 14.44, Windows 11, 16 hardware threads), measured on a MODEL of the store with
+/// 500k ids, not on the production store: sleep_for(50 us) lasted 15.8 ms, so a sleep-based pause
+/// added about 1.9 s per call; the spin lasted 50 us. With 4 writers at about 38k upserts/s the
+/// spin call took 63 ms (unsliced 55 ms) and the worst upsert stall fell from 55 ms to 1.3 ms;
+/// with 16 writers at about 32k/s, 162 ms and 4.7 ms. One writer in a tight loop, far above the
+/// heartbeat rate (about 17k/s at 500k agents on a 30 s interval), starves the reader (every
+/// slice waits for the lock): 1.5 s per call. The production store's unit tests pass on Windows.
+/// Slices are not a point-in-time snapshot, which list_devices never was (the registry lock is
+/// released before the health lock is taken).
+inline constexpr std::size_t kGuardianBackendSlice = 4096;
+inline constexpr std::chrono::microseconds kGuardianBackendPause{50};
+static_assert(kGuardianBackendSlice > 0, "a zero slice would never advance the bulk loop");
+static_assert(kGuardianBackendPause >= std::chrono::microseconds{1} &&
+                  kGuardianBackendPause <= std::chrono::milliseconds{1},
+              "the pause must be real (it is what lets ingest in) and must stay small (it is paid "
+              "once per slice on the request thread)");
+
+/// The heartbeat tag the agent's DEX crash and hang observer reports ("1" armed, "0" disarmed).
+/// Emitted on Windows, Linux and macOS agents with the observer enabled; absent otherwise. The
+/// fleet gauge and `AgentHealthStore::dex_observer_for` read this one constant.
+inline constexpr std::string_view kDexObserverArmedTag = "yuzu.dex_observer_armed";
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
@@ -1489,8 +1449,9 @@ public:
     /// memory is per-process and pruned every ~90 s): the sink
     /// (EchoCorruptionAuditGate) owns durable dedup and its own rate limit; a
     /// failed write is retried after the gate's degraded window, and a
-    /// candidate skipped only because the gate's slot was busy is retried on
-    /// the next heartbeat -- see echo_corruption_audit.hpp for the distinction.
+    /// candidate skipped because that agent's lookup was already in flight (or
+    /// the in-flight set is at its bound) is retried on the next heartbeat --
+    /// see echo_corruption_audit.hpp for the distinction.
     /// This is the store's first plugin-specific side-effecting hook -- a
     /// second consumer of the same "surface a candidate, let an injected sink
     /// durably dedup it" shape should generalize this to a small named-sink
@@ -1500,6 +1461,15 @@ public:
         std::function<void(const std::string& agent_id, int64_t corruption_total,
                            const std::string& quarantine_last)>;
     void set_corruption_sink(CorruptionSink sink);
+
+    /// Bounds the `plugin` label of `yuzu_fleet_plugin_init_failed` to these names (lowercase, as
+    /// `catalogue_plugin_names` returns them; plugin_init_failed_labels.hpp). The heartbeat tag is
+    /// agent-supplied, so an agent must never choose the labels: a well-formed token that is not in
+    /// the set is summed under `plugin="unknown"` and counted in
+    /// `yuzu_fleet_plugin_init_failed_rejected`. A store that is never given a set (production
+    /// always gives one) fails closed: every name reads as unknown. Call once at boot, before the
+    /// first sweep.
+    void set_known_plugins(std::vector<std::string> names);
 
     void remove(const std::string& agent_id);
 
@@ -1521,10 +1491,58 @@ public:
     /// so the dashboard and the yuzu_fleet_net_* gauges see the same population).
     std::vector<AgentHealthSnapshot> net_snapshot(std::chrono::seconds staleness) const;
 
+    /// #2240: the per-device twin of the yuzu_fleet_guardian_backend gauge. Same table, same
+    /// strict parse (guardian_backend_fleet_tags.hpp) and same staleness contract as
+    /// recompute_metrics, so the gauge and the device field cannot disagree on classification or
+    /// on the freshness test; pass kAgentHealthStaleness. Two differences remain. POPULATION: the
+    /// gauge counts every health-store snapshot within the window, including an agent that has just
+    /// disconnected (remove() has no production caller, so the sweep prune is the only eviction),
+    /// while the device surfaces list only registry-connected rows. SAMPLING: the gauge is
+    /// republished every 15 s sweep, these read the live store. So after a disconnect the gauge can
+    /// still count the agent for up to about 105 s (window plus one sweep), and the two can differ in
+    /// either direction for up to one sweep (a null field does not by itself mean the gauge has
+    /// stopped counting the agent, and a non-null field can precede the gauge's first count).
+    /// CLOCK: last_seen (the tag rides every beat today; a status-beat split must move this and the
+    /// gauge together - see the header).
+    ///
+    /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token
+    /// (a view into the header's constexpr table, static storage, safe after mu_ is released)
+    /// or nullopt for an id that is unknown to the store, stale, has no tag or an empty one, or
+    /// carries a rejected value. nullopt NEVER means `legacy`. It does one hash lookup per id with
+    /// no string copies, taking mu_ per kGuardianBackendSlice ids with a pause between slices
+    /// (kGuardianBackendPause: a sleep or a busy-wait by platform, see the constants).
+    /// Only DeviceApi::list_devices() calls it (REST /api/v1/devices and MCP list_agents); the
+    /// callers that discard the field use list_devices_basic() or connected_count().
+    /// Because mu_ is released between slices an entry can be refreshed or pruned mid-call: each
+    /// id is read consistently, the list is not one snapshot.
+    /// `guardian_backend_of` is the O(1) point lookup for lookup_device (#3564: no scan, so a miss
+    /// costs the same as a hit). Neither may be called from a hot path; both are for
+    /// Infrastructure:Read device reads.
+    [[nodiscard]] std::vector<std::optional<std::string_view>>
+    guardian_backend_for(std::span<const std::string> agent_ids,
+                         std::chrono::seconds staleness) const;
+    [[nodiscard]] std::optional<std::string_view>
+    guardian_backend_of(const std::string& agent_id, std::chrono::seconds staleness) const;
+
+    /// The DEX observer state of each input id, ALIGNED by index (duplicates and all), read with
+    /// the same slicing, pause and staleness contract as `guardian_backend_for`; pass
+    /// kAgentHealthStaleness. Tag "1" is Armed, "0" is Disarmed; an absent tag, any other value,
+    /// an unknown id or a stale snapshot is NoneReported (an agent that opted out and one on a
+    /// build with no observer are indistinguishable: neither sends the tag). Counts only reach
+    /// the Apps page, never an id. Not for a hot path.
+    [[nodiscard]] std::vector<DexObserverState>
+    dex_observer_for(std::span<const std::string> agent_ids, std::chrono::seconds staleness) const;
+
 private:
+    /// The one sliced read loop behind `guardian_backend_for` and `dex_observer_for`: for each id,
+    /// in order, `fn(snapshot_or_null, now)` runs with mu_ held, mu_ is released between slices.
+    template <typename Fn>
+    void for_each_snapshot_sliced(std::span<const std::string> agent_ids, Fn&& fn) const;
+
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
     CorruptionSink corruption_sink_;
+    std::set<std::string, std::less<>> known_plugins_; // guarded by mu_; empty = nothing known
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

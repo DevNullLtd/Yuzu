@@ -38,7 +38,7 @@ TEST_CASE("route inventory: a sink records the method and the exact pattern of e
           "[routeinv]") {
     httplib::Server svr;
     RouteInventory::instance().forget(&svr);
-    HttplibRouteSink sink(svr);
+    HttplibRouteSink sink(svr, yuzu::server::StageRequirement::ExemptNoStage);
     sink.Get("/yuzu_test_get", kNoop);
     sink.Post(R"(/yuzu_test/([^/]+)/post)", kNoop);
     sink.Put("/yuzu_test_put", kNoop);
@@ -62,8 +62,8 @@ TEST_CASE("route inventory: registrations are keyed by server and de-duplicated"
     httplib::Server b;
     RouteInventory::instance().forget(&a);
     RouteInventory::instance().forget(&b);
-    HttplibRouteSink sink_a(a);
-    HttplibRouteSink sink_b(b);
+    HttplibRouteSink sink_a(a, yuzu::server::StageRequirement::ExemptNoStage);
+    HttplibRouteSink sink_b(b, yuzu::server::StageRequirement::ExemptNoStage);
 
     sink_a.Post("/yuzu_test_dup", kNoop);
     sink_a.Post("/yuzu_test_dup", kNoop); // the same route twice is one entry
@@ -88,7 +88,7 @@ TEST_CASE("route inventory: forget drops one server and an unknown server reads 
     // and never forget it, so clear the address before counting: a stale four-route entry here
     // reads `5 == 1`.
     RouteInventory::instance().forget(&svr);
-    HttplibRouteSink sink(svr);
+    HttplibRouteSink sink(svr, yuzu::server::StageRequirement::ExemptNoStage);
     sink.Post("/yuzu_test_forget", kNoop);
     REQUIRE(RouteInventory::instance().routes_for(&svr).size() == 1);
 
@@ -124,7 +124,7 @@ TEST_CASE("route inventory: a sealed server refuses a mutating registration with
           "[routeinv][seal]") {
     httplib::Server svr;
     RouteInventory::instance().forget(&svr);
-    HttplibRouteSink sink(svr);
+    HttplibRouteSink sink(svr, yuzu::server::StageRequirement::ExemptNoStage);
     sink.Post("/yuzu_test_before_seal", kNoop); // unsealed: unclassified is recorded as before
     RouteInventory::instance().seal(&svr);
     REQUIRE(RouteInventory::instance().is_sealed(&svr));
@@ -144,7 +144,7 @@ TEST_CASE("route inventory: a sealed server still accepts a classified or non-mu
           "[routeinv][seal]") {
     httplib::Server svr;
     RouteInventory::instance().forget(&svr);
-    HttplibRouteSink sink(svr);
+    HttplibRouteSink sink(svr, yuzu::server::StageRequirement::ExemptNoStage);
     RouteInventory::instance().seal(&svr);
 
     // Every row of the real table is admitted after the seal, whatever its class.
@@ -174,8 +174,8 @@ TEST_CASE("route inventory: an unsealed server and per-server keying are unaffec
     httplib::Server open_svr;
     RouteInventory::instance().forget(&sealed_svr);
     RouteInventory::instance().forget(&open_svr);
-    HttplibRouteSink sealed_sink(sealed_svr);
-    HttplibRouteSink open_sink(open_svr);
+    HttplibRouteSink sealed_sink(sealed_svr, yuzu::server::StageRequirement::ExemptNoStage);
+    HttplibRouteSink open_sink(open_svr, yuzu::server::StageRequirement::ExemptNoStage);
     RouteInventory::instance().seal(&sealed_svr);
 
     CHECK(RouteInventory::instance().is_sealed(&sealed_svr));

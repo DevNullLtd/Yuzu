@@ -142,8 +142,12 @@ inline constexpr std::array<RequirementEdge, 2> kRequirements{{
 // matrix: docs/os-capability-matrix.md generated block (2026-10-06; shares.list,
 // pkg_inventory.store_packages, msi_packages.list_inventory and remote_access_audit.list added
 // 2026-10-17/19; registry set_user_value, delete_user_value and apply added in registry 2.1.0;
-// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned), 242 rows.
-inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
+// hardware chassis/baseboard/swap/machine_id and disk_actions partitions/topology added as planned;
+// middleware ibm_mq added by SAM.2; runtimes python added 2026-10-28; hardware drivers_inventory
+// added by SAM-32; virtualization host added by PR12.1-a, virtualization wsl added 2026-11-08, virtualization runtime_posture added by
+// PR12.1-b2),
+// 248 rows.
+inline constexpr std::array<UnitOsRow, 248> kUnitOs{{
     {"agent_actions", "set_log_level", kWin | kLin | kMac},
     {"agent_actions", "info", kWin | kLin | kMac},
     {"agent_logging", "get_log", kWin | kLin | kMac},
@@ -225,8 +229,9 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"hardware", "memory", kWin | kLin | kMac},
     {"hardware", "disks", kWin | kLin | kMac},
     {"hardware", "drivers", kWin | kLin},
+    {"hardware", "drivers_inventory", kWin | kLin},
     {"hardware", "system", kWin | kLin | kMac},
-    // chassis/baseboard/swap/machine_id: planned on every leg (applicable).
+    // chassis/baseboard/swap/machine_id: applicable on every leg (read on Windows, planned on Linux/macOS).
     {"hardware", "chassis", kWin | kLin | kMac},
     {"hardware", "baseboard", kWin | kLin | kMac},
     {"hardware", "swap", kWin | kLin | kMac},
@@ -251,6 +256,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"local_security_policy", "audit_policy", kWin | kLin | kMac},
     {"local_security_policy", "sudoers", kLin | kMac},
     {"mgmt_posture", "posture", kWin | kLin | kMac},
+    {"middleware", "ibm_mq", kWin | kLin | kMac},
     {"msi_packages", "list", kWin | kMac},
     {"msi_packages", "product_codes", kWin | kMac},
     {"msi_packages", "list_inventory", kWin},
@@ -280,7 +286,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"peripherals", "thunderbolt", kWin | kLin | kMac},
     {"pkg_inventory", "managers", kWin | kLin | kMac},
     {"pkg_inventory", "packages", kWin | kMac},
-    // store_packages: the Windows leg is `planned` (applicable); macOS is `unsupported`.
+    // store_packages: macOS is `unsupported` (installed_apps owns it).
     {"pkg_inventory", "store_packages", kWin | kLin},
     {"platform_security", "secure_boot", kWin | kLin},
     {"platform_security", "code_integrity", kWin | kLin | kMac},
@@ -317,6 +323,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"registry", "apply", kWin | kLin | kMac},
     {"runtimes", "dotnet", kWin | kLin | kMac},
     {"runtimes", "jvm", kWin | kLin | kMac},
+    {"runtimes", "python", kWin | kLin | kMac},
     {"sccm", "client_version", kWin},
     {"sccm", "site", kWin},
     {"script_exec", "exec", kWin | kLin | kMac},
@@ -327,8 +334,7 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"services", "set_start_mode", kWin | kLin | kMac},
     // remote_access_audit: Linux is constrained, macOS supported, Windows `planned` (applicable).
     {"remote_access_audit", "list", kWin | kLin | kMac},
-    // shares: Linux and Windows are supported; the macOS leg is `planned`, which is applicable (not
-    // unsupported).
+    // shares: Linux, Windows and macOS are all supported.
     {"shares", "list", kWin | kLin | kMac},
     {"software_actions", "list_upgradable", kWin | kLin | kMac},
     {"software_actions", "installed_count", kWin | kLin | kMac},
@@ -375,6 +381,9 @@ inline constexpr std::array<UnitOsRow, 242> kUnitOs{{
     {"users", "group_members", kWin | kLin | kMac},
     {"users", "primary_user", kWin | kLin | kMac},
     {"users", "session_history", kWin | kLin | kMac},
+    {"virtualization", "host", kWin | kLin | kMac},
+    {"virtualization", "wsl", kWin},
+    {"virtualization", "runtime_posture", kLin},
     {"vuln_scan", "scan", kWin | kLin | kMac},
     {"vuln_scan", "cve_scan", kWin | kLin | kMac},
     {"vuln_scan", "config_scan", kWin | kLin | kMac},

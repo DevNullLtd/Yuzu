@@ -14,9 +14,9 @@ colorlog==6.10.1 \
     --hash=sha256:2d7e8348291948af66122cff006c9f8da6255d224e7cf8e37d8de2df3bad8c9c \
     --hash=sha256:eb4ae5cb65fe7fec7773c2306061a8e63e02efc2c72eba9d27b0fa23c94f1321
     # via gcovr
-gcovr==8.7 \
-    --hash=sha256:2a68612c5981c388537f2e236c231a5d788b8bd9e406d13ced662c97b17e9784 \
-    --hash=sha256:cfb9b2c373cc5be4b1cbe53250a5e4446fe6d4723c6900d3f41aa83540c8ddc8
+gcovr==8.8 \
+    --hash=sha256:0320230a432c033c1a41f34ba943082f450008c789bee05d414e532f380fd788 \
+    --hash=sha256:a5c3e3d4a9c8ab4a95aa8e4b072fcaec7962b1d9fb2add3f10645f649ef29545
     # via -r requirements-ci.in
 jinja2==3.1.6 \
     --hash=sha256:0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d \

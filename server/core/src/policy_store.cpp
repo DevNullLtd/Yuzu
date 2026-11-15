@@ -604,6 +604,40 @@ PolicyStore::get_fragment(const std::string& id) const {
     return std::optional<PolicyFragment>{read_fragment(res.get(), 0)};
 }
 
+std::expected<std::vector<std::string>, PolicyReadError>
+PolicyStore::fragments_referencing_instruction(
+    const std::string& instruction_id, int limit,
+    const std::unordered_set<std::string>& exclude_ids) const {
+    if (!open_) {
+        spdlog::warn("PolicyStore::fragments_referencing_instruction: store not open");
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        spdlog::warn("PolicyStore::fragments_referencing_instruction: no connection in time ({})",
+                     pool_.last_error());
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<std::string_view> excluded(exclude_ids.begin(), exclude_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT id FROM policy_store.policy_fragments WHERE (check_instruction = $1 "
+        "OR fix_instruction = $1 OR post_check_instruction = $1) "
+        "AND NOT (id = ANY($3::text[])) ORDER BY id ASC LIMIT $2",
+        std::vector<std::string>{instruction_id, std::to_string(std::max(limit, 1)),
+                                 pg::to_text_array(excluded)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("PolicyStore::fragments_referencing_instruction: query failed: {}",
+                     PQerrorMessage(lease.get()));
+        return std::unexpected(PolicyReadError::kDegraded);
+    }
+    std::vector<std::string> ids;
+    ids.reserve(static_cast<size_t>(PQntuples(res.get())));
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        ids.emplace_back(PQgetvalue(res.get(), i, 0));
+    return ids;
+}
+
 bool PolicyStore::delete_fragment(const std::string& id) {
     if (!open_)
         return false;
@@ -706,24 +740,29 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     std::vector<PolicyTrigger> triggers;
     auto triggers_section = extract_yaml_section(yaml_source, "triggers");
     if (!triggers_section.empty()) {
+        // Item boundaries: every `-` line at the column of the FIRST `-` line.
+        // The first `-` is looked for on line starts only, never inside a
+        // comment: a hyphen in `# re-check every 5-min` used to set the item
+        // column, no item matched it, and the policy was stored with no
+        // triggers (#2123 governance G4-TRIG-1). extract_yaml_section returns
+        // the block LF-joined, so splitting on '\n' here is exact.
         std::vector<size_t> dash_positions;
         {
-            auto first_dash = triggers_section.find('-');
-            if (first_dash != std::string::npos) {
-                auto line_start = triggers_section.rfind('\n', first_dash);
-                size_t dash_indent =
-                    (line_start == std::string::npos) ? first_dash : first_dash - line_start - 1;
-                size_t scan = 0;
-                while (scan < triggers_section.size()) {
-                    auto nl = triggers_section.find('\n', scan);
-                    if (nl == std::string::npos)
-                        nl = triggers_section.size();
-                    auto line = triggers_section.substr(scan, nl - scan);
-                    auto fc = line.find_first_not_of(" \t");
-                    if (fc != std::string::npos && line[fc] == '-' && fc == dash_indent)
+            size_t dash_indent = std::string::npos;
+            size_t scan = 0;
+            while (scan < triggers_section.size()) {
+                auto nl = triggers_section.find('\n', scan);
+                if (nl == std::string::npos)
+                    nl = triggers_section.size();
+                auto line = triggers_section.substr(scan, nl - scan);
+                auto fc = line.find_first_not_of(" \t");
+                if (fc != std::string::npos && line[fc] == '-') {
+                    if (dash_indent == std::string::npos)
+                        dash_indent = fc;
+                    if (fc == dash_indent)
                         dash_positions.push_back(scan + fc);
-                    scan = nl + 1;
                 }
+                scan = nl + 1;
             }
         }
         for (size_t di = 0; di < dash_positions.size(); ++di) {
@@ -765,6 +804,12 @@ PolicyStore::create_policy(const std::string& yaml_source) {
     }
 
     auto groups = extract_yaml_list(yaml_source, "managementGroups");
+    // A reference that cannot be a group id (a misspelling, or a list item
+    // yaml_scan could not place) would match nobody, and a non-empty group list
+    // replaces the scope at evaluation, so refuse it rather than store a policy
+    // that silently targets zero devices (#2123 governance G4-UP-1 / G4-UP-2).
+    if (auto err = validate_management_group_ids(groups))
+        return std::unexpected(*err);
     auto now = now_epoch();
 
     // Whole write is one transaction (improvement over the SQLite original's

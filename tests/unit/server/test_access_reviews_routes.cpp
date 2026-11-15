@@ -368,6 +368,21 @@ TEST_CASE("reviews routes: campaign success audits access_review.get with the id
     CHECK(h.last_get_id == "abc123");
 }
 
+TEST_CASE("reviews routes: the signed-in reviewer gets no controls on a user grant that names them",
+          "[access-reviews][routes][4752]") {
+    Harness h; // the session user is "rev"
+    h.wire();
+    auto own = one_campaign("abc123").attestations[0];
+    own.principal_id = "rev";
+    auto v = one_campaign("abc123");
+    v.attestations.push_back(own);
+    h.get_result = v;
+    const auto res = h.get(std::string(kCampaign) + "?id=abc123");
+    REQUIRE(res);
+    CHECK(count_of(res->body, "data-act=\"ar-attest\"") == 1); // alice's row only
+    CHECK(count_of(res->body, "Another reviewer must decide") == 1);
+}
+
 TEST_CASE("reviews routes: grants audits access_review.exported with format=view and the stamp",
           "[access-reviews][routes]") {
     Harness h;

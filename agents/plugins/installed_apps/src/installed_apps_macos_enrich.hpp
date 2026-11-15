@@ -46,14 +46,14 @@
 // read_bundle_ids_bounded, NOT by this header); the ADR-0016 InvRecord is
 // untouched (see the next paragraph).
 //
-// ADR-0016 CRITICAL: the blob-v2 12-field row (installed_apps_inventory.hpp)
+// ADR-0016 CRITICAL: the blob-v3 13-field row (installed_apps_inventory.hpp)
 // is hashed byte-identically on agent and server. This header hands its
 // caller a bundle id, publisher, and a binary signed/unsigned verdict; the
 // caller (installed_apps_plugin.cpp::get_inventory_macos) fills ONLY the
 // pre-existing, currently-honest-empty `publisher`/`signature_status` fields
-// with it. `bundle_id` has no existing home in the frozen 12-field row and is
+// with it. `bundle_id` has no existing home in the frozen 13-field row and is
 // deliberately NOT persisted there -- see the call site's comment and this
-// PR's report for the open question this leaves for a future field (a v3
+// PR's report for the open question this leaves for a future field (a later
 // contract bump, not a repurposed Linux-only field).
 
 #if defined(__APPLE__)

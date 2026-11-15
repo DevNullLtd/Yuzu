@@ -170,6 +170,23 @@ struct RbacRoleHarness {
     // Mirrors test_mcp_server.cpp's `ts.metrics_for_test = &reg` idiom.
     yuzu::MetricsRegistry metrics;
 
+    /// The session this harness hands a route: the `session_*` fields above plus `tier` as the
+    /// mcp_tier. The ONE place the field list lives.
+    yuzu::server::auth::Session session_with_tier(const std::string& tier) const {
+        yuzu::server::auth::Session s;
+        s.username = session_user;
+        s.token_scope_service = session_token_scope_service;
+        s.principal_kind = session_principal_kind;
+        s.auth_source = session_auth_source;
+        s.mcp_tier = tier;
+        return s;
+    }
+    /// The session the REST routes see (`rest_session_mcp_tier`), for a test that must ask a
+    /// helper about exactly the caller the route is given.
+    yuzu::server::auth::Session rest_session() const {
+        return session_with_tier(rest_session_mcp_tier);
+    }
+
     yuzu::server::RestApiV1 api;
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn mcp_handler;
@@ -205,15 +222,7 @@ struct RbacRoleHarness {
         // MCP each pass their OWN member (`rest_session_mcp_tier` /
         // `session_mcp_tier`) so the two transports can never accidentally
         // share one convention again (#520/Doomgoose PR #4985 round-2).
-        auto session_of = [this](const std::string& tier) {
-            yuzu::server::auth::Session s;
-            s.username = session_user;
-            s.token_scope_service = session_token_scope_service;
-            s.principal_kind = session_principal_kind;
-            s.auth_source = session_auth_source;
-            s.mcp_tier = tier;
-            return s;
-        };
+        auto session_of = [this](const std::string& tier) { return session_with_tier(tier); };
 
         auto rest_auth_fn = [this, session_of](const httplib::Request&,
                                                httplib::Response&) -> std::optional<yuzu::server::auth::Session> {

@@ -23,6 +23,7 @@
 /// either. A denial audits through the gate itself.
 
 #include "access_render.hpp"
+#include "rbac_admin_hint.hpp"
 #include "rbac_store.hpp"
 
 #include <yuzu/server/auth.hpp>
@@ -81,6 +82,14 @@ struct Deps {
                            const std::string& message, const std::string& target_type,
                            const std::string& target_id)>;
 
+    /// The advisory "may this session try the RBAC administration routes" answer, bound in
+    /// server.cpp to `rbac_admin_hint` on `RbacAdminSurface::kRest` over the real stores. HINT
+    /// ONLY: it decides whether the Assign button and the enforcement switch are drawn live,
+    /// disabled with a reason, or disabled as not permitted; the routes those controls call
+    /// keep their own gates. This module sees only the answer type (rbac_admin_hint.hpp), never
+    /// the predicate or the stores behind it.
+    using RbacAdminHintFn = std::function<RbacAdminHint(const auth::Session&)>;
+
     // Designated initialisers must follow this order (GCC and MSVC reject a reordered one).
     AuthFn auth_fn;
     AdminFn admin_fn;
@@ -92,6 +101,7 @@ struct Deps {
     ListAssignmentsFn list_assignments_fn;
     EnforcementStateFn enforcement_state_fn;
     DenyServiceScopedFn deny_service_scoped_fn;
+    RbacAdminHintFn rbac_admin_hint_fn; ///< appended LAST: the order above is positional
 };
 
 /// Throws `std::invalid_argument` when any `Deps` member is unbound.

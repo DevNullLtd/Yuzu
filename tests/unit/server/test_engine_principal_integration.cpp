@@ -340,10 +340,15 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
 
     using R = auth::CredentialCheck;
 
+    // Taken BEFORE the first read, so every entry the outer body warms below expires strictly
+    // after it. A SECTION that freezes the store's clock here sees the entry live however long the
+    // process was stalled since (a loaded or sanitizer box), instead of racing the real ~12 s TTL.
+    const auto before_warm = std::chrono::steady_clock::now();
+
     // First tick: cold cache, so the engine gate reads through to Postgres.
     // An authoritative confirmation is plain kValid — NOT kValidStale. This is
     // what lets a stream pump reset its grace budget.
-    CHECK(ar.revalidate_stream(req, expected) == R::kValid);
+    CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kCached) == R::kValid);
 
     // Later ticks within the TTL are served from the liveness cache, and the
     // caller MUST see kValidStale so the pump does not treat a cached answer as
@@ -351,7 +356,7 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
     // untested: kValidStale reaching a consumer through the real auth path
     // rather than a hand-written verdict lambda.
     for (int i = 0; i < 4; ++i)
-        CHECK(ar.revalidate_stream(req, expected) == R::kValidStale);
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kCached) == R::kValidStale);
 
     SECTION("a revoke cuts the stream on the next tick, cache notwithstanding") {
         auto revoked = engine_store->revoke("engine:reval");
@@ -359,7 +364,35 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
         REQUIRE(*revoked);
         // revoke() invalidated the cache synchronously, so the very next tick
         // reads through and sees the dead principal — not a stale cached Active.
-        CHECK(ar.revalidate_stream(req, expected) == R::kRevoked);
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kCached) == R::kRevoked);
+    }
+
+    SECTION("the authoritative read ignores the 15 s liveness cache") {
+        // The outer body warmed the entry, so the cached read says kValidStale. The authoritative
+        // read asks Postgres: kValid, never kValidStale.
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kAuthoritative) ==
+              R::kValid);
+        // A principal revoked behind the cache (a second replica's write: the cache is not told)
+        // is still "valid" to the cached read and revoked to the authoritative one.
+        REQUIRE(api_tokens->validate_token(*raw).has_value());
+        // Freeze the liveness clock at the pre-warm instant: the cached read below is then
+        // "inside the TTL" by construction, not by being quick. (By value, restored on exit.)
+        engine_store->set_clock_for_test([before_warm] { return before_warm; });
+        {
+            auto lease = ep_integ_shared().pool->acquire();
+            REQUIRE(lease);
+            auto r = yuzu::server::pg::exec_params(
+                lease.get(),
+                "UPDATE engine_principal_store.engine_principals SET lifecycle_state = 'revoked' "
+                "WHERE principal_id = $1",
+                std::vector<std::string>{expected});
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kCached) ==
+              R::kValidStale);
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kAuthoritative) ==
+              R::kRevoked);
+        engine_store->set_clock_for_test({});
     }
 
     SECTION("an expired entry reverts to an authoritative kValid") {
@@ -372,8 +405,8 @@ TEST_CASE("Engine stream re-validation end-to-end: first tick authoritative, nex
         auto fake_now = std::chrono::steady_clock::now();
         engine_store->set_clock_for_test([&] { return fake_now; });
         fake_now += std::chrono::seconds(30); // well past the ~12-15 s TTL
-        CHECK(ar.revalidate_stream(req, expected) == R::kValid);      // expired -> read through
-        CHECK(ar.revalidate_stream(req, expected) == R::kValidStale); // re-warmed under fake clock
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kCached) == R::kValid);      // expired -> read through
+        CHECK(ar.revalidate_stream(req, expected, auth::CredentialReadMode::kCached) == R::kValidStale); // re-warmed under fake clock
         // fake_now is a SECTION-scoped local captured by-ref in the store's
         // clock_; restore the default before it dies so the borrowed reference
         // can never dangle (the store outlives this scope).

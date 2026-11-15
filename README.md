@@ -144,7 +144,7 @@ Yuzu/
 
 Prebuilt artifacts are published with every tagged release. If you just want to run Yuzu, start here — you do not need to build from source.
 
-- **Release binaries & installers** (server/agent for Linux, Windows, macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0, a fresh-deployment release: it supports initial deployment into a new database only, with no in-place upgrade from, and no return to, 0.14.x or earlier (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract).
+- **Release binaries & installers** (server and agent for Linux, agent for Windows and macOS; Compose Wizard zip): [GitHub Releases](https://github.com/DevNullLtd/Yuzu/releases). Latest stable is v0.15.0, a fresh-deployment release: it supports initial deployment into a new database only, with no in-place upgrade from, and no return to, 0.14.x or earlier (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract).
 - **Container images** (published to GHCR on every tag):
   - `ghcr.io/devnullltd/yuzu-server:<version>`
   - `ghcr.io/devnullltd/yuzu-postgres:<version>`
@@ -192,7 +192,7 @@ The admin password is kept in the database. `yuzu-server.cfg` only seeds the fir
 
 The stack publishes ports 8443 (dashboard and REST API), 8080 (plain HTTP: redirects to HTTPS and answers the four health probes in cleartext), 50051 (agent gRPC) and 50052 (management gRPC) on every interface. On a machine other people can reach, publish the ones you need only locally on `127.0.0.1`, for example `"127.0.0.1:8443:8443"` in the `ports:` list of `docker-compose.yml`; change the host side there too if a port is already in use. Recreating the server keeps the certificate authority and the secrets key; changing `YUZU_VERSION` on an existing install is not a supported upgrade for 0.15.0, which supports fresh deployment only (see [Upgrading](docs/user-manual/upgrading.md#behaviour-change-stored-responses-of-forensics-tier-plugins-need-forensicsread-4990-fresh-deployment-only), Deployment contract). `docker compose -f docker-compose.yml down -v` deletes the certificate authority and the secrets key, together with the database, and every other install on this host whose directory is also named `yuzu`: never run it unless you mean to destroy this install. To back up this install for restoring onto this same deployment, use the recipe under **Back up before upgrading** in [Upgrading](docs/user-manual/upgrading.md#docker) and `P=yuzu` (the 0.14.0 compose file's header recipe names the volumes without the project prefix and backs up nothing). The stack runs the server only: the dashboard stays empty until agents enroll; [Agent enrollment](docs/user-manual/device-management.md#agent-enrollment) covers connecting agents, and [Agent bundle](docs/agent-bundle.md) the agent install image.
 
-[`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) is a development stack, not a download-only install. It builds the server and Postgres images from a checkout of this repository (`build: context: ../..`), ignores `YUZU_VERSION`, and publishes port 8080 but not 8443. Run it from `deploy/docker/` in a clone ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)).
+[`deploy/docker/docker-compose.yml`](deploy/docker/docker-compose.yml) is a development stack, not a download-only install. It builds the server and Postgres images from a checkout of this repository (`build: context: ../..`), ignores `YUZU_VERSION`, and publishes port 8080 but not 8443. Run it from `deploy/docker/` in a clone ([#5419](https://github.com/DevNullLtd/Yuzu/issues/5419)). It also runs Grafana and refuses to start until `YUZU_GRAFANA_ADMIN_PASSWORD` is set ([#4817](https://github.com/DevNullLtd/Yuzu/issues/4817)); see Docker Compose in [Server administration](docs/user-manual/server-admin.md).
 
 ## Building
 
@@ -250,7 +250,7 @@ meson compile -C build-windows
 | Option | Default | Notes |
 |---|---|---|
 | `-Dbuild_agent` | true | Agent daemon |
-| `-Dbuild_server` | true | Server daemon |
+| `-Dserver` | auto | Server daemon (feature option; Linux only: `auto` builds it on a Linux target and skips it elsewhere, `enabled` elsewhere is an error). The old `-Dbuild_server` boolean is deprecated |
 | `-Dbuild_tests` | false | Catch2 test suite |
 | `-Dbuild_examples` | true | Demo plugins only (`example`, `chargen`, `procfetch`, `netprobe`) — every other plugin builds under `-Dbuild_agent` regardless |
 | `-Db_lto` | false | Link-time optimisation |

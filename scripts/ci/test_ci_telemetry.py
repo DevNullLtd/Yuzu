@@ -407,6 +407,63 @@ def main() -> int:
             failures,
         )
 
+    # --logbase (ci.yml's Linux leg runs its invocations concurrently, each
+    # under its own meson --logbase): every named base's junit and its
+    # `<base>-flake-retry.json` are imported, and the default testlog.* files
+    # are NOT read when bases are named.
+    with tempfile.TemporaryDirectory(prefix="yuzu-ci-telemetry-lb-") as temp:
+        root = Path(temp)
+        env = fake_env(root)
+        args = argparse.Namespace(job_name="Linux gcc-15 debug", triplet="x64-linux")
+        check(telemetry.start(args, env) == 0, "logbase start failed", failures)
+        db = telemetry.telemetry_db_path(env)
+        builddir = root / "build-linux"
+        logs = builddir / "meson-logs"
+        (builddir / "meson-info").mkdir(parents=True)
+        logs.mkdir(parents=True)
+        (builddir / "meson-info" / "intro-tests.json").write_text(
+            json.dumps([
+                {"name": "echo unit tests", "timeout": 90},
+                {"name": "server pg unit tests shard A", "timeout": 700},
+                {"name": "stale entry", "timeout": 10},
+            ]),
+            encoding="utf-8",
+        )
+        for base, name, secs in (
+            ("testlog-nonpg-cheap", "echo - yuzu:echo unit tests", "11.0"),
+            ("testlog-pg", "server-pg - yuzu:server pg unit tests shard A", "400.0"),
+            ("testlog", "x - yuzu:stale entry", "1.0"),
+        ):
+            (logs / f"{base}.junit.xml").write_text(
+                f'<testsuites><testsuite><testcase name="{name}" time="{secs}"/>'
+                "</testsuite></testsuites>",
+                encoding="utf-8",
+            )
+        for report, case in (
+            ("testlog-pg-flake-retry.json", "PG Flake"),
+            ("flake-retry.json", "Default Flake"),
+        ):
+            (logs / report).write_text(
+                json.dumps({"platform": "linux", "blocked": [], "recovered": [
+                    {"case": case, "cross_platform": False, "attempts": 1}]}),
+                encoding="utf-8",
+            )
+        finish_args = argparse.Namespace(
+            job_name="Linux gcc-15 debug", triplet="x64-linux",
+            builddir=str(builddir), conclusion="success",
+            logbase=["testlog-nonpg-cheap", "testlog-nonpg-server", "testlog-pg"],
+        )
+        check(telemetry.finish(finish_args, env) == 0, "logbase finish failed", failures)
+        with closing(sqlite3.connect(db)) as conn:
+            suites = conn.execute(
+                "SELECT suite_name FROM ci_test_suites ORDER BY suite_name"
+            ).fetchall()
+            flakes = conn.execute("SELECT case_name FROM ci_flake_events").fetchall()
+        check(suites == [("echo unit tests",), ("server pg unit tests shard A",)],
+              f"logbase import read the wrong junit set: {suites}", failures)
+        check(flakes == [("PG Flake",)],
+              f"logbase import read the wrong flake report: {flakes}", failures)
+
     if failures:
         for failure in failures:
             print(f"FAIL: {failure}")

@@ -58,6 +58,7 @@
 /// #438).
 
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/scim_store.hpp>
 
 #include "deprovision_erasure.hpp"
@@ -65,10 +66,47 @@
 
 #include <httplib.h>
 
+#include <array>
+#include <expected>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace yuzu::server {
+
+/// #6836: the CLOSED `guard` label set of `yuzu_scim_guard_store_unavailable_total`. The emit
+/// helper in scim_routes.cpp takes only the four values below, and server.cpp pre-seeds the counter
+/// by iterating `kScimGuardStoreUnavailableGuards`, so the seeded series and the emitted series
+/// cannot drift apart (a label missing from the seed would make `increase()` skip the first fault
+/// per guard).
+inline constexpr std::string_view kScimGuardProvenance = "provenance";
+inline constexpr std::string_view kScimGuardRole = "role";
+/// #6835: the bearer-token check could not read the SCIM token store (was a false 401), and a
+/// SCIM resource / Group lookup could not read the SCIM store (was a false 404 / 409 / skipped
+/// check). Same counter, same retryable 503.
+inline constexpr std::string_view kScimGuardBearer = "bearer";
+inline constexpr std::string_view kScimGuardResource = "resource";
+inline constexpr std::array<std::string_view, 4> kScimGuardStoreUnavailableGuards{
+    kScimGuardProvenance, kScimGuardRole, kScimGuardBearer, kScimGuardResource};
+
+/// The verdict of a SCIM account-role guard (#6836). Three values, because "refused" and "could
+/// not ask" need different answers: `Refused` is the 404 and the only value the ADR-2001 D1
+/// callers escalate on; `Unavailable` is a store fault whose retryable 503 the guard answers.
+enum class GuardVerdict { Ok, Refused, Unavailable };
+
+/// The ONE classification of an authoritative role read, shared by the deprovision guard
+/// (`deprovision_role_ok`) and the POST-revive role re-check so the two cannot drift: a role of
+/// `user` is `Ok`; any other role, and every DEFINITIVE negative (`UserNotFound`,
+/// `InvalidUsername`, a missing AuthDB reported as `UserNotFound`) is `Refused`; only an
+/// `is_store_unavailable` error is `Unavailable`. A new `AuthDBError` value therefore fails
+/// CLOSED to `Refused` (404) until `is_store_unavailable` is deliberately widened.
+[[nodiscard]] inline GuardVerdict
+classify_role_read(const std::expected<auth::Role, AuthDBError>& role) noexcept {
+    if (!role)
+        return is_store_unavailable(role.error()) ? GuardVerdict::Unavailable
+                                                  : GuardVerdict::Refused;
+    return *role == auth::Role::user ? GuardVerdict::Ok : GuardVerdict::Refused;
+}
 
 class AuditStore;
 class EnginePrincipalStore;

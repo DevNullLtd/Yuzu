@@ -12,6 +12,7 @@
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -225,9 +226,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // sqlite_backfill_source's sole purpose was the backfill idempotency marker,
         // which no longer has a writer. Appended at the next free version (3) rather
         // than reusing v2 — v2 (the idempotency-key ALTER above) has actually run
-        // against real dev/UAT databases, and PgMigrationRunner tracks a bare version
-        // integer with no content check, so renumbering an already-shipped migration
-        // makes any database already at v2 re-apply it and fail closed on boot. See
+        // against real dev/UAT databases, and PgMigrationRunner tracks the version
+        // integer (plus, since #7158, a hash of each applied migration's text), so
+        // renumbering an already-shipped migration makes any database already at v2
+        // re-apply it and fail closed on boot. See
         // ADR-0054's Update.
         {3, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
     };
@@ -1087,6 +1089,29 @@ std::expected<std::optional<ProductPack>, std::string> ProductPackStore::get(
     }
     p.items = std::move(*items);
     return std::optional<ProductPack>{std::move(p)};
+}
+
+std::expected<std::vector<std::string>, std::string>
+ProductPackStore::packs_containing_item(const std::string& kind, const std::string& item_id,
+                                        int limit) {
+    if (!open_)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "database unavailable");
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT pack_id FROM product_pack_store.product_pack_items "
+        "WHERE kind = $1 AND item_id = $2 ORDER BY pack_id ASC LIMIT $3::int",
+        std::vector<std::string>{kind, item_id, std::to_string(std::max(limit, 1))});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                               "pack lookup failed: " + PQerrorMessage(lease.get()));
+    std::vector<std::string> ids;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        ids.push_back(text_col(res.get(), i, 0));
+    return ids;
 }
 
 // ── Uninstall ───────────────────────────────────────────────────────────────

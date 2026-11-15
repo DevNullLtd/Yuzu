@@ -2,17 +2,19 @@
 
 /// @file step_up_wiring.hpp
 ///
-/// The body of `server.cpp`'s `set_pre_request_handler` lambda, moved here unchanged in behaviour
-/// so a test can install the SAME function on a real `httplib::Server` and drive it over a socket.
-/// httplib runs the pre-request handler after routing (so `req.matched_route` is set) and after the
-/// body has been read, which is the only point at which the post-read body cap and the MFA step-up
-/// chokepoint can both be applied.
+/// The post-read stage `server.cpp` installs through `PostReadStageRegistry` (`post_read_stage.hpp`)
+/// and `HttplibRouteSink` runs in front of every handler it registers, kept here so a test can
+/// install the SAME function on a real `httplib::Server` and drive it over a socket. The stage
+/// runs after routing (so `req.matched_route` is set) and after the body has been read, which is
+/// the only point at which the post-read body cap and the MFA step-up chokepoint can both be
+/// applied. It is NOT a `set_pre_request_handler` body: from cpp-httplib v0.47.0 that handler runs
+/// before the body is read, so `req.body.size()` below would always be 0.
 ///
 /// Stage order, fixed: the post-read body cap (413 on an over-cap body), then
 /// `apply_step_up_chokepoint` for a body within the cap. The whole block is contained: a throw
 /// answers 413 (fail closed) rather than reaching an httplib call site. The caller builds `deps`
 /// per request (the auth store pointer is re-read each time so a nulled store answers 503).
-/// See `server.cpp` at the `set_pre_request_handler` call for the capture contract and the
+/// See `server.cpp` at the `PostReadStageRegistry::install` call for the capture contract and the
 /// reasoning behind the containment.
 ///
 /// `run_in_handler_step_up` is the decision behind the `StepUpFn` that `server.cpp` hands to the
@@ -41,8 +43,8 @@
 namespace yuzu::server::detail {
 
 [[nodiscard]] inline httplib::Server::HandlerResponse
-run_pre_request_stage(const httplib::Request& req, httplib::Response& res,
-                      const StepUpChokepointDeps& deps) {
+run_post_read_stage(const httplib::Request& req, httplib::Response& res,
+                    const StepUpChokepointDeps& deps) {
     try {
         const auto cap_match = resolve_body_cap(req.method, req.path);
         if (req.body.size() <= cap_match.max_body_bytes) {

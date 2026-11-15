@@ -128,25 +128,31 @@ def _find_nm() -> str:
     return nm
 
 
-def _core_obj_dir(mod, build_dir: Path) -> Path:
-    """UP-10: find_object() now looks ONLY inside the core library target's
-    own object directory, not the whole build tree - mirror that here so
-    every fixture this file compiles is actually where find_object() will
-    look for it."""
-    d = build_dir / mod.CORE_TARGET_OBJ_DIR
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def _core_obj_dir(mod, build_dir: Path, lib: int = 0) -> Path:
+    """UP-10: find_object() looks ONLY inside the server-core libraries' object
+    directories (CORE_TARGET_OBJ_DIRS: yuzu_server_core_lib, then
+    yuzu_server_routes_lib - the LNK1248 split), not the whole build tree.
+    Mirror that here: create EVERY directory (find_object() requires all of
+    them to exist) and return the one at index `lib`, so every fixture this
+    file compiles is where find_object() will look for it."""
+    dirs = [build_dir / d for d in mod.CORE_TARGET_OBJ_DIRS]
+    for d in dirs:
+        d.mkdir(parents=True, exist_ok=True)
+    return dirs[lib]
 
 
-def _compile_stem(cxx: str, build_dir: Path, stem: str, source: str, mod=None) -> None:
+def _compile_stem(
+    cxx: str, build_dir: Path, stem: str, source: str, mod=None, lib: int = 0
+) -> None:
     """Compile `source` (a tiny synthetic .cpp body) into
-    build_dir/<CORE_TARGET_OBJ_DIR>/src_<stem>.cpp.o, matching both the
+    build_dir/<CORE_TARGET_OBJ_DIRS[lib]>/src_<stem>.cpp.o, matching both the
     object naming AND the object LOCATION this script's find_object() looks
-    for (UP-10). `mod` defaults to a fresh `_load_checker()` call when the
-    caller doesn't already have one handy."""
+    for (UP-10). `lib` picks which server-core library's object directory
+    (0 = core, 1 = routes). `mod` defaults to a fresh `_load_checker()` call
+    when the caller doesn't already have one handy."""
     if mod is None:
         mod = _load_checker()
-    out_dir = _core_obj_dir(mod, build_dir)
+    out_dir = _core_obj_dir(mod, build_dir, lib)
     src_path = out_dir / f"{stem}.cpp"
     src_path.write_text(source)
     obj_path = out_dir / f"src_{stem}.cpp.o"
@@ -235,6 +241,36 @@ class TestPositiveFireProbe(unittest.TestCase):
         self.assertEqual("probe_core", v.core_obj)
         self.assertEqual("probe_pres", v.presentation_obj)
         self.assertIn("presentation_only_fn", v.symbol)
+
+    def test_core_and_presentation_in_different_libs_still_fires(self) -> None:
+        # The real dex shape after the LNK1248 split: the family's core TU
+        # (dex_api) is in yuzu_server_core_lib's object dir and its
+        # presentation TU (dex_routes) is in yuzu_server_routes_lib's. The
+        # gate must still fire across the two directories.
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "xlib_core",
+            "extern void presentation_only_fn();\n"
+            "void core_fn() { presentation_only_fn(); }\n",
+            lib=0,
+        )
+        _compile_stem(
+            self.cxx,
+            self.build_dir,
+            "xlib_pres",
+            "void presentation_only_fn() {}\n",
+            lib=1,
+        )
+        violations = self.mod.check_family(
+            self.build_dir,
+            self.nm,
+            "xlib_probe",
+            {"core": ["xlib_core"], "presentation": ["xlib_pres"]},
+        )
+        self.assertEqual(1, len(violations), "expected exactly one violation")
+        self.assertEqual("xlib_core", violations[0].core_obj)
+        self.assertEqual("xlib_pres", violations[0].presentation_obj)
 
     def test_core_not_calling_presentation_defined_symbol_is_clean(self) -> None:
         # Negative control for the probe above: same two-object shape, but
@@ -449,29 +485,45 @@ class TestFindObject(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_core_target_dir_missing_raises(self) -> None:
-        # UP-10: find_object() looks ONLY inside CORE_TARGET_OBJ_DIR - if
-        # that directory itself was never built, it must say so clearly
-        # rather than reporting a generic "no compiled object" (which reads
-        # as "you forgot the file", not "you forgot the whole build").
+    def _make_dirs(self) -> list[Path]:
+        dirs = [self.build_dir / d for d in self.mod.CORE_TARGET_OBJ_DIRS]
+        for d in dirs:
+            d.mkdir(parents=True)
+        return dirs
+
+    def test_core_target_dirs_missing_raises(self) -> None:
+        # UP-10: find_object() looks ONLY inside CORE_TARGET_OBJ_DIRS - if
+        # those directories were never built, it must say so clearly rather
+        # than reporting a generic "no compiled object" (which reads as "you
+        # forgot the file", not "you forgot the whole build").
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.find_object(self.build_dir, "does_not_exist")
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_one_target_dir_missing_raises(self) -> None:
+        # Server core is two libraries (LNK1248 split); a build that produced
+        # only one of the two object directories is incomplete and must fail
+        # loudly instead of resolving a stem from half the tree.
+        dirs = [self.build_dir / d for d in self.mod.CORE_TARGET_OBJ_DIRS]
+        dirs[0].mkdir(parents=True)
         with self.assertRaises(SystemExit) as ctx:
             self.mod.find_object(self.build_dir, "does_not_exist")
         self.assertIn("does not exist", str(ctx.exception))
 
     def test_missing_object_raises(self) -> None:
-        (self.build_dir / self.mod.CORE_TARGET_OBJ_DIR).mkdir(parents=True)
+        self._make_dirs()
         with self.assertRaises(SystemExit) as ctx:
             self.mod.find_object(self.build_dir, "does_not_exist")
         self.assertIn("no compiled object", str(ctx.exception))
 
     def test_duplicate_stem_outside_target_dir_is_ignored(self) -> None:
-        # UP-10's whole point: restricting the lookup to ONE directory means
-        # a same-named object compiled into some OTHER target's `.p`
-        # directory (a future test binary that also compiles this source
-        # file, say) can never be mistaken for the real one - a scenario
-        # the OLD whole-tree `rglob` genuinely could not disambiguate.
-        core_dir = self.build_dir / self.mod.CORE_TARGET_OBJ_DIR
-        core_dir.mkdir(parents=True)
+        # UP-10's whole point: restricting the lookup to the server-core
+        # libraries' object directories means a same-named object compiled
+        # into some OTHER target's `.p` directory (a future test binary that
+        # also compiles this source file, say) can never be mistaken for the
+        # real one - a scenario the OLD whole-tree `rglob` genuinely could not
+        # disambiguate.
+        core_dir, _ = self._make_dirs()
         (core_dir / "src_found_stem.cpp.o").write_bytes(b"real")
         other_dir = self.build_dir / "tests" / "some_other_target.p"
         other_dir.mkdir(parents=True)
@@ -481,11 +533,27 @@ class TestFindObject(unittest.TestCase):
         self.assertEqual(b"real", found.read_bytes())
 
     def test_exact_match_found(self) -> None:
-        core_dir = self.build_dir / self.mod.CORE_TARGET_OBJ_DIR
-        core_dir.mkdir(parents=True)
+        core_dir, _ = self._make_dirs()
         (core_dir / "src_found_stem.cpp.o").write_bytes(b"")
         found = self.mod.find_object(self.build_dir, "found_stem")
         self.assertEqual(core_dir / "src_found_stem.cpp.o", found)
+
+    def test_stem_only_in_routes_dir_is_found(self) -> None:
+        # rest_api_v1 / mcp_server / dex_routes live in yuzu_server_routes_lib.
+        _, routes_dir = self._make_dirs()
+        (routes_dir / "src_routes_only.cpp.o").write_bytes(b"")
+        found = self.mod.find_object(self.build_dir, "routes_only")
+        self.assertEqual(routes_dir / "src_routes_only.cpp.o", found)
+
+    def test_stem_in_both_dirs_is_ambiguous(self) -> None:
+        # A TU belongs to exactly one library; the same stem in both means a
+        # stale object survived a target move (or a TU is listed twice).
+        core_dir, routes_dir = self._make_dirs()
+        (core_dir / "src_dup.cpp.o").write_bytes(b"")
+        (routes_dir / "src_dup.cpp.o").write_bytes(b"")
+        with self.assertRaises(SystemExit) as ctx:
+            self.mod.find_object(self.build_dir, "dup")
+        self.assertIn("ambiguous", str(ctx.exception))
 
 
 if __name__ == "__main__":

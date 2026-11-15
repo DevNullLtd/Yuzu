@@ -22,8 +22,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 #include <random>
@@ -51,7 +53,8 @@ constexpr int kMaxListLimit = 10000;
 
 // ADR-0058 seed-vs-live coordination lock. Serializes every writer of the
 // (instruction_definitions/instruction_sets, deleted_seed_content) pair against every other —
-// the trusted-reseed insert path, create_set_seed, delete_definition, and delete_set. MUST be
+// the trusted-reseed insert path, the plain-create insert path (its updated_at floor reads the
+// tombstone), create_set_seed, delete_definition, and delete_set. MUST be
 // acquired in its own statement, strictly BEFORE the statement that checks-and-mutates (a
 // single statement's READ COMMITTED snapshot is fixed before any of its own function calls
 // run — embedding the lock via CTE in the same statement does NOT work;
@@ -60,8 +63,10 @@ constexpr int kMaxListLimit = 10000;
 // store-wide serialization is cheap — same reasoning as RbacStore's kRevokeCoordLockSql /
 // ProductPackStore's kErasureCoordLockSql, whose shared two-int32 form + "yuzu" namespace
 // constant (2037545589) this reuses; the hashtext string is this store's own key. Plain
-// create_definition/update_definition/create_set/the SIGNED import_definition_json path never
-// touch deleted_seed_content and take NO lock (docs/adr/0058-...md "Locking").
+// create_definition and every non-trusted import_definition_json path, signed or unsigned
+// (insert_definition_row, !is_seed), take the lock for the tombstone version floor only, never
+// to suppress; plain update_definition and create_set touch neither table pair and take NO lock
+// (docs/adr/0058-...md "Locking").
 constexpr const char* kSeedCoordLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext('instruction_store:seed_coordination'))";
 
@@ -194,7 +199,43 @@ std::string normalize_to_array_helper(const nlohmann::json& v) {
 
 // ── Echo rename (upgrade window) ─────────────────────────────────────────────
 
-// The token chain the rename script applies to the builtin Echo definitions' prose, as
+// The archive-tool guards of the retired rename script (its PROTECT list's captured-data
+// and "archive tool: files, commands, package lists, prose" groups), ported as
+// zero-width constraints placed before the bare-word rule. The script masks a protected span and
+// rewrites the rest; the equivalent here is a `tar` that is protected when its left context L
+// AND its right context R both hold, so it is rewritten only when (NOT L) OR (NOT R):
+// `(?:(?<!L)|(?!tar R))` per guard, which Postgres ARE (lookbehind since 9.6) accepts. The word
+// boundary `\b` of the script is `\y` in ARE. Ported (script lines 94, 97-100, 102, 103 and 107):
+// captured data (`tar|123`), archive file names (`.tar.gz`, `x.tar`, `tar.exe`, `modern-tar`),
+// the archive command shapes (`tar -x`, `tar xzf`, `tar --strip..`), a `tar` piped to another
+// tool, and `tar` beside another package in a package list (`tar unzip git`). NOT widened to
+// `\s*\|`: the shipped `tar|snapshot` response line must still become `echo|snapshot`. NOT
+// ported, so an operator edit of a builtin-shaped row using one of these exact shapes IS
+// rewritten: `<tar@debian.org>`, `unzip tar`, `zip tar`, `curl tar`, `--entrypoint tar`,
+// `tar/zstd`, `tar archive`, `tar stream`, `tar) tar`,
+// `.tar.gz tar` at a line end, and the prose sentences of repository files (`sh, cp, tar, ls`,
+// `sh ls cp tar cat`, "Never tar the postgres", "tar preserves", "tar takes SIGPIPE",
+// "tar unpacks", "filesystem-level `tar`", "by `tar`-ing", "and tar takes"). The shipped builtin
+// definitions contain none of them (they pass the chain byte-identical to the seeded text);
+// the carried-forward database that could is the unsupported upgrade path. Quotes are doubled
+// because the chain sits inside single-quoted SQL.
+constexpr const char* kEchoRenameBareTarGuards =
+    "(?!tar\\|\\d)"                                      // captured data
+    "(?!tar\\.(?:gz|xz|zst|bz2|lz|lzma|Z)(?![A-Za-z]))"    // .tar.gz and kin
+    "(?:(?<![\\w}\\)\"'']\\.)|(?!tar(?:[\"''\\s`)\\]]|$)))" // name.tar
+    "(?<!modern-)"
+    "(?!tar\\.exe)"
+    "(?:(?<=[\\w.-])|(?!tar(?:"                           // archive command / pipe-to-tool
+    "\\s+(?:-[A-Za-z]|--(?:strip|exclude|create|extract|list|directory|file|gzip|xz|zstd|"
+    "warning|no-|owner|group|sort|mtime|numeric|use-|transform|wildcards|totals|verbose|"
+    "one-file|format|posix|preserve|same|keep|overwrite|to-stdout|files-from|null|absolute|"
+    "dereference|hard|remove|index|label|checkpoint|blocking|record|sparse|ignore|anchored|"
+    "auto-|bzip2|lzma|lzop|compress|show|backup|suffix|atime|touch|version|help)|"
+    "[xctzvjJ]+f?\\y)|"
+    "\\s*\\|\\s*(?:grep|head|wc|sed|awk|tee|gzip|zstd|xz|sha\\w*)\\y|"
+    "\\s+(?:zip|unzip|git|python3-pip|ca-certificates|gzip)\\y)))";
+
+// The token chain applied to the builtin Echo definitions' prose, as
 // regexp_replace calls over one column expression. Word boundaries are Postgres ARE `\m` / `\M`.
 std::string echo_rename_text_chain(const std::string& col) {
     std::string e = col;
@@ -203,8 +244,10 @@ std::string echo_rename_text_chain(const std::string& col) {
     };
     wrap("Timeline Activity Record \\(TAR\\)", "Echo");
     wrap("\\mTAR\\M", "Echo");
-    wrap("\\mtar_", "echo_");
-    wrap("\\mtar\\M", "echo");
+    // Legacy on-disk `tar_events` objects stay (the script's "legacy on-disk SQLite objects"
+    // guard).
+    wrap("\\mtar_(?!events)", "echo_");
+    wrap(std::string(kEchoRenameBareTarGuards) + "\\mtar\\M", "echo");
     return e;
 }
 
@@ -261,6 +304,29 @@ std::string echo_rename_definitions_sql() {
         "WHERE id LIKE 'crossplatform.tar.%' AND NOT EXISTS ("
         "  SELECT 1 FROM deleted_seed_content t2 WHERE t2.kind = deleted_seed_content.kind "
         "  AND t2.id = replace(deleted_seed_content.id, 'crossplatform.tar.', 'crossplatform.echo.'));";
+    // Fail closed on a collision, after BOTH id updates. The NOT EXISTS guards above leave a legacy
+    //    id in place when an Echo-named definition already exists, while the dependent stores
+    //    (schedules, approvals, policies, workflows) rewrite their references to
+    //    the Echo id unconditionally and would silently re-point at the other definition. The raise
+    //    aborts this migration's transaction, the store does not open, and server startup refuses
+    //    (server.cpp: a store that is not open sets startup_failed_, which the construction of
+    //    every store built after the InstructionStore - ExecutionTracker, ScheduleEngine,
+    //    CommandOutboxStore, ApprovalManager, ResultSetStore, PolicyStore, WorkflowEngine - is
+    //    gated on). Two stores are built BEFORE it and have already committed their own rename
+    //    rewrites when this raises: PluginConfigStore (kill switches, enablement rules) and
+    //    ResponseStore; the runbook in docs/user-manual/upgrading.md ("Definition id collision")
+    //    says so, which is why it forbids returning to the older build. It is part of this one
+    //    migration only: no standing guard on the `crossplatform.tar.` namespace, which is
+    //    unreserved and may legitimately hold an operator-authored id once this has run.
+    sql +=
+        "DO $echo_collision$ BEGIN "
+        "IF EXISTS (SELECT 1 FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%') "
+        "THEN "
+        "RAISE EXCEPTION 'Echo rename: legacy definition ids remain (collision with an existing "
+        "Echo definition): %', (SELECT string_agg(id, ', ' ORDER BY id) FROM ("
+        "SELECT id FROM instruction_definitions WHERE id LIKE 'crossplatform.tar.%' "
+        "ORDER BY id LIMIT 10) c); "
+        "END IF; END $echo_collision$;";
     return sql;
 }
 
@@ -320,8 +386,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // Gate 4 UP-3: the original v1 briefly included a sqlite_backfill_source table
         // (for the backfill mechanism retired in full before this store shipped, see
         // ADR-0058's "Backfill — none" section) and had it edited out of v1 in place —
-        // PgMigrationRunner tracks by version number only, so any dev/UAT database that
-        // ran a migration during that narrow window keeps the orphan table forever.
+        // PgMigrationRunner decides what to apply by version number alone (since #7158 it
+        // also refuses a database whose recorded hash for an applied version differs), so
+        // any dev/UAT database that ran a migration during that narrow window keeps the
+        // orphan table forever.
         // Harmless (nothing references it) but permanent schema drift; drop it
         // idempotently for the databases that have it, no-op for the ones that don't.
         {2, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
@@ -331,6 +399,13 @@ const std::vector<pg::PgMigration>& migrations() {
         // plugin and prose forever. Idempotent: each statement is guarded by its own predicate.
         // The numbered steps are in echo_rename_definitions_sql().
         {3, echo_rename_definitions_sql()},
+        // v4: the version token must stay strictly monotonic across a delete and a re-create of
+        // the same id (a stale expected_updated_at from before the delete must never match the
+        // new row). The tombstone is already stamped in the delete's own transaction for every
+        // deleted definition, so it carries the deleted row's last token: the re-insert floors its
+        // updated_at above it. 0 = none recorded (every row stamped before this migration, and
+        // every 'set' row, where the column is unused).
+        {4, "ALTER TABLE deleted_seed_content ADD COLUMN IF NOT EXISTS last_version BIGINT NOT NULL DEFAULT 0;"},
     };
     return kMigrations;
 }
@@ -438,6 +513,43 @@ std::optional<std::string> validate_parameter_schema_write(const std::string& pa
 // ---------------------------------------------------------------------------
 // spec.scope validation (pure logic, shared by create+update; unaffected by storage substrate)
 // ---------------------------------------------------------------------------
+
+namespace {
+// A string holding a NUL can never equal a stored id or filter value (create, import and update
+// sanitize or refuse a NUL in every column they bind, and an id is closed-charset on create), so
+// a read or delete keyed on one has a definite answer without asking Postgres: nothing
+// matches. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to
+// truncate it, so binding one raw would surface a client error as a "read failed" store fault
+// (REST 503 / MCP internal error) on every caller, including the pre-existing legacy ones.
+bool has_nul(const std::string& s) {
+    return s.find('\0') != std::string::npos;
+}
+
+// The columns bound to Postgres WITHOUT sanitize_pg_text (structured text, free-form
+// concurrency_mode, and type: validate_and_prepare closes type to question/action on create, but
+// update_definition does not and the legacy dashboard PUT stores any string; id and approval_mode
+// are closed-charset or closed-set checked elsewhere). A NUL in any of them is refused at the
+// create/import/update chokepoint as a client error. pg::exec_params refuses a NUL parameter (SQLSTATE 22021) where libpq used to truncate it
+// silently, so an unguarded one surfaces as a 503 "outcome unknown" store fault for what is a
+// permanent 400. yaml_source has its own message in validate_definition_scope.
+std::optional<std::string> reject_nul_in_unsanitised_columns(const InstructionDefinition& def) {
+    const struct {
+        const char* name;
+        const std::string& value;
+    } columns[] = {
+        {"type", def.type},
+        {"parameter_schema", def.parameter_schema},
+        {"result_schema", def.result_schema},
+        {"concurrency_mode", def.concurrency_mode},
+        {"visualization_spec", def.visualization_spec},
+        {"response_templates_spec", def.response_templates_spec},
+    };
+    for (const auto& c : columns)
+        if (c.value.find('\0') != std::string::npos)
+            return std::string(c.name) + " contains a NUL byte";
+    return std::nullopt;
+}
+} // namespace
 
 // Store-level yaml_source gates shared by create AND update (size cap, scope-walking
 // fromResultSet combos, inline flow-mapping rejection). Only errors when spec.scope.fromResultSet
@@ -558,6 +670,9 @@ InstructionStore::query_definitions(const InstructionQuery& q) const {
         note_read_degrade(metrics_, kReasonStoreNotOpen);
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(q.name_filter) || has_nul(q.plugin_filter) || has_nul(q.type_filter) ||
+        has_nul(q.set_id_filter))
+        return std::vector<InstructionDefinition>{};
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         note_read_degrade(metrics_, kReasonPoolTimeout);
@@ -617,6 +732,8 @@ InstructionStore::get_definition(const std::string& id) const {
         note_read_degrade(metrics_, kReasonStoreNotOpen);
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(id))
+        return std::optional<InstructionDefinition>{};
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease) {
         note_read_degrade(metrics_, kReasonPoolTimeout);
@@ -663,6 +780,8 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
 
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
+    if (auto err = reject_nul_in_unsanitised_columns(def))
+        return std::unexpected(*err);
     // Covers create_definition and both JSON imports (signed and trusted).
     if (auto err = validate_parameter_schema_write(def.parameter_schema))
         return std::unexpected(*err);
@@ -681,6 +800,11 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
                 return std::unexpected(
                     "definition id may only contain letters, digits, '.', '_', and '-'");
         }
+        // "." and ".." pass the charset but are path-traversal segments in /api/v1/instructions/{id}
+        // and every other id-in-path route. Create-path only, like the reservations below: a
+        // row that predates this check stays readable, editable and deletable.
+        if (def.id == "." || def.id == "..")
+            return std::unexpected("definition id may not be '.' or '..'");
         // Reserved namespaces (#2442, #6062): mcp.<tool> ids belong to the MCP approval-ticket gate
         // and guardian.<...> ids to the Guardian rule-deploy approvals.
         // Create-path only, deliberately: an update cannot originate an id, so an id that
@@ -719,7 +843,10 @@ InstructionStore::insert_definition_row(const InstructionDefinition& def, bool i
          yaml_source, parameter_schema, result_schema, approval_mode,
          concurrency_mode, platforms, min_agent_version, required_plugins,
          readable_payload, visualization_spec, response_templates_spec)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::boolean,$9,$10::int,$11::int,$12,$13::bigint,$14::bigint,
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::boolean,$9,$10::int,$11::int,$12,$13::bigint,
+                GREATEST($14::bigint, COALESCE((SELECT last_version + 1
+                    FROM instruction_store.deleted_seed_content
+                    WHERE kind = 'definition' AND id = $1), 0)),
                 $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
         ON CONFLICT (id) DO NOTHING RETURNING id
     )";
@@ -753,19 +880,45 @@ InstructionStore::insert_definition_row(const InstructionDefinition& def, bool i
         std::string(kConflictPrefix) + " instruction definition '" + def.id + "' already exists";
 
     if (!is_seed) {
-        auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease) {
+        // Plain create: lock -> insert, one transaction. The insert_sql's updated_at floor reads
+        // deleted_seed_content, and a single statement's snapshot is taken before it waits on the
+        // unique index: without the lock a create of an id whose delete is still uncommitted
+        // blocks, then lands with the OLD token and a stale expected_updated_at matches the
+        // re-created row. delete_definition holds the same lock until its commit, so by the time
+        // this INSERT starts the tombstone is committed and visible (READ COMMITTED, a fresh
+        // snapshot per statement). Creates are operator-driven, never a hot path.
+        std::string failure;
+        bool landed = false;
+        bool entered = false;
+        bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+            entered = true;
+            // MUST be the first statement: see kSeedCoordLockSql's comment.
+            pg::PgResult lk = pg::exec_params(conn, kSeedCoordLockSql, std::vector<std::string>{});
+            if (lk.status() != PGRES_TUPLES_OK) {
+                failure = std::format("seed-coordination lock: {}", PQerrorMessage(conn));
+                return false;
+            }
+            pg::PgResult res = pg::exec_params(conn, insert_sql, binds);
+            if (res.status() != PGRES_TUPLES_OK) {
+                failure = std::format("insert: {}", PQerrorMessage(conn));
+                return false;
+            }
+            landed = PQntuples(res.get()) > 0;
+            return true;
+        });
+        if (!ok) {
             note_write_degrade(metrics_, "insert_definition_row");
+            // Three distinct causes, none guessed: the callback never ran (no connection within
+            // the bound, or BEGIN failed), a statement failed (`failure` says which), or the
+            // statements ran and the transaction still did not complete (COMMIT failed, or the
+            // aborted-transaction refusal).
             return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
-                                   "pool acquire timeout");
+                                   (!entered ? std::string("pool acquire timeout or BEGIN failed")
+                                    : failure.empty()
+                                        ? std::string("transaction did not complete")
+                                        : failure));
         }
-        pg::PgResult res = pg::exec_params(lease.get(), insert_sql, binds);
-        if (res.status() != PGRES_TUPLES_OK) {
-            note_write_degrade(metrics_, "insert_definition_row");
-            return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
-                                   PQerrorMessage(lease.get()));
-        }
-        if (PQntuples(res.get()) == 0)
+        if (!landed)
             return std::unexpected(conflict_msg);
         return def.id;
     }
@@ -832,10 +985,17 @@ InstructionStore::update_definition(const InstructionDefinition& def,
     }
     if (def.id.empty())
         return std::unexpected("id is required for update");
+    // A NUL id can never match a stored row (see has_nul), and binding it would surface as a
+    // db-error and bump the write-degrade counter for what is a plain not-found.
+    if (has_nul(def.id))
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction definition not found: id contains a NUL byte");
 
     // arch-B1/UP-4: the same scope-block validation the create path enforces — update must not
     // be a bypass for the fromResultSet rules.
     if (auto err = validate_definition_scope(def.yaml_source))
+        return std::unexpected(*err);
+    if (auto err = reject_nul_in_unsanitised_columns(def))
         return std::unexpected(*err);
     // An empty schema keeps the stored column (below), so only a supplied one is checked,
     // and only when it differs from the stored text: a legacy row that predates the write
@@ -861,7 +1021,7 @@ InstructionStore::update_definition(const InstructionDefinition& def,
         UPDATE instruction_store.instruction_definitions SET
             name=$1, version=$2, type=$3, plugin=$4, action=$5, description=$6,
             enabled=$7::boolean, instruction_set_id=$8, gather_ttl_seconds=$9::int,
-            response_ttl_days=$10::int, updated_at=$11::bigint,
+            response_ttl_days=$10::int, updated_at=GREATEST($11::bigint, updated_at + 1),
             yaml_source=$12,
             parameter_schema=CASE WHEN $13::text = '' THEN parameter_schema ELSE $13::text END,
             result_schema=$14, approval_mode=$15,
@@ -927,23 +1087,37 @@ InstructionStore::update_definition(const InstructionDefinition& def,
             pg::PgResult exists = pg::exec_params(
                 lease.get(), "SELECT 1 FROM instruction_store.instruction_definitions WHERE id=$1",
                 std::vector<std::string>{def.id});
-            if (exists.status() == PGRES_TUPLES_OK && PQntuples(exists.get()) > 0)
+            if (exists.status() != PGRES_TUPLES_OK) {
+                // The probe itself failed: we cannot tell "gone" from "moved on", and a 404 for
+                // a row that exists would be a false statement. A db fault, never not_found.
+                note_write_degrade(metrics_, "update_definition");
+                return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) +
+                                       "existence probe after a zero-row update: " +
+                                       PQerrorMessage(lease.get()));
+            }
+            if (PQntuples(exists.get()) > 0)
                 return std::unexpected(std::string(kConflictPrefix) + " instruction definition '" +
                                        def.id + "' was modified since it was loaded");
         }
-        return std::unexpected("not_found: definition not found: " + def.id);
+        return std::unexpected(std::string(kNotFoundPrefix) + "definition not found: " + def.id);
     }
     return {};
 }
 
-std::expected<void, std::string> InstructionStore::delete_definition(const std::string& id) {
+std::expected<void, std::string>
+InstructionStore::delete_definition(const std::string& id,
+                                    std::optional<std::int64_t> expected_updated_at) {
     if (!open_) {
         note_write_degrade(metrics_, "delete_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(id))
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction definition not found: id contains a NUL byte");
 
     std::string failure;
     bool deleted = false;
+    bool stale = false;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // MUST be the first statement — see kSeedCoordLockSql's comment.
         pg::PgResult lk = pg::exec_params(conn, kSeedCoordLockSql, std::vector<std::string>{});
@@ -951,24 +1125,49 @@ std::expected<void, std::string> InstructionStore::delete_definition(const std::
             failure = std::format("seed-coordination lock: {}", PQerrorMessage(conn));
             return false;
         }
-        pg::PgResult del = pg::exec_params(
-            conn, "DELETE FROM instruction_store.instruction_definitions WHERE id=$1 RETURNING id",
-            std::vector<std::string>{id});
+        std::string del_sql = "DELETE FROM instruction_store.instruction_definitions WHERE id=$1";
+        std::vector<std::string> del_binds{id};
+        if (expected_updated_at) {
+            del_sql += " AND updated_at=$2::bigint";
+            del_binds.push_back(std::to_string(*expected_updated_at));
+        }
+        del_sql += " RETURNING updated_at";
+        pg::PgResult del = pg::exec_params(conn, del_sql.c_str(), del_binds);
         if (del.status() != PGRES_TUPLES_OK) {
             failure = std::format("delete: {}", PQerrorMessage(conn));
             return false;
         }
         deleted = PQntuples(del.get()) > 0;
-        if (!deleted)
+        if (!deleted) {
+            if (expected_updated_at) {
+                // Zero rows is "gone" or "moved on since the caller read it"; tell them apart in
+                // this txn (the seed lock is held, so nothing can slip in between). A failed
+                // probe is a db fault, never a guessed not_found (mirrors update_definition).
+                pg::PgResult exists = pg::exec_params(
+                    conn, "SELECT 1 FROM instruction_store.instruction_definitions WHERE id=$1",
+                    std::vector<std::string>{id});
+                if (exists.status() != PGRES_TUPLES_OK) {
+                    failure = std::format("existence probe after a zero-row delete: {}",
+                                          PQerrorMessage(conn));
+                    return false;
+                }
+                stale = PQntuples(exists.get()) > 0;
+            }
             return true; // nothing to tombstone; commits an empty no-op txn
+        }
         // ADR-0058: stamp the tombstone in the SAME transaction as the delete, so the
         // seed-aware insert path can never observe a deletion without also observing its
-        // suppression marker.
+        // suppression marker. The row's last version token rides along (the suppression
+        // semantics and deleted_at are untouched on a repeat delete) so a re-create of the id
+        // gets a strictly greater token than any a caller read before the delete.
         pg::PgResult tomb = pg::exec_params(
             conn,
-            "INSERT INTO instruction_store.deleted_seed_content (kind, id, deleted_at) "
-            "VALUES ('definition', $1, $2::bigint) ON CONFLICT (kind, id) DO NOTHING",
-            std::vector<std::string>{id, std::to_string(now_epoch())});
+            "INSERT INTO instruction_store.deleted_seed_content (kind, id, deleted_at, "
+            "last_version) VALUES ('definition', $1, $2::bigint, $3::bigint) "
+            "ON CONFLICT (kind, id) DO UPDATE SET last_version = "
+            "GREATEST(deleted_seed_content.last_version, EXCLUDED.last_version)",
+            std::vector<std::string>{id, std::to_string(now_epoch()),
+                                     PQgetvalue(del.get(), 0, 0)});
         if (tomb.status() != PGRES_COMMAND_OK) {
             failure = std::format("tombstone stamp: {}", PQerrorMessage(conn));
             return false;
@@ -979,8 +1178,12 @@ std::expected<void, std::string> InstructionStore::delete_definition(const std::
         note_write_degrade(metrics_, "delete_definition");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + failure);
     }
+    if (stale)
+        return std::unexpected(std::string(kConflictPrefix) + " instruction definition '" + id +
+                               "' was modified since it was loaded");
     if (!deleted)
-        return std::unexpected("not_found: instruction definition not found: " + id);
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction definition not found: " + id);
     return {};
 }
 
@@ -1131,6 +1334,51 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
             spdlog::info("InstructionStore::import_definition_json: definition has no signature "
                          "— importing as unverified");
         }
+    }
+
+    // Scalar-field type gate. The extraction below uses get<T>()/value(), which throw
+    // nlohmann::json::type_error on a wrong-typed value; neither the REST nor the MCP
+    // import caller catches it, so the result was a bare 500 (and, on the twins, an
+    // attempt audit row with no outcome row). Reject with a precise reason instead, the
+    // same shape as the signing-field check above.
+    if (parsed.is_object()) {
+        static constexpr auto kStringFields = std::to_array<const char*>(
+            {"id", "name", "version", "type", "plugin", "action", "description",
+             "instruction_set_id", "created_by", "yaml_source", "parameter_schema",
+             "result_schema", "approval_mode", "concurrency_mode", "platforms",
+             "min_agent_version", "required_plugins", "readable_payload"});
+        for (const char* key : kStringFields) {
+            if (parsed.contains(key) && !parsed[key].is_string())
+                return std::unexpected(
+                    std::format("instruction-import field '{}' must be a string", key));
+        }
+        // The two TTLs: an integer, then the SAME range the create/update builders enforce
+        // (instruction_definition_model.hpp). The extraction below narrows int64 to int, so an
+        // unchecked 3000000000 would store as a negative value. A float or null is not an integer.
+        struct TtlField {
+            const char* key;
+            int max;
+        };
+        for (const TtlField& f : {TtlField{"gather_ttl_seconds", kMaxDefinitionGatherTtlSeconds},
+                                  TtlField{"response_ttl_days", kMaxDefinitionResponseTtlDays}}) {
+            if (!parsed.contains(f.key))
+                continue;
+            const auto& v = parsed[f.key];
+            if (!v.is_number_integer())
+                return std::unexpected(
+                    std::format("instruction-import field '{}' must be an integer", f.key));
+            // An unsigned value may exceed int64; compare it as unsigned.
+            const bool in_range =
+                v.is_number_unsigned()
+                    ? v.get<std::uint64_t>() >= 1 &&
+                          v.get<std::uint64_t>() <= static_cast<std::uint64_t>(f.max)
+                    : v.get<std::int64_t>() >= 1 && v.get<std::int64_t>() <= f.max;
+            if (!in_range)
+                return std::unexpected(std::format(
+                    "instruction-import field '{}' must be an integer from 1 to {}", f.key, f.max));
+        }
+        if (parsed.contains("enabled") && !parsed["enabled"].is_boolean())
+            return std::unexpected("instruction-import field 'enabled' must be a boolean");
     }
 
     InstructionDefinition def;
@@ -1305,6 +1553,44 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
         }
     }
 
+    // The operator import applies the bounds the v1 JSON builders and the YAML authoring check
+    // enforce (instruction_definition_model.hpp), so a document cannot store what the other
+    // authoring surfaces refuse (a 1 MiB name bloats every list page). The trusted boot seed is
+    // exempt (!check_signature): bundled content is reviewed at build time. `description` takes
+    // the wider kMaxDefinitionImportDescriptionLen, not the builders' 512: the bundled envelope
+    // carries the full YAML description (91 of 296 bundled definitions exceed 512 bytes), so an
+    // export of one must stay importable.
+    // `plugin` and `action` are checked only when non-empty; an empty plugin is
+    // validate_and_prepare's "plugin is required". Agent plugins match the action case-sensitively
+    // and every other writer lowercases it, so an unsigned import does too.
+    if (check_signature) {
+        const auto too_long = [](std::string_view key, std::size_t size, std::size_t max)
+            -> std::optional<std::string> {
+            if (size > max)
+                return std::format("instruction-import field '{}' must be at most {} characters",
+                                   key, max);
+            return std::nullopt;
+        };
+        if (auto e = too_long("name", def.name.size(), kMaxDefinitionNameLen))
+            return std::unexpected(*e);
+        if (auto e = too_long("version", def.version.size(), kMaxDefinitionVersionLen))
+            return std::unexpected(*e);
+        if (auto e = too_long("description", def.description.size(),
+                              kMaxDefinitionImportDescriptionLen))
+            return std::unexpected(*e);
+        if (auto e = too_long("instruction_set_id", def.instruction_set_id.size(),
+                              kMaxDefinitionInstructionSetIdLen))
+            return std::unexpected(*e);
+        std::transform(def.action.begin(), def.action.end(), def.action.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (!def.plugin.empty())
+            if (auto e = check_dispatch_identifier("plugin", def.plugin))
+                return std::unexpected("instruction-import " + *e);
+        if (!def.action.empty())
+            if (auto e = check_dispatch_identifier("action", def.action))
+                return std::unexpected("instruction-import " + *e);
+    }
+
     auto prep = validate_and_prepare(def);
     if (!prep)
         return std::unexpected(prep.error());
@@ -1437,6 +1723,9 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
         note_write_degrade(metrics_, "delete_set");
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + "store not open");
     }
+    if (has_nul(id))
+        return std::unexpected(std::string(kNotFoundPrefix) +
+                               "instruction set not found: id contains a NUL byte");
 
     std::string failure;
     bool deleted = false;
@@ -1463,9 +1752,9 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
         // pre-migration behaviour exactly.
         pg::PgResult upd = pg::exec_params(
             conn,
-            "UPDATE instruction_store.instruction_definitions SET instruction_set_id='' WHERE "
-            "instruction_set_id=$1",
-            std::vector<std::string>{id});
+            "UPDATE instruction_store.instruction_definitions SET instruction_set_id='', "
+            "updated_at=GREATEST($2::bigint, updated_at + 1) WHERE instruction_set_id=$1",
+            std::vector<std::string>{id, std::to_string(now_epoch())});
         if (upd.status() != PGRES_COMMAND_OK) {
             failure = std::format("unlink referencing definitions: {}", PQerrorMessage(conn));
             return false;
@@ -1486,7 +1775,7 @@ std::expected<void, std::string> InstructionStore::delete_set(const std::string&
         return std::unexpected(std::string(kInstructionStoreDbErrorPrefix) + failure);
     }
     if (!deleted)
-        return std::unexpected("not_found: instruction set not found: " + id);
+        return std::unexpected(std::string(kNotFoundPrefix) + "instruction set not found: " + id);
     return {};
 }
 

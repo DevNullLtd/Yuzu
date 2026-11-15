@@ -133,7 +133,7 @@ Three refinements from the grill-with-docs session that fixed the author-facing 
   *Recorded exception (2026-10-22).* Plain transactional index builds on an already-large table are
   accepted for now as a controlled exception, on the maintainer's no-rolling-upgrade decision: see
   ADR-0053 "Update (2026-10-20)" (the conditions under which it ends) and ADR-2002 §7f "Update
-  (2026-10-22, #5683)" (the `agent_routes` unique session index). This does not change the rule.
+  (2026-10-22, #5683)" (the `agent_routes` unique session index), and `guaranteed_state_store` schema v4 (2026-11-03, #5690), whose identity fill rewrites `guaranteed_state_events` under ACCESS EXCLUSIVE (docs/user-manual/upgrading.md, ADR-0038 "Update (2026-11-03)"). This does not change the rule.
 
 - **The "optional thin ctor helper" becomes mandatory before the fan-out.** The Decision above
   left a thin non-polymorphic helper optional. With *all* stores migrating (ADR-0006 Update) over
