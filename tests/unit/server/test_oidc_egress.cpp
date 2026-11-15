@@ -1439,6 +1439,12 @@ TEST_CASE("OIDC resolver: the default OIDC pool serves lookups and is separate f
     Nat64CacheReset cache;
     REQUIRE(wait_for([] { return oidc_resolver_in_flight() == 0; }));
     const int process_before = net::process_resolver_in_flight();
+    // The two accessors the server's 15 s tick publishes read this default pool: its slot count is
+    // the cap, and a lookup through it moves its outcome counts (an accessor reading another pool
+    // would not).
+    CHECK(oidc_resolver_pool_capacity() == net::kMaxInFlightLookups);
+    CHECK(oidc_resolver_pool_capacity() == 16);
+    const auto counts_before = oidc_resolver_outcome_counts();
     auto st = std::make_shared<LookupState>();
     BoundedLookupGuard guard(make_lookup(st), nullptr); // null pool: the production default
     auto older = std::make_unique<OidcProvider>(resolver_cfg("https://idp.test"));
@@ -1456,6 +1462,10 @@ TEST_CASE("OIDC resolver: the default OIDC pool serves lookups and is separate f
     holder.finish();
     REQUIRE(holder.result.has_value());
     CHECK(wait_for([] { return oidc_resolver_in_flight() == 0; }));
+    const auto counts_after = oidc_resolver_outcome_counts();
+    CHECK(counts_after != counts_before);
+    CHECK(counts_after[static_cast<std::size_t>(net::ResolveStatus::kOk)] >
+          counts_before[static_cast<std::size_t>(net::ResolveStatus::kOk)]);
     OidcProvider::set_bounded_lookup_for_test({}, nullptr); // the hook can be cleared
     CHECK(oidc_resolver_in_flight() == 0);
 }
