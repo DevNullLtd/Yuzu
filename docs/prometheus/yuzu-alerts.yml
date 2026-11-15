@@ -7179,6 +7179,61 @@ groups:
             affected agents' warn logs for "SparkEngine: instantiation failed"; a restart
             after resolving host pressure clears the posture within one sweep.
           runbook_url: "https://docs.yuzu.io/runbooks/spark-boot-failed"
+      # YuzuGuardianBaselineUnpersisted (#5605). yuzu_fleet_guardian_baseline_unpersisted is the
+      # fleet SUM of Spark baseline-on-arm captures staged on an agent and not yet written to its
+      # local KV store: a CURRENT, re-statable value (it falls as captures are written), unlike
+      # the latching counter-sums commented out below, so a bare `> 0` is sound for it. It is
+      # absent fleet-wide until an agent runs with prefer_spark (every released agent today), so
+      # the rule is dormant in production and is exercised only by the promtool cases (#2553).
+      #
+      # The expression copies YuzuDedupStoreDegraded: AgentHealthStore::upsert replaces an
+      # agent's whole tag map on every heartbeat and the 90 s staleness prune drops an absent
+      # agent, so a missed heartbeat or a failover to another core replica is a GAP in the
+      # series that would reset a bare `for:`. max_over_time[5m] bridges the gap and
+      # `sum by (job)` drops the per-replica `instance` label from the alert identity. Measured
+      # width: a backlog spanning 10 minutes does not fire, one spanning 11 does (cases T27a and
+      # T27b), so "15 minutes" below is the evaluation clock, not the minimum backlog age.
+      # The value is summed across core replicas, so a failover can count one agent twice for a
+      # few minutes. Same `job` caveat as the dedup rule above.
+      #
+      # severity=warning, deliberately NOT critical: agent-self-reported inside the heartbeat
+      # trust boundary, so ONE forged or buggy agent can keep the alert up (same reasoning as
+      # YuzuSparkBootFailed). Fleet-scale caveat: a sum of current counts stays above 0 while ANY
+      # agent has a slow or failing store, so at ten thousand agents one flapping endpoint keeps
+      # it firing and an operator may silence the group. The threshold and window are not
+      # derived from fleet data: revisit them at the F14 flip (docs/spark-flip-gate.md).
+      - alert: YuzuGuardianBaselineUnpersisted
+        expr: |
+          sum by (job) (max_over_time(yuzu_fleet_guardian_baseline_unpersisted[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "About {{ $value }} Spark baseline capture(s) have waited more than 15 minutes to be written to an agent's local store"
+          description: >-
+            Across the fleet, about {{ $value }} captured file-hash-equals baseline(s) (summed
+            across core replicas, so a failover can count one agent twice for a few minutes)
+            have stayed staged on their agents, not yet written to the agent's local KV store
+            (kv_store.db), for a sustained period. This is a persistence BACKLOG, not proof that
+            a write failed: a failing or slow local store, a write pass that ran out of its
+            budget and a worker pass that yielded to a policy push all leave captures staged. It
+            detects an OPEN loss window on a live agent and cannot show that a loss happened (an
+            agent that crashes drops out of the series, and the capture is lost with it). The
+            figure is agent-self-reported, hence a warning. The 5 minute window and the sum
+            across replicas exist because a missed heartbeat or a failover to another core
+            replica would otherwise reset the 15 minute clock. Check the agent log on the affected
+            endpoints for "failed to persist captured baseline" and for the ERROR lines logged
+            at stop, then fix the store (a full or read-only data directory, permissions, a
+            locked kv_store.db). Do NOT restart the agent as a first remedy: the capture lives
+            only in memory until it is written, and a restart destroys the in-memory baseline;
+            the next boot then captures whatever the file holds at that moment, which is the
+            gap this alert exists to expose. This covers the Spark path only: persist failures
+            on the legacy detection path are logged and are not counted. Read a quiet graph
+            together with yuzu_fleet_guardian_baseline_reporting: while that is 0 (every
+            released agent today) the alert cannot fire for any reason. The 15 minute clock and
+            the 5 minute window are not tuned against fleet data; revisit them at the Spark
+            flip.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#fleet-monitoring-of-baseline-persistence"
   # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
   # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
   # dark at once" (fleet-wide agent outage / gateway partition) — real alert blindness,
