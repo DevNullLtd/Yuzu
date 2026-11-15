@@ -136,7 +136,9 @@ struct ResolverPool {
     std::atomic<int> in_flight{0};
     int cap{kMaxInFlightLookups};
     /// How many calls ended in each status, indexed by `ResolveStatus`. Written only by
-    /// `note_outcome`, which `bounded_resolve` calls exactly once per call.
+    /// `note_outcome`: one increment per lookup, made by `bounded_resolve` for a lookup it ran, or
+    /// by the OIDC adapter (`resolve_host_addresses_status`) for a lookup it refused before the
+    /// pool was asked.
     std::array<std::atomic<std::uint64_t>, kResolveStatusCount> outcomes{};
     explicit ResolverPool(int c = kMaxInFlightLookups) : cap(c) {}
 

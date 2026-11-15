@@ -8,7 +8,8 @@
 //
 // Why the counter is mirrored and not incremented live: a lookup runs on a request thread inside a
 // free function that has no `MetricsRegistry`, and the pool lives for the whole process. The count
-// is therefore kept in the pool (`ResolverPool::outcomes`, one increment in `bounded_resolve`) and
+// is therefore kept in the pool (`ResolverPool::outcomes`, one increment per lookup: in
+// `bounded_resolve`, or in the OIDC adapter for a lookup it refused before the pool was asked) and
 // `ResolverPoolPublisher::publish` adds the change since its last call to the registry counter. The
 // publisher has no lock: call `publish` from ONE thread (the 15 s tick).
 

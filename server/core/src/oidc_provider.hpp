@@ -370,6 +370,12 @@ public:
     static void set_bounded_lookup_for_test(
         BoundedLookupForTest lookup, std::shared_ptr<net::ResolverPool> pool,
         std::shared_ptr<net::HostLookupAdmission> admission = {});
+    /// Test-only seam: the process-wide admission the POSIX adapter uses when no test has installed
+    /// a lookup or a pool (null on Windows, whose lookup has none). A test reads its limits and
+    /// that it is one object; the adapter's choice of it is pinned in the source. Same
+    /// source-scan pin.
+    [[nodiscard]] static std::shared_ptr<net::HostLookupAdmission>
+    production_lookup_admission_for_test();
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);

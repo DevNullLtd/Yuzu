@@ -22,7 +22,8 @@
  *      the workflow table-size refresh that follows;
  *   4. the OIDC resolver pool's publisher is registered once, published once on that tick, and its
  *      metric names are not literals in server.cpp; `bounded_resolve` counts through
- *      `note_outcome` exactly once (the "OIDC resolver pool metrics" cases below).
+ *      `note_outcome` once for each lookup it runs (the OIDC adapter makes the one increment for
+ *      a lookup it refuses before the pool; the "OIDC resolver pool metrics" cases below).
  * It matches with whitespace removed, so a reformat does not turn it red; a rename or a
  * restructuring does, and the fix is to update the needles here. Limits: it cannot tell that the
  * tick runs or that the branch is reachable.

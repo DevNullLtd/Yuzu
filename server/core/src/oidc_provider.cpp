@@ -1131,7 +1131,11 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 #else
 // Whether a lookup goes through the admission (the per-name limit and the refusal memory). The
 // NAT64 probe is exempt: it takes no lease, is not refused by the admission and does not feed it, so
-// only the pool's cap applies to it, as before the admission existed.
+// only the pool's cap applies to it, as before the admission existed. That cap is the probe's only
+// bound: it is not single-flight (callers that find the cache stale at the same moment each start
+// one), a probe that was started and failed arms the 1 minute negative window below, and a probe
+// the pool refused arms none. Open owner decision: give it its own small cap, or make it
+// single-flight.
 enum class LookupAdmission { kApply, kExempt };
 
 // The throttled warning for a lookup refused before the pool was asked: a name refused or timed out
@@ -1142,15 +1146,29 @@ void log_lookup_refused_before_pool(const std::string& host,
                                     const net::HostLookupAdmission::Limits& limits) {
     using Verdict = net::HostLookupAdmission::Verdict;
     const char* key = "oidc_lookup_refused_recent";
+    switch (verdict) {
+    case Verdict::kRefusedNameLimit:
+    case Verdict::kRefusedTableFull:
+        key = "oidc_lookup_refused_name_limit";
+        break;
+    case Verdict::kRefusedRecent:
+    case Verdict::kAdmitted:
+    case Verdict::kRefusedError:
+        break;
+    }
+    // The throttle is consulted for every refusal, so its window advances. A line it demotes to
+    // debug is not built at all unless the logger takes debug.
+    const auto level = oidc_resolver_log_throttle().should_warn(key) ? spdlog::level::warn
+                                                                     : spdlog::level::debug;
+    if (!spdlog::default_logger_raw()->should_log(level))
+        return;
     std::string cause;
     switch (verdict) {
     case Verdict::kRefusedNameLimit:
-        key = "oidc_lookup_refused_name_limit";
         cause = std::to_string(limits.per_name_in_flight) +
                 " lookups for this name are already outstanding";
         break;
     case Verdict::kRefusedTableFull:
-        key = "oidc_lookup_refused_name_limit";
         cause = "lookups for " + std::to_string(limits.max_names_in_flight) +
                 " names are already outstanding";
         break;
@@ -1165,8 +1183,7 @@ void log_lookup_refused_before_pool(const std::string& host,
         cause = "the admission check did not complete";
         break;
     }
-    spdlog::log(oidc_resolver_log_throttle().should_warn(key) ? spdlog::level::warn
-                                                              : spdlog::level::debug,
+    spdlog::log(level,
                 "OIDC egress: the name lookup for '{}' was not started: {} (this warning is "
                 "written at most once per 60 s; "
                 "yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} has the full count)",
@@ -2771,6 +2788,14 @@ void OidcProvider::set_bounded_lookup_for_test(
     bounded_lookup_hook().lookup = std::move(lookup);
     bounded_lookup_hook().pool = std::move(pool);
     bounded_lookup_hook().admission = std::move(admission);
+}
+
+std::shared_ptr<net::HostLookupAdmission> OidcProvider::production_lookup_admission_for_test() {
+#ifdef _WIN32
+    return {}; // the Windows lookup has no admission
+#else
+    return oidc_lookup_admission_ref();
+#endif
 }
 
 int oidc_resolver_in_flight() {

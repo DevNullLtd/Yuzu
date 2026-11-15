@@ -1,8 +1,9 @@
 /**
- * test_resolver_host_admission.cpp -- the refusal memory in front of the OIDC name lookup
- * (resolver_host_admission.hpp). Deterministic: an injected clock, no DNS, no sleeping for time.
- * Only the concurrency case starts threads, and it asserts after the joins (Catch2 assertions are
- * not thread-safe).
+ * test_resolver_host_admission.cpp -- the admission in front of the OIDC name lookup
+ * (resolver_host_admission.hpp): the refusal memory, the per-name limit, the lease and its
+ * lifetime, and the pin that the documented figures are the constants. Deterministic: an injected
+ * clock, no DNS, no sleeping for time. Only the concurrency cases start threads, and they assert
+ * after the joins (Catch2 assertions are not thread-safe).
  *
  * The wiring through the OIDC adapter is in test_oidc_egress.cpp ([oidc_resolver]).
  */
@@ -19,7 +20,9 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <latch>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -176,12 +179,16 @@ TEST_CASE("HostLookupAdmission: only a busy or timed out lookup arms a name; an 
     FakeClock clock;
     auto adm = make(clock);
 
-    adm->note_outcome("a.example", ResolveStatus::kNotFound);
-    adm->note_outcome("a.example", ResolveStatus::kTemporary);
-    adm->note_outcome("a.example", ResolveStatus::kOk);
-    adm->note_outcome("a.example", ResolveStatus::kCount);
-    CHECK(adm->refusal_entries() == 0);
-    CHECK(adm->admit("a.example").verdict == Verdict::kAdmitted);
+    // Each status on a name that was never armed: nothing is remembered.
+    int n = 0;
+    for (const auto status : {ResolveStatus::kNotFound, ResolveStatus::kTemporary,
+                              ResolveStatus::kOk, ResolveStatus::kCount}) {
+        const std::string fresh = "fresh" + std::to_string(n++) + ".example";
+        CAPTURE(static_cast<int>(status));
+        adm->note_outcome(fresh, status);
+        CHECK(adm->refusal_entries() == 0);
+        CHECK(adm->admit(fresh).verdict == Verdict::kAdmitted);
+    }
 
     adm->note_outcome("b.example", ResolveStatus::kTimeout);
     CHECK(adm->admit("b.example").verdict == Verdict::kRefusedRecent);
@@ -264,8 +271,8 @@ TEST_CASE("HostLookupAdmission: concurrent arming and admission keeps the table 
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t)
         threads.emplace_back([&, t] {
-            while (!go.load()) {
-            }
+            while (!go.load())
+                std::this_thread::yield();
             for (int i = 0; i < 2000; ++i) {
                 const std::string name = "n" + std::to_string((t * 7 + i) % 40) + ".example";
                 adm->note_outcome(name, i % 3 == 0 ? ResolveStatus::kBusy : ResolveStatus::kOk);
@@ -529,8 +536,8 @@ TEST_CASE("HostLookupAdmission: concurrent admission never holds more than the l
     std::vector<std::thread> threads;
     for (int t = 0; t < 8; ++t)
         threads.emplace_back([&, t] {
-            while (!go.load()) {
-            }
+            while (!go.load())
+                std::this_thread::yield();
             for (int i = 0; i < 2000; ++i) {
                 const int n = (t + i) % kNames;
                 auto admitted = adm->admit("n" + std::to_string(n) + ".example");
@@ -555,11 +562,87 @@ TEST_CASE("HostLookupAdmission: concurrent admission never holds more than the l
     CHECK(adm->hosts_in_flight() == 0);
 }
 
+TEST_CASE("HostLookupAdmission: with every attempt in flight at once, exactly the limit is admitted",
+          "[resolver_host_admission]") {
+    // A latch holds every thread until all of them have asked and none has released, so the number
+    // admitted is the limit itself and not merely something at most the limit.
+    FakeClock clock;
+    constexpr std::size_t kLimit = 3;
+    constexpr int kThreads = 8;
+    auto adm = make_limited(clock, kLimit, /*max_names=*/8);
+    std::latch all_asked(kThreads);
+    std::atomic<int> admitted{0};
+    std::atomic<int> refused{0};
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&] {
+            auto result = adm->admit("idp.example");
+            if (result.verdict == Verdict::kAdmitted)
+                admitted.fetch_add(1);
+            else if (result.verdict == Verdict::kRefusedNameLimit)
+                refused.fetch_add(1);
+            all_asked.arrive_and_wait(); // the lease is still held here
+            result.lease.release();
+        });
+    for (auto& th : threads)
+        th.join();
+    CHECK(admitted.load() == static_cast<int>(kLimit));
+    CHECK(refused.load() == kThreads - static_cast<int>(kLimit));
+    CHECK(adm->hosts_in_flight() == 0);
+}
+
+TEST_CASE("HostLookupAdmission: a clock that throws is a refusal, never an admission, and leaves "
+          "nothing counted",
+          "[resolver_host_admission]") {
+    std::atomic<bool> throws{false};
+    FakeClock clock;
+    HostLookupAdmission::Limits limits;
+    auto adm = HostLookupAdmission::create(limits, [&]() -> Clock::time_point {
+        if (throws.load())
+            throw std::runtime_error("clock failed");
+        return clock.now();
+    });
+
+    throws.store(true);
+    auto refused = adm->admit("idp.example");
+    CHECK(refused.verdict == Verdict::kRefusedError);
+    CHECK_FALSE(static_cast<bool>(refused.lease));
+    CHECK(adm->in_flight_for("idp.example") == 0);
+    CHECK(adm->hosts_in_flight() == 0);
+
+    // Recording an outcome is best effort and never throws; the name stays unremembered.
+    CHECK_NOTHROW(adm->note_outcome("idp.example", ResolveStatus::kBusy));
+    CHECK(adm->refusal_entries() == 0);
+
+    throws.store(false); // the clock recovers: the same name is admitted
+    CHECK(adm->admit("idp.example").verdict == Verdict::kAdmitted);
+}
+
+TEST_CASE("HostLookupAdmission: the refusal memory holds at least one name", "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make(clock, /*max_entries=*/0);
+    CHECK(adm->limits().max_refusal_entries == 1);
+    adm->note_outcome("a.example", ResolveStatus::kBusy);
+    adm->note_outcome("b.example", ResolveStatus::kBusy); // replaces the first, as at any cap
+    CHECK(adm->refusal_entries() == 1);
+    CHECK(adm->admit("b.example").verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("a.example").verdict == Verdict::kAdmitted);
+}
+
 TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check runs before the "
           "lookup, only a lookup that ran feeds the memory, and a refusal is counted once",
           "[resolver_host_admission][wiring][lexical]") {
     const std::string flat = squeeze(comment_free_source("oidc_provider.cpp"));
 
+    // The production instance is chosen only when no test installed a lookup or a pool: a pin on
+    // the selection, because no test can drive the production lookup without DNS.
+    const std::string selection =
+        "if(!admission&&!lookup&&!pool)admission=oidc_lookup_admission_ref();";
+    CHECK(count_occurrences(flat, selection) == 1);
+    // definition, the selection, and the test seam that returns it
+    CHECK(count_occurrences(flat, "oidc_lookup_admission_ref()") == 3);
+    const auto chosen = flat.find(selection);
     const auto exempt = flat.find("if(mode==LookupAdmission::kExempt)admission.reset();");
     const auto admit = flat.find("admission->admit(host)");
     const auto resolve = flat.find("net::bounded_resolve(host,std::chrono::seconds(timeout_sec),");
@@ -573,6 +656,8 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
     REQUIRE(wrap != std::string::npos);
     CHECK(count_occurrences(flat, "hold_lease_during(") == 1);
     // The exemption is decided before the admission is consulted.
+    REQUIRE(chosen != std::string::npos);
+    CHECK(chosen < exempt);
     CHECK(exempt < admit);
     CHECK(admit < wrap);
     CHECK(wrap < resolve);
@@ -590,12 +675,19 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
     CHECK(count_occurrences(flat, "resolve_host_addresses_status(") == 3); // definition + two callers
     // The warnings share one throttle with a small key budget.
     CHECK(count_occurrences(flat, "RefusalLogThrottle(std::chrono::seconds(60),4)") == 1);
-    CHECK(count_occurrences(flat, "should_warn(") <= 4);
-    // Four fixed keys in all: the two pool warnings and the two refusals before the pool.
+    // Three call sites (the pool-full line, the probe line, the refusals before the pool).
+    CHECK(count_occurrences(flat, "should_warn(") == 3);
+    // Four fixed keys in all: the two pool warnings and the two refusals before the pool. The
+    // key set must fit the throttle's budget, so the literals are distinct and number the budget.
+    const std::vector<std::string> keys = {"oidc_lookup_busy", "oidc_nat64_probe_busy",
+                                           "oidc_lookup_refused_recent",
+                                           "oidc_lookup_refused_name_limit"};
+    CHECK(std::set<std::string>(keys.begin(), keys.end()).size() == keys.size());
+    CHECK(keys.size() == 4); // the `4` in RefusalLogThrottle(std::chrono::seconds(60),4) above
     CHECK(count_occurrences(flat, "\"oidc_lookup_busy\"") == 1);
     CHECK(count_occurrences(flat, "\"oidc_nat64_probe_busy\"") == 1);
     CHECK(count_occurrences(flat, "\"oidc_lookup_refused_recent\"") == 1);
-    CHECK(count_occurrences(flat, "\"oidc_lookup_refused_name_limit\"") == 2);
+    CHECK(count_occurrences(flat, "\"oidc_lookup_refused_name_limit\"") == 1);
 }
 
 namespace {
@@ -640,11 +732,34 @@ TEST_CASE("OIDC lookup admission limits (LEXICAL pin, not behaviour): the docume
         REQUIRE_FALSE(text.empty());
         CHECK(text.find(window) != std::string::npos);
     }
-    // These two wrap or spell the interval differently.
+    // These wrap or spell the interval differently. Whitespace runs are collapsed, so a wrapped
+    // line does not hide a figure.
+    const auto collapsed = [](std::string text) {
+        std::string out;
+        bool space = false;
+        for (const char c : text) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '#' || c == '"') {
+                space = true;
+                continue;
+            }
+            if (space && !out.empty())
+                out.push_back(' ');
+            space = false;
+            out.push_back(c);
+        }
+        return out;
+    };
     const std::string help = read_repo_file("server/core/src/resolver_pool_metrics.hpp");
     CHECK(help.find("the last " + ttl) != std::string::npos);
     const std::string alerts = read_repo_file("docs/prometheus/yuzu-alerts.yml");
     CHECK(alerts.find("the last " +
                       std::to_string(yuzu::server::net::kLookupRefusalTtl.count()) + " seconds") !=
+          std::string::npos);
+    // The per-name figure (8) in the HELP text, the alert description and the provider's comments.
+    const std::string limit = std::to_string(yuzu::server::net::kLookupPerNameLimit);
+    CHECK(collapsed(help).find(limit + " lookups for the name") != std::string::npos);
+    CHECK(collapsed(alerts).find(limit + " lookups for the name") != std::string::npos);
+    const std::string provider = read_repo_file("server/core/src/oidc_provider.cpp");
+    CHECK(collapsed(provider).find("the name already had " + limit + " lookups outstanding") !=
           std::string::npos);
 }

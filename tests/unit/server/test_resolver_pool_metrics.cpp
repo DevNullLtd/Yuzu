@@ -11,10 +11,17 @@
 
 #include <array>
 #include <string>
+#include <type_traits>
 
 namespace {
 
 namespace srv = yuzu::server;
+
+// The publisher keeps a pointer to the names it is given: a temporary must not compile, an
+// lvalue must.
+static_assert(!std::is_constructible_v<srv::ResolverPoolPublisher, srv::ResolverPoolMetricNames>);
+static_assert(std::is_constructible_v<srv::ResolverPoolPublisher,
+                                      const srv::ResolverPoolMetricNames&>);
 
 constexpr const char* kOutcomes[] = {"ok", "not_found", "temporary", "timeout", "busy"};
 

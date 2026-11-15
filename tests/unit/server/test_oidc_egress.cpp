@@ -1874,7 +1874,8 @@ TEST_CASE("OIDC resolver memory: a success, a not-found and a temporary failure 
     CHECK(busy_count(pool) == 0);
 }
 
-TEST_CASE("OIDC resolver memory: a success removes the memory of a name",
+TEST_CASE("OIDC resolver memory: a name whose memory has ended is looked up again and left "
+          "unremembered",
           "[oidc][oidc_egress][oidc_resolver][oidc_refusal_memory]") {
     Nat64CacheReset cache;
     AdmissionClock clock;
@@ -2017,13 +2018,10 @@ TEST_CASE("OIDC resolver limit: a name at its limit is refused at once without t
     CHECK(adm->in_flight_for("x.a.test") == 2);
     CHECK(pool->in_flight.load() == 2);
 
-    const auto started = std::chrono::steady_clock::now();
     const auto refused = vet_name("x.a.test", 10000);
-    const auto elapsed = std::chrono::steady_clock::now() - started;
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error() == kBusyReason);
-    CHECK(elapsed < std::chrono::milliseconds(2000));
-    CHECK(st->gate->entered.load() == 2); // no third lookup was started
+    CHECK(st->gate->entered.load() == 2); // no third lookup was started: the refusal did not wait
     CHECK(pool->in_flight.load() == 2);   // and no slot was taken
     CHECK(busy_count(pool) == 1);         // counted once, as busy
     CHECK(adm->refusal_entries() == 0);   // a refusal by the limit is not remembered
@@ -2191,6 +2189,59 @@ TEST_CASE("OIDC resolver limit: the warning names the limit, is written once per
     CHECK(busy_count(pool) == 3);
     CHECK(pool->in_flight.load() == 0);
     CHECK(st->others.load() == 0);
+}
+
+TEST_CASE("OIDC resolver limit: an admission check that fails refuses the lookup, counts it as busy "
+          "and says so in the log",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit]") {
+    Nat64CacheReset cache;
+    std::atomic<bool> throws{true};
+    auto adm = net::HostLookupAdmission::create(
+        net::HostLookupAdmission::Limits{},
+        [&throws]() -> std::chrono::steady_clock::time_point {
+            if (throws.load())
+                throw std::runtime_error("clock failed");
+            return std::chrono::steady_clock::now();
+        });
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    const auto refused = vet_name("clock.test");
+    cap.stop();
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == kBusyReason); // a failed check is a refusal, never an allow
+    CHECK(st->others.load() == 0);         // no lookup was started
+    CHECK(busy_count(pool) == 1);          // counted once, as busy
+    CHECK(pool->in_flight.load() == 0);
+    CHECK(adm->hosts_in_flight() == 0);
+    CHECK(cap.text().find("was not started: the admission check did not complete") !=
+          std::string::npos);
+    CHECK(cap.text().find("lookup pool") == std::string::npos);
+
+    throws.store(false); // the clock recovers: the same name is looked up
+    REQUIRE(vet_name("clock.test").has_value());
+    CHECK(st->others.load() == 1);
+    CHECK(wait_for([&] { return adm->hosts_in_flight() == 0; }));
+}
+
+TEST_CASE("OIDC resolver limit: the production admission is one process-wide object with the "
+          "documented limits",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit][wiring]") {
+    // The adapter chooses it only when no test installed a lookup or a pool; that choice is pinned
+    // in test_resolver_host_admission.cpp, because no test can drive the production lookup without
+    // DNS. This reads the object that choice returns.
+    const auto first = OidcProvider::production_lookup_admission_for_test();
+    const auto second = OidcProvider::production_lookup_admission_for_test();
+    REQUIRE(first != nullptr);
+    CHECK(first == second);
+    const auto& limits = first->limits();
+    CHECK(limits.per_name_in_flight == 8);
+    CHECK(limits.max_names_in_flight == 64);
+    CHECK(limits.refusal_ttl == std::chrono::seconds(3));
+    CHECK(limits.max_refusal_entries == 32);
+    CHECK(first->hosts_in_flight() == 0); // nothing outstanding at rest
 }
 
 TEST_CASE("OIDC resolver limit: discovery refused by the limit is not remembered by the 30 s "

@@ -37,12 +37,16 @@
 ///
 /// The NAT64 prefix probe (`ipv4only.arpa`) is exempt from both: the adapter does not call this
 /// class for it, so it takes no lease, is never refused here and never feeds the memory; only the
-/// pool's cap applies to it.
+/// pool's cap applies to it. That cap is the probe's only bound: the probe is not single-flight, so
+/// stuck probe lookups are limited by the pool alone (open owner decision: its own small cap, or
+/// single-flight).
 ///
 /// The caller treats a refusal like any other refused lookup: the same `kBusy` status and the
 /// same reason text as a full pool, so no caller learns a new failure kind. Nothing here returns an
 /// address, so a refusal can never become a success.
 
+// First, before the standard headers: on Windows bounded_resolver.hpp must see winsock2.h before any
+// header that pulls in windows.h.
 #include "bounded_resolver.hpp"
 
 #include <chrono>
@@ -54,6 +58,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace yuzu::server::net {
 
@@ -76,6 +81,8 @@ public:
         std::size_t per_name_in_flight{kLookupPerNameLimit};
         std::size_t max_names_in_flight{kLookupMaxNames};
         Clock::duration refusal_ttl{kLookupRefusalTtl};
+        /// A value below 1 is raised to 1: a memory that can hold nothing would still insert the
+        /// entry it was asked to make.
         std::size_t max_refusal_entries{kLookupRefusalMaxNames};
     };
 
@@ -224,7 +231,14 @@ public:
     [[nodiscard]] const Limits& limits() const noexcept { return limits_; }
 
 private:
-    HostLookupAdmission(Limits limits, NowFn now) : limits_(limits), now_(std::move(now)) {}
+    HostLookupAdmission(Limits limits, NowFn now)
+        : limits_(sanitised(limits)), now_(std::move(now)) {}
+
+    static Limits sanitised(Limits limits) noexcept {
+        if (limits.max_refusal_entries < 1)
+            limits.max_refusal_entries = 1;
+        return limits;
+    }
 
     /// The key every name that cannot be keyed shares. It holds a NUL, which no vetted host has.
     static constexpr std::string_view unkeyed_name() noexcept {
