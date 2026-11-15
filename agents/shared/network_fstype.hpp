@@ -20,8 +20,8 @@
 // trigger point blocks on traversal), and the "fuse.<suffix>" types that are network-backed. It does
 // NOT see a STACKED filesystem (an overlay/ecryptfs/loop over a dead network mount reports its own
 // local type) or a bare `fuse` mount (many are local): that needs a bounded-call seam in agent
-// core, not a longer list. TAR's
-// tar_mapdrive_collector.cpp keeps a deliberately different, map-drive-specific set.
+// core, not a longer list. Echo's
+// echo_mapdrive_collector.cpp keeps a deliberately different, map-drive-specific set.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
 // this directory. `network_mount_points` parses TEXT the caller already read; reading the file

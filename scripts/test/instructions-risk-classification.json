@@ -100,7 +100,7 @@
     "device.tags.clear":                         "destructive",
     "crossplatform.power.set_power_plan":        "destructive",
     "crossplatform.printing.clear_queue":        "destructive",
-    "crossplatform.tar.rollup":                  "destructive",
+    "crossplatform.echo.rollup":                  "destructive",
 
     "crossplatform.app_usage.summary":           "forensic",
     "crossplatform.app_usage.foreground":        "forensic",
@@ -114,6 +114,6 @@
     "windows.execution_artifacts.prefetch":      "forensic",
 
     "device.asset_tags.sync":                    "server-internal",
-    "crossplatform.tar.fleet_snapshot":          "server-internal"
+    "crossplatform.echo.fleet_snapshot":          "server-internal"
   }
 }

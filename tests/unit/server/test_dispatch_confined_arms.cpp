@@ -32,6 +32,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -722,6 +723,25 @@ TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as 
     CHECK(*result.abort_reason == ScopeAbortReason::Unresolvable);
 }
 
+TEST_CASE("resolve_scope_targets: a ResultSetUnusable registry evaluation aborts as "
+          "result_set_unusable and matched is absent",
+          "[server][dispatch][scope]") {
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs_x"});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "result_set_unusable");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::ResultSetUnusable);
+    CHECK(result.abort_detail == "rs_x"); // the registry's detail is carried for this reason
+}
+
 TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
           "[server][dispatch][scope]") {
     // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and
@@ -741,6 +761,19 @@ TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwis
           to_string(to_abort_reason(Kind::OwnerCheckFailed)));
     CHECK(std::string(to_string(Kind::PresenceDegraded)) ==
           to_string(to_abort_reason(Kind::PresenceDegraded)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusable)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) == "result_set_unusable");
+    // A pending set may fill, so a retry can succeed: transient, not permanent.
+    CHECK_FALSE(scope_abort_is_permanent(Kind::ResultSetUnusable));
+    // A failed set, or an incomplete one where a missing member would match (for example under
+    // NOT, LEN or STARTSWITH), does not change by retrying: permanent, with the same wire reason.
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusablePermanent)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) == "result_set_unusable");
+    CHECK(to_abort_reason(Kind::ResultSetUnusablePermanent) ==
+          ScopeAbortReason::ResultSetUnusablePermanent);
+    CHECK(scope_abort_is_permanent(Kind::ResultSetUnusablePermanent));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1043,12 +1076,12 @@ TEST_CASE("the shared confined-dispatch seam does not refuse a Destructive fan-o
             {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
     }
 
-    // A REAL Destructive row (tar.purge_source, DispatchClass::Destructive in
+    // A REAL Destructive row (echo.purge_source, DispatchClass::Destructive in
     // capability_decls/plugin_action_catalogue_a.hpp) — named explicitly so
     // this case cannot quietly become a test about a harmless pair.
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("d3-pin-cmd");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("purge_source");
     cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
     auto classified = ClassifiedCommandTestAccess::make(cmd);
@@ -1205,6 +1238,52 @@ TEST_CASE("wire_and_dispatch_confined: a local-miss agent with a ROUTABLE direct
     auto pending = registry.drain_gateway_pending();
     REQUIRE(pending.size() == 1);
     CHECK(pending[0].agent_id == "dev-remote");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+// A command for the echo plugin to an agent that only has a directory row (no local session) is
+// queued under its own plugin name.
+TEST_CASE("wire_and_dispatch_confined: a directory-routed echo command is written as `echo`",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][echo_rename]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    {
+        auto fresh = store.register_fresh("dev-remote-echo", "sess-echo");
+        REQUIRE(fresh.has_value());
+        REQUIRE(fresh->won);
+        auto announced = store.announce_connected("dev-remote-echo", "sess-echo", "cluster-b",
+                                                  "node-b", 90);
+        REQUIRE(announced.has_value());
+        REQUIRE(announced->matched);
+    }
+
+    auto cmd = make_route_fallback_cmd("route-fb-echo");
+    cmd.set_plugin("echo");
+    cmd.set_action("sql");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-echo", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-remote-echo"}, /*scope_expr=*/"",
+        /*exec_visible=*/unfiltered(), /*broadcast_on_none=*/false, kNoContainment, classified,
+        /*definition_id=*/{}, /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 1);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].cmd.plugin() == "echo");
     REQUIRE(pending[0].cluster_id.has_value());
     CHECK(*pending[0].cluster_id == "cluster-b");
 }

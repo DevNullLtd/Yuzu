@@ -11,15 +11,15 @@ Captured 2026-07-05 on `feat/spark-rebuild` @ origin/dev (2294dfe0), before any 
 
 ## Plugin callers — grep across all 47 plugins found exactly ONE
 
-**`agents/plugins/tar/src/tar_plugin.cpp`** — the only plugin calling `register_trigger`/`unregister_trigger`. Five interval-type triggers, all TAR pumps:
+**`agents/plugins/echo/src/echo_plugin.cpp`** — the only plugin calling `register_trigger`/`unregister_trigger`. Five interval-type triggers, all Echo pumps:
 
 | Trigger ID | Type | Purpose | Runtime re-register site |
 |---|---|---|---|
-| `tar.fast` | interval | fast capture cadence | `tar_plugin.cpp:430`, dynamic re-register `:2573/:2577` |
-| `tar.slow` | interval | slow capture cadence | `tar_plugin.cpp:435`, dynamic re-register `:2581/:2585` |
-| `tar.perf` | interval | perf-tier capture | `tar_plugin.cpp:449` |
-| `tar.software` | interval | software-inventory capture (config-tunable cadence, "0" disables — `tar.yaml:455`) | `tar_plugin.cpp:464`, dynamic re-register `:2592/:2597` |
-| `tar.rollup` | interval | warehouse rollup | `tar_plugin.cpp:470` |
+| `echo.fast` | interval | fast capture cadence | `echo_plugin.cpp:430`, dynamic re-register `:2573/:2577` |
+| `echo.slow` | interval | slow capture cadence | `echo_plugin.cpp:435`, dynamic re-register `:2581/:2585` |
+| `echo.perf` | interval | perf-tier capture | `echo_plugin.cpp:449` |
+| `echo.software` | interval | software-inventory capture (config-tunable cadence, "0" disables — `echo.yaml:455`) | `echo_plugin.cpp:464`, dynamic re-register `:2592/:2597` |
+| `echo.rollup` | interval | warehouse rollup | `echo_plugin.cpp:470` |
 
 All five unregister on shutdown/reconfigure (`:736-740`). This is the entire Stage-5 "built-in schedules → shipped Reflex bindings" worklist — small and fully enumerated, not a discovery risk.
 
@@ -39,7 +39,7 @@ All five unregister on shutdown/reconfigure (`:736-740`). This is the entire Sta
 
 ## Other trigger mentions (no code action needed)
 
-`policy_management.yaml` and `tar.yaml` reference "trigger" only in prose/config-tunable descriptions of the above — no additional call sites.
+`policy_management.yaml` and `echo.yaml` reference "trigger" only in prose/config-tunable descriptions of the above — no additional call sites.
 
 ## "Port" vs "rewrite" — the service spark is a rewrite, not a port
 
@@ -48,5 +48,5 @@ The Stage-1 framing "port the watching" (move detection logic from `guard_*.cpp`
 ## Stage 5 action items derived from this inventory
 
 1. ~~Port `agent_startup` as a spark type (missing from the original Stage-1 file list) — one-shot fire-at-boot, no persistent watcher.~~ **DONE — `spark_startup.cpp` landed on `dev`.**
-2. Convert TAR's 5 interval triggers to shipped Reflex bindings (embedded content, per ADR §8) — `tar_plugin.cpp`'s `register_trigger`/`unregister_trigger` calls are replaced by SparkEngine subscription + Reflex binding lookup; the dynamic re-register-on-reconfigure paths (`:2573-2597`) need an equivalent "rebind on config change" path in the new engine.
-3. Delete `yuzu_register_trigger`/`unregister_trigger` from the ABI (`plugin.h`, `plugin.hpp`), `trigger_engine.{hpp,cpp}`, and the `agent.cpp` wiring (`:422`, `:554`/`:2423` context field) once TAR is migrated — no other plugin depends on them.
+2. Convert Echo's 5 interval triggers to shipped Reflex bindings (embedded content, per ADR §8) — `echo_plugin.cpp`'s `register_trigger`/`unregister_trigger` calls are replaced by SparkEngine subscription + Reflex binding lookup; the dynamic re-register-on-reconfigure paths (`:2573-2597`) need an equivalent "rebind on config change" path in the new engine.
+3. Delete `yuzu_register_trigger`/`unregister_trigger` from the ABI (`plugin.h`, `plugin.hpp`), `trigger_engine.{hpp,cpp}`, and the `agent.cpp` wiring (`:422`, `:554`/`:2423` context field) once Echo is migrated — no other plugin depends on them.

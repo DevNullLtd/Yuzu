@@ -30,9 +30,11 @@
 #include "leader_elector.hpp"
 #include "leader_metrics.hpp"
 #include "pg/secret_codec.hpp"
+#include "ca_store.hpp"
 #include "pg_reachability_probe.hpp"
 #include "plugin_config_store.hpp"
 #include "principal_class.hpp"
+#include "raw_close_probe.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -54,7 +56,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <chrono>
+#include <expected>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -108,6 +112,7 @@ struct Harness {
     const std::atomic<std::uint64_t>* leader_loop_errors{nullptr}; // HA WS-11
     NvdDatabase* nvd_db{nullptr}; // null unless a case wires one
     EnablementStore* enablement_store{nullptr}; // null unless a case wires one
+    CaStore* ca_store{nullptr}; // #6527: null unless a case wires one
 
     bool session_present{true};
     std::string session_username{"alice"};
@@ -209,6 +214,7 @@ struct Harness {
         deps.server_start_time = std::chrono::steady_clock::now();
         deps.nvd_db = nvd_db;
         deps.enablement_store = enablement_store;
+        deps.ca_store = ca_store;
         deps.plaintext_probe_sink =
             plain_override ? plain_override : (plain_wired ? &plain_sink : nullptr);
         deps.main_listener_serving_fn = [this] { return main_serving.load(); };
@@ -337,6 +343,557 @@ TEST_CASE("health_routes: GET /metrics with a null mgmt_group_store/nvd_db "
     CHECK(r->status == 200);
 }
 
+// ── /metrics — CRL freshness gauges (#6527) ─────────────────────────────────
+
+namespace {
+PgReachabilityProbe::PingFn fixed_ping(PgReachabilityProbe::PingResult::Kind k);
+yuzu::test::PgTestTemplate health_ca_tpl{"health_ca_store", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    CaStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("health ca template: ca_store did not migrate");
+}};
+
+// The value of one unlabelled series in a Prometheus text body, or nullopt when absent.
+std::optional<double> series_value(const std::string& body, const std::string& name) {
+    const std::string needle = "\n" + name + " ";
+    const auto at = ("\n" + body).find(needle);
+    if (at == std::string::npos)
+        return std::nullopt;
+    return std::stod(("\n" + body).substr(at + needle.size()));
+}
+} // namespace
+
+TEST_CASE("health_routes: /metrics publishes the latest CRL's nextUpdate and publish time "
+          "(#6527) and is absent until one exists",
+          "[server][pg][routes][health_routes][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    Harness h;
+    h.ca_store = &store;
+    h.wire();
+    const std::string next = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+    const std::string pub = "yuzu_server_ca_crl_published_timestamp_seconds";
+
+    // No CRL yet: neither series exists (a 0 would read as a CRL that expired in 1970).
+    auto none = h.sink.Get("/metrics");
+    REQUIRE(none);
+    CHECK_FALSE(series_value(none->body, next));
+    CHECK_FALSE(series_value(none->body, pub));
+
+    CrlVersionRecord v1;
+    v1.version = 1;
+    v1.der = {0x30, 0x00};
+    v1.this_update = 1'800'000'000;
+    v1.next_update = 1'800'172'800;
+    v1.published_at = 1'800'000'100;
+    REQUIRE(store.record_crl_for_test(v1));
+    CrlVersionRecord v2 = v1;
+    v2.version = 2;
+    v2.next_update = 1'800'259'200;
+    v2.published_at = 1'800'086'500;
+    REQUIRE(store.record_crl_for_test(v2));
+
+    // The highest version wins, and the exact epoch seconds are exported.
+    auto got = h.sink.Get("/metrics");
+    REQUIRE(got);
+    REQUIRE(series_value(got->body, next));
+    CHECK(*series_value(got->body, next) == 1'800'259'200.0);
+    REQUIRE(series_value(got->body, pub));
+    CHECK(*series_value(got->body, pub) == 1'800'086'500.0);
+}
+
+TEST_CASE("health_routes: /metrics keeps the last CRL value when the freshness read fails on a "
+          "lease timeout or a query error (#6527)",
+          "[server][pg][routes][health_routes][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    CrlVersionRecord v;
+    v.version = 1;
+    v.der = {0x30, 0x00};
+    v.this_update = 1'800'000'000;
+    v.next_update = 1'800'172'800;
+    v.published_at = 1'800'000'100;
+    REQUIRE(store.record_crl_for_test(v));
+
+    Harness h;
+    h.ca_store = &store;
+    h.wire();
+    const std::string next = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+    const std::string pub = "yuzu_server_ca_crl_published_timestamp_seconds";
+    const auto expect_kept = [&](const char* what) {
+        auto r = h.sink.Get("/metrics");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        INFO(what);
+        REQUIRE(series_value(r->body, next));
+        CHECK(*series_value(r->body, next) == 1'800'172'800.0);
+        REQUIRE(series_value(r->body, pub));
+        CHECK(*series_value(r->body, pub) == 1'800'000'100.0);
+    };
+    expect_kept("first scrape sets the series");
+
+    // A newer CRL row now exists, so a read that SUCCEEDED during the failing legs below would
+    // visibly change the series; the checks therefore prove the read failed AND the value stayed.
+    CrlVersionRecord newer = v;
+    newer.version = 2;
+    newer.next_update = 1'800'345'600;
+    newer.published_at = 1'800'172'900;
+    REQUIRE(store.record_crl_for_test(newer));
+
+    {
+        auto held = pool.acquire(); // the only connection: the next read times out on the lease
+        REQUIRE(held);
+        expect_kept("lease timeout leaves the last value, never 0");
+    }
+
+    yuzu::server::pg::PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::PgResult{
+                PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions RENAME COLUMN "
+                                    "next_update TO next_update_x")}
+                .ok());
+    expect_kept("query error leaves the last value, never 0");
+    REQUIRE(yuzu::server::pg::PgResult{
+                PQexec(admin.get(), "ALTER TABLE ca_store.ca_crl_versions RENAME COLUMN "
+                                    "next_update_x TO next_update")}
+                .ok());
+    // Reads work again, so the series catches up to the newer row on the next scrape.
+    auto caught_up = h.sink.Get("/metrics");
+    REQUIRE(caught_up);
+    REQUIRE(series_value(caught_up->body, next));
+    CHECK(*series_value(caught_up->body, next) == 1'800'345'600.0);
+    REQUIRE(series_value(caught_up->body, pub));
+    CHECK(*series_value(caught_up->body, pub) == 1'800'172'900.0);
+}
+
+TEST_CASE("health_routes: /metrics skips the CRL freshness read while the Postgres probe says "
+          "down and reads once it is Ready (#6527)",
+          "[server][pg][routes][health_routes][crl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    CrlVersionRecord v;
+    v.version = 1;
+    v.der = {0x30, 0x00};
+    v.this_update = 1'800'000'000;
+    v.next_update = 1'800'172'800;
+    v.published_at = 1'800'000'100;
+    REQUIRE(store.record_crl_for_test(v));
+    const std::string next = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+
+    // A probe that has never been Ready: the read is skipped, so the series stays absent even
+    // though a CRL row exists. The skip is the only thing that can make that so.
+    PgReachabilityProbe down(fixed_ping(PgReachabilityProbe::PingResult::Kind::Failed));
+    down.probe_once();
+    Harness gated;
+    gated.ca_store = &store;
+    gated.pg_probe = &down;
+    gated.wire();
+    auto skipped = gated.sink.Get("/metrics");
+    REQUIRE(skipped);
+    CHECK_FALSE(series_value(skipped->body, next));
+
+    PgReachabilityProbe up(fixed_ping(PgReachabilityProbe::PingResult::Kind::Ok));
+    up.probe_once();
+    Harness ready;
+    ready.ca_store = &store;
+    ready.pg_probe = &up;
+    ready.wire();
+    auto read = ready.sink.Get("/metrics");
+    REQUIRE(read);
+    REQUIRE(series_value(read->body, next));
+    CHECK(*series_value(read->body, next) == 1'800'172'800.0);
+}
+
+TEST_CASE("health_routes: /metrics without a ca_store wired emits no CRL freshness series",
+          "[server][routes][health_routes][crl]") {
+    Harness h;
+    h.wire();
+    auto r = h.sink.Get("/metrics");
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(r->body.find("yuzu_server_ca_crl_next_update_timestamp_seconds") == std::string::npos);
+}
+
+// ── /metrics — CRL freshness read vs the publisher's table lock (#7098) ─────
+//
+// `CaStore::publish_next_crl` holds `LOCK TABLE ca_store.ca_crl_versions IN SHARE ROW EXCLUSIVE
+// MODE` from before it builds the CRL until COMMIT (docs/pki-architecture.md). The scrape-time
+// `latest_crl_freshness()` is a plain SELECT (ACCESS SHARE), which that mode does not conflict
+// with. These cases pin that: a scrape must keep answering while a publish sits on the lock, and
+// scrape + publish + scrape must be free of data races (races only show under the nightly
+// `sanitize-tsan` leg, `[tsan]` below; in a normal build they check the outcome only).
+//
+// NOT modelled: a publisher on another process or replica (here both "replicas" share a process
+// and use their own pool, so the only coupling is Postgres itself, as in production), and a
+// blocked scrape under the pool's own statement timeout (the mutation this guards is a read that
+// queues behind the lock, which is exactly what the bounds below catch).
+//
+// BOUND (case 1), chosen so a loaded shared 4-runner box cannot flake it and a lock-blocked read
+// cannot pass it:
+//  - kCrlHoldCap (10 s): the publisher parks INSIDE its transaction (so the table lock is held)
+//    until the scrapers have completed kScrapesDuringHold scrapes or this cap passes. Unblocked
+//    scrapes take milliseconds (tens under TSan), so the cap is >100x headroom. A read that queued
+//    behind the lock can make no progress until the publisher releases, which only the cap does,
+//    so the scrapes cannot complete in time and the case fails on `hold_cap_hit` and on
+//    `total_done < kScrapesDuringHold`. Those two are the detectors. Individual scrape latency is
+//    deliberately NOT measured in case 1: a scrape that blocked is only released after the
+//    publisher is, and is then discarded as post-release, so a latency bound there would be dead.
+// Case 2 carries a per-scrape bound (kCrlScrapeBound, 5 s) only as a gross-stall diagnostic; its
+// correctness is carried by `bad == 0`, `out_of_range == 0` and the version sequence.
+// The wait is driven by progress (scrape count), not a sleep, so a fast machine is not slowed and
+// a slow one is not flaky.
+namespace {
+
+constexpr auto kCrlHoldCap = std::chrono::seconds(10);
+constexpr auto kCrlScrapeBound = std::chrono::milliseconds(5000);
+constexpr int kScrapesDuringHold = 20;
+
+const std::string kNextSeries = "yuzu_server_ca_crl_next_update_timestamp_seconds";
+const std::string kPubSeries = "yuzu_server_ca_crl_published_timestamp_seconds";
+
+// Granted ShareRowExclusiveLock holders on THIS database's ca_crl_versions (pg_locks is
+// cluster-wide and a template clone shares relation OIDs, so the database is filtered too).
+int share_row_exclusive_holders(PGconn* admin) {
+    yuzu::server::pg::PgResult r{PQexec(
+        admin,
+        "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'ca_store' AND c.relname = 'ca_crl_versions' "
+        "AND l.mode = 'ShareRowExclusiveLock' AND l.granted "
+        "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())")};
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+        return -1;
+    return std::atoi(PQgetvalue(r.get(), 0, 0));
+}
+
+CrlVersionRecord seed_crl(std::int64_t next_update, std::int64_t published_at) {
+    CrlVersionRecord v;
+    v.version = 1;
+    v.der = {0x30, 0x00};
+    v.this_update = 1'800'000'000;
+    v.next_update = next_update;
+    v.published_at = published_at;
+    return v;
+}
+
+// One scraper thread's tally. Plain atomics: the thread body contains no Catch2 assertion
+// (Catch2 is not thread-safe), the main thread reads these after join.
+struct ScrapeTally {
+    std::atomic<int> done{0};
+    std::atomic<int> bad{0}; // status != 200, a missing series, a failed read, an unexpected value
+    std::atomic<std::int64_t> max_latency_us{0}; // case 2 only
+};
+
+} // namespace
+
+TEST_CASE("health_routes: a /metrics CRL freshness scrape is not blocked by an in-flight CRL "
+          "publish's SHARE ROW EXCLUSIVE table lock (#7098)",
+          "[server][pg][routes][health_routes][crl][tsan]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    yuzu::server::pg::PgPool publish_pool{{.conninfo = db.dsn(), .size = 2}};
+    // 3 leases for 2 scrapers (each runs its two reads one after the other): a read never waits
+    // on the pool, so a stall can only be the table lock.
+    yuzu::server::pg::PgPool read_pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(publish_pool.valid());
+    REQUIRE(read_pool.valid());
+    CaStore publisher{publish_pool};
+    CaStore reader{read_pool};
+    REQUIRE(publisher.is_open());
+    REQUIRE(reader.is_open());
+
+    constexpr std::int64_t kSeedNext = 1'800'172'800;
+    constexpr std::int64_t kSeedPub = 1'800'000'100;
+    REQUIRE(reader.record_crl_for_test(seed_crl(kSeedNext, kSeedPub)));
+
+    Harness h;
+    h.ca_store = &reader;
+    h.wire();
+
+    // Everything a thread below touches is declared BEFORE the Joiner, so it outlives the join on
+    // every exit path (locals are destroyed in reverse order).
+    std::atomic<bool> lock_held{false};
+    std::atomic<bool> hold_cap_hit{false};
+    std::atomic<bool> publisher_done{false};
+    // Set by the builder just before it returns, i.e. before the publish can commit. A scrape that
+    // is still unreleased when it ENDS read the table before the commit was possible.
+    std::atomic<bool> released{false};
+    std::atomic<int> total_done{0};
+    ScrapeTally tallies[2];
+    std::atomic<bool> stop_scrapers{false};
+    std::expected<CrlVersionRecord, CaStore::PublishFailure> published =
+        std::unexpected(CaStore::PublishFailure{CaStore::PublishError::Failed,
+                                                CaStore::PublishFailReason::NoConnection});
+    std::thread publish_thread;
+    std::vector<std::thread> scrapers;
+    scrapers.reserve(2); // emplace_back below never reallocates, so no thread is ever orphaned
+    // Raises the stop flag and joins on every exit path, so a REQUIRE unwinding out of this scope
+    // never leaves a joinable std::thread to std::terminate. The parked builder also watches the
+    // stop flag, so an unwind before the scrapers start does not hold the table lock for the cap.
+    // (std::thread, not std::jthread: Apple Clang's libc++ has none.)
+    struct Joiner {
+        std::atomic<bool>& stop;
+        std::thread& publisher;
+        std::vector<std::thread>& scrapers;
+        ~Joiner() {
+            stop.store(true, std::memory_order_release);
+            for (auto& t : scrapers)
+                if (t.joinable())
+                    t.join();
+            if (publisher.joinable())
+                publisher.join();
+        }
+    } joiner{stop_scrapers, publish_thread, scrapers};
+
+    publish_thread = std::thread([&] {
+        published = publisher.publish_next_crl(
+            [&](std::uint64_t number, const std::vector<IssuedCertRecord>&)
+                -> std::optional<CaStore::BuiltCrl> {
+                // Runs inside the transaction with the table lock held: park here until the
+                // scrapers have made progress, the cap passes, or the test is unwinding, then let
+                // the publish commit.
+                lock_held.store(true, std::memory_order_release);
+                const auto deadline = std::chrono::steady_clock::now() + kCrlHoldCap;
+                while (total_done.load(std::memory_order_acquire) < kScrapesDuringHold &&
+                       !stop_scrapers.load(std::memory_order_acquire)) {
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        hold_cap_hit.store(true, std::memory_order_release);
+                        break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                released.store(true, std::memory_order_release);
+                CaStore::BuiltCrl b;
+                b.der = {0x30, 0x00};
+                b.this_update = 1'800'000'000;
+                b.next_update = 1'800'259'200 + static_cast<std::int64_t>(number);
+                return b;
+            });
+        publisher_done.store(true, std::memory_order_release);
+    });
+
+    // Scrapers start only once the publish is demonstrably inside its transaction (or has
+    // already finished early, which the REQUIRE below then reports).
+    {
+        const auto deadline = std::chrono::steady_clock::now() + kCrlHoldCap;
+        while (!lock_held.load(std::memory_order_acquire) &&
+               !publisher_done.load(std::memory_order_acquire) &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(lock_held.load());
+
+    // Precondition, not an assumption: Postgres reports the publisher holding the table lock.
+    // Without this a refactor that stopped locking would leave the test green and vacuous.
+    yuzu::server::pg::PgConn admin{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    REQUIRE(share_row_exclusive_holders(admin.get()) == 1);
+
+    for (auto& tally : tallies) {
+        scrapers.emplace_back([&h, &reader, &tally, &total_done, &stop_scrapers, &released] {
+            while (!stop_scrapers.load(std::memory_order_acquire)) {
+                // Two reads per round. The route scrape exercises the production wiring, but its
+                // gauges keep their last value when a read fails or times out, so on its own it
+                // cannot prove a read happened. The direct call is the same function the route
+                // calls and reports a failed read as an error, so it can.
+                auto r = h.sink.Get("/metrics");
+                const auto direct = reader.latest_crl_freshness();
+                // A round that ended after the release may have read the committed row, so it is
+                // neither validated nor counted as "during the hold".
+                if (released.load(std::memory_order_acquire))
+                    break;
+                bool ok = r && r->status == 200 && direct.has_value() && direct->has_value() &&
+                          (*direct)->version == 1 && (*direct)->next_update == 1'800'172'800 &&
+                          (*direct)->published_at == 1'800'000'100;
+                if (ok) {
+                    const auto next = series_value(r->body, kNextSeries);
+                    const auto pub = series_value(r->body, kPubSeries);
+                    ok = next && pub && *next == 1'800'172'800.0 && *pub == 1'800'000'100.0;
+                }
+                if (!ok)
+                    tally.bad.fetch_add(1, std::memory_order_relaxed);
+                tally.done.fetch_add(1, std::memory_order_relaxed);
+                total_done.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+
+    publish_thread.join();
+    stop_scrapers.store(true, std::memory_order_release);
+    for (auto& t : scrapers)
+        t.join();
+
+    INFO("scrape rounds done while the lock was held (needed " << kScrapesDuringHold
+                                                               << "): " << total_done.load());
+    CHECK_FALSE(hold_cap_hit.load());
+    CHECK(total_done.load() >= kScrapesDuringHold);
+    for (auto& tally : tallies)
+        CHECK(tally.bad.load() == 0);
+    REQUIRE(published.has_value());
+    CHECK(published->version == 2);
+
+    // Lock released and committed: the next scrape reports the new CRL.
+    auto after = h.sink.Get("/metrics");
+    REQUIRE(after);
+    REQUIRE(series_value(after->body, kNextSeries));
+    CHECK(*series_value(after->body, kNextSeries) ==
+          static_cast<double>(1'800'259'200 + published->version));
+    CHECK(share_row_exclusive_holders(admin.get()) == 0);
+}
+
+TEST_CASE("health_routes: concurrent /metrics scrapes race-free against concurrent CRL publishes "
+          "on two stores (#7098)",
+          "[server][pg][routes][health_routes][crl][tsan]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, health_ca_tpl);
+    // Two publishers on separate pools model two replicas (the in-process publish mutex is
+    // per CaStore), so they queue on the Postgres table lock exactly as replicas do.
+    yuzu::server::pg::PgPool pool_a{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::pg::PgPool pool_b{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::pg::PgPool read_pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool_a.valid());
+    REQUIRE(pool_b.valid());
+    REQUIRE(read_pool.valid());
+    CaStore store_a{pool_a};
+    CaStore store_b{pool_b};
+    CaStore reader{read_pool};
+    REQUIRE(store_a.is_open());
+    REQUIRE(store_b.is_open());
+    REQUIRE(reader.is_open());
+
+    constexpr std::int64_t kSeedNext = 1'800'172'800;
+    REQUIRE(reader.record_crl_for_test(seed_crl(kSeedNext, 1'800'000'100)));
+
+    Harness h;
+    h.ca_store = &reader;
+    h.wire();
+
+    constexpr int kPublishesPerStore = 15;
+    // next_update is a strictly increasing function of the allocated number, so every value a
+    // scrape can legitimately observe lies in [kSeedNext, kMaxNext] and ties to a real version.
+    constexpr std::int64_t kBase = 1'800'259'200;
+    constexpr std::int64_t kMaxNext = kBase + 1 + 2 * kPublishesPerStore;
+    const auto build = [](std::uint64_t number,
+                          const std::vector<IssuedCertRecord>&) -> std::optional<CaStore::BuiltCrl> {
+        CaStore::BuiltCrl b;
+        b.der = {0x30, 0x00};
+        b.this_update = 1'800'000'000;
+        b.next_update = kBase + static_cast<std::int64_t>(number);
+        return b;
+    };
+
+    // Everything a thread below touches is declared BEFORE the Joiner (see case 1).
+    std::atomic<bool> stop_scrapers{false};
+    ScrapeTally tallies[2];
+    std::atomic<int> out_of_range{0};
+    std::atomic<int> publish_failures{0};
+    std::atomic<int> publishes_in_flight{0};
+    std::atomic<int> overlapped{0}; // scrapes that began and ended with a publish in flight
+    std::vector<std::int64_t> versions_a, versions_b; // each written by its own thread only
+    const auto publisher_body = [&](CaStore& store, std::vector<std::int64_t>& versions) {
+        for (int i = 0; i < kPublishesPerStore; ++i) {
+            publishes_in_flight.fetch_add(1, std::memory_order_acq_rel);
+            auto r = store.publish_next_crl(build);
+            publishes_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            if (r)
+                versions.push_back(r->version);
+            else
+                publish_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(4); // every emplace_back below constructs a Joiner-owned thread in place
+    struct Joiner {
+        std::atomic<bool>& stop;
+        std::vector<std::thread>& threads;
+        ~Joiner() {
+            stop.store(true, std::memory_order_release);
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+    } joiner{stop_scrapers, threads};
+
+    for (auto& tally : tallies) {
+        threads.emplace_back([&h, &tally, &stop_scrapers, &out_of_range, &publishes_in_flight,
+                              &overlapped] {
+            while (!stop_scrapers.load(std::memory_order_acquire)) {
+                const bool in_flight_before =
+                    publishes_in_flight.load(std::memory_order_acquire) > 0;
+                const auto t0 = std::chrono::steady_clock::now();
+                auto r = h.sink.Get("/metrics");
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count();
+                if (in_flight_before && publishes_in_flight.load(std::memory_order_acquire) > 0)
+                    overlapped.fetch_add(1, std::memory_order_relaxed);
+                bool ok = r && r->status == 200;
+                if (ok) {
+                    const auto next = series_value(r->body, kNextSeries);
+                    const auto pub = series_value(r->body, kPubSeries);
+                    ok = next && pub;
+                    if (ok && (*next < static_cast<double>(kSeedNext) ||
+                               *next > static_cast<double>(kMaxNext)))
+                        out_of_range.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!ok)
+                    tally.bad.fetch_add(1, std::memory_order_relaxed);
+                auto prev = tally.max_latency_us.load(std::memory_order_relaxed);
+                while (us > prev && !tally.max_latency_us.compare_exchange_weak(
+                                        prev, us, std::memory_order_relaxed)) {
+                }
+                tally.done.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    threads.emplace_back([&] { publisher_body(store_a, versions_a); });
+    threads.emplace_back([&] { publisher_body(store_b, versions_b); });
+    // threads[2] and [3] are the publishers; the scrapers run until both finish.
+    threads[2].join();
+    threads[3].join();
+    stop_scrapers.store(true, std::memory_order_release);
+    threads[0].join();
+    threads[1].join();
+
+    CHECK(publish_failures.load() == 0);
+    CHECK(out_of_range.load() == 0);
+    // Overlap of a scrape with a publish is probabilistic (nothing forces the interleaving), so
+    // it is reported, not asserted: publishes and scrapes both run back to back for the whole
+    // window, which makes a zero count implausible but not impossible. Correctness does not hang
+    // on it. Every scraper completed at least one scrape, none failed, and none stalled grossly.
+    INFO("scrapes that began and ended with a publish in flight: " << overlapped.load());
+    for (auto& tally : tallies) {
+        CHECK(tally.done.load() > 0);
+        CHECK(tally.bad.load() == 0);
+        CHECK(tally.max_latency_us.load() <
+              std::chrono::duration_cast<std::chrono::microseconds>(kCrlScrapeBound).count());
+    }
+
+    // The table lock serialised the publishers: versions 2..(2K+1), each issued exactly once.
+    std::vector<std::int64_t> all = versions_a;
+    all.insert(all.end(), versions_b.begin(), versions_b.end());
+    std::sort(all.begin(), all.end());
+    REQUIRE(all.size() == static_cast<std::size_t>(2 * kPublishesPerStore));
+    for (std::size_t i = 0; i < all.size(); ++i)
+        CHECK(all[i] == static_cast<std::int64_t>(i) + 2);
+
+    // Quiescent: one more scrape converges on the latest CRL.
+    auto last = h.sink.Get("/metrics");
+    REQUIRE(last);
+    REQUIRE(series_value(last->body, kNextSeries));
+    CHECK(*series_value(last->body, kNextSeries) == static_cast<double>(kMaxNext));
+}
+
 // ── /livez — trivial, no gate, no deps ──────────────────────────────────────
 
 TEST_CASE("health_routes: GET /livez is reachable with no session and always ok",
@@ -387,6 +944,9 @@ TEST_CASE("health_routes: GET /readyz with every store pointer null reports "
     CHECK(std::find(failed.begin(), failed.end(), "response_store") != failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "api_token_store") != failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "fleet_topology_store") != failed.end());
+    // ADR-0070 R1: the registered-CRL-source store is GATING (fail-closed at boot), unlike the
+    // /crypto layout store: a null pointer here is a failed store, never a "degraded" notice.
+    CHECK(std::find(failed.begin(), failed.end(), "revocation_source_store") != failed.end());
     CHECK(std::find(failed.begin(), failed.end(), "pg_pool") != failed.end());
     // scim_store's check is opt-in gated (cfg.scim_enable defaults false) —
     // must NOT appear in failed_stores despite the pointer being null.
@@ -1169,8 +1729,9 @@ TEST_CASE("health_routes: wiring -- server.cpp still calls "
            "the general limiter site uses the shared 429 writer");
     // The sink the probes register on must exist before register_health_routes is handed it:
     // deleting the construction leaves a null sink, which silently registers nothing.
-    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_)", 1,
-           "the redirect listener's route sink is built");
+    expect("redirect_sink_ = std::make_unique<HttplibRouteSink>(*redirect_server_, "
+           "StageRequirement::ExemptNoStage)", 1,
+           "the redirect listener's route sink is built, and opts out of the post-read stage");
     {
         const auto built =
             flat.find(squeeze("redirect_sink_ = std::make_unique<HttplibRouteSink>("));
@@ -2197,7 +2758,7 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
             std::lock_guard<std::mutex> lk(seen_mu);
             seen.emplace_back(req.method, res.status);
         });
-    HttplibRouteSink plain{srv};
+    HttplibRouteSink plain{srv, StageRequirement::ExemptNoStage};
 
     Harness h;
     h.plain_override = &plain;
@@ -2333,4 +2894,48 @@ TEST_CASE("health_routes: the production redirect pre-routing serves probes and 
     expect_security_headers(down);
     counted(10, "GET", 503);
 }
+
+#ifndef _WIN32
+TEST_CASE("health_routes: the plaintext redirect closes the connection after a request that "
+          "declares a body it never reads",
+          "[server][routes][health_routes][plaintext][live][bounds]") {
+    // From httplib 0.59 a response below 400 that leaves a declared request body unread must
+    // carry `Connection: close`. The probe is a raw socket on purpose:
+    // httplib::Client sends `Connection: close` itself and the server echoes it, and it sends
+    // `Expect: 100-continue` instead of a declared body of 1024 bytes or more once the early 301
+    // arrives, so a Client-based check passes with the server's own close removed. The raw probe
+    // sends no Connection header, asserts the 301 head carries `Connection: close`, and waits
+    // for EOF.
+    httplib::Server srv;
+    srv.set_read_timeout(30, 0);
+    health::install_plaintext_redirect_pre_routing(srv, "127.0.0.1", 8443);
+    const int port = srv.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { srv.listen_after_bind(); });
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            srv.wait_until_ready();
+            srv.stop();
+            th.join();
+        }
+    }};
+    srv.wait_until_ready();
+    REQUIRE(srv.is_running());
+
+    for (const auto& [name, request] :
+         {std::pair<const char*, std::string>{"chunked", yuzu::test::kChunkedPostRequest},
+          std::pair<const char*, std::string>{"content-length 64 MiB declared",
+                                              yuzu::test::kLengthPostRequest},
+          std::pair<const char*, std::string>{"empty then chunked Transfer-Encoding lines",
+                                              yuzu::test::kEmptyThenChunkedPostRequest}}) {
+        DYNAMIC_SECTION(name) {
+            const auto r = yuzu::test::probe_for_close(port, request);
+            INFO(r.head);
+            CHECK(r.head.starts_with("HTTP/1.1 301"));
+            CHECK(r.head.find("Connection: close") != std::string::npos);
+            CHECK(r.closed);
+        }
+    }
+}
+#endif // !_WIN32
 #endif // !YUZU_HEALTH_ROUTES_LIVE_TSAN

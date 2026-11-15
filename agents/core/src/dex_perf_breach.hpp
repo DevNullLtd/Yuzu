@@ -4,12 +4,12 @@
  * dex_perf_breach.hpp — sustained performance-breach detection (BRD A3,
  * docs/dex-brd-coverage.md rows 13–15, 124).
  *
- * The A1 TAR perf warehouse is HISTORY (every 30 s sample, on-device, raw-SQL
+ * The A1 Echo perf warehouse is HISTORY (every 30 s sample, on-device, raw-SQL
  * queryable); this module is ALERTS: the Windows state poller samples a minimal
  * counter set on a slow cadence and emits a ruleless DEX observation when a
  * metric stays bad for a sustained window — `perf.cpu_sustained`,
  * `perf.memory_pressure`, `perf.disk_latency_high`. Detection lives here in
- * agent core, NOT the TAR plugin: plugins have no path to the Guardian
+ * agent core, NOT the Echo plugin: plugins have no path to the Guardian
  * observation sink, and sustained-condition semantics are exactly the
  * dex_win_poll poll-and-latch shape (see memory project-dex-brd-delivery).
  *
@@ -21,7 +21,7 @@
  * the 120 s cadence). Thresholds are hardcoded sane defaults until F1 makes
  * them operator-tunable (the D3 blast-radius precedent).
  *
- * The counter derivations mirror tar_perf.cpp (the A1 reference
+ * The counter derivations mirror echo_perf.cpp (the A1 reference
  * implementation) but read only the three breach metrics; the two stay
  * separate because agent core must not compile plugin sources. Pure functions
  * compile and unit-test on every host; the Win32 reads (GetSystemTimes,
@@ -42,7 +42,7 @@ namespace yuzu::agent::win {
 /// CPU and disk are CUMULATIVE since boot; commit charge is instantaneous.
 /// `valid` covers the CPU core read; `commit_valid` and `disk_valid` are
 /// PER-DOMAIN because GetPerformanceInfo (commit) and IOCTL_DISK_PERFORMANCE
-/// (disk) can each fail independently of GetSystemTimes — mirrors the tar_perf
+/// (disk) can each fail independently of GetSystemTimes — mirrors the echo_perf
 /// contract. A failed sub-read must NOT feed a healthy 0% into its latch (that
 /// would clear a real breach / reset a building one — gov review MEDIUM #1).
 struct PerfBreachCounters {
@@ -86,7 +86,7 @@ struct PerfBreachSample {
 /// reading is invalid, elapsed <= 0, or a CPU counter regressed (reboot /
 /// counter reset — rates from a regressed baseline would be garbage). A disk
 /// counter regression (hotplug/reset) invalidates only the disk domain for
-/// one interval via the saturating delta — mirrors tar_perf::derive_sample.
+/// one interval via the saturating delta — mirrors echo_perf::derive_sample.
 YUZU_EXPORT PerfBreachSample derive_breach_sample(const PerfBreachCounters& prev,
                                                   const PerfBreachCounters& cur);
 

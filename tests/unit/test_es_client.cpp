@@ -1,5 +1,5 @@
 // Tests for yuzu/agent/es_client.hpp -- pure Endpoint Security helpers
-// relocated from tar_proc_es.cpp (A0, macOS Spark/Reflex/DEX programme).
+// relocated from echo_proc_es.cpp (A0, macOS Spark/Reflex/DEX programme).
 // Every case is pure integer arithmetic, run on every host.
 
 #include <yuzu/agent/es_client.hpp>

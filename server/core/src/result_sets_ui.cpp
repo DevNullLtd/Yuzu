@@ -66,8 +66,8 @@ std::string utc_stamp(int64_t epoch) {
 }
 
 const char* source_label(const std::string& kind) {
-    if (kind == source_kind::kTarQuery)
-        return "TAR query";
+    if (kind == source_kind::kEchoQuery)
+        return "Echo query";
     if (kind == source_kind::kInstructionResult)
         return "Instruction result";
     if (kind == source_kind::kManualCurate)
@@ -78,7 +78,7 @@ const char* source_label(const std::string& kind) {
 }
 
 bool reeval_supported(const std::string& kind) {
-    return kind == source_kind::kTarQuery || kind == source_kind::kInstructionResult;
+    return kind == source_kind::kEchoQuery || kind == source_kind::kInstructionResult;
 }
 
 } // namespace
@@ -370,7 +370,7 @@ const char* const kResultSetsPageTemplate = R"HTM(<!DOCTYPE html>
           <div class="rs-tools">
             <button type="button" class="rs-btn" id="ox-rs-instr">From instruction</button>
             <button type="button" class="rs-btn" id="ox-rs-inv">From inventory</button>
-            <button type="button" class="rs-btn" id="ox-rs-tar">From TAR query</button>
+            <button type="button" class="rs-btn" id="ox-rs-echo">From Echo query</button>
           </div>
           <div id="ox-rs-out" aria-live="polite"></div>
           <div id="rs-sidebar"

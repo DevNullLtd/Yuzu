@@ -150,7 +150,7 @@ Pipe-delimited rows via `write_output()`, the first field naming the row kind (`
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (`response_retention_days`, default 90 days), queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics. Nothing here runs on a schedule.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics. Nothing here runs on a schedule.
 - **Sensitivity.** Rows describe the device's application-control configuration (enforcement mode, rule counts, the file stem of each active policy). No username, hostname or rule content appears in any field; a `REG_SZ`/`REG_EXPAND_SZ` value under `CI\Policy` is reported verbatim (escaped, at most 4 KiB), so a string value could carry a path. The posture itself is security-relevant: it tells a reader which controls are not enforced.
 - **Siblings:** `antivirus` (Defender and exclusion state, not application control), `windows_optional_features` (OS feature state), `registry` / `wmi` (general-purpose reads this plugin's narrow surface deliberately does not replace) — none join with this plugin's output.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("windows.app_control.wdac_policy")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

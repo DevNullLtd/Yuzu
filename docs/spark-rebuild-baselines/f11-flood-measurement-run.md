@@ -209,7 +209,7 @@ worktree's branch was cut from):
 over:** the pushed rules never reached this agent's Guardian reconcile. Across two
 `full_sync` pushes (the arm call's own, plus a manual re-push ~4 minutes into a stable
 connection) and a combined ~5 minutes of polling both the agent's own log (zero
-`attach_rule`/`reconcile`/`guard.unhealthy` lines - heartbeats and unrelated TAR/DEX
+`attach_rule`/`reconcile`/`guard.unhealthy` lines - heartbeats and unrelated Echo/DEX
 triggers kept firing normally throughout, so the process was not hung, just never
 received the push) and the server's `/api/v1/guaranteed-state/status` route
 (`errored_rules` stayed `0` throughout), no evidence surfaced that the 40 rules were

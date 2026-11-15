@@ -111,6 +111,10 @@ Closes `/auth-and-authz` gap-matrix **P0 #3** (both halves of Workstream B line
   `--oidc-issuer` is non-empty, not that the IdP resolves; a typo'd issuer with
   no break-glass user is a silent lockout. Documented prerequisite; an IdP
   discovery probe is a tracked follow-up.
+  *(Superseded in part by #4160: a runtime-wiring check now refuses to start when no
+  provider came up, but OIDC reachability is deliberately still NOT probed at start-up
+  so an IdP outage at restart cannot block boot. See `docs/auth-architecture.md`,
+  "Boot guard". This dated record is otherwise unchanged.)*
 
 ## Validation
 

@@ -34,6 +34,7 @@
 #if defined(__linux__)
 
 #include "disk_actions_legs.hpp"
+#include <planned_leg.hpp>
 
 namespace yuzu::disk_actions {
 
@@ -68,6 +69,16 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     emit_unsupported(ctx, "linux:volumes",
                      "not implemented -- see the descriptor fallback prose");
     return 0;
+}
+
+// PLANNED (partitions/topology): one `status|<action>|unsupported|linux:planned` row until
+// H.12 lands. The shared reporter owns the grammar (agents/shared/planned_leg.hpp).
+int emit_partitions(yuzu::CommandContext& ctx) {
+    return yuzu::shared::report_planned(ctx, "partitions");
+}
+
+int emit_topology(yuzu::CommandContext& ctx) {
+    return yuzu::shared::report_planned(ctx, "topology");
 }
 
 } // namespace yuzu::disk_actions

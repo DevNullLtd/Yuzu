@@ -217,7 +217,7 @@ std::string escape_cell(std::string_view s) {
 //
 // Five capability registries live outside the plugin descriptor world: two
 // header-only constexpr arrays (Guardian registry-guard hives, service-guard
-// states) and three backed by real translation units (TAR capture sources,
+// states) and three backed by real translation units (Echo capture sources,
 // Spark mechanism factories, DEX obs-type platform coverage). This host tool
 // dlopens agent plugins, so it must never link agent_core or server_core
 // (that pulls the very libraries whose plugins it loads, and drags libpq/
@@ -235,7 +235,7 @@ struct RegistryTable {
 constexpr RegistryTable kRegistryTables[] = {
     {"registry_hives.tsv", "Guardian registry-guard hives"},
     {"service_states.tsv", "Guardian service-guard states"},
-    {"tar_capture_sources.tsv", "TAR capture sources"},
+    {"echo_capture_sources.tsv", "Echo capture sources"},
     {"spark_mechanisms.tsv", "Spark detection mechanisms"},
     {"dex_obs_platforms.tsv", "DEX observation-type platform coverage"},
 };

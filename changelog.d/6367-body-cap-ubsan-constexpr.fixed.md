@@ -1,1 +1,0 @@
-- **CI/build-only: `resolve_body_cap` is constant-evaluable under GCC 15 `-fsanitize=undefined` again.** It tracks its best match by index instead of by pointer, so `crypto_routes.cpp`'s `static_assert(resolve_body_cap(...))` is expected to compile in the UBSan CI legs, which still run with `null,alignment` checks disabled (#5492). No runtime or operator-visible change (#6367).

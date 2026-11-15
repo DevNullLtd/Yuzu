@@ -332,7 +332,8 @@ inline bool skip_certificate_body(Reader& r) {
     // The signature field is itself a blob: the algorithm string, then the signature payload
     // string, and nothing after (ssh-keygen -lf: "incomplete message" / "unexpected bytes remain
     // after decoding"). A security-key (sk-*) algorithm carries its flags byte and counter
-    // after the payload, as ssh-ed25519-sk.c / ssh-ecdsa-sk.c verify them.
+    // after the payload, as ssh-ed25519-sk.c / ssh-ecdsa-sk.c verify them. A WebAuthn
+    // (webauthn-sk-*) signature carries more fields and is refused here until #6263.
     Reader sr{*sig};
     const auto alg = sr.cstr(); // a C string, as OpenSSH reads it; stricter: any NUL is refused
     if (!alg || !sr.str())
@@ -599,7 +600,7 @@ struct KeysParse {
 
 /// Parses one authorized_keys file's text into `out.rows` (one `key|...` row per accepted line,
 /// in file order, duplicates kept). Blank and `#` lines are uncounted; a line over kMaxKeyLine
-/// is counted oversized, one sshd would not accept is counted malformed. Each row is charged
+/// is counted oversized, one this decoder refuses is counted malformed. Each row is charged
 /// before it is retained; stops at the first refusal (`out.truncated`). A line is cut at its
 /// first NUL (`out.nul_truncated`): sshd treats it as a C string, so a key before the NUL is
 /// still trusted.
@@ -642,8 +643,10 @@ inline void parse_authorized_keys(std::string_view text, std::string_view accoun
             key = std::move(second.key);
             if (!key || !parsed) {
                 ++out.malformed;
-                out.unknown_type =
-                    out.unknown_type || first.unknown_refused || second.unknown_refused;
+                // Options that parsed were not a key type, so only the key behind them can be an
+                // unknown one; a leading token that did not parse as options may itself be.
+                out.unknown_type = out.unknown_type || second.unknown_refused ||
+                                   (!parsed && first.unknown_refused);
                 continue;
             }
             opts = *parsed;

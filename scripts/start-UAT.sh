@@ -729,7 +729,7 @@ start_all() {
 
     # #1454 — seed a management-group role binding the admin to the root "All
     # Devices" group. With #1453 the default RBAC-disabled rig already shows the
-    # full fleet to the admin (TAR fleet scan, /api/me), so this is NOT required
+    # full fleet to the admin (Echo fleet scan, /api/me), so this is NOT required
     # out of the box; it is here so the rig is ALSO correct if an operator later
     # ENABLES RBAC — without it the role-scoped visibility join would return
     # "no agents in scope" under enforcement. The root group + the
@@ -744,7 +744,7 @@ start_all() {
              VALUES ('000000000000', 'user', '${ADMIN_USER}', 'ITServiceOwner');" 2>/dev/null; then
             ok "Seeded admin → root-group ITServiceOwner role (#1454; for RBAC-enabled mode)"
         else
-            warn "Could not seed admin management-group role (#1454) — TAR scan still works with RBAC disabled (#1453)"
+            warn "Could not seed admin management-group role (#1454) — Echo scan still works with RBAC disabled (#1453)"
         fi
     else
         warn "sqlite3 not found or $mgmt_db missing — skipping admin role seed (#1454)"

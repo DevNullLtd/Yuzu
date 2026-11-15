@@ -165,6 +165,12 @@ TEST_CASE("discovered devices: fragment states are distinct and never draw manag
         CHECK(html.find("showing the 1 most recently seen") != std::string::npos);
         CHECK(html.find("Managed") == std::string::npos);
         CHECK(html.find("managed") == std::string::npos);
+        // The approved table shape: exactly these six headers, in order, and no
+        // device-type / topology / scan controls (those are a later row).
+        CHECK(html.find("<thead><tr><th>Address</th><th>Name</th><th>MAC</th><th>Subnet</th>"
+                        "<th>Found by</th><th>Last seen</th></tr></thead>") != std::string::npos);
+        for (const char* absent : {"Device type", "Topology", "Scan", "<button", "<form"})
+            CHECK(html.find(absent) == std::string::npos);
     }
     SECTION("an unreadable store is a failbox") {
         CHECK(render_discovered_devices_unavailable().find("failbox") != std::string::npos);

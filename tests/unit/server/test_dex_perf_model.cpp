@@ -24,7 +24,7 @@
 #include "tag_store.hpp"
 #include "test_dex_perf_api_double.hpp"
 #include "test_route_sink.hpp"
-#include "../../../agents/plugins/tar/src/tar_schema_registry.hpp" // registry tripwire only
+#include "../../../agents/plugins/echo/src/echo_schema_registry.hpp" // registry tripwire only
 
 #include "../test_helpers.hpp"
 
@@ -127,6 +127,22 @@ TEST_CASE("dex_perf_os_from_session: normalizes to the closed token set",
     CHECK(rules::dex_perf_os_from_session("darwin") != "windows");
     CHECK(rules::dex_perf_os_from_session("freebsd").empty());
     CHECK(rules::dex_perf_os_from_session("").empty());
+}
+
+TEST_CASE("dex_perf_os_from_session: non-shipped macOS spellings fold to macos (Apps fleet normaliser)",
+          "[dex][perf][rules][os]") {
+    for (const char* os : {"darwin24.1", "macos14", "Darwin", "MacOS"})
+        CHECK(rules::dex_perf_os_from_session(os) == "macos");
+    CHECK(rules::dex_perf_os_from_session("haiku").empty());
+}
+
+TEST_CASE("dex_fleet_os_label: normalised token; unknown passes through raw",
+          "[dex][perf][rules][os]") {
+    for (const char* os : {"darwin24.1", "Darwin 24.0", "macos14"})
+        CHECK(rules::dex_fleet_os_label(os) == "macos");
+    CHECK(rules::dex_fleet_os_label("Windows 11") == "windows");
+    CHECK(rules::dex_fleet_os_label("haiku") == "haiku");
+    CHECK(rules::dex_fleet_os_label("").empty());
 }
 
 TEST_CASE("dex_perf_os_collects: only OSes with a real perf collector today",
@@ -361,6 +377,37 @@ TEST_CASE("perf fragment: cohort values are HTML-escaped (no stored XSS)",
     CHECK(html.find("&lt;script&gt;") != std::string::npos);
 }
 
+// #7535: a cohort key or value that carries a zero-width character prints a marker in its text and
+// keeps its raw bytes in every form value and URL, or the filter would stop matching its own cohort.
+TEST_CASE("perf fragment: a cohort option value keeps its raw bytes while its label is marked",
+          "[dex][perf][render][marking]") {
+    const std::string zwsp = "\xE2\x80\x8B";
+    DexPerfSnapshot snap;
+    snap.cohort_key = "mo" + zwsp + "del";
+    snap.available_keys = {snap.cohort_key};
+    for (int i = 0; i < 3; ++i)
+        snap.devices.push_back(dev("a-" + std::to_string(i), 10.0, 50.0, 1.0, "a" + zwsp));
+    for (int i = 0; i < 3; ++i)
+        snap.devices.push_back(dev("b-" + std::to_string(i), 40.0, 70.0, 3.0, "b"));
+    const auto html = render_dex_perf_fragment(snap, 7);
+    // The key picker's option: raw value, marked label.
+    CHECK(html.find("<option value=\"mo" + zwsp + "del\" selected>mo&lt;U+200B&gt;del</option>") !=
+          std::string::npos);
+    // The cohort's cell is marked, and its drill link carries the raw bytes.
+    CHECK(html.find(">a&lt;U+200B&gt;</button>") != std::string::npos);
+    CHECK(html.find("cohort_value=a%E2%80%8B") != std::string::npos);
+    // The A/B cohort pickers: raw option values, marked labels.
+    CHECK(html.find("<option value=\"a" + zwsp + "\"") != std::string::npos);
+    CHECK(html.find(">a&lt;U+200B&gt;</option>") != std::string::npos);
+    // Never inside a tag.
+    for (std::size_t at = html.find('<'); at != std::string::npos; at = html.find('<', at + 1)) {
+        const auto end = html.find('>', at);
+        REQUIRE(end != std::string::npos);
+        INFO(html.substr(at, end - at));
+        CHECK(html.substr(at, end - at).find("&lt;U+") == std::string::npos);
+    }
+}
+
 TEST_CASE("devices fragment: titles, escape, honest empty states", "[dex][perf][render]") {
     auto snap = two_cohorts(3, 0);
     snap.devices.push_back(dev("<img src=x>", 50.0, 50.0, 1.0, "a"));
@@ -370,8 +417,13 @@ TEST_CASE("devices fragment: titles, escape, honest empty states", "[dex][perf][
     CHECK(worst.find("Worst devices by current CPU") != std::string::npos);
     CHECK(worst.find("<img src=x>") == std::string::npos); // agent_id escaped
     CHECK(worst.find("&lt;img") != std::string::npos);
+    // Its back link and device drills are text-link buttons, and a pane swap drops the previous
+    // fragment's <style>: the shared reset rule must ride in this fragment (else they paint as
+    // user-agent buttons).
+    CHECK(worst.find("<button type=\"button\" class=\"dx-lk") != std::string::npos);
+    CHECK(worst.find("where(button.dx-lk") != std::string::npos);
 
-    auto nr = render_dex_perf_devices_fragment(snap, DexPerfMetric::kCpu, true, std::nullopt,
+    auto nr =render_dex_perf_devices_fragment(snap, DexPerfMetric::kCpu, true, std::nullopt,
                                                50, 7);
     CHECK(nr.find("Everyone is reporting") != std::string::npos); // honest empty complement
 }
@@ -834,19 +886,19 @@ TEST_CASE("REST /dex/perf/fleet: stats + denominators, absent metric is null",
     CHECK(j["data"]["perf_capable_online"] == 3);
 }
 
-TEST_CASE("dex_perf_os_collects is pinned to the tar registry's perf rows (#1845 tripwire)",
+TEST_CASE("dex_perf_os_collects is pinned to the echo registry's perf rows (#1845 tripwire)",
           "[dex][perf][rules][registry]") {
     // The server keeps detail::dex_perf_os_collects as its runtime fact; this pins
     // it to the plugin's declared capture support. A collector landing for a new
     // OS in the registry fails here until dex_perf_rules.hpp is flipped too.
     bool saw_perf = false;
-    for (const auto& src : yuzu::tar::capture_sources()) {
+    for (const auto& src : yuzu::echo::capture_sources()) {
         if (src.name != "perf")
             continue;
         saw_perf = true;
         for (const auto& row : src.os_support) {
-            const bool collects = row.status == yuzu::tar::OsSupportStatus::kSupported ||
-                                  row.status == yuzu::tar::OsSupportStatus::kSupportedConstrained;
+            const bool collects = row.status == yuzu::echo::OsSupportStatus::kSupported ||
+                                  row.status == yuzu::echo::OsSupportStatus::kSupportedConstrained;
             INFO("os=" << row.os);
             CHECK(rules::dex_perf_os_collects(std::string{row.os}) == collects);
         }
@@ -1051,7 +1103,7 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
         -> yuzu::server::ConfinedDispatchOutcome {
         auto it = params.find("sql");
         dispatched_sql = it != params.end() ? it->second : "";
-        return {.sent = 1, .command_id = "tar-abc123"};
+        return {.sent = 1, .command_id = "echo-abc123"};
     };
     const std::string output =
         "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
@@ -1059,7 +1111,7 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
     DexRoutes::ResponsesFn responses =
         [&](const std::string& command_id, const std::string& /*agent_id*/)
         -> std::vector<DexAgentResponse> {
-        if (command_id == "tar-abc123")
+        if (command_id == "echo-abc123")
             return {{"WS-1", 0, output, ""}};
         return {};
     };
@@ -1103,12 +1155,12 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
         CHECK(audited.empty());
         CHECK(dispatched_sql.empty());
     }
-    SECTION("result route renders the parsed panel; non-tar command_ids are rejected") {
+    SECTION("result route renders the parsed panel; non-echo command_ids are rejected") {
         yuzu::server::test::TestRouteSink sink;
         DexRoutes routes;
         routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, dispatch, responses);
         auto ok = sink.Get(
-            "/fragments/dex/device/procperf/result?command_id=tar-abc123&agent_id=WS-1&window=7d");
+            "/fragments/dex/device/procperf/result?command_id=echo-abc123&agent_id=WS-1&window=7d");
         REQUIRE(ok);
         CHECK(ok->status == 200);
         CHECK(ok->body.find("Teams.exe") != std::string::npos);

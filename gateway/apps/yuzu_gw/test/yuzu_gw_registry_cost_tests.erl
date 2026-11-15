@@ -44,7 +44,7 @@
          <<"privacy_permissions">>, <<"processes">>, <<"procfetch">>, <<"quarantine">>,
          <<"rdp_control">>, <<"registry">>, <<"runtimes">>, <<"sccm">>, <<"script_exec">>,
          <<"services">>, <<"software_actions">>, <<"status">>, <<"storage">>,
-         <<"system_hardening">>, <<"tags">>, <<"tar">>, <<"update_source_trust">>,
+         <<"system_hardening">>, <<"tags">>, <<"echo">>, <<"update_source_trust">>,
          <<"users">>, <<"vuln_scan">>, <<"wifi">>, <<"windows_optional_features">>,
          <<"windows_updates">>, <<"wmi">>, <<"wol">>]).
 

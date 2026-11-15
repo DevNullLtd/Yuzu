@@ -45,7 +45,7 @@ using rbac_sql::kWriteTimeout;
 // Availability hardening (governance re-review, #2703 Gate 7 — Fable-reviewed
 // merge slice, item 1 commit A). The hot authz path (`maybe_refresh_generation`,
 // `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
-// `user_rbac_group_names`/`role_effects_for`) is on the request-serving critical
+// `user_rbac_group_names_checked`/`role_effects_for`) is on the request-serving critical
 // path for EVERY confined operator action, so it uses this short acquire budget
 // instead of `kReadTimeout` (2 s). PgPool clamps a bounded acquire that finds the
 // pool already saturated at entry to its `saturated_fast_fail` (500ms by default),
@@ -566,7 +566,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 38> types = {
+    const std::array<std::string_view, 39> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -677,7 +677,15 @@ void RbacStore::seed_defaults() {
         // PowerManagement/PluginConfig precedent — unused ops are harmless
         // and keep the loop uniform); ITServiceOwner gets a TARGETED
         // Decommission:Delete grant below (see that grant's comment).
-        "Decommission"
+        "Decommission",
+        // ADR-0070 R1 (slice 2b-1a): registered CRL sources - operator-registered egress targets
+        // (the URLs the server may fetch) plus the CA certificates a CRL is checked against.
+        // Only `Read` and `Write` are consumed (removal is a Write, not a Delete); the
+        // Administrator loop below grants every operation, and NO other role is seeded. The pair
+        // is ALSO gated on the durable-administrator predicate (revocation_source_admin_gate.hpp),
+        // so a custom role granted it under RBAC on is still refused, and `Read` is in the
+        // topology floor so an RBAC-off install stays admin-only.
+        "RevocationSource"
     };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
@@ -797,9 +805,8 @@ void RbacStore::seed_defaults() {
         // committing, matching the UP-3 discipline PgPool::run_in_txn enforces
         // centrally for every OTHER write path in this store — a failed
         // statement must not be followed by commit() (PgTxn::commit() on an
-        // aborted transaction still returns PGRES_COMMAND_OK while silently
-        // performing a rollback; calling it unconditionally would have been
-        // correct-by-accident, not by contract).
+        // aborted transaction rolls back and returns false; checking first keeps
+        // the failure attributable to the statement that caused it).
         if (!exec("INSERT INTO rbac_store.role_permissions (role_name, securable_type, "
                   "operation, effect) SELECT $1, $2, $3, 'allow' WHERE NOT EXISTS ("
                   "  SELECT 1 FROM rbac_store.revoked_seed_defaults "
@@ -1981,7 +1988,7 @@ RbacStore::role_permission_effect_authz_checked(const std::string& role_name,
                                                 const std::string& operation) const {
     if (!open_)
         return std::unexpected(std::string(kRbacErrStoreNotOpen));
-    // Same contract as the hot authz reads (user_rbac_group_names / role_effects_for):
+    // Same contract as the hot authz reads (user_rbac_group_names_checked / role_effects_for):
     // breaker-gated, short acquire budget, outcome fed back to the breaker. The degrade
     // metric is NOT bumped here; the gate that consumes the error owns the counter.
     if (!breaker_admit())
@@ -2390,10 +2397,12 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
 // §3 cross-schema query owner, constructed per call exactly as `unassign_role` does. None of
 // them changes a `principal_roles` / `rbac_meta` row, so none applies a local cache generation.
 
-AccountDeactivationResult RbacStore::deactivate_account(const std::string& username) {
+AccountDeactivationResult RbacStore::deactivate_account(const std::string& username,
+                                                        SessionGenerationMode session_mode) {
     if (!open_)
         return {AccountDeactivationResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
-    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.deactivate_account(username);
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.deactivate_account(username,
+                                                                                      session_mode);
 }
 
 LocalRoleChangeResult RbacStore::set_local_role(const std::string& username, auth::Role role) {
@@ -3005,20 +3014,53 @@ bool RbacStore::check_scoped_permission(const std::string& username,
                                         const std::string& securable_type,
                                         const std::string& operation, const std::string& agent_id,
                                         const ManagementGroupStore* mgmt_store) const {
-    // 1. Global permission first (a global ALLOW short-circuits, #1715(b)).
-    if (check_permission(username, securable_type, operation))
-        return true;
+    return check_scoped_permission_checked(username, securable_type, operation, agent_id,
+                                           mgmt_store)
+        .value_or(false);
+}
+
+std::expected<bool, std::string> RbacStore::check_scoped_permission_checked(
+    const std::string& username, const std::string& securable_type, const std::string& operation,
+    const std::string& agent_id, const ManagementGroupStore* mgmt_store) const {
+    // #3739: a `false` reached AFTER a read degraded is "could not be determined", not a
+    // definitive denial. The FIRST degrade seen is remembered and surfaced only if the decision
+    // would otherwise be a plain `false`; an ALLOW and an explicit deny-group hit are returned
+    // as such, and the control flow is otherwise identical to the pre-#3739 Boolean
+    // implementation, so the Boolean wrapper's answers do not change. (A deny-group hit after an
+    // earlier degraded GLOBAL read is reported as a plain deny: the unread global grant, which
+    // could have overridden it, is not named. Accepted residual, recorded in the #3739 ledger.)
+    std::optional<std::string> degraded;
+    const auto note_degrade = [&degraded](std::string why) {
+        if (!degraded)
+            degraded = std::move(why);
+    };
+    const auto deny = [&degraded]() -> std::expected<bool, std::string> {
+        if (degraded)
+            return std::unexpected(*degraded);
+        return false;
+    };
+
+    // 1. Global permission first (a global ALLOW short-circuits, #1715(b)). A failed global read
+    //    does NOT end the check (the scoped path still runs, as before) but is remembered.
+    if (auto global = check_permission_checked(username, securable_type, operation)) {
+        if (*global)
+            return true;
+    } else {
+        note_degrade(std::move(global.error()));
+    }
 
     // 2. No mgmt store or agent → cannot do the scoped check.
     if (!mgmt_store || agent_id.empty())
-        return false;
+        return deny();
 
     // 3. Resolve allow/deny groups via the shared INV-7 resolver, intersect
     //    with the agent's reachable groups. Deny wins within the scoped set.
-    //    Fail-closed: any store error → false.
+    //    Fail-closed: any store error → deny (degraded).
     auto pg = resolve_perm_groups(username, securable_type, operation, mgmt_store);
-    if (!pg)
-        return false;
+    if (!pg) {
+        note_degrade(std::move(pg.error()));
+        return deny();
+    }
 
     // CONFINEMENT reads are now degrade-distinguishable (ADR-0042): a `nullopt`
     // means the mgmt-store degraded (store-not-open / pool-acquire timeout /
@@ -3026,33 +3068,37 @@ bool RbacStore::check_scoped_permission(const std::string& username,
     // silent empty here would drop the agent's reachable groups and could admit
     // a scoped grant that a DENY assignment should have blocked (fail-open).
     auto groups = mgmt_store->get_agent_groups(agent_id);
-    if (!groups)
-        return false; // mgmt-store degrade → deny
+    if (!groups) {
+        note_degrade(std::string(kRbacErrMgmtGroupReadDegraded));
+        return deny(); // mgmt-store degrade → deny
+    }
     std::unordered_set<std::string> reachable;
     for (const auto& gid : *groups) {
         reachable.insert(gid);
         auto ancestors = mgmt_store->get_ancestor_ids(gid);
-        if (!ancestors)
-            return false; // mgmt-store degrade → deny
+        if (!ancestors) {
+            note_degrade(std::string(kRbacErrMgmtGroupReadDegraded));
+            return deny(); // mgmt-store degrade → deny
+        }
         for (const auto& aid : *ancestors)
             reachable.insert(aid);
     }
     if (reachable.empty())
-        return false;
+        return deny();
 
     for (const auto& g : pg->deny_groups)
         if (reachable.contains(g))
-            return false;
+            return false; // explicit deny is definitive even after an earlier degraded read
     for (const auto& g : pg->allow_groups)
         if (reachable.contains(g))
             return true;
-    return false;
+    return deny();
 }
 
 // ── ADR-0017 admit-then-filter list gate ─────────────────────────────────────
 
 std::expected<std::vector<std::string>, std::string>
-RbacStore::user_rbac_group_names(const std::string& username) const {
+RbacStore::user_rbac_group_names_checked(const std::string& username) const {
     std::vector<std::string> groups;
     if (!open_)
         return std::unexpected(std::string(kRbacErrStoreNotOpen));
@@ -3066,8 +3112,8 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         // existing regex needs no change.
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
-            spdlog::warn(
-                "RbacStore::user_rbac_group_names: circuit breaker open — DENY without pool touch");
+            spdlog::warn("RbacStore::user_rbac_group_names_checked: circuit breaker open — DENY "
+                         "without pool touch");
         return std::unexpected(std::string(kRbacErrCircuitBreakerOpen));
     }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
@@ -3075,7 +3121,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
-            spdlog::warn("RbacStore::user_rbac_group_names: pool acquire timed out — DENY");
+            spdlog::warn("RbacStore::user_rbac_group_names_checked: pool acquire timed out — DENY");
         return std::unexpected(std::string(kRbacErrPoolAcquireTimeout));
     }
     pg::PgResult r = pg::exec_params(
@@ -3085,7 +3131,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         breaker_note_result(false);
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
-            spdlog::warn("RbacStore::user_rbac_group_names: query failed: {} — DENY",
+            spdlog::warn("RbacStore::user_rbac_group_names_checked: query failed: {} — DENY",
                          PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
     }
@@ -3103,7 +3149,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
     if (!breaker_admit()) {
-        // #2703 Gate 7 item 3 — see user_rbac_group_names' matching call for
+        // #2703 Gate 7 item 3 — see user_rbac_group_names_checked' matching call for
         // the ADR-0017 chokepoint-visibility rationale; same reason labels.
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
@@ -3154,13 +3200,20 @@ RbacStore::resolve_perm_groups(const std::string& username, const std::string& s
     if (!mgmt_store)
         return std::unexpected("management group store unavailable");
 
-    auto rbac_groups = user_rbac_group_names(username);
+    auto rbac_groups = user_rbac_group_names_checked(username);
     if (!rbac_groups)
         return std::unexpected(rbac_groups.error());
 
     auto assignments = mgmt_store->get_assignments_for_principal(username, *rbac_groups);
-    if (!assignments)
-        return std::unexpected(assignments.error());
+    if (!assignments) {
+        // #3739: this read belongs to the MANAGEMENT-GROUP store (it counts
+        // yuzu_server_mgmt_group_read_degrade_total itself), so its failure carries that
+        // store's token, not the forwarded text -- which is ambiguous ("query failed: ..." is
+        // shared with the RBAC reads) and would be labelled as an RBAC-side fault by
+        // `check_scoped_permission_checked`'s callers. Every caller of this helper only tests
+        // for failure; none consumes the text.
+        return std::unexpected(std::string(kRbacErrMgmtGroupReadDegraded));
+    }
 
     auto role_effect_r = role_effects_for(securable_type, operation);
     if (!role_effect_r)

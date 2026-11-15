@@ -115,7 +115,7 @@ Each action writes one or more independently-shaped, pipe-delimited lines via `w
 ### Where the data goes
 
 - **Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`.
-- **Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — a grep of `server/core/src` for `"storage"` and for the five `agent.storage.*` ids finds no server-side consumer beyond the generic dispatch/response path.
+- **Not consumed by** daily-sync inventory, the Echo warehouse, DEX, or metrics — a grep of `server/core/src` for `"storage"` and for the five `agent.storage.*` ids finds no server-side consumer beyond the generic dispatch/response path.
 - **Sensitivity.** The plugin never interprets its `key`/`value` content — every row is opaque caller-supplied text, so whether a given row identifies a device, a person, or installed software depends entirely on what the calling plugin chose to store there, not on anything this plugin's own columns declare. The `status`/`count`/`cleared` fields carry nothing beyond the device id.
 - **Siblings:** none. `content/definitions/storage.yaml` is the only definitions file with `execution.plugin: storage`; the plugin's five actions are the only definitions that execute against it.
 - **MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition("agent.storage.get")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`.

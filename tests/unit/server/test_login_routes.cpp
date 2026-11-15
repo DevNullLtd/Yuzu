@@ -187,7 +187,7 @@ TEST_CASE("GET /login forwards to the landing page, keeping only a validated nex
         {"/login?error=SSO_FAILED", "/home"},
         {"/login?next=devices&next=/evil", "/home?next=devices"},
         {"/login?next=devices%20", "/home"},
-        {"/login?next=tar&error=sso_invalid", "/home?next=tar&error=sso_invalid"},
+        {"/login?next=echo&error=sso_invalid", "/home?next=echo&error=sso_invalid"},
     };
     for (const auto& [path, location] : expected) {
         INFO(path);

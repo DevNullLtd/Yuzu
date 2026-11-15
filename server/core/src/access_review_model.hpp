@@ -90,9 +90,12 @@
 /// DOES propagate — the pointer being present makes it part of the read set
 /// this call promised to read completely.
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
@@ -189,5 +192,147 @@ build_access_review(AuthDB* users, RbacStore* rbac, EnginePrincipalStore* engine
 /// to `rbac_enforcement_in_effect()`. `rbac` may be null (degrades to
 /// `"degraded"`, matching `rbac_enforcement_label(nullptr)`).
 [[nodiscard]] std::string access_review_rbac_enforcement(const RbacStore* rbac);
+
+/// Longest campaign id any surface accepts (the store mints 16 hex digits; this is wider).
+inline constexpr std::size_t kCampaignIdMaxLen = 64;
+
+/// The refusal text every surface (REST 400, MCP invalid-params) returns for an id that fails
+/// `valid_campaign_id`, so the two transports cannot drift.
+inline constexpr std::string_view kCampaignIdInvalidMessage =
+    "campaign id must be 1-64 characters of A-Z, a-z, 0-9, _ or -";
+
+/// Longest `principal_type` / `principal_id` and `role_name` an attestation names, in bytes. The
+/// cap bounds what a caller can make an audit row (and a log line) carry before any existence
+/// proof, and must still admit every grant the stores can freeze: an OIDC principal is
+/// `oidc:<iss>#<sub>` with `iss` and `sub` each capped at 255 bytes by `oidc_provider.cpp` (about
+/// 516 bytes), a SAML principal caps each component the same way, and an IdP group is stored as
+/// `<source>:<external_id>` with an external id up to 512 bytes (`kMaxExternalIdLength` in
+/// `rbac_store.cpp`). `RbacStore::create_role` and the engine principal id carry no length cap of
+/// their own, so 1024 is a bound on what is attestable, not a proven upper bound of every store.
+/// No known creation path produces a longer id. A frozen grant whose `principal_id` or `role_name`
+/// is longer cannot be attested (400); it stays pending and is reported as an incomplete review
+/// when the campaign closes.
+/// A row carries at most three such fields (`audit_token` neutralises bytes but does not shorten
+/// them), so an audit row stays under about 3.3 KiB.
+inline constexpr std::size_t kPrincipalIdMaxLen = 1024;
+inline constexpr std::size_t kRoleNameMaxLen = 1024;
+
+/// The refusal text REST (400) and MCP (invalid-params) return for an attestation grant field that
+/// is over its cap or holds a NUL byte, so the two transports (and the store backstop, which
+/// prefixes `bad_request: `) cannot drift. An EMPTY field keeps its own "required" refusal. The
+/// number is spelled out in the text, so the `static_assert`s below pin it to the constants:
+/// change the text and the asserts together with `kPrincipalIdMaxLen`/`kRoleNameMaxLen`.
+inline constexpr std::string_view kGrantFieldInvalidMessage =
+    "principal_type, principal_id and role_name must be 1-1024 bytes without NUL";
+static_assert(kPrincipalIdMaxLen == 1024 && kRoleNameMaxLen == 1024,
+              "kGrantFieldInvalidMessage spells out 1024: update the text with the constants");
+
+/// Most decisions one grant keeps. `record_attestation` refuses the next one (`bad_request:` +
+/// `kDecisionCapMessage`, nothing written) and `get_campaign(id, true)` returns at most this many
+/// history entries per grant (the latest), so one grant cannot make a read or a response grow
+/// without bound (for rows written through the application path; rows added by other means, such
+/// as owner-level SQL with the guard triggers disabled, are outside that guarantee).
+/// `decision_seq` stays the total count: a consumer detects a truncated history as
+/// `decision_seq > history.size()`. Same type as `decision_seq`. The count alone does not bound a
+/// campaign with many grants: superseded entries also return a justification preview only
+/// (`kHistoryJustificationPreviewChars`, access_review_store.hpp).
+inline constexpr std::int32_t kMaxDecisionsPerGrant = 100;
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a decision past the cap, so the
+/// two transports (and the store, which prefixes `bad_request: `; the handlers strip that prefix
+/// for this one refusal) cannot drift. It spells out 100, pinned below.
+inline constexpr std::string_view kDecisionCapMessage =
+    "this grant already has the maximum number of recorded decisions (100) in this campaign; no "
+    "further decision can be recorded on it. To review it again, open a new campaign (closing "
+    "this one is a separate choice: it leaves every undecided grant pending). If an earlier "
+    "attempt may have been recorded, read the campaign first";
+static_assert(kMaxDecisionsPerGrant == 100,
+              "kDecisionCapMessage spells out 100: update the text with the constant");
+
+/// The store's in-transaction refusal when the reviewer owns the engine principal named by the
+/// grant's FROZEN snapshot (`owner_or_email`, written at campaign open). The route layer reads the
+/// owner live before the write; this is the backstop for an ownership transfer since the campaign
+/// opened, so a former owner stays refused. Carries the `forbidden: ` class prefix; the gate maps
+/// it to the engine-owner outcome (same 403 body).
+inline constexpr std::string_view kStoreForbiddenEngineOwner =
+    "forbidden: reviewer owned the engine principal named by this grant when the campaign opened";
+
+/// The key under which a frozen grant snapshot carries the engine principal's owner
+/// (`owner_username` for an engine row). The two open-campaign builders (REST, MCP) WRITE it and
+/// the store's frozen-owner backstop READS it: one name, so a rename cannot silently disable the
+/// backstop.
+inline constexpr const char* kSnapshotOwnerKey = "owner_or_email";
+
+/// The `bad_request: ` prefix the store puts on a refusal it classifies as the caller's.
+inline constexpr std::string_view kBadRequestPrefix = "bad_request: ";
+
+/// The wire text of the cap refusal: the store's `bad_request: <kDecisionCapMessage>` without the
+/// classification prefix, or `nullopt` for any other store error. Exact match, so no other
+/// `bad_request:` string changes behaviour.
+[[nodiscard]] inline std::optional<std::string_view>
+decision_cap_wire_message(std::string_view store_error) noexcept {
+    if (store_error.size() == kBadRequestPrefix.size() + kDecisionCapMessage.size() &&
+        store_error.starts_with(kBadRequestPrefix) &&
+        store_error.substr(kBadRequestPrefix.size()) == kDecisionCapMessage)
+        return kDecisionCapMessage;
+    return std::nullopt;
+}
+
+/// True when `principal_type`, `principal_id` and `role_name` are each within their cap and free of
+/// a NUL byte (emptiness is the caller's own check). `pg/pg_exec.hpp` binds `c_str()`, so a NUL
+/// would truncate the bound value and name a different grant than the one audited.
+[[nodiscard]] inline bool attest_grant_fields_within_bounds(std::string_view principal_type,
+                                                            std::string_view principal_id,
+                                                            std::string_view role_name) noexcept {
+    const auto ok = [](std::string_view s, std::size_t cap) {
+        return s.size() <= cap && s.find('\0') == std::string_view::npos;
+    };
+    return ok(principal_type, kPrincipalIdMaxLen) && ok(principal_id, kPrincipalIdMaxLen) &&
+           ok(role_name, kRoleNameMaxLen);
+}
+
+/// The single shared campaign id validator: 1..kCampaignIdMaxLen bytes, each in `[A-Za-z0-9_-]`.
+/// REST, MCP, the Access page and the Settings campaign fragment all call this;
+/// never fork a second copy. It tests every byte of the view, so an embedded NUL is rejected:
+/// `pg/pg_exec.hpp` binds `c_str()`, so a NUL (httplib decodes `%00` in a route capture to a real
+/// one) would truncate the bound id and read or write a different row than the one named. The
+/// accepted alphabet excludes every URL-significant byte, so an id that passes can be placed in a
+/// query value or a path segment unchanged.
+[[nodiscard]] inline bool valid_campaign_id(std::string_view id) noexcept {
+    if (id.empty() || id.size() > kCampaignIdMaxLen)
+        return false;
+    for (const unsigned char c : id) {
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+/// Longest campaign title any surface accepts, in bytes. A title is a short human label (the
+/// examples are "Q3 2026 Access Review"), and it is the one caller-supplied free-text field of
+/// `open_access_review` that is stored for good (campaigns are never pruned) and returned by every
+/// list read, so it is bounded like the other fields. A longer title is refused with 400 before
+/// anything is written; no audit row is written for it.
+inline constexpr std::size_t kCampaignTitleMaxLen = 256;
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a title over the cap, and the
+/// store backstop's text (which prefixes `bad_request: `). It spells out 256, pinned below.
+inline constexpr std::string_view kCampaignTitleTooLongMessage = "title must be at most 256 bytes";
+static_assert(kCampaignTitleMaxLen == 256,
+              "kCampaignTitleTooLongMessage spells out 256: update the text with the constant");
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a title holding a NUL byte, so
+/// the handlers refuse it before the grant population is read and the store's backstop (the same
+/// text with `bad_request: ` in front) cannot drift from them. `pg/pg_exec.hpp` binds `c_str()`,
+/// so a NUL would truncate the stored title.
+inline constexpr std::string_view kCampaignTitleNulMessage = "title contains a NUL byte";
+
+/// The refusal text REST (400) and MCP (invalid-params) return for a PRESENT `justification` that
+/// is not a JSON string. Absent and JSON null both mean "no justification"; any other type used to
+/// be read as the empty string, so the decision was recorded without the note the reviewer sent
+/// and the call answered 200. The entry is append-only, so the lost note could only be superseded.
+inline constexpr std::string_view kJustificationTypeMessage = "justification must be a string";
 
 } // namespace yuzu::server

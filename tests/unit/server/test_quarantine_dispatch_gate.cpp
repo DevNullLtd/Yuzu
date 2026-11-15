@@ -608,7 +608,7 @@ TEST_CASE("compose_containment_gate: ONLY the quarantine control plugin is exemp
     const auto now = std::chrono::steady_clock::now();
     std::unordered_set<std::string> quarantined{"dev-A"};
 
-    for (const auto* plugin : {"firewall", "services", "tar", "quarantine_helper", ""}) {
+    for (const auto* plugin : {"firewall", "services", "echo", "quarantine_helper", ""}) {
         QuarantineSnapshot snap;
         const auto d = compose_containment_gate(plugin, "exec", false, std::optional{quarantined}, snap, now);
         INFO("plugin=" << plugin);

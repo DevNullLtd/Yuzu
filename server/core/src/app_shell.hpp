@@ -61,6 +61,10 @@ std::vector<std::string> breadcrumb_trail(const ShellCtx& ctx);
 inline constexpr std::string_view kShellBegin = "<!--yuzu:shell-->";
 inline constexpr std::string_view kShellEnd = "<!--/yuzu:shell-->";
 
+/// The colour-scheme names the boot scripts and the Settings picker accept, as a JS regex source.
+/// Single source: each emitting TU splices this between its own script prefix and suffix.
+inline constexpr std::string_view kThemeWhitelistRe = "^(slate|navy|jade|light|light-baby|light-hot)$";
+
 /// The chrome block: kShellBegin, shell CSS, sidebar, header, user/role script, kShellEnd.
 std::string render_shell(const ShellCtx& ctx);
 

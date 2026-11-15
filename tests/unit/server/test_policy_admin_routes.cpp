@@ -309,3 +309,179 @@ TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
     REQUIRE(yuzu::server::pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{})
                 .status() == PGRES_COMMAND_OK);
 }
+
+TEST_CASE("POST /api/policies: the policy.create audit row records the stored targeting (#2123)",
+          "[compliance][admin]") {
+    // Governance G6-CO-1 (CC6.1/CC6.3): the audit row carried an empty detail, so
+    // what a policy actually targeted could not be reconstructed after the fact —
+    // the reason #2123's silently-broadened scopes left no trace.
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    PolicyAdminHarness h{&store};
+
+    const std::string yaml = "apiVersion: yuzu.io/v1alpha1\r\n"
+                             "kind: Policy\r\n"
+                             "displayName: Audited Policy\r\n"
+                             "fragment: " +
+                             *frag +
+                             "\r\n"
+                             "scope:\r\n"
+                             "  selector:\r\n"
+                             "    platform: Windows\r\n"
+                             "\r\n"
+                             "    tags: [prod]\r\n"
+                             "managementGroups:\r\n"
+                             "  - abc123def456\r\n";
+    auto res = h.sink.Post("/api/policies", yaml, "text/plain");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+    REQUIRE(!h.audit_calls.empty());
+    const auto& a = h.audit_calls.back();
+    CHECK(a.action == "policy.create");
+    INFO("detail = " << a.detail);
+    CHECK(a.detail.find("scope=") != std::string::npos);
+    CHECK(a.detail.find("tag:prod") != std::string::npos);
+    CHECK(a.detail.find("windows") != std::string::npos);
+    CHECK(a.detail.find("groups=1") != std::string::npos);
+    CHECK(a.detail.find("abc123def456") != std::string::npos);
+    CHECK(a.detail.find('\n') == std::string::npos);
+    CHECK(a.detail.find('\r') == std::string::npos);
+}
+
+TEST_CASE("POST /api/policies: policy.create audit records an empty group list as groups=0 (#2123)",
+          "[compliance][admin]") {
+    // A value only the stored policy can supply (the request carries no groups
+    // and a mixed-case platform), so an echo of the request cannot satisfy it
+    // (governance Gate 8 quality-engineer F2).
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag.has_value());
+    PolicyAdminHarness h{&store};
+    const std::string yaml =
+        "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: Selector Only\n"
+        "fragment: " +
+        *frag + "\nscope:\n  selector:\n    platform: LiNuX\n";
+    auto res = h.sink.Post("/api/policies", yaml, "text/plain");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+    REQUIRE(!h.audit_calls.empty());
+    const auto& a = h.audit_calls.back();
+    INFO("detail = " << a.detail);
+    CHECK(a.detail == "scope=ostype____\"linux\" groups=0");
+}
+
+// ── Identifier handling: an invalid id is refused ─────────────────────────────────────────────
+//
+// The id in these routes is a path capture. An id that is not valid is refused as a whole:
+// no policy is deleted, enabled or disabled, and no success audit row is written.
+
+namespace {
+
+std::string make_policy(PolicyStore& store) {
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag);
+    auto policy = store.create_policy(R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Id Handling Policy
+description: A test policy
+fragment: )" + *frag + R"(
+scope: "tags.env == 'production'"
+)");
+    REQUIRE(policy);
+    return *policy;
+}
+
+} // namespace
+
+TEST_CASE("DELETE /api/policies/:id: an invalid id deletes nothing and audits no success",
+          "[pg][compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string pid = make_policy(store);
+
+    PolicyAdminHarness h{&store};
+    auto res = h.sink.Delete("/api/policies/" + pid + std::string("\0junk", 5));
+    REQUIRE(res);
+    // Nothing matched, so the route answers a plain "not deleted": status 200, deleted=false.
+    CHECK(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("deleted"));
+    CHECK(body["deleted"] == false);
+    {
+        auto still = store.get_policy(pid);
+        REQUIRE(still.has_value());
+        CHECK(still->has_value());
+    }
+    CHECK(h.audit_calls.empty());
+    CHECK(h.emitted_events.empty());
+}
+
+TEST_CASE("POST /api/policies/:id/disable|enable: an invalid id changes nothing",
+          "[pg][compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string pid = make_policy(store);
+    const auto before = store.get_policy(pid);
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+
+    PolicyAdminHarness h{&store};
+    const std::string bad = pid + std::string("\0junk", 5);
+    auto dis = h.sink.Post("/api/policies/" + bad + "/disable", "");
+    REQUIRE(dis);
+    // The store refuses the value, which the route reports as a store fault (503) with the
+    // store's fixed message, never as success.
+    CHECK(dis->status == 503);
+    {
+        const auto body = nlohmann::json::parse(dis->body);
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["message"] == "failed to disable policy");
+    }
+    auto ena = h.sink.Post("/api/policies/" + bad + "/enable", "");
+    REQUIRE(ena);
+    CHECK(ena->status == 503);
+    {
+        const auto body = nlohmann::json::parse(ena->body);
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["message"] == "failed to enable policy");
+    }
+
+    const auto after = store.get_policy(pid);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->enabled == (*before)->enabled);
+    CHECK(h.audit_calls.empty());
+    CHECK(h.emitted_events.empty());
+}
+
+TEST_CASE("POST /api/policies/:id/disable|enable: an unknown clean id answers 400 policy not found",
+          "[pg][compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+
+    PolicyAdminHarness h{&store};
+    for (const char* verb : {"disable", "enable"}) {
+        INFO("verb=" << verb);
+        auto res = h.sink.Post(std::string("/api/policies/yuzu_test_no_such_policy/") + verb, "");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"] == "policy not found");
+    }
+    CHECK(h.audit_calls.empty());
+    CHECK(h.emitted_events.empty());
+}

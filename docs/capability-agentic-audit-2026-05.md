@@ -4,7 +4,7 @@
 
 ## What this document is
 
-A capability-and-agentic-readiness audit of Yuzu against two bars: (1) feature parity with mature commercial endpoint-management platforms (Tanium, BigFix, Intune, ServiceNow Discovery, Ansible Tower, CrowdStrike), and (2) the **agentic-first** thesis — every operation a human can perform via the dashboard must be performable by an authenticated LLM-driven worker through a documented, discoverable, machine-readable surface.
+A capability-and-agentic-readiness audit of Yuzu against two bars: (1) feature parity with mature commercial endpoint-management platforms (real-time endpoint query and response, patch and configuration management, cloud device management, IT discovery, automation and orchestration, and endpoint detection and response products), and (2) the **agentic-first** thesis — every operation a human can perform via the dashboard must be performable by an authenticated LLM-driven worker through a documented, discoverable, machine-readable surface.
 
 Companion docs:
 
@@ -18,7 +18,7 @@ This audit makes recommendations only; it does not implement. The recommendation
 
 ## 1. Executive Summary
 
-**Capability state.** Per `docs/capability-map.md` §Progress at a Glance, Yuzu is **166/225 = 74%** complete. The headline number masks two realities: (a) the Foundation (33/33) and Advanced (101/101) tiers are at 100% feature presence but **not** at 100% production hardening — known gaps at the §-level include Tier-3 cert validation (1.1), configurable heartbeat (1.2), unified diagnostics bundle (1.3), runtime plugin install (1.5), and others; (b) the New tier (Phases 8–16) is at **1/41 = 2%**, with TAR Phase 15.A in flight and Guardian Phases 16.A PRs 1–2 shipped of a 17-PR ladder. The Advanced/Foundation tiers should be read as "scaffolded and functional" rather than "production-quality and proven-at-scale".
+**Capability state.** Per `docs/capability-map.md` §Progress at a Glance, Yuzu is **166/225 = 74%** complete. The headline number masks two realities: (a) the Foundation (33/33) and Advanced (101/101) tiers are at 100% feature presence but **not** at 100% production hardening — known gaps at the §-level include Tier-3 cert validation (1.1), configurable heartbeat (1.2), unified diagnostics bundle (1.3), runtime plugin install (1.5), and others; (b) the New tier (Phases 8–16) is at **1/41 = 2%**, with Echo Phase 15.A in flight and Guardian Phases 16.A PRs 1–2 shipped of a 17-PR ladder. The Advanced/Foundation tiers should be read as "scaffolded and functional" rather than "production-quality and proven-at-scale".
 
 **Top three capability gaps (deal-blocking for enterprise):**
 
@@ -60,9 +60,9 @@ This audit corrects facts in two predecessor sources: (a) the original draft pla
 |---|---|
 | Capability count: 184/150/82% | `README.md:239` says **184/150/82%** — stale; `capability-map.md:35` says **166/225/74%**. README is the artifact to fix. |
 | Capability count: 208/165/79% | This number does not appear in the repo. (It was Ultraplan's artefact of reading an older snapshot.) |
-| Roadmap stops at Phase 14 | Roadmap goes through **Phase 16** (`docs/roadmap.md:1483` Phase 15 TAR & Scope Walking; `:1552` Phase 16 System Guardian). |
-| TAR is Issue 7.19 Done | TAR is **Phase 15** with Issue 15.A (page shell + retention list) **In Progress** and 15.B–15.H Open (`docs/roadmap.md:1487-…`). |
-| `docs/scope-walking-design.md` / `tar-dashboard.md` / `tar-implementer.md` do not exist | All three exist in `docs/` and the first two are routed from `CLAUDE.md:354-355`. |
+| Roadmap stops at Phase 14 | Roadmap goes through **Phase 16** (`docs/roadmap.md:1483` Phase 15 Echo & Scope Walking; `:1552` Phase 16 System Guardian). |
+| Echo is Issue 7.19 Done | Echo is **Phase 15** with Issue 15.A (page shell + retention list) **In Progress** and 15.B–15.H Open (`docs/roadmap.md:1487-…`). |
+| `docs/scope-walking-design.md` / `echo-dashboard.md` / `echo-implementer.md` do not exist | All three exist in `docs/` and the first two are routed from `CLAUDE.md:354-355`. |
 | Tag/scope filter targeting is not implemented (cap-map §2.2 gap) | `agent_registry.cpp:820-861` — `AgentRegistry::evaluate_scope` instantiates an `AttributeResolver` (lines 826-855) that resolves `ostype` (829), `hostname` (831), `arch` (833), `agent_version` (835), `tag:X` (838-847 — looks in in-memory `scopable_tags`, falls back to persistent `TagStore`), and `props.X` (849-853). The cap-map §2.2 "Gap" entries at lines 137 and 139 are **doc bugs**, not code gaps. |
 | MCP Phase 2 not on roadmap | **Issue 13.5** in `docs/roadmap.md` plans `set_tag`, `delete_tag`, `approve_request`, `reject_request`, `quarantine_device` plus SSE for execution progress. |
 | `set_tag`, `delete_tag` MCP tools are implemented | They appear in `kWriteTools` (`mcp_server.cpp:229-232`) and `kToolSecurity` (`mcp_server.cpp:267-273`). The misleading comment at `:227-228` says "Implemented: set_tag, delete_tag, execute_instruction" — only `execute_instruction` has a dispatch handler (`:1313`). The five other write tools fall through to the Unknown-tool branch. |
@@ -110,7 +110,7 @@ Per surface, what an authenticated agentic worker can do today vs cannot.
 ### 4.3 Dashboard
 
 **Can do (as a human):**
-- Navigate every admin surface (user mgmt, enrollment, settings, executions, schedules, scopes, policies, TAR).
+- Navigate every admin surface (user mgmt, enrollment, settings, executions, schedules, scopes, policies, Echo).
 
 **Cannot do (as an agent):**
 - Get JSON for any `/fragments/*` route — they return `text/html` only. No `Accept: application/json` content negotiation.
@@ -170,7 +170,7 @@ Full text and rationale: `docs/agentic-first-principle.md`. The `consistency-aud
 | `docs/agentic-first-principle.md` (NEW) | A1–A4 invariants that this PR introduces | `consistency-auditor` on every PR |
 | `docs/enterprise-parity-plan.md` | Detailed competitor parity matrix; complements capability-map | `architect` on capability-map / roadmap changes |
 
-The remaining ~11 unrouted docs (`analytics-events.md`, `ci-cpp23-troubleshooting.md`, `ci-troubleshooting.md`, `clickhouse-setup.md`, `dependency-rollout-2026-04-14.md`, `dependency-updates.md`, `enterprise-edition.md`, `erlang-gateway-blueprint.md`, `erlang-gateway-review.md`, `tar-implementer.md`, `tar-warehouse-plan.md`, `test-coverage.md`) are operational/internal and route per their natural owner agents organically — no immediate action required.
+The remaining ~11 unrouted docs (`analytics-events.md`, `ci-cpp23-troubleshooting.md`, `ci-troubleshooting.md`, `clickhouse-setup.md`, `dependency-rollout-2026-04-14.md`, `dependency-updates.md`, `enterprise-edition.md`, `erlang-gateway-blueprint.md`, `erlang-gateway-review.md`, `echo-implementer.md`, `echo-warehouse-plan.md`, `test-coverage.md`) are operational/internal and route per their natural owner agents organically — no immediate action required.
 
 ---
 
@@ -204,7 +204,7 @@ These five items become roadmap issues 17.1–17.5 (proposed Phase 17 — Agenti
 - **Phase 9 Connector Framework.** Largest enterprise gap. Start with SCCM, Intune, ServiceNow.
 - **Phase 16 System Guardian.** Maintain Windows PR cadence (PRs 3–17); start Linux delivery once Windows soaks.
 - **Phase 10 Software Catalog & License Compliance.** Depends on Phase 9 framework.
-- **Phase 15 Scope Walking finishing.** 15.B (result-set store) → 15.C (`from_result_set:` scope kind) → 15.D (TAR SQL frame) — already designed in `docs/scope-walking-design.md`, just needs delivery.
+- **Phase 15 Scope Walking finishing.** 15.B (result-set store) → 15.C (`from_result_set:` scope kind) → 15.D (Echo SQL frame) — already designed in `docs/scope-walking-design.md`, just needs delivery.
 - **Phase 8.2 / 8.3** — Visualization templates and offloading complete the visualization phase.
 
 ### P3 — Roadmap holes (proposed Phase 18)

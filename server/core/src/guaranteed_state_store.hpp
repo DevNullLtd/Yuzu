@@ -27,7 +27,10 @@
 /// Events are an **immutable audit-style log** — intentionally no foreign key
 /// from `guaranteed_state_events.rule_id` to `guaranteed_state_rules(rule_id)`.
 /// When a rule is deleted, its historical events remain for forensic review.
-/// Time-based expiry is the single retention mechanism.
+/// Time-based expiry is the single retention mechanism for events. An agent decommission
+/// (`delete_agent`) does not change that: it deletes the agent's per-agent order row, retires its
+/// pending census evidence (clears the pending flag of its pending events) and deletes its census
+/// rows, and no event row is deleted.
 ///
 /// ── Posture (ADR-0012 §1 / ADR-0038), split by table family ─────────────────
 ///  - **Rules + meta reads — AUTHORITATIVE, type-distinguishable** (the
@@ -35,7 +38,7 @@
 ///    return `std::expected<std::vector<T>, std::string>`; `get_rule` keeps a
 ///    three-state `std::expected<std::optional<Row>, GuaranteedStateReadError>`
 ///    (found / genuinely-absent / degraded — mirrors
-///    `DeviceInventoryStore::CiReadError`). `agent_rule_statuses` /
+///    `CiReadError`, device_inventory_types.hpp). `agent_rule_statuses` /
 ///    `agent_rule_statuses_for_agent` / `errored_rule_count` (enforce-gate/
 ///    census/ADR-0017 list-read input) are the same
 ///    `std::expected<..., std::string>` shape. A degraded read
@@ -52,11 +55,12 @@
 ///    dropped enforcement-history row is re-derivable from the agent's next
 ///    report cycle; ingest must never block the gRPC thread. Infra-level
 ///    drops (pool exhaustion / lease timeout / BEGIN-prepare-exec-commit
-///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family (ADR-0037
-///    label convention) IN ADDITION to the existing four-way
-///    `EventInsertOutcome` classification + its per-outcome atomics below.
-///  - **Status upserts — fail-soft with the same counter**; status READS stay
-///    type-distinguishable (see above).
+///    failure) bump the existing `yuzu_server_guardian_events_{dropped,ingest_errors}_total` family
+///    (ADR-0037 label convention) IN ADDITION to the existing four-way `EventInsertOutcome`
+///    classification + its per-outcome atomics below.
+///  - **Status upserts — fail-soft**; the census upsert has its own failure counter and runs in
+///    the event transaction under a savepoint (ADR-0038 Update, 2026-10-31, #5674); status READS
+///    stay type-distinguishable (see above).
 ///  - **DEX analytic reads — deferred widening (ADR-0038, follow-up #2659).**
 ///    The ~20 `dex_*` aggregate reads plus `query_events` / `rule_activity` /
 ///    `daily_remediations` / `query_observations` KEEP their plain
@@ -98,6 +102,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -154,6 +159,12 @@ struct GuardianAgentRuleStatus {
     std::string rule_id;
     std::string state;       // "compliant" | "drifted" | "errored"
     std::string updated_at;  // ISO-8601 of the event that set it
+    // Ordering evidence (schema v4). `order_uncertain` is sticky: the order of the verdict
+    // persisted for this pair cannot be proven. `projection_pending`: a retained event
+    // for this pair has not reached the row. Both false does not establish freshness or
+    // completeness: an event that never arrived leaves no trace.
+    bool order_uncertain{false};
+    bool projection_pending{false};
 };
 
 // The DEX read-model value types (GuardianObservationRow + the Dex* observation
@@ -178,6 +189,13 @@ inline constexpr int kDefaultEventRetentionDays = 30;
 // + alert observers ONLY on `Inserted`; Redelivered / Conflict / Error all
 // return before the observers.
 enum class EventInsertOutcome { Inserted, Redelivered, Conflict, Error };
+
+/// The three points of the per-agent order step at which the test seam
+/// `set_agent_step_gap_hook_for_test` runs, in the order a step reaches them. `EnsureToDecide` is
+/// between the first Ensure and the first DECIDE; `BeforeRetryEnsure` is after a first DECIDE that
+/// returned no row and before the retry's Ensure; `RetryEnsureToDecide` is between the retry's
+/// Ensure and the retry's DECIDE. Never reached outside a test that sets the hook.
+enum class AgentStepGap { EnsureToDecide, BeforeRetryEnsure, RetryEnsureToDecide };
 struct EventInsertResult {
     EventInsertOutcome outcome{EventInsertOutcome::Error};
     std::string error; // set for Conflict (mismatch detail) + Error (db message); empty otherwise
@@ -204,6 +222,34 @@ struct PolicyGenerationRaise {
 /// `kOutOfRange`: the target is outside 1..guardian::kMaxPolicyGenerationTarget.
 /// `kStoreUnavailable`: the store could not read or write the counter (never reported as 0).
 enum class PolicyGenerationRaiseError { kOutOfRange, kStoreUnavailable };
+
+/// Cap on the rule ids `GuaranteedStateStore::unrepresented_pending_for_agent` returns (#7217). The
+/// count is exact and never capped; only the id list is.
+inline constexpr std::size_t kUnrepresentedPendingIdCap = 50;
+
+/// Cap on the agent ids `GuaranteedStateStore::unordered_agents` returns. The count is exact and
+/// never capped; only the id list is.
+inline constexpr std::size_t kUnorderedAgentIdCap = 50;
+
+/// Result of `GuaranteedStateStore::unrepresented_pending_for_agent`: how many (agent, rule) pairs of
+/// one device have a retained `projection_pending` event and NO census row, and the first
+/// `kUnrepresentedPendingIdCap` of their rule ids in `rule_id` order. `count > rule_ids.size()`
+/// means the list is truncated.
+struct UnrepresentedPendingSummary {
+    std::int64_t count{0};
+    std::vector<std::string> rule_ids;
+};
+
+/// Why `unrepresented_pending_for_agent` failed (#7217). `kStatementTimeout` is SQLSTATE 57014: the
+/// read ran past its time budget, most likely because of the size of the retained pending backlog,
+/// so a retry usually fails identically until the cause clears. Everything else (store not open, pool timeout,
+/// BEGIN / SET LOCAL / query failure) is `kUnavailable` and is worth retrying.
+enum class UnrepresentedPendingFault { kUnavailable, kStatementTimeout };
+
+struct UnrepresentedPendingError {
+    UnrepresentedPendingFault kind{UnrepresentedPendingFault::kUnavailable};
+    std::string message;
+};
 
 class GuaranteedStateStore {
 public:
@@ -247,6 +293,84 @@ public:
     /// reachable without holding real concurrent queries.
     void set_apps_read_budget_for_test(int n) noexcept { apps_read_budget_ = n; }
 
+    /// Test seam for the Apps read's concurrency budget: `fn` runs once per read, after the budget
+    /// slot is taken and before the lease, so a test can hold several reads at that point. Set it
+    /// before the store is used concurrently and clear it with an empty function after the
+    /// threads have joined. Production leaves it empty (a no-op).
+    void set_apps_read_barrier_for_test(std::function<void()> fn) { apps_read_barrier_ = std::move(fn); }
+
+    /// Test seam for the census lock order: `fn` runs immediately after the pair-lock statement
+    /// (every pending event row of the (agent, rule) pair, locked in `ingest_seq` order) returns
+    /// and before the census row is touched, so a test can hold one writer at that point while a
+    /// second writer, or `delete_rule`, runs. Production leaves it empty (a no-op). Set it before
+    /// the store is used concurrently and clear it with an empty function.
+    void set_census_lock_barrier_for_test(std::function<void()> fn) {
+        census_lock_barrier_ = std::move(fn);
+    }
+
+    /// Test seam for the per-agent order step (schema v5): `fn(gap, agent_id)` runs on the ingest
+    /// thread, inside the open transaction, at each `AgentStepGap` of a census-bearing first
+    /// delivery or batch row, so a test can commit or hold a competing write to the agent's order
+    /// row in the gap between Ensure and DECIDE. It may block (a parked writer is observed through
+    /// `pg_stat_activity`). A Repair runs no agent step, so it never reaches it. Production leaves
+    /// it empty (a no-op). Set it before the store is used concurrently and clear it with an empty
+    /// function.
+    void set_agent_step_gap_hook_for_test(std::function<void(AgentStepGap, const std::string&)> fn) {
+        agent_step_gap_hook_ = std::move(fn);
+    }
+
+    /// Test seam: `false` skips the per-agent order step for every first delivery and batch row
+    /// (default `true`). Under schema v5 two first deliveries of one agent serialise on the
+    /// agent's order row, so a test that overlaps two same-agent writers inside the census can
+    /// only reach that schedule at the census SQL level, with the step off. Production never
+    /// sets it. Atomic, so a setter never races an ingest on another thread.
+    void set_agent_step_enabled_for_test(bool enabled) noexcept {
+        agent_step_enabled_.store(enabled, std::memory_order_relaxed);
+    }
+
+    /// The agent order step's own `lock_timeout`, in milliseconds. It bounds EACH lock wait in the
+    /// step (Ensure, DECIDE, and the one re-run after a concurrent delete), so a step can hold its
+    /// pooled connection for the sum of its waits. See the Timeouts paragraph on `agent_order_step`.
+    static constexpr int kAgentStepLockTimeoutMs = 1000;
+
+    /// Test seam: the `lock_timeout` the agent order step applies, in milliseconds (default
+    /// `kAgentStepLockTimeoutMs`). A test that parks a delivery behind a held lock and expects the
+    /// delivery to wait and succeed raises it so the margin does not depend on the production
+    /// bound. Production never sets it, so it is inert by default. Atomic, so a setter never races
+    /// an ingest on another thread.
+    void set_agent_step_lock_timeout_ms_for_test(int ms) noexcept {
+        agent_step_lock_timeout_ms_.store(ms, std::memory_order_relaxed);
+    }
+
+    /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
+    /// reaches the database step invokes it first and returns `std::unexpected` when it returns true,
+    /// so a test can fail ONLY this read (the earlier reads on the same request keep working). The
+    /// engaged-empty filter short-circuit never reaches it. Set it before the store is used
+    /// concurrently; clear it with an empty function. Production leaves it empty.
+    void set_unrepresented_pending_fault_for_test(std::function<bool()> fn) {
+        unrepresented_pending_fault_ = std::move(fn);
+    }
+
+    /// Test seam: the statement timeout `unrepresented_pending_for_agent` applies, in milliseconds
+    /// (default 5000). A test lowers it to reach SQLSTATE 57014 in well under a second instead of
+    /// waiting out the production budget. Production never sets it. The value is atomic, like
+    /// its sibling `apps_read_budget_`, so a read on another thread never races the setter.
+    void set_unrepresented_pending_timeout_ms_for_test(int ms) noexcept {
+        unrepresented_pending_timeout_ms_.store(ms, std::memory_order_relaxed);
+    }
+
+    /// Test seam for the pre-commit health check: `fn` runs with the transaction's `PGconn*` (as
+    /// `void*`, this header does not include libpq) immediately before each of the three
+    /// `txn_healthy` checks (the repair of a redelivered pending event, a single-event insert, a
+    /// batch insert), so a test can put the transaction into the aborted state and prove the commit
+    /// is refused instead of reporting success for a transaction that stored nothing. The handle is
+    /// borrowed for the call only: do not retain it, and do not COMMIT or ROLLBACK through it.
+    /// Production leaves it empty (a no-op). Set it before the store is used concurrently and clear
+    /// it with an empty function.
+    void set_pre_commit_hook_for_test(std::function<void(void*)> fn) {
+        pre_commit_hook_ = std::move(fn);
+    }
+
     // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
     // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
     // rule_id) are reported as an error prefixed with `kConflictPrefix` so
@@ -254,6 +378,21 @@ public:
     std::expected<void, std::string> create_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> update_rule(const GuaranteedStateRuleRow& row);
     std::expected<void, std::string> delete_rule(const std::string& rule_id);
+    /// Decommission erasure (ADR-0024 Decision 11 cascade member, #5675). One transaction in the
+    /// census writers' lock order: the agent's `guardian_agent_order` row is deleted first, then
+    /// the agent's pending events are locked in `ingest_seq` order and retired
+    /// (`projection_pending = false`), then the agent's census rows are deleted. No rule row is
+    /// locked. True iff the transaction committed; zero rows is still true (idempotent).
+    /// False on an empty id, a store that is not open, a lease timeout, a failed statement or a
+    /// failed COMMIT (the whole transaction is rolled back). The event log and the DEX
+    /// observations are NOT erased (they expire by retention, which is 30 days by default; rows
+    /// written while the retention setting is 0 or below never expire). This is not a rule
+    /// mutation: no policy-generation bump, no `on_rule_mutation_` hook, no push, no advisory lock. A
+    /// still-running agent's next census-bearing event (after a state change, an agent restart or a
+    /// rule push; not on a schedule) re-creates its census row and its order row (stop the agent
+    /// first), and an agent's first event can commit an order row just after this returns: the
+    /// order-row DELETE cannot see a row an in-flight first delivery has not committed.
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
     /// Three-state read (ADR-0038 catastrophic-read set): found / genuinely
     /// absent (`std::nullopt`) / degraded (`std::unexpected`). Callers MUST
     /// treat a degrade as "cannot verify" (503), never as "not found" (404).
@@ -321,12 +460,14 @@ public:
     /// devices (so they are members of it), while `crashes`, `hangs` and
     /// `affected_devices` stay window-wide. At most `kDexAppsConcurrentReads`
     /// run at once (each holds a lease for seconds); one over the budget is
-    /// refused at once. `std::nullopt` on a degraded read (store-not-open /
-    /// pool-timeout / query-error / concurrency-budget), never collapsed into an
-    /// empty vector, same contract as `dex_signal_summary_checked`. Row order is unspecified (no ORDER BY):
+    /// refused at once. A degraded read returns the `DexReadFault` that caused it
+    /// (store-not-open / pool-timeout / query-error / statement-timeout /
+    /// concurrency-budget), never collapsed into an empty vector. The statement
+    /// timeout is the pool's (30 s by default); the read adds no transaction of its
+    /// own. Row order is unspecified (no ORDER BY):
     /// `dex_apps_model_from_rows` owns the published ranking. `app_limit` 0 returns
     /// no rows, so `apps_total` is unreportable; callers pass a positive limit.
-    std::optional<std::vector<DexAppStabilityRow>>
+    std::expected<std::vector<DexAppStabilityRow>, DexReadFault>
     dex_app_stability_checked(const std::string& since, const std::string& platform, int app_limit,
                               int version_limit, std::int64_t per_device_cap,
                               const std::vector<std::string>& online_agent_ids,
@@ -432,12 +573,60 @@ public:
     /// 0, on any store/query failure.
     std::expected<std::size_t, std::string>
     errored_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
+    /// COUNT(DISTINCT rule_id) of live rules with an order-uncertain census row or a pending event
+    /// on at least one in-scope represented pair; same scope contract as errored_rule_count.
+    std::expected<std::size_t, std::string>
+    uncertain_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
+
+    /// The `guardian_agent_order` row of ONE device: `nullopt` = no row (the agent never had a
+    /// census-bearing event accepted, or was decommissioned), which is an answer, not a failure.
+    /// AUTHORITATIVE: `std::unexpected`, never a silent `nullopt`, on any store/query failure.
+    std::expected<std::optional<GuardianAgentOrder>, std::string>
+    agent_order_for_agent(std::string_view agent_id) const;
+
+    /// Agents currently unordered (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns >
+    /// COALESCE(epoch_recv_ns, 0)`): the exact count and the first `kUnorderedAgentIdCap` ids in
+    /// `agent_id COLLATE "C"` order. Same scope contract as `uncertain_rule_count`: `nullopt` = the
+    /// whole fleet; engaged-empty = `{0, {}}` WITHOUT a query; a non-empty scope is applied IN SQL,
+    /// so the count never includes a hidden agent. `std::unexpected`, never a silent zero, on any
+    /// store/query failure.
+    std::expected<UnorderedAgentsSummary, std::string>
+    unordered_agents(const std::optional<std::vector<std::string>>& agent_scope) const;
+
+    /// The fleet-wide count of `unordered_agents` (same predicate), with no id list: the 15 s gauge
+    /// sweep's read, so it does not pay for an ORDER BY / window pass it discards. Runs under a 1 s
+    /// `SET LOCAL statement_timeout`. `std::unexpected`, never a silent zero, on any failure,
+    /// counted on the `guardian_census` degrade source (the gauge's own, never the request path's
+    /// `guardian_rules`). The request path keeps `unordered_agents`.
+    std::expected<std::int64_t, std::string> unordered_agent_count() const;
+
+    /// Pairs of ONE device (`agent_id`) that have a retained `projection_pending` event and NO census
+    /// row (#7217): evidence the represented-pair reads cannot show. `rule_filter`: `nullopt` = every
+    /// rule; engaged-empty = `{0, {}}` without a lease or a seam call; non-empty = only those
+    /// rule ids (the Baseline-anchored form passes the deployed snapshot). `count` is the exact
+    /// number of distinct qualifying rule ids; `rule_ids` the first `kUnrepresentedPendingIdCap` in
+    /// byte order of `rule_id` (`COLLATE "C"`, so the same ids on every cluster). No live-rule join:
+    /// a pending event can outlive its rule only through the #6829 race, and that is exactly the
+    /// evidence this read exists to disclose. Runs under a 5 s `SET LOCAL statement_timeout`. An
+    /// engaged-empty filter is answered without touching the store; every other failure (store not
+    /// open, pool timeout, BEGIN / SET LOCAL / query error, timeout expiry) is `std::unexpected`,
+    /// counted on the `guardian_census_device` degrade source, NEVER a zero. SQLSTATE 57014 is
+    /// `UnrepresentedPendingFault::kStatementTimeout` (reason `statement_timeout`): the retained
+    /// pending backlog is too large for the time budget, so a retry fails identically.
+    std::expected<UnrepresentedPendingSummary, UnrepresentedPendingError>
+    unrepresented_pending_for_agent(const std::string& agent_id,
+                                    const std::optional<std::vector<std::string>>& rule_filter) const;
 
     std::size_t rule_count() const;
     /// Type-distinguishable twin of `rule_count()`: an error string on a store that is not open,
     /// a pool timeout or a failed query, never 0 (the degrade-collapsing `rule_count()` would
     /// read as an empty rule set).
     std::expected<std::size_t, std::string> rule_count_checked() const;
+
+    /// Events stored with pending census evidence (their census write failed; a redelivery or
+    /// `delete_rule` retires it). Bounded by a 5 s statement timeout; an error means "not
+    /// answered", never zero.
+    std::expected<std::int64_t, std::string> pending_projection_count_checked() const;
     std::size_t event_count() const;
 
     // Monotonic policy generation — the version stamp of the rule SET, bumped
@@ -492,6 +681,7 @@ public:
     uint64_t observations_proj_failures_total() const noexcept {
         return observations_proj_failures_.load();
     }
+    uint64_t census_proj_failures_total() const noexcept { return census_proj_failures_.load(); }
     uint64_t observations_reaped_total() const noexcept { return observations_reaped_.load(); }
     uint64_t events_dropped_total() const noexcept { return events_dropped_.load(); }
     uint64_t events_redelivered_total() const noexcept { return events_redelivered_.load(); }
@@ -530,10 +720,21 @@ private:
     std::atomic<uint64_t> events_written_{0};
     std::atomic<uint64_t> events_reaped_{0};
     std::atomic<uint64_t> observations_proj_failures_{0};
+    // census upsert failed for a reason other than a 23503 refusal; the failure does not discard
+    // the event (counted before the caller's COMMIT)
+    std::atomic<uint64_t> census_proj_failures_{0};
     std::atomic<uint64_t> observations_reaped_{0};
     std::atomic<uint64_t> events_dropped_{0};      // event_id conflict, MISMATCHED payload
     std::atomic<uint64_t> events_redelivered_{0};  // event_id conflict, MATCHING payload
     std::atomic<uint64_t> events_ingest_errors_{0}; // operational ingest fault
+    std::function<void()> census_lock_barrier_;     // test seam, empty in production
+    std::function<void()> apps_read_barrier_;       // test seam, empty in production
+    std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
+    std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
+    std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
+    std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
+    std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
+    std::function<void(void*)> pre_commit_hook_;    // test seam, empty in production
 
     // Compute ttl_expires_at = now + retention_days*86400 in epoch seconds;
     // retention_days <= 0 means "never expire" (returns 0, the sentinel the

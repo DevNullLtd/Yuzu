@@ -23,6 +23,7 @@
 
 #include "dex_perf_model.hpp"
 
+#include "dex_pane.hpp"
 #include "web_utils.hpp"
 
 #include <cctype>
@@ -35,11 +36,16 @@ namespace yuzu::server {
 
 // Shared with dex_routes.cpp (declared in dex_routes.hpp).
 std::string dex_subnav(const std::string& active, int window_days);
+std::string dex_fragment_style();
 std::string dex_window_token(int window_days);
 
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+// Text-node twin for an agent-reported or tag-derived name (bidirectional-control and zero-width
+// characters print as visible markers). Never inside a tag: the cohort option values are sent back by
+// the browser and keep `esc` (#7535).
+std::string esc_text(const std::string& s) { return html_escape_marked(s); }
 
 // Percent-encode for a query-string value (RFC 3986 unreserved kept literal).
 std::string url_encode(const std::string& s) {
@@ -63,8 +69,7 @@ std::string placeholder(const std::string& title, const std::string& sub) {
 }
 
 std::string drill(const std::string& path_qs, const std::string& disp) {
-    return "<a hx-get=\"" + path_qs + "\" hx-target=\"#guardian-detail\" "
-           "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" + disp + "</a>";
+    return dex_pane_link(path_qs, disp);
 }
 
 std::string fmt_pct(double v) { return std::format("{:.1f}%", v); }
@@ -121,7 +126,7 @@ std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
                                       const std::string& window) {
     if (rows.empty()) {
         // The SOFT truthful empty state (grill decision 5/A): the read-only
-        // operator-SQL surface deliberately hides tar.db config, so the server
+        // operator-SQL surface deliberately hides echo.db config, so the server
         // cannot distinguish "disabled" from "enabled, no rollup yet". Say both.
         return "<div class=\"gp-note\"><b>No per-app samples in the last 24 hours.</b> "
                "Per-application sampling (<span style=\"font-family:var(--mono)\">"
@@ -135,7 +140,7 @@ std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
     for (const auto& r : rows) {
         h += "<tr><td>" +
              drill("/fragments/dex/app?name=" + url_encode(r.name) + "&amp;window=" + window,
-                   esc(r.name)) +
+                   esc_text(r.name)) +
              "</td><td>" + fmt_pct(r.cpu_avg) + "</td><td>" + fmt_pct(r.cpu_max) + "</td><td>" +
              fmt_bytes(r.ws_avg_bytes) + "</td><td>" + fmt_bytes(r.ws_max_bytes) + "</td><td>" +
              std::to_string(r.instances_max) + "</td><td>" + std::to_string(r.hours) +
@@ -202,14 +207,14 @@ std::string render_dex_device_perf_context(const DexPerfDeviceContext& ctx,
     const bool cohort_shown = ctx.cpu.cohort_pctile >= 0 || ctx.commit.cohort_pctile >= 0 ||
                               ctx.disk_lat.cohort_pctile >= 0;
     if (cohort_shown) {
-        const std::string label = ctx.cohort.empty() ? "(untagged)" : esc(ctx.cohort);
+        const std::string label = ctx.cohort.empty() ? "(untagged)" : esc_text(ctx.cohort);
         h += "<div class=\"gp-note\">band = fleet p50&ndash;p90 &middot; marker = this device "
              "(red when above fleet p90). Cohort = " +
              drill("/fragments/dex/perf/devices?cohort_key=" + url_encode(cohort_key) +
                        "&amp;cohort_value=" + url_encode(ctx.cohort) + "&amp;window=" + window,
                    label) +
              " <span class=\"gp-mute\">(" + std::to_string(ctx.cohort_n) +
-             " reporting devices, key " + esc(cohort_key) + ")</span></div>";
+             " reporting devices, key " + esc_text(cohort_key) + ")</span></div>";
     } else {
         h += "<div class=\"gp-note\">band = fleet p50&ndash;p90 &middot; marker = this device "
              "(red when above fleet p90). Cohort comparison withheld &mdash; " +
@@ -248,7 +253,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     if (now.reporting == 0) {
         h += placeholder("No perf telemetry yet",
                          "No device reported a perf heartbeat this cycle. Perf telemetry is "
-                         "collected on Windows and Linux (TAR perf capture source; macOS support "
+                         "collected on Windows and Linux (Echo perf capture source; macOS support "
                          "is planned); devices appear here within a heartbeat of coming online.");
     } else {
         h += "<div class=\"gp-tiles\">";
@@ -292,17 +297,17 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
 
     // Key picker — htmx submits the select's own name=value on change.
     h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
-         "hx-get=\"/fragments/dex/perf?window=" + w + "\" hx-target=\"#guardian-detail\" "
-         "hx-swap=\"innerHTML\" hx-trigger=\"change\" class=\"dx-ctl\">";
+         "hx-get=\"/fragments/dex/perf?window=" + w + "\"" + std::string(kDexPaneSwapAttrs) +
+         " hx-trigger=\"change\" class=\"dx-ctl\">";
     bool key_listed = false;
     for (const auto& k : snap.available_keys) {
         const bool on = (k == snap.cohort_key);
         key_listed = key_listed || on;
-        h += "<option value=\"" + esc(k) + "\"" + (on ? " selected" : "") + ">" + esc(k) +
+        h += "<option value=\"" + esc(k) + "\"" + (on ? " selected" : "") + ">" + esc_text(k) +
              "</option>";
     }
     if (!key_listed) // requested key has no tagged devices — show it anyway, honestly
-        h += "<option value=\"" + esc(snap.cohort_key) + "\" selected>" + esc(snap.cohort_key) +
+        h += "<option value=\"" + esc(snap.cohort_key) + "\" selected>" + esc_text(snap.cohort_key) +
              " (no devices tagged)</option>";
     h += "</select></div>";
 
@@ -313,11 +318,11 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
         return h;
     }
 
-    h += "<table class=\"gp-table\"><thead><tr><th>Cohort (" + esc(snap.cohort_key) +
+    h += "<table class=\"gp-table\"><thead><tr><th>Cohort (" + esc_text(snap.cohort_key) +
          ")</th><th>Devices</th><th>CPU p50 / p90</th><th>Commit p50 / p90</th>"
          "<th>Disk lat p50 / p90</th></tr></thead><tbody>";
     for (const auto& c : cohorts) {
-        const std::string label = c.cohort.empty() ? "(untagged)" : esc(c.cohort);
+        const std::string label = c.cohort.empty() ? "(untagged)" : esc_text(c.cohort);
         const std::string qs = "cohort_key=" + url_encode(snap.cohort_key) +
                                "&amp;cohort_value=" + url_encode(c.cohort) + "&amp;window=" + w;
         h += "<tr><td>" + drill("/fragments/dex/perf/devices?" + qs, label) + "</td><td>" +
@@ -358,7 +363,7 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
                             "hx-target=\"#dex-cohort-diff\" hx-swap=\"innerHTML\" "
                             "class=\"dx-ctl\">";
             for (const auto& c : cohorts) {
-                const std::string lbl = c.cohort.empty() ? "(untagged)" : esc(c.cohort);
+                const std::string lbl = c.cohort.empty() ? "(untagged)" : esc_text(c.cohort);
                 s += "<option value=\"" + esc(c.cohort) + "\"" +
                      (c.cohort == sel ? " selected" : "") + ">" + lbl + "</option>";
             }
@@ -378,7 +383,7 @@ std::string render_dex_perf_cohort_diff_fragment(const DexPerfSnapshot& snap,
                                                  const std::string& cohort_b, int /*window_days*/) {
     const auto d = dex_perf_cohort_diff(snap, cohort_a, cohort_b);
     auto label = [](const std::string& c) {
-        return c.empty() ? std::string("(untagged)") : esc(c);
+        return c.empty() ? std::string("(untagged)") : esc_text(c);
     };
     // One cohort's p50 cell, honouring found / sub-floor suppression.
     auto cell = [](bool found, bool suppressed, const std::optional<DexPerfStat>& s, bool lat) {
@@ -436,7 +441,7 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
     if (not_reporting)
         title = "Devices not reporting performance";
     else if (cohort_filter)
-        title = (cohort_filter->empty() ? "(untagged)" : esc(*cohort_filter)) +
+        title = (cohort_filter->empty() ? "(untagged)" : esc_text(*cohort_filter)) +
                 std::string(" &mdash; devices");
     else {
         const char* m = metric == DexPerfMetric::kCommit    ? "memory commit"
@@ -445,13 +450,14 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
         title = std::string("Worst devices by current ") + m;
     }
 
-    std::string h;
+    // The back link and the device drills are text-link buttons: the shared style block rides in
+    // this fragment (a pane swap drops the previous one).
+    std::string h = dex_fragment_style();
     // Back link preserves the cohort key, so returning from an image-cohort
     // drill lands on the image table, not the default (grill fix).
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf?window=" + w +
-         (snap.cohort_key.empty() ? std::string{} : "&amp;key=" + url_encode(snap.cohort_key)) +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Fleet performance</a>";
+    h += dex_pane_link("/fragments/dex/perf?window=" + w +
+                           (snap.cohort_key.empty() ? std::string{} : "&amp;key=" + url_encode(snap.cohort_key)),
+                       "&larr; Fleet performance", "gp-back");
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + title +
          "</h1></div><div class=\"gp-sub\">Values are each device&rsquo;s current heartbeat "
          "sample &mdash; the same data the fleet cards aggregate, so this list and the cards "
@@ -465,7 +471,7 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
                                    : "No reporting devices match this view.");
 
     h += "<table class=\"gp-table\"><thead><tr><th>#</th><th>Device</th><th>Cohort" +
-         (snap.cohort_key.empty() ? std::string{} : " (" + esc(snap.cohort_key) + ")") +
+         (snap.cohort_key.empty() ? std::string{} : " (" + esc_text(snap.cohort_key) + ")") +
          "</th><th>CPU</th><th>Commit</th><th>Disk lat</th><th>vs fleet</th></tr></thead><tbody>";
     int i = 1;
     for (const auto& r : rows) {
@@ -476,9 +482,9 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
         };
         h += "<tr><td class=\"gp-mute\">" + std::to_string(i++) + "</td><td>" +
              drill("/fragments/dex/device?id=" + url_encode(r.agent_id) + "&amp;window=" + w,
-                   esc(r.agent_id)) +
+                   esc_text(r.agent_id)) +
              "</td><td>" + (r.cohort.empty() ? "<span class=\"gp-mute\">(untagged)</span>"
-                                             : esc(r.cohort)) +
+                                             : esc_text(r.cohort)) +
              "</td><td>" + cell(r.cpu_pct, false) + "</td><td>" + cell(r.commit_pct, false) +
              "</td><td>" + cell(r.disk_lat_ms, true) + "</td><td>" +
              (r.fleet_pctile >= 0 ? std::to_string(r.fleet_pctile) + "th pctile"

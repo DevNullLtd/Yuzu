@@ -48,7 +48,7 @@ struct EcosystemFamily {
 
 /// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
 /// shifts positions, so say so in the changelog.
-inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 20> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"msi", "windows"},
@@ -61,6 +61,14 @@ inline constexpr std::array<EcosystemFamily, 12> kEcosystemFamilies{{
     {"pacman", "linux"},
     {"snap", "linux"},
     {"flatpak", "linux"},
+    {"python", "other"},
+    {"ibm_mq", "other"},  // middleware (SAM.2): no OS family -- the product runs on several
+    {"dotnet", "other"},
+    {"jvm", "other"},
+    {"chocolatey", "windows"}, // pkg_inventory Windows legs
+    {"winget", "windows"},
+    {"appx", "windows"},
+    {"kernel_module", "linux"}, // hardware.drivers_inventory (Linux loaded kernel modules)
 }};
 
 /// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
@@ -99,6 +107,82 @@ static_assert(ecosystem_table_well_formed(),
               "kEcosystemFamilies: an empty table, an empty or duplicate row (a commented-out "
               "entry with the declared size kept?), or a name outside the charset the renderers "
               "assume (ecosystem [a-z_], family [a-z])");
+
+// ── UI vocabulary: Software-page kind chips and Found-by chips ──────────────
+
+struct VocabEntry {
+    std::string_view value;   ///< the filter token (`kind`, or a collector `plugin.action` source)
+    std::string_view title;   ///< chip label
+    std::string_view tooltip; ///< chip title attribute
+};
+
+/// Row order is the order the Kind chips render. A new kind is one row here.
+inline constexpr std::array<VocabEntry, 5> kSoftwareKinds{{
+    {"app", "app",
+     "applications (Windows and macOS apps, Homebrew casks, store apps, runtimes and middleware)"},
+    {"pkg", "pkg",
+     "packages: macOS pkgutil receipts, Homebrew formulae, snap and flatpak runtimes, MSI products"},
+    {"package", "package", "OS packages (rpm, deb, apk, pacman)"},
+    {"feat", "feat", "Windows optional features"},
+    {"driver", "driver", "device drivers (Windows PnP signed drivers, Linux loaded kernel modules)"},
+}};
+
+/// One row per collector source, in the collector's kInventoryActions order
+/// (agents/core/src/sync_source_installed_software.cpp); the vocabulary test compares the ordered
+/// lists. A new source is one row here.
+inline constexpr std::array<VocabEntry, 11> kSoftwareSources{{
+    {"installed_apps.list_inventory", "installed_apps.list_inventory",
+     "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
+     "receipts"},
+    {"pkg_inventory.managers", "pkg_inventory.managers",
+     "Manager presence rows (Homebrew on macOS; Chocolatey and winget on Windows)"},
+    {"pkg_inventory.packages", "pkg_inventory.packages",
+     "Homebrew formulae and casks (macOS); Chocolatey packages (Windows)"},
+    {"pkg_inventory.store_packages", "pkg_inventory.store_packages",
+     "Active snaps and flatpaks (Linux); Appx and MSIX packages (Windows)"},
+    {"windows_optional_features.list", "windows_optional_features.list",
+     "Windows optional features (state in the version column)"},
+    {"msi_packages.list_inventory", "msi_packages.list_inventory",
+     "Machine-context Windows Installer (MSI) products"},
+    {"runtimes.python", "runtimes.python",
+     "Python interpreters at the standard machine-wide locations (Windows, macOS, Linux)"},
+    {"middleware.ibm_mq", "middleware.ibm_mq",
+     "Registered IBM MQ installations, from installer metadata (Linux)"},
+    {"runtimes.dotnet", "runtimes.dotnet",
+     ".NET runtimes, SDKs and Framework at the standard machine-wide locations (Windows, macOS, "
+     "Linux)"},
+    {"runtimes.jvm", "runtimes.jvm",
+     "Java runtimes and development kits at the standard machine-wide locations (Windows, macOS, "
+     "Linux)"},
+    {"hardware.drivers_inventory", "hardware.drivers_inventory",
+     "Windows PnP signed drivers (WMI); Linux loaded kernel modules"},
+}};
+
+/// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty
+/// title and tooltip, no repeated value. A row commented out with the declared size kept leaves an
+/// empty row, which this rejects.
+template <std::size_t N>
+[[nodiscard]] consteval bool vocab_table_well_formed(const std::array<VocabEntry, N>& t) {
+    if (N == 0)
+        return false;
+    for (std::size_t i = 0; i < N; ++i) {
+        if (t[i].value.empty() || t[i].title.empty() || t[i].tooltip.empty())
+            return false;
+        for (const char c : t[i].value) {
+            if ((c < 'a' || c > 'z') && c != '_' && c != '.')
+                return false;
+        }
+        for (std::size_t j = i + 1; j < N; ++j) {
+            if (t[i].value == t[j].value)
+                return false;
+        }
+    }
+    return true;
+}
+static_assert(vocab_table_well_formed(kSoftwareKinds),
+              "kSoftwareKinds: empty table, empty/duplicate row, or value outside [a-z_.]");
+static_assert(vocab_table_well_formed(kSoftwareSources),
+              "kSoftwareSources: empty table, empty/duplicate row, or value outside [a-z_.]");
 
 /// SQL `CASE` over the `ecosystem` column generated from kEcosystemFamilies, so the SQL has
 /// one source of truth. Every literal comes from the constexpr table (never input).

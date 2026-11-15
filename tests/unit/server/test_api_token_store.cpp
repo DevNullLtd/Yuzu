@@ -1845,6 +1845,39 @@ TEST_CASE("ApiTokenStore: confirm_rotation sole-credential states are terminal, 
     CHECK(classify_engine_store_error(none.error()) == E::Transient);
 }
 
+TEST_CASE("ApiTokenStore: confirm_rotation on two active credentials with broken linkage is a "
+          "terminal conflict, never the retryable empty-read error (#6716)",
+          "[pg][token][rotation][confirm]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    // Two active credentials that no rotation linked together: a positive read
+    // of a malformed pair, not an empty one. Retrying cannot repair it, so it
+    // must not classify as the Transient (retryable, hinted) empty-read error.
+    const std::string principal = "engine:rotation-confirm-malformed";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc-a", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.create_token("svc-b", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+
+    auto malformed =
+        store.confirm_rotation(principal, active.at(0).token_id, "irrelevant-secret", "admin");
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK(malformed.error().find("rotation pair is malformed") != std::string::npos);
+    CHECK(malformed.error().find("no in-flight rotation to confirm") == std::string::npos);
+    CHECK(classify_engine_store_error(malformed.error()) == E::Conflict);
+}
+
 TEST_CASE("ApiTokenStore: confirm_rotation replay after success is a terminal already-confirmed "
           "conflict, not a retryable 503 (#2404)",
           "[pg][token][rotation][confirm]") {
@@ -2326,7 +2359,7 @@ TEST_CASE("ApiTokenStore: validate_token_checked reports a live token as valid",
     auto raw = store.create_token("Stream Token", "alice");
     REQUIRE(raw.has_value());
 
-    auto checked = store.validate_token_checked(*raw);
+    auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kValid);
     REQUIRE(checked.token.has_value());
     CHECK(checked.token->principal_id == "alice");
@@ -2345,7 +2378,7 @@ TEST_CASE("ApiTokenStore: a revoked token is DEFINITIVELY invalid, not indetermi
 
     REQUIRE(store.revoke_token(live->token_id));
 
-    auto checked = store.validate_token_checked(*raw);
+    auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     // kInvalid — NOT kUnavailable. A revocation must cut the stream on the next
     // tick; if it were reported as indeterminate it would instead buy the revoked
     // credential a full grace window of extra life.
@@ -2358,7 +2391,7 @@ TEST_CASE("ApiTokenStore: an unknown token is definitively invalid", "[pg][token
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
-    auto checked = store.validate_token_checked("yuzu_never_issued_0123456789012");
+    auto checked = store.validate_token_checked("yuzu_never_issued_0123456789012", ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
@@ -2367,7 +2400,7 @@ TEST_CASE("ApiTokenStore: an empty token is definitively invalid", "[pg][token][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ApiTokenStore store{pool};
     REQUIRE(store.is_open());
-    CHECK(store.validate_token_checked("").status == ApiTokenStore::TokenCheck::kInvalid);
+    CHECK(store.validate_token_checked("", ApiTokenStore::TokenReadMode::kCached).status == ApiTokenStore::TokenCheck::kInvalid);
 }
 
 TEST_CASE("ApiTokenStore: an EXHAUSTED connection pool is kUnavailable, not kInvalid",
@@ -2390,7 +2423,7 @@ TEST_CASE("ApiTokenStore: an EXHAUSTED connection pool is kUnavailable, not kInv
     auto hog = pool.try_acquire_for(std::chrono::seconds{5});
     REQUIRE(hog); // we now hold the only connection
 
-    const auto checked = store.validate_token_checked(*raw);
+    const auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
     CHECK_FALSE(checked.token.has_value()); // indeterminate NEVER grants access
 }
@@ -2418,7 +2451,7 @@ TEST_CASE("ApiTokenStore: an unreadable store is kUnavailable, NOT kInvalid",
         REQUIRE(r.ok());
     }
 
-    const auto checked = store.validate_token_checked(*raw);
+    const auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
     CHECK_FALSE(checked.token.has_value()); // indeterminate NEVER grants access
 }
@@ -2453,7 +2486,7 @@ TEST_CASE("ApiTokenStore: a CONTENDED store is kUnavailable, not a false revocat
         REQUIRE(r.ok());
     }
 
-    const auto checked = store.validate_token_checked(*raw);
+    const auto checked = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     CHECK(checked.status == ApiTokenStore::TokenCheck::kUnavailable);
     CHECK_FALSE(checked.token.has_value());
 }
@@ -2471,7 +2504,7 @@ TEST_CASE("ApiTokenStore: re-validation does not write last_used_at",
     auto raw = store.create_token("read-only-check", "alice");
     REQUIRE(raw.has_value());
 
-    const auto before = store.validate_token_checked(*raw);
+    const auto before = store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached);
     REQUIRE(before.status == ApiTokenStore::TokenCheck::kValid);
     CHECK(before.token->last_used_at == 0); // create_token leaves it unset
 
@@ -2485,6 +2518,42 @@ TEST_CASE("ApiTokenStore: re-validation does not write last_used_at",
     CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "0"); // a READ — it did not stamp
 }
 
+
+TEST_CASE("ApiTokenStore: validate_token_checked(kAuthoritative) sees a revoke made behind the "
+          "cache and leaves the cache and its counters alone",
+          "[pg][token][authoritative]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    auto raw = store.create_token("authoritative-check", "alice");
+    REQUIRE(raw.has_value());
+    const auto live = store.validate_token(*raw); // warms the 60 s cache
+    REQUIRE(live.has_value());
+    REQUIRE(store.cache_size() == 1);
+
+    // A revoke handled by another replica: the row changes, this process is not told.
+    PgConn other{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(other.get()) == CONNECTION_OK);
+    PgResult r{PQexec(other.get(), "UPDATE api_token_store.api_tokens SET revoked = true")};
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string(PQcmdTuples(r.get())) == "1");
+
+    const auto hits = store.cache_hits();
+    const auto misses = store.cache_misses();
+    const auto authoritative =
+        store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kAuthoritative);
+    CHECK(authoritative.status == ApiTokenStore::TokenCheck::kInvalid); // definitive
+    CHECK_FALSE(authoritative.token.has_value());
+    CHECK(store.cache_size() == 1);        // no erase
+    CHECK(store.cache_hits() == hits);     // no hit, no miss counted
+    CHECK(store.cache_misses() == misses);
+
+    // The cached read still answers from the entry (this is the lag the authoritative read exists
+    // to step around, kept for the stream pump).
+    CHECK(store.validate_token_checked(*raw, ApiTokenStore::TokenReadMode::kCached).status ==
+          ApiTokenStore::TokenCheck::kValid);
+}
 
 // ── Human arm: token-keyed overlap-pair rotation (P2 #11, SOC 2 CC6.3) ─────
 
@@ -6301,4 +6370,71 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: failed_pairs counts a COMMIT 
     REQUIRE(pred_after.has_value());
     REQUIRE(pred_after->has_value());
     CHECK_FALSE((*pred_after)->revoked);
+}
+
+TEST_CASE("ApiTokenStore: rotate_engine_credential refuses a sole credential that still carries "
+          "stale rotation linkage and mints nothing (#6716 UP-6)",
+          "[pg][token][rotation][engine_principal]") {
+    using yuzu::server::detail::classify_engine_store_error;
+    using E = yuzu::server::detail::EngineStoreErrorClass;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:rotate-stale-linkage";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+
+    // Negative control: a clean sole credential still rotates (201 path).
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string predecessor_id, successor_id;
+    for (const auto& t : store.list_active_for_principal(principal)) {
+        if (t.supersedes_token_id.empty())
+            predecessor_id = t.token_id;
+        else
+            successor_id = t.token_id;
+    }
+    REQUIRE_FALSE(predecessor_id.empty());
+    REQUIRE_FALSE(successor_id.empty());
+
+    // Manufacture the UP-6 state: the predecessor is revoked out of band and the
+    // best-effort pair-resolve never ran, so the surviving successor keeps its
+    // rotation_group and supersedes_token_id (same direct-SQL seam as the confirm
+    // test above).
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const std::string sql =
+            "UPDATE api_token_store.api_tokens SET revoked = TRUE WHERE token_id = '" +
+            predecessor_id + "';";
+        PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.ok());
+    }
+    auto before = store.list_active_for_principal(principal);
+    REQUIRE(before.size() == 1);
+    CHECK(before[0].token_id == successor_id);
+    CHECK_FALSE(before[0].supersedes_token_id.empty());
+
+    auto refused = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("unresolved rotation metadata") != std::string::npos);
+    CHECK(refused.error().find("do not rotate") != std::string::npos);
+    CHECK(classify_engine_store_error(refused.error()) == E::Conflict);
+    // Same refusal as confirm gives for the same state: the two never disagree.
+    auto confirm = store.confirm_rotation(principal, successor_id, "irrelevant-secret", "admin");
+    REQUIRE_FALSE(confirm.has_value());
+    CHECK(confirm.error() == refused.error());
+
+    // Nothing was minted or changed: still exactly the one survivor, same linkage.
+    auto after = store.list_active_for_principal(principal);
+    REQUIRE(after.size() == 1);
+    CHECK(after[0].token_id == successor_id);
+    CHECK(after[0].supersedes_token_id == before[0].supersedes_token_id);
+    CHECK(after[0].rotation_group == before[0].rotation_group);
 }

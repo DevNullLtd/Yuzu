@@ -9,9 +9,9 @@
  * agent restart AND remembers each command's TERMINAL outcome so a duplicate
  * replays the ORIGINAL result rather than a bare REJECTED.
  *
- * Why replay matters: the server's at-least-once delivery (and, later, the WS-1
- * transactional outbox) can redeliver a command whose first terminal ack was
- * lost. Without outcome replay the honest guarantee is only "effect-once,
+ * Why replay matters: the server's at-least-once delivery (and the WS-3 command
+ * outbox, which re-sends a stable command_id) can redeliver a command whose first
+ * terminal ack was lost. Without outcome replay the honest guarantee is only "effect-once,
  * result-maybe-lost": the side effect ran once, but the operator sees REJECTED
  * and the real SUCCESS/output is gone. This store closes that. It is
  * effectively-once, NOT exactly-once (ADR-2002 §Guarantees): a command claimed
@@ -66,8 +66,10 @@
  * durability, it never propagates into the command hot path.
  */
 
+#include <yuzu/command_replay_horizon.hpp>
 #include <yuzu/plugin.h>
 
+#include <atomic>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
@@ -91,6 +93,11 @@ enum class DedupState {
 };
 
 /// Outcome of claim().
+///
+/// Adding an enumerator here REQUIRES revisiting decide_after_claim()
+/// (agents/core/src/command_dedup_decision.hpp, #3668): a status that switch does not
+/// handle fails SAFE to "answer RUNNING, run nothing", so the new case would silently
+/// stop executing commands. -Wswitch flags the switch, but the build is werror=false.
 enum class ClaimStatus {
     Claimed,   ///< first sighting; caller owns the in-flight record and must resolve it
     Duplicate, ///< already known; see `state` (+ `response` when Terminal)
@@ -128,8 +135,24 @@ class YUZU_EXPORT CommandDedupStore {
 public:
     /**
      * Open (or create) the store at the given path. Sets WAL + synchronous=FULL
-     * + busy_timeout=5000 and creates the schema if absent. Fails only on an
-     * unusable path/DB — the caller treats a failure as "durable dedup
+     * + busy_timeout=5000 and creates the schema if absent.
+     *
+     * CORRUPTION RECOVERY (#3665): when the file CANNOT BE OPENED because it is corrupt
+     * (SQLITE_CORRUPT / SQLITE_NOTADB from sqlite3_open_v2, the pragmas, or creating the two
+     * tables; damage confined to the unused `meta` table only logs a warning), the main file is
+     * moved aside to
+     * `<path>.corrupt-<unix-epoch-seconds>[-n]` (a non-empty -wal/-shm/-journal goes with it as
+     * `<that name>-wal` etc; empty or unmovable sidecars are removed) and a fresh store is opened,
+     * ONCE — never a loop. Only the newest 3 quarantined stores are kept. The dedup history in
+     * the corrupt file is gone either way (it was unreadable); the recovery restores protection
+     * going forward instead of leaving the agent degraded on every boot. Transient/environmental
+     * errors (BUSY, IOERR, FULL, CANTOPEN, PERM) never quarantine, and NEITHER does a file that
+     * opens but has damaged pages: there is deliberately no integrity scan, because discarding a
+     * mostly-usable file would discard in-flight claims too (invariants 4 and 5). See
+     * quarantined_this_open().
+     *
+     * Otherwise fails only on an unusable path/DB, or a corrupt file that could not be
+     * moved aside (left untouched) — the caller treats a failure as "durable dedup
      * unavailable" and runs degraded (fail-open), which it MUST surface.
      */
     static std::expected<CommandDedupStore, CommandDedupError>
@@ -160,10 +183,11 @@ public:
      * undeduplicated (its claim had failed, fail-open) OR this is a duplicate
      * terminal. It is NOT a measure of the eviction-driven double-execute: an
      * outcome aged out of the ring produces a fresh Claimed on redelivery, not a
-     * Miss, so that path is not separately detectable here (it is bounded by
-     * kMaxDedupRows exceeding the server's retry horizon, not observed). Best-
-     * effort + noexcept: a failure only degrades durability. Miss on an empty id /
-     * closed store returns Miss / Error respectively.
+     * Miss, so that path is not separately detectable here (it is limited, as an
+     * estimate, by kMaxDedupRows exceeding the server's outbox redelivery horizon,
+     * #3678 -- see command_replay_horizon.hpp for what the estimate misses -- and not
+     * observed). Best-effort + noexcept: a failure only degrades durability. Miss on
+     * an empty id / closed store returns Miss / Error respectively.
      */
     RecordOutcome record_terminal(std::string_view command_id,
                                   std::string_view serialized_response) noexcept;
@@ -178,8 +202,37 @@ public:
      */
     ReleaseOutcome release(std::string_view command_id) noexcept;
 
-    /** Row count (TEST/observability). nullopt on error/closed store. */
+    /**
+     * Filename (not full path) of the quarantined corrupt database when THIS open() recovered
+     * from corruption (#3665); nullopt on a normal open. The caller MUST surface it (log +
+     * counter): the prior dedup history is lost, so a command executed before the corruption
+     * and redelivered afterwards may re-execute.
+     */
+    [[nodiscard]] const std::optional<std::string>& quarantined_this_open() const noexcept {
+        return quarantined_file_;
+    }
+
+    /** Row count (TEST/observability). nullopt on error/closed store. Takes the store
+     *  mutex and runs a COUNT(*) -- NOT for the heartbeat; use cached_row_count(). */
     [[nodiscard]] std::optional<std::int64_t> count() const;
+
+    /**
+     * Lock-free, approximate row count for the heartbeat capacity signal (#3663,
+     * `yuzu.dedup_rows`). Never takes mu_ and never queries SQLite, so the
+     * heartbeat thread cannot contend with claim() on the latency-critical reader.
+     *
+     * EXACT at construction and again after every prune that reaches its recount
+     * (record_terminal() recounts under mu_ each kPruneInterval terminal records; a
+     * prune whose DELETE failed to PREPARE returns before it). Between those points
+     * it is only incremented on a new claim: a release() of an in-flight row does not
+     * decrement it, so it can over-read by the number of releases since the last
+     * recount -- an over-read of a capacity gauge, never an under-read. A recount that
+     * fails KEEPS the previous value, so nullopt means only that the count at
+     * construction failed (unknown, NOT zero) and stays so until a prune recount
+     * succeeds, which on a low-volume agent can be a long time. Counts in-flight and
+     * terminal rows together, like count().
+     */
+    [[nodiscard]] std::optional<std::int64_t> cached_row_count() const noexcept;
 
     /**
      * TEST-ONLY: lower the terminal-ring bound so retention tests exercise the
@@ -194,10 +247,15 @@ public:
      * terminal rows are evicted by rowid (insert order), never by clock, never
      * touching in-flight rows. Exceeding this between a command's execution and a
      * possible redelivery is what would let a duplicate re-execute, so it MUST
-     * stay well above the server's max retry/outbox horizon (WS-1/WS-3).
-     * Substrate-tuned; do not copy the number elsewhere.
+     * stay above the server's outbox redelivery horizon. That relationship is a
+     * compile-time check, not prose (#3678): the value is
+     * `yuzu::kAgentDedupRingRows` and `kMaxOutboxRedeliveryHorizonCommands` is
+     * static_asserted to at most half of it in
+     * `common/include/yuzu/command_replay_horizon.hpp`, which the WS-3 command
+     * outbox (`command_outbox_delivery`) enforces by dead-lettering a redrive past
+     * it. Substrate-tuned; do not copy the number elsewhere.
      */
-    static constexpr std::int64_t kMaxDedupRows = 20000;
+    static constexpr std::int64_t kMaxDedupRows = ::yuzu::kAgentDedupRingRows;
 
     /**
      * Prune cadence: prune after this many claims, so eviction is O(rows)
@@ -212,7 +270,18 @@ private:
     /// Clock-free ring eviction over TERMINAL rows only. Caller holds mu_.
     void prune_locked() noexcept;
 
+    /// COUNT(*) into cached_rows_; on failure the previous value is kept. Caller holds
+    /// mu_ (or is the sole owner, as in the constructor).
+    void refresh_row_count_locked() noexcept;
+
+    /// Sentinel for "row count unknown" in cached_rows_.
+    static constexpr std::int64_t kRowCountUnknown = -1;
+
     sqlite3* db_{nullptr};
+    /// Heartbeat capacity signal; see cached_row_count(). Relaxed ordering: it is a
+    /// monitoring value, it synchronises nothing.
+    std::atomic<std::int64_t> cached_rows_{kRowCountUnknown};
+    std::optional<std::string> quarantined_file_{}; ///< set by open() when it recovered (#3665)
     mutable std::mutex mu_;
     /// Prune is triggered from record_terminal() (a worker thread), NOT claim()
     /// (the latency-critical reader): the ring evicts TERMINAL rows, which only

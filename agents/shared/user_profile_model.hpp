@@ -4,7 +4,7 @@
  * user_profile_model.hpp — pure model for Windows user-profile / registry-hive
  * discovery (PR1.7).
  *
- * windows.h-free by design (mirrors tar_module_etw.hpp's EtwImageSample
+ * windows.h-free by design (mirrors echo_module_etw.hpp's EtwImageSample
  * split): the Win32 shell (agents/shared/win_profiles.hpp) gathers raw
  * ProfileList rows and HKEY_USERS subkey names into the plain structs below;
  * every classification and formatting decision here is a pure function over
@@ -78,7 +78,7 @@ struct ProfileInfo {
 
 /// The three well-known local-system profile SIDs ProfileList always carries
 /// (LocalSystem / LocalService / NetworkService). Matches the existing
-/// convention in tar_mapdrive_collector.cpp's is_system_sid and
+/// convention in echo_mapdrive_collector.cpp's is_system_sid and
 /// licensing_win.cpp's enumerate_profiles verbatim — deliberately not a
 /// general S-1-5-* classifier, so it stays in lockstep with those call sites.
 [[nodiscard]] inline bool is_system_sid(std::string_view sid) {

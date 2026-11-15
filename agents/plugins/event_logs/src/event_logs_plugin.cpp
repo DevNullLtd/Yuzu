@@ -85,7 +85,7 @@ constexpr auto kLogShowDeadline = std::chrono::milliseconds(10000);
 #ifdef _WIN32
 
 // EVT_HANDLE must be closed with EvtClose, not CloseHandle — a local
-// single-owner guard, same shape as users_plugin.cpp's / tar_netconn_win
+// single-owner guard, same shape as users_plugin.cpp's / echo_netconn_win
 // .cpp's EvtGuard (deliberately file-local per the plugin-isolation
 // precedent).
 struct EvtGuard {
@@ -100,7 +100,7 @@ struct EvtGuard {
     explicit operator bool() const { return h != nullptr; }
 };
 
-// Render one event to UTF-8 XML (size-then-fill, users/tar shape).
+// Render one event to UTF-8 XML (size-then-fill, users/echo shape).
 std::string render_event_xml(EVT_HANDLE event) {
     DWORD used = 0, props = 0;
     ::EvtRender(nullptr, event, EvtRenderEventXml, 0, nullptr, &used, &props);

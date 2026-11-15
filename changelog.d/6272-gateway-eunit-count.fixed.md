@@ -1,1 +1,0 @@
-- **Gateway EUnit docs no longer state a fixed test count.** The gateway build guide and both `/gateway-eunit` skill copies said to expect 657 and 148 tests, while the suite runs 845, so a healthy run looked short. They now point at the run's own summary line instead. A clean run reports its total there (#6265).

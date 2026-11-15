@@ -61,7 +61,7 @@ void respond_fragment(httplib::Response& res, const std::string& body) {
 void register_access_routes(HttpRouteSink& sink, Deps deps) {
     if (!deps.auth_fn || !deps.admin_fn || !deps.perm_fn || !deps.audit_fn || !deps.list_users_fn ||
         !deps.list_roles_fn || !deps.role_permissions_fn || !deps.list_assignments_fn ||
-        !deps.enforcement_state_fn || !deps.deny_service_scoped_fn)
+        !deps.enforcement_state_fn || !deps.deny_service_scoped_fn || !deps.rbac_admin_hint_fn)
         throw std::invalid_argument("access::register_access_routes: every Deps member is required");
 
     sink.Get("/access/users", [deps](const httplib::Request& req, httplib::Response& res) {
@@ -218,7 +218,11 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
                  AssignmentsView view;
                  view.rows = std::move(*grants);
                  view.self = session->username;
-                 view.can_assign = may_attempt_rbac_admin(*session);
+                 // The same authority the assign routes apply, asked again on every panel load. It
+                 // is a drawing hint: the route re-checks on the click.
+                 const auto hint = deps.rbac_admin_hint_fn(*session);
+                 view.can_assign = hint == RbacAdminHint::kMay;
+                 view.admin_unconfirmed = hint == RbacAdminHint::kUnconfirmed;
                  if (view.can_assign) {
                      // Role NAMES only, filtered to the closed assignable list; the catalogue is
                      // read only for a caller who would be offered the button.
@@ -235,8 +239,10 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
 
     // Enforcement: the twin is GET /api/v1/me, which reports rbac_enabled to any signed-in
     // session, so this is a session-only gate too. The switch is a hint (the server decides on
-    // every PUT); the state is read ONLY through the store's display accessors, never through
-    // the label or administrator predicates the routed A2/A1 row reserves.
+    // every PUT). The displayed state is read ONLY through the store's display accessors; whether
+    // the switch is live comes from `rbac_admin_hint_fn`, the composition of the administrator
+    // predicate and the regime check (the enforcement route applies the regime rule inside
+    // `set_enforcement`), wired in server.cpp.
     sink.Get("/fragments/access/enforcement",
              [deps](const httplib::Request& req, httplib::Response& res) {
                  // The fleet-wide RBAC state, including the "Unconfirmed" bit /api/v1/me does
@@ -255,7 +261,13 @@ void register_access_routes(HttpRouteSink& sink, Deps deps) {
                      respond_fragment(res, render_enforcement(Unavailable{}));
                      return;
                  }
-                 state->may_toggle = may_attempt_rbac_admin(*session);
+                 // A degraded view is drawn as "Unconfirmed" whatever the switch would be, so
+                 // the authority is not even asked then.
+                 if (!state->degraded) {
+                     const auto hint = deps.rbac_admin_hint_fn(*session);
+                     state->may_toggle = hint == RbacAdminHint::kMay;
+                     state->admin_unconfirmed = hint == RbacAdminHint::kUnconfirmed;
+                 }
                  respond_fragment(res, render_enforcement(*state));
              });
 

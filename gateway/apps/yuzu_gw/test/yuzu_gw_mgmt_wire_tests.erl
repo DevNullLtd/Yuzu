@@ -28,8 +28,8 @@
 -define(MOCKS, [yuzu_gw_registry, yuzu_gw_router, yuzu_gw_agent]).
 
 %% The agents of the mocked registry, in agent id order.
--define(ROWS, [row(<<"a1">>, <<"host-1">>, [<<"os_info">>, <<"tar">>], 1001),
-               row(<<"a2">>, <<"host-2">>, [<<"tar">>], 1002),
+-define(ROWS, [row(<<"a1">>, <<"host-1">>, [<<"os_info">>, <<"echo">>], 1001),
+               row(<<"a2">>, <<"host-2">>, [<<"echo">>], 1002),
                row(<<"a3">>, <<"host-3">>, [], 1003),
                row(<<"a4">>, <<"host-4">>, [<<"os_info">>], 1004),
                row(<<"a5">>, <<"host-5">>, [], 1005)]).
@@ -145,7 +145,7 @@ mock_registry(#{live := Live, error := Err, nodedown := Nd, stale := Stale}) ->
 mock_agent(#{live := Live, error := Err, nodedown := Nd}) ->
     meck:expect(yuzu_gw_agent, get_info,
                 fun(Pid) when Pid =:= Live ->
-                       {ok, #{hostname => <<"live-host">>, plugins => [<<"os_info">>, <<"tar">>],
+                       {ok, #{hostname => <<"live-host">>, plugins => [<<"os_info">>, <<"echo">>],
                               connected_at => 4242}};
                    (Pid) when Pid =:= Err ->
                        {error, boom};
@@ -194,7 +194,7 @@ get_found(#{chan := Chan}) ->
     ?assertMatch(#{summary := #{agent_id := <<"live">>, hostname := <<"live-host">>,
                                 online := true, last_seen := #{millis_epoch := 4242}}},
                  Response),
-    ?assertEqual([<<"os_info">>, <<"tar">>], [N || #{name := N} <- maps:get(plugins, Response)]).
+    ?assertEqual([<<"os_info">>, <<"echo">>], [N || #{name := N} <- maps:get(plugins, Response)]).
 
 get_missing(#{chan := Chan}) ->
     ?assertMatch({error, {<<"5">>, <<"Agent not connected">>}, _},
@@ -225,7 +225,7 @@ inventory_all(#{chan := Chan}) ->
     ?assertMatch({_, _}, binary:match(A1, <<"\"agent_id\":\"a1\"">>)),
     ?assertMatch({_, _}, binary:match(A1, <<"\"session_id\":\"s-a1\"">>)),
     ?assertMatch({_, _}, binary:match(A1, <<"\"connected_at\":1001">>)),
-    ?assertMatch({_, _}, binary:match(A1, <<"\"plugins\":[\"os_info\",\"tar\"]">>)),
+    ?assertMatch({_, _}, binary:match(A1, <<"\"plugins\":[\"os_info\",\"echo\"]">>)),
     ?assertMatch(#{collected_at := #{millis_epoch := _}}, Response).
 
 inventory_by_agent(#{chan := Chan}) ->
@@ -234,11 +234,11 @@ inventory_by_agent(#{chan := Chan}) ->
     ?assertEqual(<<"a2">>, maps:get(agent_id, Response)).
 
 inventory_by_plugin(#{chan := Chan}) ->
-    {ok, Response, _} = unary(Chan, ?INVENTORY, #{plugin => <<"tar">>}, inventory_def()),
+    {ok, Response, _} = unary(Chan, ?INVENTORY, #{plugin => <<"echo">>}, inventory_def()),
     ?assertEqual([<<"a1">>, <<"a2">>], lists:sort(maps:keys(maps:get(plugin_data, Response)))).
 
 inventory_by_both(#{chan := Chan}) ->
-    {ok, Response, _} = unary(Chan, ?INVENTORY, #{agent_id => <<"a1">>, plugin => <<"tar">>},
+    {ok, Response, _} = unary(Chan, ?INVENTORY, #{agent_id => <<"a1">>, plugin => <<"echo">>},
                               inventory_def()),
     ?assertEqual([<<"a1">>], maps:keys(maps:get(plugin_data, Response))),
     {ok, Other, _} = unary(Chan, ?INVENTORY, #{agent_id => <<"a2">>, plugin => <<"os_info">>},

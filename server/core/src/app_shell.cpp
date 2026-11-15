@@ -67,9 +67,9 @@ constexpr NavItem kPosture[] = {
      .href = "/guardian",
      .icon = "M5 11h14v10H5z M8 11V7a4 4 0 018 0v4"},
     {.key = "dex", .label = "DEX", .href = "/dex", .icon = "M22 12h-4l-3 9L9 3l-3 9H2"},
-    {.key = "tar",
-     .label = "TAR",
-     .href = "/tar",
+    {.key = "echo",
+     .label = "Echo",
+     .href = "/echo",
      .icon = "M3 12a9 9 0 109-9 M3 4v5h5 M12 7v5l3 2"},
     {.key = "crypto",
      .label = "Crypto",
@@ -475,7 +475,7 @@ constexpr std::string_view kBellScript = R"JS(<script>
 // Ctrl+K itself has already called preventDefault and is left alone. The hand-off also
 // stands down while focus is in something you type into (a text input, textarea, select,
 // contenteditable, or a role=textbox/combobox widget): navigating would throw away what was
-// typed on pages that never bound the shortcut, such as the TAR SQL box.
+// typed on pages that never bound the shortcut, such as the Echo SQL box.
 //
 // The online count is `agents.online` from GET /api/health, refreshed every 30 s and when
 // the tab becomes visible. The fetch omits credentials so the server takes its cheap
@@ -601,16 +601,18 @@ std::vector<std::string> breadcrumb_trail(const ShellCtx& ctx) {
 // Colour scheme (Settings > General > Appearance, localStorage 'yuzu-theme'). Runs first in the
 // chrome, right after <body> opens and before any content paints, so a saved scheme never
 // flashes slate. Exact-match whitelist; a blocked or absent store leaves slate (the :root).
-constexpr std::string_view kThemeBoot =
-    "<script>try{var t=localStorage.getItem('yuzu-theme');"
-    "if(/^(slate|navy|jade|light|light-baby|light-hot)$/.test(t))"
-    "document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>";
+constexpr std::string_view kThemeBootPre =
+    "<script>try{var t=localStorage.getItem('yuzu-theme');if(/";
+constexpr std::string_view kThemeBootPost =
+    "/.test(t))document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>";
 
 std::string render_shell(const ShellCtx& ctx) {
     std::string out;
     out.reserve(9000);
     out += kShellBegin;
-    out += kThemeBoot;
+    out += kThemeBootPre;
+    out += kThemeWhitelistRe;
+    out += kThemeBootPost;
     out += kShellCss;
     out += kBellCss;
     append_sidebar(out, ctx.active_key);

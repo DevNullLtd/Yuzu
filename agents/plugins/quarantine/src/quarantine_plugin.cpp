@@ -270,7 +270,7 @@ std::string join_ips(const std::vector<std::string>& ips) {
 
 /// Absolute path to netsh.exe, resolved via GetSystemDirectoryW so this
 /// never depends on PATH (same PATH-hijack rationale as
-/// tar_mapdrive_collector.cpp's system32_path — that helper returns a
+/// echo_mapdrive_collector.cpp's system32_path — that helper returns a
 /// shell-quoted string for its own popen()-based caller; run_bounded_subprocess
 /// execs argv[0] directly with no shell, so this returns UNQUOTED). Cached
 /// on first call — the system directory can't change during the agent's

@@ -787,3 +787,55 @@ TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit
         CHECK(res->status == 400);
     }
 }
+
+TEST_CASE("preflight ui: /auto renders the Deployments tab strip, panels, refusal listener and "
+          "the empty-notice reveal fix",
+          "[preflight][routes][ui]") {
+    const std::string h = render_auto_config({}, {});
+    CHECK(contains(h, "class=\"tabs\" id=\"auto-tabs\" role=\"tablist\""));
+    CHECK_FALSE(contains(h, "gp-subnav"));
+    CHECK(contains(h, "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\""));
+    CHECK(contains(h, "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
+                      "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\""));
+    // replace, not drop: the list read is unaudited and capped, and a hung request must not
+    // wedge every later tab click (drop ignores clicks until the stuck XHR settles).
+    CHECK(contains(h, "hx-sync=\"this:replace\""));
+    CHECK_FALSE(contains(h, "this:drop"));
+    // Returning to the list clears a drilled detail so it cannot outlive the refreshed list.
+    CHECK(contains(h, "if(w==='list'){var x=document.getElementById('auto-detail');if(x)x.innerHTML='';}"));
+    // Tab wiring: the two onclick handlers and the pfTab switcher.
+    CHECK(contains(h, "window.pfTab=function"));
+    CHECK(contains(h, "onclick=\"pfTab('flow');return false\""));
+    CHECK(contains(h, "onclick=\"pfTab('list')\""));
+    const auto flow = h.find("<div id=\"auto-flow\">");
+    const auto cfg = h.find("id=\"auto-cfg\"");
+    const auto verify = h.find("id=\"auto-verify\"");
+    const auto panel = h.find("<div id=\"auto-deployments\" hidden>");
+    REQUIRE(flow != std::string::npos);
+    REQUIRE(cfg != std::string::npos);
+    REQUIRE(verify != std::string::npos);
+    REQUIRE(panel != std::string::npos);
+    CHECK(flow < cfg);
+    CHECK(verify < panel);
+    CHECK(contains(h, "<div id=\"auto-list\" class=\"panel\">"));
+    CHECK(contains(h, "<div id=\"auto-detail\"></div>"));
+    // Refusal listener: once-guarded, scoped to the two targets, 401 login, 403 names the grant.
+    CHECK(contains(h, "if(!window.__pfDepErr){window.__pfDepErr=1;"));
+    CHECK(contains(h, "t.id!=='auto-list'&&t.id!=='auto-detail'"));
+    CHECK(contains(h, "location.href='/login'"));
+    CHECK(contains(h, "needs the SoftwareDeployment:Read permission."));
+    CHECK(contains(h, "Deployments could not be read just now."));
+    CHECK(contains(h, "htmx:sendError"));
+    // Browser Back/Forward: a once-guarded hashchange listener that tolerates the panel missing.
+    CHECK(contains(h, "window.addEventListener('hashchange',function(){var d=document.getElementById('auto-deployments');"
+                      "if(!d)return;"));
+    CHECK(contains(h, "if(want===!d.hidden)return;pfTab(want?'list':'flow');"));
+    // Deep link calls htmx.ajax (a click on a swapped anchor would run before htmx binds it).
+    CHECK(contains(h, "htmx.ajax('GET','/fragments/auto/deployments'"));
+    CHECK_FALSE(contains(h, "hx-on"));
+
+    // ISS-11: the empty notice is hidden by the stylesheet, so showing it needs 'block'.
+    const std::string r = render_auto_results({}, "cfg", "scope", "", true, "run-1", "");
+    CHECK(contains(r, "e.style.display=vis?'none':'block'"));
+    CHECK_FALSE(contains(r, "vis?'none':''"));
+}

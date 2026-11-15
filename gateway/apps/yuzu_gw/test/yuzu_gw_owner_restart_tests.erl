@@ -71,7 +71,7 @@ setup() ->
                             yuzu_gw_router, yuzu_gw_upstream_regulator,
                             yuzu_gw_upstream_pressure, yuzu_gw_gauge, yuzu_gw_health,
                             yuzu_gw_cluster_discovery, yuzu_gw_memory_shedder,
-                            yuzu_gw_mgmt_pins, yuzu_gw_sup]],
+                            yuzu_gw_mem_reclaim, yuzu_gw_mgmt_pins, yuzu_gw_sup]],
     application:set_env(yuzu_gw, allow_no_upstream, true),
     application:set_env(yuzu_gw, allow_no_listeners, true),
     application:set_env(yuzu_gw, prometheus_port, 0),

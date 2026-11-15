@@ -1,0 +1,1 @@
+- **Echo page: exact and cut-off views removed.** The **Exact** retention column, the exact and capped timeline regions with the "record cut off" banner and the row-limit band, and the process tree's per-process view (running or exited state, process ids, same-name grouping and the **On boot** and **On agent install** presets) are gone.

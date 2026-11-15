@@ -778,7 +778,7 @@ must decide privacy before any slice-3 code is written. It must at least settle 
   - the data-processor obligations an engine takes on when it consumes this data (the
     ADR-0024 re-home note is the precedent).
 - **Collection mechanism.** Login evidence comes from logs: the sshd journal and auth logs,
-  and the Windows OpenSSH event log. That makes a TAR cursor source the likely collector,
+  and the Windows OpenSSH event log. That makes an Echo cursor source the likely collector,
   with its no-silent-replay contract. An `app_usage`-style daily-sync hand-off follows if
   the data is centralised at all. The slice-3 ADR must choose.
 

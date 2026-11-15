@@ -339,7 +339,7 @@ change.
 ## Phase 3: deferred
 
 - Per-user SSH keys and token or secret locations (Forensics tier).
-- Passive TLS observation through the TAR capture path (opt-in).
+- Passive TLS observation through the Echo capture path (opt-in).
 - Active subnet scanning from agent vantage points.
 - Cloud KMS, Vault and Kubernetes connectors, as ADR-1005 engines.
 - CBOM and SBOM import.

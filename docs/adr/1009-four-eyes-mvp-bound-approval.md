@@ -511,7 +511,7 @@ keep them green and extend them to the new surface. Test names are the case titl
   Per-version author history is out of scope.
 - **Stale-payload ordering** is not closed fleet-wide until PR7 (agent stale-generation rejection).
 - **Mutating-class writes** (for example `filesystem.write_content`, `registry.set_value`),
-  `tar.*`, `power_health.set_power_plan`, `printing.clear_queue` and `content_dist` via the
+  `echo.*`, `power_health.set_power_plan`, `printing.clear_queue` and `content_dist` via the
   deployment pipeline (#3686) are not in the mandatory set.
 - **Scheduled execution of mandatory pairs is refused** (intent, PR5), not approved.
 - **Engine-submitted gated effects are refused** (D4), not rooted to an owner.

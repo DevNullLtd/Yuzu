@@ -26,7 +26,7 @@
 ///     authored but fires through `command_dispatch_fn`, which dispatches as
 ///     `DispatchCaller{.system = true}`, and the chokepoint's system_reserved
 ///     guard only refuses NON-system callers. Without this branch an operator
-///     who may not dispatch `tar.fleet_snapshot` directly could schedule it —
+///     who may not dispatch `echo.fleet_snapshot` directly could schedule it —
 ///     the definition ships operator-referencable — and the fire would reach
 ///     the fleet under system authority. Refused here, where the operator's
 ///     provenance is still known;

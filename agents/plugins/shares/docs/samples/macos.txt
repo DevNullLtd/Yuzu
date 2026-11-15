@@ -1,0 +1,8 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-10-29 · euid 501 (share name and home path redacted) · leg-hash 9e4e83a528e3
+== action=list
+status|list|supported|-
+source|exports|absent|-
+source|sharing|read|1
+share|smb|J Smith’s Public Folder|/Users/jsmith/Public|rw|true|-|sharing
+[result_status] OK / FULL / 
+

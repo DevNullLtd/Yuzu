@@ -2,7 +2,7 @@
 """tsan-gdb-capture.py — multi-binary gdb stack capture for the TSan nightly (#1038).
 
 The nightly TSan job's diagnostic step used to gdb a single hardcoded binary
-(`./tests/yuzu_server_tests`), so a crash in yuzu_agent_tests, yuzu_tar_tests or
+(`./tests/yuzu_server_tests`), so a crash in yuzu_agent_tests, yuzu_echo_tests or
 yuzu_transport_tests captured no stack at all (#1038, R-06). This derives the
 binaries to inspect from the run itself and appends every capture to one file.
 
@@ -477,11 +477,11 @@ def _selftest():
 Inherited environment: FOO=bar
 
 ==================================== 1/3 =====================================
-test:         tar - yuzu:tar unit tests
+test:         echo - yuzu:echo unit tests
 start time:   06:00:01
 duration:     6.51s
 result:       exit status 0
-command:      /b/tests/yuzu_tar_tests
+command:      /b/tests/yuzu_echo_tests
 ----------------------------------- stdout -----------------------------------
 Randomness seeded to: 111
 All tests passed
@@ -499,15 +499,15 @@ ThreadSanitizer: data race
 ==============================================================================
 """
     sections = parse_sections(log)
-    check(set(sections) == {"tar - yuzu:tar unit tests", "server - yuzu:server unit tests"},
+    check(set(sections) == {"echo - yuzu:echo unit tests", "server - yuzu:server unit tests"},
           "parse_sections finds exactly the two entries")
-    check(seed_of(sections["tar - yuzu:tar unit tests"]) == 111, "per-entry seed: tar -> 111")
+    check(seed_of(sections["echo - yuzu:echo unit tests"]) == 111, "per-entry seed: echo -> 111")
     check(seed_of(sections["server - yuzu:server unit tests"]) == 222,
           "per-entry seed: server -> 222 (not the first seed in the file)")
     check(seed_of("no seed here") is None, "missing seed degrades to None")
 
     tests = [
-        {"name": "tar unit tests", "cmd": ["/b/tests/yuzu_tar_tests"], "env": {}},
+        {"name": "echo unit tests", "cmd": ["/b/tests/yuzu_echo_tests"], "env": {}},
         {"name": "server unit tests", "cmd": ["/b/tests/yuzu_server_tests", "~[pg]"], "env": {}},
         {"name": "server pg unit tests",
          "cmd": ["/b/tests/yuzu_server_tests", "[pg]"], "env": {"PG": "1"}},
@@ -553,7 +553,7 @@ ThreadSanitizer: data race
     check(t == [], "a python/hygiene entry is never gdb'd")
 
     # Cancelled path: the entries with no testlog.txt section are the candidates.
-    # tar + server finished (they have sections); server-pg and agent did not.
+    # echo + server finished (they have sections); server-pg and agent did not.
     t = targets_for_cancelled(fr, tests, sections)
     check([x[0] for x in t] == ["server pg unit tests", "agent unit tests shard A"],
           "cancelled: only the entries that never finished are candidates")
@@ -561,7 +561,7 @@ ThreadSanitizer: data race
     # stuck-test case we most want a stack for, so it must yield every Catch2
     # entry as a candidate — not be mistaken for "nothing ran, nothing to do".
     t = targets_for_cancelled(fr, tests, {})
-    check([x[0] for x in t] == ["tar unit tests", "server unit tests",
+    check([x[0] for x in t] == ["echo unit tests", "server unit tests",
                                 "server pg unit tests", "agent unit tests shard A"],
           "cancelled with nothing finished: every Catch2 entry is a hang candidate")
     check(all("python3" not in c[0] for _, c, _, _ in t),

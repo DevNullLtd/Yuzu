@@ -20,7 +20,7 @@ changes are eight test-only `*_for_test` seams plus one ownership move; the rest
 | `AuthRoutes::expire_mfa_pending_for_test` | `mfa_pending_mu_` (`lock_guard`) | scope entry | scope exit | no-op on unknown token |
 | `AgentRegistry::expire_presence_cache_for_test` | `presence_cache_mu_` (`lock_guard`) | scope entry | scope exit | n/a |
 | `AnalyticsEventStore::drain_once_for_test`, `drain_running_for_test` | no lock taken: a caller-thread `drain_batch()` (its own Postgres advisory transaction lock excludes a concurrent drain) and an unsynchronised `joinable()` read | n/a | n/a | documented: not to be called while the drain thread runs |
-| Tar test writer thread (`test_tar_aggregator.cpp`) | existing RAII `Joiner` | test scope | every exit path, including a failed `REQUIRE` or a throw from `run_retention` | unchanged; `kMaxProbeWrites` bounds the loop, the 1 ms park still honours `stop` |
+| Echo test writer thread (`test_echo_aggregator.cpp`) | existing RAII `Joiner` | test scope | every exit path, including a failed `REQUIRE` or a throw from `run_retention` | unchanged; `kMaxProbeWrites` bounds the loop, the 1 ms park still honours `stop` |
 
 No thread, callback context or raw resource API was added. Every seam has zero callers outside tests.
 Confirmed independently by cpp-safety (Gate 3, no findings), security-guardian and authdb. Sanitizer coverage:

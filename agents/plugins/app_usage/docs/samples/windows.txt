@@ -1,11 +1,11 @@
 captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash pending
 == action=summary
-constrained|tar_db_unavailable|C:\ProgramData\yuzu\agent\tar.db|unable to open database file
+constrained|echo_db_unavailable|C:\ProgramData\yuzu\agent\echo.db|unable to open database file
 [result_status] UNAVAILABLE / PARTIAL / unable to open database file
 [rc] 1
 
 == action=last_used
-constrained|tar_db_unavailable|C:\ProgramData\yuzu\agent\tar.db|unable to open database file
+constrained|echo_db_unavailable|C:\ProgramData\yuzu\agent\echo.db|unable to open database file
 [result_status] UNAVAILABLE / PARTIAL / unable to open database file
 [rc] 1
 

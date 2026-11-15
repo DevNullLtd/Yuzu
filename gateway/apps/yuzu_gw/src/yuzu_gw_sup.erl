@@ -14,10 +14,15 @@
 %%%   7. yuzu_gw_health            — HTTP health/readiness endpoint
 %%%   8. yuzu_gw_memory_shedder    — node-wide memory load shedder (suspends the
 %%%      agent listener(s) under memory pressure, never the management listener)
+%%%      yuzu_gw_mem_reclaim       — gives OS memory back after the agent count
+%%%      drops (GC of the large long-lived processes, then malloc_trim on glibc)
 %%%   9. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
 %%%  10. yuzu_gw_mgmt_pins         — the management-pin watcher (#5696): resolves the
 %%%      {cert_file, Path} pins in init, so the first management stream finds them,
 %%%      and re-reads them (content digest) on its own timer; the per-stream check does no file I/O
+%%%      yuzu_gw_mgmt_crl_source   — the CA revocation list watcher (#6016 PR 4b): loads
+%%%      the CRL in init (bounded, total), so the first management stream finds it, and
+%%%      refreshes it on its own timer; `ignore' when no `mgmt_crl_source' is configured
 %%%  11. one yuzu_grpc_listener per {yuzu_gw, grpc_listeners} entry — LAST, so
 %%%      nothing is served before the registry, router and agent supervisor a
 %%%      handler calls exist, and a listener that cannot bind stops the tree
@@ -150,6 +155,15 @@ init([]) ->
           shutdown => 5000,
           type     => worker},
 
+        %% Gives OS memory back after a storm or a drain (module doc). It reads
+        %% the registry table, which yuzu_gw_registry (above) owns; it never
+        %% raises, so it cannot spend the restart intensity of the tree.
+        #{id       => yuzu_gw_mem_reclaim,
+          start    => {yuzu_gw_mem_reclaim, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
         #{id       => yuzu_gw_agent_sup,
           start    => {yuzu_gw_agent_sup, start_link, []},
           restart  => permanent,
@@ -161,6 +175,15 @@ init([]) ->
         %% leaves the published pins in place (they are a persistent_term).
         #{id       => yuzu_gw_mgmt_pins,
           start    => {yuzu_gw_mgmt_pins, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        %% After the pins and still ahead of the listeners, for the same reason:
+        %% its init/1 loads the CA's CRL before the management listener can take a
+        %% stream. It returns `ignore' when no CRL source is configured.
+        #{id       => yuzu_gw_mgmt_crl_source,
+          start    => {yuzu_gw_mgmt_crl_source, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker}

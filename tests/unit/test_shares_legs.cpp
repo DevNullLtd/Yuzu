@@ -1,14 +1,24 @@
 /**
- * test_shares_legs.cpp -- fault tests for the OS-free `list_linux`: every boundary is a
- * canned fake (no disk, no uid dependence).
+ * test_shares_legs.cpp -- fault tests for the OS-free `list_linux`, `list_windows` and
+ * `list_macos`: every boundary is a canned fake (no disk, no uid dependence, no Windows API,
+ * no process).
  *
- * Provenance: every specimen is a RECONSTRUCTION built from the documented layouts.
+ * Provenance: every specimen is a RECONSTRUCTION built from the documented layouts (the
+ * Windows pages from the SHARE_INFO_1/2 and STYPE_* documentation). The native capture
+ * agents/plugins/shares/docs/samples/windows.txt (kingsley, LocalSystem, 2026-10-27) has the
+ * same row shapes: kind and special flags, '-' for the IPC$ path, backslash paths folded to '/'.
+ * The SDK side is pinned by shares_win.cpp's static_asserts and the tripwire case below. The
+ * macOS cases feed `sharing -l -f json` text shaped like the native capture
+ * agents/plugins/shares/docs/samples/macos.txt (braga, 2026-10-29); the runner outcomes
+ * (deadline, signal, truncation, exit codes) are reconstructions.
  */
 #include <catch2/catch_test_macros.hpp>
 
 #include "shares_legs.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -310,4 +320,644 @@ TEST_CASE("shares linux: rows are source rows first, then shares, each pipe-clea
     CHECK(l.rows[0] == "source|exports|read|1");
     CHECK(l.rows[3] == "share|nfs|-|/srv/pub|rw|true|clients_1|exports");
     CHECK(l.rows[4] == "share|smb|a|/srv/a|rw|false|-|smb_conf");
+}
+
+// ---------------------------------------------------------------------------
+// list_windows -- RECONSTRUCTED NetShareEnum pages (SHARE_INFO_2 / SHARE_INFO_1 layouts)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+WinShareRec rec(std::string name, std::string path, std::uint32_t type = 0) {
+    return WinShareRec{std::move(name), std::move(path), type};
+}
+
+/// A drain that asks for more pages than this has not terminated: fail the test instead of
+/// letting a loop-exit regression spin the shard until its timeout.
+constexpr std::size_t kMaxPagerCalls = 64;
+
+/// Canned pager: per level, pages served in order; the last page repeats if asked again.
+/// Every call's level is recorded.
+struct FakeWinPages {
+    std::map<int, std::vector<WinPage>> pages;
+    std::map<int, std::size_t> next;
+    std::vector<int> calls;
+
+    WinPageFn fn() {
+        return [this](int level) {
+            calls.push_back(level);
+            if (calls.size() > kMaxPagerCalls)
+                FAIL("the pager was asked for more than " << kMaxPagerCalls
+                                                           << " pages: the drain does not terminate");
+            auto& v = pages[level];
+            if (v.empty())
+                return WinPage{};
+            auto& i = next[level];
+            const WinPage& p = v[std::min(i, v.size() - 1)];
+            ++i;
+            return p;
+        };
+    }
+    Listing run() { return list_windows(fn()); }
+    std::size_t calls_at(int level) const {
+        return static_cast<std::size_t>(std::ranges::count(calls, level));
+    }
+};
+
+/// `total` is NetShareEnum's totalentries for the call; list_windows reads it from the first page
+/// of a multi-page drain only.
+WinPage page_of(std::uint32_t status, std::vector<WinShareRec> shares = {},
+                std::uint32_t total = 0) {
+    return WinPage{status, std::move(shares), total};
+}
+
+std::vector<WinShareRec> disks(const std::string& prefix, std::size_t n) {
+    std::vector<WinShareRec> v;
+    for (std::size_t i = 0; i < n; ++i)
+        v.push_back(rec(prefix + std::to_string(i), "C:/d" + std::to_string(i)));
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("shares windows: one page of every kind is typed and special is flagged not hidden",
+          "[shares]") {
+    FakeWinPages f;
+    // NetShareEnum returns backslash paths; the row grammar folds them to '/'. 3 is STYPE_IPC.
+    f.pages[2] = {page_of(0, {rec("C$", "C:\\", kStypeSpecial), rec("ADMIN$", "C:\\Windows", kStypeSpecial),
+                              rec("IPC$", "", kStypeSpecial | 3u), rec("Users", "C:\\Users", 0),
+                              rec("HP", "", 1), rec("COM1", "", 2), rec("tmp", "C:\\t", kStypeTemporary),
+                              rec("exfil$", "D:\\exfil", 0)})};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
+    REQUIRE(l.rows.size() == 9);
+    CHECK(l.rows[0] == "source|netshareenum|read|8");
+    CHECK(l.rows[1] == "share|smb|C$|C:/|-|-|disk,special|netshareenum");
+    CHECK(l.rows[2] == "share|smb|ADMIN$|C:/Windows|-|-|disk,special|netshareenum");
+    CHECK(l.rows[3] == "share|smb|IPC$|-|-|-|ipc,special|netshareenum");
+    CHECK(l.rows[4] == "share|smb|Users|C:/Users|-|-|disk|netshareenum");
+    CHECK(l.rows[5] == "share|smb|HP|-|-|-|print|netshareenum");
+    CHECK(l.rows[6] == "share|smb|COM1|-|-|-|device|netshareenum");
+    CHECK(l.rows[7] == "share|smb|tmp|C:/t|-|-|disk,temporary|netshareenum");
+    // A trailing '$' on a share that is not STYPE_SPECIAL is the browse-hiding convention.
+    CHECK(l.rows[8] == "share|smb|exfil$|D:/exfil|-|-|disk,hidden|netshareenum");
+    CHECK(f.calls == std::vector<int>{2});
+}
+
+TEST_CASE("shares windows: an unknown kind is other and the temporary bit alone is disk then "
+          "temporary",
+          "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(0, {rec("x", "C:/x", 7), rec("t", "C:/t", kStypeTemporary),
+                              rec("h$", "C:/h", 2u | kStypeTemporary)})};
+    const auto l = f.run();
+    CHECK(has(l, "share|smb|x|C:/x|-|-|other|netshareenum"));
+    CHECK(has(l, "share|smb|t|C:/t|-|-|disk,temporary|netshareenum"));
+    // kind, then hidden, then temporary
+    CHECK(has(l, "share|smb|h$|C:/h|-|-|device,hidden,temporary|netshareenum"));
+}
+
+TEST_CASE("shares windows: an advancing pager is drained in page order", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2), 6), page_of(kWinMoreData, disks("b", 2), 6),
+                  page_of(0, disks("c", 2), 6)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
+    CHECK(count_prefix(l, "share|") == 6);
+    CHECK(has(l, "source|netshareenum|read|6"));
+    CHECK(l.rows[1].starts_with("share|smb|a0|"));
+    CHECK(l.rows[6].starts_with("share|smb|c1|"));
+    CHECK(f.calls_at(2) == 3);
+}
+
+TEST_CASE("shares windows: a terminal page that keeps nothing ends the drain cleanly, not as "
+          "no_progress",
+          "[shares]") {
+    // The status==0 check must precede the kept==0 check: an empty last page, or one that only
+    // repeats a name already seen, is the end of a clean drain and every earlier row survives.
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2), 2), page_of(0, {}, 2)};
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("a", 2), 2), page_of(0, disks("a", 1), 2)};
+    for (auto* p : {&f, &g}) {
+        const auto l = p->run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.reason.empty());
+        CHECK_FALSE(reason_has(l, "no_progress"));
+        CHECK_FALSE(reason_has(l, "inconsistent_drain"));
+        CHECK(count_prefix(l, "share|") == 2);
+        CHECK(has(l, "source|netshareenum|read|2"));
+        CHECK(p->calls_at(2) == 2);
+    }
+}
+
+TEST_CASE("shares windows: a stalled pager is no_progress and reports no rows", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2)), page_of(kWinMoreData)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:no_progress"));
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+}
+
+TEST_CASE("shares windows: a cyclic pager is no_progress on its second page and reports no rows",
+          "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("c", 100))}; // the same page, forever
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:no_progress"));
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+    CHECK(f.calls_at(2) == 2); // the repeat kept nothing new, so no third page was asked for
+}
+
+TEST_CASE("shares windows: a share returned twice is kept once and costs no budget", "[shares]") {
+    FakeWinPages f;
+    // Cursor drift repeats a share (names compare without regard to ASCII case).
+    f.pages[2] = {page_of(kWinMoreData, {rec("a", "C:/a"), rec("b", "C:/b"), rec("c", "C:/c")}, 5),
+                  page_of(0, {rec("B", "C:/other"), rec("c", "C:/c"), rec("d", "C:/d"), rec("e", "C:/e")}, 5)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::supported);
+    CHECK(l.reason.empty());
+    CHECK(count_prefix(l, "share|") == 5);
+    CHECK(has(l, "source|netshareenum|read|5"));
+    CHECK(has(l, "share|smb|b|C:/b|-|-|disk|netshareenum")); // the first occurrence wins
+    CHECK_FALSE(has(l, "share|smb|B|C:/other|-|-|disk|netshareenum"));
+
+    // 400 distinct names, then a page that repeats all 400 and adds 112: 512 distinct fit the row
+    // cap exactly only if the 400 repeats were not charged.
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("d", 400), 512), page_of(0, [] {
+                      auto v = disks("d", 400);
+                      auto n = disks("n", 112);
+                      v.insert(v.end(), n.begin(), n.end());
+                      return v;
+                  }(), 512)};
+    const auto o = g.run();
+    CHECK(count_prefix(o, "share|") == kMaxShareRows);
+    CHECK(o.status == StatusState::supported);
+    CHECK_FALSE(reason_has(o, "windows:shares:row_cap"));
+}
+
+TEST_CASE("shares windows: a multi-page drain whose count differs from the first page's total is "
+          "inconsistent_drain with the rows kept",
+          "[shares]") {
+    // A share created while paging: 4 read, 3 announced.
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 2), 3), page_of(0, disks("b", 2), 4)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:inconsistent_drain"));
+    CHECK(count_prefix(l, "share|") == 4);
+    CHECK(has(l, "source|netshareenum|read|4"));
+
+    // A share deleted while paging: 4 read, 5 announced.
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("a", 2), 5), page_of(0, disks("b", 2), 4)};
+    const auto o = g.run();
+    CHECK(o.status == StatusState::constrained);
+    CHECK(reason_has(o, "windows:shares:netshareenum:inconsistent_drain"));
+    CHECK(count_prefix(o, "share|") == 4);
+
+    // A single page is read == total trivially and is never judged against it.
+    FakeWinPages h;
+    h.pages[2] = {page_of(0, disks("a", 2), 7)};
+    const auto s1 = h.run();
+    CHECK(s1.status == StatusState::supported);
+    CHECK_FALSE(reason_has(s1, "inconsistent_drain"));
+}
+
+TEST_CASE("shares windows: one budget spans every page and refusal stops fetching", "[shares]") {
+    FakeWinPages f;
+    for (int i = 0; i < 6; ++i)
+        f.pages[2].push_back(page_of(kWinMoreData, disks("p" + std::to_string(i) + "_", 100)));
+    const auto l = f.run();
+    CHECK(count_prefix(l, "share|") == kMaxShareRows);
+    CHECK(reason_has(l, "windows:shares:row_cap"));
+    CHECK(has(l, "source|netshareenum|read|512"));
+    CHECK_FALSE(reason_has(l, "inconsistent_drain")); // a truncated drain is row_cap, not drift
+    CHECK(f.calls_at(2) == 6); // page 7 was never asked for
+
+    FakeWinPages g;
+    g.pages[2] = {page_of(0, {rec(std::string(5000, 'n'), "C:/x")})};
+    const auto o = g.run();
+    CHECK(reason_has(o, "windows:shares:field_oversized"));
+    REQUIRE(o.rows.size() == 2);
+    CHECK(o.rows[1].size() < 4200);
+}
+
+TEST_CASE("shares windows: the byte budget cuts the listing before the row cap at the first "
+          "refusal",
+          "[shares]") {
+    // Large entries exhaust 1 MiB long before 512 rows. Name, path, flags and the fixed per-row
+    // overhead are all charged ("disk" plus its separator is 5 flag bytes), and a small entry
+    // behind the refused one is never looked at.
+    const std::size_t per_row = 4000 + 4000 + 5 + kRowOverhead;
+    const std::size_t fit = kMaxShareBytes / per_row;
+    REQUIRE(fit < kMaxShareRows);
+    std::vector<WinShareRec> big;
+    for (std::size_t i = 0; i <= fit + 10; ++i) {
+        std::string name = "L" + std::to_string(i);
+        name.resize(4000, 'n');
+        big.push_back(rec(std::move(name), std::string(4000, 'p')));
+    }
+    big.push_back(rec("small", "C:/s"));
+    FakeWinPages f;
+    f.pages[2] = {page_of(0, std::move(big))};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:row_cap"));
+    CHECK_FALSE(reason_has(l, "windows:shares:field_oversized")); // 4000 bytes is under the cut
+    CHECK(count_prefix(l, "share|") == fit);
+    CHECK(has(l, "source|netshareenum|read|" + std::to_string(fit)));
+    CHECK(count_prefix(l, "share|smb|small|") == 0);
+}
+
+TEST_CASE("shares windows: the level-1 fallback does not inherit level-2 state", "[shares]") {
+    // An oversized name read at level 2 is discarded with its page: the level-1 answer is judged
+    // on its own rows, so it carries no field_oversized, and the names the discarded level-2 rows
+    // used are free to appear again.
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, {rec(std::string(5000, 'n'), "C:/x"), rec("Users", "C:/u")}, 800),
+                  page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(0, {rec("Users", ""), rec("Data", "")})};
+    const auto l = f.run();
+    CHECK(f.calls == std::vector<int>{2, 2, 1});
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+    CHECK_FALSE(reason_has(l, "windows:shares:field_oversized"));
+    CHECK(has(l, "source|netshareenum|read|2"));
+    CHECK(has(l, "share|smb|Users|-|-|-|disk|netshareenum"));
+
+    // A multi-page level-1 drain is judged against ITS first page's total, not level 2's (800).
+    FakeWinPages g;
+    g.pages[2] = {page_of(kWinMoreData, disks("a", 2), 800), page_of(kWinAccessDenied)};
+    g.pages[1] = {page_of(kWinMoreData, {rec("a0", ""), rec("a1", "")}, 3), page_of(0, {rec("a2", "")}, 3)};
+    const auto o = g.run();
+    CHECK(o.status == StatusState::constrained);
+    CHECK_FALSE(reason_has(o, "inconsistent_drain"));
+    CHECK(has(o, "source|netshareenum|read|3"));
+}
+
+TEST_CASE("shares windows: a failing later page discards every earlier row", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 3)), page_of(8)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:status_8"));
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+}
+
+TEST_CASE("shares windows: level 2 refused falls back to level 1 names without paths", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(0, {rec("Users", "", 0), rec("IPC$", "", kStypeSpecial | 3u)})};
+    const auto l = f.run();
+    CHECK(f.calls == std::vector<int>{2, 1});
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+    CHECK(has(l, "source|netshareenum|read|2"));
+    CHECK(has(l, "share|smb|Users|-|-|-|disk|netshareenum"));
+    CHECK(has(l, "share|smb|IPC$|-|-|-|ipc,special|netshareenum"));
+}
+
+TEST_CASE("shares windows: the level-1 fallback that then fails reports no shares and both tokens",
+          "[shares]") {
+    // The fallback token says the retry was attempted, not that it succeeded: a level-1 drain
+    // that fails leaves ONE failed source row (two wire rows with the status row) and no share.
+    for (const std::uint32_t st : {8u, kWinMoreData}) { // status_8 / no_progress (empty page)
+        FakeWinPages f;
+        f.pages[2] = {page_of(kWinAccessDenied)};
+        f.pages[1] = {page_of(st)};
+        const auto l = f.run();
+        INFO("level-1 status " << st);
+        CHECK(f.calls == std::vector<int>{2, 1});
+        CHECK(l.status == StatusState::constrained);
+        CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+        CHECK(reason_has(l, st == 8u ? "windows:shares:netshareenum:status_8"
+                                     : "windows:shares:netshareenum:no_progress"));
+        CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+    }
+}
+
+TEST_CASE("shares windows: the level-1 fallback that answers empty is read|0 and still constrained",
+          "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(0)};
+    const auto l = f.run();
+    CHECK(f.calls == std::vector<int>{2, 1});
+    CHECK(l.status == StatusState::constrained);
+    CHECK(reason_has(l, "windows:shares:netshareenum:level2_permission_denied"));
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|read|0"});
+}
+
+TEST_CASE("shares windows: the fallback restarts the budget and drops level-2 rows", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinMoreData, disks("a", 400)), page_of(kWinAccessDenied)}; // denied after rows were gathered
+    f.pages[1] = {page_of(0, disks("a", 400))}; // the same names: the discarded rows are forgotten
+    const auto l = f.run();
+    CHECK(count_prefix(l, "share|") == 400);
+    CHECK_FALSE(reason_has(l, "windows:shares:row_cap"));
+    CHECK(has(l, "source|netshareenum|read|400"));
+    REQUIRE(l.rows.size() > 1);
+    CHECK(l.rows[1].starts_with("share|smb|a0|"));
+}
+
+TEST_CASE("shares windows: refused at both levels is permission_denied", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(kWinAccessDenied)};
+    f.pages[1] = {page_of(kWinAccessDenied)};
+    const auto l = f.run();
+    CHECK(l.status == StatusState::permission_denied);
+    CHECK(l.reason == "windows:shares:netshareenum:permission_denied");
+    CHECK(l.rows == std::vector<std::string>{"source|netshareenum|refused|-"});
+}
+
+TEST_CASE("shares windows: a stopped Server service is typed unsupported and level 1 is not tried",
+          "[shares]") {
+    for (const std::uint32_t st : {kNerrServerNotStarted, kRpcServerUnavailable, kRpcUnknownIf}) {
+        FakeWinPages f;
+        f.pages[2] = {page_of(st)};
+        const auto l = f.run();
+        INFO("status " << st);
+        CHECK(l.status == StatusState::unsupported);
+        CHECK(l.reason == (st == kNerrServerNotStarted ? "windows:shares:netshareenum:server_not_started"
+                                       : "windows:shares:netshareenum:server_unavailable"));
+        CHECK(l.rows == std::vector<std::string>{"source|netshareenum|failed|-"});
+        CHECK(f.calls == std::vector<int>{2});
+    }
+}
+
+TEST_CASE("shares windows: hostile bytes in a name stay inside one escaped field", "[shares]") {
+    FakeWinPages f;
+    f.pages[2] = {page_of(0, {rec(std::string("a|b\xff") + "c", "C:/x")})};
+    const auto l = f.run();
+    REQUIRE(l.rows.size() == 2);
+    std::size_t pipes = 0;
+    for (std::size_t i = 0; i < l.rows[1].size(); ++i)
+        if (l.rows[1][i] == '|' && l.rows[1][i - 1] != '\\')
+            ++pipes;
+    CHECK(pipes == 7);
+    CHECK(l.rows[1].find('\xff') == std::string::npos);
+}
+
+TEST_CASE("shares windows: the shell's SDK constants are pinned (portable tripwire)", "[shares]") {
+    CHECK(kStypeSpecial == 0x80000000u);
+    CHECK(kStypeTemporary == 0x40000000u);
+    CHECK(kStypeMask == 0xFFu);
+    CHECK(kWinAccessDenied == 5);
+    CHECK(kWinMoreData == 234);
+    CHECK(kNerrServerNotStarted == 2114);
+    CHECK(kRpcServerUnavailable == 1722);
+    CHECK(kRpcUnknownIf == 1717);
+}
+
+// ---------------------------------------------------------------------------
+// macOS: list_macos over a fake read boundary and a fake runner
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using yuzu::agent::SubprocessOptions;
+using yuzu::agent::SubprocessResult;
+using yuzu::agent::TerminationReason;
+
+constexpr const char* kOneShare =
+    R"({"Pub":{"path":"\/Users\/jsmith\/Public","smb_guest_access":1,"smb_name":"Pub",)"
+    R"("smb_read_only":0,"smb_sealed":0,"smb_shared":1}})";
+
+SubprocessResult ran(std::string output, int exit_code = 0) {
+    SubprocessResult r;
+    r.tool_ran = true;
+    r.exit_code = exit_code;
+    r.termination_reason = TerminationReason::exited;
+    r.output = std::move(output);
+    return r;
+}
+
+SubprocessResult ended(TerminationReason why) {
+    SubprocessResult r;
+    r.termination_reason = why;
+    r.tool_ran = why != TerminationReason::spawn_error;
+    r.timed_out = why == TerminationReason::deadline;
+    return r;
+}
+
+/// Canned macOS boundaries. `order` records the sequence of boundary calls so the test can
+/// pin that /etc/exports is read before the tool runs.
+struct FakeMac {
+    FileReadLike exports = io(ENOENT);
+    SubprocessResult result = ran("{}");
+    std::vector<std::string> order, reads, argv;
+    SubprocessOptions opts;
+    int runs = 0;
+
+    Listing run() {
+        MacFs fs;
+        fs.exports_path = kExports;
+        fs.read = [this](const std::string& p) {
+            order.push_back("read");
+            reads.push_back(p);
+            return exports;
+        };
+        fs.run = [this](const std::vector<std::string>& a, const SubprocessOptions& o) {
+            order.push_back("run");
+            ++runs;
+            argv = a;
+            opts = o;
+            return result;
+        };
+        return list_macos(fs);
+    }
+};
+
+std::size_t unescaped(const std::string& row) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < row.size(); ++i)
+        if (row[i] == '|' && (i == 0 || row[i - 1] != '\\'))
+            ++n;
+    return n;
+}
+
+} // namespace
+
+TEST_CASE("shares macos: argv and bounds are pinned and the exports read comes first", "[shares]") {
+    FakeMac f;
+    f.result = ran(kOneShare);
+    const auto l = f.run();
+    CHECK(f.runs == 1);
+    CHECK(f.argv == std::vector<std::string>{"/usr/sbin/sharing", "-l", "-f", "json"});
+    CHECK(f.opts.deadline == std::chrono::milliseconds{5000});
+    CHECK_FALSE(f.opts.merge_stderr);
+    CHECK(f.opts.max_lines == 1);
+    CHECK_FALSE(f.opts.stop_after_max_lines); // keeps max_lines from ever ending the run early
+    CHECK(f.opts.output_cap_bytes == 2 * kMaxShareBytes);
+    CHECK(f.reads == std::vector<std::string>{kExports}); // nothing else is read
+    CHECK(f.order == std::vector<std::string>{"read", "run"});
+    CHECK(l.status == StatusState::supported);
+}
+
+TEST_CASE("shares macos: a tool that does not finish fails the sharing source only", "[shares]") {
+    const std::pair<TerminationReason, const char*> cases[] = {
+        {TerminationReason::spawn_error, "spawn_error"}, {TerminationReason::deadline, "deadline"},
+        {TerminationReason::cancelled, "cancelled"},     {TerminationReason::signaled, "signaled"},
+        {TerminationReason::line_limit, "line_limit"}};
+    for (const auto& [why, name] : cases) {
+        INFO(name);
+        FakeMac f;
+        f.exports = ok("/srv\n");
+        f.result = ended(why);
+        f.result.output = kOneShare; // even complete-looking output is not trusted
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == std::string{"macos:shares:sharing:"} + name);
+        REQUIRE(l.rows.size() == 3);
+        CHECK(l.rows[0] == "source|exports|read|1");
+        CHECK(l.rows[1] == "source|sharing|failed|-");
+        CHECK(l.rows[2] == "share|nfs|-|/srv|rw|true|clients_0|exports");
+    }
+}
+
+TEST_CASE("shares macos: truncation exit codes and unrecognised output", "[shares]") {
+    {
+        FakeMac f;
+        f.result = ran(kOneShare);
+        f.result.output_truncated = true;
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:sharing:output_truncated");
+        CHECK(has(l, "source|sharing|failed|-"));
+        CHECK(count_prefix(l, "share|") == 0);
+    }
+    {
+        FakeMac f;
+        f.result = ran(kOneShare, 1);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:sharing:exit_nonzero");
+        CHECK(count_prefix(l, "share|") == 0);
+    }
+    for (const int code : {0, 1}) { // the exact no-records text is not a failure at any exit code
+        FakeMac f;
+        f.result = ran("  No share point records.\n", code);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.rows ==
+              std::vector<std::string>{"source|exports|absent|-", "source|sharing|read|0"});
+    }
+    for (const char* text :
+         {"", "  \n", "[]", "not json", "{\"truncated\":", "No share point records. x"}) {
+        INFO(text);
+        FakeMac f;
+        f.result = ran(text);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:sharing:unrecognised_output");
+        CHECK(has(l, "source|sharing|failed|-"));
+        CHECK(has(l, "source|exports|absent|-"));
+    }
+}
+
+TEST_CASE("shares macos: a malformed record is a token and its siblings are kept", "[shares]") {
+    FakeMac f;
+    f.result = ran(R"({"bad":{"smb_name":"x"},"good":{"path":"/ok"}})");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(l.reason == "macos:shares:sharing:malformed_records_1");
+    CHECK(has(l, "source|sharing|read|1"));
+    CHECK(has(l, "share|smb|good|/ok|-|-|-|sharing"));
+}
+
+TEST_CASE("shares macos: exports absent refused and failed against a good tool", "[shares]") {
+    {
+        FakeMac f;
+        f.result = ran(kOneShare);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::supported);
+        CHECK(l.reason.empty());
+        REQUIRE(l.rows.size() == 3);
+        CHECK(l.rows[0] == "source|exports|absent|-");
+        CHECK(l.rows[1] == "source|sharing|read|1");
+        CHECK(l.rows[2] == "share|smb|Pub|/Users/jsmith/Public|rw|true|-|sharing");
+    }
+    {
+        FakeMac f; // refused exports + a read tool: constrained, not permission_denied
+        f.exports = io(EACCES);
+        f.result = ran(kOneShare);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == "macos:shares:exports:permission_denied");
+        CHECK(has(l, "source|exports|refused|-"));
+        CHECK(has(l, "source|sharing|read|1"));
+    }
+    {
+        FakeMac f; // refused exports + a failed tool: nothing was read
+        f.exports = io(EPERM);
+        f.result = ended(TerminationReason::deadline);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::permission_denied);
+        CHECK(reason_has(l, "macos:shares:exports:permission_denied"));
+        CHECK(reason_has(l, "macos:shares:sharing:deadline"));
+        CHECK(count_prefix(l, "source|") == 2);
+    }
+    const std::pair<FileReadLike, const char*> failures[] = {
+        {kind(ReadErr::symlink_refused), "macos:shares:exports:symlink_refused"},
+        {kind(ReadErr::oversized), "macos:shares:exports:oversized"},
+        {ok(std::string("/srv\0x", 6)), "macos:shares:exports:invalid_bytes"}};
+    for (const auto& [read, token] : failures) {
+        INFO(token);
+        FakeMac f;
+        f.exports = read;
+        f.result = ran(kOneShare);
+        const auto l = f.run();
+        CHECK(l.status == StatusState::constrained);
+        CHECK(l.reason == token);
+        CHECK(has(l, "source|exports|failed|-"));
+        CHECK(has(l, "source|sharing|read|1"));
+    }
+}
+
+TEST_CASE("shares macos: one budget spans both sources and NFS is charged first", "[shares]") {
+    std::string exports;
+    for (int i = 0; i < 510; ++i)
+        exports += "/p" + std::to_string(i) + "\n";
+    FakeMac f;
+    f.exports = ok(exports);
+    f.result = ran(R"({"a":{"path":"/1"},"b":{"path":"/2"},"c":{"path":"/3"},"d":{"path":"/4"}})");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(l.reason == "macos:shares:row_cap");
+    CHECK(has(l, "source|exports|read|510"));
+    CHECK(has(l, "source|sharing|read|2")); // only the rows the remaining budget admits
+    CHECK(count_prefix(l, "share|nfs|") == 510);
+    CHECK(count_prefix(l, "share|smb|") == 2);
+    CHECK(has(l, "share|smb|a|/1|-|-|-|sharing"));
+    CHECK_FALSE(has(l, "share|smb|c|/3|-|-|-|sharing"));
+}
+
+TEST_CASE("shares macos: an oversized field is cut and reported", "[shares]") {
+    FakeMac f;
+    f.result = ran(R"({"k":{"path":"/p","smb_name":")" + std::string(5000, 'n') + R"("}})");
+    const auto l = f.run();
+    CHECK(l.status == StatusState::constrained);
+    CHECK(l.reason == "macos:shares:field_oversized");
+    CHECK(count_prefix(l, "share|smb|") == 1);
+}
+
+TEST_CASE("shares macos: rows are the two source rows then the shares each pipe-clean",
+          "[shares]") {
+    FakeMac f;
+    f.exports = ok("/srv -ro friends\n");
+    f.result = ran(R"({"k":{"path":"/p|q","smb_name":"a|b"}})");
+    const auto l = f.run();
+    REQUIRE(l.rows.size() == 4);
+    CHECK(l.rows[0] == "source|exports|read|1");
+    CHECK(l.rows[1] == "source|sharing|read|1");
+    CHECK(l.rows[2] == "share|nfs|-|/srv|ro|false|clients_1|exports");
+    CHECK(l.rows[3].starts_with("share|smb|"));
+    CHECK(unescaped(l.rows[2]) == 7);
+    CHECK(unescaped(l.rows[3]) == 7);
 }

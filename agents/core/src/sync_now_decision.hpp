@@ -34,10 +34,18 @@
 
 #include "sync_scheduler.hpp"
 
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace yuzu::agent {
+
+/// Upper bound of the `delay_max_s` command parameter (24 h).
+inline constexpr std::int64_t kSyncNowMaxDelaySeconds = 86400;
 
 /// Result of deciding a `__sync__.now` command — maps 1:1 onto the subset of
 /// CommandResponse fields the loop populates for this reserved command
@@ -54,20 +62,31 @@ struct SyncNowDecision {
 ///   action            - cmd.action(); only "now" is a recognised action.
 ///   source_param      - the "source" command parameter, ALREADY defaulted by
 ///                        the caller to SyncScheduler::kAllSources when the
-///                        parameter is absent or empty.
+///                        parameter is absent or empty. One name, `all`, or a
+///                        comma-separated list; all-or-nothing (any unknown
+///                        name arms nothing).
+///   delay_max_s       - the "delay_max_s" command parameter, nullopt when the
+///                        key is absent. A present value is a plain base-10
+///                        integer in [0, 86400]; 0 or absent is the immediate
+///                        path. Anything else, an empty value included, is a
+///                        FAILURE (exit 2) before request_now is called. The
+///                        agent spreads the fire over [0, delay_max_s) by a
+///                        stable per-agent offset.
 ///   inventory_disable - cfg_.inventory_disable; used only to pick between the
 ///                        two "scheduler not running" FAILURE messages.
 ///   sched             - the agent's current sync_scheduler_, or null when the
 ///                        daily-sync framework isn't running (e.g.
 ///                        --inventory-disable, or not yet connected).
 ///
-/// Calls sched->request_now(source_param) exactly once when sched is
-/// non-null (matching the original inline `else if (auto armed = ...)`) —
-/// request_now() itself has a side effect, arming the scheduler's pending
-/// list for its next tick, so this is a "decision" only in the sense the
-/// original inline code was: the arm happens as part of computing the reply.
+/// Calls sched->request_now(source_param, std::chrono::seconds{delay}) exactly
+/// once when sched is non-null and delay_max_s is valid (matching the original
+/// inline `else if (auto armed = ...)`) — request_now() itself has a side effect,
+/// arming the scheduler's pending list for its next tick, so this is a "decision"
+/// only in the sense the original inline code was: the arm happens as part of
+/// computing the reply.
 [[nodiscard]] inline SyncNowDecision decide_sync_now(std::string_view action,
                                                       std::string_view source_param,
+                                                      std::optional<std::string_view> delay_max_s,
                                                       bool inventory_disable,
                                                       SyncScheduler* sched) {
     if (action != "now") {
@@ -79,7 +98,19 @@ struct SyncNowDecision {
                 inventory_disable ? "daily-sync disabled (--inventory-disable)"
                                    : "daily-sync not running (not connected)"};
     }
-    auto armed = sched->request_now(source_param);
+    std::int64_t delay = 0;
+    if (delay_max_s) {
+        // from_chars rejects garbage, an empty range, a leading space or '+', and overflow;
+        // ptr != end rejects trailing characters ("12s", "1.5").
+        const char* const end = delay_max_s->data() + delay_max_s->size();
+        const auto [ptr, ec] = std::from_chars(delay_max_s->data(), end, delay);
+        if (ec != std::errc{} || ptr != end || delay < 0 || delay > kSyncNowMaxDelaySeconds) {
+            return {SyncNowDecision::Status::Failure, 2,
+                    "invalid delay_max_s '" + std::string(*delay_max_s) +
+                        "' — expected an integer 0.." + std::to_string(kSyncNowMaxDelaySeconds)};
+        }
+    }
+    auto armed = sched->request_now(source_param, std::chrono::seconds{delay});
     if (armed.empty()) {
         std::string valid;
         for (const auto& n : sched->source_names())

@@ -180,7 +180,7 @@ std::string format_filetime(DWORD low, DWORD high) {
 // ── Security-channel event log reader (wevtapi) ─────────────────────────
 
 // EVT_HANDLE must be closed with EvtClose, not CloseHandle — a local
-// single-owner guard, same shape as tar_netconn_win.cpp's EvtGuard.
+// single-owner guard, same shape as echo_netconn_win.cpp's EvtGuard.
 struct EvtGuard {
     EVT_HANDLE h{nullptr};
     explicit EvtGuard(EVT_HANDLE handle) : h{handle} {}
@@ -193,7 +193,7 @@ struct EvtGuard {
     explicit operator bool() const { return h != nullptr; }
 };
 
-// Render one event to UTF-8 XML (size-then-fill, same as tar_netconn_win.cpp).
+// Render one event to UTF-8 XML (size-then-fill, same as echo_netconn_win.cpp).
 std::string render_event_xml(EVT_HANDLE event) {
     DWORD used = 0, props = 0;
     ::EvtRender(nullptr, event, EvtRenderEventXml, 0, nullptr, &used, &props);

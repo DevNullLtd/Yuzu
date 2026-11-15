@@ -277,6 +277,12 @@ CREATE UNIQUE INDEX ux_agent_routes_session_id
     ON agent_routes (session_id) WHERE session_id IS NOT NULL;
 DROP INDEX IF EXISTS agent_routes_session_id_idx;
 )"},
+        // v6 (Echo rename): a flag for the pre-rename plugin name `tar`. Nothing writes or reads
+        // it any more; the column stays as an unused additive column (DEFAULT FALSE is harmless;
+        // this codebase has no DROP COLUMN) so an applied migration list never changes.
+        {6, R"(
+ALTER TABLE agent_routes ADD COLUMN legacy_echo_wire_name BOOLEAN NOT NULL DEFAULT FALSE;
+)"},
     };
     return kMigrations;
 }

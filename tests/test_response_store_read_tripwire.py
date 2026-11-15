@@ -107,7 +107,7 @@ INTERNAL_CONSUMER_SITES = {
         "quarantine_containment_reconciler.cpp: in-flight quarantine command poll (the closed "
         "protective set, plugin `quarantine`; polls its own dispatch)",
     "server/core/src/server.cpp:query(command_id)":
-        "server.cpp: tar.fleet_snapshot topology poll (fixed plugin `tar`; parsed into the "
+        "server.cpp: echo.fleet_snapshot topology poll (fixed plugin `echo`; parsed into the "
         "topology graph, never returned as rows)",
     "server/core/src/server.cpp:query_by_execution(execution_id)":
         "server.cpp: deployment collect (fixed plugin `content_dist`; scored, cohort "

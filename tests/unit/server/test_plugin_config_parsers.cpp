@@ -331,7 +331,7 @@ TEST_CASE("resolve_kill_switch: base layer ANDed with the per-OS layer",
 
 TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence format",
           "[server][config][killswitch]") {
-    const KillSwitchScope plain{"tar", "sql", ""};
+    const KillSwitchScope plain{"echo", "sql", ""};
     CHECK(kill_switch_set_detail(plain, false) == "enabled=false");
     CHECK(kill_switch_set_detail(plain, true, "") == "enabled=true");
     CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false) ==
@@ -340,7 +340,7 @@ TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence for
 
 TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped reason",
           "[server][config][killswitch]") {
-    const KillSwitchScope plain{"tar", "sql", ""};
+    const KillSwitchScope plain{"echo", "sql", ""};
     CHECK(kill_switch_set_detail(plain, false, "incident INC-42") ==
           "enabled=false, reason=\"incident INC-42\"");
     // Protective marker first, then the reason.
@@ -361,7 +361,7 @@ TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped re
 
 TEST_CASE("kill_switch_set_detail never tears a UTF-8 sequence at the cut",
           "[server][config][killswitch]") {
-    const KillSwitchScope plain{"tar", "sql", ""};
+    const KillSwitchScope plain{"echo", "sql", ""};
     // 511 ASCII bytes then a two-byte e-acute (C3 A9) straddling the 512-byte cut: the whole
     // character is dropped, not half of it.
     const std::string two = std::string(511, 'x') + "\xC3\xA9" + "tail";

@@ -2,7 +2,7 @@
 
 A Resource Ledger is required for a C++ diff (policy floor). Server-side only; no agent code.
 
-## Production code (`server/core/src/agent_registry.cpp`, `server.cpp`; doc comment only in `tar_corruption_audit.hpp`)
+## Production code (`server/core/src/agent_registry.cpp`, `server.cpp`; doc comment only in `echo_corruption_audit.hpp`)
 
 No new fd, HANDLE, SOCKET, `FILE*`, sqlite handle, OpenSSL object, C string, mapped library, temp path,
 subprocess or thread.
@@ -19,9 +19,9 @@ the only objects are a stack scalar, an immutable function-static string and a b
 handle, callback context or thread is created.
 
 Published every sweep, 0 included, so no `clear_gauge_family` is needed. Precedent for an
-always-published-at-0 server-owned count: `yuzu_fleet_tar_db_corruption_agents`.
+always-published-at-0 server-owned count: `yuzu_fleet_echo_db_corruption_agents`.
 
-The tag value is parsed by the existing `parse_tar_corruption_total` (`tar_corruption_audit.hpp`, #1567):
+The tag value is parsed by the existing `parse_echo_corruption_total` (`echo_corruption_audit.hpp`, #1567):
 `noexcept`, allocation-free, bounded to 18 characters; only tested for > 0, never read, summed or used as
 a label.
 

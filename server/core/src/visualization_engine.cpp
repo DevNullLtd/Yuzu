@@ -256,7 +256,7 @@ group_single(const std::string& plugin, int label_field, int value_field,
     for (const auto& r : responses) {
         if (r.output.empty()) continue;
         for (const auto& line : split_output_lines(r.output)) {
-            if (is_tar_protocol_line(line)) continue;
+            if (is_echo_protocol_line(line)) continue;
             auto fields = split_fields(plugin, line);
             if (!where.matches(fields)) continue;
             auto label = field_or_empty(fields, label_field);
@@ -306,7 +306,7 @@ group_multi(const std::string& plugin, int label_field, int series_field, int va
     for (const auto& r : responses) {
         if (r.output.empty()) continue;
         for (const auto& line : split_output_lines(r.output)) {
-            if (is_tar_protocol_line(line)) continue;
+            if (is_echo_protocol_line(line)) continue;
             auto fields = split_fields(plugin, line);
             if (!where.matches(fields)) continue;
             auto label = field_or_empty(fields, label_field);
@@ -355,7 +355,7 @@ void render_datetime_series(const json& spec, const std::string& plugin,
     for (const auto& r : responses) {
         if (r.output.empty()) continue;
         for (const auto& line : split_output_lines(r.output)) {
-            if (is_tar_protocol_line(line)) continue;
+            if (is_echo_protocol_line(line)) continue;
             auto fields = split_fields(plugin, line);
             int64_t x_val = 0;
             if (x_field.from_response_timestamp) {

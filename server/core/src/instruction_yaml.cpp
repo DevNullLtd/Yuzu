@@ -177,16 +177,14 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
     // Multiple documents: the Save path persists ONE definition; a pasted
     // multi-doc file (every shipped content/definitions/*.yaml) would save
     // doc 1 and silently drop the rest (governance dsl-S2). A separator on
-    // the first content line is a lead-in, not a second document.
+    // the first content line is a lead-in, not a second document. Lines are split
+    // by yaml_scan::split_lines so a lone-CR break is seen here exactly as the
+    // scanners see it; splitting on '\n' alone let a lone-CR file hide its `---`
+    // and save doc 1 only (#2123 governance G2-SEC-F2).
     {
         bool seen_content = false;
-        for (std::size_t pos = 0; pos < yaml_source.size();) {
-            auto eol = yaml_source.find('\n', pos);
-            if (eol == std::string::npos)
-                eol = yaml_source.size();
-            std::string_view line{yaml_source.data() + pos, eol - pos};
-            while (!line.empty() &&
-                   (line.back() == ' ' || line.back() == '\t' || line.back() == '\r'))
+        for (auto line : yaml_scan::split_lines(yaml_source)) {
+            while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
                 line.remove_suffix(1);
             if (line == "---") {
                 if (seen_content) {
@@ -201,7 +199,6 @@ std::vector<std::string> validate_definition_yaml(const std::string& yaml_source
                 if (first != std::string_view::npos && line[first] != '#')
                     seen_content = true;
             }
-            pos = eol + 1;
         }
     }
     const auto f = parse_definition_yaml(yaml_source);

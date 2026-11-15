@@ -88,11 +88,12 @@ inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
 // approval-gated path - `mcp_server.cpp`'s sole `compiled_input_schemas()
 // .at(tool_name).validate(args)` call site sits inside `requires_approval()`
 // (mcp_policy.hpp), which itself returns false immediately for an EMPTY
-// `mcp_tier` - and `/mcp/v1/`'s `auth_fn` (`require_auth`) admits a plain
+// `mcp_tier` - and `/mcp/v1/`'s `auth_fn` (`require_auth`) then admitted a plain
 // RBAC session or a non-MCP-tiered API token the same way any REST route
-// does, so that caller class never reaches C8 at all, on ANY tool. 11 of the
+// does, so that caller class never reached C8 at all, on ANY tool (since #4309
+// admission refuses an empty tier, mcp_admission.hpp). 11 of the
 // 19 are ALSO never approval-gated even at a non-empty tier; 3
-// (`create_result_set_from_tar_query`, `create_result_set_from_instruction_result`,
+// (`create_result_set_from_echo_query`, `create_result_set_from_instruction_result`,
 // `reevaluate_result_set`) are approval-gated at supervised tier only, so an
 // operator-tier call skipped validate() too; the remaining 5
 // (`create_management_group`, `update_management_group`,
@@ -149,7 +150,7 @@ inline constexpr std::array<std::string_view, 19> kFieldBoundTools{
     "list_result_sets",
     "create_result_set",
     "create_result_set_from_inventory_query",
-    "create_result_set_from_tar_query",
+    "create_result_set_from_echo_query",
     "create_result_set_from_instruction_result",
     "get_result_set",
     "get_result_set_members",

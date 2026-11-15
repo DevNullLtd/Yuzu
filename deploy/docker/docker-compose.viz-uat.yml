@@ -10,7 +10,7 @@
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
 # Minimal three-service compose for exercising the feat/viz-engine ladder:
-#   * tar.fleet_snapshot action (PR 1)
+#   * echo.fleet_snapshot action (PR 1)
 #   * FleetTopologyStore (PR 2; not yet REST-exposed)
 #   * Future PRs will exercise REST + dashboard renderer here
 #

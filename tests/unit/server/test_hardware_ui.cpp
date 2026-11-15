@@ -203,6 +203,19 @@ TEST_CASE("hardware results region: sortable th / filter chip / pager always hx-
     const auto pagers = all_opening_tags(html, "<button class=\"gp-btn\" hx-get=\"");
     REQUIRE(pagers.size() == 2); // both Prev and Next are showing
     assert_controls(pagers, 2);
+
+    // Newest-wins: every sort header and pager button syncs on the search box with `replace`.
+    // `this:abort` DROPS a request issued while another is in flight, so the operator's latest
+    // click was lost. The search box keeps its own `this:replace`: same xhr slot, same policy.
+    CHECK(html.find("this:abort") == std::string::npos);
+    for (const auto& tag : all_opening_tags(html, "<th class=\"sortable\""))
+        CHECK(tag.find("hx-sync=\"#hw-q:replace\"") != std::string::npos);
+    for (const auto& tag : pagers)
+        CHECK(tag.find("hx-sync=\"#hw-q:replace\"") != std::string::npos);
+    const auto full = render_hardware_list_fragment(page, false, false, /*results_only=*/false);
+    const auto search = all_opening_tags(full, "<input id=\"hw-q\"");
+    REQUIRE(search.size() == 1);
+    CHECK(search[0].find("hx-sync=\"this:replace\"") != std::string::npos);
 }
 
 // ── Checkbox column + sticky bulk-tag bar ─────────────────────────────────────
@@ -661,5 +674,28 @@ TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once
             CHECK(html.find(ci_banner) == std::string::npos);
             CHECK(html.find(tags_banner) == std::string::npos);
         }
+    }
+}
+
+TEST_CASE("software lens links into the Software host view", "[hardware][ui]") {
+    HwSyncAffordance sync;
+    const std::string id = "a b&c#1";
+    const std::string link = "href=\"/software#host=a%20b%26c%231\">Open in Software</a>";
+    const std::vector<SoftwareEntry> one{SoftwareEntry{}};
+    SECTION("populated") {
+        CHECK(render_hardware_software_lens(id, one, false, true, sync, 1700000000).find(link) !=
+              std::string::npos);
+    }
+    SECTION("offline, never synced") {
+        CHECK(render_hardware_software_lens(id, std::vector<SoftwareEntry>{}, false, false, sync, 0)
+                  .find(link) != std::string::npos);
+    }
+    SECTION("online, synced but empty") {
+        CHECK(render_hardware_software_lens(id, std::vector<SoftwareEntry>{}, false, true, sync, 0)
+                  .find(link) != std::string::npos);
+    }
+    SECTION("degraded read has no link") {
+        CHECK(render_hardware_software_lens(id, std::nullopt, false, true, sync, std::nullopt)
+                  .find("/software#host=") == std::string::npos);
     }
 }

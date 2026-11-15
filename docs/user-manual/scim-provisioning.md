@@ -25,9 +25,9 @@ using a bearer token you configure. From then on:
   `POST /scim/v2/Users` → a Yuzu account is created automatically, ready to
   sign in via SSO.
 - **Employee terminated / unassigned from the app in the IdP** → the IdP
-  calls `PATCH`, `PUT` (or `DELETE`) → the Yuzu account is disabled
-  immediately, and any active session for that user is revoked. No admin
-  has to remember to go disable the account by hand.
+  calls `PATCH`, `PUT` (or `DELETE`) → the Yuzu account is disabled, and
+  the user's sessions and API tokens are revoked once the call returns a
+  success. No admin has to remember to go disable the account by hand.
 - **Employee later re-assigned / re-hired** → the IdP re-activates the same
   SCIM resource → the Yuzu account is restored (any stale account lockout
   is cleared). The user re-enrolls MFA on their next login — a reactivation
@@ -277,7 +277,9 @@ Deploy these alert rules alongside SCIM Groups → role mapping:
 - **`yuzu_scim_audit_write_failures_total`** — the existing CC6.8
   evidence-integrity alert; it also covers a lost audit row for a group
   create/update/delete or role-change event (the SCIM call and the role
-  change themselves still succeeded — only the evidence row is missing).
+  change themselves still succeeded — only the evidence row is missing). It can
+  also fire for a failure row written for a `503` that changed nothing (see
+  "Evidence limits" under "During a database outage").
 
 **Remediation for a misconfigured `--scim-admin-group`:** fix the flag
 value and restart the server (see [Configuration](#configuration) above —
@@ -339,9 +341,10 @@ When your IdP deactivates or removes a user's app assignment, it sends a
 `PATCH` or `PUT` (setting `active: false`) or a `DELETE`. Any of the three
 has the same effect:
 
-- The Yuzu account is disabled immediately.
+- The Yuzu account is disabled when the call returns a success (`2xx`).
 - Any session the user currently holds is revoked — they are logged out,
-  not just blocked from a future login.
+  not just blocked from a future login. Other server replicas see the revoke
+  within about a second (up to 30 seconds during a PostgreSQL brownout).
 - The action is recorded in the audit log (`scim.user.deactivated` /
   `scim.user.deleted`), giving you a timestamped record for termination
   evidence (CC6.8).
@@ -376,12 +379,49 @@ has the same effect:
 
 Deprovision is **credentials-first**: tokens and sessions are revoked for
 the slug and every linked identity *before* the account is marked inactive
-or deleted, and if any token revoke does not durably persist, the whole
-deprovision call fails with a **`500`** rather than reporting success — this
-is new behavior your IdP connector's retry/alerting should account for: a
-`500` on a deactivate/delete call means the underlying store had a transient
-problem persisting the revoke, and the IdP should retry the call rather
-than treat it as a permanent rejection.
+or deleted, and if any token revoke **or any session delete** does not durably persist,
+the whole deprovision call fails with a **`500`** rather than reporting
+success — this is behavior your IdP connector's retry/alerting should account
+for: a `500` on a `PATCH`/`PUT` `active:false` or a `DELETE` means the
+underlying store had a transient problem persisting the revoke, and the IdP
+should retry the call rather than treat it as a permanent rejection. The
+account stays active and the SCIM resource and identity links are untouched by
+that `500`, but credentials whose revoke did persist stay revoked (a sessions-only
+failure leaves the API tokens already revoked, and in a call that covers
+several linked identities the other identities' sessions stay deleted), so the
+retry completes the deprovision. The body names the failed step:
+`failed to revoke API tokens for one or more linked identities`,
+`failed to revoke sessions for one or more linked identities` or
+`failed to revoke API tokens and sessions for one or more linked identities`.
+The audit row (`scim.user.deactivated` / `scim.user.deleted`) is `partial`
+with `api_tokens_db_error=true` and/or `sessions_db_error=true`. This does
+**not** apply to `POST /Users` with `active:false` (a user staged as
+deactivated): its token step still fails closed with `500`, but the account
+was already created, so the IdP's retry meets `409`; reconcile with a
+`GET` and a `PATCH` `active:false`. When the principal set is only the local username, its session step
+is covered by the account removal that follows, and a failed delete there is
+noted in the audit detail as `sessions_db_error=true session_leg_backstopped=true`
+(on the `scim.user.provisioned` `success` row, or on its `failure` row
+`account deactivated; durable session wipe failed`, but not on the row for a refused API-token revoke);
+if the set has any additional linked `oidc:` or `saml:` principal, the session
+step is gated like the other calls. While the session store is degraded a
+deprovision cannot complete; there is no override. Wait for PostgreSQL to
+recover (the `YuzuSessionStoreDegraded` alert needs the session-store degrade
+counter to rise for a full 10 minutes, so a short outage may never fire it;
+search the audit log for `partial` rows), then retry.
+
+This case answers `500`, not `503` with `Retry-After` (tracked separately), so
+configure the connector to retry a `500`. Some identity providers pause or
+quarantine the provisioning app after repeated 5xx responses (Microsoft Entra
+does); after the store recovers, confirm the provisioning job is running and
+re-trigger a sync. If the post-deactivation session wipe itself fails, the
+account is deactivated and a session whose local account is inactive is rejected
+at validation (about one second after the deactivation commits on a healthy
+generation poll, at most about 30 seconds while a replica's poll fails); the
+surviving row is removed when the account is reactivated or you end it with
+`DELETE /api/v1/sessions?username=<name>`. Sessions of an OIDC or SAML sign-in
+are ended by the linked-identity revoke of the deprovision, not by this check,
+and API tokens are unchanged.
 
 **SCIM will not deactivate an account that is currently `role=admin`,**
 whether that admin role came from a dashboard promotion or from
@@ -478,6 +518,97 @@ administrator and no other exists. The old administrator keeps the role, the new
 one is promoted afterwards, the request says `recompute=incomplete`, and the old
 administrator has to be demoted by hand (see the remedy below).
 
+**When the user store cannot answer a deactivation (#4068).** A `PUT` or `PATCH` with
+`active:false` for a resource whose Yuzu mirror already reads inactive does not trust the
+mirror: it checks the real account first, because a failed earlier deprovision can leave the
+mirror inactive while the account is still live. If the user store cannot answer that check,
+Yuzu now refuses with `503` and `Retry-After: 2` (audit `scim.user.deactivated`, result
+`failure`, detail `store_unavailable: verifying account state`) instead of reporting the
+deprovision complete. Nothing is changed, and a retry once the store answers repairs the account.
+Configure your IdP to retry `5xx` responses.
+
+**When the user store cannot answer the provenance or role check (#6836).** Before Yuzu
+deactivates, deletes, reactivates or updates a SCIM resource, it re-reads the account's
+provisioning source. It also re-reads the account's role while the account is still active: before a deactivation, before a `DELETE` of an active resource, and before the `externalId` write of a `PUT` or `PATCH` whose resource is active at that point (including straight after a reactivation), and straight after a `POST` revive's reactivation. A `PUT` always reaches that write; a `PATCH` only when its body carries `externalId`.
+A `DELETE` of an already-inactive mirror and a `PUT`/`PATCH` reactivation itself run the provenance check
+only. If the user store cannot answer either read (a connection that cannot
+be leased, or a failed query), Yuzu answers `503` with `Retry-After: 2` and the detail
+"temporarily unable to verify the account's provenance|role (authorization store unavailable);
+retry", instead of `404`. The audit row is the request's own action (`scim.user.deactivated`
+for a `PATCH`/`PUT` with `active:false`, `scim.user.deleted` for a `DELETE`,
+`scim.user.reactivated` for `active:true`, or `scim.user.updated` for the check before the
+`externalId` write of a `PUT` or `PATCH`, including after an `active` change) with result `failure` and detail
+`store_unavailable: provenance check` or `store_unavailable: role check`. A `POST` that
+revives a removed account re-reads only the role, after the reactivation; if that read meets the
+outage, Yuzu undoes the reactivation (the account stays down, the same guarded undo as a role
+refusal), answers `503` with `Retry-After: 2`, and audits `scim.user.provisioned` /
+`failure` with detail `store_unavailable: revive role check`. The IdP's retry of the `POST`
+converges once the store answers. Because the undo needs the same store as the failed role read, during a real outage the undo is likely to fail too: the answer is then `500`, not `503`, with a `scim.user.compensation_failed` audit row, a `yuzu_scim_compensation_failed_total` increment and a critical analytics event, and the account may be left active at the role the pre-check read (or in an indeterminate state) with no SCIM mapping created. An IdP retry revives it idempotently once the store answers; an operator should check the account (see [`rbac.md`](rbac.md) and the `scim.user.compensation_failed` audit row). The `500` audit detail is `store_unavailable: revive role check; undo did not complete; see scim.user.compensation_failed`.
+
+The guard that fails makes no change. A `PUT`, or a `PATCH` that sets `externalId` together with
+a change to `active`, applies the `active` change first and then re-checks provenance (and, after a reactivation, the role). If that
+re-check meets the outage, the `503` is returned for a request whose activation change was
+already applied. The audit shows a `success` row for the activation followed by a
+`scim.user.updated` `failure`. The IdP's retry finds the account already in the requested state
+and completes.
+
+For a deactivate, delete, reactivate, update or a `POST` that revives a removed account, a store fault is not a denial.
+`yuzu_scim_provenance_denied_total` does not move and the
+`scim.user.deprovision_role_refused_with_link` escalation does not fire, because nothing was
+refused. The `POST` create reads (the provisioning-source read and the duplicate/race reads) are tracked in #6837; the tombstone-role `500` in the revive pre-check (`POST` revive and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers `503`) and the `500` when the reactivation's own post-commit re-read fails (`failed to revive the underlying account`, no undo) are not covered by this change either (same defect class as #6837, which does not list them). Each fault instead counts on
+`yuzu_scim_guard_store_unavailable_total{guard="provenance"|"role"}`, and the
+`YuzuScimGuardStoreUnavailable` alert (warning) fires on any increase over an hour. This alert
+is distinct from `YuzuScimProvenanceDenied`, which no longer fires for outages. A real refusal
+(the account was not created by SCIM, or its role is not `user`) is unchanged: `404`
+`provenance_denied`. `yuzu_auth_get_user_role_store_error_total` does not move for these
+faults; it counts only the mirror-inactive (#4068) check above.
+
+If the `503` persists, check `/readyz` and the `yuzu_pg_*` metrics, look in the server log for
+the `ERROR` lines `ScimRoutes: provenance check`, `ScimRoutes: deprovision role check` and `ScimRoutes: revive role check`, and
+confirm in your IdP's provisioning log that it retried. Whether your IdP retries a `503`, and
+how many failures it tolerates before it pauses or quarantines provisioning, is that vendor's
+behaviour; the Okta, Entra and OneLogin pages cited there do not describe it (see
+[What the IdP vendors document](#what-the-idp-vendors-document)). Configure your IdP to retry
+`5xx` responses. The bearer-token check and the User and Group lookups answer the same retryable
+`503` for a store fault (#6835); see [SCIM failure-mode matrix](#scim-failure-mode-matrix).
+
+*What this does not cover.* These changes narrow two gaps and do not make deprovisioning
+outage-proof:
+
+- A full database outage no longer answers `401` at bearer-token validation (#6835): it is the
+  same retryable `503` (see [SCIM failure-mode matrix](#scim-failure-mode-matrix)). The deprovisioning
+  request is not carried out until the IdP retries after the outage.
+- Unfiltered `GET /Users` and `GET /Groups` are not covered: `list()` and `count()` fail open
+  (#2481), so during a store fault an unfiltered list can answer an empty `200` while a filtered
+  one answers `503`. Do not treat an empty list as authoritative during an outage.
+- Yuzu runs no reconciliation sweep. If your IdP stops retrying, an account that was never
+  deactivated stays active until an operator acts. To find such accounts, list SCIM resources
+  that read inactive and whose account is still active
+  (`scim_store.scim_resources` with `active = false`, joined on `username` to `auth.users`
+  with `is_active = TRUE`), then re-send `active:false` from the IdP or deactivate the user in
+  Settings → Users. The `store_unavailable` audit rows are the evidence trail, with two
+  counters: `yuzu_auth_get_user_role_store_error_total` for the mirror-inactive (#4068) check
+  and `yuzu_scim_guard_store_unavailable_total` for the provenance and role checks (#6836) and
+  the bearer and lookup checks (#6835).
+  A mutating request's row is best effort: the audit row is itself written to the database that
+  is down, so it can be missing for the outage window (the server log still carries an `ERROR`
+  line).
+- The `POST` create reads (the provisioning-source read and the duplicate/race reads) still
+  behave as before (#6837). That includes the concurrent-create re-read (`get_by_username` after
+  a failed create) and `find_by_external_id`: a fault there falls through to the later `500`,
+  not a `503`. So do the post-mutation re-fetches (`500`), and so do the tombstone-role `500` in the revive pre-check (`POST` revive
+  and `PATCH`/`PUT` `active:true`; the grant-read fault in the same pre-check already answers
+  `503`) and the `500` when the reactivation's own post-commit re-read fails (no undo): the same
+  defect class as #6837, which does not list them.
+- The #5214 state (the account is already deactivated but the SCIM mirror still reads active,
+  after a failed mirror write) still answers `404` plus the ADR-2001 D1 escalation on every IdP
+  retry once the store is healthy; the new `503` does not change that (#5214, #5673).
+- `DELETE` of a resource whose mirror is already inactive does not run the account-state check
+  described under #4068 above (it does run the provenance check).
+
+These gaps are tracked in #6837 and #6838 (list pagination in #2481, a concurrent revive
+race in #6946).
+
 **Known limits of the Group role recompute.** These are real gaps, tracked in
 #5673. Until then they are documented rather than engineered
 around:
@@ -555,8 +686,15 @@ around:
    group or a slow store; the HTTP request and the per-process Group lock
    (taken by `PUT`, `PATCH` and `DELETE`, not by `POST`) are held meanwhile.
    There is no time bound on the loop.
-4. A Group `POST` that fails after the group row is created leaves an empty
-   group, and a retry answers `409`.
+4. A Group `POST` resolves its members before it creates the group row (#6835). If
+   that resolution cannot be completed because the store failed, the request answers
+   `503` (`Retry-After: 2`) and creates nothing, so the retry never meets a `409` against
+   an empty group; the failure audit row has an empty target id. Nothing is rolled back
+   (there is no rollback), so a concurrent `PUT` or `PATCH` cannot have added a member to
+   a group that is then removed. A Group `POST` that fails after the group was created
+   (the `500` `failed to persist group membership`, when the members cannot be persisted)
+   leaves the empty group in place: it is not rolled back, and the retry meets `409` until
+   the group is removed.
 5. Deactivation of an account whose role is not `user` is refused with `404`
    until the role is corrected.
 6. `POST /Users` re-provisioning recomputes the one user but ignores an
@@ -607,7 +745,213 @@ enforcement is off; if the grant read is unavailable the answer is `503` with
 If the person is later re-added in the IdP, the same SCIM resource is
 reactivated (`active: true`): the account comes back, any lockout state is
 cleared, but **MFA is not restored** — they will re-enroll TOTP the next
-time they sign in.
+time they sign in. Reactivation first removes any session the account still has
+(also when the account is already active, for example on an IdP retry after a
+failed mirror write, which signs the user out again). If that removal does not
+persist, Yuzu answers `500`, the account stays inactive and the IdP must retry;
+configure the connector to retry a `500`, as for a deprovision. A sign-in after
+the reactivation is a new sign-in, with one residual: a login whose first factor
+was verified before the deactivation can still complete after the reactivation,
+because the post-mint recheck compares only role, credential hash and active
+state; deactivation clears the TOTP secret and recovery codes, so a pending MFA
+login cannot complete unless the user enrols again inside the pending window.
+
+## SCIM failure-mode matrix
+
+An IdP needs a SCIM server to tell three things apart: "your credential is wrong" (stop and fix
+it), "that does not exist, or is a duplicate" (a definitive answer), and "I could not look right
+now" (retry). Before #6835, a store fault during a PostgreSQL outage or pool saturation was
+reported as one of the first two: `401` at bearer validation, or `404`, `409`, an empty list or
+a skipped duplicate check on a lookup. An IdP may read a `401` as a credential failure and a
+`404` as "resource gone". Yuzu now answers `503` with `Retry-After: 2` when the store behind a
+check could not answer, and keeps `401`, `404` and `409` for the cases where the check ran and
+said no.
+
+**Bearer check.** A bad, malformed or missing token, an empty token, and a SCIM store that is
+not configured or not open are `401` with `WWW-Authenticate: Bearer`, a `scim.auth.denied` audit
+row and a `yuzu_scim_auth_failures_total` increment, as before: those are permanent, not
+faults. A store *fault* while checking the token (a connection that cannot be leased in time,
+or a failed query) is `503` with `Retry-After: 2` and the detail "temporarily unable to
+authenticate the request (store unavailable); retry". It writes no `scim.auth.denied` row and
+does not move `yuzu_scim_auth_failures_total`, because an outage is not a credential guess. It
+counts `yuzu_scim_guard_store_unavailable_total{guard="bearer"}` and logs an `ERROR`
+(`ScimRoutes: bearer validation - SCIM token store unavailable`).
+
+**Resource lookups.** `GET`, `PUT`, `PATCH` and `DELETE` on `/Users/{id}` and `/Groups/{id}`
+(including the second read of the current Group inside `PUT` and `PATCH`), the duplicate
+`userName` check of `POST /Users`, the duplicate `displayName` check of `POST /Groups`, the
+rename duplicate checks of `PUT` and `PATCH` on a Group, and the filter queries
+`GET /Users?filter=userName eq "..."` and `GET /Groups?filter=displayName eq "..."` answer
+`503` with `Retry-After: 2` and the detail "temporarily unable to read the SCIM store (store
+unavailable); retry" when the store read fails. The request changes nothing. It counts
+`yuzu_scim_guard_store_unavailable_total{guard="resource"}` and logs an `ERROR` naming the site
+(for example `ScimRoutes: user lookup (get)` or `ScimRoutes: group lookup (group_patch)`). A
+resource that is genuinely absent is still `404`; a genuine duplicate is still `409`.
+
+**Which of these `503`s are audited.** A *mutating* request whose lookup fails is audited under
+its own verb with result `failure` and detail `store_unavailable: lookup (<site>)`: `POST /Users`
+`scim.user.provisioned` (target = the `userName`), `PUT`/`PATCH /Users/{id}`
+`scim.user.updated`, `DELETE /Users/{id}` `scim.user.deleted`, `POST /Groups`
+`scim.group.created` (empty target), `PUT`/`PATCH /Groups/{id}` `scim.group.updated` and
+`DELETE /Groups/{id}` `scim.group.deleted`. The sites are `user lookup (create)`, `(replace)`,
+`(patch)` and `(delete)`, and `group lookup (create)`, `(group_replace)`,
+`(group_replace, current)`, `(rename, replace)`, `(group_patch)`, `(group_patch, current)`,
+`(rename, patch)` and `(group_delete)`. For a deprovision the row is the only per-resource
+evidence that the IdP's first attempt was deferred. The row is best effort: the audit store is
+usually the same database that just failed, so a drained pool loses it, while a fault confined to
+`scim_resources` or `scim_groups` keeps it. **No audit row** is written for `GET /Users/{id}`,
+`GET /Groups/{id}`, the two list filters or the bearer-token `503`: a read has no audit verb of
+its own, the bearer check has no verb or identity, and a row per polled `GET` would trip
+`YuzuScimAuditWriteFailures` ("a committed mutation lost its evidence") for requests that
+changed nothing. For those the trail is the `ERROR` log line and the counter. The `ERROR` line
+for a lookup also carries the target id (`ScimRoutes: <site> (target '<id>') - SCIM store
+unavailable...`); the bearer `ERROR` line is throttled to one per minute (the rest are
+`debug`) while the counter stays exact. The provenance and role guard `503`s of #6836 are
+audited as `failure` on the request's own action, as before.
+
+*Evidence limits.* In a FULL outage no audit row can be written for the `503` at all, because
+the audit store is the same database; the trail is then the `ERROR` log line plus the counter,
+and a bearer-token `503` is never audited. When a mutating request's failure row cannot be
+written, `yuzu_scim_audit_write_failures_total{action}` moves and `YuzuScimAuditWriteFailures`
+can fire for a request that changed nothing. The verb is the request's own, chosen before the
+body is read: a `PATCH` or `PUT` that would have deactivated a user is audited as
+`scim.user.updated`, not `scim.user.deactivated`, when its lookup answers `503`.
+
+The Group "membership unavailable" `503`s (a failed read of a Group's members) existed before
+and now also carry `Retry-After: 2`.
+
+| Situation | Answer | Retry-After | Audit row | Counter / alert | What the IdP should do |
+|---|---|---|---|---|---|
+| Missing, malformed or wrong bearer token; empty token; SCIM store not configured or not open | `401` + `WWW-Authenticate: Bearer` | none | `scim.auth.denied` (`denied`) | `yuzu_scim_auth_failures_total` | Fix the token in the connector. Retrying with the same token will not help. |
+| Store fault while checking the bearer token | `503` | `2` | none | `yuzu_scim_guard_store_unavailable_total{guard="bearer"}` and `YuzuScimGuardStoreUnavailable`; `yuzu_scim_auth_failures_total` does not move | Retry. The token was not checked. |
+| Store fault in the User or Group lookup, or the duplicate check, of a `POST`, `PUT`, `PATCH` or `DELETE` | `503` | `2` | `failure` on the request's own action (`scim.user.provisioned`, `scim.user.updated`, `scim.user.deleted`, `scim.group.created`, `scim.group.updated`, `scim.group.deleted`), detail `store_unavailable: lookup (<site>)`; best effort | `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and `YuzuScimGuardStoreUnavailable` | Retry. Nothing was changed. |
+| Store fault in `GET /Users/{id}`, `GET /Groups/{id}` or a `userName eq` / `displayName eq` filter query | `503` | `2` | none | `yuzu_scim_guard_store_unavailable_total{guard="resource"}` and `YuzuScimGuardStoreUnavailable` | Retry. Nothing was changed. |
+| Store fault in the provenance or role guard of a deactivate, delete, reactivate, update or revive (#6836) | `503` | `2` | `failure` on the request's own action, detail `store_unavailable: provenance check`, `role check` or `revive role check` | `yuzu_scim_guard_store_unavailable_total{guard="provenance"\|"role"}` and `YuzuScimGuardStoreUnavailable` | Retry. A `PUT` or `PATCH` may already have applied its `active` change; the retry completes. A revive whose undo also fails is `500` (`scim.user.compensation_failed`): an operator checks the account. |
+| Group membership read fault | `503` ("membership unavailable") | `2` | `failure` on a Group `POST`, `PUT`, `PATCH` or `DELETE`; none on a `GET` | none | Retry. **`POST /Groups`:** the members are resolved before the group row is created, so on this `503` nothing is created, no rollback runs, and the retry creates the group normally (`201`, never a `409` against an empty group). The failure audit row `scim.group.created` has an empty target id and the detail `member resolution unavailable; no group was created`. A failure of the membership write after the group was created is a different case: the `500` `failed to persist group membership` leaves the empty group in place (limit 4 under "Known limits of the Group role recompute"). |
+| API-token revoke or durable session delete did not persist during a `PATCH`/`PUT` `active:false` or a `DELETE` of an active user (#4772) | `500` (`failed to revoke <API tokens \| sessions \| API tokens and sessions> for one or more linked identities`) | none | `scim.user.deactivated` or `scim.user.deleted`, `partial`, detail `api_tokens_db_error=true` and/or `sessions_db_error=true` | `YuzuSessionStoreDegraded` (`increase(yuzu_auth_session_store_degrade_total[10m]) > 0` held for 10 minutes, any `op`; it can miss a short outage) | Retry; the account stays active and the SCIM resource and links are untouched, but credentials that did revoke stay revoked. Configure the connector to retry a `500`. |
+| Same, on `POST /Users` with `active:false` (#4772) | `500` for a token step that did not persist, with audit `scim.user.provisioned` `partial`; when the principal set is only the local username, a session delete that did not persist is not a failure unless the account removal's own session wipe also fails (the backstop marker `session_leg_backstopped=true` is noted with `sessions_db_error=true`) (`500`, audit `failure`, `account deactivated; durable session wipe failed`) | none | as stated | as above | The account already exists and is mapped, so a retry meets `409`. Reconcile: `GET` the user, then `PATCH` `active:false`. |
+| The durable session wipe that runs before a reactivation did not persist (`PATCH`/`PUT` `active:true`, or a `POST` that revives a removed account) | `500` (`failed to reactivate the underlying account`; on a `POST` revive, `failed to revive the underlying account`) | none | `scim.user.reactivated` `failure` (`scim.user.provisioned` `failure` for the `POST` revive), no detail | none; `yuzu_auth_session_store_degrade_total{op}` moves when the cause is a store outage, and `YuzuSessionStoreDegraded` can fire | Retry. The account is still inactive and the SCIM mirror is unchanged. Configure the connector to retry a `500`. |
+| Resource does not exist | `404` | none | none | none | Treat as gone. |
+| Provenance or role refusal (account not created by SCIM, or role other than `user`) | `404` | none | `scim.user.provenance_denied` (`denied`) | `yuzu_scim_provenance_denied_total` | Stop. This is a refusal, not a fault. |
+| Duplicate `userName` or `displayName` | `409` (`scim_type=uniqueness`) | none | `denied` on the create or update action | none | Update the existing resource instead. On `POST /Groups` the members are resolved before the duplicate check, so while the store is faulting a duplicate whose members cannot be resolved answers `503` rather than `409`; the retry then meets the `409`. |
+| Unfiltered `GET /Users` and `GET /Groups` (`list()` / `count()` fail open, #2481). Not covered. | `200`: a store fault can read as an empty or short list, while a filtered list answers `503` | none | none | none | Do not treat an empty list as authoritative during an outage. |
+| `POST /Users` create reads other than the duplicate check, including the concurrent-create re-read (`get_by_username` after a failed create) and `find_by_external_id`. Not covered (#6837). | Whatever the unconverted path answered before: a fault there falls through to the later `500` | none | none (500) | none | A `5xx` is not promised to converge; retry once the store answers. |
+| Tombstone-role `500` in the revive pre-check; the `500` when a reactivation's own post-commit re-read fails. Not covered. | `500` | none | the site's own row, unchanged by this change | none | A `5xx` is not promised to converge. An operator checks the account. |
+| Post-mutation re-fetches that already answer `500`. Not covered. | `500` | none | none (500) | none | As above. |
+| Account already deactivated but the SCIM mirror still reads active (#5214). Not covered. | `404`, plus the ADR-2001 D1 escalation, on every retry | none | `scim.user.provenance_denied` and the escalation | `yuzu_scim_provenance_denied_total` | Operator action; see "What this does not cover" above. |
+
+Also not covered: Yuzu runs no reconciliation sweep (#6838), and a concurrent revive race
+(#6946).
+
+### During a database outage
+
+**What the IdP sees.** `503` with `Retry-After: 2` on the SCIM checks this change converts:
+the token check, the User and Group lookups, the duplicate checks and the `eq` filters (the reads
+listed under "Not covered" in the matrix still answer as before: the unfiltered lists `200`, the
+`POST /Users` create reads `500`). Nothing
+is refused and nothing is changed by the failed read, so there is nothing to re-provision. `429`
+was considered as the status for this condition and rejected: `503` is the correct "the server
+cannot serve this right now" status, while `429` means the client is sending too fast.
+
+**What to check.**
+
+1. `/readyz` on the server: it answers `503` with `pg_reachable` in `failed_stores` when Postgres is unreachable. A total outage may stop
+   the `/metrics` scrape too (a remote scrape resolves its token against Postgres), so
+   `YuzuScimGuardStoreUnavailable` and the Postgres alerts may be silent until recovery. The
+   honest backstops are `/readyz` and an operator-defined `up == 0` (scrape target down) alert.
+   **Pool saturation with Postgres still reachable keeps `/readyz` green:** its `pg_reachable` and
+   `pg_pool` rows go red on a connect failure, not on a saturated pool. For saturation read
+   `yuzu_pg_pool_in_use` against the pool size, `yuzu_pg_acquire_wait_seconds`, and the guard counter
+   below.
+2. `yuzu_scim_guard_store_unavailable_total` by `guard` (`bearer`, `resource`, `provenance`,
+   `role`) on a scrape that works, to see which check is failing.
+3. The server `ERROR` log: `ScimRoutes: bearer validation - SCIM token store unavailable`
+   (throttled to one line per minute; the counter stays exact), `ScimRoutes: user lookup (...)`
+   and `ScimRoutes: group lookup (...)` (each names the target id), and the provenance and
+   role lines listed above.
+4. Audit rows with `result=failure` and a detail beginning `store_unavailable:`. In a full
+   outage there are none (the audit store is the same database); see
+   [audit-log.md](audit-log.md) for the evidence limits.
+
+**What to do.** Restore PostgreSQL. The IdPs retry on their own schedule (configure each
+connector to retry `5xx`), and for the `503` cases the retries complete the work: nothing needs re-provisioning. Two
+exceptions: a `PUT` or `PATCH` whose `active` change had already committed before a later read
+faulted converges on the retry (the account state is already changed), and a Group create that
+failed AFTER the group row was created (the `500` `failed to persist group membership`) leaves
+an empty group that needs removing.
+Afterwards, look in the IdP's provisioning log for resources whose retries were exhausted and
+re-send them; Yuzu runs no reconciliation sweep (#6838).
+
+**Caveats.** An unfiltered `GET /Users` or `GET /Groups` still fails open: during a fault it
+can answer an empty or partial list with `200` (tracked as #2481), so do not treat an empty
+list as authoritative during an outage. A `POST /Groups` whose member resolution met the fault
+creates nothing and answers `503` (see the matrix row above); only the `500` `failed to persist
+group membership` leaves an empty group, which must be removed.
+
+### What the IdP vendors document
+
+How a given IdP reacts to a `503` is a separate question from what Yuzu sends. This subsection
+records only what the vendors' own documentation states, checked on 2026-11-03. **None of the
+pages cited below describes the vendor's behaviour when a SCIM server answers `503`**; the
+research did not exhaust each vendor's support knowledge base, and a connector-specific article
+could say more. Yuzu's guidance (configure the
+connector to retry `5xx`, and to honour `Retry-After` where it can) is Yuzu's recommendation. It
+is not a claim about how any vendor behaves.
+
+**Okta.** "Understanding SCIM" (<https://developer.okta.com/docs/concepts/scim/>, section
+"Handle SCIM server rate limiting (HTTP 429)", no last-updated date shown) documents HTTP `429`
+only: "When a SCIM server returns an HTTP 429 status code, Okta immediately pauses the
+provisioning task." The retry process "continues for a maximum of 10 attempts", "For each
+subsequent retry attempt, Okta doubles the previous wait time." and "If the 10th attempt also
+fails due to rate limiting, the task fails permanently and requires manual intervention." On
+`Retry-After`: "Okta's rate-limit handling only supports integer values (seconds) in the
+Retry-After header. Non-integer or null values aren't processed, causing the retry logic to use
+the default wait time." The default is stated as "Okta defaults to a five-minute wait". The page
+applies this to `429` responses only, and says nothing about `Retry-After` on a `503`. Handling
+of `401`, `404` and `503` (or any `5xx`) is not documented. The only credential wording found is
+on "Troubleshoot provisioning"
+(<https://help.okta.com/en-us/content/topics/provisioning/lcm/troubleshooting.htm>): "The
+credentials used to connect to the API were invalid; please check your configuration." That
+page does not name HTTP `401` or say whether Okta retries or pauses.
+
+**Microsoft Entra ID.** "Quarantine status in Microsoft Entra Application Provisioning"
+(<https://learn.microsoft.com/en-us/entra/identity/app-provisioning/application-provisioning-quarantine-status>)
+lists causes of quarantine. The only HTTP status it names is `404`: "**SCIM Compliance issue:** An HTTP/404 Not Found
+response was returned rather than the expected HTTP/200 OK response." It also lists "**Invalid
+credentials:** When attempting to authorize, access to the target application, we received a
+response from the target application that indicates the credentials provided are invalid." It
+also says "A job can go into quarantine regardless of failure counts for issues such as admin
+credentials or SCIM compliance." and "If most, or all, of the calls made against the target
+system consistently fail then the provisioning job is marked as in quarantine." Generic retry
+behaviour for a failed operation is stated on "Understand how Application Provisioning in Microsoft Entra ID"
+(<https://learn.microsoft.com/en-us/entra/identity/app-provisioning/how-provisioning-works>):
+"The errors are continually retried, gradually scaling back the frequency of retries." The
+6 hour, 12 hour and 24 hour cadence is on the quarantine page and describes the retry of
+escrowed failures, not a per-request cadence: the first retry is after 6 hours, the second 12
+hours and the third 24 hours after the first failure, then every 24 hours. That page also says
+"If the provisioning job stays in quarantine for more than four weeks, the provisioning job is
+disabled (stops running)." and adds "The logic documented here may be different for certain
+connectors". Neither page names HTTP `401`, `429` or `503`, and neither documents `Retry-After`
+on outbound SCIM calls.
+
+**OneLogin.** "Introduction to User Provisioning"
+(<https://onelogin.service-now.com/kb_view_customer.do?sysparm_article=KB0010298>, modified
+02/03/2026) describes a `Failed` status with a reason such as "Invalid authentication", "which
+often indicates that OneLogin's connection to the app's provisioning API needs to be refreshed
+or re-authenticated". "Step 4. Test Your SCIM"
+(<https://developers.onelogin.com/docs/scim/test-your-scim/>) says to "select failed to view a
+reason for the failure and to RETRY the provisioning task", which describes a manual retry by an
+administrator. In the OneLogin developer pages read, `404` is mentioned only for the initial connection
+check and for a deleted user, and behaviour on a `404` during provisioning is not documented
+there. In the pages read, OneLogin documents no handling of `401`, `429`, `503` or
+`Retry-After`, and no automatic retry or backoff.
+
+**What to do.** Treat the vendor's behaviour on a `503` from Yuzu as unknown until you have
+tested it. Before relying on a connector, simulate an outage against a non-production Yuzu server
+and a non-production IdP tenant (for example by stopping or blocking PostgreSQL there) and watch
+the connector's provisioning log: does it retry, how long does it wait, and does it pause or
+quarantine the job? Resume or re-sync after the test. The vendor pages may have changed since
+2026-11-03; the vendors' current documentation takes precedence over this summary.
 
 ## SCIM ↔ OIDC identity linkage (federated token revocation)
 
@@ -678,11 +1022,15 @@ assuming a wave of terminated users is trying to log back in.
 
 ### The ~60 second window
 
-A deprovision revokes tokens and sessions **immediately** at the store
-level, but an already-validated API/MCP token can keep passing validation
-for **up to ~60 seconds** afterward due to an in-memory cache — a
-concurrently in-flight request may briefly still see the old "valid"
-answer. Cookie sessions have no such cache and are revoked instantly. The
+A deprovision revokes tokens and sessions at the store level, but an
+already-validated API/MCP token can keep passing validation for **up to ~60
+seconds** afterward due to an in-memory cache — a concurrently in-flight
+request may briefly still see the old "valid" answer. Cookie sessions are
+durable rows with a short per-replica cache: other replicas see the revoke
+within about a second (up to 30 seconds during a PostgreSQL brownout), and
+only once the durable delete has persisted. If it does not persist, the
+deprovision call fails with `500` (see "Deprovisioning and termination").
+The
 honest guarantee is "revoked within about a minute of the deprovision
 reaching Yuzu," not instantaneous — plan any time-sensitive incident
 response (e.g. a hostile termination) with that window in mind, and
@@ -975,6 +1323,15 @@ with a **currently-active** account.
 - **Every request returns 401.** The bearer token is checked on every
   `/scim/v2/*` call including the discovery endpoints — there's no
   unauthenticated preview. Re-verify the token value configured in the IdP.
+  A `401` always means the token was checked and rejected (or missing), or that SCIM is not configured / its store is not open (a boot or config state, not an outage); it is never an outage.
+- **Every request returns 503 with `Retry-After: 2`.** Yuzu could not read the SCIM store, so it
+  could not check the token or look up the resource (#6835). Nothing was refused and nothing was
+  changed. Check `/readyz`, the `yuzu_pg_*` metrics and the server `ERROR` lines starting
+  `ScimRoutes: bearer validation` or `ScimRoutes: user lookup` / `group lookup`; the IdP should
+  retry. A `GET`, a list filter and the token check write no audit row; a mutating request's
+  row (`failure`, detail `store_unavailable: lookup (...)`) is best effort, and in a full
+  outage none can be written. See the
+  [failure-mode matrix](#scim-failure-mode-matrix).
 - **Provisioning fails with a 400 about `userName`.** Your IdP is almost
   certainly sending an email address as `userName` — Yuzu usernames must be
   a slug (letters, numbers, `.`, `_`, `-` only, no `@`). Remap `userName` to

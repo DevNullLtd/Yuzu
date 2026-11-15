@@ -11,6 +11,8 @@
 /// null-vs-value contract for the new fields, and the POST .../sync route matrix.
 
 #include "hardware_routes.hpp"
+#include "hardware_section_integrity.hpp"
+#include "offline_endpoint_types.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_forensics_tier_fixture.hpp"
@@ -20,10 +22,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <cstdio>
 #include <expected>
+#include <functional>
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -74,8 +78,11 @@ struct HwHarness {
     bool roster_ci_degraded = false;
     bool roster_tags_degraded = false;
     bool roster_degraded = false; // #5531: the durable roster read failed
+    bool roster_truncated = false; // #5712: the durable roster read was a typed partial
 
     HardwareCiDetail ci_detail; // configurable per test; default = degraded (the struct's own default)
+    std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call, in order
+    yuzu::MetricsRegistry metrics; // the integrity counter the fake ci_detail_fn below feeds
 
     int dex_calls = 0;
     std::vector<std::string> dex_calls_for; // agent_ids scored, in call order
@@ -112,6 +119,10 @@ struct HwHarness {
 
     // When non-empty, `audit_should_fail` fails ONLY this audit action (the row is still recorded).
     std::string audit_fail_only;
+
+    /// Runs inside every audit write with its result: the window in which production lets a grant
+    /// move between the route's first gate and its dispatch (#7110).
+    std::function<void(const std::string& result)> on_audit;
 
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
@@ -177,9 +188,19 @@ struct HwHarness {
             out.ci_degraded = roster_ci_degraded;
             out.tags_degraded = roster_tags_degraded;
             out.roster_degraded = roster_degraded;
+            out.roster_truncated = roster_truncated;
             return out;
         };
-        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string&) { return ci_detail; };
+        HardwareRoutes::CiDetailFn ci_fn = [this](const std::string& id, CiRead ci_read) {
+            ci_reads.push_back(ci_read);
+            HardwareCiDetail detail = ci_detail;
+            // Mirrors the hw_ci_detail_fn closure in server.cpp (the real one is pinned lexically
+            // by test_hw_ci_detail_wiring_lexical.cpp): count after the sections read, for
+            // WithSections only, and only for a READ list.
+            if (ci_read == CiRead::WithSections && detail.ci_sections && *detail.ci_sections)
+                record_section_integrity(**detail.ci_sections, id, &metrics);
+            return detail;
+        };
         HardwareRoutes::ScopedProbeFn probe = [this](const httplib::Request&, const std::string& type,
                                                      const std::string& op, const std::string&) {
             probes.push_back(type + ":" + op);
@@ -199,6 +220,8 @@ struct HwHarness {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             audit_details.push_back(detail);
+            if (on_audit)
+                on_audit(r);
             return !(audit_should_fail && (audit_fail_only.empty() || audit_fail_only == a));
         };
         HardwareRoutes::DexScoreFn dex_fn = [this](const std::string& id) {
@@ -896,6 +919,46 @@ TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatc
     REQUIRE(h.sync_dispatch_calls == 0);
 }
 
+TEST_CASE("route: POST .../sync — the device grant withdrawn inside the requested-row write "
+          "dispatches nothing; 403, failure row permission_revoked (#7110)",
+          "[hardware][route][rest][security][7110]") {
+    HwHarness h;
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.allow_scoped_perm = false; // withdrawn INSIDE the row write
+    };
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":"app_perf"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.sync_dispatch_calls == 0); // the system-reserved dispatch cannot see the operator's grant
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0] == "inventory.sync.request|requested");
+    CHECK(h.audits[1] == "inventory.sync.request|failure");
+    CHECK(h.audit_details[1] == "permission_revoked");
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed")); // control: the failure row persisted
+}
+
+// Kills: reverting the recheck's failure row to try_persist_audit. That row is the only evidence
+// the sync was NOT requested of the agent, so its loss must be on the answer.
+TEST_CASE("route: POST .../sync — a lost failure row after the recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[hardware][route][rest][security][7110]") {
+    HwHarness h;
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.allow_scoped_perm = false; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_should_fail = true; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":"app_perf"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.sync_dispatch_calls == 0);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[1] == "inventory.sync.request|failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
 // #4644: offset/limit/await_since are ONE base-10 integer or a 400. `await_since` is
 // the freshness bound a sync poll waits past: a malformed one used to read as "no bound" and
 // the poll could serve a STALE snapshot as fresh.
@@ -993,6 +1056,91 @@ TEST_CASE("route: list fragment — roster failure with a degraded audit store k
     REQUIRE(res->status == 200);
     REQUIRE(contains(res->body, "Hardware roster unavailable"));
     REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+// #5712. A truncated roster is SERVED with a notice, never refused (#5371). Kills: reusing the
+// roster-unavailable arm for a partial (no table); dropping the notice; a notice only on the full
+// page so the first htmx re-render loses it; no notice in the EMPTY-result state (a search that
+// finds nothing proves nothing on a partial roster); KPI tiles shown as exact; no audit marker.
+TEST_CASE("route: list fragment — a truncated roster is served with a lower-bound notice",
+          "[hardware][route][roster_truncated]") {
+    HwHarness h;
+    h.roster_truncated = true;
+    h.roster_rows = {make_row("agent-1", "PARTIAL-HOST", "windows", true)};
+
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    REQUIRE(contains(res->body, "<table"));            // served, not refused
+    REQUIRE(contains(res->body, "PARTIAL-HOST"));
+    REQUIRE(contains(res->body, "id=\"hw-roster-truncated\""));
+    REQUIRE(contains(res->body, "Partial list."));
+    REQUIRE(contains(res->body, "100,000"));           // the store's cap, worded
+    REQUIRE_FALSE(contains(res->body, "Hardware roster unavailable"));
+    // Every count tile is a floor, not the fleet: the marker sits in the SAME tile as each label
+    // (a marker applied to only some tiles would leave the others reading as exact).
+    REQUIRE(contains(res->body, "&ge;&nbsp;1</div><div class=\"l\">Total CIs"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;1</div><div class=\"l\">Online"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;0</div><div class=\"l\">Offline"));
+    REQUIRE(contains(res->body, "&ge;&nbsp;0</div><div class=\"l\">Stale"));
+    REQUIRE(contains(res->body, "cannot be paged past this limit"));
+    REQUIRE(h.audits.back() == "inventory.devices|success");
+    REQUIRE(contains(h.audit_details.back(), "roster_truncated=1"));
+
+    // The swap target keeps the notice on every re-render.
+    auto ro = h.sink.Get("/fragments/hardware/list?results_only=1");
+    REQUIRE(ro);
+    REQUIRE(contains(ro->body, "id=\"hw-roster-truncated\""));
+
+    // A search that finds nothing: the notice is there, and it says a miss proves nothing.
+    auto miss = h.sink.Get("/fragments/hardware/list?results_only=1&q=zzz-no-such-host");
+    REQUIRE(miss);
+    REQUIRE(contains(miss->body, "No devices match."));
+    REQUIRE(contains(miss->body, "id=\"hw-roster-truncated\""));
+    REQUIRE(contains(miss->body, "does not prove a device does not exist"));
+}
+
+// Kills: the notice or the audit marker appearing on a complete roster (a permanent false alarm).
+TEST_CASE("route: list fragment — a complete roster carries no partial notice, no floor marker",
+          "[hardware][route][roster_truncated]") {
+    HwHarness h;
+    h.roster_rows = {make_row("agent-1", "FULL-HOST", "windows", true)};
+    auto res = h.sink.Get("/fragments/hardware/list");
+    REQUIRE(res);
+    REQUIRE_FALSE(contains(res->body, "hw-roster-truncated"));
+    REQUIRE_FALSE(contains(res->body, "&ge;&nbsp;"));
+    REQUIRE_FALSE(contains(h.audit_details.back(), "roster_truncated"));
+}
+
+// Kills: the REST twin dropping the flag/cap, answering 503 for a partial, losing the audit marker,
+// and a complete roster reporting a partial.
+TEST_CASE("route: GET /api/v1/hardware — a truncated roster is 200 with roster_truncated and the cap",
+          "[hardware][route][rest][roster_truncated]") {
+    {
+        HwHarness h;
+        h.roster_truncated = true;
+        h.roster_rows = {make_row("agent-1", "PARTIAL-HOST", "windows", true)};
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK(body["data"]["roster_truncated"] == true);
+        CHECK(body["data"]["roster_cap"] == yuzu::server::kOfflineRosterRowCap);
+        CHECK(body["data"]["ci_degraded"] == false); // a partial is not a degraded read
+        CHECK(body["data"]["count"] == 1);
+        REQUIRE(h.audits.back() == "inventory.devices|success");
+        CHECK(contains(h.audit_details.back(), "roster_truncated=1"));
+    }
+    {
+        HwHarness h;
+        h.roster_rows = {make_row("agent-1", "FULL-HOST", "windows", true)};
+        auto res = h.sink.Get("/api/v1/hardware");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        CHECK(body["data"]["roster_truncated"] == false);
+        CHECK_FALSE(contains(h.audit_details.back(), "roster_truncated"));
+    }
 }
 
 // Kills: dropping the roster_degraded guard in the REST list (200 with an empty data page).
@@ -1327,7 +1475,7 @@ TEST_CASE("result poll: the catalogue lookup is case-insensitive and the Forensi
     const CommandCapabilityRegistry registry{YUZU_ALL_CAPABILITY_FRAGMENTS};
     // The derivation is "everything before the last dash of <plugin>-<hex>". It is only sound
     // while no plugin name carries a dash; this is the check that keeps that true.
-    for (const char* p : {"browser_inventory", "tar", "hardware", "app_usage"})
+    for (const char* p : {"browser_inventory", "echo", "hardware", "app_usage"})
         CHECK(registry.knows_plugin(p));
     CHECK_FALSE(registry.knows_plugin("no_such_plugin"));
     CHECK_FALSE(registry.knows_plugin(""));
@@ -1350,8 +1498,8 @@ TEST_CASE("result poll: the plugin comes from the command id; a mismatching capt
     // A real catalogue plugin with a matching caption passes the validation (no reply yet: pending).
     CHECK(status(poll_url("agent-1", "hardware-abc123", "hardware")) == 200);
     // The caption names a different plugin than the command id carries.
-    CHECK(status(poll_url("agent-1", "hardware-abc123", "tar")) == 400);
-    CHECK(status(poll_url("agent-1", "tar-abc123", "hardware")) == 400);
+    CHECK(status(poll_url("agent-1", "hardware-abc123", "echo")) == 400);
+    CHECK(status(poll_url("agent-1", "echo-abc123", "hardware")) == 400);
     // A prefix that is not a catalogue plugin, even with a matching caption.
     CHECK(status(poll_url("agent-1", "no_such_plugin-abc123", "no_such_plugin")) == 400);
     // No dash, an empty prefix, or an extra dash (the prefix would then not be a plugin).
@@ -1770,6 +1918,170 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — identity_degraded with a readabl
         REQUIRE_FALSE(h.audits.empty());
         REQUIRE(h.audits.back() == "inventory.device.ci|success");
     }
+}
+
+// ───────────────────────── GET /api/v1/hardware/{id} — the v2 sections (H.7) ─────────────
+
+namespace {
+HardwareCiDetail v2_record_detail() {
+    HardwareCiDetail d;
+    d.identity = make_row("agent-x", "HOST-X", "linux", true);
+    DeviceCiRecord rec;
+    rec.blob_version = 2;
+    rec.chassis_serial = "CHS1";
+    rec.chassis_source = "smbios";
+    rec.machine_id_hash = "abcdef01";
+    d.ci = std::optional<DeviceCiRecord>(rec);
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "constrained";
+    cpu.reason = "agent:partial";
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    DeviceCiSection chassis;
+    chassis.kind = "chassis";
+    chassis.level = "ok";
+    d.ci_sections = std::vector<DeviceCiSection>{chassis, cpu};
+    d.software = std::vector<SoftwareEntry>{};
+    d.tags = std::vector<DeviceTag>{};
+    return d;
+}
+} // namespace
+
+TEST_CASE("route: GET /api/v1/hardware/{id} — serves the v2 scalars and sections and audits a success",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    const auto& data = body["data"];
+    CHECK(data["sections_state"] == "found");
+    CHECK(data["ci"]["chassis_serial"] == "CHS1");
+    CHECK(data["ci"]["machine_id_hash"] == "abcdef01");
+    CHECK(data["ci"]["board_serial"].is_null());
+    REQUIRE(data["ci"]["sections"].size() == 2);
+    CHECK(data["ci"]["sections"][0]["kind"] == "chassis");
+    CHECK(data["ci"]["sections"][0]["source"] == "smbios");
+    CHECK(data["ci"]["sections"][1]["kind"] == "cpu");
+    CHECK(data["ci"]["sections"][1]["complete"] == false); // constrained = incomplete
+    CHECK(data["ci"]["sections"][1]["rows"][0]["model"] == "Xeon");
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|success");
+}
+
+// Kills: flattening a failed sections read to an empty list (a 200 that reads "reports none").
+TEST_CASE("route: GET /api/v1/hardware/{id} — a failed sections read is 503 with a retry hint and never "
+          "an empty 200",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    h.ci_detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["retry_after_ms"].get<int>() == 5000);
+    CHECK(body["error"]["message"].get<std::string>() == "hardware sections unavailable");
+    CHECK_FALSE(body.contains("data")); // nothing of the record leaks beside the 503
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|failure");
+    CHECK(contains(h.audit_details.back(), "state=sections unreadable"));
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed")); // control: the failure row persisted
+}
+
+// The new 503 composes with, and does not replace, the per-part degrade the schema documents: a
+// degraded ci (sections never read) and a v1 record (none stored) both stay a 200.
+TEST_CASE("route: GET /api/v1/hardware/{id} — a degraded ci or a v1 record with no sections stays a 200",
+          "[hardware][route][rest][sections]") {
+    {
+        HwHarness h;
+        h.ci_detail = v2_record_detail();
+        h.ci_detail.ci = std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+            std::unexpected(CiReadError::kDegraded));
+        h.ci_detail.ci_sections = std::vector<DeviceCiSection>{};
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["ci_state"] == "degraded");
+        CHECK(body["data"]["sections_state"] == "degraded");
+    }
+    {
+        HwHarness h;
+        h.ci_detail = v2_record_detail();
+        h.ci_detail.ci_sections = std::vector<DeviceCiSection>{};
+        auto res = h.sink.Get("/api/v1/hardware/agent-x");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["data"]["sections_state"] == "absent");
+        REQUIRE(body["data"]["ci"]["sections"].is_array());
+        CHECK(body["data"]["ci"]["sections"].empty());
+    }
+}
+
+// The existence-oracle closure is unchanged: an out-of-scope id never reaches the sections arm.
+TEST_CASE("route: GET /api/v1/hardware/{id} — scope 404 precedes the sections 503",
+          "[hardware][route][rest][sections][security]") {
+    HwHarness h;
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    h.ci_detail = v2_record_detail();
+    h.ci_detail.ci_sections = std::unexpected(CiReadError::kDegraded);
+    auto res = h.sink.Get("/api/v1/hardware/agent-out");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.audits.empty());
+}
+
+// Only the REST record route asks for the sections: the dashboard fragment, its sync-now poll and
+// the actions lens never render them and must not pay for the extra read. A counting fake records
+// the `CiRead` argument of every call. Kills: passing WithSections from a dashboard call site, or
+// RecordOnly from the REST route.
+TEST_CASE("route: only the REST record asks for sections - the dashboard and actions lens do not",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    h.actions_plugins = {{.name = "firewall", .version = "1", .actions = {"rules"}}};
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview"));
+    REQUIRE(h.ci_reads.size() == 1);
+    CHECK(h.ci_reads.back() == CiRead::RecordOnly);
+
+    // the 1-2 s sync-now poll is the same fragment route
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview&lens_only=1&await_since=1000"));
+    REQUIRE(h.ci_reads.size() == 2);
+    CHECK(h.ci_reads.back() == CiRead::RecordOnly);
+
+    auto actions = h.sink.Get("/fragments/hardware/ci/actions?id=agent-x");
+    REQUIRE(actions);
+    REQUIRE(h.ci_reads.size() == 3);
+    CHECK(h.ci_reads.back() == CiRead::RecordOnly);
+
+    auto rest = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(rest);
+    REQUIRE(h.ci_reads.size() == 4);
+    CHECK(h.ci_reads.back() == CiRead::WithSections);
+}
+
+// Section rows are agent-supplied bytes. A byte that is not valid UTF-8 must not throw out of the
+// serialiser after the access audit row persisted: the body is served with the byte replaced.
+// Kills: dump() without the replace error handler.
+TEST_CASE("route: GET /api/v1/hardware/{id} - an invalid UTF-8 byte in a section row is replaced and still served",
+          "[hardware][route][rest][sections]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    (**h.ci_detail.ci_sections)[1].rows[0][1] = std::string("Xe\xffon");
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["data"]["ci"]["sections"][1]["rows"][0]["model"].get<std::string>().starts_with("Xe"));
+    REQUIRE_FALSE(h.audits.empty());
+    CHECK(h.audits.back() == "inventory.device.ci|success");
 }
 
 // ───────────────────────── Containment UI hidden (kContainmentUi == false) ───────────
@@ -2299,4 +2611,71 @@ TEST_CASE("software lens header: count and last synced, never-synced told apart 
                    "last synced time unavailable"));
     // Click-to-load hosts ride the same lens and nothing is fetched on render.
     CHECK(contains(synced, "hx-trigger=\"click\""));
+}
+
+// #7159: only the sections-reading record route moves the integrity counter. The dashboard
+// fragment, the sync-now poll and the actions lens ask for the record only, so they never reach the
+// count even for a record whose sections are faulted. What this proves: the routes pass the right
+// `CiRead` (WithSections only for the REST record, RecordOnly for the three dashboard surfaces).
+// It does NOT prove the real closure counts only on WithSections - the fake ci_detail_fn below
+// mirrors that rule; the real one is pinned lexically (test_hw_ci_detail_wiring_lexical.cpp).
+// Kills: a dashboard route asking for CiRead::WithSections, or the REST record asking for
+// RecordOnly.
+TEST_CASE(
+    "route: only the REST record moves the section integrity counter; the dashboard never does",
+    "[hardware][route][rest][sections][metrics]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    // A cpu section stored with 2 rows but served with 1: the row-count rule faults it.
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.row_count = 2;
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    h.ci_detail.ci_sections = std::vector<DeviceCiSection>{cpu};
+    h.actions_plugins = {{.name = "firewall", .version = "1", .actions = {"rules"}}};
+    const auto count = [&] {
+        return h.metrics
+            .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
+            .value();
+    };
+
+    REQUIRE(h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview"));
+    REQUIRE(
+        h.sink.Get("/fragments/hardware/ci?id=agent-x&lens=overview&lens_only=1&await_since=1000"));
+    REQUIRE(h.sink.Get("/fragments/hardware/ci/actions?id=agent-x"));
+    CHECK(count() == 0.0);
+
+    auto rest = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(rest);
+    REQUIRE(rest->status == 200);
+    CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["reason"] ==
+          std::string(section_fault_token(SectionFault::RowCount)));
+    // The one row that remains is withheld from the body (#7165).
+    CHECK(nlohmann::json::parse(rest->body)["data"]["ci"]["sections"][0]["rows"].empty());
+    CHECK(count() == 1.0);
+}
+
+// Kills: a route that reaches its ci_detail_fn before the scope check: the fake records every
+// call, so a fetch for an out-of-scope id shows in `ci_reads` (and would move a fleet-wide
+// counter).
+TEST_CASE(
+    "route: an out-of-scope REST read neither fetches the record nor moves the integrity counter",
+    "[hardware][route][rest][sections][metrics][security]") {
+    HwHarness h;
+    h.ci_detail = v2_record_detail();
+    DeviceCiSection cpu;
+    cpu.kind = "cpu";
+    cpu.level = "ok";
+    cpu.row_count = 2;
+    cpu.rows = {{"0", "Xeon", "8", "16", "2400", "CPU0", ""}};
+    h.ci_detail.ci_sections = std::vector<DeviceCiSection>{cpu};
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/api/v1/hardware/agent-x");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.ci_reads.empty());
+    CHECK(h.metrics
+              .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
+              .value() == 0.0);
 }

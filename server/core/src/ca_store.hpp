@@ -154,6 +154,14 @@ struct IssuedCertRecord {
     std::string issuer_key_id;
 };
 
+/// The three columns a freshness reading needs from the latest CRL row. Deliberately has no DER:
+/// the `/metrics` scrape reads this on every request, and a CRL can be megabytes.
+struct CrlFreshness {
+    int64_t version{0};
+    int64_t next_update{0};
+    int64_t published_at{0};
+};
+
 struct CrlVersionRecord {
     int64_t version{0};
     std::vector<uint8_t> der;
@@ -532,6 +540,12 @@ public:
     /// wrong CRL) — verified against every call site before choosing to keep this a plain
     /// `std::optional` rather than `std::expected` (ADR-0053).
     [[nodiscard]] std::optional<CrlVersionRecord> latest_crl();
+
+    /// The latest CRL's version, `nextUpdate` and publish time without its DER (#6527), for the
+    /// scrape-time freshness gauges. Unlike `latest_crl()` this tells "nothing published yet"
+    /// (`nullopt` inside the expected) from "the read failed" (`unexpected`), because the caller
+    /// must keep the last good reading on a failure and publish nothing when none exists.
+    [[nodiscard]] std::expected<std::optional<CrlFreshness>, std::string> latest_crl_freshness();
 
     /// What a `CrlBuilder` returns: the signed DER plus the validity window it signed.
     struct BuiltCrl {

@@ -3000,7 +3000,8 @@ Each rung is an independently-governed PR on `dev`, run through the full
      current-gauge vs cumulative-counter split per §7.7b split.
      **Landed (F7, #2298),** together with R2's terminal-state code and the
      `yuzu.guardian_backend` heartbeat tag (#2240 item 1 - the server-side flap/dark-
-     device detector, #2240 item 2, remains open).
+     device detector, #2240 item 2, remains open); the server-side reader of the tag (the fleet gauge
+     and the per-device field) has since landed under #2240.
    - **10.** Parity + durability + integration matrix. Semantic ports land **before**
      7.7b where possible; live/equivalence after. Carries the **intentional-delta
      registry** (R2 consequence 2, **shipped ahead of schedule, F12/#3386:

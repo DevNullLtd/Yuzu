@@ -19,7 +19,7 @@
 /// server's own schedule/reconcile loops (or, for `__sync__.now`, behind a
 /// route that gates the operator itself and then dispatches as the system):
 ///
-///   - `tar.fleet_snapshot` (`server.cpp:2427`) — the periodic fleet-wide
+///   - `echo.fleet_snapshot` (`server.cpp:2427`) — the periodic fleet-wide
 ///     snapshot pull. Read-only: it asks agents to report, it does not
 ///     change agent state.
 ///   - `__guard__.push_rules` (`server.cpp:2907`, `:14195`) — the Guardian
@@ -41,7 +41,7 @@ namespace detail {
 
 inline constexpr std::array<CommandCapability, 4> kCoreDispatchCapabilities{{
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "fleet_snapshot",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -77,7 +77,7 @@ inline constexpr std::array<CommandCapability, 4> kCoreDispatchCapabilities{{
         // Operator-REQUESTED but system-DISPATCHED (POST /api/v1/hardware/{id}/sync
         // RBAC-gates the operator, then dispatches as the system caller): asks the
         // agent to run its daily-sync source(s) now and report — the same thing it
-        // does unprompted every 24h. Read-only like tar.fleet_snapshot: nothing on
+        // does unprompted every 24h. Read-only like echo.fleet_snapshot: nothing on
         // the endpoint changes. The securable/operation here never admit anyone
         // (system_reserved); they name the data the report lands under.
         .plugin = "__sync__",

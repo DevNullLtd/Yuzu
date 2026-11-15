@@ -32,6 +32,12 @@ using pg::PgResult;
 namespace {
 
 constexpr const char* kStoreName = "session_store"; // schema = snake_case(SessionStore)
+// The ONE statement of the stored-principal invariant (#2343): a human session (any source
+// except engine_token) or an engine session (engine_token). The v2 migration interpolates it
+// into both the DELETE (negated) and the CHECK, so the two cannot drift apart.
+constexpr const char* kPrincipalPairingOk =
+    "((principal_kind = 'human' AND auth_source <> 'engine_token')"
+    " OR (principal_kind = 'engine' AND auth_source = 'engine_token'))";
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 
@@ -156,6 +162,59 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX sessions_username_idx ON sessions (username);"
          "CREATE INDEX sessions_expires_idx ON sessions (expires_at_ms);"
          "CREATE TABLE session_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"},
+        // v2 (#2343): the stored principal class is exactly one of two pairings: a human
+        // session (any source but engine_token) or an engine session (engine_token). Token
+        // sessions (api/mcp/engine tokens) are never persisted, and every persist_new_session
+        // caller hard-codes a local, oidc or saml auth_source with the default 'human' kind,
+        // so no binary writes a row this constraint rejects; only a hand-edited row can. Such
+        // a row is untrusted by definition and a session is ephemeral, so the DELETE costs
+        // that principal one sign-in; the count is raised as a server-log WARNING (a forced
+        // sign-out leaves a trace). Without the constraint, code that reads the stored kind
+        // alone and code that reads Session::is_engine() could classify one session
+        // differently.
+        // Shape: ONE migration (the runner commits each migration as one transaction),
+        // DELETE first so a retry clears any row an older binary wrote between attempts
+        // before the ALTER validates (same shape as AuditStore v2). The DROP ... IF EXISTS
+        // makes the ADD idempotent against a constraint of the same name applied by hand
+        // (otherwise 42710 would refuse boot on every restart). The LOCK TABLE comes first so
+        // the migration holds the strongest lock before it deletes anything: without it the
+        // DELETE (row locks) followed by the ALTER (lock upgrade) deadlocks with a live
+        // session writer waiting on a row the DELETE removed (reproduced on postgres:18), and
+        // a row committed between the DELETE and the ALTER would fail the ADD's validation
+        // and refuse boot. The lock wait is capped at 3 s by this migration's own SET LOCAL
+        // lock_timeout (the CaStore v4 precedent), whatever the pool or a DSN `options`
+        // setting says: while the request queues behind a long transaction (pg_dump), every
+        // new sessions query on a running peer queues behind it, so a short cap keeps that
+        // stall short, and the whole migration rolls back and retries on the next boot.
+        // The write_generation bump runs only when rows were deleted, inside the DO block's
+        // IF, so a clean upgrade does not make every replica drop its validate cache for
+        // nothing. Its position is safe because the ACCESS EXCLUSIVE lock is already held: a
+        // session writer takes sessions locks before it bumps session_meta (see
+        // session_store_sql_helpers.hpp "take it LAST"), so none can be holding the
+        // session_meta row while this waits on sessions. A peer replica's validate cache then
+        // drops the deleted rows on its next generation poll instead of serving them until
+        // some unrelated login bumps it. v2 has not shipped, so it is edited in place.
+        {2, std::string("SET LOCAL lock_timeout = '3s';"
+                        "LOCK TABLE sessions IN ACCESS EXCLUSIVE MODE;"
+                        "DO $$ DECLARE n bigint; BEGIN"
+                        " DELETE FROM sessions WHERE NOT ") +
+                kPrincipalPairingOk +
+                std::string(";"
+                            " GET DIAGNOSTICS n = ROW_COUNT;"
+                            " IF n > 0 THEN"
+                            " RAISE WARNING 'session_store v2 (#2343): deleted % inconsistent"
+                            " session row(s); each affected principal must sign in again', n;"
+                            " INSERT INTO session_store.session_meta (key, value)"
+                            " VALUES ('write_generation', '1')"
+                            " ON CONFLICT (key) DO UPDATE SET value ="
+                            " (session_store.session_meta.value::bigint + 1)::text;"
+                            " END IF;"
+                            " END $$;"
+                            "ALTER TABLE sessions DROP CONSTRAINT IF EXISTS"
+                            " sessions_principal_kind_consistent;"
+                            "ALTER TABLE sessions ADD CONSTRAINT"
+                            " sessions_principal_kind_consistent CHECK (") +
+                kPrincipalPairingOk + std::string(");")},
     };
     return kMigrations;
 }

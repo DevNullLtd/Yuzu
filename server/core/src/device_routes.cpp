@@ -78,7 +78,7 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
         return LiveKind{"network_diag", "connections", "Active connections",
                         "device.live.connections"};
     if (kind == "capture_sources")
-        return LiveKind{"tar", "status", "Capture sources", "device.live.capture_sources"};
+        return LiveKind{"echo", "status", "Capture sources", "device.live.capture_sources"};
     if (kind == "disk")
         return LiveKind{"disk_space", "free", "Disk space", "device.live.disk"};
 
@@ -385,11 +385,11 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         return body;
     }
 
-    if (kind == "capture_sources") { // tar status: config|<src>_enabled|v, config|<src>_live_rows|N
+    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_rows|N
         // Display order + presentation metadata. The server does NOT link the agent's
-        // tar_schema_registry, so source name/$-table/category are held here; we only
+        // echo_schema_registry, so source name/$-table/category are held here; we only
         // render a row for a source the agent actually reported (its `<src>_enabled` key
-        // is present in tar/status), so an older agent without arp/dns shows no phantom
+        // is present in echo/status), so an older agent without arp/dns shows no phantom
         // rows. Hand-maintained — the os-capability-matrix "will drift; durable fix =
         // generate from machine-readable metadata" situation, tracked as a follow-up.
         struct Meta { const char* name; const char* dollar; const char* category; };
@@ -417,8 +417,10 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             s.dollar = m.dollar;
             s.category = m.category;
             s.enabled = (en->second == "true");
-            if (auto it = cfg.find(std::string(m.name) + "_live_rows"); it != cfg.end()) {
-                try { s.live_rows = std::stoll(it->second); } catch (...) {}
+            // Row count: `<src>_rows` is the hourly count.
+            auto rows_it = cfg.find(std::string(m.name) + "_rows");
+            if (rows_it != cfg.end()) {
+                try { s.live_rows = std::stoll(rows_it->second); } catch (...) {}
             }
             if (s.enabled) ++on;
             rows.push_back(std::move(s));
@@ -506,6 +508,10 @@ nlohmann::json device_agent_row_json(const DeviceListRow& row) {
         {"os", row.os},
         {"arch", row.arch},
         {"agent_version", row.agent_version},
+        // #2240: the key is ALWAYS present. JSON null = not reported (never "legacy"); the
+        // value, when present, is already one of the server's closed token strings.
+        {"guardian_backend", row.guardian_backend ? nlohmann::json(*row.guardian_backend)
+                                                  : nlohmann::json(nullptr)},
     };
 }
 
@@ -599,7 +605,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
     // Exact /api/agents parity: the gate admits Infrastructure:Read operators and
     // the caller's OWN confinement filter (visible_set_fn_, applied via
-    // authz::in_scope over api_->list_devices()'s unscoped rows — ADR-0031 WS-A4
+    // authz::in_scope over api_->list_devices_basic()'s unscoped rows, ADR-0031 WS-A4
     // wave 2) admits only the caller's visible devices, so an operator never
     // enumerates devices outside their scope. --
     sink.Get("/fragments/devices/list", [this, to_device_row](const httplib::Request& req,
@@ -607,7 +613,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         // Fleet-wide identity/inventory disclosure (SEC-2/SEC-3 confinement-gap
-        // class, found during a docs sweep): api_->list_devices() below is
+        // class, found during a docs sweep): api_->list_devices_basic() below is
         // fleet-wide/UNSCOPED (see device_api.hpp's own banner) and does not by
         // itself confine a service-scoped API token whose principal resolves to
         // an unscoped grant — the full device roster (hostname, agent_id, OS,
@@ -639,7 +645,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 : std::nullopt;
         std::vector<DeviceRow> all;
         if (api_) {
-            for (const auto& r : api_->list_devices()) {
+            // The basic list: this fragment never renders the per-device backend, so it must
+            // not pay the health-store read for it (and cannot carry it by construction).
+            for (const auto& r : api_->list_devices_basic()) {
                 if (!authz::in_scope(scope, r.agent_id)) continue;
                 all.push_back(to_device_row(r));
             }
@@ -968,8 +976,8 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         };
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
-                // 300, matching the sibling site in tar_tree_routes.cpp. Both
-                // render the SAME `tar status` reply, and the storage-offline
+                // 300, matching the sibling site in echo_tree_routes.cpp. Both
+                // render the SAME `echo status` reply, and the storage-offline
                 // line is 231 chars (287 when the read path is gone too), so a
                 // 200-byte cap truncated it mid-sentence and dropped "Restart
                 // the agent to recover." -- the operator got the problem

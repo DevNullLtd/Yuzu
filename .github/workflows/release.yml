@@ -30,7 +30,7 @@ env:
   # pre-provisioned meson, pinned by deploy/windows/toolchain-contract.json.
   # vcpkg baseline is tracked by the scheduled
   # .github/workflows/vcpkg-baseline-update.yml workflow.
-  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
   # ccache sizing — mirror ci.yml. Without this the self-hosted build-linux
   # leg inherits the host default (5 GiB on Big Tam), far too small for ~700
@@ -98,9 +98,12 @@ jobs:
             echo "::error::release.yml must run from a release tag, not ${GITHUB_REF_TYPE:-<unset>} '${tag}' (dispatch with --ref vX.Y.Z). Refusing (#5282)."
             exit 1
           fi
-          re='^v[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)[0-9]+)?$'
+          # 1-4 digits per field: scripts/build-agent-bundle.sh (the post-release
+          # agent-bundle job) refuses wider fields, so a tag it would reject must
+          # not be allowed to publish a release first (#7529).
+          re='^v[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(-(alpha|beta|rc)[0-9]{1,4})?$'
           if [[ ! "$tag" =~ $re ]]; then
-            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N). Refusing (#5282)."
+            echo "::error::'$tag' is not a release tag (vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N, 1-4 digits per number). Refusing (#5282)."
             exit 1
           fi
           out="$(mktemp)"; err="$(mktemp)"; rc=0
@@ -731,11 +734,13 @@ jobs:
         shell: pwsh
         run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
-      # ccache (~\AppData\Local\ccache) and vcpkg_installed/ both
-      # persist on the self-hosted Windows runner between jobs. The
-      # original cache/restore@v5 calls were already restore-only —
-      # local persistence delivers the same restore semantics without
-      # any GHA round-trip. Issue #569.
+      # ccache (~\AppData\Local\ccache) persists on the self-hosted
+      # Windows runner between jobs (the original cache/restore@v5 calls
+      # were already restore-only — local persistence delivers the same
+      # restore semantics without any GHA round-trip, issue #569).
+      # vcpkg_installed/ does NOT persist for this job: the default
+      # clean: true checkout runs git clean -ffdx, so every release run
+      # installs its own agent-only tree.
       - name: Reset ccache stats
         run: ccache -z
 
@@ -761,10 +766,18 @@ jobs:
 
       - name: Install vcpkg packages
         run: |
+          # Agent-only vcpkg profile (ADR-0035 step 3): no `server` feature
+          # (libpq, xmlsec, drogon) and no `tests` (-Dbuild_tests=false).
           & "${{ github.workspace }}/vcpkg/vcpkg.exe" install `
             --triplet x64-windows `
-            --x-manifest-root="${{ github.workspace }}"
+            --x-manifest-root="${{ github.workspace }}" `
+            --x-no-default-features
 
+      # Agent only (ADR-0035): the server is supported on Linux only, so the
+      # Windows release builds and ships the agent and its plugins, never
+      # yuzu-server.exe. -Dserver=disabled is explicit here (this job starts
+      # from a clean checkout, so no stored option can reach an older
+      # branch). Pinned by tests/test_release_agent_only.py.
       - name: Configure (Meson release)
         env:
           CC: ccache cl
@@ -774,7 +787,8 @@ jobs:
             --buildtype=release `
             -Dcpp_std=vc++latest `
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/x64-windows `
-            -Dbuild_tests=false
+            -Dbuild_tests=false `
+            -Dserver=disabled
 
       - name: Build
         run: meson compile -C build-windows -j $env:YUZU_BUILD_JOBS
@@ -785,7 +799,6 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          & ./build-windows/server/core/yuzu-server.exe --help
           & ./build-windows/agents/core/yuzu-agent.exe --help
         continue-on-error: true
 
@@ -814,7 +827,6 @@ jobs:
 
           # Collect all EXE and DLL files to sign
           $filesToSign = @()
-          $filesToSign += Get-ChildItem build-windows -Filter "yuzu-server.exe" -Recurse
           $filesToSign += Get-ChildItem build-windows -Filter "yuzu-agent.exe" -Recurse
           $filesToSign += Get-ChildItem build-windows -Filter "yuzu_agent_core.dll" -Recurse
           $filesToSign += Get-ChildItem build-windows/agents/plugins -Filter "*.dll" -Recurse
@@ -846,12 +858,10 @@ jobs:
         shell: pwsh
         run: |
           $version = "$env:GITHUB_REF_NAME".TrimStart("v").Replace("-", "_")
-          $staging = "yuzu-${version}-windows-x64"
+          $staging = "yuzu-agent-${version}-windows-x64"
           New-Item -ItemType Directory -Force -Path "${staging}/bin", "${staging}/plugins"
 
-          # Binaries (InstructionDefinitions are embedded into yuzu-server.exe
-          # at build time — no content/ directory shipped).
-          Copy-Item "build-windows/server/core/yuzu-server.exe" "${staging}/bin/"
+          # Agent only (ADR-0035): no yuzu-server.exe.
           Copy-Item "build-windows/agents/core/yuzu-agent.exe" "${staging}/bin/"
 
           # Agent core DLL
@@ -860,13 +870,61 @@ jobs:
           # Plugin DLLs
           Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
-          # Runtime DLLs from vcpkg that plugins/binaries need
+          # Runtime DLLs from vcpkg that plugins/binaries need. This copies
+          # every DLL vcpkg installed; since ADR-0035 step 3 the install above
+          # is agent-only, so the server-only DLLs (libpq and its libecpg/
+          # libpgtypes siblings, drogon, trantor, jsoncpp, xmlsec) are not
+          # installed; the verify step below refuses the archive if one is.
           $vcpkgBin = "${{ github.workspace }}/vcpkg_installed/x64-windows/bin"
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
           }
 
-          Compress-Archive -Path "${staging}" -DestinationPath "yuzu-windows-x64.zip"
+          Compress-Archive -Path "${staging}" -DestinationPath "yuzu-agent-windows-x64.zip"
+
+      # Unlike "Test (smoke)" above, this one gates, before the installers
+      # are built and signed and before anything is attested or uploaded
+      # (the binaries were Authenticode-signed above). It checks the archive
+      # holds yuzu-agent.exe and no yuzu-server.exe, holds every plugin DLL
+      # the build produced, and that yuzu-agent.exe --help runs from the
+      # extracted archive with PATH cut down to the Windows directories. That
+      # catches a DLL that yuzu-agent.exe or yuzu_agent_core.dll imports at
+      # load time and the archive lacks. It does NOT cover DLLs only a plugin
+      # imports (--help loads no plugin), or the MSVC runtime, which resolves
+      # from System32 here because the runner has the VC++ runtime installed
+      # (the archive does not ship it). The agent is killed if it has not
+      # exited within 60 s. Pinned by tests/test_release_agent_only.py.
+      - name: Verify the agent runs from the packaged archive
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "yuzu-agent-archive-check"
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+          Expand-Archive -Path "yuzu-agent-windows-x64.zip" -DestinationPath $out
+          $top = Get-ChildItem -Path $out -Directory | Select-Object -First 1
+          $bin = Join-Path $top.FullName "bin"
+          $agent = Join-Path $bin "yuzu-agent.exe"
+          if (-not (Test-Path $agent)) { Write-Error "yuzu-agent.exe missing from the archive"; exit 1 }
+          if (Test-Path (Join-Path $bin "yuzu-server.exe")) { Write-Error "yuzu-server.exe found in the agent archive"; exit 1 }
+          # ADR-0035 step 3: the install is agent-only, so a server-only DLL in the archive means the
+          # vcpkg profile regressed. The patterns cover the nine DLLs that a full x64-windows vcpkg
+          # tree has and an agent-only one lacks (measured on a real tree): drogon, jsoncpp,
+          # libecpg, libecpg_compat, libpgtypes, libpq, libxmlsec1, libxmlsec1-openssl, trantor.
+          # UNVERIFIED on a release: this check ran in the ADR-0035 step-3 Windows rehearsal (not a
+          # release) and has not yet run on a real release tag; until then it is lexically pinned and
+          # rehearsed, not operationally proven.
+          $serverDlls = @(Get-ChildItem -Path $top.FullName -Recurse -File -Include "libpq*.dll", "libecpg*.dll", "libpgtypes*.dll", "drogon*.dll", "trantor*.dll", "jsoncpp*.dll", "*xmlsec*.dll" | ForEach-Object { $_.Name })
+          if ($serverDlls.Count -gt 0) { Write-Error "server-only DLLs in the agent archive: $($serverDlls -join ', ')"; exit 1 }
+          $built = @(Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse).Count
+          $packed = @(Get-ChildItem -Path (Join-Path $top.FullName "plugins") -Filter "*.dll").Count
+          if ($built -lt 1 -or $packed -ne $built) { Write-Error "plugin DLLs: built $built, in the archive $packed"; exit 1 }
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $p = Start-Process -FilePath $agent -ArgumentList "--help" -NoNewWindow -PassThru `
+                 -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "yuzu-agent-help.txt")
+          $null = $p.Handle  # keeps the exit code readable after the process ends
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error "yuzu-agent.exe --help did not exit within 60 s"; exit 1 }
+          if ($p.ExitCode -ne 0) { Write-Error "yuzu-agent.exe --help exited $($p.ExitCode) from the packaged archive"; exit 1 }
+          Write-Host "yuzu-agent.exe --help ran from the packaged archive ($packed plugin DLLs)"
 
       - name: Build Windows installers (InnoSetup)
         shell: pwsh
@@ -915,18 +973,7 @@ jobs:
           $agentInstaller = "deploy\packaging\windows\output\YuzuAgentSetup-${version}.exe"
           Copy-Item $agentInstaller "YuzuAgentSetup-${version}.exe"
           Write-Host "Agent installer: $('{0:N1} MB' -f ((Get-Item $agentInstaller).Length / 1MB))"
-
-          # Build server installer
-          Write-Host "=== Building Server Installer ==="
-          & $iscc `
-            "/DAppVersion=${version}" `
-            "/DBuildDir=${{ github.workspace }}\build-windows" `
-            "deploy\packaging\windows\yuzu-server.iss"
-          if ($LASTEXITCODE -ne 0) { Write-Error "Server installer failed"; exit 1 }
-
-          $serverInstaller = "deploy\packaging\windows\output\YuzuServerSetup-${version}.exe"
-          Copy-Item $serverInstaller "YuzuServerSetup-${version}.exe"
-          Write-Host "Server installer: $('{0:N1} MB' -f ((Get-Item $serverInstaller).Length / 1MB))"
+          # No server installer: YuzuServerSetup was discontinued by ADR-0035.
 
       - name: Sign installers (Authenticode)
         if: env.HAS_SIGNING_CERT == 'true'
@@ -945,7 +992,7 @@ jobs:
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1 -ExpandProperty FullName
 
-          foreach ($installer in @("YuzuAgentSetup-${version}.exe", "YuzuServerSetup-${version}.exe")) {
+          foreach ($installer in @("YuzuAgentSetup-${version}.exe")) {
             if (Test-Path $installer) {
               Write-Host "Signing: $installer"
               & $signtool sign `
@@ -966,13 +1013,20 @@ jobs:
       # Scans vcpkg_installed/x64-windows (C++ deps) + build-windows (PE
       # binaries). Syft supports PowerShell/Windows runners via the
       # composite action, which downloads a Windows syft binary.
+      # Known limitation: `path: .` scans the whole workspace (the vcpkg
+      # ports tree and build trees too), so this SBOM can list components the
+      # agent archive does not ship or load. Since ADR-0035 step 3 the vcpkg
+      # install on this runner is agent-only, so the server's dependencies
+      # (libpq, drogon, xmlsec) are no longer installed here; whether Syft
+      # still reports them from the ports tree is unverified until a release
+      # SBOM is inspected. The release notes and release-verification.md say so.
       - name: Generate Windows SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
-          output-file: yuzu-windows-x64.cdx.json
-          artifact-name: yuzu-windows-x64.cdx.json
+          output-file: yuzu-agent-windows-x64.cdx.json
+          artifact-name: yuzu-agent-windows-x64.cdx.json
           upload-artifact: false
 
       - name: Generate Windows SBOM (SPDX)
@@ -980,24 +1034,23 @@ jobs:
         with:
           path: .
           format: spdx-json
-          output-file: yuzu-windows-x64.spdx.json
-          artifact-name: yuzu-windows-x64.spdx.json
+          output-file: yuzu-agent-windows-x64.spdx.json
+          artifact-name: yuzu-agent-windows-x64.spdx.json
           upload-artifact: false
 
       - name: Attest Windows provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            yuzu-windows-x64.zip
+            yuzu-agent-windows-x64.zip
             YuzuAgentSetup-*.exe
-            YuzuServerSetup-*.exe
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
-          name: yuzu-windows-x64
-          path: yuzu-windows-x64.zip
+          name: yuzu-agent-windows-x64
+          path: yuzu-agent-windows-x64.zip
           retention-days: 3
 
       - name: Upload installer artifacts
@@ -1007,17 +1060,16 @@ jobs:
           name: yuzu-windows-installer
           path: |
             YuzuAgentSetup-*.exe
-            YuzuServerSetup-*.exe
           retention-days: 3
 
       - name: Upload Windows SBOM artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
-          name: yuzu-windows-x64-sbom
+          name: yuzu-agent-windows-x64-sbom
           path: |
-            yuzu-windows-x64.cdx.json
-            yuzu-windows-x64.spdx.json
+            yuzu-agent-windows-x64.cdx.json
+            yuzu-agent-windows-x64.spdx.json
           retention-days: 3
 
   # ── macOS ARM64 release build ────────────────────────────────────────
@@ -1053,9 +1105,11 @@ jobs:
 
       - name: Install dependencies
         run: |
-          # autoconf/automake/libtool: vcpkg's libpq port (Postgres substrate,
-          # ADR-0006) runs autoreconf during its build and the hosted macOS
-          # image doesn't ship autotools.
+          # autoconf/automake/libtool: installed back when vcpkg's libpq port
+          # (Postgres substrate, ADR-0006) ran autoreconf on this leg. This
+          # install is agent-only since ADR-0035 step 3 (no libpq), so they
+          # may no longer be needed; kept until a macOS run proves the leg
+          # builds without them (the hosted image doesn't ship autotools).
           #
           # cmake deliberately excluded from this brew line, pinned via pipx
           # below instead. 2026-07-16: brew's floating `cmake` drifted to
@@ -1136,9 +1190,11 @@ jobs:
           VCPKG_DEFAULT_BINARY_CACHE: ${{ runner.tool_cache }}/yuzu-vcpkg-binary-cache-macos
         run: |
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+          # Agent-only vcpkg profile (ADR-0035 step 3), no tests.
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
-            --x-manifest-root=${{ github.workspace }}
+            --x-manifest-root=${{ github.workspace }} \
+            --x-no-default-features
 
       - name: Configure (Meson release + LTO)
         env:
@@ -1152,14 +1208,19 @@ jobs:
         run: |
           # -Dbackend_max_links=1 serialises the link steps. `-j` bounds ninja's
           # job COUNT, not the per-process RSS of a monolithic full-LTO link of
-          # yuzu-server/yuzu-agent — the real memory spike. Serialising caps peak
+          # yuzu-agent — the real memory spike. Serialising caps peak
           # to one big LTO link at a time on the 24 GiB box; the full-LTO artifact
           # is unchanged.
+          # Agent only (ADR-0035): the server is supported on Linux only, so the
+          # macOS release never builds or ships yuzu-server. Pinned by
+          # tests/test_release_agent_only.py. -Dserver=disabled is explicit
+          # (clean checkout, nothing stored).
           meson setup build-macos \
             --native-file meson/native/macos-appleclang.ini \
             --buildtype=release \
             -Dcmake_prefix_path=${{ github.workspace }}/vcpkg_installed/arm64-osx \
             -Dbuild_tests=false \
+            -Dserver=disabled \
             -Db_lto=true \
             -Dbackend_max_links=1
 
@@ -1177,7 +1238,6 @@ jobs:
 
       - name: Test (smoke)
         run: |
-          ./build-macos/server/core/yuzu-server --help || true
           ./build-macos/agents/core/yuzu-agent --help || true
 
       - name: Sign binaries (codesign)
@@ -1213,7 +1273,10 @@ jobs:
 
           # Sign all binaries and dylibs with hardened runtime
           IDENTITY="${MACOS_SIGNING_IDENTITY}"
-          for binary in build-macos/yuzu-server build-macos/yuzu-agent; do
+          # The agent binary is built under agents/core/ (the bare
+          # build-macos/yuzu-agent path this loop used never existed; it went
+          # unnoticed because MACOS_SIGNING_CERT has never been set).
+          for binary in build-macos/agents/core/yuzu-agent; do
             echo "Signing: ${binary}"
             codesign --force --options runtime \
               --sign "${IDENTITY}" \
@@ -1245,20 +1308,30 @@ jobs:
           # Create a ZIP of the signed binaries for notarization submission
           NOTARIZE_ZIP="${RUNNER_TEMP}/yuzu-notarize.zip"
           zip -j "${NOTARIZE_ZIP}" \
-            build-macos/yuzu-server \
-            build-macos/yuzu-agent
+            build-macos/agents/core/yuzu-agent
 
           # Add dylibs to the notarization payload
           find build-macos -name '*.dylib' -exec zip -j "${NOTARIZE_ZIP}" {} \;
 
           # Submit for notarization and wait for result
           echo "Submitting for Apple notarization..."
+          # --wait returns when Apple has decided, and an Invalid verdict is
+          # not guaranteed to be a non-zero exit, so read the status. (The
+          # .pkg below needs no such check: stapling fails without a ticket.)
+          RESULT="${RUNNER_TEMP}/yuzu-notarize-result.plist"
           xcrun notarytool submit "${NOTARIZE_ZIP}" \
             --apple-id "${MACOS_NOTARIZATION_APPLE_ID}" \
             --password "${MACOS_NOTARIZATION_PASSWORD}" \
             --team-id "${MACOS_NOTARIZATION_TEAM_ID}" \
             --wait \
-            --timeout 15m
+            --timeout 15m \
+            --output-format plist > "${RESULT}" || true  # the verdict below decides; the plist is printed on failure
+          STATUS=$(/usr/libexec/PlistBuddy -c 'Print :status' "${RESULT}" 2>/dev/null || echo unknown)
+          if [ "${STATUS}" != "Accepted" ]; then
+            echo "::error::Apple notarization status is '${STATUS}', not Accepted. Read the reason with: xcrun notarytool log <id> (the id is below)."
+            cat "${RESULT}"
+            exit 1
+          fi
 
           echo "Notarization complete"
           rm -f "${NOTARIZE_ZIP}"
@@ -1275,12 +1348,10 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           VERSION="${VERSION//-/_}"
-          STAGING="yuzu-${VERSION}-macos-arm64"
+          STAGING="yuzu-agent-${VERSION}-macos-arm64"
           mkdir -p "${STAGING}/bin" "${STAGING}/plugins"
 
-          # Binaries (InstructionDefinitions are embedded into yuzu-server
-          # at build time — no content/ directory shipped).
-          cp build-macos/server/core/yuzu-server "${STAGING}/bin/"
+          # Agent only (ADR-0035): no yuzu-server.
           cp build-macos/agents/core/yuzu-agent "${STAGING}/bin/"
 
           # Agent core dylib
@@ -1289,12 +1360,7 @@ jobs:
           # Plugin dylibs
           find build-macos/agents/plugins -name '*.dylib' -exec cp {} "${STAGING}/plugins/" \;
 
-          # Postgres provisioning helper (ADR-0006, #1320) — tarball installs
-          # run it manually (script's local mode covers Homebrew postgresql@16).
-          mkdir -p "${STAGING}/scripts"
-          cp scripts/install-server-postgres.sh "${STAGING}/scripts/"
-
-          tar czf "yuzu-macos-arm64.tar.gz" "${STAGING}"
+          tar czf "yuzu-agent-macos-arm64.tar.gz" "${STAGING}"
 
       - name: Build macOS installer (.pkg)
         run: |
@@ -1344,13 +1410,17 @@ jobs:
 
       # ── macOS SBOM (CycloneDX + SPDX) ───────────────────────────────
       # Scans vcpkg_installed/arm64-osx + build-macos (Mach-O binaries).
+      # Same known limitation as the Windows SBOM: `path: .` covers the
+      # whole workspace, so it can list components the agent archive does not
+      # ship. The vcpkg install is agent-only (ADR-0035 step 3), so the
+      # server's dependencies are not installed on this runner either.
       - name: Generate macOS SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
-          output-file: yuzu-macos-arm64.cdx.json
-          artifact-name: yuzu-macos-arm64.cdx.json
+          output-file: yuzu-agent-macos-arm64.cdx.json
+          artifact-name: yuzu-agent-macos-arm64.cdx.json
           upload-artifact: false
 
       - name: Generate macOS SBOM (SPDX)
@@ -1358,23 +1428,23 @@ jobs:
         with:
           path: .
           format: spdx-json
-          output-file: yuzu-macos-arm64.spdx.json
-          artifact-name: yuzu-macos-arm64.spdx.json
+          output-file: yuzu-agent-macos-arm64.spdx.json
+          artifact-name: yuzu-agent-macos-arm64.spdx.json
           upload-artifact: false
 
       - name: Attest macOS provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            yuzu-macos-arm64.tar.gz
+            yuzu-agent-macos-arm64.tar.gz
             YuzuAgent-*.pkg
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
-          name: yuzu-macos-arm64
-          path: yuzu-macos-arm64.tar.gz
+          name: yuzu-agent-macos-arm64
+          path: yuzu-agent-macos-arm64.tar.gz
           retention-days: 3
 
       - name: Upload .pkg artifact
@@ -1389,19 +1459,25 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         continue-on-error: true
         with:
-          name: yuzu-macos-arm64-sbom
+          name: yuzu-agent-macos-arm64-sbom
           path: |
-            yuzu-macos-arm64.cdx.json
-            yuzu-macos-arm64.spdx.json
+            yuzu-agent-macos-arm64.cdx.json
+            yuzu-agent-macos-arm64.spdx.json
           retention-days: 3
 
   # ── Docker images — server + gateway published to GHCR ──────────────
   # Runs on the self-hosted Linux runner (native dockerd, systemd-managed).
   # Both images build in parallel via matrix; buildx registry cache persists
   # across releases so repeat runs with unchanged vcpkg/rebar deps are fast.
+  # build-windows and build-macos are in the needs: so a failed agent
+  # packaging step (e.g. the Windows "Verify the agent runs from the packaged
+  # archive" refusal) stops the push before any :X.Y.Z image exists; without
+  # them the images were pushed while no GitHub Release was created (ADR-0035
+  # step 3, UP-12). Neither build job has an `if:`, so neither is skipped on
+  # any tag, and docker-publish has no `if:` that reads needs.*.
   docker-publish:
     name: "Publish ${{ matrix.image }} image"
-    needs: [release-guard, build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 90
     permissions:
@@ -1433,7 +1509,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -1643,17 +1719,20 @@ jobs:
   # Postgres 16 + pgvector + app role/db init (ADR-0006/0007/0008, #1318).
   # Mirrors docker-publish (login / metadata / SBOM / attestation / cosign)
   # with three differences:
-  #   1. No needs on build-linux/build-gateway — the image contains no Yuzu
-  #      build artifacts (it's postgres + pgvector + init SQL), so a core
-  #      build failure is irrelevant to it. It IS in the release job's
-  #      needs: the composes release-pin ghcr.io/.../yuzu-postgres:X.Y.Z,
-  #      so a release must not publish if this image failed to.
+  #   1. The image contains no Yuzu build artifacts (it's postgres + pgvector
+  #      + init SQL), so no build is an INPUT to it. It still waits for all
+  #      four builds (build-linux, build-gateway, build-windows, build-macos),
+  #      purely as a success gate: no :X.Y.Z image is pushed for a release
+  #      whose server or agent packaging fails (ADR-0035 step 3, UP-12; owner
+  #      decision 2026-11-12). It IS in the release job's needs: the composes
+  #      release-pin ghcr.io/.../yuzu-postgres:X.Y.Z, so a release must not
+  #      publish if this image failed to.
   #   2. amd64-only today: the QEMU arm64 leg was dropped (see the buildx
   #      step); the demo/viz rigs would need it back.
   #   3. Distinct local buildcache path (postgres suffix).
   docker-publish-postgres:
     name: "Publish postgres image"
-    needs: [release-guard]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     timeout-minutes: 60
     permissions:
@@ -1681,7 +1760,7 @@ jobs:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -1828,7 +1907,9 @@ jobs:
   #      collides with docker-publish's cache.
   docker-publish-chisel:
     name: "Publish ${{ matrix.image }}-chisel image"
-    # Mirror docker-publish's needs (core builds must pass). The release job
+    # Mirror docker-publish's needs (core builds AND the Windows/macOS agent
+    # builds must pass, so no :X.Y.Z image is pushed for a release whose agent
+    # packaging fails; ADR-0035 step 3, UP-12). The release job
     # NEEDS this job (#5242): the three chisel images' SBOMs are release assets
     # and belong inside the signed SHA256SUMS, and while this job stayed out of
     # the release's needs they were attached only when it happened to finish
@@ -1839,7 +1920,7 @@ jobs:
     # Recovery: "Re-run failed jobs" on the NEWEST run for the tag (digests of
     # the succeeded legs are kept; each push re-checks the tag), never on an
     # older run (#5242); a fresh run is the fallback. See the release skill.
-    needs: [release-guard, build-linux, build-gateway]
+    needs: [release-guard, build-linux, build-gateway, build-windows, build-macos]
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
     # Job-level concurrency so a re-tagged release (same ref) cancels an
     # in-flight build instead of wedging the single self-hosted Linux runner
@@ -1905,7 +1986,7 @@ jobs:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -2106,10 +2187,10 @@ jobs:
 
   # ── Agent-bundle delivery image — published + SIGNED after the release ─
   # The 3-triplet agent bundle (yuzu-agent-bundle-chisel) repackages the
-  # release's OWN signed agent archives, so it can only be built once the
+  # release's OWN agent archives, so it can only be built once the
   # GitHub Release exists -> needs: [release]. It runs on a GitHub-hosted
-  # runner (no compilation, just download + repackage; gh/docker/buildx/cosign
-  # all preinstalled), reuses scripts/build-agent-bundle.sh as the single
+  # runner (no compilation, just download + repackage; gh/docker/buildx are
+  # preinstalled, cosign is installed by the job), reuses scripts/build-agent-bundle.sh as the single
   # source of truth, then signs + SBOMs + attests the pushed image exactly
   # like docker-publish. It is deliberately NOT in the release job's needs:
   # (it depends on release, not vice-versa), so it never gates the release.
@@ -2150,7 +2231,7 @@ jobs:
           driver: docker-container
 
       - name: Log in to GHCR
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
         with:
           registry: ghcr.io
           # GHCR_PAT (write:packages-only PAT) instead
@@ -2172,8 +2253,8 @@ jobs:
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
 
-      # Reuse the maintainer script (download release artifacts -> verify by
-      # sha256 -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
+      # Reuse the maintainer script (download release artifacts -> verify
+      # SHA256SUMS' cosign signature, then each file against its own line -> lay out -> build host-arch (amd64) image -> push). GH_TOKEN
       # lets its `gh release download` authenticate against this just-published
       # release. linux/arm64 dropped — pass --push without --multiarch.
       - name: Build + push agent bundle (amd64)
@@ -2182,6 +2263,7 @@ jobs:
         run: |
           bash scripts/build-agent-bundle.sh \
             --version "${{ steps.ref.outputs.version }}" \
+            --signer-repo "${{ github.repository }}" \
             --push
 
       - name: Resolve pushed image digest
@@ -2353,7 +2435,7 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          # *.zip glob covers both yuzu-windows-x64.zip and yuzu-compose-wizard-*.zip.
+          # *.zip glob covers both yuzu-agent-windows-x64.zip and yuzu-compose-wizard-*.zip.
           # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
           # verify the SBOM they download matches the SBOM we shipped.
           sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json > SHA256SUMS
@@ -2363,6 +2445,9 @@ jobs:
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
 
       - name: Sign SHA256SUMS (keyless)
+        env:
+          SIGN_REPOSITORY: ${{ github.repository }}
+          SIGN_REF: ${{ github.ref }}
         run: |
           cd artifacts
           # cosign v3.0+ rejects explicit --oidc-issuer when a signing
@@ -2380,6 +2465,16 @@ jobs:
           # every future release Scorecard-visible by default.
           cosign sign-blob --yes SHA256SUMS --bundle SHA256SUMS.sigstore
           echo "Signed SHA256SUMS with cosign (keyless/OIDC)"
+          # Verify what we just signed with the exact identity the published
+          # instructions (and scripts/build-agent-bundle.sh) will use, BEFORE
+          # the GitHub Release is created (#7529): a bundle a verifier would
+          # reject fails this job here, not after the release is public. (The
+          # images are already pushed and signed by now.)
+          cosign verify-blob --bundle SHA256SUMS.sigstore \
+            --certificate-identity "https://github.com/${SIGN_REPOSITORY}/.github/workflows/release.yml@${SIGN_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            SHA256SUMS
+          echo "Verified the SHA256SUMS signature with its exact release.yml identity"
 
       - name: Bundle SLSA attestations as .intoto.jsonl release assets
         env:
@@ -2481,20 +2576,24 @@ jobs:
           | Component | Windows | macOS | Debian/Ubuntu | RHEL/Fedora |
           |---|---|---|---|---|
           | Agent | \`.exe\` (InnoSetup) | \`.pkg\` (launchd) | \`.deb\` (systemd) | \`.rpm\` (systemd) |
-          | Server | \`.exe\` (InnoSetup) | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
+          | Server | — | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
           | Gateway | — | — | \`.deb\` (systemd) | \`.rpm\` (systemd) |
+
+          The server runs on Linux only (ADR-0035): use the container image or
+          the Linux packages. \`YuzuServerSetup-*.exe\` is discontinued, and
+          the Windows and macOS archives contain the agent only. To move an
+          existing Windows or macOS server to Linux, follow "Moving a Windows
+          or macOS server to Linux" in \`docs/user-manual/server-admin.md\`:
+          its data cannot be carried over, so you deploy a new Linux server,
+          enroll agents with it as new installations, and delete the old server's
+          leftover files, which hold secrets.
 
           ### Windows silent install (GPO / SCCM / Intune)
           \`\`\`powershell
-          # Agent
           YuzuAgentSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /SERVER=yuzu-server:50051 /TOKEN=<enrollment-token>
-
-          # Server
-          YuzuServerSetup-*.exe /VERYSILENT /SUPPRESSMSGBOXES /ADMIN_USER=admin /ADMIN_PASS=<password> \`
-            /HTTPS_CERT=cert.pem /HTTPS_KEY=key.pem
           \`\`\`
 
-          Silent uninstall — agent: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\`; server: \`"C:\\Program Files\\Yuzu Server\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). Each removes the program but keeps its data directory: \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key) or \`%ProgramData%\\Yuzu Server\` (databases, configuration, TLS keys). To decommission a device, revoke its certificate on the server and delete that directory (see \`docs/agent-bundle.md\`). Uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
+          Silent uninstall: \`"C:\\Program Files\\Yuzu\\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES\` (or the path in the product's \`UninstallString\` registry value, if it was installed to another directory). It removes the program but keeps its data directory, \`%ProgramData%\\Yuzu\` (the agent's identity and mTLS private key). To decommission a device, revoke its certificate on the server and delete \`%ProgramData%\\Yuzu\` (see \`docs/agent-bundle.md\`). Agent uninstallers from earlier releases (up to 0.14.0-rc2) hang on a silent uninstall; upgrade first.
 
           ### macOS silent install (Jamf / MDM)
           \`\`\`bash
@@ -2518,8 +2617,16 @@ jobs:
           | \`yuzu-linux-x64.tar.gz\` | Linux (server + agent) | x86_64 |
           | \`yuzu-linux-arm64.tar.gz\` | Linux (server + agent) | ARM64 (coming soon) |
           | \`yuzu-gateway-linux-x64.tar.gz\` | Linux (gateway) | x86_64 |
-          | \`yuzu-windows-x64.zip\` | Windows (server + agent) | x86_64 |
-          | \`yuzu-macos-arm64.tar.gz\` | macOS (server + agent) | ARM64 (Apple Silicon) |
+          | \`yuzu-agent-windows-x64.zip\` | Windows (agent) | x86_64 |
+          | \`yuzu-agent-macos-arm64.tar.gz\` | macOS (agent) | ARM64 (Apple Silicon) |
+
+          In earlier releases the Windows and macOS archives were named
+          \`yuzu-windows-x64.zip\` and \`yuzu-macos-arm64.tar.gz\` and also
+          held the server; update any script that downloads them by name.
+
+          Known limitation: the Windows and macOS SBOMs are generated from the whole build
+          workspace, so they can list components the archive does not ship
+          or load; a finding in one of those does not apply to the agent.
 
           ## Compose Wizard
 
@@ -2556,7 +2663,7 @@ jobs:
 
           \`\`\`bash
           cosign verify-blob --bundle SHA256SUMS.sigstore \\
-            --certificate-identity-regexp '.*' \\
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \\
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
             SHA256SUMS
           \`\`\`
@@ -2626,11 +2733,10 @@ jobs:
               ${PRERELEASE_FLAG} \
               artifacts/yuzu-linux-x64.tar.gz \
               artifacts/yuzu-gateway-linux-x64.tar.gz \
-              artifacts/yuzu-windows-x64.zip \
+              artifacts/yuzu-agent-windows-x64.zip \
               artifacts/YuzuAgentSetup-*.exe \
-              artifacts/YuzuServerSetup-*.exe \
               artifacts/YuzuAgent-*.pkg \
-              artifacts/yuzu-macos-arm64.tar.gz \
+              artifacts/yuzu-agent-macos-arm64.tar.gz \
               artifacts/*.deb \
               artifacts/*.rpm \
               artifacts/*.cdx.json \

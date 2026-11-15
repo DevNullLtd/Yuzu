@@ -69,7 +69,7 @@ Use `execute_instruction` for each of these plugin/action pairs. After each disp
 - `agent_actions` / `info`
 - `filesystem` / `exists` (params: `{"path": "/etc/hosts"}`)
 - `filesystem` / `list_dir` (params: `{"path": "/tmp"}`)
-- `tar` / `status`
+- `echo` / `status`
 - `quarantine` / `status`
 - `vuln_scan` / `summary`
 

@@ -1,5 +1,6 @@
 #include "sso_boot_guard.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/server.hpp>  // Config
 
 namespace yuzu::server {
@@ -58,6 +59,71 @@ bool sso_only_boot_guard_ok(const Config& cfg, std::string& err) {
           "and --saml-idp-entity-id, plus HTTPS enabled), or use --auth-mode=standard.";
 #endif
     return false;
+}
+
+std::expected<void, std::string>
+sso_only_runtime_providers_ok(const Config& cfg, bool oidc_up, bool saml_up) {
+    if (cfg.auth_mode != "sso-only")
+        return {};
+
+    if (oidc_up || saml_up)
+        return {};
+
+    // Name each provider the operator DID configure and that wiring then
+    // disabled, symmetrically. A provider that was never configured is not
+    // mentioned (the config-presence guard in main.cpp owns that message).
+    std::string disabled;
+    int named = 0;
+    auto note = [&disabled, &named](const char* name) {
+        if (!disabled.empty())
+            disabled += " and ";
+        disabled += name;
+        ++named;
+    };
+    if (oidc_config_complete(cfg))
+        note("OIDC");
+#ifndef _WIN32
+    if (saml_config_complete(cfg))
+        note("SAML");
+#endif
+    if (disabled.empty())
+        disabled = "the configured SSO provider";
+
+    return std::unexpected(
+        "--auth-mode=sso-only disables local-password login, but " + disabled +
+        (named > 1 ? " were" : " was") + " disabled at startup, so every operator would be locked out. The cause is the "
+        "error logged just before this line (for example a SAML IdP certificate that is "
+        "missing, over 64 KiB, not a PEM certificate, a certificate type this server "
+        "cannot use such as Ed25519, or an unusable SAML signing key). Fix the "
+        "configuration and restart. As a last resort --auth-mode=standard starts the server "
+        "with local-password login enabled again for every account, including accounts of "
+        "people who have left. The break-glass account "
+        "does not satisfy this check: it is the recovery for an IdP outage after a "
+        "successful start.");
+}
+
+void publish_oidc_provider_gauges(yuzu::MetricsRegistry& metrics, bool configured, bool enabled) {
+    metrics.describe("yuzu_auth_oidc_provider_configured",
+                     "1 when OIDC is configured (issuer and client id set), else 0",
+                     "gauge");
+    metrics.gauge("yuzu_auth_oidc_provider_configured").set(configured ? 1.0 : 0.0);
+    metrics.describe("yuzu_auth_oidc_provider_enabled",
+                     "1 when the OIDC provider is constructed and enabled, else 0; "
+                     "configured=1 with enabled=0 means disabled at runtime",
+                     "gauge");
+    metrics.gauge("yuzu_auth_oidc_provider_enabled").set(enabled ? 1.0 : 0.0);
+}
+
+void publish_saml_provider_gauges(yuzu::MetricsRegistry& metrics, bool configured, bool enabled) {
+    metrics.describe("yuzu_auth_saml_provider_configured",
+                     "1 when SAML is configured (all five SAML settings set), else 0",
+                     "gauge");
+    metrics.gauge("yuzu_auth_saml_provider_configured").set(configured ? 1.0 : 0.0);
+    metrics.describe("yuzu_auth_saml_provider_enabled",
+                     "1 when the SAML provider is constructed and enabled, else 0; "
+                     "configured=1 with enabled=0 means disabled at runtime",
+                     "gauge");
+    metrics.gauge("yuzu_auth_saml_provider_enabled").set(enabled ? 1.0 : 0.0);
 }
 
 }  // namespace yuzu::server

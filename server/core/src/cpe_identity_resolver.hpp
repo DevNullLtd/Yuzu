@@ -37,7 +37,7 @@
 
 namespace yuzu::server {
 
-struct SoftwareEntry; // software_inventory_store.hpp (only referenced by ref)
+struct SoftwareEntry; // software_inventory_types.hpp (only referenced by ref)
 
 /// Fail-closed floor: the production constructor refuses to build a resolver
 /// whose curated map holds fewer than this many entries (a corrupt/empty embed

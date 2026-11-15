@@ -83,6 +83,10 @@ namespace {
 // bound as one agent, plugin_result_audit.hpp).
 static_assert(kRegistryAuditBudgetKeyBytes >= auth::kMaxAgentIdLength,
               "the registry audit budget must key on a whole agent id");
+// The unverified-frame registry keeps exact agent ids up to the enrolment bound (a longer one is
+// never stored and fails closed).
+static_assert(UnverifiedFrameRegistry::kMaxAgentIdBytes == auth::kMaxAgentIdLength,
+              "the unverified-frame registry must keep every enrolled agent id whole");
 
 // Persists the `registry.write` audit rows one stored output frame owes (see
 // plugin_result_audit.hpp for the binding: a minted registry command id AND an agent-stamped
@@ -247,6 +251,9 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
     // constructs this service directly. set_ota_bound_config() replaces it.
     set_ota_bound_config(ota_cfg_);
     registry_audit_budget_ = make_registry_audit_budget();
+    if (unverified_frames_.salt_fell_back())
+        spdlog::warn("[ingest] no random salt could be drawn for the unverified-frame record: its "
+                     "command-id digest runs unsalted in this process");
 }
 
 // -- Register -----------------------------------------------------------------
@@ -1594,9 +1601,15 @@ grpc::Status AgentServiceImpl::Subscribe(
             const ResponseProvenance prov =
                 resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
             if (resp.output() == "__keepalive__") {
-                notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+                notify_exec_tracker(resp.command_id(), agent_id, resp, prov,
+                                    /*response_dropped=*/false);
                 continue;
             }
+            // A failed provenance lookup: stored under the unverified label, which the result-set
+            // fill never reads, and reaching no tracker row, so the pair's terminal frame reports
+            // it (unverified_frame_seen). An unrecorded id can never reach a tracker row: not noted.
+            if (prov.outcome == ProvenanceOutcome::kLookupDegraded)
+                note_unverified_frame(resp.command_id(), agent_id);
 
             // Track first response for server-side latency
             {
@@ -1621,7 +1634,12 @@ grpc::Status AgentServiceImpl::Subscribe(
             // Publish each row as its own SSE event
             publish_output_rows(agent_id, plugin, resp.output());
 
-            // Store streaming response
+            // Store streaming response. A frame the store did not keep (a failed write, or a cap
+            // refusal) carries output no stored-response read will return: `response_dropped`
+            // records it beside the agent's status (same tracker upsert), and the tracker keeps
+            // it for the rest of the execution, so a result-set fill cannot read the agent as
+            // having fully answered.
+            bool response_dropped = false;
             if (response_store_) {
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
@@ -1634,7 +1652,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 // command_execution record so the executions detail drawer
                 // can correlate exactly, on any replica.
                 sr.execution_id = prov.execution_id;
-                response_store_->store(sr);
+                response_dropped = !store_outcome_durable(response_store_->store(sr));
             }
 
             // registry.write audit rows (RUNNING frames carry the plugin output).
@@ -1646,7 +1664,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // UAT 2026-05-06 #8: notify the executions tracker so the
             // drawer's per-agent KPI table populates and the SSE
             // `agent-transition` event fires for live updates.
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
             if (auto analytics_store = analytics_store_.lock()) {
                 AnalyticsEvent ae;
@@ -1671,7 +1689,10 @@ grpc::Status AgentServiceImpl::Subscribe(
             const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
             const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
 
-            // Store completion response
+            // Store completion response. `response_dropped` records that this terminal answer was
+            // NOT persisted (a failed store or finalize); the tracker keeps it beside the agent's
+            // status so a result-set fill does not count the agent as having answered.
+            bool response_dropped = false;
             if (response_store_) {
                 const std::string& plugin_name = prov.plugin;
                 std::string err_detail;
@@ -1715,12 +1736,20 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.plugin = plugin_name;
                     sr.error_detail = err_detail;
                     sr.execution_id = current_exec;
-                    response_store_->store(sr);
+                    response_dropped = !store_outcome_durable(response_store_->store(sr));
+                } else if (finalize_result == FR::Error) {
+                    // Already logged inside the store; do NOT insert (would re-create the
+                    // sentinel). The terminal answer is not durable, so say so.
+                    response_dropped = true;
                 }
                 // FR::Updated → row already updated in place, no insert.
-                // FR::Error → already logged inside the store; do NOT
-                //             insert — would re-create the sentinel.
             }
+            // An earlier RUNNING frame of this agent whose provenance lookup failed is absent from
+            // the result-set fill's read: the answer is not fully stored. Checked, not consumed:
+            // notify_exec_tracker below forgets the record only once a tracker row carries the
+            // flag, so a terminal frame it cannot record leaves the record for a replay.
+            if (unverified_frame_seen(resp.command_id(), agent_id))
+                response_dropped = true;
 
             // A terminal frame that carries output AND the agent-stamped action owes its audit
             // rows too (defence in depth: this agent's terminal frame carries no output); a frame
@@ -1733,7 +1762,7 @@ grpc::Status AgentServiceImpl::Subscribe(
             // UAT 2026-05-06 #8: notify the executions tracker on terminal
             // status so the drawer's per-agent KPI flips to its terminal
             // state and the SSE `agent-transition` event fires.
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
             std::string status_str =
                 (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
@@ -1951,12 +1980,16 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
     // has failed the rest are SKIPPED: counted as a degrade exactly like a failed write (the
     // command is still dispatched; its responses are labelled unverified), so an outage costs the
     // loop one short wait, not N. A null latch is every other caller: the ordinary budget, no skip.
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (latch && latch->tripped()) {
         latch->note_skipped();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        // #3678: the command is still sent and may consume an agent dedup-ring slot, so the
+        // outbox redelivery horizon must count it even though its record was not written.
+        if (tracker)
+            tracker->note_unrecorded_dispatch();
         return;
     }
-    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     const bool recorded =
         tracker && (latch ? tracker->record_command_dispatch(command_id, plugin, execution_id,
                                                              latch->lease_timeout())
@@ -1965,6 +1998,10 @@ void AgentServiceImpl::record_command_dispatch(const std::string& command_id,
         if (latch)
             latch->trip();
         metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
+        // #3678: see the skipped branch above. A null tracker has no sequence to advance (the
+        // outbox's reader is then unreadable and holds), so there is nothing to count.
+        if (tracker)
+            tracker->note_unrecorded_dispatch();
     }
 }
 
@@ -1990,9 +2027,12 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const ResponseProvenance prov =
             resolve_response_provenance(resp.command_id(), resp.output() == "__keepalive__");
         if (resp.output() == "__keepalive__") {
-            notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+            notify_exec_tracker(resp.command_id(), agent_id, resp, prov,
+                                /*response_dropped=*/false);
             return;
         }
+        if (prov.outcome == ProvenanceOutcome::kLookupDegraded) // see the Subscribe twin
+            note_unverified_frame(resp.command_id(), agent_id);
 
         // Track first response for server-side latency
         {
@@ -2013,6 +2053,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const std::string& plugin = prov.plugin;
         publish_output_rows(agent_id, plugin, resp.output());
 
+        bool response_dropped = false; // a frame the store did not keep; see the Subscribe twin
         if (response_store_) {
             StoredResponse sr;
             sr.instruction_id = resp.command_id();
@@ -2024,7 +2065,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             // PR 2 / HA WS-1(1b): streaming response — keep the mapping
             // until completion (PG-backed, shared across replicas).
             sr.execution_id = prov.execution_id;
-            response_store_->store(sr);
+            response_dropped = !store_outcome_durable(response_store_->store(sr));
         }
 
         // registry.write audit rows. No gRPC context on the gateway path to carry an
@@ -2033,7 +2074,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         (void)audit_registry_frame(agent_id, resp, plugin);
 
         // UAT 2026-05-06 #8: gateway-streamed RUNNING — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
         if (auto analytics_store = analytics_store_.lock()) {
             AnalyticsEvent ae;
@@ -2053,6 +2094,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
         const ResponseProvenance prov = resolve_response_provenance(resp.command_id());
         const std::string sink_error = failure_text_for_sinks(prov.plugin, resp);
 
+        bool response_dropped = false; // see the Subscribe twin
         if (response_store_) {
             const std::string& gw_plugin = prov.plugin;
             std::string err_detail;
@@ -2086,17 +2128,21 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                 sr.plugin = gw_plugin;
                 sr.error_detail = err_detail;
                 sr.execution_id = current_exec;
-                response_store_->store(sr);
+                response_dropped = !store_outcome_durable(response_store_->store(sr));
+            } else if (finalize_result == FR::Error) {
+                response_dropped = true;
             }
             // FR::Updated → in-place; FR::Error → already logged, do NOT insert.
         }
+        if (unverified_frame_seen(resp.command_id(), agent_id)) // see the Subscribe twin
+            response_dropped = true;
 
         // A terminal frame that carries output owes its audit rows too (see the Subscribe twin;
         // the hook has logged any failure (and counted the rows it knows) itself).
         (void)audit_registry_frame(agent_id, resp, prov.plugin);
 
         // UAT 2026-05-06 #8: gateway-streamed terminal — notify tracker.
-        notify_exec_tracker(resp.command_id(), agent_id, resp, prov);
+        notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);
 
         std::string status_str = (resp.status() == pb::CommandResponse::SUCCESS) ? "done" : "error";
         metrics_.counter("yuzu_commands_completed_total", {{"status", status_str}}).increment();
@@ -2228,14 +2274,65 @@ std::string AgentServiceImpl::failure_text_for_sinks(const std::string& plugin,
         return {};
     std::string text = resp.error().message();
     if (!forensics_plugins_ || forensics_plugins_->contains(plugin))
-        text = sanitize_forensics_error_detail(text);
+        return sanitize_forensics_error_detail(text);
+    // Every sink of this text (tracker row, outbox, bus, notification, analytics, webhook) binds
+    // or embeds it as text, and a NUL byte cannot be stored in a text column. Replace it with
+    // U+FFFD so the status is always recorded; the rest of the message is kept as sent.
+    if (text.find('\0') != std::string::npos) {
+        std::string cleaned;
+        cleaned.reserve(text.size() + 8);
+        for (const char c : text) {
+            if (c == '\0')
+                cleaned += "\xEF\xBF\xBD";
+            else
+                cleaned += c;
+        }
+        text = std::move(cleaned);
+    }
     return text;
+}
+
+namespace {
+int64_t steady_seconds_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+void AgentServiceImpl::note_unverified_frame(const std::string& command_id,
+                                             const std::string& agent_id) {
+    const auto noted = unverified_frames_.note(command_id, agent_id, steady_seconds_now());
+    if (noted.evicted > 0)
+        metrics_
+            .counter("yuzu_server_response_ingest_dropped_total",
+                     {{"reason", "unverified_registry_overflow"}})
+            .increment(static_cast<double>(noted.evicted));
+    // The counter is the evidence for every eviction; these lines name the agent only when a
+    // marker or the latch is first set (at most one line per 10 min per agent for a marker).
+    if (noted.marked) {
+        static RefusalLogThrottle marker_log(std::chrono::seconds(600));
+        if (marker_log.should_warn(agent_id))
+            spdlog::warn("[ingest] the unverified-frame record is full for agent={}: for the "
+                         "next {} s every answer of that agent is reported as not fully stored",
+                         yuzu::log_id_token(agent_id),
+                         UnverifiedFrameRegistry::kDefaultMaxAgeSeconds);
+    }
+    if (noted.latched)
+        spdlog::warn("[ingest] the unverified-frame record cannot keep an entry: for the next "
+                     "{} s every agent answer is reported as not fully stored (agent={})",
+                     UnverifiedFrameRegistry::kDefaultMaxAgeSeconds, yuzu::log_id_token(agent_id));
+}
+
+bool AgentServiceImpl::unverified_frame_seen(const std::string& command_id,
+                                             const std::string& agent_id) {
+    return unverified_frames_.contains(command_id, agent_id, steady_seconds_now());
 }
 
 void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
                                            const std::string& agent_id,
                                            const pb::CommandResponse& resp,
-                                           const ResponseProvenance& prov) {
+                                           const ResponseProvenance& prov, bool response_dropped) {
     // Atomic snapshot — detached gateway-forward worker threads spawned
     // by ServerImpl::forward_gateway_pending outlive gRPC's Shutdown
     // drain (those threads are *clients* of the gateway, not server-side
@@ -2295,9 +2392,9 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
         // definition-less dispatch). Skipping it here avoids a wasted
         // write-pool lease + UPDATE on every guard push/reconcile response
         // (routine, high-frequency) for a claim that can structurally never
-        // exist. Deliberately NOT extended to `tar-` (Fable's other
-        // candidate): `tar` is also a REAL agent plugin name
-        // (agents/plugins/tar) that a per-device-gated definition could in
+        // exist. Deliberately NOT extended to `echo-` (Fable's other
+        // candidate): `echo` is also a REAL agent plugin name
+        // (agents/plugins/echo) that a per-device-gated definition could in
         // principle target — a string-prefix skip there would risk
         // silently skipping a legitimate release if that ever happens, and
         // nothing in the code (only today's content library) guarantees it
@@ -2376,6 +2473,7 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // #4990: shown at the Execution:Read tier (drawer, execution status, event stream and outbox),
     // below the Forensics tier of the plugin's own rows; see failure_text_for_sinks.
     s.error_detail = failure_text_for_sinks(prov.plugin, resp);
+    s.response_dropped = response_dropped;
     switch (resp.status()) {
     case pb::CommandResponse::RUNNING:
         s.status = "running";
@@ -2405,7 +2503,18 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     default:
         return;
     }
-    tracker->update_agent_status(execution_id, s);
+    // The row now carries the dropped-answer flag (sticky), so the record of an earlier unverified
+    // frame of this pair has done its job; a failed upsert keeps it for a replayed terminal frame.
+    // A lost answer whose row could not be written is recorded instead, so a later terminal or
+    // replayed frame of the pair still reports it. Noted even when a marker, a remembered command
+    // or the latch already reports the pair: those may expire first (note keeps an existing entry).
+    const bool recorded = tracker->update_agent_status(execution_id, s);
+    if (response_dropped) {
+        if (recorded)
+            unverified_frames_.forget(command_id, agent_id);
+        else
+            note_unverified_frame(command_id, agent_id);
+    }
 }
 
 void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const std::string& plugin,
@@ -2424,17 +2533,17 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
     auto& col_names = yuzu::server::columns_for_plugin(plugin);
     auto lines = yuzu::server::split_output_lines(raw_output);
     for (const auto& line : lines) {
-        // TAR warehouse protocol lines: __schema__ and __total__
-        if (plugin == "tar" && yuzu::server::is_tar_protocol_line(line)) {
+        // Echo warehouse protocol lines: __schema__ and __total__
+        if (plugin == "echo" && yuzu::server::is_echo_protocol_line(line)) {
             if (line.starts_with("__schema__|")) {
-                auto cols = yuzu::server::parse_tar_schema_line(line);
+                auto cols = yuzu::server::parse_echo_schema_line(line);
                 // M16: Validate schema line has non-empty columns
                 if (cols.empty())
                     continue;
                 // H14: Thread-safe per-instance cache with mutex
                 {
                     std::lock_guard lock(cmd_times_mu_);
-                    tar_dynamic_columns_ = cols;
+                    echo_dynamic_columns_ = cols;
                 }
                 // C1: HTML-escape column names to prevent XSS via AS aliases
                 std::string thead = "<thead id=\"results-thead\" hx-swap-oob=\"true\"><tr>"
@@ -2472,14 +2581,14 @@ void AgentServiceImpl::publish_output_rows(const std::string& agent_id, const st
             continue;
         }
 
-        // Use dynamic columns for TAR SQL results if available (H14: lock)
-        std::vector<std::string> tar_cols_copy;
+        // Use dynamic columns for Echo SQL results if available (H14: lock)
+        std::vector<std::string> echo_cols_copy;
         {
             std::lock_guard lock(cmd_times_mu_);
-            tar_cols_copy = tar_dynamic_columns_;
+            echo_cols_copy = echo_dynamic_columns_;
         }
         auto& effective_cols =
-            (!tar_cols_copy.empty() && plugin == "tar") ? tar_cols_copy : col_names;
+            (!echo_cols_copy.empty() && plugin == "echo") ? echo_cols_copy : col_names;
 
         auto count = output_row_count_.fetch_add(1, std::memory_order_relaxed) + 1;
         auto row_html = render_row(agent_name, plugin, line, effective_cols);

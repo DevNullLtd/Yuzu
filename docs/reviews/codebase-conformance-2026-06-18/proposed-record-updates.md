@@ -103,8 +103,8 @@ each cites its register row(s).
 - **`instr-21`:** "150/184 (82%)" headline is stale — reconcile with capability-map.
 
 ### `docs/os-capability-matrix.md`
-- **`agent-12` (contradiction):** Row 29 marks DEX perf telemetry "Linux ✅ … tar_perf.cpp", but
-  `tar_perf.cpp:190` is `kPlanned` on Linux (returns `valid=false`); `tar_schema_registry.cpp:296`
+- **`agent-12` (contradiction):** Row 29 marks DEX perf telemetry "Linux ✅ … echo_perf.cpp", but
+  `echo_perf.cpp:190` is `kPlanned` on Linux (returns `valid=false`); `echo_schema_registry.cpp:296`
   confirms `kPlanned`. Change Linux to ⛔/Planned. (This is exactly the "Linux-only-network gap" class
   of matrix overclaim the doc itself warns about.)
 
@@ -119,8 +119,8 @@ each cites its register row(s).
   either drop the hard numbers or refresh them.
 
 ### Smaller record fixes
-- **`tar-14`:** `tar-dashboard.md` §9 / `scope-walking-design.md` §11 mark PR-B/PR-C/PR-D pending — shipped.
-- **`tar-19`:** `asset-tagging-guide.md` ITServiceOwner lists 10 securable types; code seeds 16
+- **`echo-14`:** `echo-dashboard.md` §9 / `scope-walking-design.md` §11 mark PR-B/PR-C/PR-D pending — shipped.
+- **`echo-19`:** `asset-tagging-guide.md` ITServiceOwner lists 10 securable types; code seeds 16
   (`rbac_store.cpp:401-435`) with different names (Infrastructure vs Device, no Scope, Execution).
 - **`viz-24`:** `fleet-viz-invariants.md` PR7 states an 80 KB bundle soft cap — verify against the
   current `yuzu-viz.js` size and update the cap or note the overage.

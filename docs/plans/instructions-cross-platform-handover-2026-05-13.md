@@ -30,7 +30,7 @@ Files touched:
 | `content/definitions/discovery.yaml` | D | `type: query` → `question` for `device.discovery.scan_subnet` |
 | `content/definitions/deployment.yaml` | D | `type: query` → `question` for `server.deployment.list_jobs` |
 | `content/definitions/procfetch.yaml` | C | `platforms:` adds `darwin` |
-| `agents/plugins/tar/src/tar_plugin.cpp` | E | `tar.export` UNION ALL projects uniform `(source, ts, snapshot_id, action, summary)` |
+| `agents/plugins/echo/src/echo_plugin.cpp` | E | `echo.export` UNION ALL projects uniform `(source, ts, snapshot_id, action, summary)` |
 | `agents/plugins/agent_logging/src/agent_logging_plugin.cpp` | F | "no log file" → `status\|empty` rc=0 |
 | `agents/plugins/procfetch/src/procfetch_plugin.cpp` | C | macOS branch via `libproc` + OpenSSL EVP |
 | `agents/plugins/wifi/src/wifi_plugin.cpp` | C | macOS fallback to `system_profiler SPAirPortDataType` when `airport` is gone (Sonoma+) |
@@ -42,7 +42,7 @@ Plus one diagnostic-only CI workflow added at the tail end:
 1b20f6f ci: one-shot workflow_dispatch to validate Instructions gate on Shulgi
 ```
 
-Adds `.github/workflows/instructions-windows-validate.yml`. **Currently unusable** — GitHub requires `workflow_dispatch` workflow files to live on the default branch (`main`), but we work off `dev`/feature branches and don't PR direct to main. Two options on resume:
+Adds `.github/workflows/instructions-windows-validate.yml`. *(2026-11-10: the workflow was deleted by ADR-0035 ladder step 1.)* **Currently unusable** — GitHub requires `workflow_dispatch` workflow files to live on the default branch (`main`), but we work off `dev`/feature branches and don't PR direct to main. Two options on resume:
 - **Delete the workflow** — it's dead weight if we never restore Tailscale before merging through `dev` → `main` (which would land it via the normal flow anyway).
 - **Keep it** as a backup plan for a future session where Tailscale is also blocked.
 

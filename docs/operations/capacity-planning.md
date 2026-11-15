@@ -16,7 +16,7 @@
 | Response rows | ~1 KB | ~100 MB/day (100 commands/day/agent) |
 | Audit events | ~0.5 KB | ~50 MB/day |
 | Policy compliance | ~0.2 KB | ~10 MB/day |
-| TAR events (per agent) | ~0.3 KB/event | ~2-3 MB/day/agent |
+| Echo events (per agent) | ~0.3 KB/event | ~2-3 MB/day/agent |
 
 **Retention impact:** At default retention (90 days responses, 365 days audit), a 1,000-agent fleet needs ~15 GB for responses and ~18 GB for audit data.
 
@@ -29,19 +29,19 @@
 
 ## Agent Sizing
 
-| Resource | Typical | With TAR | Notes |
+| Resource | Typical | With Echo | Notes |
 |----------|---------|----------|-------|
 | RAM | 30-50 MB | 50-80 MB | Depends on active plugins |
-| Disk | 50 MB | 100 MB | Plugins + TAR database |
+| Disk | 50 MB | 100 MB | Plugins + Echo database |
 | CPU | < 1% idle | < 2% idle | Spikes during command execution |
 | Network | ~1 KB/30s | ~1 KB/30s | Heartbeat only when idle |
 
-The "Typical"/"With TAR" RAM figures above do not yet include one fixed addition: since #4666 PR-2,
+The "Typical"/"With Echo" RAM figures above do not yet include one fixed addition: since #4666 PR-2,
 the agent's async log hand-off queue pre-allocates 8193 x 408 bytes = 3,342,744 bytes (~3.34 MB, about
 3.19 MiB) of RSS unconditionally at startup, whether or not anything is logged. This is on top of both
 figures, on every OS.
 
-TAR disk usage: ~2-3 MB/day with 7-day retention (default). A busy workstation with many processes may use up to 10 MB/day.
+Echo disk usage: ~2-3 MB/day with 7-day retention (default). A busy workstation with many processes may use up to 10 MB/day.
 
 ## Gateway Sizing
 

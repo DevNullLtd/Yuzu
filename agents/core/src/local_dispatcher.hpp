@@ -4,7 +4,7 @@
  * local_dispatcher.hpp — agent-side in-process plugin dispatch.
  *
  * #1001 / arch-S3: PR 10 introduced an agent snapshot pump that needs
- * to invoke `tar.fleet_snapshot` locally and harvest its JSON payload
+ * to invoke `echo.fleet_snapshot` locally and harvest its JSON payload
  * without touching the gRPC channel. The first implementation hand-wired
  * a `capture` pointer onto CommandContextImpl and branched
  * `flush_output_locked` on `capture != nullptr` to avoid null-deref on
@@ -74,7 +74,7 @@ public:
     /// `result.captured`. Bounded by `capture_cap` — defaults to
     /// kCaptureMaxBytes so the fleet-topology snapshot contract is untouched;
     /// a caller with a larger bounded payload (the installed_software sync's
-    /// v2 rows, whose 12-field output outgrows 2 MiB around ~14k packages)
+    /// rows, whose 13-field output outgrows 2 MiB around ~14k packages)
     /// passes its own cap explicitly rather than raising the shared default.
     Result run(const YuzuPluginDescriptor* descriptor, std::string_view action,
                std::span<const YuzuParam> params = {},

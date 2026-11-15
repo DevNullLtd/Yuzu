@@ -29,9 +29,12 @@
  * event is delivered in admission order or counted as lost; two events for the
  * SAME rule_id never collapse into one slot (drift.detected, drift.remediated,
  * remediation.failed, guard.compliant, guard.unhealthy are all distinct census
- * signals - the server orders same-second events by ARRIVAL order, so reordering
- * is a correctness bug, not just a cardinality change). Bounded by BOTH
- * `max_events` and `max_bytes` (Event::ByteSizeLong(), computed once at offer()).
+ * signals - a server that does not compare the (boot_epoch, emit_seq) pair orders
+ * events with an identical stamp by ARRIVAL order (and flags the (agent, rule) census row),
+ * and the stamp pair itself is drawn in admission order, so reordering is a correctness bug,
+ * not just a cardinality change).
+ * Bounded by BOTH `max_events` and `max_bytes` (Event::ByteSizeLong() plus
+ * kEmitPairMaxWireBytes, computed once at offer()).
  *
  * LOSS ACCOUNTING AND THE STICKY INTEGRITY GAP. Every event this executor admitted
  * or was offered but the server will not receive is a *loss* except the two
@@ -78,6 +81,12 @@
  * the seq check alone only stops a superseded repair's Sent from erasing the
  * gap after the fact, it does not stop the repair from being SENT at all.
  *
+ * (UP-14) The wire `emit_seq` stamped in the same locked block is a SEPARATE draw,
+ * from the engine-shared GuardianEmitSeqSource, never `next_seq`: `next_seq` is
+ * per-executor and drives the gap logic above, while the wire value must order
+ * events across the legacy executor AND the Spark runtime. Both are taken once per
+ * offer() that reaches the lock, so both advance on a refused offer too.
+ *
  * `GapRecord::repair_seq` (0 = no repair outstanding) records the seq of the
  * repair CURRENTLY queued for that rule, if any - the successor to a plain
  * `repair_in_flight` bool, needed because a repair can be superseded (a newer
@@ -94,9 +103,10 @@
  * repair_seq at all), the repair is SKIPPED - never sent - and counted in
  * `repairs_suppressed`. This is the piece that actually closes the reported
  * symptom (a stale synthetic repair overwriting a newer real verdict on the
- * server via its own `updated_at >=` upsert guard): checking supersession only
- * at kick/fire time is not enough, because the supersession can happen AFTER
- * the repair is already queued and BEFORE it reaches the front.
+ * server via its own census ordering key; this check and SEQ-GUARDED CLEARING are
+ * the agent-side defence, independent of how the server orders): checking
+ * supersession only at kick/fire time is not enough, because the supersession can
+ * happen AFTER the repair is already queued and BEFORE it reaches the front.
  *
  * ADMISSION-TIME EPISODE BINDING (adversarial-review finding, 2026-09-24 - a
  * residual gap in SEQ-GUARDED CLEARING that DEQUEUE-TIME SUPERSESSION alone
@@ -195,6 +205,7 @@
  */
 
 #include "guardian_detached_worker_role.hpp" // GuardianDetachedWorkerRole
+#include "guardian_emit_seq.hpp"             // GuardianEmitSeqSource, stamp_emit_pair
 #include "guardian_io_executor.hpp"          // io_detail::spawn_detached
 
 #include "guaranteed_state.pb.h" // yuzu::guardian::v1::GuaranteedStateEvent
@@ -224,7 +235,9 @@
 
 namespace yuzu::agent {
 
-/// Outcome of one delivery attempt, reported by the injected send function.
+/// Outcome of one delivery attempt, reported by the injected send function. Sent means the
+/// event left the queue for good: written, or refused locally as unsendable (an empty rule_id,
+/// see AgentImpl::refuse_unsendable_guardian_event) without a Write.
 enum class LegacySendOutcome : std::uint8_t { Sent, LinkDown, WriteFailed };
 
 /**
@@ -298,7 +311,19 @@ public:
         std::size_t max_events{4096};
         std::size_t max_bytes{4u << 20};
         std::chrono::milliseconds stall_threshold{5'000};
+        /// UP-14: the engine-owned emit ordinal this executor draws its wire
+        /// `emit_seq` from, shared with the Spark runtime so one sequence covers both
+        /// emit paths. Null means a private epoch-0 source (nothing stamped on the
+        /// wire), which keeps every directly-constructed executor unchanged.
+        std::shared_ptr<GuardianEmitSeqSource> emit_seq_source;
     };
+
+    /// UP-14: the most wire bytes stamp_emit_pair() can add to an event. Fields 24
+    /// and 25 have tags 192 and 200, both >= 128, so each tag is a 2-byte varint;
+    /// each value is at most a 10-byte varint: 2 + 2 + 10 + 10 = 24. offer() adds
+    /// this to the pre-lock ByteSizeLong() so the byte cap accounts for the stamp
+    /// applied later, under the lock.
+    static constexpr std::size_t kEmitPairMaxWireBytes = 24;
 
     /// Admission outcome of offer(). Never describes the eventual SEND outcome -
     /// that is asynchronous and observed later via stats()/gapped_rules_needing_repair().
@@ -447,6 +472,8 @@ public:
         state_->max_events = cfg.max_events;
         state_->max_bytes = cfg.max_bytes;
         state_->stall_threshold = cfg.stall_threshold;
+        state_->emit_seq_source = cfg.emit_seq_source ? std::move(cfg.emit_seq_source)
+                                                      : std::make_shared<GuardianEmitSeqSource>(0);
     }
     GuardianLegacySinkExecutor(const GuardianLegacySinkExecutor&) = delete;
     GuardianLegacySinkExecutor& operator=(const GuardianLegacySinkExecutor&) = delete;
@@ -493,7 +520,11 @@ public:
             // (1) Compute the byte size and copy the identifying fields BEFORE
             // the lock - these allocate, and the strong-guarantee rollback below
             // relies on none of them having touched State yet.
-            const std::size_t bytes = ev.ByteSizeLong();
+            // UP-14: charge the worst-case emit-pair stamp now, so the cap check below
+            // (and the byte total the queue carries) already includes the bytes the
+            // stamp adds under the lock. An unconditional over-count, not a measured one:
+            // the stamp is applied later and its varint widths are not known here.
+            const std::size_t bytes = ev.ByteSizeLong() + kEmitPairMaxWireBytes;
             rule_id = ev.rule_id();
             guard_type = ev.guard_type();
             rule_name = ev.rule_name();
@@ -520,6 +551,16 @@ public:
                 // deliberately stays ahead of the throwing step rather than being
                 // pushed below it.
                 const std::uint64_t seq = ++state_->next_seq;
+                // UP-14: the wire ordinal is a SEPARATE draw from `seq` above (which
+                // drives SEQ-GUARDED CLEARING and must not change). It is taken here,
+                // under the same lock that decides queue order, so wire emit_seq order
+                // equals FIFO order equals send order; and BEFORE the outcome is
+                // decided or `ev` is moved into the queue, so a refused offer consumes
+                // a value (a harmless gap - consumers compare, never assume
+                // consecutive) exactly as it consumes `seq`. With a boot_epoch of 0 the
+                // value is still drawn but stamp_emit_pair() writes nothing.
+                stamp_emit_pair(ev, state_->emit_seq_source->boot_epoch,
+                                state_->emit_seq_source->draw());
                 if (state_->stopping) {
                     // Not a "loss" counter by design - see the class doc comment's
                     // loss table (discarded_at_stop is deliberately not events_lost).
@@ -546,8 +587,9 @@ public:
                 } else {
                     // (3) The list-node allocation - the LAST throwing step; on
                     // throw, nothing above this point mutated State EXCEPT the seq
-                    // counter bump above, which is deliberately harmless to lose
-                    // track of on rollback (see the comment on that bump).
+                    // counter bump above (and the UP-14 emit draw beside it), which are
+                    // deliberately harmless to lose track of on rollback (see the
+                    // comment on that bump).
                     if (admission_fault_for_test() == AdmissionFaultForTest::ThrowOnNode)
                         throw std::bad_alloc{};
                     state_->queue.push_back(Item{std::move(ev), std::move(send), rule_id, bytes,
@@ -994,6 +1036,10 @@ private:
         /// offer() call that reaches the lock (admitted or refused alike) gets the
         /// next value. See the class doc comment's SEQ-GUARDED CLEARING section.
         std::uint64_t next_seq{0};
+        /// UP-14: never null (the constructor substitutes a private epoch-0 source).
+        /// Drawn from under `mu` in offer(); see the class doc comment's SEQ-GUARDED
+        /// CLEARING section for why this is a SEPARATE counter from `next_seq`.
+        std::shared_ptr<GuardianEmitSeqSource> emit_seq_source;
         /// #4783 Gate 4 UP-2: bumped once per kick() call (the first statement in
         /// its locked block, before any other kick() logic) - the "round number"
         /// stamped onto GapRecord::last_attempt_kick when a repair is queued for a
@@ -1177,7 +1223,8 @@ private:
             // AFTER it was already dequeued and sending.
             if (auto gi = st.gaps.find(it.rule_id); gi != st.gaps.end()) {
                 if (it.seq > gi->second.lost_seq) {
-                    st.gaps.erase(gi); // confirmed delivered, strictly newer than any known loss
+                    // delivered or disposed (Sent), strictly newer than any known loss
+                    st.gaps.erase(gi);
                     // #4783 Gate 4 UP-3: a gap CLEAR is the other half of
                     // change_gen's contract (record_gap_locked bumps it on every
                     // LOSS) - a caller comparing generations must see this too,

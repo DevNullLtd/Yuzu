@@ -27,7 +27,16 @@
 %%% In every mode the peer must carry serverAuth, and a certificate whose SERIAL
 %%% is in `{yuzu_gw, mgmt_peer_denied}' is refused even when it would otherwise
 %%% be admitted. Order: decode, serverAuth, mode (identity and/or pin),
-%%% deny-list. Rejection reasons are a closed set (yuzu_gw_telemetry).
+%%% deny-list, CA revocation list. Rejection reasons are a closed set (yuzu_gw_telemetry).
+%%%
+%%% Revocation (#6016 PR 4b). With `{yuzu_gw, mgmt_crl_source}' set, a peer that would otherwise be
+%%% admitted must also not be on the install CA's CRL, which yuzu_gw_mgmt_crl_source loads, verifies
+%%% by signature and publishes (see that module for the configuration and for what keeps the last
+%%% good CRL). Three reasons: `revocation_unknown' (no CRL loaded yet, or the loaded one was issued
+%%% by another CA than the peer's), `revocation_stale' (past nextUpdate plus the grace) and
+%%% `crl_revoked' (the peer's serial is listed). The CRL never removes a denial: the deny-list stays
+%%% an independent manual override. The check applies to every admitted peer in every mode, so set
+%%% a source only when the server's certificate is issued by the CA that signs the CRL.
 %%%
 %%% Pin model: `{yuzu_gw, mgmt_peer_pins}` is a list of
 %%%   {cert_file, Path}       — pin to the SPKI of the FIRST certificate in
@@ -86,7 +95,7 @@
 
 -export([check_mgmt_peer/1, init_log_limits/0]).
 %% exported for testing (spki_sha256/1 is also yuzu_gw_mgmt_pins')
--export([check_peer/2, check_peer/3, spki_sha256/1, has_server_auth_eku/1,
+-export([check_peer/2, check_peer/3, check_peer/4, spki_sha256/1, has_server_auth_eku/1,
          server_uri_sans/1, serial_number/1, resolve_pin/1]).
 
 -define(IDENTITY, <<"yuzu-server">>).
@@ -115,12 +124,19 @@ check_peer(DerCert, Pins) ->
 %% -- exported for testing.
 -spec check_peer(public_key:der_encoded(), term(), yuzu_gw_mgmt_identity:state()) ->
           {true, binary()} | false.
-check_peer(_DerCert, [], #{mode := pin}) ->
+check_peer(DerCert, Pins, Auth) ->
+    check_peer(DerCert, Pins, Auth, os:system_time(second)).
+
+%% @doc As check_peer/3 with the clock injected (seconds since the epoch): the only thing the
+%% revocation list's freshness reads it for -- exported for testing.
+-spec check_peer(public_key:der_encoded(), term(), yuzu_gw_mgmt_identity:state(), integer()) ->
+          {true, binary()} | false.
+check_peer(_DerCert, [], #{mode := pin}, _Now) ->
     %% Installed auth_fun in pin mode but no pins configured: fail closed. The
     %% boot guard refuses this posture on an exposed listener; this is the
     %% runtime backstop.
     reject(no_pins_configured);
-check_peer(DerCert, Pins, #{mode := Mode} = Auth) when is_list(Pins) ->
+check_peer(DerCert, Pins, #{mode := Mode} = Auth, Now) when is_list(Pins) ->
     case spki_sha256(DerCert) of
         {ok, PeerSpki} ->
             case has_server_auth_eku(DerCert) of
@@ -129,7 +145,23 @@ check_peer(DerCert, Pins, #{mode := Mode} = Auth) when is_list(Pins) ->
                         {admit, Method} ->
                             case denied(DerCert, Auth) of
                                 true  -> reject(revoked);
-                                false -> admitted(Method)
+                                false ->
+                                    %% Spelled out, one literal per reason: the closed set is
+                                    %% checked against this file's reject/1 calls
+                                    %% (yuzu_gw_telemetry_tests), and a reason added to
+                                    %% yuzu_gw_mgmt_crl:check/4 without a line here is an
+                                    %% internal_error refusal, never an admission.
+                                    case crl_decision(DerCert, Now) of
+                                        ok -> admitted(Method);
+                                        {reject, revocation_unknown} ->
+                                            reject(revocation_unknown);
+                                        {reject, revocation_stale} ->
+                                            reject(revocation_stale);
+                                        {reject, crl_revoked} ->
+                                            reject(crl_revoked);
+                                        {reject, bad_peer_cert} ->
+                                            reject(bad_peer_cert)
+                                    end
                             end;
                         {reject, Reason} ->
                             reject(Reason)
@@ -140,7 +172,7 @@ check_peer(DerCert, Pins, #{mode := Mode} = Auth) when is_list(Pins) ->
         error ->
             reject(bad_peer_cert)
     end;
-check_peer(_DerCert, _Bad, _Auth) ->
+check_peer(_DerCert, _Bad, _Auth, _Now) ->
     reject(bad_pin_config).
 
 %% What admits the peer, per mode. Either path alone is enough in
@@ -220,6 +252,18 @@ identity_decision(Der, #{identity := Identity}) when is_binary(Identity) ->
     end;
 identity_decision(_Der, _Auth) ->
     {reject, identity_unresolved}.
+
+%% The CA's revocation list, when a `mgmt_crl_source' is configured (#6016 PR 4b): a persistent_term
+%% read of what yuzu_gw_mgmt_crl_source published, no I/O here. Without a source there is no check.
+%% With one, the peer is refused until a CRL has loaded (revocation_unknown), once the loaded one
+%% is past nextUpdate plus the grace (revocation_stale), and when its serial is listed (crl_revoked).
+crl_decision(Der, Now) ->
+    case yuzu_gw_mgmt_crl_source:policy() of
+        none ->
+            ok;
+        #{grace_s := Grace} ->
+            yuzu_gw_mgmt_crl:check(yuzu_gw_mgmt_crl_source:current(), Der, Now, Grace)
+    end.
 
 denied(_Der, #{denied := []}) ->
     false;
@@ -381,7 +425,7 @@ reject(Reason) ->
       {mgmt_peer_rejected, Reason},
       "mgmt-plane peer rejected: ~p (CA-issued cert is not "
       "authorization to command the fleet — see mgmt_peer_auth_mode, "
-      "mgmt_peer_pins)",
+      "mgmt_peer_pins, mgmt_crl_source)",
       [Reason]),
     false.
 

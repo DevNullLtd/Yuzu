@@ -51,9 +51,13 @@ struct UninstallRoot {
     HKEY root;
     std::wstring subkey;
     REGSAM extra_sam;
-    // true for HKCU and HKLM-32: a user hive often has no Uninstall key, a host
-    // without WoW64 has no WOW6432Node one
+    // true for HKCU and, on a 32-bit OS only, HKLM-32: a user hive often has no Uninstall key, a
+    // host without WoW64 has no WOW6432Node one (the rows of windows_roots() in the plugin)
     bool absent_ok;
+    // false for the agent identity's OWN HKCU: per-user data, so a failed read of it is logged
+    // (failed_roots) but never degrades the machine-scope collection. The default keeps the
+    // per-user walks strict.
+    bool degrades_walk{true};
 };
 
 struct WalkResult {
@@ -164,10 +168,10 @@ WalkResult collect_uninstall_apps(std::span<const UninstallRoot> roots,
                                   const Ops& ops = Ops{}) {
     WalkResult out;
     for (std::size_t i = 0; i < roots.size(); ++i) {
-        if (enumerate_uninstall_key(roots[i], out.apps, ops) == HiveRead::failed) {
-            out.degraded = true;
+        const HiveRead read = enumerate_uninstall_key(roots[i], out.apps, ops);
+        out.degraded = out.degraded || parsers::walk_degrades(read, roots[i].degrades_walk);
+        if (read == HiveRead::failed)
             out.failed_roots.push_back(i);
-        }
     }
     return out;
 }
@@ -193,6 +197,7 @@ int list_inventory(Ctx& ctx, std::span<const UninstallRoot> roots, const Ops& op
         r.version = std::move(app.version);
         r.publisher = std::move(app.publisher);
         r.install_date = std::move(app.install_date);
+        r.install_location = std::move(app.install_location);
         r.kind = "app";
         r.ecosystem = "windows";
         // epoch/release/signature honest-empty: the Uninstall hive stores no

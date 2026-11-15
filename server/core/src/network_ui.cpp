@@ -13,6 +13,7 @@
 
 #include "network_routes.hpp"
 
+#include "dex_pane.hpp"
 #include "web_utils.hpp"
 
 #include <cctype>
@@ -56,8 +57,8 @@ std::string placeholder(const std::string& title, const std::string& sub) {
 
 // A drill anchor: hx-get the fragment into the shared page mount (#guardian-detail).
 std::string drill(const std::string& path_qs, const std::string& disp) {
-    return "<a hx-get=\"" + path_qs + "\" hx-target=\"#guardian-detail\" "
-           "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" + disp + "</a>";
+    return "<a hx-get=\"" + path_qs + "\"" + std::string(kDexPaneSwapAttrs) +
+           " style=\"cursor:pointer;\">" + disp + "</a>";
 }
 
 std::string fmt_ms(double v) { return std::format("{:.0f} ms", v); }
@@ -103,15 +104,75 @@ std::string cell(const std::optional<double>& v, Unit u) {
     return v ? fmt_val(*v, u) : std::string("<span class=\"gp-mute\">&mdash;</span>");
 }
 
-} // namespace
-
-std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
+// Wraps the quality body with the back link, DEX sub-nav, the Quality / Discovered
+// tab strip, both panels and the tab script. The Discovered anchor always carries an
+// href so it is focusable and Enter-activatable; htmx leaves a fragment href alone,
+// so the hash is set natively and doubles as the /network#discovered deep link.
+// Inline onclick + a body listener (never hx-on); the listener is registered once per
+// page life via a window flag because this fragment re-renders on every sub-nav visit.
+// The discovered fragment gates on Infrastructure:Read while the overview gates on
+// GuaranteedState:Read, and htmx drops a non-2xx body, so the error handler paints it.
+// The deep-link boot calls htmx.ajax directly: this script runs during the swap, before
+// htmx has processed the new anchor's hx-get, so a synthetic click would fire no request.
+std::string network_overview_shell(const std::string& quality_body) {
     std::string h;
     h += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
     // The DEX sub-nav with "network" active (Network sits under DEX). This is a
     // now-view with no window of its own, so the threaded window is the DEX
     // default (7 = "7d") — it only governs which window a sibling signal tab opens.
     h += dex_subnav("network", 7);
+    h += "<div class=\"gp-subnav\" id=\"net-tabs\" role=\"tablist\">"
+         "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\" "
+         "onclick=\"netTab('quality');return false\">Quality</a>"
+         "<a href=\"#discovered\" role=\"tab\" aria-selected=\"false\" "
+         "hx-get=\"/fragments/network/discovered\" hx-target=\"#net-discovered\" "
+         "hx-swap=\"innerHTML\" hx-sync=\"this:drop\" onclick=\"netTab('discovered')\">"
+         "Discovered</a></div>";
+    h += "<div id=\"net-quality\">" + quality_body + "</div>";
+    // class="panel": yuzu.css scopes the dense-table / empty-note rules under .panel.
+    h += "<div id=\"net-discovered\" class=\"panel\" hidden><div class=\"gp-placeholder\">"
+         "Loading discovered hosts&hellip;</div></div>";
+    h += "<script>"
+         "window.netTab=function(t){var q=t==='quality';"
+         "document.getElementById('net-quality').hidden=!q;"
+         "document.getElementById('net-discovered').hidden=q;"
+         "var a=document.querySelectorAll('#net-tabs a');"
+         "for(var i=0;i<a.length;i++){var on=(i===0)===q;"
+         "a[i].className=on?'on':'';a[i].setAttribute('aria-selected',on?'true':'false');}"
+         // Quality leaves the hash behind otherwise, so a re-render would re-open
+         // Discovered. Discovered sets '#discovered' natively via its href.
+         "if(q&&location.hash)history.replaceState(null,'',location.pathname+location.search);};"
+         "if(!window.__netErr){window.__netErr=1;"
+         "['htmx:responseError','htmx:sendError','htmx:timeout'].forEach(function(n){"
+         "document.body.addEventListener(n,function netFail(e){"
+         "var t=e.detail.target;if(!t||t.id!=='net-discovered')return;"
+         "var s=e.detail.xhr&&e.detail.xhr.status;"
+         "if(s===401){location.href='/login';return}"
+         "t.innerHTML=s===403?'<div class=\"failbox\" role=\"alert\">Your account cannot read "
+         "discovered hosts. This list needs the Infrastructure:Read permission and is not "
+         "available to service-scoped or group-confined accounts.</div>'"
+         ":'<div class=\"failbox\" role=\"alert\">Discovered hosts could not be read just now. "
+         "Try again in a moment.</div>';});});"
+         // Back/Forward: act only when the visible tab disagrees with the hash. A
+         // Discovered click already ran onclick + hx-get, so its hashchange no-ops.
+         "window.addEventListener('hashchange',function(){"
+         "var p=document.getElementById('net-discovered');if(!p)return;"
+         "var d=location.hash==='#discovered';if(p.hidden!==d)return;"
+         "netTab(d?'discovered':'quality');"
+         "if(d)htmx.ajax('GET','/fragments/network/discovered',"
+         "{target:'#net-discovered',swap:'innerHTML'});});}"
+         "if(location.hash==='#discovered'){netTab('discovered');"
+         "htmx.ajax('GET','/fragments/network/discovered',"
+         "{target:'#net-discovered',swap:'innerHTML'});}"
+         "</script>";
+    return h;
+}
+} // namespace
+
+std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
+    // Quality body is built first so the tab strip, both panels and the script
+    // wrap every return path (the no-telemetry placeholder included).
+    std::string h;
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Network quality &mdash; fleet"
          "</h1></div><div class=\"gp-sub\">Device / <b>local-link</b> health, measured on each "
          "endpoint from kernel counters (no packet capture, no flow export) and rolled up across the "
@@ -129,7 +190,7 @@ std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
         h += placeholder("No network telemetry yet",
                          "No device reported a network sample this cycle. Devices appear here within "
                          "a heartbeat of coming online (and of network collection being enabled).");
-        return h;
+        return network_overview_shell(h);
     }
     h += "<div class=\"gp-tiles\">";
     if (now.rtt)
@@ -183,7 +244,7 @@ std::string render_network_overview_fragment(const NetPerfFleetNow& now) {
          "<i>where the pain is</i> view &mdash; is gated on that classification. Both land once there "
          "is baseline data to calibrate against. Until then this page is honest evidence, not a "
          "verdict.</div>";
-    return h;
+    return network_overview_shell(h);
 }
 
 std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>& rows,
@@ -223,8 +284,8 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
     }
 
     std::string h = dex_fragment_style();
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/network/overview\" hx-target=\"#guardian-detail\" "
-         "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">&larr; Network quality</a>";
+    h += "<a class=\"gp-back\" hx-get=\"/fragments/network/overview\"" + std::string(kDexPaneSwapAttrs) +
+         " style=\"cursor:pointer;\">&larr; Network quality</a>";
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + title +
          "</h1></div><div class=\"gp-sub\">Values are each device&rsquo;s current heartbeat sample "
          "&mdash; the same data the fleet cards aggregate. The device/app flags are <b>measured "
@@ -240,8 +301,7 @@ std::string render_network_devices_fragment(const std::vector<NetPerfDeviceRow>&
         h += "<div class=\"gp-note\">cohort by tag key: <select name=\"key\" "
              "hx-get=\"/fragments/network/devices?metric=" +
              std::string(metric_token) +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
-             "class=\"dx-ctl\">";
+             "\"" + std::string(kDexPaneSwapAttrs) + " hx-trigger=\"change\" class=\"dx-ctl\">";
         h += "<option value=\"\"" + std::string(cohort_key.empty() ? " selected" : "") +
              ">(none)</option>";
         bool key_listed = false;

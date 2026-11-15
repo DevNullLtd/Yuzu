@@ -27,7 +27,70 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <optional>
+#include <string>
+#include <vector>
+
 namespace yuzu::server {
+
+/// The most agent ids a run row stores in `agent_ids_json`. The run itself always targets the FULL
+/// list the caller named; only the stored copy is bounded, so a looped run over a huge list cannot
+/// grow `workflow_executions` by ~1.3 MB a row. 1000 ids of up to 128 bytes is 131,001 bytes of
+/// JSON text.
+inline constexpr std::size_t kStoredAgentIdsMax = 1000;
+
+/// The most bytes of JSON text a run row stores in `agent_ids_json`, the marker included: 1000 ids
+/// of the 128 bytes the v1 and MCP routes allow, quoted and comma-separated, is 131,001 bytes. The
+/// legacy execute route checks no id length, so the count alone does not bound the column.
+inline constexpr std::size_t kStoredAgentIdsColumnMaxBytes = 131072;
+
+/// An id longer than this, or containing a NUL byte, is never stored (it is counted in the marker's
+/// total and digest). This is `auth::kMaxAgentIdLength`, the longest id any agent can have, and
+/// registration refuses a NUL, so no real device is dropped.
+inline constexpr std::size_t kStoredAgentIdSkipBytes = 256;
+
+/// Bytes held back from the budget for the truncation marker (about 125 with a 20 digit total).
+inline constexpr std::size_t kStoredAgentIdsMarkerReserve = 160;
+
+/// The `agent_ids_json` text a run row stores for `agent_ids`.
+///
+/// The ids are first reduced to the DISTINCT ids in first-seen order (duplicates are dropped before
+/// any bound, so padding a list with copies of one id cannot push a real id out). If every distinct
+/// id is at most `kStoredAgentIdSkipBytes` long and holds no NUL byte, there are at most `max` of
+/// them and their JSON text is at most `max_bytes`, the column is that JSON array of strings, and a
+/// list with no duplicates is stored unchanged. Otherwise it holds the ids admitted in this order:
+/// those for which `first` answers true (the caller's own visible devices, so a confined caller can
+/// still see the run it started), then the rest, each group in first-seen order. Admission stops at `max` ids or when
+/// the next id would take the text past `max_bytes` less `kStoredAgentIdsMarkerReserve`; an id over
+/// `kStoredAgentIdSkipBytes`, or holding a NUL byte, is skipped (so a copy that skipped one carries
+/// the marker even for a short list). The array is then followed by ONE non-string element, the
+/// marker `{"truncated":true,"total":<DISTINCT ids named>,"sha256":"<hex>"}`. `total` counts every
+/// distinct id including the skipped ones; `sha256` is the digest of the JSON text of the distinct
+/// list in first-seen order (the order the dispatcher received it, not the stored order), and is
+/// null if the digest provider failed. The marker is an object so every reader that takes only
+/// string elements (`workflow_execution_visible`, `confined_workflow_agent_ids_json`, the list SQL)
+/// skips it with no change, and the column stays a valid JSON array. `max` and `max_bytes` are
+/// seams for tests. The run is dispatched with the list as the caller sent it, never this one.
+[[nodiscard]] std::string stored_agent_ids_json(
+    const std::vector<std::string>& agent_ids,
+    const std::function<bool(const std::string&)>& first = {},
+    std::size_t max = kStoredAgentIdsMax, std::size_t max_bytes = kStoredAgentIdsColumnMaxBytes);
+
+/// The number of distinct agent ids the run named when `agent_ids_json` holds a truncated copy (the
+/// `stored_agent_ids_json` marker), or `nullopt` for a complete copy, a malformed column or a
+/// marker without a usable count.
+[[nodiscard]] std::optional<std::int64_t> stored_agent_ids_total(const std::string& agent_ids_json);
+
+/// Adds `agent_ids_truncated: true` to a run detail object when `agent_ids_json` holds a truncated
+/// copy, and, for an UNCONFINED reader only, `agent_ids_total` (the count the run named). Nothing
+/// is added for a complete copy. The total is withheld from a confined reader on the same ground
+/// as a step's `agents_reached`: it would disclose how many agents the run named beyond the
+/// reader's scope. One function for the v1 twin, MCP and the legacy route so they cannot drift.
+void add_agent_ids_bound(nlohmann::json& detail, const std::string& agent_ids_json,
+                         bool confined);
 
 /// List-row shape for `GET /api/workflows` / `GET /api/v1/workflows` / MCP
 /// `list_workflows` — per-step summary (no `yaml_source`). Unlike the

@@ -48,10 +48,15 @@ using yuzu::server::twin_table::kExpectedTwins;
 
 namespace {
 
-// Registry tools that no ledger row names as its mcp_twin yet. Empty today: every registry tool
-// is ledgered. Shrink-only: never add a name, ledger the tool.
-const std::set<std::string> kLedgerBackfill{};
-constexpr std::size_t kLedgerBackfillCap = 0;
+// Registry tools that no ledger row names as its mcp_twin yet. Shrink-only: never add a name,
+// ledger the tool. ONE recorded exception (owner ruling on #6558 PR 2, tracked by #6700): these
+// three /crypto tools have a REST twin that exists only under /api/v1, and the ledger keys rows on
+// fragment/legacy routes (a v1-keyed row is legal only with an `exception:` status, which would
+// be false for a tool that HAS a twin), so no legal row exists yet. #6700 decides the row shape;
+// the change that lands it deletes these three names and lowers the cap back to 0.
+const std::set<std::string> kLedgerBackfill{"export_crypto_cbom", "list_crypto_widgets",
+                                            "set_crypto_dashboard_layout"};
+constexpr std::size_t kLedgerBackfillCap = 3;
 
 // Registry tools with no kExpectedTwins row yet. discover_routes is ledgered (settings.json) but
 // its gate is not pinned in the twin table. Shrink-only: delete the entry when the row lands.

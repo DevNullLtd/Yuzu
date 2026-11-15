@@ -82,9 +82,9 @@ cases at seed `2353298010`: the new lifecycle fixture left process-global
 cancellation enabled. Isolated subprocess tests passing did not close that defect.
 The repaired fixture restores the prior state after stopping and joining the agent;
 the same-seed full rerun above passes. The final combined command,
-`meson test -C build-macos --no-rebuild --suite agent --suite tar --print-errorlogs`,
+`meson test -C build-macos --no-rebuild --suite agent --suite echo --print-errorlogs`,
 also exits 0: all five targets passed, including the full agent target (103.74
-seconds), TAR (1.93 seconds) and packaging (3.76 seconds).
+seconds), Echo (1.93 seconds) and packaging (3.76 seconds).
 
 The final development package was rebuilt after the recovery fixes. Its expanded
 preinstall, postinstall and native JXA helper match current source byte-for-byte.

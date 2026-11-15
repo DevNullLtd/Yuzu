@@ -80,17 +80,24 @@ function showError(rootEl, msg) {
 const MONO_FONT = getComputedStyle(document.documentElement)
   .getPropertyValue('--mds-font-family-mono').trim() || 'monospace';
 
+// Read a CSS custom property off <html> (the active colour scheme), falling
+// back when the token is unset. The theme boot script runs before this module.
+function cssToken(name, fallback) {
+  return (getComputedStyle(document.documentElement).getPropertyValue(name) || '').trim() || fallback;
+}
+
 // PR 6: per-OS cube colour palette. Keys match the lowercase substring we
 // expect in `MachineNode.os` from fleet_topology.v1; default covers
-// agents whose os field is empty or unknown. Slate data colours from
-// yuzu.css (--c2, --c3, --c1, --mut); opacity is set on the material,
-// not the colour, so colour stays vivid through transparency.
+// agents whose os field is empty or unknown. Data colours read from the
+// yuzu.css tokens (--c2, --c3, --c1, --mut) so every scheme applies; opacity
+// is set on the material, not the colour, so colour stays vivid through
+// transparency.
 const OS_PALETTE = {
-  linux:   '#2dd4bf',  // --c2
-  darwin:  '#f5c542',  // --c3
-  macos:   '#f5c542',
-  windows: '#4c9aff',  // --c1
-  default: '#9aa2ae'   // --mut
+  linux:   cssToken('--c2', '#2dd4bf'),
+  darwin:  cssToken('--c3', '#f5c542'),
+  macos:   cssToken('--c3', '#f5c542'),
+  windows: cssToken('--c1', '#4c9aff'),
+  default: cssToken('--mut', '#9aa2ae')
 };
 function pickOsColor(osName) {
   if (!osName) return OS_PALETTE.default;
@@ -103,18 +110,18 @@ function pickOsColor(osName) {
 
 // PR 7: per-category process-node palette. Keys exactly match the lowercase
 // strings emitted by category_to_string() in process_category.hpp; any
-// string not in the table falls through to `other`. Slate data colours
-// from yuzu.css (--mut, --c1, --c3, --c2, --c5, --faint) for contrast
-// against the cube's translucent shell on the dark canvas. Pinned
+// string not in the table falls through to `other`. Data colours read from
+// yuzu.css (--mut, --c1, --c3, --c2, --c5, --faint) so each scheme keeps its
+// contrast against the cube's translucent shell. Pinned
 // in test_static_js_bundle.cpp — the palette is a UX contract; changing
 // a colour is deliberate, not incidental.
 const CATEGORY_PALETTE = {
-  system:   '#9aa2ae',
-  browser:  '#4c9aff',
-  database: '#f5c542',
-  web:      '#2dd4bf',
-  runtime:  '#a78bfa',
-  other:    '#9199a6'
+  system:   cssToken('--mut', '#9aa2ae'),
+  browser:  cssToken('--c1', '#4c9aff'),
+  database: cssToken('--c3', '#f5c542'),
+  web:      cssToken('--c2', '#2dd4bf'),
+  runtime:  cssToken('--c5', '#a78bfa'),
+  other:    cssToken('--faint', '#9199a6')
 };
 function pickCategoryColor(category) {
   if (!category) return CATEGORY_PALETTE.other;
@@ -359,7 +366,7 @@ function buildCube(machine) {
 const PROCESS_DOT_RADIUS = 0.22;
 const PROCESS_INTERIOR_FRACTION = 0.78;
 // gov R7 CAP-1: soft cap on dots rendered per cube. Agent-side
-// `tar.fleet_snapshot` already truncates at `kFleetSnapshotMaxRows`
+// `echo.fleet_snapshot` already truncates at `kFleetSnapshotMaxRows`
 // (4096); this bound is for graceful degradation when an agent on
 // a heavily-threaded host (e.g. a JVM with thousands of threads)
 // exceeds typical visualization tolerances. Operator sees 1000 dots;
@@ -370,7 +377,7 @@ const PROCESS_PER_CUBE_SOFT_CAP = 1000;
 function placeProcessesInCube(processes, cubeSize) {
   if (!processes || processes.length === 0) return [];
   const N = processes.length;
-  // gov: process count from the server is bounded by tar.fleet_snapshot
+  // gov: process count from the server is bounded by echo.fleet_snapshot
   // truncation (per machine), so N stays in low thousands worst-case.
   const buckets = Math.max(2, Math.ceil(Math.cbrt(Math.max(N * 1.5, 8))));
   const span = cubeSize * PROCESS_INTERIOR_FRACTION;
@@ -448,10 +455,12 @@ function buildHostnameLabel(hostname) {
   canvas.width = 256;
   canvas.height = 64;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(20,23,28,0.6)';  // --bg
+  ctx.fillStyle = cssToken('--bg', '#14171c');
+  ctx.globalAlpha = 0.6;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalAlpha = 1;
   ctx.font = '500 24px ' + MONO_FONT;
-  ctx.fillStyle = '#c4cad3';  // --ink2
+  ctx.fillStyle = cssToken('--ink2', '#c4cad3');
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   let label = String(hostname || '(unknown)');
@@ -612,10 +621,12 @@ function buildPortLabel(port) {
   canvas.width = 96;
   canvas.height = 40;
   const ctx = canvas.getContext('2d');
-  ctx.fillStyle = 'rgba(20,23,28,0.7)';  // --bg
+  ctx.fillStyle = cssToken('--bg', '#14171c');
+  ctx.globalAlpha = 0.7;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.globalAlpha = 1;
   ctx.font = '500 22px ' + MONO_FONT;
-  ctx.fillStyle = '#ff6b7a';  // --c4, matches the listener sphere
+  ctx.fillStyle = cssToken('--c4', '#ff6b7a');  // the sphere itself stays 0xff6b7a on every scheme
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(':' + port, canvas.width / 2, canvas.height / 2);
@@ -1080,7 +1091,7 @@ function mount() {
       // the OrbitControls camera moves or as PR 11 toggles per-cube
       // visibility for LOD culling. Layout coordinates are cube-local.
       //
-      // gov R7 CAP-1: agent-side `tar.fleet_snapshot` caps at
+      // gov R7 CAP-1: agent-side `echo.fleet_snapshot` caps at
       // kFleetSnapshotMaxRows (4096 today). At the documented
       // machines_max ceiling (100k) the worst-case fleet would render
       // 4096 × 100,000 = 409M dots — well past anything WebGL can
@@ -1668,7 +1679,7 @@ function mount() {
 
   // ── PR 6: data fetch ──────────────────────────────────────────────────
   // Asynchronous because the cache-cold path on the server can take up to
-  // 5 s (fleet-wide tar.fleet_snapshot dispatch). Surface failures via
+  // 5 s (fleet-wide echo.fleet_snapshot dispatch). Surface failures via
   // #viz-error rather than letting the scene sit empty.
   function setError(msg) {
     const e = root.querySelector('#viz-error');

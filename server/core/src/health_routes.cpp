@@ -1,4 +1,5 @@
 #include "health_routes.hpp"
+#include "model_param_helpers.hpp"
 
 #include "home_panels_render.hpp"
 #include "http_route_sink.hpp"
@@ -14,6 +15,7 @@
 #include "baseline_store.hpp"
 #include "ca_store.hpp"
 #include "crypto_dashboard_layout_store.hpp"
+#include "revocation_source_store.hpp"
 #include "custom_properties_store.hpp"
 #include "default_certs.hpp"
 #include "deployment_store.hpp"
@@ -44,6 +46,7 @@
 #include "process_health.hpp"
 #include "product_pack_store.hpp"
 #include "product_registry_store.hpp"
+#include "software_collection_settings_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
@@ -147,6 +150,32 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
                 deps.leader_loop_errors ? deps.leader_loop_errors->load(std::memory_order_relaxed)
                                         : 0,
                 yuzu::server::LeaderMetricsPublisher::steady_now_ns());
+        }
+        // #6527: CRL freshness. Absolute timestamps, not "seconds remaining", so a scrape whose
+        // read fails or is skipped leaves the last value in place and Prometheus's `- time()`
+        // keeps counting down from it: for ONE replica that value stays true (only a publish moves
+        // nextUpdate). With several replicas a replica whose reads keep failing holds an OLDER
+        // nextUpdate than the shared row, which is why the alerts aggregate `max by (job)`: the
+        // freshest replica wins and a stale one cannot page. Nothing is published while no CRL
+        // exists, and a successful read that finds no row also leaves the last value (the re-root
+        // runbook restarts every instance, docs/pki-architecture.md). Every replica reads the shared
+        // row, so a wedged or absent leader is visible from any scrape. The read omits the DER; the
+        // pool lease wait is bounded by the store's read timeout (the query itself by the pool's
+        // statement timeout). It is skipped while the reachability probe (no I/O) says Postgres is
+        // down, so this series adds no stall to a scrape during that outage; a null probe means
+        // "unknown", so the read proceeds.
+        const bool pg_known_down =
+            deps.pg_reachability_probe &&
+            yuzu::server::pg_reachability::classify(deps.pg_reachability_probe->snapshot(),
+                                                    yuzu::server::PgReachabilityProbe::now_ns()) !=
+                yuzu::server::pg_reachability::Verdict::Ready;
+        if (!pg_known_down && deps.ca_store && deps.ca_store->is_open()) {
+            if (auto fresh = deps.ca_store->latest_crl_freshness(); fresh.has_value() && *fresh) {
+                deps.metrics->gauge("yuzu_server_ca_crl_next_update_timestamp_seconds")
+                    .set(static_cast<double>((*fresh)->next_update));
+                deps.metrics->gauge("yuzu_server_ca_crl_published_timestamp_seconds")
+                    .set(static_cast<double>((*fresh)->published_at));
+            }
         }
         // Refresh management group gauges before serializing
         if (deps.mgmt_group_store && deps.mgmt_group_store->is_open()) {
@@ -777,6 +806,9 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
              deps.certificate_inventory_store && deps.certificate_inventory_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
+            {"software_collection_settings_store",
+             deps.software_collection_settings_store &&
+                 deps.software_collection_settings_store->is_open()},
             // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
             // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
             // that fails to open AND `--allow-unsigned-packs` set produces
@@ -879,6 +911,13 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // ADR-3006 — the enablement tables ride the plugin-config schema; boot
             // state only (latched), like the row above.
             {"enablement_store", deps.enablement_store && deps.enablement_store->is_open()},
+            // ADR-0070 R1 - registered CRL sources. AUTHORITATIVE per ADR-0012 section 1: the
+            // registered egress targets and the CA keys every later revocation statement is
+            // judged against. Construction fail-closed already makes a not-open state
+            // unreachable in production (startup_failed_ stops the server before it serves);
+            // boot state only (is_open() is latched, #3061).
+            {"revocation_source_store",
+             deps.revocation_source_store && deps.revocation_source_store->is_open()},
         };
 
         // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
@@ -1192,19 +1231,27 @@ void install_plaintext_redirect_pre_routing(httplib::Server& srv, std::string we
             if (!req.params.empty()) {
                 location += "?";
                 bool first = true;
-                for (const auto& [k, v] : req.params) {
+                for (const auto& [k, v] : model_detail::to_params(req.params)) {
                     if (!first)
                         location += "&";
                     location += k + "=" + v;
                     first = false;
                 }
             }
-            // set_redirect (void in httplib 0.37.1) silently ignores a location carrying a
+            // set_redirect (void in httplib 0.37.1 and 0.59.0) silently ignores a location carrying a
             // CR/LF/control byte (a decoded %00 in the path) and leaves the status unset, which
             // would answer an empty 200.
             res.set_redirect(location, 301);
             if (res.status != 301)
                 res.status = 400;
+            // This listener answers before any body is read and never consumes one. From
+            // httplib 0.59 a response below 400 that leaves a declared request body unread must
+            // carry `Connection: close` (httplib.h v0.59.0:14797-14806); the response therefore
+            // closes the connection. The redirect answer closes unconditionally, with
+            // or without a declared body; the probe requests this handler leaves to the normal
+            // routes (Unhandled above) are not affected.
+            // Pinned by test_health_routes.cpp (the 301 head and EOF over a raw socket).
+            res.set_header("Connection", "close");
             return httplib::Server::HandlerResponse::Handled;
         });
 }

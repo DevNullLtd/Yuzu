@@ -11,6 +11,7 @@
 
 #include "rbac_store.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -131,6 +132,43 @@ TEST_CASE("string_to_role", "[auth][role]") {
     REQUIRE(string_to_role("admin") == Role::admin);
     REQUIRE(string_to_role("user") == Role::user);
     REQUIRE(string_to_role("unknown") == Role::user); // default
+}
+
+TEST_CASE("string_to_role logs unrecognized values and stays silent for valid ones",
+          "[auth][role]") {
+    // #4072: fail-safe floor to Role::user is unchanged; the drift must be visible.
+    yuzu::test::LogCapture cap;
+    CHECK(string_to_role("admin") == Role::admin);
+    CHECK(string_to_role("user") == Role::user);
+    cap.stop();
+    CHECK(cap.text().empty());
+
+    yuzu::test::LogCapture cap2;
+    CHECK(string_to_role("superadmin") == Role::user);
+    CHECK(string_to_role("Admin") == Role::user); // case-sensitive: never promotes
+    CHECK(string_to_role("") == Role::user);
+    cap2.stop();
+    const auto out = cap2.text();
+    CHECK(out.find("superadmin") != std::string::npos);
+    CHECK(out.find("Admin") != std::string::npos);
+    CHECK(out.find("unrecognized role value") != std::string::npos);
+    // The empty string is also drift (a NULL/blank column) and must name itself: the
+    // value is logged between quotes, so an empty role reads "value ''".
+    CHECK(out.find("value ''") != std::string::npos);
+
+    // CWE-117: a stored value carrying a line break must not forge a second log line,
+    // and an over-long value must be length-capped rather than logged verbatim.
+    yuzu::test::LogCapture cap3;
+    CHECK(string_to_role("evil\nrole") == Role::user);
+    CHECK(string_to_role(std::string(10000, 'x')) == Role::user);
+    cap3.stop();
+    const auto out3 = cap3.text();
+    CHECK(out3.find("evil_role") != std::string::npos);
+    CHECK(out3.find("evil\nrole") == std::string::npos);
+    CHECK(out3.size() < 2000);
+    // The logged value is capped at 256 bytes (log_key_token; the exact head/tail split
+    // is pinned in test_log_token.cpp), so no run of 257 identical bytes may survive.
+    CHECK(out3.find(std::string(257, 'x')) == std::string::npos);
 }
 
 TEST_CASE("pending_status_to_string", "[auth][role]") {
@@ -737,6 +775,8 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
     REQUIRE(mgr_b.remove_user("cora"));
 
     REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value());
+    // #4068: a genuine miss reports NotFound on the error channel, never DbError.
+    REQUIRE(mgr_a.get_user_role("cora").error() == AuthManager::GetUserRoleError::NotFound);
     // A genuine UserNotFound is NOT a store error - must not fire the
     // store-error counter (Gate 5 CH-3 re-review follow-up: this discrimination
     // is exactly what would drown the real signal if it ever regressed).
@@ -746,11 +786,13 @@ TEST_CASE("get_user_role reflects a cross-manager removal immediately, no re-log
     // username is a rejected-shape input, not a store health signal - #4020's
     // own get_user()/is_valid_principal fix, bucketed with UserNotFound).
     REQUIRE_FALSE(mgr_a.get_user_role(std::string("cor") + '\0' + "a").has_value());
+    CHECK(mgr_a.get_user_role(std::string("cor") + '\0' + "a").error() ==
+          AuthManager::GetUserRoleError::NotFound);
     CHECK(metrics.counter("yuzu_auth_get_user_role_store_error_total").value() == 0);
 }
 
 TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-saturated",
-          "[pg][auth][cold_cache]") {
+          "[pg][auth][cold_cache][store-error]") {
     // The critical negative case: a DB-backed manager must NEVER fall back to
     // a stale cached role on a store error - that would silently reopen the
     // exact gap this fix closes, at the one moment (a degraded store) it
@@ -771,7 +813,10 @@ TEST_CASE("get_user_role fails closed (not cached-admin) when AuthDB is pool-sat
         held.push_back(std::move(lease));
     }
 
-    REQUIRE_FALSE(mgr.get_user_role("cora").has_value()); // NOT Role::admin from cache
+    const auto saturated = mgr.get_user_role("cora"); // ONE call: each one bumps the counter
+    REQUIRE_FALSE(saturated.has_value());             // NOT Role::admin from cache
+    // #4068: and the error channel says WHY - a store error, not "not found".
+    CHECK(saturated.error() == AuthManager::GetUserRoleError::DbError);
     // Gate 5 chaos-injector CH-3/UP-6 follow-up: the ONE caller-visible signal
     // that a legacy-token-authenticated request is about to be floored to
     // Role::user must fire, not just a log line invisible under load.
@@ -789,6 +834,7 @@ TEST_CASE("get_user_role stays cache-only in config-file (no AuthDB) mode",
     mgr->upsert_user("alice", "secret123456", Role::admin);
     REQUIRE(mgr->get_user_role("alice") == Role::admin);
     REQUIRE_FALSE(mgr->get_user_role("nobody").has_value());
+    CHECK(mgr->get_user_role("nobody").error() == AuthManager::GetUserRoleError::NotFound);
 }
 
 TEST_CASE("authenticate mints a session at the CURRENT role after a cross-manager demotion "

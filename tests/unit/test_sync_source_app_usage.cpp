@@ -204,7 +204,7 @@ TEST_CASE("format -> parse: a >320-byte pipe-heavy exe_key round-trips intact â€
           "[app_usage_sync][parse][P5]") {
     // Real plugin formatter (app_usage_parsers.hpp), not a hand-built fixture:
     // format_last_used_row used to snprintf into a fixed 320-byte stack buffer
-    // with no truncation check. Neither normalise_exe_key nor TAR's own writer
+    // with no truncation check. Neither normalise_exe_key nor Echo's own writer
     // caps executable-name length, and pipe-escaping roughly doubles a
     // pipe-heavy name's length, so a real basename could silently overflow
     // that buffer â€” and the daily-sync consumer below then DROPS (rather than
@@ -272,12 +272,12 @@ TEST_CASE("parse: a constrained| line sets constrained and stops collecting rows
         CHECK(p.constrained);
         CHECK(p.rows.empty());
     }
-    SECTION("tar.db unavailable, with prior rows in the buffer") {
+    SECTION("echo.db unavailable, with prior rows in the buffer") {
         // Even if rows had somehow already been captured, a constrained
         // report must not be treated as a valid detected-empty state.
         AppUsageParse p = parse_app_usage_last_used_output(
             "last_used|chrome.exe|1700000500|1699000000|12|43200\n"
-            "constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|no such file\n");
+            "constrained|echo_db_unavailable|/var/lib/yuzu/agent/echo.db|no such file\n");
         CHECK(p.constrained);
     }
 }

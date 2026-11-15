@@ -1,1 +1,0 @@
-- Fixed the Settings → Agent Updates (OTA) upload form overflowing its container, pushing the Upload button out of view with no way to reach it. The shared `.add-user-form` row now wraps instead of clipping. (#5572)

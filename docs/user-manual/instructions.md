@@ -96,6 +96,20 @@ curl -s -b cookies.txt \
   --data-urlencode "yaml_source@definitions/process-list.yaml"
 ```
 
+**Versioned and MCP twins (#2146 batch C).** The same operations are available as JSON REST v1 routes and MCP tools: `POST /api/v1/instructions/yaml` (MCP `save_definition_yaml`; body `{"yaml_source": ..., "id"?: ..., "updated_at"?: ...}`, create or update) and `POST /api/v1/instructions/validate-yaml` (MCP `validate_definition_yaml`; answers `{"valid": ..., "errors": [...]}` as JSON instead of an HTML fragment). Fields-based authoring is `POST /api/v1/instructions`, `PUT` and `DELETE /api/v1/instructions/{id}` (MCP `create_definition`, `update_definition`, `delete_definition`), and `POST /api/v1/instructions/import` / `import_definition` imports an exported document. Instruction sets: `GET` and `POST /api/v1/instruction-sets`, `DELETE /api/v1/instruction-sets/{id}` (MCP `list_instruction_sets`, `create_instruction_set`, `delete_instruction_set`). See the REST API reference section "Instruction Authoring and Instruction Sets" and the MCP tool table for the exact fields.
+
+Things that differ from the legacy routes:
+
+- **Audit-first.** The twin write routes and tools write an `attempted` audit row before they change anything, and refuse (503 with `Sec-Audit-Failed: true`, or an MCP error) without changing anything when that row cannot be stored.
+- **Approval at the supervised MCP tier.** `InstructionDefinition:Write` now requires an approval ticket at that tier, because an unticketed update could set `approval_mode` to `auto` or repoint `plugin` and `action`, after which an existing schedule or an operator-tier run needs no human. A supervised-tier MCP token therefore gets `403` on the legacy `POST /api/instructions`, `PUT /api/instructions/{id}`, `POST /api/instructions/import` and `POST /api/instructions/yaml` routes and on the response-template write routes, as well as on the twins. Instruction-set writes are not gated.
+- **Default `approval_mode`.** A create without `approval_mode` stores `auto`, which means later runs by schedules or by an operator-tier caller need no human approval. Set `role-gated` or `always` when a person must approve each run.
+- **Bounds.** The field twins (`POST /api/v1/instructions`, `PUT /api/v1/instructions/{id}` and the MCP tools) require `plugin` and `action` to be at most 128 characters of `A-Za-z0-9._-`, `gather_ttl_seconds` to be 1 to 86400 and `response_ttl_days` to be 1 to 3650, and refuse an unknown key. A `plugin` that is present must be non-empty (`{"plugin":""}` is a `400`, so an update cannot blank the column); an empty `action` is still storable. The YAML twins (`validate-yaml`, `yaml`, and the MCP `validate_definition_yaml` / `save_definition_yaml`) apply the same `name` (1 to 128) and `version` (at most 64) bounds to the parsed YAML, and a `description` of at most 16384 bytes (not the 512 of the JSON field twins: the bundled content carries descriptions past 512 bytes), in the one error list validate and save share, and refuse a YAML source with a NUL byte or over 1 MiB without parsing it. The `id` of a YAML save is at most 128 bytes. The operator import (the twins and the legacy `POST /api/instructions/import`, not the boot seed) bounds `name`, `version`, `instruction_set_id` and `description` (16384 bytes), applies the `plugin` / `action` character and length check (a signed document's `yaml_source` values included) and lowercases `action`. A new definition's `id` may not be `.` or `..` (any create path, including the import, the YAML save and the dashboard create; a stored row with such an id is unchanged). A NUL byte in `type`, `parameter_schema`, `result_schema`, `concurrency_mode`, `visualization_spec` or `response_templates_spec` is refused `400` naming the field on every create, import and update path (an import document's `\u0000` escape included), where it would otherwise be a store fault. The dashboard routes (create, update, `validate-yaml` and the YAML save) do not apply the field, identifier, name, version, description and TTL bounds above; the NUL refusal is in the store and applies to them too.
+- **Optimistic concurrency.** `PUT /api/v1/instructions/{id}` and `DELETE /api/v1/instructions/{id}?expected_updated_at=<n>` take an optional `expected_updated_at` (MCP: `update_definition` and `delete_definition`); when the stored definition no longer carries that `updated_at` the call is refused 409 and the row is unchanged. `updated_at` is a monotonic version token that moves on every write of the row (it is no longer exactly the epoch second of the write, so do not show it as a time of day). At the supervised MCP tier the MCP `update_definition`, `delete_definition` and an id-bearing `save_definition_yaml` require it, because the approver approves one version of the definition; a token that is already stale, missing or out of range is refused before an approval ticket is minted.
+- **Import size and trust.** The REST v1 import route and the MCP tool admit 4 MiB where the legacy import route admits 16 MiB. An import may carry a signature, which is checked against the `publicKey` in the same request (there is no trust anchor), so it proves the document was not altered, not who authored it (a holder of `InstructionDefinition:Write` can sign with a key of their own; unsigned create and YAML save are separate paths, and `POST /api/product-packs` is the only other signature-gated route). An export carries no `signature` or `publicKey`, so a signed document is produced outside the product.
+- **Import creator.** The v1 and MCP import twins record the authenticated principal as `created_by` and ignore the document's `created_by` (the signature covers `yaml_source` only, so the field is unsigned).
+- **Deleting a referenced definition (v1 `DELETE` and MCP `delete_definition`).** A definition that a schedule, a live workflow step or a policy fragment (check, fix or post-check) names is refused `409` with the referrers listed, instead of leaving them silently inert (a schedule would skip as `definition_unknown`, a policy check would stop maturing verdicts). Remove each referrer or point it at another definition, then delete. A failed or unconfigured reference check is `503` and deletes nothing. A product pack that merely contains the definition is advisory: the delete's success audit row ends with `packs=<id>,...` and the delete goes ahead. The check is advisory, not transactional: a schedule created between the check and the delete is not seen.
+- **A field edit clears a stored YAML.** `PUT /api/v1/instructions/{id}` and MCP `update_definition` clear the stored `yaml_source` when they change `name`, `description`, `version`, `type`, `plugin`, `action` or `approval_mode` on a definition that has one, so a later YAML round trip cannot silently revert the edit; the audit detail ends with `yaml_source cleared yaml_source_bytes=<n> yaml_source_sha256=<hex>` (`yaml_source_sha256` is left out if the digest cannot be computed), the size and SHA-256 of the cleared text, so it can be matched to a backup or an export. When a clear happens, the detail also says which of `name`, `version` and `type` changed (`old -> new`) and that the `description` did (`description: changed <old> -> <new> bytes`, sizes only), just before that suffix. A change to `enabled` alone does not clear it, because a YAML save never writes `enabled`. To keep a YAML as the source of truth, edit it and save it with `POST /api/v1/instructions/yaml` instead.
+
 ### Dashboard YAML Editor
 
 The Instruction Management page provides two authoring modes:
@@ -364,7 +378,7 @@ curl -s -b cookies.txt \
     "description": "Service inspect, start, stop, restart"
   }'
 
-# Delete a set (cascades to contained definitions)
+# Delete a set (the definitions in it are kept; their instruction_set_id is cleared)
 curl -s -b cookies.txt \
   -H "Origin: http://localhost:8080" \
   -X DELETE http://localhost:8080/api/instruction-sets/abc123
@@ -471,7 +485,7 @@ over a limit makes execute answer `500`):
 
 `enabled: false` hides a definition from the discovery catalog and stops its schedules (the schedule
 poller records `definition_disabled`), but it does **not** stop `POST /api/instructions/{id}/execute`:
-that route does not read `enabled`.
+that route does not read `enabled`, and neither do its v1 and MCP twins.
 
 ### Replacing a stored parameter schema
 
@@ -508,7 +522,7 @@ publisher authentication. See [REST API](rest-api.md).
   Any public import skips the tombstone, whether signed or unsigned under `--allow-unsigned-definitions`
   (both run as a non-seed insert), so the replacement lands and later boots leave it alone. The tombstone is
   permanent: a replaced bundled definition never receives later bundled corrections from the reseed.
-- The delete removes only the definition row. A schedule that references the id has its occurrences skipped
+- The delete removes only the definition row (this step uses the legacy `DELETE /api/instructions/{id}`, which does not check for referrers; `DELETE /api/v1/instructions/{id}` refuses a definition that a schedule, live workflow or policy fragment names with a `409`). A schedule that references the id has its occurrences skipped
   and audited as `definition_unknown` until the id exists again. A policy does not name the instruction; its
   fragment does (`check_instruction`, `fix_instruction` and `post_check_instruction`, which falls back to
   `check_instruction`). Check, fix and verify dispatches that name a missing id log `unknown check/fix instruction`
@@ -596,7 +610,7 @@ spec:
 
 When a user (or MCP tool) executes an instruction that requires approval:
 
-1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). An MCP client is different: it re-calls the same tool with the `approval_id` once the ticket is approved, and that call runs it.
+1. **HTTP 202 response.** The server returns `{"status": "pending_approval", "approval_id": "...", "definition_id": "..."}` instead of dispatching immediately. Nothing runs yet: the request waits as a pending approval ticket. Approving a ticket created this way records the decision but does not yet dispatch the instruction, because an instruction-origin ticket has no redemption path (tracked in #6064; see [Upgrading](upgrading.md)). This is true on every surface, MCP included: a `pending_approval` answer from `execute_instruction_definition` carries the same kind of instruction-origin ticket, and no surface can redeem it, so re-calling the tool with that `approval_id` does not run the instruction. Only an MCP tier ticket is redeemable: when the supervised tier itself holds a call for approval (an `execute_instruction` or similar call answered with `approval_required` (-32006)), the client re-calls the same tool with that `approval_id` once a person has approved it, and that call runs. A definition whose `approval_mode` is not `auto` therefore cannot be run through the execute routes or tools until #6064 lands (this limit predates the v1 and MCP twins).
 2. **Dashboard toast notification.** A toast appears in the web dashboard confirming the request was submitted for approval. The toast includes the approval ID for reference.
 3. **Approvals tab or page.** The pending request is visible in the **Approvals** tab of the dashboard and on the Approvals page (`/approvals`). The executor can check its status there at any time. Once an approver approves or rejects the request, the status updates in the tab (a rejected request is never run; an approved instruction-origin ticket is recorded but not dispatched, as in step 1). On the Approvals page, **Approve** and **Reject** open a dialog with an optional reviewer comment (capped at 4000 bytes); the sidebar pending-approvals badge refreshes after each decision.
 
@@ -697,7 +711,7 @@ the same route, and to `POST /api/approvals/{id}/approve` and `POST /api/approva
 
 **MCP clients cannot approve.** MCP callers authenticate with a bearer token and the MCP transport runs no MFA step-up, so the MCP tools
 `approve_request` and `reject_request` always return a typed refusal, whatever credential the caller used
-(a browser cookie session that reaches `/mcp/v1/` is refused too). This is an exception
+(a browser cookie session is refused at `/mcp/v1/` before any tool runs, because it carries no MCP tier). This is an exception
 recorded in ADR-1005's exception ledger (entry 2026-10-18): human review is a human-session act. The tools stay registered, and listing
 pending approvals through MCP (`list_pending_approvals`, `get_pending_approval_count`) is
 unchanged. A supervised-tier agentic worker still gets its ticket from the first call and still
@@ -856,11 +870,89 @@ delivery loop then drains the outbox and performs the actual dispatch, within
 Delivery emits its own `command.outbox_delivered` audit event recording the
 real send outcome: `success` (dispatched, with the agents-reached count),
 `failure` (no agents currently in scope — recorded and skipped, not retried;
-or a malformed occurrence), or `denied` (authority was revoked between
-enqueue and delivery). The execution row's targeted-agent count fills in at
+a malformed occurrence; or a redelivery-limit dead-letter, below), or `denied`
+(authority was revoked between enqueue and delivery). The execution row's targeted-agent count fills in at
 delivery, once the real outcome is known. A systemic delivery-gate failure
 (for example, containment status unreadable) is treated as transient: the
 same occurrence is retried with back-off rather than failed outright.
+
+A retry re-sends the occurrence's original command ID, so that an agent which
+already ran it can recognise and absorb the repeat. An agent only remembers the
+most recent 20,000 completed commands, so the server bounds how long an
+occurrence may keep being retried. It records the server's dispatch counts just
+before the first delivery attempt and, once they have advanced by 10,000 (half
+the agent's memory) before a retry, it stops: the occurrence is marked failed
+with the note `redelivery_horizon_exceeded`, a `failure`
+`command.outbox_delivered` audit event is written, and it is never sent again.
+The note is `redelivery_sequence_regressed` instead if the shared dispatch count
+went backwards, which means a database restore or a failover that lost recent
+writes.
+
+A first delivery attempt that reached no agent at all (the delivery gate was
+unreadable) does not start that count: it is recorded again at the next
+attempt. If the dispatch counts cannot be read, or recording them does not
+commit, the occurrence is held (neither sent nor failed) and tried again on the
+next cycle; an unreadable count holds every pending occurrence for that cycle.
+The `yuzu_server_command_outbox_deliver_degrade_total` and
+`yuzu_server_command_outbox_deliver_hold_cause_total{cause}` counters rise while
+that lasts. The `YuzuOutboxHeld` alert fires after a hold of several minutes,
+and `YuzuOutboxStampFailing` if recording the counts keeps failing for roughly 35 to 45 minutes or more.
+An occurrence that was already being retried keeps counting dispatches during a
+hold, so it can be dead-lettered once the counts are readable again.
+
+**After a dead-letter (the run was marked failed and will not be retried).** The failed occurrence may have executed once, or may
+never have been sent at all (for example while a delivery gate stayed unreadable
+on some agents). To find it, use the `query_audit_log` tool (or the dashboard's
+audit page) with action `command.outbox_delivered`, and look for rows whose
+result is `failure` and whose detail contains `redelivery_horizon_exceeded` or
+`redelivery_sequence_regressed`. The detail starts with the scheduled run's
+source, occurrence, plugin and action, so search within it rather than for a
+prefix. Every successful scheduled run writes a row for the same action, so on a
+busy server a failure can be several pages back: give `query_audit_log` a `since`
+and `until` and page with `offset`. The row names the command ID as its target and
+carries the execution ID and the first eight characters of any approval ID. Open
+that execution in the Executions history, check which agents responded, then run
+the instruction again by hand if it did not complete. If the occurrence needed an approval, that ticket is spent (a failed
+occurrence keeps its ticket consumed), so request a new one (see
+[Who can approve](#who-can-approve)). The next scheduled occurrence is
+unaffected and fires normally. The occurrence's execution row is not cancelled by
+this step. If no agent has answered by the next stuck-execution sweep, which runs
+roughly every 15 minutes and looks at executions that are over 30 minutes old,
+the sweep may cancel it, including an execution whose agents were reached but
+have not responded yet; until then it can look in-flight.
+
+The count is an estimate, not a clock, and it can err in both directions.
+
+*It can end a run early (the safe direction).* It is fleet-wide, so any
+operator's or any push's dispatches advance it: a Guardian, asset-tag or sync
+push counts once for every target, and one push to 10,000 devices ends every
+occurrence that is waiting to be retried at that moment. Guardian control messages
+count although they take no place in the agent's memory. A long gateway-directory
+outage in which many occurrences are being retried also ages them, because each
+retry counts as a dispatch. After a change of leadership on the server, the new
+leader also charges every unrecorded dispatch it has made since it started,
+however old, so a server that once failed to record 10,000 dispatches ends every
+waiting occurrence at each later leadership change until it is restarted.
+
+*It can fail to end a run in time (the unsafe direction).* Dispatches whose
+record failed to write are counted only by the server process that made them. A
+different server replica, or an earlier run of the same server that has since
+restarted or been taken over by another replica, takes that count with it: after a
+restart the server cannot tell how many such dispatches passed, so the limit can
+trip late. Four other cases also let it trip late: a command dispatched before the
+first attempt but delivered to the agent after it is not counted; a database
+restore that leaves the dispatch count still above a waiting occurrence's recorded
+value reads as small progress; a server replica working from an out-of-date view
+can still send an occurrence that another replica has just marked failed; and the
+dispatch count cannot see an agent whose own memory was lost. Agents running
+without a working command-dedup store are not protected at all: they re-run every
+redelivery. None of this is closed by this change; the sound close, in which the
+agent refuses an ID older than its own memory, is a protocol change and is not part
+of it.
+
+It is not a time limit, so an occurrence stuck on a quiet fleet is not ended by
+it. The dispatch-count part of the retry limit is delivered under #3678; a
+time-based cap and a retry-count cap remain open under #4167.
 
 Approval-gated runs (the schedule's `requires_approval` flag, or a definition
 whose `approvalMode` is not `auto` — there is no operator session on the
@@ -1002,6 +1094,8 @@ curl -s -b cookies.txt \
 ```
 
 The `scope` field controls which agents are included. Set `"scope": "failed_only"` to target only agents that reported failure; any other value (or omitting the field) reruns all agents.
+
+**What a rerun does.** It creates a new `pending` execution record linked to the original; it does not send anything to any device. The REST v1 route `POST /api/v1/executions/{id}/rerun` and the MCP tool `record_execution_rerun` do the same, take a boolean `failed_only` instead of the `scope` string, and answer `dispatched_to_devices: false`. Likewise `POST /api/v1/executions/{id}/cancel` and `cancel_execution` only mark the execution cancelled; they do not stop a command a device already received. See `docs/user-manual/rest-api.md`.
 
 ### Cancel
 
@@ -1323,6 +1417,8 @@ curl -s -b cookies.txt \
 
 > **Approval gate:** The response varies based on the definition's `approval_mode`. Definitions with `approval_mode: auto` return HTTP 200 with an immediate execution result. Definitions with `approval_mode: role-gated` or `always` return HTTP 202 with a `pending_approval` status and an `approval_id` when the caller requires approval. See [Section 7](#7-approval-workflows) for details.
 
+**Versioned and MCP twins (#2146).** `POST /api/v1/instructions/{id}/execute` and the MCP tool `execute_instruction_definition` run the same pipeline with the same `agent_ids` / `scope` / `params` and the same `approval_mode` rules, with these differences from the route above: the v1 response is wrapped as `{"data": {...}, "meta": {"api_version": "v1"}}` and every error carries an A4 envelope with a machine-readable `reason`; a call is audited `requested` BEFORE it dispatches and refused with `503` if that row cannot be stored (the legacy route audits after the send); the `202` body adds `approval_mode`; zero agents reached is an error with a `reason` (`400` for `invalid_scope`, `503` otherwise) rather than the legacy untyped `503`; the check order puts the dispatch authorization (`403`/`400` with a `reason`) and the destructive-targeting rules (`400` `destructive_untargeted` / `forensic_untargeted`, `404` `destructive_no_visible_target`) before the definition's approval, so a call that is refused for those reasons never queues an approval. A definition id holding a control character (a byte below `0x20` or equal to `0x7F`, NUL included) or not valid UTF-8 (reachable on REST, where the HTTP layer percent-decodes the path to raw bytes) is refused before the definition is looked up (`400` / `-32602`, `reason` `invalid_definition_id`, a `denied` audit row, nothing queued or dispatched); the legacy route does not apply that check. A dispatch that throws part-way answers `500` / `-32603` `dispatch_exception` with no retry hint, and names the execution row it left running as the typed field `error.execution_id` (`error.data.execution_id` on MCP) plus, when known, the lower-bound count of agents already sent the command as `error.agents_sent` (`error.data.agents_sent`; a gateway-routed agent counts once its command is queued for forwarding, which can still fail): check that execution's results or close it with `cancel_execution` before running the definition again. Like the legacy route, neither twin reads the definition's `enabled` flag. The MCP twin does not stream progress, and a definition whose `approval_mode` is not `auto` answers `pending_approval` for an operator-tier or a supervised-tier token alike: a tier's auto-approval or consumed ticket never stands in for the definition's own approval, and a supervised token's ticket never lifts the admin-or-approval requirement of the definition's `plugin.action` either: a non-administrator is refused with `approval_required` (permanent, no ticket minted). See the [REST API reference](rest-api.md) and the [MCP guide](mcp.md).
+
 #### List definitions (v1 endpoint)
 
 ```
@@ -1370,7 +1466,7 @@ curl -s -b cookies.txt \
 DELETE /api/instruction-sets/{id}
 ```
 
-Cascade-deletes all definitions in the set.
+Definitions in the set are not deleted: their `instruction_set_id` is cleared.
 
 ```bash
 curl -s -b cookies.txt \
@@ -1615,13 +1711,13 @@ The Instruction Management page is accessible from the main dashboard. It uses H
 | **Schedules** | Create, enable/disable, and delete recurring schedules. Shows next and last execution times. |
 | **Approvals** | Review pending approval requests. Approve or reject with comments. The sidebar's Approvals entry shows the pending count. A submitting account cannot review its own request (account names are compared; see [Who can approve](#who-can-approve)). A pending row you submitted shows a "You submitted this" hint saying another reviewer must approve, instead of buttons, and any backend denial (self-review, already-reviewed) surfaces as an error toast. |
 
-**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
+**Executions and Approvals pages.** `/executions` and `/approvals` are read-only pages in the sidebar under Instructions: Executions lists the dispatch history with the same status counters as the tab, and Approvals lists the approval queue, pending first. Both honour your access scope and show a note, not an empty list, when a store cannot be read. Executing stays on the Instructions tab. On `/approvals`, pending rows carry Approve and Reject buttons (dialog with an optional comment). The page shows a request's scope in full up to 17,408 bytes (a bound request is at most 16 KiB, so it is always shown whole). The scope of an `import_definition` or `save_definition_yaml` ticket opens with the tool and the definition's `approval_mode`, `plugin`, `action`, `definition_id` and `name` (or `parse_error: true` when the document could not be read), and ends with the byte length and SHA-256 of the document, so the digest identifies the exact bytes. The short scope cell shows only the START of that subject (the dispatch-relevant fields come first); open the request for the whole subject. An import always shows the `approval_mode` it will store: the document's, else for a signed document the one in its `yaml_source`, else `auto` (a signed document's `yaml_source` is read for `plugin`, `action` and `approval_mode` only; the id and name come from the document, and an omitted id is generated by the server at import); a YAML save shows the YAML's `approval_mode` when it states one, otherwise `auto` for a create (which stores `auto`) and none for an update (which keeps the stored value). A larger scope, which only an unbound request from a tool with no bound of its own can have, is shown clipped: the row is tagged "Scope clipped", the detail panel states the true size, Approve is withheld and Reject stays. Read the full scope with `GET /api/v1/approvals`, then approve with `POST /api/approvals/{id}/approve` from a signed-in session (an API token or an MCP client cannot approve). The older Approvals tab does the same. On `/executions`, selecting a row shows per-device results; a running execution updates live over SSE (a chip shows the stream state); and **Cancel execution** (dialog, shown when you may cancel and the execution is not finished) cancels it. Fleet-wide figures (today, all time, device success rate, average duration) appear for unconfined operators only and are hidden when the store cannot be read.
 
 **Workflows page.** `/workflows` is a page in the sidebar under Instructions (its workflow actions are described below): the workflow definitions (name, description, step count; selecting one lists its steps with each step's failure policy) and the recurring schedules. Schedules run a single instruction on the cadence the scheduler really applies (once, every N minutes, daily, weekly or monthly; time of day, weekday and day of month are stored but not used) and are not linked to workflows. A schedule you did not create shows only whether it targets all devices or a subset.
 
 The definitions table also shows each workflow's Last run and Result (the newest run you may see: "Not run" when there is none, "None visible" when runs exist only on devices outside your scope, "Unknown" when the list of newest runs was cut off before it reached that workflow). Selecting a workflow loads its latest run in the **Latest run** panel (status, start, duration, device count and one row per step) and the **Recent runs** disclosure lists its ten newest runs; selecting one loads it. A step shown as *Dispatched* means the command was sent: it says nothing about the result on a device, and for a caller confined to a device scope it reads *Dispatched (run-wide)* because the send covered the run's whole target list. A skipped step says why only for the three reasons the engine writes (condition not met, previous step failed, workflow aborted); a failed step shows its error text when the engine stored one, otherwise "No detail.". A run is visible to you only if at least one of its target devices is in your scope; a run you may not see and a run that does not exist look the same.
 
-**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: that the server keeps running a workflow after the page stops waiting.
+**Workflow actions.** **New workflow** (shown when you hold `Workflow:Write`) opens a dialog for the workflow's YAML; the server's message is shown if the YAML is refused, and nothing runs until you run it. Each row's **Run now** (needs `Workflow:Execute`) opens a device checklist built from the connected devices you may see (filter box, the first 200 matches shown, at most 500 selected); without permission to list devices it falls back to a box of device ids, one per line. Each step is sent to every selected device in order; a step whose instruction needs approval is refused, and device results are not collected on this page. The server runs the whole workflow before it answers, so the page waits 8 seconds, then says the run may keep running on the server, disables that workflow's Run now and checks its newest run every 5 seconds for up to 10 minutes. Check Recent runs before running it again. The server stops a run 60 seconds after the call, and the page's own wait ends at 8 seconds with only the timeout message, so read the run in Recent runs to see how it ended. An account may have 2 runs in progress at once, and the server as a whole has a limit shared with its other open streams; a refused click shows the server's message; an HTTP 429 adds "Try again in N seconds", and a 503 (the server is shutting down or a store is unavailable) shows the server's own advice, or "Try again shortly.", with no retry time. A run the page stopped waiting for still holds one of your two slots until it ends, which can take up to a minute, so another click can be refused for that long. **Delete** in the Steps panel (needs `Workflow:Delete`) retires the workflow after a confirmation; run history is kept and there is no undelete in the console. A control you may not use is shown disabled with the permission it needs. Instruction names appear on step rows only if you also hold `InstructionDefinition:Read`; otherwise the step's label or instruction id is shown. **Schedule actions.** Each schedule row has **Enable**/**Disable** and **Delete**, enabled only on schedules you created (a schedule with no recorded creator is nobody's, so both stay disabled). **Enable** needs `Schedule:Write` and `Execution:Execute` and asks for confirmation because the schedule then runs without anyone present; **Disable** needs `Schedule:Write` and is one click; **Delete** needs `Schedule:Delete` and confirms first. After a change the list is re-read and the stored state shown. **New schedule** (needs `Schedule:Write` and `Execution:Execute`; the instruction list needs `InstructionDefinition:Read`) takes a name, an enabled instruction, a cadence (once runs at the next scheduler tick, about now; the scheduler ignores time of day), targets, whether each run needs approval and parameters as JSON. Leaving targets empty needs an explicit acknowledgement that it reaches every device. A final summary shows the instruction's approval mode before the schedule is created enabled; a run can still be refused when it fires. Not verified by running a workflow against a live fleet: how the page behaves when the server stops a run at the 60 second bound after the page has stopped waiting.
 
 Who sees what: Administrator, Operator, PlatformEngineer, Viewer and ITServiceOwner hold `Workflow:Read` and see all definitions; runs follow the fleet-read scope of the account. A caller scoped only to management groups is refused the definitions and schedules panels (the existing global-grant rule) but sees runs that include a device in scope. ITServiceOwner can create, enable and delete its own schedules elsewhere but has no Run, New workflow or Delete workflow control, and a service-scoped token is refused the schedules panel outright.
 
@@ -1719,6 +1815,7 @@ Reads are gated on `InstructionDefinition:Read`, mutations on `InstructionDefini
 **Limitations operators should expect:**
 
 - **Equals-op only in dashboard auto-apply.** The dashboard's filter map is exact-match; `contains`/`starts_with`/`ends_with` filters in a template are stored and returned by REST but the dashboard only auto-applies the `equals` clauses. Operators can still use the column-by-column filter controls to narrow the view further once the template is loaded.
+- **The View's equals filters are defaults, not locks.** Tick **View without saved filters** (shown next to the View dropdown when a template carries an `equals` filter) to show the results without them. While the box is ticked, the table and its sort, page and Search requests skip the View's filters; untick it to bring them back. It never drops a filter you set yourself, and a new command starts with it unticked.
 - **Detail drawer ignores the column subset.** The expandable per-row detail drawer always shows every parsed field — hiding values there would defeat its "expand for full record" purpose.
 - **Dashboard YAML editor strips `spec.responseTemplates`.** Same caveat as `spec.visualization`. Author through `POST /api/v1/definitions/import` (JSON envelope) or the REST template endpoints.
 

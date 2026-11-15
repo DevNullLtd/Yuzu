@@ -108,11 +108,11 @@ TEST_CASE("response provenance: the decision over a record source",
                 *d = "query_failed";
                 return std::nullopt;
             }
-            return CommandRecord{"tar", "exec-9"};
+            return CommandRecord{"echo", "exec-9"};
         };
-        const auto p = resolve_response_provenance("tar-0003", flaky);
+        const auto p = resolve_response_provenance("echo-0003", flaky);
         CHECK(p.verified());
-        CHECK(p.plugin == "tar");
+        CHECK(p.plugin == "echo");
         CHECK(p.degrade_reasons == std::vector<std::string>{"query_failed"});
     }
     SECTION("a record without a plugin is not a provenance record") {
@@ -122,9 +122,9 @@ TEST_CASE("response provenance: the decision over a record source",
         CHECK(p.execution_id.empty()); // the correlation of an unusable record is not trusted either
     }
     SECTION("an empty command id is never looked up; an unwired source is unrecorded") {
-        CHECK_FALSE(resolve_response_provenance("", make_lookup(CommandRecord{"tar", ""})).verified());
+        CHECK_FALSE(resolve_response_provenance("", make_lookup(CommandRecord{"echo", ""})).verified());
         CHECK(calls == 0);
-        const auto p = resolve_response_provenance("tar-0005", CommandRecordLookupFn{});
+        const auto p = resolve_response_provenance("echo-0005", CommandRecordLookupFn{});
         CHECK(p.outcome == ProvenanceOutcome::kUnrecorded);
         CHECK(p.plugin == std::string(kUnverifiedProvenanceLabel));
     }
@@ -657,7 +657,7 @@ TEST_CASE("provenance ingest: the server's own correlation-id families keep thei
         const std::vector<Family> families = {
             {"__sync__-now-1700000000-aabbccdd", "__sync__"},
             {"asset-tag-sync-1700000000123", "asset_tags"}, // prefix `asset` is not the plugin
-            {"tar-0123456789abcdef", "tar"},
+            {"echo-0123456789abcdef", "echo"},
         };
         for (const auto& f : families) {
             CAPTURE(f.id);
@@ -667,7 +667,7 @@ TEST_CASE("provenance ingest: the server's own correlation-id families keep thei
             REQUIRE(stored.size() == 1);
             CHECK(stored[0].plugin == f.plugin);
             CHECK(stored[0].plugin != kUnverified);
-            CHECK(h.fixed_poll(f.id).size() == 1); // the hardware / TAR polls read exactly this
+            CHECK(h.fixed_poll(f.id).size() == 1); // the hardware / Echo polls read exactly this
         }
     }
     SECTION("a reserved-looking id the server never issued is unverified like any other") {

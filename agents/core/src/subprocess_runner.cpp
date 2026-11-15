@@ -174,7 +174,7 @@ namespace {
 // sticky, setting it kills EVERY in-flight and future subprocess for the
 // process lifetime. A future caller MUST NOT repurpose it for a per-operation
 // or per-connection cancel -- that would silently abort all concurrent capture
-// (TAR, DEX, plugin shell-outs) agent-wide. A narrower per-call cancel is
+// (Echo, DEX, plugin shell-outs) agent-wide. A narrower per-call cancel is
 // SubprocessOptions::cancel_token (CancellationToken) -- both are checked on
 // every poll, independently.
 std::atomic<bool> g_subprocess_cancel{false};

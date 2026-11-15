@@ -1,1 +1,0 @@
-- **DEX and TAR page headings match the menu.** The `/dex` and `/tar` pages now head with exactly "DEX" and "TAR", the same words as the navigation and breadcrumb; the long forms ("Digital Employee Experience: ..." and "Timeline Activity Record: ...") move to each page's subtitle.

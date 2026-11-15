@@ -70,7 +70,8 @@ class ManagementGroupStore; // forward declaration
 /// cannot be answered. They are a CONTRACT with `authz::ceiling_degrade_reason`
 /// (authz_gates.cpp), which maps a failed ceiling read to a `yuzu_server_rbac_read_degrade_total`
 /// reason label by matching these prefixes: every producer and that mapping use these
-/// constants, never a re-typed literal. A failed query is `"query failed: "` followed by the
+/// constants, never a re-typed literal. (`kRbacErrMgmtGroupReadDegraded` below is the one
+/// exception: that mapping never sees it.) A failed query is `"query failed: "` followed by the
 /// libpq message and has no constant (it is the label mapping's fallthrough).
 inline constexpr std::string_view kRbacErrStoreNotOpen = "rbac store not open";
 inline constexpr std::string_view kRbacErrPoolAcquireTimeout = "pool acquire timeout";
@@ -79,6 +80,14 @@ inline constexpr std::string_view kRbacErrCircuitBreakerOpen = "circuit breaker 
 /// cached-disabled view), so no grant read was attempted.
 inline constexpr std::string_view kRbacErrEnforcementUnconfirmed =
     "rbac enforcement state unconfirmed";
+/// `check_scoped_permission_checked` (#3739): the scoped decision needed the management-group
+/// store (`get_assignments_for_principal` via `resolve_perm_groups`, `get_agent_groups`,
+/// `get_ancestor_ids`) and that read degraded (ADR-0042). The exact reason (`store_not_open` /
+/// `pool_acquire_timeout` / `query_error`) is carried by
+/// `yuzu_server_mgmt_group_read_degrade_total{reason}`, not by this text. NOT consumed by
+/// `authz::ceiling_degrade_reason` (the ceiling path never reaches the scoped check); its only
+/// consumer is the audit-source label in `AuthRoutes::require_scoped_permission`.
+inline constexpr std::string_view kRbacErrMgmtGroupReadDegraded = "management group read degraded";
 
 struct RbacRole {
     std::string name;
@@ -167,6 +176,15 @@ enum class RbacRegimeAuthority {
 namespace auth {
 enum class Role; // yuzu/server/auth.hpp (the column values 'user' / 'admin')
 }
+
+/// How `RbacStore::deactivate_account` treats the durable session write-generation. There is
+/// deliberately no default: every caller states it, so a deactivation can never silently skip
+/// telling the session caches that an account went inactive.
+enum class SessionGenerationMode {
+    kBumpSessionGeneration, ///< bump `session_store.session_meta` `write_generation` in the
+                            ///< deactivation transaction (a `SessionStore` is wired)
+    kNoSessionStore,        ///< touch no `session_store` object (no `SessionStore` is wired)
+};
 
 /// Outcome of `RbacStore::deactivate_account` (#4966). A closed answer, never a flag pair.
 struct AccountDeactivationResult {
@@ -592,8 +610,10 @@ public:
     /// last member of a protected population; it does NOT prove anyone can still sign in
     /// (lockout, MFA, sso-only accounts and IdP state are outside it). Applies no cache
     /// generation: no `principal_roles` / `rbac_meta` row changes. The caller (AuthManager)
-    /// owns the post-commit session wipe and cache erase.
-    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username);
+    /// owns the post-commit session wipe and cache erase. `session_mode` has no default: the
+    /// caller states whether a `SessionStore` is wired (`SessionGenerationMode`).
+    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username,
+                                                               SessionGenerationMode session_mode);
 
     /// #4966: the guarded role-column write behind `AuthManager::update_role_checked` (the
     /// demotion twin of `deactivate_account`). Thin delegation to
@@ -632,6 +652,17 @@ public:
     std::optional<std::vector<std::string>>
     find_local_groups_with_prefix(const std::string& prefix) const;
     std::vector<std::string> get_group_members(const std::string& group_name) const;
+
+    /// Authoritative group names `username` is a member of (the `group_members` rows; IdP
+    /// memberships are reconciled into the same table at login). Unlike `get_group_members`, which
+    /// collapses a failed read into an empty vector, a failure is an `unexpected` the caller MUST
+    /// fail closed on, never read as "not a member". Breaker-gated, `kAuthzAcquireTimeout` budget:
+    /// every call feeds the replica's RBAC breaker and a failure bumps
+    /// `yuzu_server_rbac_read_degrade_total` (the ADR-0017 admit-then-filter chokepoint's read,
+    /// also used by the attestation separation-of-duties gate). Errors: `kRbacErrStoreNotOpen`,
+    /// `kRbacErrCircuitBreakerOpen`, `kRbacErrPoolAcquireTimeout`, `"query failed: ..."`.
+    [[nodiscard]] std::expected<std::vector<std::string>, std::string>
+    user_rbac_group_names_checked(const std::string& username) const;
     std::expected<void, std::string> add_group_member(const std::string& group_name,
                                                       const std::string& username);
     std::expected<void, std::string> remove_group_member(const std::string& group_name,
@@ -667,8 +698,9 @@ public:
     /// before the breaker, exactly as for `check_permission`. A real role-query failure is counted
     /// under `yuzu_server_rbac_read_degrade_total{reason="query_error"}` and booked as a breaker
     /// FAILURE; a healthy empty role set is neither. Only a caller that can act on "unavailable"
-    /// differently from "denied" (the Forensics-tier resolver through
-    /// `AuthRoutes::probe_permission_unavailable_aware`) should use this; every other caller uses
+    /// differently from "denied" (the Forensics-tier resolver and the software collection settings
+    /// per-group routes, both through `AuthRoutes::probe_permission_unavailable_aware`) should use
+    /// this; every other caller uses
     /// the Boolean wrapper. The list-read gates (`authorize_list_read`, via
     /// `ListReadAuthorization::read_failed`) and `engine_grant_checked` also use it.
     [[nodiscard]] std::expected<bool, std::string>
@@ -676,10 +708,25 @@ public:
                              const std::string& operation) const;
 
     /// Scoped permission check: first tries global, then checks group-scoped
-    /// roles. FAIL-CLOSED: false on any store error.
+    /// roles. FAIL-CLOSED: false on any store error. Boolean compatibility wrapper over
+    /// `check_scoped_permission_checked` (`value_or(false)`), like `check_permission`.
     bool check_scoped_permission(const std::string& username, const std::string& securable_type,
                                  const std::string& operation, const std::string& agent_id,
                                  const ManagementGroupStore* mgmt_store) const;
+
+    /// The same decision with a degrade-driven denial told apart from a definitive one (#3739):
+    /// `true` = granted, `false` = definitively denied (no grant among the reads that completed,
+    /// an explicit deny-group hit, an empty reachable set, or no mgmt store / agent id wired AND
+    /// no earlier read failed), `unexpected(msg)` = the answer is a deny BECAUSE a read failed.
+    /// `msg` is `kRbacErrMgmtGroupReadDegraded` when the FIRST failed read belonged to the
+    /// management-group store (the assignments, member or ancestor reads), otherwise the
+    /// RBAC-side error text (`kRbacErr*` or `"query failed: ..."`). An ALLOW and an explicit
+    /// deny-group hit are returned as such even if an earlier read degraded. The decision itself
+    /// is identical to the Boolean wrapper's.
+    [[nodiscard]] std::expected<bool, std::string>
+    check_scoped_permission_checked(const std::string& username, const std::string& securable_type,
+                                    const std::string& operation, const std::string& agent_id,
+                                    const ManagementGroupStore* mgmt_store) const;
 
     // ── ADR-0017 admit-then-filter list gate ─────────────────────────────
     /// The single chokepoint for list/fan-out reads of per-agent data under
@@ -755,13 +802,14 @@ private:
                                          const std::string& operation) const;
 
     // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
-    // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for
-    // are legitimately private (internal helpers `resolve_perm_groups` shares),
-    // but their OWN degrade-emission sites are what this fix adds, and
-    // resolve_perm_groups short-circuits on the FIRST failure — so a black-box
-    // test through the public `authorize_list_read()` chokepoint can only ever
-    // exercise user_rbac_group_names's sites, never role_effects_for's. The
-    // friend seam lets the test drive each directly.
+    // DashboardResultsColumnsTestAccess: role_effects_for is legitimately private (an
+    // internal helper `resolve_perm_groups` shares; its sibling
+    // user_rbac_group_names_checked is public since the attestation gate reads it), but its
+    // OWN degrade-emission sites are what this fix adds, and resolve_perm_groups
+    // short-circuits on the FIRST failure, so a black-box test through the public
+    // `authorize_list_read()` chokepoint can only ever exercise
+    // user_rbac_group_names_checked's sites, never role_effects_for's. The friend seam lets
+    // the test drive it directly.
     friend struct RbacStoreTestAccess;
 
     pg::PgPool& pool_;
@@ -825,9 +873,6 @@ private:
 
     std::expected<std::vector<std::string>, std::string>
     expand_visible_set(const PermGroups& pg, const ManagementGroupStore* mgmt_store) const;
-
-    std::expected<std::vector<std::string>, std::string>
-    user_rbac_group_names(const std::string& username) const;
 
     std::expected<std::unordered_map<std::string, int>, std::string>
     role_effects_for(const std::string& securable_type, const std::string& operation) const;

@@ -407,23 +407,23 @@ const char* const kGuardianDetailPageTemplate =
       dlg.querySelector('#ls-po-body').innerHTML = body ? body.innerHTML : '';
       dlg.showModal();
     }
-    /* Process-tree filter (matches /tar): hide all, reveal each matching row's ancestor
+    /* Process-tree filter (matches /echo): hide all, reveal each matching row's ancestor
        chain. Matches PID/name/hash/endpoint via row.textContent. Scoped to the nearest
        body so it works in the card AND the popped-out clone. */
     function lsFilterTree(input) {
       var scope = input.closest('.ls-body,.po-body'); if (!scope) return;
       var tree = scope.querySelector('.proctree'); if (!tree) return;
       var q = (input.value || '').trim().toLowerCase();
-      var nodes = tree.querySelectorAll('.tar-tree-node,.tar-tree-leaf');
+      var nodes = tree.querySelectorAll('.echo-tree-node,.echo-tree-leaf');
       if (!q) { nodes.forEach(function (el) { el.style.display = ''; }); return; }
       nodes.forEach(function (el) { el.style.display = 'none'; });
-      tree.querySelectorAll('.tar-tree-row').forEach(function (row) {
+      tree.querySelectorAll('.echo-tree-row').forEach(function (row) {
         if (row.textContent.toLowerCase().indexOf(q) === -1) return;
-        var el = row.closest('.tar-tree-leaf,.tar-tree-node');
+        var el = row.closest('.echo-tree-leaf,.echo-tree-node');
         while (el && tree.contains(el)) {
           el.style.display = '';
           if (el.tagName === 'DETAILS') el.open = true;
-          el = el.parentElement ? el.parentElement.closest('.tar-tree-node') : null;
+          el = el.parentElement ? el.parentElement.closest('.echo-tree-node') : null;
         }
       });
     }

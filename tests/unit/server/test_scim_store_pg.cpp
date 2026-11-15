@@ -1411,3 +1411,63 @@ TEST_CASE("ScimStore reports !is_open when v3 migration finds pre-existing dupli
         CHECK_FALSE(check.ok()); // table must not exist
     }
 }
+
+// #6835: the tri-state reads. A bad credential / a missing row is a DEFINITIVE answer; a store
+// fault (here: the only pooled connection is leased elsewhere, so the 1.5 s lease times out) is a
+// different answer that a caller must never turn into a 401 / 404.
+TEST_CASE("ScimStore tri-state token and lookup reads separate a store fault from a definitive "
+          "answer (#6835)",
+          "[pg][scim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.set_token("s3cr3t-raw-token", "idp-1"));
+    auto resource = store.create_resource("zed", "ext-z");
+    REQUIRE(resource.has_value());
+    auto group = store.create_group("zeds");
+    REQUIRE(group.has_value());
+    const std::string missing(32, '0');
+
+    SECTION("definitive answers") {
+        CHECK(store.validate_token_checked("s3cr3t-raw-token") == ScimStore::TokenCheck::Valid);
+        CHECK(store.validate_token_checked("wrong") == ScimStore::TokenCheck::Invalid);
+        CHECK(store.validate_token_checked("") == ScimStore::TokenCheck::Invalid);
+
+        auto hit = store.get_by_scim_id_checked(resource->scim_id);
+        REQUIRE(hit.has_value());
+        REQUIRE(hit->has_value());
+        CHECK((*hit)->username == "zed");
+        auto miss = store.get_by_scim_id_checked(missing);
+        REQUIRE(miss.has_value()); // the store answered...
+        CHECK_FALSE(miss->has_value()); // ...with a definitive miss
+        auto empty_id = store.get_by_scim_id_checked("");
+        REQUIRE(empty_id.has_value());
+        CHECK_FALSE(empty_id->has_value());
+
+        auto g_hit = store.get_group_by_id_checked(group->scim_id);
+        REQUIRE(g_hit.has_value());
+        REQUIRE(g_hit->has_value());
+        auto g_miss = store.get_group_by_id_checked(missing);
+        REQUIRE(g_miss.has_value());
+        CHECK_FALSE(g_miss->has_value());
+        auto n_hit = store.get_group_by_display_name_checked("zeds");
+        REQUIRE(n_hit.has_value());
+        CHECK(n_hit->has_value());
+        auto n_miss = store.get_group_by_display_name_checked("no-such-group");
+        REQUIRE(n_miss.has_value());
+        CHECK_FALSE(n_miss->has_value());
+    }
+
+    SECTION("a store fault is neither Valid / Invalid nor a miss") {
+        auto held = pool.acquire(); // the only connection: every store read now times out
+        REQUIRE(held);
+        CHECK(store.validate_token_checked("s3cr3t-raw-token") ==
+              ScimStore::TokenCheck::Unavailable);
+        CHECK_FALSE(store.validate_token("s3cr3t-raw-token")); // the plain bool cannot tell
+        CHECK_FALSE(store.get_by_scim_id_checked(resource->scim_id).has_value());
+        CHECK_FALSE(store.get_group_by_id_checked(group->scim_id).has_value());
+        CHECK_FALSE(store.get_group_by_display_name_checked("zeds").has_value());
+    }
+}

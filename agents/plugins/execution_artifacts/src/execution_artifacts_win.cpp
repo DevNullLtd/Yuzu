@@ -174,7 +174,7 @@ std::string amcache_copy_error_token(DWORD err) {
 // an untrusted size). Mirrors agents/core/src/guard_win_handle.hpp's
 // ScopedWinHandle shape -- that header is core-internal and not on this
 // plugin's include path, so this is a local specialisation rather than a
-// cross-module include, same precedent as tar_netconn_win.cpp's EvtGuard.
+// cross-module include, same precedent as echo_netconn_win.cpp's EvtGuard.
 template <void (*CloseFn)(HANDLE)>
 class ScopedWinHandle {
 public:

@@ -7,6 +7,12 @@
  *               where the OS exposes it, wear indicators.
  *   "volumes" — The mapping between physical drives and the logical volumes
  *               they back.
+ *   "partitions" — read on Windows (Win32_DiskPartition + Win32_LogicalDiskToPartition,
+ *               cross-checked against Win32_LogicalDisk, through bounded WMI); PLANNED on
+ *               Linux and macOS.
+ *   "topology"   — PLANNED on every OS.
+ *               A planned action answers one `status|<action>|unsupported|<os>:planned` row
+ *               until its leg lands.
  *
  * SCOPE, decided deliberately (Alex ruling, Wave 6 planning). `volumes` is NOT
  * a third volume inventory. `hardware.disks` already enumerates physical
@@ -103,6 +109,33 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "no assigned drive letter or mount point reports '-' for mount points rather than being "
          "omitted"},
     },
+    {
+        /* .action      = */ "partitions",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "/proc/self/mountinfo + /sys/block/*/<part>",
+         "not read yet: one unsupported status row, linux:planned"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "diskutil list + getmntinfo",
+         "not read yet: one unsupported status row, macos:planned"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "WMI Win32_DiskPartition + Win32_LogicalDiskToPartition + Win32_LogicalDisk (bounded)",
+         "one row per partition Windows exposes through Win32_DiskPartition, with its drive "
+         "letters; the 16 MiB Microsoft Reserved partition is not listed by that class, and a "
+         "volume mounted on a folder rather than a drive letter shows no mount point"},
+    },
+    {
+        /* .action      = */ "topology",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "/sys/block/dm-*/dm/{name,uuid}, md*/md, slaves",
+         "not read yet: one unsupported status row, linux:planned"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_PLANNED, 1, "diskutil apfs list",
+         "not read yet: one unsupported status row, macos:planned"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_PLANNED, 1, "no source ruled; stays planned",
+         "not read yet: one unsupported status row, windows:planned"},
+    },
 };
 
 } // namespace
@@ -117,7 +150,7 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"smart", "volumes", nullptr};
+        static const char* acts[] = {"smart", "volumes", "partitions", "topology", nullptr};
         return acts;
     }
 
@@ -138,6 +171,10 @@ public:
             return yuzu::disk_actions::emit_smart(ctx);
         if (action == "volumes")
             return yuzu::disk_actions::emit_volumes(ctx);
+        if (action == "partitions")
+            return yuzu::disk_actions::emit_partitions(ctx);
+        if (action == "topology")
+            return yuzu::disk_actions::emit_topology(ctx);
 
         // `action` is request-supplied and lands in a pipe-delimited stream, so
         // it goes through the shared escaper like any other untrusted field.

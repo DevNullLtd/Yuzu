@@ -11,6 +11,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "../test_log_capture.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -326,7 +328,7 @@ TEST_CASE("ids_missing_plugin: an agent whose inventory does not include the plu
     p->set_name("os_info");
     registry.register_agent(info);
 
-    const auto missing = registry.ids_missing_plugin("tar", "sql");
+    const auto missing = registry.ids_missing_plugin("echo", "sql");
     CHECK(missing.contains("dev-A"));
 }
 
@@ -338,10 +340,10 @@ TEST_CASE("ids_missing_plugin: an agent whose inventory DOES include the plugin 
     AgentRegistry registry(bus, metrics);
     auto info = make_presence_test_info("dev-A");
     auto* p = info.add_plugins();
-    p->set_name("tar");
+    p->set_name("echo");
     registry.register_agent(info);
 
-    const auto missing = registry.ids_missing_plugin("tar", "sql");
+    const auto missing = registry.ids_missing_plugin("echo", "sql");
     CHECK_FALSE(missing.contains("dev-A"));
 }
 
@@ -357,7 +359,7 @@ TEST_CASE("ids_missing_plugin: an agent with an EMPTY reported inventory is neve
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_presence_test_info("dev-A")); // no add_plugins() call at all
 
-    const auto missing = registry.ids_missing_plugin("tar", "sql");
+    const auto missing = registry.ids_missing_plugin("echo", "sql");
     CHECK_FALSE(missing.contains("dev-A"));
 }
 
@@ -369,7 +371,7 @@ TEST_CASE("ids_missing_plugin: a mixed fleet reports exactly the agents genuinel
     AgentRegistry registry(bus, metrics);
 
     auto has_it = make_presence_test_info("dev-has-it");
-    has_it.add_plugins()->set_name("tar");
+    has_it.add_plugins()->set_name("echo");
     registry.register_agent(has_it);
 
     auto lacks_it = make_presence_test_info("dev-lacks-it");
@@ -378,7 +380,7 @@ TEST_CASE("ids_missing_plugin: a mixed fleet reports exactly the agents genuinel
 
     registry.register_agent(make_presence_test_info("dev-no-inventory"));
 
-    const auto missing = registry.ids_missing_plugin("tar", "sql");
+    const auto missing = registry.ids_missing_plugin("echo", "sql");
     CHECK(missing.size() == 1);
     CHECK(missing.contains("dev-lacks-it"));
     CHECK_FALSE(missing.contains("dev-has-it"));
@@ -408,8 +410,8 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
     using yuzu::server::Mutability;
     using yuzu::server::detail::finalize_classified_command;
 
-    constexpr CommandCapability kTarPurgeCap{
-        .plugin = "tar",
+    constexpr CommandCapability kEchoPurgeCap{
+        .plugin = "echo",
         .action = "purge_source",
         .dispatch_class = DispatchClass::Mutating,
         .mutability = Mutability::Reversible,
@@ -424,18 +426,18 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
         };
 
     // A real caller dispatching with different-cased spelling — classify() is
-    // case-insensitive, so this is authorized against kTarPurgeCap exactly
+    // case-insensitive, so this is authorized against kEchoPurgeCap exactly
     // like test_dispatch_chokepoint.cpp's own BR-009 test.
-    auto classified = finalize_classified_command(kTarPurgeCap, switch_on, "TAR", "Purge_Source",
+    auto classified = finalize_classified_command(kEchoPurgeCap, switch_on, "Echo", "Purge_Source",
                                                    "cmd-br009", {}, {}, 0, 0, {}, {});
     REQUIRE(classified.has_value());
-    REQUIRE(classified->wire().plugin() == "tar");
+    REQUIRE(classified->wire().plugin() == "echo");
 
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     auto info = make_presence_test_info("dev-A");
-    info.add_plugins()->set_name("tar"); // agent reports the canonical spelling
+    info.add_plugins()->set_name("echo"); // agent reports the canonical spelling
     registry.register_agent(info);
 
     // The fix: query with the canonical wire plugin — the agent has it.
@@ -446,7 +448,7 @@ TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
     // have wrongly reported dev-A as missing the plugin it genuinely has —
     // pinned here so a future call-site regression back to the raw string is
     // caught by this same test, not just by the composition it demonstrates.
-    const auto missing_raw_caller_casing = registry.ids_missing_plugin("TAR", "sql");
+    const auto missing_raw_caller_casing = registry.ids_missing_plugin("Echo", "sql");
     CHECK(missing_raw_caller_casing.contains("dev-A"));
 }
 
@@ -483,15 +485,15 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     {
-        // dev-A reports "tar" (the dispatched plugin) so it is genuinely
-        // reachable; dev-B reports a NON-EMPTY inventory that lacks "tar".
+        // dev-A reports "echo" (the dispatched plugin) so it is genuinely
+        // reachable; dev-B reports a NON-EMPTY inventory that lacks "echo".
         // Registering dev-B via the bare `make_presence_test_info` helper
         // (no plugins at all) would instead hit `ids_missing_plugin`'s
         // fail-open branch (empty inventory = unknown, not absent -- see
         // the dedicated fail-open test above) and never land in
         // `unknown_plugin`, so this test's REQUIRE below could never pass.
         auto info_a = make_presence_test_info("dev-A");
-        info_a.add_plugins()->set_name("tar");
+        info_a.add_plugins()->set_name("echo");
         registry.register_agent(info_a);
         auto info_b = make_presence_test_info("dev-B");
         info_b.add_plugins()->set_name("os_info");
@@ -504,7 +506,7 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-plugin-presence-cmd");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("sql");
     cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
     auto classified = ClassifiedCommandTestAccess::make(cmd);
@@ -531,4 +533,63 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
     auto reclaim = tracker.claim_concurrency_slots("def-1", "exec-2", "wiring-plugin-presence-cmd-2",
                                                     {"dev-B"}, /*expires_at_seconds=*/9999999999);
     CHECK(reclaim == std::vector<std::string>{"dev-B"});
+}
+
+// ───────── Echo plugin name: the registry takes an inventory at its word ─────────
+//
+// A fresh deployment reports `echo`. An inventory that reports only the retired name `tar` is not
+// treated as having `echo`, and a command for `echo` reaches the wire under its own name.
+
+TEST_CASE("an agent reporting only the retired `tar` plugin does not count as having `echo`",
+          "[server][dispatch][plugin_presence][registry][echo_rename]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    auto info = make_presence_test_info("dev-retired-name");
+    info.add_plugins()->set_name("os_info");
+    info.add_plugins()->set_name("tar");
+    yuzu::test::LogCapture logs;
+    (void)registry.register_agent(info);
+    logs.stop();
+    // The operator's only signal that this agent is not an Echo agent here.
+    CHECK(logs.text().find("retired plugin name 'tar' and no 'echo'") != std::string::npos);
+
+    CHECK(registry.ids_missing_plugin("echo", "sql").contains("dev-retired-name"));
+
+    const auto session = registry.get_session("dev-retired-name");
+    REQUIRE(session);
+    CHECK(std::ranges::find(session->plugin_names, "echo") == session->plugin_names.end());
+    CHECK(std::ranges::find(session->plugin_names, "tar") != session->plugin_names.end());
+}
+
+TEST_CASE("an agent reporting `echo` has it and send_to / send_to_all write `echo` to the wire",
+          "[server][dispatch][registry][echo_rename]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    auto info = make_presence_test_info("dev-new");
+    info.add_plugins()->set_name("echo");
+    (void)registry.register_agent(info);
+    CHECK_FALSE(registry.ids_missing_plugin("echo", "sql").contains("dev-new"));
+    REQUIRE(registry.set_gateway_route(
+        "dev-new", /*session_id=*/{}, "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+
+    agent_pb::CommandRequest cmd;
+    cmd.set_command_id("send-1");
+    cmd.set_plugin("echo");
+    cmd.set_action("sql");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    const auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    REQUIRE(registry.send_to("dev-new", classified));
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].cmd.plugin() == "echo");
+    CHECK(pending[0].cmd.dispatch_tag() == "v1|ro|none|0123456789abcdef0123456789abcdef");
+
+    REQUIRE(registry.send_to_all(classified) == 1);
+    pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].cmd.plugin() == "echo");
 }

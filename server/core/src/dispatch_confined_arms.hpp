@@ -12,6 +12,7 @@
 #include <yuzu/protective_actions.hpp>
 
 #include "authz_model.hpp"
+#include "dispatch_denial.hpp"
 #include "dispatch_target_shape.hpp"
 
 /// @file dispatch_confined_arms.hpp
@@ -297,7 +298,7 @@ struct ArmDispatchResult {
 /// declared here rather than there so every `DispatchFn` typedef across the
 /// codebase (mcp_server.hpp, bundle_orchestrator.hpp, dashboard_routes.hpp,
 /// deployment_engine.hpp, dex_routes.hpp, preflight_routes.hpp,
-/// tar_tree_routes.hpp -- #3424/#3511) can include this lighter header
+/// echo_tree_routes.hpp -- #3424/#3511) can include this lighter header
 /// instead of dispatch_scope_ladder.hpp's much heavier dependency list. `sent`
 /// is the count actually dispatched; `scope_parse_error` is set only when the
 /// Scope arm's resolved expression failed to parse -- the one distinction a
@@ -376,6 +377,27 @@ struct ConfinedDispatchOutcome {
     /// branches below (`dispatch_confined_arms` never calls
     /// `prepare_route_fallback` for Broadcast/None).
     bool route_unreadable = false;
+    /// #7114: set ONLY by `ServerImpl::dispatch_confined` when
+    /// `build_classified_command` refused the pair (unclassified, ambiguous,
+    /// anonymous operator, forbidden, approval required, kill switched) BEFORE
+    /// any targeting; a denial never reaches an agent, so `sent` is 0. Carried
+    /// so a surface that reports a zero-reach can name the real cause instead of
+    /// folding it into "the agent is not connected". Every zero-reach consumer
+    /// that names a cause must handle it: the shared `classify_zero_reach` ranks
+    /// it first (`ZeroReachCause::Denied`). Of the five hand-copied legacy
+    /// cascades, three (mcp_server.cpp, command_routes.cpp, server.cpp legacy
+    /// forward) run an authorize dry run before dispatching, so a denial there
+    /// is only a race and they are left on their existing order;
+    /// workflow_routes.cpp's legacy execute runs no dry run and still folds a
+    /// denial into its generic no-agents answer (it re-decides its route gate
+    /// and the definition's approval mode after its execution row, #7110, but
+    /// reads no cause); dashboard_routes.cpp runs no dry run, so all five of
+    /// its readers check this field before their cascade: the execute console,
+    /// the Echo re-enable and purge arms, the echo-execute (SQL) arm and the
+    /// echo.status scan. The sibling fragments in echo_tree_routes.cpp,
+    /// dex_routes.cpp and device_routes.cpp, and the REST result-set producers,
+    /// still fold a denial into no-agents.
+    std::optional<detail::DispatchDenial> denied;
 };
 
 // The closed quarantine-control predicate lives in the shared pure header so the
@@ -444,12 +466,12 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 /// before this they were invisible on every channel.
 /// SCOPE OF THE BYPASS, per enumerator — because "these three are exempt" is
 /// not by itself enough for anyone reviewing the containment surface:
-///   - `tar_fleet_snapshot` requests a READ-ONLY topology snapshot.
+///   - `echo_fleet_snapshot` requests a READ-ONLY topology snapshot.
 ///   - `asset_tags_sync` writes device tags. No execution.
 ///   - `inventory_sync_now` asks an agent to re-run its daily-sync source(s)
 ///     and report (`__sync__.now`, ADR-0016 update). Read-only, no execution;
 ///     operator-REQUESTED but system-DISPATCHED, so it rides this door. Not
-///     quarantine-gated, same as tar_fleet_snapshot. Three operator surfaces use it:
+///     quarantine-gated, same as echo_fleet_snapshot. Three operator surfaces use it:
 ///     `POST /api/v1/hardware/{id}/sync` reaches ONE agent (gated on
 ///     Execution:Execute for that device), and `POST /api/v1/hardware/sync` plus the MCP tool
 ///     `sync_hardware_software` reach up to 500 on this server process under ONE command id
@@ -469,7 +491,7 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     baseline on a compromised host is the point, but it is the enumerator
 ///     to think hardest about before adding a sibling.
 enum class SystemReservedPush {
-    tar_fleet_snapshot,
+    echo_fleet_snapshot,
     guardian_push_rules,
     asset_tags_sync,
     inventory_sync_now,
@@ -480,8 +502,8 @@ enum class SystemReservedPush {
 [[nodiscard]] inline constexpr std::string_view
 system_reserved_push_label(SystemReservedPush push) {
     switch (push) {
-    case SystemReservedPush::tar_fleet_snapshot:
-        return "tar.fleet_snapshot";
+    case SystemReservedPush::echo_fleet_snapshot:
+        return "echo.fleet_snapshot";
     case SystemReservedPush::guardian_push_rules:
         return "__guard__.push_rules";
     case SystemReservedPush::asset_tags_sync:
@@ -496,7 +518,7 @@ system_reserved_push_label(SystemReservedPush push) {
 /// call sites — same reason `kQuarantineGateOutcomes` exists. An internal push
 /// that has never fired must read as zero, not as an absent series.
 inline constexpr std::array<SystemReservedPush, 4> kSystemReservedPushes{
-    SystemReservedPush::tar_fleet_snapshot, SystemReservedPush::guardian_push_rules,
+    SystemReservedPush::echo_fleet_snapshot, SystemReservedPush::guardian_push_rules,
     SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now};
 
 /// The two outcomes a system-reserved push can have at the registry seam.

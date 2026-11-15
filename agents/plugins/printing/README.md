@@ -193,8 +193,8 @@ Every row is pipe-delimited, one row per printer/job. `printers`/`jobs` report `
 ### Where the data goes
 
 - **Instruction result.** Every row is server instruction-result data — the standard retention policy, served over REST `/api/responses`. Nothing here is a durable server-side table of its own.
-- **Not consumed by** daily-sync, TAR, DEX, or metrics — the plugin never runs on a schedule outside an explicit instruction dispatch, and there is no agent daily-sync source for print queues.
-- **Sensitivity.** `jobs.document` is the job's user-supplied document title or file name: user content, kept with instruction-result retention only and never forwarded to daily-sync, TAR or DEX. `jobs.owner` is a local account name on the device. A printer's `make_model` and `uri` can name an internal print server.
+- **Not consumed by** daily-sync, Echo, DEX, or metrics — the plugin never runs on a schedule outside an explicit instruction dispatch, and there is no agent daily-sync source for print queues.
+- **Sensitivity.** `jobs.document` is the job's user-supplied document title or file name: user content, kept with instruction-result retention only and never forwarded to daily-sync, Echo or DEX. `jobs.owner` is a local account name on the device. A printer's `make_model` and `uri` can name an internal print server.
 - **Siblings:** `crossplatform.printing.printers`, `crossplatform.printing.jobs`.
 
 ## Sample output

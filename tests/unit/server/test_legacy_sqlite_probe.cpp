@@ -210,7 +210,7 @@ TEST_CASE("legacy_sqlite_probe: warns (does not silently skip) when the legacy p
     REQUIRE(std::filesystem::create_directory(dir));
     // RAII: restore permissions before removal even if an assertion throws,
     // so a permission-locked temp dir never leaks onto a CI box that reuses
-    // workspaces (test_tar_store.cpp's DirGuard precedent).
+    // workspaces (test_echo_store.cpp's DirGuard precedent).
     struct DirGuard {
         std::filesystem::path dir;
         ~DirGuard() {

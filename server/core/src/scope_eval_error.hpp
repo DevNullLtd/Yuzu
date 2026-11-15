@@ -53,9 +53,19 @@ struct ScopeEvalError {
         /// (`evaluate_scope`, never `evaluate_scope_local`, which never
         /// consults presence at all).
         PresenceDegraded,
+        /// A referenced result set (owned by the caller) cannot be used as scope YET: it is still
+        /// `pending` and may fill, so a retry can succeed. `detail` is
+        /// `cause=pending result_set=<id>` (the id neutralised).
+        ResultSetUnusable,
+        /// A referenced result set (owned by the caller) cannot be used as scope and retrying will
+        /// not change that: its fill `failed`, or it is incomplete (an agent failed or never
+        /// answered) and is referenced where a missing member would match (under NOT, LEN or
+        /// STARTSWITH). Re-running the producer that created the set is the remedy. Same wire
+        /// reason as `ResultSetUnusable`; `detail` is `cause=<failed|incomplete> result_set=<id>`.
+        ResultSetUnusablePermanent,
     };
     Kind kind;
-    std::string detail; // e.g. the failing result-set id, for OwnerCheckFailed
+    std::string detail; // the failing result-set id (OwnerCheckFailed), or the cause tokens above
 };
 
 /// Audit/log vocabulary for `Kind`. Kept alongside the enum (rather than only
@@ -78,16 +88,21 @@ inline const char* to_string(ScopeEvalError::Kind k) {
         return "owner_check_failed";
     case ScopeEvalError::Kind::PresenceDegraded:
         return "presence_degraded";
+    case ScopeEvalError::Kind::ResultSetUnusable:
+    case ScopeEvalError::Kind::ResultSetUnusablePermanent:
+        return "result_set_unusable";
     }
     return "unknown";
 }
 
 /// True for a PERMANENT scope-evaluation abort — a retry will NOT fix it
-/// (no dispatching principal was supplied, or a required store was never
-/// wired at this call site); false for a TRANSIENT one — a backend read
-/// that may recover on its own (a genuine store or presence degrade).
-/// Exhaustive switch, deliberately with NO `default:` case: a future 6th
-/// `Kind` value must be classified here explicitly, or `-Werror=switch`
+/// (no dispatching principal was supplied, a required store was never
+/// wired at this call site, or a referenced result set failed or is incomplete
+/// where a missing member would match); false for a TRANSIENT one — a backend
+/// read that may recover on its own (a genuine store or presence degrade), or
+/// a referenced result set that is still pending.
+/// Exhaustive switch, deliberately with NO `default:` case: a further
+/// `Kind` value (there are seven today) must be classified here explicitly, or `-Werror=switch`
 /// (`server/core/meson.build`'s `switch_werror_args`, already applied to
 /// this translation unit) fails the build — rather than the value silently
 /// and untestedly landing in whichever bucket a raw string comparison
@@ -108,9 +123,11 @@ inline bool scope_abort_is_permanent(ScopeEvalError::Kind k) {
     case ScopeEvalError::Kind::PrincipalUnresolved:
     case ScopeEvalError::Kind::Unresolvable:
     case ScopeEvalError::Kind::OwnerCheckFailed:
+    case ScopeEvalError::Kind::ResultSetUnusablePermanent: // re-run the producer instead
         return true;
     case ScopeEvalError::Kind::StoreDegraded:
     case ScopeEvalError::Kind::PresenceDegraded:
+    case ScopeEvalError::Kind::ResultSetUnusable: // a pending set may fill; retry then
         return false;
     }
     return false;

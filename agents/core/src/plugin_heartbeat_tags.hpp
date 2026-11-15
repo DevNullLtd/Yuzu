@@ -14,7 +14,7 @@
  *
  * Bounds a byte-length and a key count, nothing more: a future NUMERIC
  * consumer that sums a tag's raw value into a fleet gauge (rather than only
- * counting agents, as tar_corruption_audit.hpp's parser does today) must add
+ * counting agents, as echo_corruption_audit.hpp's parser does today) must add
  * its OWN plausibility ceiling, mirroring the kMaxPlausible*Count pattern in
  * the sibling spark_fleet_tags.hpp/guardian_*_fleet_tags.hpp headers — an
  * unbounded value summed into a double silently annihilates every honest

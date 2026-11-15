@@ -118,7 +118,7 @@ meson setup "$WT/$BUILDDIR" <mirrored-options>
 ```
 
 Run clang-tidy on changed C++ translation units using `$WT/$BUILDDIR/compile_commands.json`, compile,
-and run the targeted suites (`server/core` → server, `agents`/`sdk` → agent, TAR → tar; unclear → all).
+and run the targeted suites (`server/core` → server, `agents`/`sdk` → agent, Echo → echo; unclear → all).
 Gateway changes use `/gateway-dialyzer` and `/gateway-eunit`; workflow changes use zizmor when present.
 
 ### Dependabot or promoted fork

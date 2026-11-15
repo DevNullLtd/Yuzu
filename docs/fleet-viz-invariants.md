@@ -151,14 +151,16 @@ Standing rules:
   files: dropping `alpha: true` renders an opaque black canvas over the
   backdrop, and removing the CSS backdrop leaves the transparent canvas on
   whatever the page body is. Change both together.
-- **Token-mirrored palette.** `static/yuzu.css` owns the colour tokens
-  (`--c1`..`--c5`, `--mut`, `--faint`, `--ink`, `--primary-h`, and the rest).
-  `static/yuzu-viz.js` mirrors them as hard-coded hex values because the
-  WebGL materials cannot read CSS variables; each mirrored literal carries a
-  `// --token` comment. A token retune therefore needs a matching edit in
-  `yuzu-viz.js`, in the pinned tests, in the Fleet legend (which uses
-  `var(--c1..c3)` directly, so it follows the token while the cubes do not),
-  and in the colour sentences of `rest-api.md` and `server-admin.md`.
+- **Token-read palette.** `static/yuzu.css` owns the colour tokens
+  (`--c1`..`--c5`, `--mut`, `--faint`, `--ink2`, `--bg`, and the rest).
+  `static/yuzu-viz.js` reads them once at module load through `cssToken(name,
+  fallback)` (the WebGL materials take a colour string, not a CSS variable), so
+  the cubes, process dots and label plates follow the active colour scheme; the
+  hex argument is only the fallback when a token is unset. The label plates fill
+  `--bg` under `globalAlpha` (reset to 1 afterwards) with `--ink2` text, so the
+  pair holds on dark and light schemes alike. A token retune needs a matching
+  edit in the pinned tests, in the Fleet legend (which uses `var(--c1..c3)`
+  directly), and in the colour sentences of `rest-api.md` and `server-admin.md`.
   `static/yuzu-viz-host.js` does not mirror: it reads the tokens at render
   time through `getComputedStyle`, so the Host map follows the sheet.
 
@@ -203,8 +205,9 @@ Standing rules:
   LOD for free, and reuse `clearFleet`'s `traverse(disposeNode)` walk for
   free disposal.
 - **`CATEGORY_PALETTE`** is six colours matching the agent's
-  `category_to_string()` enum exactly. The hexes mirror the named `yuzu.css`
-  tokens (see "Token-mirrored palette" under the renderer invariants):
+  `category_to_string()` enum exactly. Each colour is read from the named `yuzu.css`
+  token (see "Token-read palette" under the renderer invariants); the hex is the
+  slate value and the `cssToken` fallback:
 
   | Category | Hex | Token |
   |---|---|---|
@@ -261,7 +264,8 @@ Standing rules:
 - **Socket primitives.** `SphereGeometry(SOCKET_DOT_RADIUS, 10, 8)` on a
   ring of radius `CUBE_SIZE * 0.32` on the cube top face; port label
   Sprite floats `0.55` units above each sphere. Listener sphere and
-  `:port` label colour is coral (`0xff6b7a`, the `--c4` chart token) —
+  `:port` label colour is coral (`0xff6b7a`; the label text reads the `--c4` chart token, the
+  sphere material is fixed) —
   the one chart colour no process category or OS cube uses, so
   operators see them as "ports" not "processes" or "machines".
 - **Cross-machine edges.** ESTABLISHED-state `connections` outbound
@@ -422,7 +426,7 @@ Standing rules:
   `yuzu_viz_topology_pushed_total{via=...}` is the canonical
   per-push metric.
 - **Capture-mode CommandContextImpl on the agent.** Agent's
-  snapshot pump invokes `tar.fleet_snapshot` locally with a
+  snapshot pump invokes `echo.fleet_snapshot` locally with a
   `capture` pointer that diverts plugin output into a stack-local
   string. Capture buffer caps at 2 MiB (UP-9); truncated payloads
   are dropped on the floor (seq does NOT advance) so the next pump
@@ -468,6 +472,19 @@ rules for the `viz_routes.cpp::handle_topology` merge:
   and MCP, appends `offline_roster_degraded=1` to the `viz.fleet_topology` audit
   detail, and increments
   `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`.
+- **Typed partial, flagged, never refused (#5712).** The offline read returns the
+  newest `kOfflineRosterRowCap` (100,000) endpoints and says when more existed. A
+  truncated read is still merged and served, with `offline_roster_truncated: true` in the
+  envelope on REST and MCP and `offline_roster_truncated=1` on the `viz.fleet_topology`
+  audit detail — on the `413` oversize audit row too. It is not `offline_roster_degraded`
+  and it is not an error; do not "fix" it into either. **It is rarely reachable as a `200`:**
+  `kMachinesMaxCeiling` equals the roster cap and the `machines_max` gate runs after the
+  merge, so a truncated merge is at least 100,000 machines: a `413` at any `machines_max`
+  below the ceiling (the default is 5000), with the flag on its audit row and no partial
+  body; a `200` with the flag needs `machines_max=100000` with every live host inside the
+  roster. One live host outside it is a permanent `413` at the ceiling whose "raise the
+  cap" advice cannot be followed (#7550). The flag is a fact about stale hosts only: a host absent from
+  `machines` may still exist.
 - **`yuzu_viz_offline_hosts_total`** counts offline nodes merged (described in
   the `server.cpp` viz metric block — keep it described, `promtool`-clean).
   Since #5678 a gracefully departed host keeps its roster row, so it is merged

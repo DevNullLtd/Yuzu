@@ -51,6 +51,7 @@ Closes the `docs/auth-architecture.md` "Deferred items" CC6.3 gap and the
   A deployment that misconfigures the cert this way, with no OIDC fallback, would
   boot with local-password disabled and SAML loudly disabled — recoverable via
   the break-glass account (host-CLI armed) exactly as an OIDC-outage is.
+  *(Superseded in part by #4160: a second, runtime-wiring check now refuses to start when no provider came up. See `docs/auth-architecture.md`, "Boot guard". This dated record is otherwise unchanged.)*
 - **No new authentication surface.** The `POST /login` local-password gate and
   the `/auth/saml/start` + `/saml/acs` handlers are unchanged — they key on
   `auth_mode` / provider-enabled state independently and already behaved

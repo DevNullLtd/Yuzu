@@ -40,7 +40,7 @@ param(
   [string]$Rebar3Version   = '3.24.0',
   [string]$PostgresVersion = '18.4',
   [ValidateSet('10.0.26100.0')][string]$WindowsSdkVersion = '10.0.26100.0',
-  [string]$VcpkgBaseline   = '4b77da7fed37817f124936239197833469f1b9a8',  # == vcpkg.json builtin-baseline
+  [string]$VcpkgBaseline   = '9eec002df1cd109f8f104cd966a763daf9751489',  # == vcpkg.json builtin-baseline
 
   # --- machine layout (conventions; keep in sync with Start-PinnedRunner.ps1) ---
   [string]$CacheRoot       = 'D:\ci',     # ccache + shared tool_cache live here (fast data drive)
@@ -790,14 +790,14 @@ Step 'Windows Defender exclusions for CI hot paths (runner work + Postgres)' {
     Add-MpPreference -ExclusionProcess (Join-Path $CacheRoot "pgbin\agent-$n\bin\postgres.exe") -EA SilentlyContinue
   }
   # The Catch2 test binaries drive the SQLite .db/-wal/-shm temp churn behind the
-  # tar (~104x Linux) and server (~5-18x) suites. A PROCESS exclusion skips
+  # echo (~104x Linux) and server (~5-18x) suites. A PROCESS exclusion skips
   # scanning ALL of a binary's file I/O wherever it lands — including the
   # LOCAL SYSTEM-context C:\Windows\Temp that the per-runner _temp routing cannot
   # reach — so it is broader than the C:\Windows\Temp\yuzu* path exclusion below
   # and complements it. Bare names (not full paths): these binaries live under the
   # per-build tests dir (which varies) and are ours alone on a CI runner, unlike
   # 'postgres.exe' which must stay path-scoped.
-  $testExes = @('yuzu_server_tests.exe','yuzu_agent_tests.exe','yuzu_tar_tests.exe')
+  $testExes = @('yuzu_server_tests.exe','yuzu_agent_tests.exe','yuzu_echo_tests.exe')
   foreach($exe in $testExes){ Add-MpPreference -ExclusionProcess $exe -EA SilentlyContinue }
   $paths = @()
   # Each registered runner's work root contains both its GitHub RUNNER_TEMP

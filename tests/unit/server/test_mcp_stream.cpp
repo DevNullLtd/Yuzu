@@ -16,6 +16,7 @@
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
 #include "../../../server/core/src/stream_budget.hpp"
+#include "mcp_test_binding.hpp"
 
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -35,6 +36,9 @@ namespace mcp = yuzu::server::mcp;
 namespace detail = yuzu::server::detail;
 
 namespace {
+
+// The principal-only fixture (an empty credential class); see mcp_test_binding.hpp.
+using yuzu::test::mcp_session::bound;
 
 /// Captures everything the pump writes, so a test can assert on the wire bytes.
 struct FakeWire {
@@ -158,6 +162,57 @@ TEST_CASE("StreamBudget: kMcpPost is an independent surface — its per-principa
     CHECK(get.lease);
     CHECK(budget.active_for(detail::SseSurface::kMcpPost, "alice") == detail::kPerPrincipalMcpPost);
     CHECK(budget.active_for(detail::SseSurface::kMcpGet, "alice") == 1);
+}
+
+TEST_CASE("StreamBudget: kWorkflowRun is a surface of the ONE budget: 2 per principal, counted in "
+          "the global cap, released with the lease (#2146 D3)",
+          "[mcp][stream][ch5][workflow][twin]") {
+    CHECK(std::string(detail::to_string(detail::SseSurface::kWorkflowRun)) == "workflow_run");
+    CHECK(detail::kPerPrincipalWorkflowRun == 2);
+
+    detail::StreamBudget budget{{.global_cap = 3}};
+    std::vector<detail::StreamBudget::Lease> held;
+    for (std::size_t i = 0; i < detail::kPerPrincipalWorkflowRun; ++i) {
+        auto r = budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                    detail::kPerPrincipalWorkflowRun);
+        REQUIRE(r.lease);
+        held.push_back(std::move(r.lease));
+    }
+    // The third run for the same principal is refused on the PER-PRINCIPAL cap...
+    auto over = budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                   detail::kPerPrincipalWorkflowRun);
+    CHECK_FALSE(over.lease);
+    CHECK(std::string(over.reject_reason) == detail::StreamBudget::kRejectPerPrincipal);
+    // ...her other surfaces are separate keys and still admit.
+    auto get = budget.try_acquire(detail::SseSurface::kMcpGet, "alice", 4);
+    REQUIRE(get.lease);
+
+    // The per-surface count is the workflow share only; active() is everything.
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 2);
+    CHECK(budget.active_for_surface(detail::SseSurface::kMcpGet) == 1);
+    CHECK(budget.active_for_surface(detail::SseSurface::kApiEvents) == 0);
+    CHECK(budget.active() == 3);
+
+    // ONE budget: the workflow runs spend the global cap that the streaming surfaces share, so a
+    // stream is refused on the global cap while two runs and a GET hold it, and a different
+    // principal's run is refused the same way.
+    auto stream = budget.try_acquire(detail::SseSurface::kApiEvents, "bob", detail::kPerPrincipalApiEvents);
+    CHECK_FALSE(stream.lease);
+    CHECK(std::string(stream.reject_reason) == detail::StreamBudget::kRejectGlobal);
+    auto bob_run = budget.try_acquire(detail::SseSurface::kWorkflowRun, "bob",
+                                      detail::kPerPrincipalWorkflowRun);
+    CHECK_FALSE(bob_run.lease);
+    CHECK(std::string(bob_run.reject_reason) == detail::StreamBudget::kRejectGlobal);
+
+    // Destroying a lease returns the slot: the count falls and the next run admits.
+    held.pop_back();
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 1);
+    auto again = budget.try_acquire(detail::SseSurface::kWorkflowRun, "alice",
+                                    detail::kPerPrincipalWorkflowRun);
+    CHECK(again.lease);
+    held.clear();
+    again.lease.release();
+    CHECK(budget.active_for_surface(detail::SseSurface::kWorkflowRun) == 0);
 }
 
 TEST_CASE("derive_stream_budget: caps are clamped to what the worker pool can spare",
@@ -1168,15 +1223,16 @@ TEST_CASE("McpStreamPump: a sink-queue overflow tells the client to resume, not 
 TEST_CASE("McpSessionRegistry: terminate closes the session's live stream",
           "[mcp][session][stream]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
 
-    auto stream = reg.stream_for(minted.session_id, "alice");
+    auto stream = reg.stream_for(minted.session_id, bound("alice"));
     REQUIRE(stream);
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
 
-    REQUIRE(reg.terminate(minted.session_id, "alice"));
+    REQUIRE(reg.terminate(minted.session_id, bound("alice")) ==
+            mcp::McpSessionRegistry::ValidateResult::kValid);
     // The provider is woken and given a reason — a DELETE must not present as a
     // bare connection drop.
     CHECK(attached.sink->sse->closed.load());
@@ -1186,14 +1242,14 @@ TEST_CASE("McpSessionRegistry: terminate closes the session's live stream",
 TEST_CASE("McpSessionRegistry: stream_for is principal-bound (no oracle)",
           "[mcp][session][stream]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
 
-    CHECK(reg.stream_for(minted.session_id, "alice"));
+    CHECK(reg.stream_for(minted.session_id, bound("alice")));
     // A real session id under the wrong principal answers exactly as a made-up one
     // does — nullptr, no signal that the id exists.
-    CHECK_FALSE(reg.stream_for(minted.session_id, "mallory"));
-    CHECK_FALSE(reg.stream_for(std::string(32, 'f'), "mallory"));
+    CHECK_FALSE(reg.stream_for(minted.session_id, bound("mallory")));
+    CHECK_FALSE(reg.stream_for(std::string(32, 'f'), bound("mallory")));
 }
 
 TEST_CASE("McpSessionRegistry: idle GC closes the stream of a reaped session",
@@ -1201,9 +1257,9 @@ TEST_CASE("McpSessionRegistry: idle GC closes the stream of a reaped session",
     auto clock_now = std::chrono::steady_clock::now();
     mcp::McpSessionRegistry reg{{.idle_ttl = std::chrono::seconds(30)},
                                 [&clock_now] { return clock_now; }};
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
-    auto stream = reg.stream_for(minted.session_id, "alice");
+    auto stream = reg.stream_for(minted.session_id, bound("alice"));
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
 
@@ -1226,12 +1282,12 @@ TEST_CASE("McpSessionRegistry: a live stream's ticking keeps its session young",
     auto clock_now = std::chrono::steady_clock::now();
     mcp::McpSessionRegistry reg{{.idle_ttl = std::chrono::seconds(30)},
                                 [&clock_now] { return clock_now; }};
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
 
     for (int i = 0; i < 4; ++i) {
         clock_now += std::chrono::seconds(20);
-        CHECK(reg.validate_and_touch(minted.session_id, "alice") ==
+        CHECK(reg.validate_and_touch(minted.session_id, bound("alice")) ==
               mcp::McpSessionRegistry::ValidateResult::kValid);
     }
     CHECK(reg.active_count() == 1); // 80 s elapsed, TTL 30 s, still alive
@@ -1247,10 +1303,10 @@ TEST_CASE("McpSessionRegistry: a live stream's ticking keeps its session young",
 TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a tick later",
           "[mcp][session][stream][race]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
-    auto stream = reg.stream_for(sid, "alice");
+    auto stream = reg.stream_for(sid, bound("alice"));
     REQUIRE(stream);
     auto attached = stream->attach_and_replay(0, nullptr, "alice");
     REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
@@ -1264,7 +1320,7 @@ TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a
             // The real production wiring (mcp_server.cpp's session_alive closure),
             // not a hardcoded `true` — proves shutdown() reaches this pump via the
             // registry, not just via a direct state->close() call.
-            return reg.validate_and_touch(sid, "alice") ==
+            return reg.validate_and_touch(sid, bound("alice")) ==
                    mcp::McpSessionRegistry::ValidateResult::kValid;
         },
         cfg};
@@ -1302,7 +1358,7 @@ TEST_CASE("McpSessionRegistry: shutdown wakes a live GET pump immediately, not a
 TEST_CASE("McpSessionRegistry: shutdown closes a live streamed-POST pump within one tick",
           "[mcp][session][stream][race]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
     const auto sid = minted.session_id;
 
@@ -1315,7 +1371,7 @@ TEST_CASE("McpSessionRegistry: shutdown closes a live streamed-POST pump within 
         [] {},                                                                  // on_final_written
         [] { return mcp::StreamRevalidate::kValid; },
         [&reg, sid] {
-            return reg.validate_and_touch(sid, "alice") ==
+            return reg.validate_and_touch(sid, bound("alice")) ==
                    mcp::McpSessionRegistry::ValidateResult::kValid;
         },
         cfg};
@@ -1341,9 +1397,9 @@ TEST_CASE("McpSessionRegistry: shutdown mid-handover closes only the new live si
           "the superseded one is already closed",
           "[mcp][session][stream][race]") {
     mcp::McpSessionRegistry reg;
-    const auto minted = reg.mint("alice");
+    const auto minted = reg.mint(bound("alice"));
     REQUIRE(minted.ok);
-    auto stream = reg.stream_for(minted.session_id, "alice");
+    auto stream = reg.stream_for(minted.session_id, bound("alice"));
     REQUIRE(stream);
 
     auto first = stream->attach_and_replay(0, nullptr, "alice");
@@ -1416,15 +1472,15 @@ TEST_CASE("McpSessionRegistry: concurrent mint / stream_for / terminate is race-
         threads.emplace_back([&, t] {
             const std::string principal = "p" + std::to_string(t % 3);
             for (int i = 0; i < 100; ++i) {
-                auto m = reg.mint(principal);
+                auto m = reg.mint(bound(principal));
                 if (!m.ok) {
                     continue;
                 }
                 ++minted;
-                if (auto s = reg.stream_for(m.session_id, principal)) {
+                if (auto s = reg.stream_for(m.session_id, bound(principal))) {
                     s->publish("message", "x");
                 }
-                reg.terminate(m.session_id, principal);
+                (void)reg.terminate(m.session_id, bound(principal));
             }
         });
     }

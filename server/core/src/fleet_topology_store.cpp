@@ -268,7 +268,7 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
             // Gate 7 UP-9 / hp-S1 — mixed-fleet split-brain fix. The push
             // path skips the dispatch fetcher entirely, so a registered
             // agent that has NOT pushed (a legacy build mid rolling-upgrade,
-            // the TAR plugin disabled, or a pump wedged on its first cycle)
+            // the Echo plugin disabled, or a pump wedged on its first cycle)
             // would silently vanish from the topology the moment ANY agent
             // pushes. Consult the roster and emit a stale placeholder for
             // every registered-but-unpushed agent so it renders as a dimmed
@@ -856,7 +856,7 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
         m.truncated_connections = r.truncated_connections;
 
         // PR 10 hardening — push-staleness gate (UP-3 stuck pump).
-        // An agent whose pump wedged inside tar.fleet_snapshot will
+        // An agent whose pump wedged inside echo.fleet_snapshot will
         // keep heartbeating but its last-attached snapshot will never
         // advance. Mark the cube stale once the gap between when the
         // server last accepted a push and wall-clock now exceeds

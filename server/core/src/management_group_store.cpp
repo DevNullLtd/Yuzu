@@ -186,6 +186,18 @@ constexpr const char* kGroupCols =
     "id, name, description, parent_id, membership_type, scope_expression, "
     "created_by, created_at, updated_at";
 
+
+/// True when the failed statement broke the UNIQUE constraint on the group name (SQLSTATE 23505
+/// naming `management_groups_name_key`, the name Postgres gives `name TEXT NOT NULL UNIQUE`).
+/// That is the caller's conflict, not a store fault. A hit on any other constraint (the generated
+/// id, say) is not matched: retrying mints a new id, so it stays a store fault.
+bool is_group_name_conflict(const PGresult* r) {
+    const char* state = PQresultErrorField(r, PG_DIAG_SQLSTATE);
+    const char* constraint = PQresultErrorField(r, PG_DIAG_CONSTRAINT_NAME);
+    return state != nullptr && constraint != nullptr && std::string_view(state) == "23505" &&
+           std::string_view(constraint) == "management_groups_name_key";
+}
+
 } // namespace
 
 // ── Construction / teardown ──────────────────────────────────────────────────
@@ -273,9 +285,12 @@ ManagementGroupStore::create_group(const ManagementGroup& group) {
         "created_by, created_at, updated_at) "
         "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::bigint, $9::bigint) RETURNING id",
         params);
-    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1)
+    if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
+        if (is_group_name_conflict(r.get()))
+            return std::unexpected("a group with that name already exists");
         return std::unexpected(std::string("failed to create group: ") +
                                PQerrorMessage(lease.get()));
+    }
     return text_col(r.get(), 0, 0);
 }
 
@@ -336,20 +351,37 @@ ManagementGroupStore::find_group_by_name(const std::string& name) const {
 }
 
 std::vector<ManagementGroup> ManagementGroupStore::list_groups() const {
-    std::vector<ManagementGroup> result;
-    if (!open_)
-        return result;
+    return list_groups_checked().value_or(std::vector<ManagementGroup>{});
+}
+
+std::optional<std::vector<ManagementGroup>> ManagementGroupStore::list_groups_checked() const {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::list_groups_checked: store not open");
+        return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
-        return result;
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("ManagementGroupStore::list_groups_checked: pool acquire timed out");
+        return std::nullopt;
+    }
     pg::PgResult r = pg::exec_params(
         lease.get(),
         (std::string("SELECT ") + kGroupCols +
          " FROM management_group_store.management_groups ORDER BY name")
             .c_str(),
         std::vector<std::string>{});
-    if (r.status() != PGRES_TUPLES_OK)
-        return result;
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::list_groups_checked: query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    std::vector<ManagementGroup> result;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         result.push_back(read_group(r.get(), i));
     return result;
@@ -418,8 +450,11 @@ std::expected<void, std::string> ManagementGroupStore::update_group(const Manage
         "parent_id = $3, membership_type = $4, scope_expression = $5, updated_at = $6::bigint "
         "WHERE id = $7",
         params);
-    if (r.status() != PGRES_COMMAND_OK)
+    if (r.status() != PGRES_COMMAND_OK) {
+        if (is_group_name_conflict(r.get()))
+            return std::unexpected("a group with that name already exists");
         return std::unexpected(std::string("update failed: ") + PQerrorMessage(lease.get()));
+    }
     if (std::string_view(PQcmdTuples(r.get())) == "0")
         return std::unexpected("group not found");
     return {};
@@ -986,6 +1021,41 @@ size_t ManagementGroupStore::count_members(const std::string& group_id) const {
     if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
         return 0;
     return static_cast<size_t>(to_i64(PQgetvalue(r.get(), 0, 0)));
+}
+
+std::optional<std::unordered_map<std::string, std::size_t>>
+ManagementGroupStore::count_members_by_group_checked() const {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::count_members_by_group_checked: store not open");
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::count_members_by_group_checked: pool acquire timed out");
+        return std::nullopt;
+    }
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT group_id, COUNT(*) FROM management_group_store.management_group_members "
+        "GROUP BY group_id",
+        std::vector<std::string>{});
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::count_members_by_group_checked: query failed: {}",
+                         PQerrorMessage(lease.get()));
+        return std::nullopt;
+    }
+    std::unordered_map<std::string, std::size_t> result;
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+        result.emplace(text_col(r.get(), i, 0),
+                       static_cast<std::size_t>(to_i64(PQgetvalue(r.get(), i, 1))));
+    return result;
 }
 
 } // namespace yuzu::server

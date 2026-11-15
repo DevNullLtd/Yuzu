@@ -10,6 +10,7 @@
 /// the host view and the devices table are admitted and scoped.
 
 #include "inventory_routes.hpp"
+#include "model_param_helpers.hpp"
 
 #include "app_shell.hpp"
 #include "http_route_sink.hpp"
@@ -110,7 +111,8 @@ constexpr std::size_t kHostTypeaheadCap = 1000;
 constexpr const char* kConfinedFleetMsg =
     "The software catalogue is a fleet-wide aggregate that cannot be narrowed to your "
     "management groups, so it is not shown to a group-scoped account. Open a device from "
-    "Hardware to see its software, or ask for fleet-wide Inventory:Read.";
+    "Hardware (Installed software, then Open in Software) to see its software, or ask for "
+    "fleet-wide Inventory:Read.";
 constexpr const char* kConfinedHostMsg =
     "This device is outside your management groups (or unknown), so its software is not shown.";
 constexpr const char* kBuildingMsg =
@@ -199,7 +201,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         d.now_secs = now_secs();
         auto reply = [&] { send_html(res, render_software_page(f, d, mode)); };
 
-        auto parsed = swc::parse_catalogue_params(req.params);
+        auto parsed = swc::parse_catalogue_params(model_detail::to_params(req.params));
         if (!parsed) {
             d.caveat = parsed.error(); // 200 + caveat: htmx does not swap 4xx
             reply();
@@ -327,7 +329,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto gate = admit(deps_.fleet_read_fn, req, res);
         if (!gate)
             return;
-        auto parsed = swc::parse_versions_params(req.params);
+        auto parsed = swc::parse_versions_params(model_detail::to_params(req.params));
         if (!parsed) {
             send_html(res, caveat_div(parsed.error()));
             return;
@@ -388,7 +390,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto gate = admit(deps_.fleet_read_fn, req, res);
         if (!gate)
             return;
-        auto parsed = swc::parse_devices_params(req.params);
+        auto parsed = swc::parse_devices_params(model_detail::to_params(req.params));
         if (!parsed) {
             send_html(res, caveat_div(parsed.error()));
             return;

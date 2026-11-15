@@ -114,6 +114,23 @@ enum class CredentialCheck : int {
     kValidStale,
 };
 
+/// Where a credential re-check may take its answer from. Passed explicitly (no default) to
+/// `AuthRoutes::revalidate_stream`, so each caller states which question it asks.
+///
+/// Pinned `: int` like `CredentialCheck`, so a forward declaration elsewhere names the same type.
+enum class CredentialReadMode : int {
+    /// The held-open stream pump's tick: the process-local API-token cache (60 s) and the
+    /// engine-principal liveness cache (15 s) may answer, and a revoke handled by another
+    /// replica is seen only when they age out (#4766, #2367).
+    kCached,
+    /// A boundary check on an already-authenticated operation (the workflow run's per-step
+    /// check): API tokens and the backing engine principal are read from their durable rows,
+    /// never from those caches, so a revoke committed by any replica before the read is seen.
+    /// A cookie session has no such cache to bypass: it is adjudicated by
+    /// `AuthManager::validate_session` in both modes (see `revalidate_stream`).
+    kAuthoritative,
+};
+
 struct UserEntry {
     std::string username;
     Role role;
@@ -213,18 +230,25 @@ struct Session {
     std::string token_scope_service;  // Non-empty = token scoped to this service
     std::string mcp_tier;             // "readonly", "operator", "supervised", or "" (not MCP)
     /// Discriminator for the session's principal class — "human" (default) or
-    /// "engine". In-memory only (no auth.db schema change: token sessions are
-    /// synthesized fresh per request, never persisted — see design doc §6).
-    /// Set by `synthesize_token_session` from the source `ApiToken::principal_kind`;
-    /// every other session-creation site leaves the "human" default. This is the
-    /// discriminator the Phase-4/5 self-target destruction guard (§9) keys on —
-    /// never infer principal kind from the shape of `username`.
+    /// "engine". Token sessions are synthesized fresh per request and never
+    /// persisted (design doc §6); `synthesize_token_session` sets this from the
+    /// source `ApiToken::principal_kind` and every other session-creation site
+    /// leaves the "human" default. The durable `sessions` row carries the column
+    /// (session_store.cpp), and a CHECK on it keeps the stored value inside
+    /// {human, engine} and consistent with `auth_source`. Do NOT branch on this
+    /// field to decide whether a session is an engine: use `is_engine()` below.
+    /// Never infer principal kind from the shape of `username`.
     std::string principal_kind{"human"};
 
     /// True iff this session authenticates as an ADR-0031 engine principal.
-    /// The canonical engine-session discriminator (mirrors the belts in
-    /// rest_api_v1.cpp deny_engine_session / mcp_server.cpp
-    /// deny_if_engine_session / principal_quota_gate.hpp apply_engine_quota_gate).
+    /// The canonical engine-session discriminator (#2343): every decision, gate
+    /// and audit-class site on a `Session` uses this, so a session classified as
+    /// an engine by either field is an engine everywhere. One helper takes bare
+    /// fields instead of a `Session` and copies this predicate by hand:
+    /// `principal_quota_gate.hpp`'s `apply_engine_quota_gate`, which must change
+    /// together with it. `same_site_write_policy.hpp` and `web_utils.hpp` also take
+    /// a bare `auth_source`, but they classify the transport (bearer token or
+    /// cookie), not engine-ness.
     [[nodiscard]] bool is_engine() const {
         return principal_kind == "engine" || auth_source == "engine_token";
     }
@@ -667,7 +691,8 @@ enum class RemoveUserOutcome : std::uint8_t {
                               ///< can complete it; an IdP retry of a SCIM request is NOT
                               ///< promised to (#5214)
     RemovedSessionWipeFailed, ///< the account IS deactivated (committed) but the durable session
-                              ///< wipe failed, so a live session may survive: a repeated
+                              ///< wipe failed, so the session row may survive (a local
+                              ///< session is refused at validation): a repeated
                               ///< `remove_user_checked` re-runs the wipe (the dashboard DELETE
                               ///< offers that); a SCIM retry is NOT promised to repeat it
                               ///< (#5214)
@@ -861,6 +886,38 @@ public:
     /// `server/core/src/**` references it. A no-op if `token` is not a live session.
     void lapse_elevation_for_test(const std::string& token, std::chrono::milliseconds elapsed);
 
+    /// TEST-ONLY: make the next session validate poll the durable
+    /// write-generation immediately, instead of waiting out the ~1 s poll
+    /// interval (#6079). Does not touch the cached generation or the stale-serve
+    /// anchor. Production code MUST NOT call this.
+    void expire_session_generation_poll_for_test();
+
+    /// TEST-ONLY: age the last SUCCESSFUL session-generation refresh by `age`, so the
+    /// stale-serve bound (`kSessionGenStaleServeBoundMs`) can be crossed without waiting it
+    /// out. Does not touch the cached generation or the poll gate. Production code MUST NOT
+    /// call this.
+    void age_session_generation_refresh_for_test(std::chrono::milliseconds age);
+
+    /// TEST-ONLY: installs a callback fired in `validate_session_durable` after the
+    /// session to serve has been obtained (from the cache, or from the store on a
+    /// miss) and before the tail's cache insert, with NO lock held. It lets a test
+    /// hold one validation open while another manager signs the session out or a
+    /// generation poll clears this manager's cache, to prove the late insert is
+    /// dropped. A hook shared by several threads must select its own thread (it also
+    /// fires for the validations the test itself makes). Production code MUST NOT
+    /// call this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default; install it before any concurrent validation starts.
+    void set_validate_pre_cache_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired in `reactivate_user` and `update_role_checked`
+    /// BETWEEN the local cache erase and the durable session wipe, with NO lock held. It lets a
+    /// test run a validation inside that gap, which reads the still-present row and caches the
+    /// pre-change session, to prove the cache is dropped again after the wipe. It also fires for
+    /// the validations the test itself makes there. Production code MUST NOT call this - no
+    /// caller in `server/core/src/**` references it. A no-op (nullptr) by default; install it
+    /// before the call under test.
+    void set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook);
+
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
     /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
@@ -969,6 +1026,15 @@ private:
     /// silent grant.
     std::optional<Session> validate_session_durable(const std::string& token,
                                                     bool idle_enabled) const;
+
+    /// Account gate for a session built from a store row (the only way a session reaches the
+    /// `validate_session_durable` cache). Closed three-way on `auth_source`: `local` is
+    /// served only while its `auth.users` account is active (skipped when no AuthDB is wired,
+    /// test wiring only); `oidc` and `saml` pass (their principal need not be a local
+    /// account); ANY other value, empty included, is refused. On every refusal the cache entry
+    /// for `key` is also erased, so a copy cached before a stale-distrust window cannot flip
+    /// a refusal back to a grant when trust returns. Called with no lock held.
+    [[nodiscard]] bool session_account_admits(const std::string& key, const Session& session) const;
 
 public:
 
@@ -1136,9 +1202,16 @@ public:
     /// Returns false if user not found, refused, or failed.
     bool update_role(const std::string& username, Role new_role);
 
-    /// Look up a user's legacy role. Returns nullopt if user not found (or,
-    /// in AuthDB-backed mode, if the store could not answer - never falls
-    /// back to a cached value on a store error). AuthDB-authoritative on
+    /// Why `get_user_role()` has no role to return (#4068). `NotFound` is a
+    /// SUCCESSFUL negative answer (no such user, soft-deleted, or a rejected
+    /// username shape); `DbError` means the store could not answer, so the
+    /// caller does NOT know whether the user exists and must not treat it as
+    /// "absent" (a fail-open on any "absent => proceed/no-op" branch).
+    enum class GetUserRoleError { NotFound, DbError };
+
+    /// Look up a user's legacy role. The error channel distinguishes a genuine
+    /// miss (`NotFound`) from an AuthDB store error (`DbError`, which never
+    /// falls back to a cached value). AuthDB-authoritative on
     /// EVERY call when configured (no cache, no cache fallback) - see the
     /// .cpp definition's doc for why (Gate 3 governance BLOCKING finding,
     /// #4020: this is the call auth_routes.cpp's legacy API-token session
@@ -1146,7 +1219,8 @@ public:
     /// live stale-privilege gap after a demotion, independent of
     /// authenticate()/verify_password() entirely). Config-file mode (no
     /// AuthDB) remains cache-only, unchanged.
-    std::optional<Role> get_user_role(const std::string& username) const;
+    [[nodiscard]] std::expected<Role, GetUserRoleError>
+    get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
     bool has_users() const;
@@ -1620,6 +1694,16 @@ private:
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;
 
+    /// Backing field for `set_validate_pre_cache_hook_for_test` - see that method's
+    /// doc. Invoked (if set) from `validate_session_durable` only. Same shape/
+    /// lifetime/production-reachability as `role_recheck_race_hook_for_test_` above.
+    std::function<void()> validate_pre_cache_hook_for_test_;
+
+    /// Backing field for `set_between_local_erase_and_wipe_hook_for_test` - see that method's
+    /// doc. Invoked (if set) from `reactivate_user` and `update_role_checked` only, with no lock
+    /// held. Same shape/lifetime/production-reachability as the hooks above.
+    std::function<void()> between_local_erase_and_wipe_hook_for_test_;
+
     /// #5342: the credential-change query owner (`set_credential_change_owner`).
     /// Borrowed, never owned; null ⇒ no credential writes.
     CredentialChangeOwner* credential_change_owner_{nullptr};
@@ -1695,6 +1779,14 @@ private:
     /// (true) without a store. Caller must NOT hold `mu_`.
     [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
 
+    /// `wipe_user_sessions_durable`, then drop the user's cached sessions AGAIN (and advance the
+    /// cache epoch) once it has returned, success or not. A cold validation that began after
+    /// the caller's first local erase can read the row before the durable delete commits, pass
+    /// the account gate and cache the pre-change session; the second drop erases whatever such a
+    /// validation inserted and makes one still in flight drop its insert. Other replicas clear
+    /// at their next generation poll. Same return and `mu_` contract as the wrapped call.
+    [[nodiscard]] bool wipe_user_sessions_then_drop_cache(const std::string& username);
+
     /// #4966: after a guarded lifecycle write answered StoreFailure (it MAY have committed: a
     /// lost COMMIT ack), evict the TARGET's `users_` entry and in-memory sessions and attempt the
     /// durable wipe, so a possibly-committed removal or demotion is not served stale. Fails
@@ -1706,9 +1798,9 @@ private:
     /// would_strand | grant_read). No-op without a MetricsRegistry.
     void note_lifecycle_store_failure(const char* op) const;
 
-    /// Poll the durable write-generation on an interval; when it has advanced
-    /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
-    /// replica), clear the process-local `sessions_` cache so the next lookup
+    /// Poll the durable write-generation on an interval; when it has changed
+    /// (advanced: a create/invalidate/elevate/mfa mutation landed, possibly on
+    /// another replica; or regressed after a restore or failover; #6079), clear the process-local `sessions_` cache so the next lookup
     /// re-reads authoritative state. Interval-gated + single-flight (mirrors
     /// RbacStore::maybe_refresh_generation); a refresh FAILURE keeps serving the
     /// existing cache (the absolute `expires_at` on every session is the
@@ -1716,7 +1808,7 @@ private:
     ///
     /// Coherence does NOT depend on anchoring a locally-committed write: a
     /// mutation bumps the durable generation, so within one refresh interval
-    /// this same poll observes the advance and clears the cache, re-reading
+    /// this same poll observes the change and clears the cache, re-reading
     /// authoritative state — write-through to the local cache only covers the
     /// sub-interval window until then.
     void maybe_refresh_session_generation() const;
@@ -1745,6 +1837,26 @@ private:
     // store row key too), by the raw token in the legacy in-memory-only mode.
     // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
+    // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
+    // section as every `sessions_.clear()` (the generation poll) and every targeted
+    // erase that revokes a session (`drop_cached_session_locked`,
+    // `drop_cached_user_sessions_locked`). Expiry and idle hygiene drops do not move it.
+    // `validate_session_durable` captures it under its step-1 shared lock and inserts
+    // its session at the tail only if it is unchanged, so a validation that straddles
+    // a clear or a revoke cannot put the session back (ADR-0012 section 4, rule 2). The
+    // generation poll alone cannot do that for a revoke on THIS replica: it sees its own
+    // bump only on the next poll.
+    mutable std::uint64_t session_cache_epoch_ = 0;
+
+    /// Targeted cache erase for a revoke, wipe, account removal or gate refusal: erases
+    /// from `sessions_` AND advances `session_cache_epoch_` in the SAME critical section.
+    /// The caller MUST hold `mu_` exclusively. Never erase `sessions_` for one of those
+    /// purposes directly: a validation held across the erase would re-insert its session.
+    void drop_cached_session_locked(const std::string& key) const;
+
+    /// As `drop_cached_session_locked`, for every cached session of `username`. Returns
+    /// how many entries were erased. The epoch advances even when none were.
+    std::size_t drop_cached_user_sessions_locked(const std::string& username) const;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
@@ -1783,6 +1895,9 @@ std::filesystem::path default_config_path();
 std::filesystem::path default_cert_dir();
 
 std::string role_to_string(Role r);
+/// "admin" -> Role::admin, "user" -> Role::user. Any other value (incl. empty) fails
+/// safe to Role::user and logs a warning naming it (#4072) - never grants elevated
+/// privilege, but the drift is not silent.
 Role string_to_role(const std::string& s);
 
 /// Shared group→role resolution for federated (OIDC/SAML) session creation.

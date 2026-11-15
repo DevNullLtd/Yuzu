@@ -1,0 +1,10 @@
+# WS-13 13.0 spike - CoreDNS for the agents' view of the gateway names.
+#
+# A STATIC zone: a dead gateway's A record is NOT withdrawn (Docker's embedded
+# DNS withdraws it the instant the container dies, which would make the DNS-mode
+# failover numbers optimistic against a real resolver serving a stale record).
+# `fixed` keeps the zone order as written; Corefile.shuffled randomises it per query.
+.:53 {
+    errors
+    file /etc/coredns/db.ha.test ha.test
+}

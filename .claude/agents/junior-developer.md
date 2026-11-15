@@ -22,7 +22,7 @@ blocks described below verbatim — they are parsed.
   change**. Match the surrounding code's style, naming, and comment density.
 - **Find the owning module → its tests → make the patch → run the targeted suite.** For what
   you touched, run the relevant suite, e.g.
-  `meson test -C build-linux --suite <agent|server|tar> --print-errorlogs`, or the direct
+  `meson test -C build-linux --suite <agent|server|echo> --print-errorlogs`, or the direct
   Catch2 binary for tag filtering. Don't run the whole world when a suite covers your change.
 - **Context discipline.** Search with Grep/`rg` before reading; read only the line ranges you
   need. Don't open generated protobuf or `vcpkg_installed/`.

@@ -197,8 +197,8 @@ def find_plugins(bin_dir: Path) -> list[Path]:
             if prior != plugin:
                 raise BundleError(f"duplicate plugin output basename: {plugin.name}")
     plugins = list(found.values())
-    if not any(plugin.name == "tar.dylib" for plugin in plugins):
-        raise BundleError("TAR plugin is required in the development bundle")
+    if not any(plugin.name == "echo.dylib" for plugin in plugins):
+        raise BundleError("Echo plugin is required in the development bundle")
     return plugins
 
 

@@ -1030,7 +1030,7 @@
   "version": "0.3.0",
   "where_the_data_goes": [
     "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore (90-day default retention), queryable at `/api/responses/{id}`.",
-    "**Not consumed by** daily-sync inventory, TAR, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its five definitions. The dashboard's generic key/value renderer is the only non-ResponseStore consumer of these rows.",
+    "**Not consumed by** daily-sync inventory, Echo, DEX, or metrics. Nothing runs on a schedule; the plugin executes only when an operator or workflow dispatches one of its five definitions. The dashboard's generic key/value renderer is the only non-ResponseStore consumer of these rows.",
     "**Sensitivity.** Nothing beyond the device id. Every column is either an enum/bool the plugin itself computes (`status`, `response` button choice, `cancelled`, `dnd_enabled`, `question_count`) or free text the interactively-logged-in user typed into a dialog (`response`, `answer_0`–`answer_4`) — the schema targets no username, device identifier, or software name, though a user could in principle type anything into a free-text field.",
     "**Siblings:** none — no other plugin performs desktop notification/dialog interaction.",
     "**MCP / REST.** Discover: `discover_plugins` (summary) → `yuzu://plugin-docs` (this page as data) → `discover_instructions` / `get_definition(\"device.interaction.notify\")`. Run: `execute_instruction {definition_id, parameters}`. Read: `/api/responses/{id}`."

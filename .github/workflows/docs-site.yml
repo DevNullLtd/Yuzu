@@ -40,6 +40,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
+          # Resolve the newest 22.x instead of the runner image's cached one: the locked Astro
+          # refuses a Node older than its engines floor (>=22.23.4), and an image that still
+          # caches an older 22.x would otherwise fail this build on an unrelated PR.
+          check-latest: true
           cache: npm
           cache-dependency-path: site/package-lock.json
       - name: Install dependencies

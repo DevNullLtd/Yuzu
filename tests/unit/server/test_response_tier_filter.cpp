@@ -40,7 +40,7 @@ ForensicsPluginSet make_set(std::vector<std::string> names) {
 // A registry with no row on the Forensics securable: the empty-derivation (boot refusal) case.
 constexpr std::array<CommandCapability, 1> kNoForensicsRows{{
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -78,7 +78,7 @@ constexpr std::array<CommandCapability, 3> kMixedRows{{
         .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "status",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -271,7 +271,7 @@ TEST_CASE("plugins_on_securable lowercases, de-duplicates and filters by securab
     const CommandCapabilityRegistry registry{std::span<const CommandCapability>(kMixedRows)};
     CHECK(registry.plugins_on_securable(kForensicsSecurable) ==
           std::vector<std::string>{"browser_inventory"});
-    CHECK(registry.plugins_on_securable("Infrastructure") == std::vector<std::string>{"tar"});
+    CHECK(registry.plugins_on_securable("Infrastructure") == std::vector<std::string>{"echo"});
     CHECK(registry.plugins_on_securable("NoSuchSecurable").empty());
 }
 

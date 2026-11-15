@@ -582,7 +582,7 @@ routes with no confinement mechanism at all across `dex_`, `compliance_`, `disco
 `inventory_routes` -- not 9, and the exact set the two reviewers found differed slightly, which
 is itself evidence that a hand count in prose is the wrong way to state this. More importantly,
 the original "six route modules... have not migrated" framing conflated two different states:
-`device_routes.cpp` and `tar_tree_routes.cpp` (and part of `inventory_routes.cpp`) already route
+`device_routes.cpp` and `echo_tree_routes.cpp` (and part of `inventory_routes.cpp`) already route
 their list surfaces through a legacy `get_visible_agents`-backed scoped provider
 (`devices_fn_`) -- not on ADR-0017's mechanism 3, and therefore still a standing non-conformance
 with INV-6, but not bare-gated or unconfined the way the other four modules' flat routes are.
@@ -657,13 +657,13 @@ sentence.
    resolved at each event per sub-clauses 1 and 3); and policy remediation (the live requesting
    operator, per sub-clause 5, with no stored root at all). Not every `system_reserved`
    capability has been individually inventoried against this table, but neither of the two named
-   in an earlier draft turns out to need it: `tar.fleet_snapshot` declares itself read-only in
+   in an earlier draft turns out to need it: `echo.fleet_snapshot` declares itself read-only in
    `core_dispatch_capabilities.hpp`, so D6's own read-only exclusion already covers it the same
    way policy evaluation is covered; and `asset_tags.sync` fires from a tag-write route gated by
    `scoped_perm_fn(req, res, "Tag", "Write", agent_id)` against a live session before dispatching
    system-rooted, so it already has a findable, live root and is not an "unexamined" case at
    all -- both corrections from an earlier draft that flagged them as unexamined without checking.
-   **The capture-source push is not in this set**: `POST /fragments/tar/capture-sources/push` is
+   **The capture-source push is not in this set**: `POST /fragments/echo/capture-sources/push` is
    session-authenticated, gated by `scoped_perm_fn_("Infrastructure", "Read", device)`, and
    derives a real, non-system caller that `build_classified_command` enforces
    `Infrastructure:Write` against -- it is already a correctly-rooted direct human dispatch, not
@@ -1027,7 +1027,7 @@ Per sub-clause 2's default rule: preflight needs no root (read-only by existing 
 scope); **quarantine reconciliation does NOT conform** -- it dispatches through the same
 unfiltered `system=true` closure as remediation (`command_dispatch_fn`), not a caller-typed path,
 and does not share Guardian's own separate `send_system_reserved` path -- so it is squarely
-inside this default rule's scope, not a plausible pre-existing exception; `tar.fleet_snapshot`
+inside this default rule's scope, not a plausible pre-existing exception; `echo.fleet_snapshot`
 and `asset_tags.sync` remain unexamined against the default rule. The capture-source push is not
 in this list: it is already a settled, correctly-rooted direct-human dispatch and was never a
 default-rule case.
@@ -1713,7 +1713,7 @@ ordinary review" rule going forward.
     function is a plain no-caller shape, not "caller-typed in signature" as an earlier draft
     claimed; the "vacuous... under-specified" quote belongs to ADR-0032 Decision 0's corollary,
     not Decision 7's own text; `yuzu_schedule_arming_denied_total` is emitted by `arming_check`,
-    not `resolve_caller`; `tar.fleet_snapshot` and `asset_tags.sync` were wrongly flagged as
+    not `resolve_caller`; `echo.fleet_snapshot` and `asset_tags.sync` were wrongly flagged as
     having no findable root (the first is already excluded as read-only, the second already has a
     live-session root); `adopt_baseline`'s authorization depends on D4, which the sequencing
     section's "D6 has no work-in-progress to gate on" did not acknowledge; and two places where

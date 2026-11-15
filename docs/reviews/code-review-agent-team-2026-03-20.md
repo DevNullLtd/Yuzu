@@ -414,7 +414,7 @@ Key categories:
 - **TOCTOU / symlinks** (5): Filesystem write, cert deletion, atomic write temp name, file trigger mtime
 - **Lock contention / threading** (6): Metrics triple-lock, tags plugin no mutex, trigger deadlock risk, COM init per-call
 - **Protocol / ABI** (5): secure_zero platform coverage, ScopeCondition.op is string, RUNNING=0 default, no calling convention annotation, context lifetime undocumented
-- **Information disclosure** (4): WiFi BSSID geolocation, proxy credentials, DNS cache browsing history, process cmdlines in TAR state
+- **Information disclosure** (4): WiFi BSSID geolocation, proxy credentials, DNS cache browsing history, process cmdlines in Echo state
 - **HTTP/staging** (4): Plaintext HTTP downloads, BCrypt handle leak, predictable temp file, staging dir permissions
 
 #### LOW — Summary (~45 findings, not itemized)
@@ -571,7 +571,7 @@ Categories: documentation gaps, dead code, informational observations, latent ri
 
 | ID | Finding | Notes |
 |----|---------|-------|
-| G2-QE-K3-001 | 38 of 45 plugins have zero test coverage | Only 7 plugins tested (filesystem, tar, vuln_scan, http_client, content_dist, interaction, agent_logging, storage, registry, wmi — descriptor-level only for most) |
+| G2-QE-K3-001 | 38 of 45 plugins have zero test coverage | Only 7 plugins tested (filesystem, echo, vuln_scan, http_client, content_dist, interaction, agent_logging, storage, registry, wmi — descriptor-level only for most) |
 
 #### MEDIUM — Thin Tests (2 findings)
 

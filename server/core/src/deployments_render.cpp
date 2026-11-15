@@ -56,8 +56,10 @@ std::string render_deployments_list(const std::vector<DeploymentRow>& rows,
         const std::string target = (i < target_labels.size() && !target_labels[i].empty())
                                        ? target_labels[i]
                                        : std::string("Run no longer kept");
-        h += "<tr data-dep=\"" + esc(d.deployment_id) + "\"><td>" + esc(d.name) +
-             "<div class=\"hint\">" + esc(d.artifact_filename) + "</div></td><td>" + esc(target) +
+        h += "<tr data-dep=\"" + esc(d.deployment_id) + "\"><td><a href=\"#\" hx-get=\"/fragments/auto/deployments/detail?dep=" +
+             esc(url_query_value(d.deployment_id)) +
+             "\" hx-target=\"#auto-detail\" hx-swap=\"innerHTML\" hx-sync=\"#auto-detail:replace\">" +
+             esc(d.name) + "</a><div class=\"hint\">" + esc(d.artifact_filename) + "</div></td><td>" + esc(target) +
              "</td><td><progress max=\"" + std::to_string(d.total) + "\" value=\"" +
              std::to_string(settled(d)) + "\"></progress> " + std::to_string(settled(d)) + " of " +
              std::to_string(d.total) + "</td><td>" +
@@ -88,8 +90,8 @@ std::string render_deployment_detail(const DeploymentRow& dep,
          std::to_string(dep.failed) + " &middot; skipped " + std::to_string(dep.skipped) +
          " &middot; in flight " + std::to_string(dep.active) + "</div>";
     if (dep.status == "running")
-        h += "<div class=\"hint\">Counts are as of the last advance. A running deployment "
-             "advances only while a Deployments page is open.</div>";
+        h += "<div class=\"hint\">Counts are as of the last advance. A running deployment advances only while its deploy results view (Pre-flight and "
+             "deploy, then Deploy) is open; this Deployments tab is read-only and never advances it.</div>";
     if (devices.empty()) {
         h += "<div class=\"gp-placeholder\" data-empty=\"devices\">No device rows.</div>";
     } else {

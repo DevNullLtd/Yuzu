@@ -95,6 +95,16 @@ reap counters above, and the alert `YuzuDispatchRecordWriteFailing` fires on a s
 skipped by a tripped per-loop latch (next paragraph) counts there too, so one real write attempt in an
 outage push yields one degrade per target.
 
+The dispatch-time write also advances `execution_tracker.dispatch_seq` (#3678), the sequence the WS-3
+command outbox measures its redelivery horizon on (`common/include/yuzu/command_replay_horizon.hpp`).
+A dispatch whose record is NOT written (a failed write, a latch skip) is still sent and still takes an
+agent dedup-ring slot, so `AgentServiceImpl::record_command_dispatch` counts it into the process-local
+`ExecutionTracker::note_unrecorded_dispatch`. `current_dispatch_position()` returns that count beside the
+shared value, never summed into it (they are on different scales). Only the process that fails to write
+counts it, and an earlier process lifetime takes its count with it: a write outage on a replica other than the
+one running the outbox, or before this process started, is not seen there (`docs/command-dedup.md` has the full set), so while `YuzuDispatchRecordWriteFailing` fires on any replica
+the horizon protection should be read as weakened, not as in force.
+
 A loop that writes one record per target is bounded differently, so that an outage costs the loop one
 short wait instead of one per target. `DispatchRecordLatch` (`dispatch_record_policy.hpp`) is declared
 per loop: its writes use a 250 ms lease budget (`kFanOutRecordLeaseTimeout`), and after the first
@@ -282,11 +292,11 @@ until `action` is stored too. The exact set of read methods and the exact set of
 out through `unrestricted_internal_consumer()` are frozen by
 `tests/test_response_store_read_tripwire.py`: four sites, all reads of a command the server
 dispatched itself from a fixed non-Forensics plugin (the pre-flight check collation, the quarantine
-containment poll, the `tar.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
+containment poll, the `echo.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
 to an operator. The server-side consumers that used to read the store unfiltered now apply the tier
 through a real filter: the policy evaluator excludes the Forensics plugins outright (such a check
-scores `unknown`), the result-set materializer does the same (a set sourced from such a command
-materializes empty for every creator), and bundle collation applies the caller's own decision
+scores `unknown`), the result-set materializer does the same (and the result-set producers refuse
+such a command as a source), and bundle collation applies the caller's own decision
 (approval to dispatch a step does not imply reading its output; a step the caller may not read stays
 `pending` with an empty output; a collation that serves a Forensics-tier step's output writes the
 `response.forensics.read` row with `surface=bundle`, REST fail-closed and MCP `audit_persisted:false`).
@@ -345,7 +355,7 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched when it is stored or published (the transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
+touched when it is stored or published, except that a NUL byte in it is replaced by U+FFFD (a text column cannot hold one) before it reaches any of the sinks above. The response store replaces a NUL in the stored response row at its own bind. (The transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
 execution that ran at least one Forensics-tier command, every agent's failure text is reduced on read,
 including the text of an ordinary plugin's command in the same execution (an over-reduction that
 exposes nothing). The same pure function (`AgentServiceImpl::failure_text_for_sinks`), evaluated once per frame on each ingest path
@@ -739,3 +749,60 @@ LISTEN/NOTIFY-plus-cursor-poll loop from it.
   not compliance evidence; the reap never touches authoritative state). Metrics:
   `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
   `yuzu_exec_outbox_store_degrade_total`.
+
+## Response frames the response store did not keep
+
+The tracker counts an agent as responded when its terminal `agent_exec_status` row is written, and
+the response rows are separate writes that can fail. `ResponseStore::store` therefore returns a
+`StoreOutcome`: a frame is lost when the write failed, or when the per-pair cap refused a
+non-terminal frame (a capped terminal frame stays durable, since the cap admits one only while no
+terminal row exists). The ingest sites in `agent_service_impl.cpp` (Subscribe and the gateway path,
+for streaming and terminal frames alike) pass that loss, or a failed finalize of a terminal answer,
+to `notify_exec_tracker`, which sets `AgentExecStatus::response_dropped` in the SAME upsert as the
+status (migration v10). The flag is sticky: the stored value is the OR of every write for the
+agent, so a later write, terminal or not, never clears it (a stored later frame cannot restore a
+lost earlier one). It is not part of any event payload, so the outbox contract is unchanged.
+`ExecutionTracker::count_response_dropped` returns the count (`nullopt` when it cannot be read), and
+the result-set fill asks for it only once the execution is terminal or the set has timed out, adds
+it to the unanswered agents, and retries on the next tick when the count is unreadable (after
+three pending timeouts it fills the set with one unanswered agent instead, so it reads incomplete
+rather than staying pending). A set whose
+member answer was lost is therefore recorded as incomplete. A new response-ingest site must pass the
+same fact.
+
+A non-terminal frame whose provenance lookup failed (`ProvenanceOutcome::kLookupDegraded`) is
+stored under the unverified label, which the fill never reads, and reaches no tracker row (it
+carries no execution id). Each ingest path records such a frame per (command id, agent id) in an
+in-memory registry (`unverified_frame_registry.hpp`); a frame with no dispatch record at all is not
+recorded, because it can never reach a tracker row. The same pair's terminal frame checks the
+record without erasing it and reports `response_dropped`; the record is erased only after the
+tracker row has been written with that flag, so a terminal frame whose own lookup or tracker write
+fails leaves the record for a replayed terminal frame. A lost answer whose tracker row could not be
+written (`update_agent_status` returned false) is recorded in the same registry, so a later terminal
+or replayed frame of the pair still reports it. The registry keys on the exact agent id and a
+salted digest of the command id, so one agent's frames never read or erase another agent's record.
+It is bounded (about 4 MiB worst case, an estimate) and fails closed: 64 entries per agent, 4,096
+in all, one hour per entry. Markers, remembered commands and the latch are set again on each
+eviction they stand for, so each lasts for an hour after the last eviction (or after the over-long
+agent id, for the latch). An agent past its own 64 is marked (at most 1,024 markers), and every
+answer of that agent then reports
+`response_dropped`: a flooding agent affects only its own answers. An entry evicted by the 4,096
+cap has its command id remembered (at most 1,024 commands), and every agent of that command then
+reports `response_dropped`. When the marker set or the command set is full, the oldest member is
+dropped and a latch is set that makes every terminal answer report `response_dropped`; an agent id
+longer than 256 bytes is never stored and sets the latch too (Register and ProxyRegister refuse
+such an id; the ingest paths check no length themselves). Only the latch and a remembered command
+reach other agents.
+Over-reporting a set as partial is the safe direction. Evictions, and an over-long agent id, count
+as `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Evidence for
+a failed provenance lookup is `yuzu_server_response_provenance_total{outcome="lookup_degraded"}`;
+for an answer the store did not keep (for example `per_agent_cap`, `malformed_identity_field`, a
+failed terminal finalize) whose tracker write failed (closed, or failed twice) it is
+`yuzu_server_response_ingest_dropped_total` by reason and, for a write that failed twice only, the
+"upsert failed twice" log line (a closed tracker, or a response store that is not open, logs nothing
+and leaves only the `store_not_open` count); a
+failed terminal finalize is counted in no `ingest_dropped` reason, and its evidence is the
+`finalize_terminal_status` log line. Check PostgreSQL health and
+`yuzu_exec_correlation_read_degrade_total{reason}` first. Residual: the
+record is held in the server process, so a restart, or a terminal frame served by a different
+replica than the non-terminal one, loses it and the set can read as complete without that frame's output.

@@ -29,10 +29,12 @@
 #include <yuzu/server/auth.hpp>
 
 #include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
+#include "dex_api.hpp" // the store-free DexApi seam: the Apps tab reads DexApi::apps (the same model as REST)
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam (#4626)
 #include "dex_perf_model.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
+#include "refusal_log_throttle.hpp" // bounds the Apps route's repeated error lines
 #include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
 // `dex_read_builders.hpp` (`dex_device_score` + the `build_dex_*_model` builders)
 // is DELIBERATELY NOT included here (ADR-0031 WS-A4 PR-1 F1 fix, Fable review
@@ -180,22 +182,13 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
 /// (This is the panel Option-D enrichment later extends with `extra{}` fields.)
 std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
 
-/// Applications list — the dedicated app-centric DEX lens (a new top-level
-/// subnav tab). Ranks apps by reliability signals (crashes + hangs) keyed on the
-/// process image, each row drilling to the per-app blast-radius view. `since` is
-/// the ISO cutoff; `window_days` drives the chips + drill links. Pure + free so
-/// it is unit-testable directly against a seeded store. (Per-app performance,
-/// version, and non-crash signal attribution are follow-on slices.)
-std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
-                                     int window_days);
-
-// ── A4: device perf sparklines (federated TAR query) ────────────────────────
+// ── A4: device perf sparklines (federated Echo query) ────────────────────────
 
 /// `DexAgentResponse` — hoisted to `dex_view_types.hpp` (store-free; see that
 /// header for the doc comment).
 
-/// One parsed hourly perf point out of the device's TAR edge warehouse
-/// (`$Perf_Hourly` — see agents/plugins/tar perf tier, BRD A1).
+/// One parsed hourly perf point out of the device's Echo edge warehouse
+/// (`$Perf_Hourly` — see agents/plugins/echo perf tier, BRD A1).
 struct DexPerfPoint {
     std::int64_t hour_ts{0};
     double cpu_avg{0.0};      ///< % busy, clamped 0..100
@@ -203,7 +196,7 @@ struct DexPerfPoint {
     double disk_lat_ms{0.0};  ///< worse of read/write avg per-IO service time
 };
 
-/// PURE: parse the `tar.sql` pipe-delimited output (`__schema__|col|…` header +
+/// PURE: parse the `echo.sql` pipe-delimited output (`__schema__|col|…` header +
 /// data rows) into perf points, chronologically sorted. Defensive against
 /// agent-controlled bytes: columns are located by NAME from the schema line,
 /// non-finite/negative numbers are rejected per-field, malformed rows are
@@ -224,7 +217,7 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points);
 // already included above), so every existing caller of THIS header is
 // unaffected.
 
-/// PURE: parse the canned per-app `tar.sql` output (same defensive contract as
+/// PURE: parse the canned per-app `echo.sql` output (same defensive contract as
 /// parse_dex_perf_output: columns by NAME from the `__schema__|…` line,
 /// non-finite/negative rejected per-field, malformed rows skipped, ≤100 rows,
 /// empty on `error|…`). cpu percentages clamp to 0..100 (a lie, not an
@@ -237,7 +230,7 @@ std::vector<DexProcPerfRow> parse_dex_procperf_output(const std::string& output)
 /// read-only query surface deliberately hides plugin config, so the server
 /// cannot distinguish "procperf disabled (the default)" from "enabled, no
 /// rollup yet" — the message says both honestly (the crisp distinction needs
-/// the tar-plugin source_state meta table, a filed follow-up).
+/// the echo-plugin source_state meta table, a filed follow-up).
 std::string render_dex_procperf_panel(const std::vector<DexProcPerfRow>& rows,
                                       const std::string& window);
 
@@ -369,6 +362,15 @@ public:
                                            const std::string& securable_type,
                                            const std::string& operation)>;
 
+    /// The DexApi the Apps tab reads (`apps()`), the same model GET /api/v1/dex/apps serves.
+    /// A setter, not a `register_routes` parameter: server.cpp registers this object before
+    /// it builds the DexApi. It follows the convention of `McpServer::set_dex_api` and
+    /// `SettingsRoutes::set_dex_apps_fn`: set once before the listener starts, read
+    /// unsynchronised per request. Unset: the Apps tab answers an error panel with reason
+    /// `not_wired` and logs it (one line per interval). The wiring is pinned by
+    /// tests/test_dex_apps_wiring_lexical.py: server.cpp must hand this route its DexApi.
+    void set_dex_api(std::shared_ptr<const DexApi> api) { dex_api_ = std::move(api); }
+
     /// Register the DEX routes. The page shell is auth-only static chrome; the
     /// data-bearing fragments gate on GuaranteedState:Read (same securable as the
     /// Guardian read surface — a dedicated DEX:Read perm is deferred). `store` may
@@ -421,6 +423,8 @@ private:
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
     DexPerfApiPtr dex_perf_api_;
+    std::shared_ptr<const DexApi> dex_api_;
+    RefusalLogThrottle apps_error_log_; ///< one error line per interval for the Apps route
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;
 };

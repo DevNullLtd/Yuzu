@@ -1,6 +1,6 @@
 /**
  * runtimes_plugin.cpp -- installed language-runtime inventory for Yuzu:
- * .NET and JVM. A software-inventory fact read from the runtime's own install
+ * .NET, JVM and Python. A software-inventory fact read from the runtime's own install
  * tree, so under its roots it also sees runtimes no package manager owns; installed_apps
  * lists the packaged-application view.
  *
@@ -8,6 +8,9 @@
  *   "dotnet" -- installed .NET (Core/5+) runtimes and SDKs.
  *   "jvm"    -- installed JVMs: version, JDK/JRE image type, vendor
  *               (e.g. Eclipse Adoptium vs Debian OpenJDK vs Oracle).
+ *   "python" -- installed Python interpreters, metadata only: PEP 514 registry keys on
+ *               Windows, the python.org framework Info.plist on macOS, python3.<minor> file
+ *               names on Linux (major.minor only: the patch level needs the interpreter).
  *
  * Wire rows (runtimes_parsers.hpp): a `status|<action>|...` row first, then
  * `<action>|<flavour>|<version>|<install_path>|<vendor or ->` data rows.
@@ -15,9 +18,7 @@
  * ZERO SUBPROCESS. Every fact is a directory name or a metadata file read
  * (rung 1); no `java` or `dotnet` process is ever started.
  *
- * SHIPPED LEGS. Linux only. The macOS and Windows legs are declared PLANNED
- * in the table below (the mechanism string names the planned read); until
- * they ship they report `status|<action>|unsupported|<macos|windows>:planned`.
+ * SHIPPED LEGS. All three actions on Linux, macOS and Windows.
  *
  * This TU is portable except for its single dispatch #if, which selects the
  * one host leg to call -- so a single-OS build never links the other two
@@ -38,9 +39,8 @@
 
 namespace {
 
-// The six per-action per-OS legs (two actions x three OSes) are FIXED and
+// The nine per-action per-OS legs (three actions x three OSes) are FIXED and
 // never wrapped in a preprocessor conditional.
-constexpr const char* kPlannedNote = "planned; the action answers a single unsupported status row on this OS";
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
@@ -51,10 +51,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "/usr/local/share/dotnet/shared walk", kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/usr/local/share/dotnet (and x64/) shared/<framework>/<version> and sdk/<version> "
+         "directory walk; network mounts skipped via getmntinfo_r_np",
+         nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "NDP release-key table + dotnet InstalledVersions + Program Files walk", kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM\\SOFTWARE\\dotnet\\Setup\\InstalledVersions\\<arch>\\{sharedfx,sdk} values + "
+         "NDP v4 Full Release key table and v3.5 Version, both registry views; no filesystem walk",
+         nullptr},
     },
     {
         /* .action      = */ "jvm",
@@ -65,12 +70,35 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "/proc/self/mountinfo",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "/Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + "
-         "Contents/Home/release",
-         kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist "
+         "JavaVM dict fallback); network mounts skipped via getmntinfo_r_np",
+         "fixture-verified only: no JDK is installed on the macOS development host, so this leg "
+         "rests on trees built from the documented bundle layout"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "JavaSoft keys + Program Files\\Java walk", kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM JavaSoft, Eclipse Adoptium, Microsoft JDK and Azul Zulu keys (both views) + one "
+         "<home>\\release read; no Program Files walk",
+         nullptr},
+    },
+    {
+        /* .action      = */ "python",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "single-level listing of /usr/bin and /usr/local/bin for python3.<minor> regular files; "
+         "version is major.minor from the name (patch level not read); network mounts skipped via "
+         "/proc/self/mountinfo",
+         "patch level unavailable without running the interpreter"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "single-level listing of /Library/Frameworks/Python.framework/Versions; version from each "
+         "version's Resources/Info.plist; network mounts skipped via getmntinfo_r_np",
+         nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM\\SOFTWARE\\Python\\PythonCore\\<tag> Version/SysVersion/InstallPath in both registry "
+         "views (PEP 514); per-user hives never read",
+         nullptr},
     },
 };
 
@@ -81,11 +109,11 @@ public:
     std::string_view name() const noexcept override { return "runtimes"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Installed .NET and JVM runtime inventory";
+        return "Installed .NET, JVM and Python runtime inventory";
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"dotnet", "jvm", nullptr};
+        static const char* acts[] = {"dotnet", "jvm", "python", nullptr};
         return acts;
     }
 

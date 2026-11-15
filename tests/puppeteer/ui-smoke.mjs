@@ -1,0 +1,846 @@
+// Browser smoke gate (/test Phase 5 "Browser smoke"). Runs against a live dashboard
+// (YUZU_BASE_URL, YUZU_UI_USER, YUZU_UI_PASSWORD; see README.md) in three stages:
+//   1. NAV CRAWL  every shell nav route answers 200 with the CSP header and no page errors,
+//                 and the discovered set matches EXPECTED (nav drift fails both ways).
+//   2. OVERFLOW   submit controls stay inside their form/dialog and the viewport (#5576).
+//   3. SCENARIOS  eight scenarios: five that each force their own precondition (#6076, add user,
+//                 #5840, #6074, #6749), with writes answered by a request stub so nothing is
+//                 written to the server; the DEX Apps tab (AP-3.2): a live keyboard half, then a
+//                 committed golden page served through a GET stub; a held Apps response superseded
+//                 by Overview (dex-pane-sync); and the DEX controls operated from the keyboard
+//                 (dex-keyboard).
+// One line per check; exit 1 when any check fails.
+//
+// `--selftest` needs no stack and no login: it proves the crawl, overflow and Apps-expander checks
+// can fail, against a local fixture server (see the SELFTEST section). The scenarios themselves
+// need the live app: the selftest does not run them, only the expander half that also runs against
+// the committed golden. The selftest runs in CI (ui-smoke-selftest.yml); the live half runs in /test.
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  DESKTOP, NARROW, WAIT_MS, assertCsp, cfg, clearStubs, launch, login, quiesce, requestLog,
+  setValue, settled, stub, submitControlsInBounds, trace, visit, waitAborted, watch,
+} from './lib/harness.mjs';
+
+// The shell nav hrefs of server/core/src/app_shell.cpp (kOperate, kInstructionsSub, kPosture,
+// kEstate, kSoftwareSub, kFleetSub, kAccess, kSystem, kSettingsSub). A nav change must edit
+// this list in the same PR.
+const EXPECTED = [
+  '/', '/instructions', '/executions', '/workflows', '/approvals', '/result-sets',
+  '/compliance', '/guardian', '/dex', '/echo', '/crypto',
+  '/groups', '/hardware', '/software', '/auto', '/viz/fleet', '/network',
+  '/access/users', '/access/tokens', '/access/audit',
+  '/settings', '/settings/general', '/settings/security', '/settings/integrations',
+  '/settings/pki', '/settings/plugins', '/settings/data', '/settings/developer',
+];
+
+let failures = 0;
+const printRecord = (r) => {
+  if (!r.ok) failures++;
+  console.log((r.ok ? 'PASS ' : 'FAIL ') + r.name + (r.detail ? ' -- ' + r.detail : ''));
+};
+// The selftest swaps this to collect results instead of printing them.
+let record = printRecord;
+function check(name, ok, detail) {
+  record({ name, ok, detail: detail || '' });
+}
+
+async function stage(name, fn) {
+  try {
+    await fn();
+  } catch (e) {
+    check(name, false, 'threw: ' + (e && e.message ? e.message : e));
+  }
+}
+
+// ---- stage 1 -------------------------------------------------------------------------
+
+const harvestNav = (page) => page.$$eval('aside.shell-side nav a[href^="/"]',
+  (as) => as.map((a) => a.getAttribute('href')));
+
+async function crawl(page) {
+  const w = watch(page);
+  const seen = new Set(); // routes already visited; the '/' seed is in here from the start
+  const harvested = new Set(); // hrefs the shell chrome actually linked to; compared with EXPECTED
+  const queue = ['/'];
+  while (queue.length) {
+    const href = queue.shift();
+    if (seen.has(href)) continue;
+    seen.add(href);
+    w.reset();
+    const { status, headers } = await visit(page, href);
+    const navHrefs = await harvestNav(page);
+    // Errors are read only once the page has gone quiet, and before the next route resets them.
+    await quiesce(page);
+    const landed = new URL(page.url()).pathname;
+    const problems = [];
+    if (status !== 200) problems.push('status ' + status);
+    if (landed !== href) problems.push('landed on ' + landed);
+    problems.push(...assertCsp(headers));
+    problems.push(...w.errors().map((e) => 'page error: ' + e));
+    check('crawl ' + href, problems.length === 0, problems.join('; '));
+    for (const h of navHrefs) {
+      harvested.add(h);
+      if (!seen.has(h)) queue.push(h);
+    }
+  }
+  const missing = EXPECTED.filter((h) => !harvested.has(h));
+  const extra = [...harvested].filter((h) => !EXPECTED.includes(h));
+  check('nav matches EXPECTED (' + EXPECTED.length + ' routes)', !missing.length && !extra.length,
+    (missing.length ? 'never discovered: ' + missing.join(', ') + '. ' : '') +
+    (extra.length ? 'not in EXPECTED: ' + extra.join(', ') : ''));
+}
+
+// ---- stage 2 -------------------------------------------------------------------------
+
+const FORMS = [
+  { path: '/settings/plugins', ready: '#updates-section form[data-confirm]', open: null },
+  { path: '/access/users', ready: '[data-act="add"]', open: '[data-act="add"]' },
+  { path: '/access/tokens', ready: '[data-tk="token-new"]', open: '[data-tk="token-new"]' },
+];
+
+async function overflow(page, forms = FORMS) {
+  for (const f of forms) {
+    for (const vp of [DESKTOP, NARROW]) {
+      const name = 'overflow ' + f.path + ' @' + vp.width + 'x' + vp.height;
+      await page.setViewport(vp);
+      await visit(page, f.path);
+      await page.waitForSelector(f.ready, { timeout: WAIT_MS });
+      if (f.open) {
+        await page.click(f.open);
+        await page.waitForSelector('dialog[open] .f button.btn-primary', { timeout: WAIT_MS });
+      }
+      const r = await submitControlsInBounds(page);
+      check(name, r.checked > 0 && r.violations.length === 0,
+        r.checked === 0 ? 'no submit control found' : r.violations.join('; '));
+      if (f.open) {
+        await page.keyboard.press('Escape');
+        await page.waitForFunction(() => !document.querySelector('dialog[open]'), { timeout: WAIT_MS });
+      }
+    }
+  }
+  await page.setViewport(DESKTOP);
+}
+
+// ---- stage 3 -------------------------------------------------------------------------
+
+// Error toasts never auto-remove (settings_plugins_ui.cpp), so a toast is matched by its exact
+// text: an earlier one cannot satisfy a later wait.
+const errorToast = (page, text) => page.waitForFunction(
+  (t) => [...document.querySelectorAll('#toast-container .toast-error')].some((el) => el.textContent === t),
+  { timeout: WAIT_MS }, text);
+const ROLLOUT_REFUSAL = 'Rollout must be a whole number from 0 to 100.'; // htmx:confirm handler
+const UPLOAD_REFUSED = 'smoke: upload refused'; // the stubbed 500's error.message
+
+// #6076: the upload form shares the htmx:confirm handler and the rollout check with the
+// per-package rollout forms.
+async function scenarioRolloutPct(page, tmp) {
+  const w = watch(page);
+  const file = join(tmp, 'yuzu_test_smoke.bin');
+  writeFileSync(file, 'x');
+  await trace(page);
+  await visit(page, '/settings/plugins');
+  const form = '#updates-section form[data-confirm]';
+  await page.waitForSelector(form, { timeout: WAIT_MS });
+  const pct = form + ' input[name="rollout_pct"]';
+  const submit = form + ' button[type="submit"]';
+  await (await page.$(form + ' input[name="file"]')).uploadFile(file);
+  const uploads = () => requestLog(page).filter((r) => r.method === 'POST' && r.path === '/api/settings/updates/upload');
+
+  // 1. The field's own pattern refuses "1e2" before htmx sees a submit. The browser moves
+  // focus to the invalid field once it has refused, which is what we wait on.
+  await setValue(page, pct, '1e2');
+  await page.click(submit);
+  await page.waitForFunction((sel) => document.activeElement === document.querySelector(sel),
+    { timeout: WAIT_MS }, pct);
+  check('#6076 the rollout pattern refuses "1e2", no upload request', uploads().length === 0,
+    'uploads=' + uploads().length);
+
+  // 2. Without the pattern only the page's own guard (the htmx:confirm handler) stands between
+  // "1e2" and the request; its refusal is a toast with this exact text.
+  await page.$eval(pct, (el) => el.removeAttribute('pattern'));
+  await page.click(submit);
+  await errorToast(page, ROLLOUT_REFUSAL);
+  check('#6076 the JS guard refuses "1e2" without the pattern, no upload request', uploads().length === 0,
+    'uploads=' + uploads().length);
+
+  // 3. A valid percentage reaches the (stubbed) request; the page shows the server's message.
+  const rule = await stub(page, {
+    method: 'POST', path: '/api/settings/updates/upload', status: 500,
+    body: JSON.stringify({ error: { message: UPLOAD_REFUSED } }),
+  });
+  await page.evaluate(() => { window.confirm = () => true; });
+  await setValue(page, pct, '50');
+  await page.click(submit);
+  await errorToast(page, UPLOAD_REFUSED);
+  check('#6076 a stubbed upload 500 shows the server message, no page error',
+    rule.calls.length === 1 && w.pageErrors().length === 0,
+    'stub calls=' + rule.calls.length + ' pageErrors=' + JSON.stringify(w.pageErrors()));
+}
+
+async function scenarioAddUser(page) {
+  const w = watch(page);
+  const user = 'yuzu_smoke_user';
+  const rule = await stub(page, {
+    method: 'POST', path: '/api/settings/users', status: 201,
+    body: JSON.stringify({ data: { username: user } }),
+  });
+  await visit(page, '/access/users');
+  await page.waitForSelector('[data-act="add"]', { timeout: WAIT_MS });
+  await page.click('[data-act="add"]');
+  await page.waitForSelector('dialog[open] input[name="username"]', { timeout: WAIT_MS });
+  await page.type('dialog[open] input[name="username"]', user);
+  await page.type('dialog[open] input[name="password"]', 'Sm0ke-Only-Pa55word!');
+  await page.click('dialog[open] .f button.btn-primary');
+  await page.waitForFunction((u) => document.getElementById('acc-msg').textContent === 'Added ' + u + '.',
+    { timeout: WAIT_MS }, user);
+  const body = rule.calls[0] ? rule.calls[0].body : '';
+  check('add-user: stubbed POST carries the typed username, page confirms, no page error',
+    rule.calls.length === 1 && new URLSearchParams(body).get('username') === user && w.pageErrors().length === 0,
+    'calls=' + rule.calls.length + ' pageErrors=' + JSON.stringify(w.pageErrors()));
+}
+
+// #5840: the page has no search or reset control; the open item is the Ctrl+K guard that
+// must not hijack a focused field.
+async function scenarioCtrlK(page) {
+  const w = watch(page);
+  await visit(page, '/executions');
+  await page.waitForSelector('#f-def', { timeout: WAIT_MS });
+  // Registered after the shell's own listener, so it sees the event after the guard has run.
+  await page.evaluate(() => {
+    window.__ctrlK = null;
+    window.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.key === 'k') window.__ctrlK = { prevented: e.defaultPrevented };
+    });
+  });
+  await page.focus('#f-def');
+  await page.keyboard.down('Control');
+  await page.keyboard.press('k');
+  await page.keyboard.up('Control');
+  await page.waitForFunction(() => window.__ctrlK !== null, { timeout: WAIT_MS });
+  const seen = await page.evaluate(() => ({ ...window.__ctrlK, path: location.pathname,
+    focused: document.activeElement && document.activeElement.id }));
+  check('#5840 Ctrl+K with #f-def focused is left alone',
+    seen.prevented === false && seen.path === '/executions' && seen.focused === 'f-def',
+    JSON.stringify(seen));
+
+  await page.evaluate(() => { document.activeElement.blur(); });
+  const navs = [];
+  page.on('request', (r) => { if (r.isNavigationRequest()) navs.push(r.url()); });
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'load', timeout: WAIT_MS }),
+    (async () => {
+      await page.keyboard.down('Control');
+      await page.keyboard.press('k');
+      await page.keyboard.up('Control');
+    })(),
+  ]);
+  // The console strips ?palette=1 once it has acted on it, so assert the navigation request
+  // and the open palette rather than the final URL.
+  await page.waitForFunction(() => {
+    const p = document.getElementById('cmd-palette');
+    return p && getComputedStyle(p).display !== 'none';
+  }, { timeout: WAIT_MS });
+  const target = navs.map((u) => new URL(u)).find((u) => u.pathname === '/' && u.searchParams.get('palette') === '1');
+  check('#5840 Ctrl+K with nothing focused opens the console palette',
+    !!target && w.pageErrors().length === 0,
+    'navigations=' + JSON.stringify(navs) + ' pageErrors=' + JSON.stringify(w.pageErrors()));
+}
+
+// #6074: the audit-failed banner and the panel load error on the PKI page.
+async function scenarioPki(page) {
+  const w = watch(page);
+  const frag = { method: 'GET', path: '/fragments/settings/ca', search: 'view=pki' };
+  await stub(page, { ...frag, status: 200, contentType: 'text/html', body: '<div>ok</div>',
+    headers: { 'Sec-Audit-Failed': 'true' } });
+  await visit(page, '/settings/pki');
+  await page.waitForSelector('#pki-notices .alert-warning', { timeout: WAIT_MS });
+  const shown = await page.$eval('#pki-notices .alert-warning', (a) => !!a.querySelector('button') &&
+    /audit record/.test(a.textContent));
+  await page.click('#pki-notices .alert-warning button');
+  await page.waitForFunction(() => !document.querySelector('#pki-notices .alert-warning'), { timeout: WAIT_MS });
+  check('#6074 Sec-Audit-Failed renders the warning with Dismiss, Dismiss removes it', shown);
+
+  clearStubs(page);
+  await stub(page, { ...frag, status: 500, contentType: 'text/html', body: '<div>down</div>' });
+  await visit(page, '/settings/pki');
+  await page.waitForFunction(() => /HTTP 500/.test(document.getElementById('ca-section').textContent),
+    { timeout: WAIT_MS });
+  check('#6074 a 500 on the CA fragment says HTTP 500 in #ca-section, no page error',
+    w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
+}
+
+// AP-3.2: the DEX Apps tab. Two halves, both always run (a missing element is a FAIL, never a skip):
+//   live    the tab opens against the real server and a platform chip is activated from the keyboard
+//   golden  the committed golden of the production renderer (apps__versions.html, byte-pinned by the
+//           golden unit test) is served through a stub, so the version expander and the score
+//           decomposition are opened and closed on every run, whatever the live stack holds
+// Names the wait that timed out; a bare "Waiting failed" says nothing about which one.
+const at = (what, p) => p.catch((e) => { throw new Error(what + ': ' + (e && e.message ? e.message : e)); });
+
+const APPS_GOLDEN = new URL('../unit/server/golden/dex/apps__versions.html', import.meta.url);
+
+async function openAppsTab(page) {
+  await at('open /dex', visit(page, '/dex'));
+  // Wait for htmx to have bound the tab (it sets its internal data when it processes the swapped
+  // fragment); a click before that is a no-op and the tab never opens.
+  await at('Apps tab bound by htmx', page.waitForFunction(() => {
+    const a = [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((x) => x.textContent.trim() === 'Apps');
+    return !!a && !!a['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  const tab = await page.evaluateHandle(() =>
+    [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((a) => a.textContent.trim() === 'Apps'));
+  await tab.click();
+  await at('Apps fragment (#dex-apps)', page.waitForSelector('#dex-apps', { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+}
+
+const windowsChipLit = (page) => page.waitForFunction(() => {
+  const b = [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows');
+  return !!b && b.classList.contains('on') && b.getAttribute('aria-pressed') === 'true';
+}, { timeout: WAIT_MS });
+
+// Computed display of the first version row of the first application.
+const versionRowDisplay = (page) => page.$eval('tbody.dx-app .dx-ver', (r) => getComputedStyle(r).display);
+// Whether the first score decomposition is rendered. A closed <details> keeps its content's layout
+// boxes (getClientRects is not empty), so visibility, not geometry, is the test.
+const decompositionShown = (page) => page.$eval('details.dx-score .dx-ded', (d) => d.checkVisibility());
+
+// The versions expander opens and closes from the keyboard. Each wait names itself, so a failure says
+// which transition did not happen. `waitMs` is short in the selftest, which feeds it a page whose
+// :has() rules were removed and expects the open wait to time out.
+async function checkAppsExpander(page, waitMs) {
+  const shut = await versionRowDisplay(page);
+  await page.focus('details.dx-vx > summary');
+  await page.keyboard.press('Enter');
+  await at('version rows shown after opening the expander', page.waitForFunction(
+    () => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'table-row',
+    { timeout: waitMs }));
+  await page.keyboard.press('Enter');
+  await at('version rows hidden after closing the expander', page.waitForFunction(
+    () => getComputedStyle(document.querySelector('tbody.dx-app .dx-ver')).display === 'none',
+    { timeout: waitMs }));
+  check('dex-apps golden: the versions expander opens and closes from the keyboard', shut === 'none');
+}
+
+// #7514: what the browser exposes to assistive technology for the expander. A closed <details>
+// exposes only its summary; opened, it must expose non-empty text (the visually hidden sentence), not
+// an empty region. Read from the browser's accessibility tree over CDP (page.accessibility is not
+// relied on); the before and after subtree is printed for the PR record.
+const EXPANDER_SENTENCE = 'The version rows follow this row in the table.';
+
+async function axSubtree(page) {
+  const cdp = await page.createCDPSession();
+  try {
+    const { nodes } = await cdp.send('Accessibility.getFullAXTree');
+    const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+    const label = (n) => (n.role && n.role.value) + (n.name && n.name.value ? ' "' + n.name.value + '"' : '');
+    const lines = [];
+    const walk = (n, depth) => {
+      lines.push('  '.repeat(depth) + label(n) + (n.ignored ? ' (ignored)' : ''));
+      for (const c of n.childIds || []) if (byId.has(c)) walk(byId.get(c), depth + 1);
+    };
+    // The expander is the parent of the disclosure triangle whose name is "N versions".
+    const tri = nodes.find((n) => !n.ignored && n.role && n.role.value === 'DisclosureTriangle' &&
+      n.name && /versions?$/.test(n.name.value));
+    if (tri && tri.parentId && byId.has(tri.parentId)) walk(byId.get(tri.parentId), 0);
+    const text = nodes.filter((n) => !n.ignored && n.role && n.role.value === 'StaticText' && n.name &&
+      n.name.value.includes(EXPANDER_SENTENCE)).length;
+    return { tree: lines.join('\n'), sentenceNodes: text, found: !!tri };
+  } finally {
+    await cdp.detach();
+  }
+}
+
+async function checkExpanderAccessibility(page) {
+  const closed = await axSubtree(page);
+  await page.focus('details.dx-vx > summary');
+  await page.keyboard.press('Enter');
+  await at('expander open for the accessibility read', page.waitForFunction(
+    () => document.querySelector('details.dx-vx').open, { timeout: WAIT_MS }));
+  const open = await axSubtree(page);
+  console.log('INFO dex-apps golden: accessibility tree of the expander, closed:\n' + closed.tree);
+  console.log('INFO dex-apps golden: accessibility tree of the expander, open:\n' + open.tree);
+  check('dex-apps golden: a closed expander exposes no hidden sentence', closed.found && closed.sentenceNodes === 0,
+    JSON.stringify({ found: closed.found, nodes: closed.sentenceNodes }));
+  check('dex-apps golden: the opened expander exposes non-empty text in the accessibility tree',
+    open.found && open.sentenceNodes >= 1, JSON.stringify({ found: open.found, nodes: open.sentenceNodes }));
+  await page.keyboard.press('Enter'); // leave it closed for the checks that follow
+  await at('expander closed again', page.waitForFunction(
+    () => !document.querySelector('details.dx-vx').open, { timeout: WAIT_MS }));
+}
+
+// htmx 2.0.4 binds a freshly swapped control a moment AFTER the swap settles (it stores its internal data
+// on the element), and a key press before that is a no-op. Wait for the binding before pressing Enter.
+const htmxBound = (page, selector) => page.waitForFunction(
+  (sel) => [...document.querySelectorAll(sel)].every((c) => !!c['htmx-internal-data']), { timeout: WAIT_MS }, selector);
+
+async function scenarioDexApps(page) {
+  const w = watch(page);
+
+  // live: Tab-order equivalent: focus the chip and press Enter, never a mouse click.
+  await openAppsTab(page);
+  // The route answers 200 with an error panel when set_dex_api was never wired or the read failed, and
+  // nothing else here would notice: the chips and the shell are present either way.
+  const liveText = await page.$eval('#dex-apps', (e) => e.textContent);
+  check('dex-apps live: the Apps tab shows the model, not the "Application stability is unavailable" panel',
+    !liveText.includes('Application stability is unavailable'), liveText.slice(0, 200));
+  await htmxBound(page, '#dex-apps button.gp-chip');
+  await page.evaluate(() => {
+    [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === 'Windows').focus();
+  });
+  await page.keyboard.press('Enter');
+  await at('Windows chip lit', windowsChipLit(page));
+  await at('htmx settled', settled(page));
+  await quiesce(page);
+  check('dex-apps live: the Apps tab opens and the Windows chip lights from the keyboard',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+
+  // golden: the production markup under the real shell and CSP.
+  w.reset();
+  const body = readFileSync(APPS_GOLDEN, 'utf8');
+  const rule = await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
+  await openAppsTab(page);
+  check('dex-apps golden: the stub answered the Apps request, so the page under test is the golden',
+    rule.calls.length === 1, 'stub calls: ' + rule.calls.length);
+  const have = await page.evaluate(() => ({
+    tog: !!document.querySelector('details.dx-vx'), sc: !!document.querySelector('details.dx-score'),
+  }));
+  check('dex-apps golden: the page has a versions expander and a score decomposition', have.tog && have.sc,
+    JSON.stringify(have));
+  if (have.tog && have.sc) {
+    await checkAppsExpander(page, WAIT_MS);
+    await checkExpanderAccessibility(page);
+
+    const before = await decompositionShown(page);
+    await page.focus('details.dx-score > summary');
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => document.querySelector('details.dx-score .dx-ded').checkVisibility(),
+      { timeout: WAIT_MS });
+    await page.keyboard.press('Enter');
+    await page.waitForFunction(() => !document.querySelector('details.dx-score .dx-ded').checkVisibility(),
+      { timeout: WAIT_MS });
+    check('dex-apps golden: the score decomposition opens and closes', before === false);
+
+    // A 256-byte image name with no break opportunity must wrap inside the first column rather than
+    // run under the Score cell (the column is fixed-width: table-layout:fixed).
+    const fit = await page.evaluate(() => {
+      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
+      a.textContent = 'W'.repeat(256);
+      const td = a.parentElement;
+      return { scroll: td.scrollWidth, client: td.clientWidth };
+    });
+    check('dex-apps golden: a 256-character unbroken application name stays inside its cell',
+      fit.scroll <= fit.client, JSON.stringify(fit));
+
+    // At the 1000 px breakpoint the table drops to table-layout:auto, where an unset overflow-wrap
+    // lets the first column shrink to its longest break opportunity. An ordinary name must stay on
+    // one line; the anchor is measured against its own nowrap height, so no font metric is assumed.
+    await page.setViewport({ width: 1000, height: DESKTOP.height });
+    const narrow = await page.evaluate(() => {
+      const a = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
+      a.textContent = 'msedgewebview2.exe';
+      const wrapped = a.offsetHeight;
+      a.style.whiteSpace = 'nowrap';
+      const oneLine = a.offsetHeight;
+      a.style.whiteSpace = '';
+      return { wrapped, oneLine, layout: getComputedStyle(a.closest('table')).tableLayout };
+    });
+    check('dex-apps golden: at 1000 px an ordinary long application name stays on one line',
+      narrow.wrapped === narrow.oneLine && narrow.layout === 'auto', JSON.stringify(narrow));
+    await page.setViewport(DESKTOP);
+  }
+  await quiesce(page);
+  check('dex-apps golden: no page error and no CSP violation while the stubbed page is exercised',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+  clearStubs(page);
+}
+
+// #7522: a slow response for a view the viewer has left must not replace the current view. The Apps
+// request is held in the browser, Overview is opened, and only then is the held response released.
+// htmx cancels the superseded request (hx-sync on the pane), so releasing it changes nothing. The
+// abort is observed (request-failed event, or htmx's abort event), so a pass proves the mechanism and
+// not merely an end state that a never-delivered response would also produce.
+async function scenarioDexPaneSync(page) {
+  const w = watch(page);
+  let release;
+  const hold = new Promise((resolve) => { release = resolve; });
+  const apps = await stub(page, {
+    path: '/fragments/dex/apps', status: 200, contentType: 'text/html',
+    body: '<div id="dex-apps">late Apps response</div>', hold,
+  });
+  await at('open /dex', visit(page, '/dex'));
+  const tab = (name) => page.evaluateHandle((n) =>
+    [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((b) => b.textContent.trim() === n), name);
+  await at('tabs bound by htmx', page.waitForFunction(() => {
+    const bs = [...document.querySelectorAll('#guardian-detail .gp-subnav button')];
+    return bs.length > 0 && bs.every((b) => !!b['htmx-internal-data']);
+  }, { timeout: WAIT_MS }));
+
+  const arrived = page.waitForRequest((r) => new URL(r.url()).pathname === '/fragments/dex/apps', { timeout: WAIT_MS });
+  await (await tab('Apps')).click();
+  await at('the Apps request reached the stub', arrived);
+  const overview = page.waitForResponse((r) => new URL(r.url()).pathname === '/fragments/dex/overview',
+    { timeout: WAIT_MS });
+  await (await tab('Overview')).click();
+  await at('the Overview response', overview);
+  await at('htmx settled', settled(page));
+  await at('Overview heading shown', page.waitForFunction(
+    () => [...document.querySelectorAll('#guardian-detail h1')].some((h) => h.textContent.trim() === 'DEX'),
+    { timeout: WAIT_MS }));
+  await at('the held Apps request observed cancelled', waitAborted(page, apps));
+  check('dex-pane-sync: the superseded Apps request was cancelled by the page', apps.aborted === true,
+    'aborted: ' + apps.aborted);
+
+  release();
+  await quiesce(page);
+  const after = await page.evaluate(() => ({
+    overview: [...document.querySelectorAll('#guardian-detail h1')].some((h) => h.textContent.trim() === 'DEX'),
+    apps: !!document.querySelector('#dex-apps'),
+  }));
+  check('dex-pane-sync: a late Apps response does not replace the Overview', after.overview && !after.apps,
+    JSON.stringify(after));
+  check('dex-pane-sync: the Apps stub saw exactly one request', apps.calls.length === 1,
+    'calls: ' + apps.calls.length);
+  // htmx itself logs these two events through console.error when hx-sync cancels the superseded request,
+  // which is exactly what this scenario provokes; any other page error or CSP violation still fails.
+  const pageErrs = w.errors().filter((e) => e !== 'htmx:afterRequest' && e !== 'htmx:sendAbort');
+  check('dex-pane-sync: no page error and no CSP violation', pageErrs.length === 0, JSON.stringify(pageErrs));
+  clearStubs(page);
+}
+
+// #7505: the DEX controls are operated with focus and Enter only, never a mouse click: the Apps tab, a
+// window chip, and (on the committed golden, so the data does not depend on the stack) an application
+// link.
+async function scenarioDexKeyboard(page) {
+  const w = watch(page);
+  await at('open /dex', visit(page, '/dex'));
+  const focusIn = (selector, text) => page.evaluate((sel, t) => {
+    const el = [...document.querySelectorAll(sel)].find((x) => x.textContent.trim() === t);
+    if (!el) throw new Error('no ' + sel + ' "' + t + '"');
+    el.focus();
+    return document.activeElement === el;
+  }, selector, text);
+  await at('Apps tab bound by htmx', page.waitForFunction(() => {
+    const b = [...document.querySelectorAll('#guardian-detail .gp-subnav button')].find((x) => x.textContent.trim() === 'Apps');
+    return !!b && !!b['htmx-internal-data'];
+  }, { timeout: WAIT_MS }));
+  check('dex-keyboard: the Apps tab takes focus', await focusIn('#guardian-detail .gp-subnav button', 'Apps'));
+  await page.keyboard.press('Enter');
+  await at('Apps fragment (#dex-apps)', page.waitForSelector('#dex-apps', { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+
+  await htmxBound(page, '#dex-apps button.gp-chip');
+  check('dex-keyboard: a window chip takes focus', await focusIn('#dex-apps button.gp-chip', '30d'));
+  await page.keyboard.press('Enter');
+  await at('30d chip lit', page.waitForFunction(() => {
+    const b = [...document.querySelectorAll('#dex-apps button.gp-chip')].find((c) => c.textContent.trim() === '30d');
+    return !!b && b.classList.contains('on') && b.getAttribute('aria-pressed') === 'true';
+  }, { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+
+  // golden: the application link, with its drill target answered by a stub so nothing depends on data.
+  const body = readFileSync(APPS_GOLDEN, 'utf8');
+  await stub(page, { path: '/fragments/dex/apps', status: 200, contentType: 'text/html', body });
+  const drill = await stub(page, { path: '/fragments/dex/app', status: 200, contentType: 'text/html',
+    body: '<div id="dex-app-stub">drill</div>' });
+  await htmxBound(page, '#guardian-detail .gp-subnav button');
+  check('dex-keyboard: the Apps tab takes focus again', await focusIn('#guardian-detail .gp-subnav button', 'Apps'));
+  await page.keyboard.press('Enter');
+  await at('golden Apps fragment', page.waitForSelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk', { timeout: WAIT_MS }));
+  await at('htmx settled', settled(page));
+  await htmxBound(page, 'tbody.dx-app .dx-lk');
+  const focused = await page.evaluate(() => {
+    const el = document.querySelector('tbody.dx-app .dx-apphead td:first-child > .dx-lk');
+    el.focus();
+    return { ok: document.activeElement === el, tag: el.tagName };
+  });
+  check('dex-keyboard: the first application link is a focusable button', focused.ok && focused.tag === 'BUTTON',
+    JSON.stringify(focused));
+  await page.keyboard.press('Enter');
+  await at('application drill rendered', page.waitForSelector('#dex-app-stub', { timeout: WAIT_MS }));
+  check('dex-keyboard: Enter on the application link requested the drill-down',
+    drill.calls.length === 1 && requestLog(page).some((r) => r.path === '/fragments/dex/app'),
+    'drill calls: ' + drill.calls.length);
+  await quiesce(page);
+  check('dex-keyboard: no page error and no CSP violation', w.errors().length === 0, JSON.stringify(w.errors()));
+  clearStubs(page);
+}
+
+// #6749: the Engine Principals roster read answers 200 with Sec-Audit-Failed when its audit row
+// was not saved; the Settings page says so once, outside the section that refreshes. A stub
+// proves the PAGE half only (the server half is the dropped-audit C++ test).
+async function scenarioEngineAudit(page) {
+  const w = watch(page);
+  const ROSTER = '/fragments/settings/engine-principals';
+  const SENTENCE = 'An audit record for this read could not be saved. The data shown is still current.';
+  const refresh = async () => {
+    await Promise.all([
+      page.waitForResponse((r) => new URL(r.url()).pathname === ROSTER, { timeout: WAIT_MS }),
+      page.evaluate(() => htmx.trigger(document.body, 'refreshEnginePrincipals')),
+    ]);
+    await settled(page);
+    await quiesce(page);
+  };
+  const banners = () => page.$$eval('#engine-principals-notices .failbox',
+    (els) => els.map((e) => ({ text: e.textContent, role: e.getAttribute('role') })));
+  const rosterShown = () => page.waitForFunction(
+    () => !!document.querySelector('#engine-principals-section #ep-stub'), { timeout: WAIT_MS });
+  const body = '<p id="ep-stub">roster stub</p>';
+
+  // Positive: a failed audit write shows exactly one banner; repeated failures keep one; the
+  // secret-reveal element outside the section survives a refresh; a later healthy refresh keeps it.
+  const rule = await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html',
+    body, headers: { 'Sec-Audit-Failed': 'true' } });
+  await visit(page, '/settings');
+  await rosterShown();
+  await page.waitForSelector('#engine-principals-notices .failbox', { timeout: WAIT_MS });
+  await page.evaluate(() => { document.getElementById('engine-principal-reveal').textContent = 'reveal-sentinel'; });
+  await refresh();
+  await refresh();
+  const shown = await banners();
+  const reveal = await page.$eval('#engine-principal-reveal', (e) => e.textContent);
+  const nested = await page.$eval('#engine-principals-notices',
+    (e) => !e.closest('#engine-principals-section') && !e.closest('#engine-principal-reveal'));
+  check('#6749 a dropped roster audit row shows one alert banner with the Tokens and principals page sentence, '
+    + 'after three failed reads', shown.length === 1 && shown[0].role === 'alert' &&
+    shown[0].text === SENTENCE && rule.calls.length >= 3, JSON.stringify({ shown, calls: rule.calls.length }));
+  check('#6749 the banner sits outside the refreshing section and the reveal survives refreshes',
+    nested && reveal === 'reveal-sentinel', JSON.stringify({ nested, reveal }));
+  rule.headers = {};
+  await refresh();
+  check('#6749 a later healthy refresh keeps the banner (it is not auto-cleared) and still one',
+    (await banners()).length === 1);
+  await quiesce(page);
+  check('#6749 no console error, HTTP >= 400 or page error on the positive leg',
+    w.errors().length === 0, JSON.stringify(w.errors()));
+
+  // Negative control 1: a healthy read shows no banner.
+  clearStubs(page);
+  const healthy = await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html', body });
+  await visit(page, '/settings');
+  await rosterShown();
+  await refresh();
+  check('#6749 control: a healthy roster read shows no banner', (await banners()).length === 0 &&
+    healthy.calls.length >= 2, JSON.stringify({ calls: healthy.calls.length }));
+  await quiesce(page);
+  check('#6749 control: no console error or HTTP >= 400 on the healthy leg', w.errors().length === 0,
+    JSON.stringify(w.errors()));
+
+  // Negative control 2: Sec-Audit-Failed on an UNRELATED fragment (200) and an unrelated 500 show
+  // no Engine Principals banner.
+  clearStubs(page);
+  w.reset();
+  await stub(page, { method: 'GET', path: ROSTER, status: 200, contentType: 'text/html', body });
+  const tokensRule = await stub(page, { method: 'GET', path: '/fragments/settings/tokens', status: 200,
+    contentType: 'text/html', body: '<p>t</p>', headers: { 'Sec-Audit-Failed': 'true' } });
+  const apiRule = await stub(page, { method: 'GET', path: '/fragments/settings/api-tokens', status: 500,
+    contentType: 'text/html', body: '<p>down</p>' });
+  await visit(page, '/settings');
+  await rosterShown();
+  await quiesce(page);
+  check('#6749 control: an unrelated fragment (audit-failed 200, or a 500) shows no Engine Principals banner',
+    (await banners()).length === 0 && w.pageErrors().length === 0 &&
+    tokensRule.calls.length >= 1 && apiRule.calls.length >= 1,
+    JSON.stringify({ banners: await banners(), pageErrors: w.pageErrors(),
+      tokensCalls: tokensRule.calls.length, apiCalls: apiRule.calls.length }));
+
+  // Negative control 3: the roster itself failing (403, with the header) is not a "data is still
+  // current" claim: no banner, the permission note instead.
+  clearStubs(page);
+  w.reset();
+  await stub(page, { method: 'GET', path: ROSTER, status: 403, contentType: 'text/html',
+    body: '<p>no</p>', headers: { 'Sec-Audit-Failed': 'true' } });
+  await visit(page, '/settings');
+  await page.waitForFunction(() => /EnginePrincipal:Read/.test(
+    document.getElementById('engine-principals-section').textContent), { timeout: WAIT_MS });
+  check('#6749 control: a 403 roster read with the header shows the permission note, no banner',
+    (await banners()).length === 0 && w.pageErrors().length === 0, JSON.stringify(w.pageErrors()));
+}
+
+// ---- selftest ------------------------------------------------------------------------
+// A gate whose checks can pass vacuously is worse than none, so every crawl and overflow check
+// gets a positive control. A local fixture serves a fake shell (28 nav links, forms) with the
+// real CSP shape; each case bends it one way and asserts the REAL check reports that failure.
+// The baseline case first proves the clean fixture passes, so a negative case cannot be
+// failing for some other reason. The scenarios need the live app and are not covered here.
+
+const CSP_OK = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'";
+const FORM_BODY = {
+  '/form-ok': '<button type="submit">Save</button>',
+  '/form-out': '<button type="submit" style="position:absolute;left:5000px">Save</button>',
+  '/form-none': '<input name="a">',
+};
+// Errors raised after a stalled main thread, well past the point where visit() returns: the
+// stall starts two frames after load and holds the thread for 60 ms, so they are delivered later
+// than anything read straight after visit(), yet still ahead of quiesce()'s own two frames and
+// timer, which queue behind this chain.
+const LATE_ERRORS = `<script>addEventListener('load', () => requestAnimationFrame(() =>
+  requestAnimationFrame(() => {
+    for (const t = Date.now(); Date.now() - t < 60;) { /* stall */ }
+    setTimeout(() => console.error('late console error'), 0);
+    setTimeout(() => { throw new Error('late throw'); }, 0);
+  })));</script>`;
+const BASE = { nav: EXPECTED, csp: CSP_OK, late: false, notFound: '', stripHas: false };
+
+function fixturePage(path, v) {
+  const nav = v.nav.map((h) => '<a href="' + h + '">' + h + '</a>').join('');
+  const form = FORM_BODY[path] ? '<form>' + FORM_BODY[path] + '</form>' : '';
+  return '<!doctype html><title>fixture</title><aside class="shell-side"><nav>' + nav +
+    '</nav></aside>' + form + (v.late ? LATE_ERRORS : '');
+}
+
+// The committed Apps golden inside the pane mount, as the shell serves it. With `stripHas` every CSS
+// line that holds a :has() rule is removed at run time (the kAppsCss source is one rule per line), so
+// the version rows can no longer be opened by the expander: the control the check is meant to catch.
+function appsGoldenPage(stripHas) {
+  let body = readFileSync(APPS_GOLDEN, 'utf8');
+  if (stripHas) body = body.split('\n').filter((l) => !l.includes(':has(')).join('\n');
+  return '<!doctype html><title>fixture</title><div id="guardian-detail">' + body + '</div>';
+}
+
+function startFixture() {
+  const fx = { v: BASE, server: null, url: '' };
+  fx.server = createServer((req, res) => {
+    const path = new URL(req.url, 'http://fixture').pathname;
+    const { v } = fx;
+    if (path === '/apps-golden') {
+      res.writeHead(200, { 'content-type': 'text/html' }).end(appsGoldenPage(v.stripHas));
+      return;
+    }
+    if (path === v.notFound) { res.writeHead(404).end('gone'); return; }
+    res.writeHead(200, { 'content-type': 'text/html', ...(v.csp ? { 'content-security-policy': v.csp } : {}) });
+    res.end(fixturePage(path, v));
+  });
+  return new Promise((resolve) => fx.server.listen(0, '127.0.0.1', () => {
+    fx.url = 'http://127.0.0.1:' + fx.server.address().port;
+    resolve(fx);
+  }));
+}
+
+const formPage = (path) => [{ path, ready: 'form', open: null }];
+const SELF_CASES = [
+  { id: 'baseline', note: 'the clean fixture passes every crawl and overflow check',
+    variant: {}, run: async (p) => { await crawl(p); await overflow(p, formPage('/form-ok')); },
+    expect: { passing: EXPECTED.length + 3 } }, // 28 routes + the nav match + 2 viewports
+  { id: 'a', note: 'nav chrome without the "/" anchor',
+    variant: { nav: EXPECTED.filter((h) => h !== '/') }, run: crawl,
+    expect: { name: 'nav matches EXPECTED', detail: ['never discovered: /.'] } },
+  { id: 'b', note: 'an href that is not in EXPECTED',
+    variant: { nav: [...EXPECTED, '/zz-drift'] }, run: crawl,
+    expect: { name: 'nav matches EXPECTED', detail: ['not in EXPECTED: /zz-drift'] } },
+  { id: 'c', note: 'a delayed console.error and a delayed uncaught throw',
+    variant: { nav: ['/'], late: true }, run: crawl,
+    expect: { name: 'crawl /', detail: ['page error: late throw', 'page error: late console error'] } },
+  { id: 'd1', note: 'a response with no Content-Security-Policy',
+    variant: { nav: ['/'], csp: null }, run: crawl,
+    expect: { name: 'crawl /', detail: ['no Content-Security-Policy header'] } },
+  { id: 'd2', note: "a Content-Security-Policy that allows 'unsafe-eval'",
+    variant: { nav: ['/'], csp: "script-src 'self' 'unsafe-inline' 'unsafe-eval'; object-src 'none'" }, run: crawl,
+    expect: { name: 'crawl /', detail: ["allows 'unsafe-eval'"] } },
+  { id: 'e', note: 'a submit button outside its form and the viewport',
+    variant: {}, run: (p) => overflow(p, formPage('/form-out')),
+    expect: { name: 'overflow /form-out', detail: ['outside its form horizontally'] } },
+  { id: 'f', note: 'a form with no submit control',
+    variant: {}, run: (p) => overflow(p, formPage('/form-none')),
+    expect: { name: 'overflow /form-none', detail: ['no submit control found'] } },
+  { id: 'g', note: 'a route that answers 404',
+    variant: { nav: ['/', '/gone'], notFound: '/gone' }, run: crawl,
+    expect: { name: 'crawl /gone', detail: ['status 404'] } },
+  { id: 'h1', note: 'the committed Apps golden: the expander opens and closes',
+    variant: {}, run: async (p) => { await visit(p, '/apps-golden'); await checkAppsExpander(p, WAIT_MS); },
+    expect: { passing: 1 } },
+  { id: 'h2', note: 'the same golden with every :has() rule removed: the version rows never open',
+    variant: { stripHas: true }, run: async (p) => { await visit(p, '/apps-golden'); await checkAppsExpander(p, 1500); },
+    expect: { name: 'selftest h2', detail: ['version rows shown after opening the expander'] } },
+];
+
+// '' when the recorded checks are what the case expects, else why not.
+function judge(expect, got) {
+  const failed = got.filter((r) => !r.ok);
+  if (expect.passing !== undefined) {
+    return !failed.length && got.length === expect.passing ? ''
+      : got.length + ' checks (want ' + expect.passing + '), failing: ' + JSON.stringify(failed);
+  }
+  const hit = failed.find((r) => r.name.startsWith(expect.name) && expect.detail.every((d) => r.detail.includes(d)));
+  return hit ? '' : 'no failing "' + expect.name + '" check with ' + JSON.stringify(expect.detail) +
+    '; failing: ' + JSON.stringify(failed);
+}
+
+async function selftest() {
+  let fx;
+  let browser;
+  let bad = 0;
+  try {
+    fx = await startFixture();
+    cfg.baseUrl = fx.url;
+    browser = await launch();
+    for (const c of SELF_CASES) {
+      fx.v = { ...BASE, ...c.variant };
+      const got = [];
+      record = (r) => got.push(r);
+      const page = await browser.newPage();
+      try {
+        await c.run(page);
+      } catch (e) {
+        got.push({ name: 'selftest ' + c.id, ok: false, detail: 'threw: ' + (e && e.message ? e.message : e) });
+      }
+      await page.close();
+      record = printRecord;
+      const why = judge(c.expect, got);
+      if (why) bad++;
+      console.log((why ? 'FAIL ' : 'PASS ') + 'selftest ' + c.id + ': ' + c.note + (why ? ' -- ' + why : ''));
+    }
+  } finally {
+    if (browser) await browser.close();
+    if (fx) fx.server.close();
+  }
+  console.log(bad ? bad + ' selftest case(s) FAILED' : 'ui-smoke selftest: every check fails when it should');
+  process.exit(bad ? 1 : 0);
+}
+
+// ---- main ----------------------------------------------------------------------------
+
+async function main() {
+  let tmp;
+  let browser;
+  try {
+    tmp = mkdtempSync(join(tmpdir(), 'yuzu_test_smoke_'));
+    browser = await launch();
+    const page = await browser.newPage();
+    await login(page);
+    await stage('crawl', () => crawl(page));
+    await stage('overflow', () => overflow(page));
+    // A fresh page per scenario: interception, stubs and window overrides never leak.
+    const scenarios = [
+      ['rollout_pct', (p) => scenarioRolloutPct(p, tmp)],
+      ['add-user', scenarioAddUser],
+      ['ctrl-k', scenarioCtrlK],
+      ['pki', scenarioPki],
+      ['dex-apps', scenarioDexApps],
+      ['engine-audit', scenarioEngineAudit],
+      ['dex-pane-sync', scenarioDexPaneSync],
+      ['dex-keyboard', scenarioDexKeyboard],
+    ];
+    for (const [name, fn] of scenarios) {
+      const p = await browser.newPage();
+      await stage('scenario ' + name, () => fn(p));
+      await p.close();
+    }
+  } finally {
+    try {
+      if (browser) await browser.close();
+    } finally {
+      if (tmp) rmSync(tmp, { recursive: true, force: true });
+    }
+  }
+  console.log(failures ? failures + ' check(s) FAILED' : 'ui-smoke: all checks passed');
+  process.exit(failures ? 1 : 0);
+}
+
+(process.argv.includes('--selftest') ? selftest() : main()).catch((e) => {
+  console.log('FAIL ui-smoke aborted: ' + (e && e.stack ? e.stack : e));
+  process.exit(1);
+});

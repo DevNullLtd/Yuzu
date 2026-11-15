@@ -154,6 +154,18 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     // Page title block: the subtitle states what the page does, in the order the stages run.
     h += "<div class=\"af-ph\"><h1>Deployments</h1><p>Check software rollouts first, deploy them, then "
          "verify the result.</p></div>";
+    // Tabs: the flow (default) and the read-only deployments list. Both anchors carry an
+    // href so they stay focusable and Enter-activatable; the Deployments href sets the hash
+    // natively (htmx leaves a fragment href alone) so #deployments deep-links.
+    // hx-sync=replace, not drop: the list read is unaudited and capped, and a hung request
+    // must not swallow every later click (drop ignores them until the stuck XHR settles).
+    h += "<div class=\"tabs\" id=\"auto-tabs\" role=\"tablist\">"
+         "<a href=\"#\" role=\"tab\" class=\"on\" aria-selected=\"true\" "
+         "onclick=\"pfTab('flow');return false\">Pre-flight and deploy</a>"
+         "<a href=\"#deployments\" role=\"tab\" aria-selected=\"false\" "
+         "hx-get=\"/fragments/auto/deployments\" hx-target=\"#auto-list\" hx-swap=\"innerHTML\" "
+         "hx-sync=\"this:replace\" onclick=\"pfTab('list')\">Deployments</a></div>";
+    h += "<div id=\"auto-flow\">";
     h += "<div class=\"af-note\">"
          "Configure the checks (parameters + thresholds), run across a cohort, and get a go/no-go "
          "grouped by device. Runs persist \xE2\x80\x94 reopen one below to revisit it.</div>";
@@ -256,6 +268,39 @@ std::string render_auto_config(const std::vector<std::pair<std::string, std::str
     h += "<div class=\"af-sect\">Verify &mdash; before / after performance</div>";
     h += "<div id=\"auto-verify\" hx-get=\"/fragments/auto/verify\" hx-trigger=\"load\" "
          "hx-swap=\"innerHTML\"><div class=\"gp-placeholder\">Loading verify&hellip;</div></div>";
+    h += "</div>"; // #auto-flow
+    // Read-only deployments list + detail drill (fragments gate on SoftwareDeployment:Read).
+    // #auto-list carries .panel so the shared table rules apply to the swapped table.
+    h += "<div id=\"auto-deployments\" hidden><div id=\"auto-list\" class=\"panel\">"
+         "<div class=\"gp-placeholder\">Loading deployments&hellip;</div></div>"
+         "<div id=\"auto-detail\"></div></div>";
+    // Tab switch + deep link + visible refusal for the list/detail swaps (htmx drops non-2xx
+    // bodies). The inline script runs before htmx binds swapped nodes, so the deep link calls
+    // htmx.ajax directly rather than clicking the anchor.
+    h += "<script>window.pfTab=function(w){var f=document.getElementById('auto-flow'),"
+         "d=document.getElementById('auto-deployments');if(!f||!d)return;f.hidden=(w!=='flow');"
+         "d.hidden=(w!=='list');if(w==='list'){var x=document.getElementById('auto-detail');"
+         "if(x)x.innerHTML='';}document.querySelectorAll('#auto-tabs a').forEach(function(a,i){"
+         "var on=(i===(w==='flow'?0:1));a.classList.toggle('on',on);"
+         "a.setAttribute('aria-selected',on?'true':'false');});"
+         "if(w==='flow'&&location.hash==='#deployments')history.replaceState(null,'',"
+         "location.pathname+location.search);};"
+         "if(!window.__pfDepErr){window.__pfDepErr=1;var fail=function(ev){var t=ev.detail&&ev.detail.target;"
+         "if(!t||(t.id!=='auto-list'&&t.id!=='auto-detail'))return;var x=ev.detail.xhr,"
+         "c=x?x.status:0;if(c===401){location.href='/login';return;}"
+         "t.innerHTML=(c===403)?'<div class=\\\"failbox\\\" role=\\\"alert\\\">Your account cannot read "
+         "deployments: this list needs the SoftwareDeployment:Read permission.</div>'"
+         ":'<div class=\\\"failbox\\\" role=\\\"alert\\\">Deployments could not be read just now. "
+         "Try again in a moment.</div>';};"
+         "document.body.addEventListener('htmx:responseError',fail);"
+         "document.body.addEventListener('htmx:sendError',fail);"
+         "window.addEventListener('hashchange',function(){var d=document.getElementById('auto-deployments');"
+         "if(!d)return;var want=(location.hash==='#deployments');if(want===!d.hidden)return;"
+         "pfTab(want?'list':'flow');if(want)htmx.ajax('GET','/fragments/auto/deployments',"
+         "{target:'#auto-list',swap:'innerHTML'});});}"
+         "if(location.hash==='#deployments'&&window.htmx){pfTab('list');"
+         "htmx.ajax('GET','/fragments/auto/deployments',{target:'#auto-list',swap:'innerHTML'});}"
+         "</script>";
     h += "</div>"; // .af-page
     return h;
 }
@@ -441,7 +486,7 @@ std::string render_auto_results(const std::vector<preflight::PreflightDeviceResu
          "gr.style.display=(sg&&sh>0)?'':'none';});"
          "g.querySelectorAll('.af-pill[data-b]').forEach(function(p){p.classList.toggle('sel',p.getAttribute('data-b')===P.b);});"
          "g.querySelectorAll('.af-chip[data-t]').forEach(function(c){c.classList.toggle('sel',c.getAttribute('data-t')===P.t);});"
-         "var e=g.querySelector('.af-empty');if(e)e.style.display=vis?'none':'';};"
+         "var e=g.querySelector('.af-empty');if(e)e.style.display=vis?'none':'block';};"
          "window.pfApply();})();</script>";
 
     h += "</div>";

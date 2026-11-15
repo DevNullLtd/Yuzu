@@ -12,7 +12,7 @@
   app restarted at 14:19"). A network-only tool can't draw this; it has no
   device/app lanes.
 
-  WHY IT'S POSSIBLE (verified): every TAR source row carries `ts` (epoch s);
+  WHY IT'S POSSIBLE (verified): every Echo source row carries `ts` (epoch s);
   process+network are co-sampled in the same collect_fast tick (same
   snapshot_id), perf is joinable by ts-bucket. So the lanes share an x-axis by
   construction. Correlation uses the $*_Live tiers (not the coarse hourly
@@ -99,7 +99,7 @@
   <h1 style="margin-top:.4rem">LNX-DUB-0094</h1>
   <div class="sub">Ubuntu 24.04 &middot; Dublin &middot; full per-connection tier (netlink <code>TCP_INFO</code>) &middot;
     reporting network quality since 2026-05-30 &middot;
-    <a title="opens the TAR console with the canned $NetQual_Live + $Perf_Live join prefilled">open in TAR console &rarr;</a></div>
+    <a title="opens the Echo console with the canned $NetQual_Live + $Perf_Live join prefilled">open in Echo console &rarr;</a></div>
 
   <!-- ───── Evidence timeline (the leapfrog) ───── -->
   <div class="sech">Co-timed evidence &mdash; last 24 h, one shared time axis</div>
@@ -124,7 +124,7 @@
     <div class="fgrid">
       <div class="fcell net"><div class="k">Network</div><div class="v">RTT 480 ms</div><div class="d">&uarr; from ~40 ms baseline &middot; retransmit 8.1%</div></div>
       <div class="fcell dev"><div class="k">Device</div><div class="v">normal</div><div class="d">CPU 11% &middot; mem 47% &middot; disk 0.9 ms &mdash; no pressure</div></div>
-      <div class="fcell app"><div class="k">App</div><div class="v">AcmeCRM.exe</div><div class="d">process restart at 14:19:52 (TAR process event)</div></div>
+      <div class="fcell app"><div class="k">App</div><div class="v">AcmeCRM.exe</div><div class="d">process restart at 14:19:52 (Echo process event)</div></div>
     </div>
   </div>
 
@@ -206,7 +206,7 @@ const LANES=[
   {cls:'dev',b:'Memory',i:'%',svg:lane(mem,'#ffcc00',{lo:0,hi:100}),v:'47'},
   {cls:'dev',b:'Disk latency',i:'ms',svg:lane(disk,'#ffcc00',{lo:0,hi:25}),v:'0.9'},
   {cls:'group',b:'Events',i:'process / service',svg:null,v:''},
-  {cls:'app',b:'App / service',i:'TAR events',svg:eventLane([[INC,'#c98bff','AcmeCRM restart']]),v:'1 restart'},
+  {cls:'app',b:'App / service',i:'Echo events',svg:eventLane([[INC,'#c98bff','AcmeCRM restart']]),v:'1 restart'},
 ];
 document.getElementById('tl').innerHTML = LANES.map(l=>{
   if(l.svg===null) return `<div class="lane group ${l.cls==='group'?'':l.cls}"><div class="ln"><b>${l.b}</b><i>${l.i}</i></div><div></div><div class="lv"></div></div>`;

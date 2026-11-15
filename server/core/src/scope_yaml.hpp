@@ -33,6 +33,16 @@ struct ScopeBlock {
     bool has_selector{false};
     std::string selector_platform;          // selector.platform (e.g. "windows")
     std::vector<std::string> selector_tags; // selector.tags (presence-checked)
+    /// Non-empty when the scope block holds a `- item` line that is not inside
+    /// the selector block (e.g. one misindented to selector's own column, which
+    /// ends the selector block before the tags list sees it). validate_scope_block
+    /// reports it first (#2123 governance Gate 8 F7). It does NOT see a list line
+    /// at or shallower than `scope:` itself, which is outside the scope block, nor
+    /// a `- item` after a sibling key (inside the selector, or after
+    /// `managementGroups:`); refusing those needs
+    /// document-level line accounting, tracked for the fail-closed follow-up on
+    /// #2123.
+    std::string malformed;
 };
 
 /// Parse the `spec.scope` block out of a full definition/policy `yaml_source`.
@@ -51,6 +61,16 @@ ScopeBlock parse_scope_block(const std::string& yaml_source);
 std::optional<std::string> validate_scope_block(const ScopeBlock& sb,
                                                 const std::string& assignment_mode,
                                                 bool assignment_has_mgmt_groups);
+
+/// Reject a management group reference that cannot be a group id. Group ids are
+/// server-generated (12 hex characters), so every real one is in the scope-token
+/// charset; anything outside it is a misspelling or a list item yaml_scan could
+/// not place (e.g. `[g1,` from an inline list that does not close on its line).
+/// Accepting such an id would store a group that matches nobody, and a non-empty
+/// group list REPLACES the scope in PolicyEvaluator::resolve_targets, so the
+/// policy would silently target zero devices, ignoring a valid selector
+/// (#2123 governance G4-UP-1 / G4-UP-2). Returns an error message, or nullopt.
+std::optional<std::string> validate_management_group_ids(const std::vector<std::string>& group_ids);
 
 /// Lower a (validated) ScopeBlock to a scope-engine expression string, AND-ing
 /// the parts: `from_result_set:<ref>`, `ostype == "<platform>"` (platform

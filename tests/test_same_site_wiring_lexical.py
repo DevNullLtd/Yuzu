@@ -26,10 +26,14 @@ stripped, whitespace collapsed) and checks:
      `return auth_routes_->audit_log_for_principal(...)` (none of `sizeof`, `decltype`,
      `noexcept`, `typeid`, `alignof` appears in it), and `#include "same_site_write_gate.hpp"` is
      present;
-  8. none of the step-up entry points (`run_pre_request_stage(`, `apply_step_up_chokepoint(`,
+  8. none of the step-up entry points (`run_post_read_stage(`, `apply_step_up_chokepoint(`,
      `run_in_handler_step_up(`, `require_mfa_step_up(`) occurs in the pre-routing lambda, and
-     `run_pre_request_stage(`, once it exists in the file, occurs exactly once, inside the
-     `set_pre_request_handler(` lambda;
+     `run_post_read_stage(`, once it exists in the file, occurs exactly once, inside the lambda
+     passed to the single `PostReadStageRegistry::instance().install(` call, which precedes the
+     first route registered on `*web_server_` (the route sink reads the stage at registration
+     time). server.cpp registers no `set_pre_request_handler(` at all: from cpp-httplib v0.47.0
+     httplib runs that handler BEFORE it reads the body, so the post-read stage cannot live
+     there;
   9. the only step-up token inside the pre-routing lambda is the single, OPTIONAL
      `clear_step_up_pass();` (spelled `detail::clear_step_up_pass();` once the step-up branch
      merges, placed beside the quota-slot reset at the top), and it sits before the first early
@@ -147,8 +151,13 @@ EARLY_UNHANDLED_CHAINS = [
     ['if (req.path == "/metrics")', 'if (!cfg_.metrics_require_auth)'],
 ]
 
-STEP_UP_ENTRY_POINTS = ("run_pre_request_stage(", "apply_step_up_chokepoint(",
+STEP_UP_ENTRY_POINTS = ("run_post_read_stage(", "apply_step_up_chokepoint(",
                         "run_in_handler_step_up(", "require_mfa_step_up(")
+STAGE_FN = "run_post_read_stage("
+STAGE_INSTALL = "PostReadStageRegistry::instance().install("
+# The first use of the web server as a route-registration target (`register_routes(*web_server_`,
+# `HttplibRouteSink sink{*web_server_}`). `web_server_.get()` and `web_server_->` are not one.
+WEB_SERVER_DEREF = "*web_server_"
 # The single step-up token the pre-routing lambda may carry. It appears only after the step-up
 # branch merges, so it is optional; if present it must sit before the first early Unhandled.
 STEP_UP_ALLOWED_TOKEN = "clear_step_up_pass();"
@@ -632,17 +641,36 @@ def problems(src):
     for name in STEP_UP_ENTRY_POINTS:
         if name in bb:
             out.append(f"{name} must not be called from the pre-routing lambda")
-    pre_request_calls = registrations(tb, "set_pre_request_handler")
-    stage_calls = occurrences(tb, "run_pre_request_stage(")
-    if stage_calls:
-        pr_body = lambda_body(t, "set_pre_request_handler", tb)
-        pr_blank = blank_literals(pr_body) if pr_body is not None else None
-        if len(pre_request_calls) != 1 or pr_body is None:
-            out.append("run_pre_request_stage( exists but set_pre_request_handler( is not "
-                       "registered exactly once")
-        elif len(stage_calls) != 1 or pr_blank.count("run_pre_request_stage(") != 1:
-            out.append("run_pre_request_stage( must occur exactly once in server.cpp, inside "
-                       "the set_pre_request_handler( lambda")
+    # From cpp-httplib v0.47.0 `set_pre_request_handler` runs BEFORE the body is read, so the
+    # post-read stage (body cap + step-up) lives in a route-sink wrapper, installed through
+    # `PostReadStageRegistry`. A pre-request handler registered here would silently run the stage's
+    # body-size check against an empty body on a newer httplib.
+    if registrations(tb, "set_pre_request_handler"):
+        out.append("server.cpp must not register set_pre_request_handler( : from cpp-httplib "
+                   "v0.47.0 it runs before the body is read; the post-read stage is installed "
+                   f"through {STAGE_INSTALL}")
+    stage_calls = occurrences(tb, STAGE_FN)
+    installs = occurrences(tb, STAGE_INSTALL)
+    if stage_calls or installs:
+        if len(installs) != 1:
+            out.append(f"{STAGE_INSTALL} must be called exactly once in server.cpp "
+                       f"(found {len(installs)})")
+        else:
+            at = installs[0]
+            st_body = lambda_body(t[at:], "install", tb[at:])
+            st_blank = blank_literals(st_body) if st_body is not None else None
+            if st_body is None:
+                out.append(f"{STAGE_INSTALL} is not passed a lambda")
+            elif len(stage_calls) != 1 or st_blank.count(STAGE_FN) != 1:
+                out.append(f"{STAGE_FN} must occur exactly once in server.cpp, inside the "
+                           f"{STAGE_INSTALL} lambda")
+            deref = occurrences(tb, WEB_SERVER_DEREF)
+            if deref and not at < deref[0]:
+                out.append(f"{STAGE_INSTALL} must precede the first route registered on "
+                           f"{WEB_SERVER_DEREF}: the sink looks the stage up at registration")
+    if not stage_calls:
+        out.append(f"{STAGE_FN} is not called from server.cpp: the post-read body cap and the "
+                   "MFA step-up chokepoint are not wired")
 
     # locals that could shadow what the gate call reads
     shadowed = local_declarations(bb, PINNED_LOCALS)

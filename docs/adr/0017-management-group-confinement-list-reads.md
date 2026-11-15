@@ -35,7 +35,7 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 > replacing it, which does not compose (`require_permission`'s RBAC branch never consults
 > `ManagementGroupStore`); the corrected wiring (`369643caf`) replaced both with the single
 > `require_list_read` gate this ADR anticipated. This landed independently of the PR-B…E
-> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/TAR) —
+> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/Echo) —
 > update that list's own status per-surface as each one actually switches, don't infer this
 > route's completion applies to any of them.
 
@@ -50,7 +50,7 @@ caller who holds the permission either **globally** (step 1, the global `check_p
 `management_group_roles` table). A single `agent_id` is available, so the scoped check can serve as
 the gate.
 
-For **list / fan-out** reads (responses, the device list, inventory, audit-log, DEX/TAR list
+For **list / fan-out** reads (responses, the device list, inventory, audit-log, DEX/Echo list
 surfaces) there is no single `agent_id` to gate on. These routes instead gate on the **global**
 `require_permission` / `perm_fn` (e.g. `dashboard_routes.cpp:203`, `rest_api_v1.cpp:3479`,
 `mcp_server.cpp:1217`, `server.cpp:5307`) and then — where a filter exists at all — drop out-of-scope
@@ -318,11 +318,25 @@ gate.
     alternative and are out of scope). It **MUST NOT** be left on the flipped gate, or it becomes an
     INV-3 cross-group count leak. The UI scope caveat is *not* the safeguard (it shows only to
     operators who already hold global read); this ADR entry is.
+  - **Update (2026-11-09, SAM-17):** the list routes `GET /api/v1/inventory/software` and
+    `GET /api/v1/inventory/software/components` return a `totals` block (install rows or
+    instances, distinct devices) that reads the same shape of fleet-wide aggregate. It is served
+    **only** when the gate admitted the caller unfiltered (`ListReadDecision::AdmitAll`, an
+    unfiltered `FleetReadGate` scope) **and** the request is an exact-name lookup with at most one
+    version filter. A confined caller (`AdmitScoped`) gets its scoped rows and `totals: null` with
+    `totals_omitted: "scope"`; distinct counts are not additive across groups, so no confined
+    total can be derived from a fleet one. `null` documents "not shown", never zero. The
+    components figures come from a new fleet-wide rollup (`component_rollup`) that falls under
+    the same rule. For the same reason the `version_min` / `version_max` range is resolved
+    over the caller's own scope (the gate's `VisibleSet` pushed into the distinct-version read,
+    an unfiltered caller reading the fleet): a fleet-wide cut would make the range refusal a
+    fact about devices the caller cannot see, so a confined caller is answered for a title with
+    2000 versions outside its scope exactly as for an unknown title (ADR-0016 "Version range").
 - **Audit-log** — `AuditLog:Read` reads (`server.cpp:5848`); audit rows carry `agent_id`, so a
   confined auditor must see only in-scope events. (Classified here per Gate-2/Gate-3 review; it is
   also a no-per-agent-filter reader, so it is in the fail-closed ship-now fix below.)
-- **DEX / TAR list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
-  `dex_routes.hpp:311`) + remaining TAR/dashboard list fragments.
+- **DEX / Echo list surfaces** — the DEX `VisibleSetFn` seam (`server.cpp:7888` def, `:8386` wiring,
+  `dex_routes.hpp:311`) + remaining Echo/dashboard list fragments.
   - **Update (2026-09-28, WS-A4 PR-1):** `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/app`, and `GET
     /api/v1/dex/overview` (REST + MCP) stay pinned to a GLOBAL-only `GuaranteedState:Read` permission
     check — the same bare gate they had before this PR, never migrated onto `require_fleet_read`.
@@ -368,7 +382,7 @@ definitive-out-of-scope) is exactly how a per-agent reader hides forever (audit-
 Two corrections are needed whether A or B is chosen and should ship independently of the gate work:
 
 - **Doc honesty.** The docs/comments that *claim* effective list-view scoping today are false-as-
-  shipped: `docs/user-manual/tar.md:302` ("scoped to your management-group visibility"), the
+  shipped: `docs/user-manual/echo.md:302` ("scoped to your management-group visibility"), the
   inventory/MCP "out-of-scope devices omitted" strings (`mcp_server.cpp:255/1436`,
   `mcp_server.hpp:96`, `rest_api_v1.cpp:3235`, `rest_api_v1.hpp:116/129`, `docs/user-manual/inventory.md:106/141`,
   `docs/rest-api.md:2659`, `docs/mcp-server.md:45`). **Highest priority:**
@@ -516,7 +530,7 @@ ahead of PR-A.)
    + json — consider splitting REST vs dashboard.
 4. **PR-D — inventory.** `query_installed_software` + `GET /api/v1/inventory/software` —
    **DONE (#3290)**. The `/software` devices expansion (`/fragments/inventory/software/devices`) is **DONE** (M.9 PR-3, see above).
-5. **PR-E — DEX / TAR / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
+5. **PR-E — DEX / Echo / audit-log.** The DEX `VisibleSetFn` seam + remaining dashboard fragments +
    the `AuditLog:Read` surface.
 
 Gate-independent, shippable now (not on this ladder): the doc corrections + the ADR-0016 Update note,

@@ -293,7 +293,7 @@ std::string render_deploy_results(const DeploymentRow& dep,
          "g.querySelectorAll('.af-grp').forEach(function(gr){var gb=gr.getAttribute('data-bucket');"
          "var s=(P.b==='all'||P.b===gb);gr.style.display=s?'':'none';if(s)vis=true;});"
          "g.querySelectorAll('.dp-kpi[data-b]').forEach(function(k){k.classList.toggle('sel',k.getAttribute('data-b')===P.b);});"
-         "var e=g.querySelector('.af-empty');if(e)e.style.display=vis?'none':'';};"
+         "var e=g.querySelector('.af-empty');if(e)e.style.display=vis?'none':'block';};"
          "window.dpApply();})();</script>";
 
     h += "</div>";

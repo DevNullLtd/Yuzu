@@ -476,6 +476,15 @@ Decision numbers are stable, since other documents cite them.
     `CertificateInventoryStore` (schema `certificate_inventory_store`, the fleet certificate inventory of
     ADR-0070 D12) joined, and its `delete_agent` erases its rows in one transaction. Its read securable,
     `CertificateInventory`, arrives in PR 2a-2b.)*
+    *(Update 2026-11-09, #5675: the cascade now covers **nine** stores. `GuaranteedStateStore` (schema
+    `guaranteed_state_store`, public key `guaranteed_state`) joined: its `delete_agent` erases the device's
+    compliance-census rows (`guardian_agent_rule_status`) and retires its pending census evidence in one
+    transaction, so a decommissioned agent stops counting in `errored_rules` and `uncertain_rules`. Its
+    read securable is `GuaranteedState:Read`, which makes it the second `GuaranteedState`-governed member
+    after `AppPerfDailyStore`. The Guardian event log and DEX observations are NOT erased by this
+    decommission; they are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Widening the erasure to them is a separate follow-up (#7531) that needs an
+    ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
+    A still-running agent re-creates its census row on its next census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), so stop the agent first.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`
@@ -538,7 +547,7 @@ Decision numbers are stable, since other documents cite them.
     reclamation verdicts (categories, candidates, coverage) join usage with entitlement
     data for a purpose, so they are UCE interpretation. The **usage collection** half — an
     opt-in (`--usage-sync-enable`, default off) machine-scope daily-sync source reading
-    the agent's TAR warehouse locally through the plugin's sandboxed read-only `sql`
+    the agent's Echo warehouse locally through the plugin's sandboxed read-only `sql`
     action, user dimension dropped on-device — is agent-side fact collection and, if/when
     it ships, ships in-server as **mechanism only**; it is out of §27 v1. Recorded as
     module design input: usage **categories** (Used ≤30 d, Rarely 31–90 d, Unused >90 d,
@@ -547,7 +556,7 @@ Decision numbers are stable, since other documents cite them.
     lead with usage coverage and render zero coverage as explicit guidance, never as
     "nothing to reclaim". **Product tags on `ProductRegistryStore` stay core** (they drive
     tag-based views and time-boxed management-group rules). *Rejected: routing
-    licence/usage data through TAR as a transport — usage reads TAR locally and pushes via
+    licence/usage data through Echo as a transport — usage reads Echo locally and pushes via
     daily-sync.*
 
 16. **Out of scope.** Yuzu's own product-licence machinery (`LicenseStore`, the

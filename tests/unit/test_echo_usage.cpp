@@ -1,0 +1,701 @@
+/**
+ * test_echo_usage.cpp -- Unit tests for the `usage` derived fold (Wave 7
+ * PR7.2b): the pure pairing/fold logic (echo_usage.hpp) and the
+ * checked_transaction-based lifecycle + fold (echo_usage.cpp).
+ *
+ * DB-backed cases follow test_echo_store.cpp's TestEchoDb pattern. The
+ * fault-injection cases reuse the SAME RAISE(ABORT)/RAISE(ROLLBACK) trigger
+ * idiom test_echo_store.cpp's checked_transaction tests established for
+ * commit 1's primitive -- this file's whole point is proving the fold built
+ * on that primitive inherits its atomicity, so it uses the identical
+ * technique rather than inventing a second one.
+ */
+
+#include "echo_usage.hpp"
+#include "echo_aggregator.hpp" // source_enabled
+#include "test_helpers.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <filesystem>
+#include <format>
+#include <string>
+#include <vector>
+
+namespace fs = std::filesystem;
+using namespace yuzu::echo;
+using namespace yuzu::echo::usage;
+
+namespace {
+
+struct TestEchoDb {
+    EchoDatabase db;
+    fs::path path;
+
+    ~TestEchoDb() {
+        { EchoDatabase discard = std::move(db); }
+        std::error_code ec;
+        fs::remove(path, ec);
+        fs::remove(fs::path{path.string() + "-wal"}, ec);
+        fs::remove(fs::path{path.string() + "-shm"}, ec);
+        fs::remove(fs::path{path.string() + "-journal"}, ec); // pre-created empty on Windows
+    }
+};
+
+TestEchoDb make_test_db() {
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_usage_");
+    auto result = EchoDatabase::open(tmp);
+    REQUIRE(result.has_value());
+    return TestEchoDb{std::move(*result), tmp};
+}
+
+int64_t count_rows(EchoDatabase& db, const std::string& table) {
+    auto r = db.execute_query("SELECT COUNT(*) FROM " + table);
+    REQUIRE(r.has_value());
+    return std::stoll(r->rows[0][0]);
+}
+
+std::string cfg(EchoDatabase& db, const char* key, const char* def = "") {
+    return db.get_config(key, def);
+}
+
+// A started/stopped pair for `exe`: a distinct pid, running from `start` to `stop` (stop < 0:
+// started only, the run stays open).
+std::vector<ProcessEvent> process_pair(uint32_t pid, const std::string& exe, int64_t start,
+                                       int64_t stop, const std::string& user = "alice") {
+    std::vector<ProcessEvent> out;
+    ProcessEvent started;
+    started.ts = start;
+    started.snapshot_id = 1;
+    started.action = "started";
+    started.pid = pid;
+    started.name = exe;
+    started.user = user;
+    out.push_back(started);
+    if (stop >= 0) {
+        ProcessEvent stopped = started;
+        stopped.ts = stop;
+        stopped.action = "stopped";
+        out.push_back(stopped);
+    }
+    return out;
+}
+
+// One tick's events folded the production way: the process tiers AND the usage fold, in the one
+// transaction, with the tick's clock injected.
+bool fold_tick(EchoDatabase& db, const std::vector<ProcessEvent>& events, int64_t now) {
+    return db.fold_process_events(events, std::nullopt, now);
+}
+
+std::vector<ProcessEvent> concat(std::vector<ProcessEvent> a, const std::vector<ProcessEvent>& b) {
+    a.insert(a.end(), b.begin(), b.end());
+    return a;
+}
+
+// An open run written straight into usage_live (what an earlier tick would have left), for the
+// sweep cases that need a run older than the events a fold would produce.
+void seed_open_run(EchoDatabase& db, uint32_t pid, const std::string& exe, int64_t start) {
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) VALUES "
+        "({0},0,'open',{1},'{2}','alice',{0})",
+        start, pid, exe)));
+}
+
+} // namespace
+
+// =============================================================================
+// Pure logic: apply_event, expire_open_runs, cap_open_runs, fold_daily
+// =============================================================================
+
+TEST_CASE("usage: apply_event pairs started/stopped into a normal closed run",
+          "[echo][usage][pure]") {
+    FoldState state;
+    ProcessEvent start;
+    start.ts = 1000;
+    start.action = "started";
+    start.pid = 1;
+    start.name = "a.exe";
+    start.user = "alice";
+    CHECK_FALSE(apply_event(state, start).has_value());
+    CHECK(state.open.size() == 1);
+
+    ProcessEvent stop = start;
+    stop.ts = 1100;
+    stop.action = "stopped";
+    auto closed = apply_event(state, stop);
+    REQUIRE(closed.has_value());
+    CHECK(closed->kind == ClosedRun::Kind::normal);
+    CHECK(closed->start_ts == 1000);
+    CHECK(closed->end_ts == 1100);
+    CHECK(state.open.empty());
+    CHECK(state.unmatched_stops == 0);
+}
+
+TEST_CASE("usage: apply_event closes an unmatched stop with no state change",
+          "[echo][usage][pure]") {
+    FoldState state;
+    ProcessEvent stop;
+    stop.ts = 1000;
+    stop.action = "stopped";
+    stop.pid = 1;
+    stop.name = "a.exe";
+    CHECK_FALSE(apply_event(state, stop).has_value());
+    CHECK(state.unmatched_stops == 1);
+    CHECK(state.open.empty());
+}
+
+TEST_CASE("usage: apply_event supersedes a stale open run on a second started, clamping a "
+          "backward clock step to 0s",
+          "[echo][usage][pure]") {
+    FoldState state;
+    ProcessEvent start1;
+    start1.ts = 1000;
+    start1.action = "started";
+    start1.pid = 1;
+    start1.name = "a.exe";
+    apply_event(state, start1);
+
+    ProcessEvent start2 = start1;
+    start2.ts = 500; // BEFORE start1's ts -- backward clock step
+    auto superseded = apply_event(state, start2);
+    REQUIRE(superseded.has_value());
+    CHECK(superseded->kind == ClosedRun::Kind::superseded);
+    CHECK(superseded->end_ts == superseded->start_ts); // clamped to 0s, not negative
+    CHECK(state.clock_anomalies == 1);
+    CHECK(state.open.size() == 1); // the NEW run is open
+}
+
+TEST_CASE("usage: expire_open_runs closes runs older than max_age as `expired`, 0s duration",
+          "[echo][usage][pure]") {
+    FoldState state;
+    ProcessEvent start;
+    start.ts = 0;
+    start.action = "started";
+    start.pid = 1;
+    start.name = "a.exe";
+    apply_event(state, start);
+
+    auto closed = expire_open_runs(state, /*now=*/1'000'000, /*max_age=*/604800);
+    REQUIRE(closed.size() == 1);
+    CHECK(closed[0].kind == ClosedRun::Kind::expired);
+    CHECK(closed[0].end_ts == closed[0].start_ts);
+    CHECK(state.open.empty());
+}
+
+TEST_CASE("usage: cap_open_runs evicts the OLDEST run first, correctly, past the refactor to "
+          "an ordered secondary index (issue #4253)",
+          "[echo][usage][pure]") {
+    // The pure regression this pins: cap_open_runs used to do a full O(N)
+    // linear scan of `open` per eviction to find the minimum start_ts.
+    // insert_open_run/erase_open_run now maintain a `open_by_start_ts`
+    // secondary index instead -- this test proves that index stays correct
+    // (evicts in the right ORDER), not just that eviction happens.
+    FoldState state;
+    for (uint32_t pid = 1; pid <= 5; ++pid) {
+        OpenRun run;
+        run.pid = pid;
+        run.exe_key = "a.exe";
+        run.user = "u";
+        run.start_ts = static_cast<int64_t>(pid) * 100; // pid 1 is oldest
+        insert_open_run(state, {run.pid, run.exe_key + std::to_string(pid)}, run);
+    }
+    REQUIRE(state.open.size() == 5);
+
+    auto closed = cap_open_runs(state, /*max_open=*/2);
+    REQUIRE(closed.size() == 3);
+    // Evicted oldest-first: pid 1 (ts=100), pid 2 (ts=200), pid 3 (ts=300).
+    CHECK(closed[0].start_ts == 100);
+    CHECK(closed[1].start_ts == 200);
+    CHECK(closed[2].start_ts == 300);
+    for (const auto& c : closed)
+        CHECK(c.kind == ClosedRun::Kind::capped);
+    CHECK(state.open.size() == 2);
+    // The two SURVIVORS must be the two newest (pid 4, pid 5) -- proves
+    // open_by_start_ts and open never desynchronised across three evictions.
+    REQUIRE(state.open_by_start_ts.size() == 2);
+    CHECK(state.open_by_start_ts.begin()->first == 400);
+}
+
+TEST_CASE("usage: fold_daily aggregates run_count/total_seconds by (day_ts, exe_key), buckets "
+          "expired+capped together, superseded separately",
+          "[echo][usage][pure]") {
+    std::vector<ClosedRun> runs;
+    ClosedRun a;
+    a.pid = 1;
+    a.exe_key = "app.exe";
+    a.user = "u";
+    a.start_ts = 1000;
+    a.end_ts = 1100;
+    a.kind = ClosedRun::Kind::normal;
+    ClosedRun b = a;
+    b.pid = 2;
+    b.start_ts = 2000;
+    b.end_ts = 2050;
+    b.kind = ClosedRun::Kind::expired;
+    ClosedRun c = a;
+    c.pid = 3;
+    c.start_ts = 3000;
+    c.end_ts = 3000;
+    c.kind = ClosedRun::Kind::capped;
+    ClosedRun d = a;
+    d.pid = 4;
+    d.start_ts = 4000;
+    d.end_ts = 4010;
+    d.kind = ClosedRun::Kind::superseded;
+
+    auto deltas = fold_daily({a, b, c, d});
+    REQUIRE(deltas.size() == 1); // same day, same exe_key
+    const auto& delta = deltas[0];
+    CHECK(delta.run_count == 4);
+    CHECK(delta.total_seconds == 100 + 50 + 0 + 10);
+    CHECK(delta.expired_runs == 2);   // b (expired) + c (capped)
+    CHECK(delta.superseded_runs == 1); // d
+}
+
+TEST_CASE("usage: fold_daily saturates instead of overflowing on an extreme start_ts, and a "
+          "SECOND extreme run in the same bucket saturates the accumulator too",
+          "[echo][usage][pure]") {
+    // Governance Gate 3 cpp-expert finding: apply_event's clamp guarantees
+    // end_ts >= start_ts (mathematical non-negativity), not int64_t
+    // representability -- a corrupt/adversarial process_live row with
+    // start_ts near INT64_MIN still overflowed the plain subtraction this
+    // file's own saturating_sub was added to prevent, at exactly the one
+    // call site that hardening pass missed.
+    ClosedRun extreme;
+    extreme.pid = 1;
+    extreme.exe_key = "corrupt.exe";
+    extreme.user = "u";
+    extreme.start_ts = std::numeric_limits<int64_t>::min() + 100;
+    extreme.end_ts = 1000; // ordinary epoch second -- duration is ~INT64_MAX
+    extreme.kind = ClosedRun::Kind::normal;
+
+    auto deltas = fold_daily({extreme});
+    REQUIRE(deltas.size() == 1);
+    CHECK(deltas[0].total_seconds == std::numeric_limits<int64_t>::max()); // saturated, not UB
+
+    // A second extreme run in the SAME (day_ts, exe_key) bucket: without its
+    // own saturating accumulation, `total_seconds += duration` would overflow
+    // AGAIN even though the first duration was already clamped to max().
+    ClosedRun extreme2 = extreme;
+    extreme2.pid = 2;
+    auto deltas2 = fold_daily({extreme, extreme2});
+    REQUIRE(deltas2.size() == 1);
+    CHECK(deltas2[0].total_seconds == std::numeric_limits<int64_t>::max()); // still saturated
+    CHECK(deltas2[0].run_count == 2); // both runs still counted, only the sum saturates
+}
+
+// =============================================================================
+// Lifecycle: usage_lifecycle_state, usage_set_enabled, usage_ensure_baselined
+// =============================================================================
+
+TEST_CASE("usage: lifecycle is Disabled when usage_enabled is not true", "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.set_config("usage_enabled", "false"));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Disabled);
+}
+
+TEST_CASE("usage: lifecycle is PendingBaseline on a fresh DB -- enabled by default, never "
+          "baselined",
+          "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    // usage_enabled absent -> default_enabled=true (registry) -> enabled.
+    // usage_generation/usage_active_generation both absent -> mismatch.
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+}
+
+TEST_CASE("usage: usage_ensure_baselined moves PendingBaseline to Active and stamps the "
+          "matching generation",
+          "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+
+    auto result = usage_ensure_baselined(t.db, /*now=*/5000);
+    REQUIRE(result.has_value());
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active);
+    CHECK(cfg(t.db, "usage_coverage_since") == "5000");
+    CHECK(cfg(t.db, "usage_hwm_id", "absent") == "absent"); // event-fed: there is no cursor to stamp
+}
+
+TEST_CASE("usage: usage_ensure_baselined is a no-op once already Active", "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 5000).has_value());
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts,snapshot_id,action,pid,exe_key,user,start_ts) VALUES "
+        "(1,0,'open',1,'a.exe','u',1)"));
+
+    auto result = usage_ensure_baselined(t.db, /*now=*/6000);
+    REQUIRE(result.has_value());
+    CHECK(cfg(t.db, "usage_coverage_since") == "5000"); // UNCHANGED -- no-op, not a re-baseline
+    CHECK(count_rows(t.db, "usage_live") == 1);         // the open run survives -- no-op proved
+}
+
+TEST_CASE("usage: usage_ensure_baselined is a no-op while Disabled", "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.set_config("usage_enabled", "false"));
+    auto result = usage_ensure_baselined(t.db, 5000);
+    REQUIRE(result.has_value()); // {} = "nothing to do", not a failure
+    CHECK(cfg(t.db, "usage_coverage_since").empty());
+}
+
+TEST_CASE("usage: usage_set_enabled(false) bumps the generation, forcing PendingBaseline on "
+          "the next enable -- forward-only across a pause",
+          "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    REQUIRE(usage_lifecycle_state(t.db) == LifecycleState::Active);
+
+    REQUIRE(usage_set_enabled(t.db, /*enabled=*/false, /*now=*/2000));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Disabled);
+
+    REQUIRE(usage_set_enabled(t.db, /*enabled=*/true, /*now=*/3000));
+    // The KEY property: re-enabling does NOT resume Active on the stale
+    // baseline -- the generation bump on disable means it must re-baseline.
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+
+    REQUIRE(usage_ensure_baselined(t.db, 3000).has_value());
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active);
+    CHECK(cfg(t.db, "usage_coverage_since") == "3000"); // re-baselined from the RE-enable time
+}
+
+TEST_CASE("usage: usage_set_enabled(true) is idempotent for an already-true source -- no "
+          "spurious generation bump",
+          "[echo][usage][lifecycle]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    REQUIRE(usage_lifecycle_state(t.db) == LifecycleState::Active);
+    const auto gen_before = cfg(t.db, "usage_generation");
+
+    // A direct usage_set_enabled(true) call -- unlike
+    // apply_source_enabled_transition's idempotent-reassert shortcut, this
+    // function itself always bumps. Callers (apply_source_enabled_transition)
+    // are responsible for the idempotent-reassert check; this test pins that
+    // usage_set_enabled alone, called twice with the same value, still
+    // reaches Active again after each re-baseline (the caller-level
+    // idempotence is covered in test_echo_aggregator.cpp).
+    REQUIRE(usage_set_enabled(t.db, true, 1500));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::PendingBaseline);
+    CHECK(cfg(t.db, "usage_generation") != gen_before);
+}
+
+// =============================================================================
+// Fold: usage_fold_in on the process fold's transaction -- atomicity, daily/user upsert
+// =============================================================================
+
+TEST_CASE("usage: the sweep does nothing (ok=true) while usage or process is disabled",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.set_config("usage_enabled", "false"));
+    auto result = usage_sweep(t.db, 1000);
+    CHECK(result.has_value());
+    CHECK(cfg(t.db, "usage_feeder_enabled") == "false");
+    CHECK(count_rows(t.db, "usage_live") == 0);
+}
+
+TEST_CASE("usage: the fold stamps a baseline on the first tick and folds nothing and "
+          "then folds forward from it and never retrospectively",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    // Events exist BEFORE the fold ever ran -- forward-only must not fold them into usage.
+    REQUIRE(fold_tick(t.db, process_pair(1, "pre.exe", 100, 200), /*now=*/1000));
+    CHECK(usage_lifecycle_state(t.db) == LifecycleState::Active); // the baseline was stamped...
+    CHECK(count_rows(t.db, "usage_daily") == 0);                   // ...and folded nothing this tick
+    CHECK(count_rows(t.db, "process_hourly") == 1);                // the process tiers took them
+
+    // Events after the baseline are the ones that fold.
+    REQUIRE(fold_tick(t.db, process_pair(2, "post.exe", 2000, 2100), /*now=*/3000));
+    auto rows = t.db.execute_query("SELECT exe_key, run_count FROM usage_daily");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->rows.size() == 1);
+    CHECK(rows->rows[0][0] == "post.exe"); // pre.exe never appears -- not retrospectively folded
+    CHECK(rows->rows[0][1] == "1");
+}
+
+TEST_CASE("usage: the tick's process tiers and usage rows commit together",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    REQUIRE(fold_tick(t.db, process_pair(1, "a.exe", 2000, 2100), 3000));
+    CHECK(count_rows(t.db, "process_hourly") == 1);
+    CHECK(count_rows(t.db, "usage_daily") == 1);
+    auto row = t.db.execute_query("SELECT run_count, total_seconds FROM usage_daily");
+    REQUIRE(row.has_value());
+    CHECK(row->rows[0][0] == "1");
+    CHECK(row->rows[0][1] == "100");
+}
+
+TEST_CASE("usage: a fault on usage_daily_user mid-fold commits NOTHING -- not "
+          "usage_daily and not usage_live and not the process tiers",
+          "[echo][usage][fold]") {
+    // The central regression this whole rewrite exists for (round 1 Blocker 1 / round 2's
+    // residual): a partial commit must be structurally impossible, not merely reduced. Fault the
+    // LAST table the fold writes (usage_daily_user) and prove the FIRST (usage_daily) is not
+    // durable either -- and, since the usage fold now rides the process fold's transaction, that
+    // the PROCESS tiers did not commit without it: a retried tick re-offers the same events to
+    // both, and a half-committed first attempt would count them twice in one of the two.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    const auto events = process_pair(1, "a.exe", 2000, 2100);
+
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_udu BEFORE INSERT ON usage_daily_user "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    CHECK_FALSE(fold_tick(t.db, events, /*now=*/3000));
+    CHECK(count_rows(t.db, "usage_daily") == 0);     // NOT durable, despite running first
+    CHECK(count_rows(t.db, "usage_live") == 0);      // NOT durable either
+    CHECK(count_rows(t.db, "process_hourly") == 0);  // the process tiers rolled back with it
+
+    REQUIRE(t.db.execute_sql("DROP TRIGGER block_udu"));
+    REQUIRE(fold_tick(t.db, events, /*now=*/3001)); // the same events, offered again
+    CHECK(count_rows(t.db, "usage_daily") == 1);
+    // exactly once in BOTH folds: one start, one stop in the process tier; one run in usage
+    auto proc = t.db.execute_query("SELECT start_count, stop_count FROM process_hourly");
+    REQUIRE(proc.has_value());
+    REQUIRE(proc->rows.size() == 1);
+    CHECK(proc->rows[0][0] == "1");
+    CHECK(proc->rows[0][1] == "1");
+    auto run = t.db.execute_query("SELECT run_count, total_seconds FROM usage_daily");
+    REQUIRE(run.has_value());
+    CHECK(run->rows[0][0] == "1");   // not 2: applied exactly once on retry
+    CHECK(run->rows[0][1] == "100"); // not 200
+}
+
+TEST_CASE("usage: a fault on usage_daily mid-fold also rolls back usage_live -- no per-table "
+          "tolerant segment survived the rewrite",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ud BEFORE INSERT ON usage_daily "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    // A run that starts and stops inside one tick closes in the same fold, so the daily upsert
+    // (blocked) and the usage_live delete share the transaction.
+    CHECK_FALSE(fold_tick(t.db, process_pair(1, "a.exe", 2000, 2100), 3000));
+    CHECK(count_rows(t.db, "usage_live") == 0); // the run's close never persisted either
+    CHECK(count_rows(t.db, "process_hourly") == 0);
+}
+
+TEST_CASE("usage: a fault in the process upsert leaves usage_live and usage_daily unchanged",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 9, "open.exe", 1500); // a run an earlier tick left open
+
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_proc BEFORE INSERT ON process_hourly_r "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    // The stop of the open run would close it and write usage_daily -- if the process fold were
+    // not in the same transaction, usage would be ahead of the process tiers.
+    ProcessEvent stop;
+    stop.ts = 2000;
+    stop.action = "stopped";
+    stop.pid = 9;
+    stop.name = "open.exe";
+    stop.user = "alice";
+    CHECK_FALSE(fold_tick(t.db, {stop}, 3000));
+    CHECK(count_rows(t.db, "usage_live") == 1);  // the run is still open
+    CHECK(count_rows(t.db, "usage_daily") == 0); // and nothing was counted
+
+    REQUIRE(t.db.execute_sql("DROP TRIGGER block_proc"));
+    REQUIRE(fold_tick(t.db, {stop}, 3001));
+    CHECK(count_rows(t.db, "usage_live") == 0);
+    CHECK(count_rows(t.db, "usage_daily") == 1);
+}
+
+TEST_CASE("usage: usage_daily_user records distinct usernames per (day, exe) and usage_daily's "
+          "distinct_users column matches",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    auto events = process_pair(1, "shared.exe", 2000, 2100, "alice");
+    events = concat(events, process_pair(2, "shared.exe", 2100, 2200, "bob"));
+    events = concat(events, process_pair(3, "shared.exe", 2200, 2300, "alice")); // repeat user, same day
+
+    REQUIRE(fold_tick(t.db, events, /*now=*/3000));
+    CHECK(count_rows(t.db, "usage_daily_user") == 2); // alice, bob -- deduped
+    auto distinct = t.db.execute_query("SELECT distinct_users, run_count FROM usage_daily WHERE "
+                                       "exe_key = 'shared.exe'");
+    REQUIRE(distinct.has_value());
+    REQUIRE(distinct->rows.size() == 1);
+    CHECK(distinct->rows[0][0] == "2");
+    CHECK(distinct->rows[0][1] == "3");
+}
+
+TEST_CASE("usage: a rollback leaves the connection usable and the same events fold exactly "
+          "once on retry",
+          "[echo][usage][fold]") {
+    // Mutation-style proof that checked_transaction's atomicity is what makes a plain additive
+    // upsert safe under retry: if a partial commit survived, a naive additive re-application on
+    // retry would double-count. It does not, because nothing commits on failure.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    const auto events = process_pair(1, "a.exe", 2000, 2100);
+
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ud2 BEFORE INSERT ON usage_daily "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    REQUIRE_FALSE(fold_tick(t.db, events, 3000));
+    CHECK(t.db.is_open()); // statement-preserving fault -- store stays usable
+
+    REQUIRE(t.db.execute_sql("DROP TRIGGER block_ud2"));
+    REQUIRE(fold_tick(t.db, events, 3001));
+
+    auto row = t.db.execute_query("SELECT run_count, total_seconds FROM usage_daily WHERE "
+                                  "exe_key = 'a.exe'");
+    REQUIRE(row.has_value());
+    REQUIRE(row->rows.size() == 1);
+    CHECK(row->rows[0][0] == "1");   // run_count == 1, not 2 -- applied exactly once
+    CHECK(row->rows[0][1] == "100"); // total_seconds == 100, not 200
+}
+
+TEST_CASE("usage: the fold has no cursor -- no hwm or lag or gap machinery is written",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(fold_tick(t.db, process_pair(1, "a.exe", 100, 200), 1000));
+    REQUIRE(fold_tick(t.db, process_pair(2, "a.exe", 2000, 2100), 3000));
+    CHECK(cfg(t.db, "usage_hwm_id", "absent") == "absent");
+    CHECK(cfg(t.db, "usage_lag_events", "absent") == "absent");
+    CHECK(cfg(t.db, "usage_gap_count", "absent") == "absent");
+}
+
+// =============================================================================
+// Adversarial review Wave 7 PR7.2b fix round 1: clock-guard anchor tri-state / re-anchoring
+// (Blocker 2). The sweep is the event-less form of the same fold, so these drive usage_sweep.
+// =============================================================================
+
+TEST_CASE("usage: expire sweep declines on a genuinely-absent anchor (first fold after "
+          "baseline) rather than proceeding",
+          "[echo][usage][fold]") {
+    // Before the fix, read_config_i64_locked's "0 on any fault OR absence" return let an absent
+    // usage_last_fold_ts read as clock_plausible=true, inverting Echo's own
+    // no-stored-reading-is-a-decline-trigger convention. Seed a run already older than max_age
+    // so a wrongly-proceeding sweep would expire it on this very first fold.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 1, "old.exe", 1000); // stays open
+
+    auto result = usage_sweep(t.db, /*now=*/1000 + yuzu::echo::usage::kDefaultMaxAgeSeconds + 1);
+    REQUIRE(result.has_value());
+    CHECK(count_rows(t.db, "usage_live") == 1); // the run is still open: the sweep declined
+}
+
+TEST_CASE("usage: expire sweep declines when the anchor read fails, and still advances the "
+          "anchor for the next tick",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.set_config("usage_last_fold_ts", "not_a_number")); // malformed -- read fails
+
+    auto result = usage_sweep(t.db, /*now=*/1000 + yuzu::echo::usage::kDefaultMaxAgeSeconds + 1);
+    REQUIRE(result.has_value()); // the read/parse failure declines the SWEEP only, not the whole fold
+    CHECK(count_rows(t.db, "usage_live") == 1);
+    CHECK(cfg(t.db, "usage_last_fold_ts") ==
+          std::to_string(1000 + yuzu::echo::usage::kDefaultMaxAgeSeconds + 1)); // re-anchored
+}
+
+TEST_CASE("usage: a declined tick DOES advance the anchor, so an ordinary sleep/wake gap "
+          "self-heals within ~2 ticks instead of freezing the guard forever",
+          "[echo][usage][fold]") {
+    // Wave 7 PR7.2b fix round 2, correcting fix round 1's own overcorrection (governance Gate 4
+    // happy-path finding): fix round 1 made usage_last_fold_ts advance ONLY on a plausible tick.
+    // Since this key has exactly one writer, ANY single declined tick froze the anchor
+    // permanently -- every later tick compared against the same stale value, the gap only grew,
+    // and the guard declined forever. An ordinary laptop closed over a weekend hit this on the
+    // very first wake tick. This test proves the corrected behavior: the anchor advances even
+    // on a declined tick, so the NEXT tick (a normal small gap relative to the just-advanced
+    // anchor) looks plausible again and the sweep resumes.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 1, "old.exe", 1500); // stays open across every tick below
+
+    // Tick 1: establishes a real anchor at now=2000 (small gap, plausible).
+    REQUIRE(usage_sweep(t.db, /*now=*/2000).has_value());
+    CHECK(cfg(t.db, "usage_last_fold_ts") == "2000");
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == ""); // never written -- no decline yet
+
+    // Tick 2: a huge forward clock jump (device slept > kMaxPlausibleFoldGapSeconds = 86400s) --
+    // must decline THIS tick's sweep (the run must not be wrongly force-closed against an
+    // untrustworthy `now`) but the anchor MUST still advance, and the decline must be counted.
+    const int64_t wake_now = 2000 + 700000; // > 8 days "asleep"
+    REQUIRE(usage_sweep(t.db, wake_now).has_value());
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(wake_now)); // advanced -- the fix
+    CHECK(count_rows(t.db, "usage_live") == 1); // the run is still open, not wrongly expired
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
+
+    // Tick 3: a normal small gap (500s) relative to tick 2's just-advanced anchor -- must be
+    // judged plausible and resume the sweep. The run (started at ts=1500) is now genuinely
+    // older than kDefaultMaxAgeSeconds (7 days) measured against the real clock, so a
+    // correctly-healed guard expires it; a still-frozen guard (the round-1 bug) would keep
+    // declining forever and this run would never expire.
+    const int64_t healed_now = wake_now + 500;
+    REQUIRE(usage_sweep(t.db, healed_now).has_value());
+    REQUIRE(healed_now - 1500 > yuzu::echo::usage::kDefaultMaxAgeSeconds); // sanity: old enough
+    CHECK(count_rows(t.db, "usage_live") == 0); // expired -- the guard self-healed
+    CHECK(cfg(t.db, "usage_last_fold_ts") == std::to_string(healed_now));
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == "1"); // unchanged -- tick 3 didn't decline
+}
+
+TEST_CASE("usage: a sustained bad clock still declines on its OWN first implausible tick",
+          "[echo][usage][fold]") {
+    // Unconditional anchor advancement (the fix above) does not weaken the guard's per-tick
+    // decision -- it only stops a single decline from becoming permanent. A clock that is wrong
+    // on tick N is still correctly declined on tick N, every time it happens. This does NOT
+    // prove protection against a SUSTAINED bad clock across multiple ticks -- per the design
+    // comment above the anchor read, no local heuristic can distinguish a one-off skip from a
+    // clock that stays wrong and self-consistent, so a smoothly-incrementing bad clock is
+    // laundered into trust after exactly one decline (governance Gate 8 security-guardian
+    // re-review finding, LOW).
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 1, "old.exe", 1500);
+
+    REQUIRE(usage_sweep(t.db, /*now=*/2000).has_value());
+
+    // A backward clock step is exactly as implausible as a huge forward one.
+    REQUIRE(usage_sweep(t.db, /*now=*/1500).has_value());
+    CHECK(count_rows(t.db, "usage_live") == 1); // declined -- not wrongly force-closed
+    CHECK(cfg(t.db, "usage_expiry_declined_count") == "1");
+}
+
+TEST_CASE("usage: a malformed usage_generation fails the whole fold instead of re-baselining",
+          "[echo][usage][fold]") {
+    // The lenient 0-on-fault read let a damaged generation read as a mismatch, and the fold then
+    // stamped a fresh baseline: DELETE FROM usage_live over a read fault. Now the read is strict
+    // and the transaction (process tiers included) rolls back.
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    seed_open_run(t.db, 1, "old.exe", 1000);
+    REQUIRE(t.db.set_config("usage_generation", "not_a_number"));
+
+    CHECK_FALSE(fold_tick(t.db, process_pair(2, "new.exe", 2000, 2100), 2100));
+    CHECK(count_rows(t.db, "usage_live") == 1);    // the open run survived
+    CHECK(count_rows(t.db, "usage_daily") == 0);
+    CHECK(count_rows(t.db, "process_hourly") == 0); // and the process half rolled back with it
+    CHECK(t.db.is_open());
+}
+
+TEST_CASE("usage: an exe or user name reaches the rows byte for byte (bound and never spliced into SQL)",
+          "[echo][usage][fold]") {
+    auto t = make_test_db();
+    REQUIRE(usage_ensure_baselined(t.db, 1000).has_value());
+    std::string odd = "it's";
+    odd.push_back('\0');
+    odd += "x.exe";
+    std::string user = "o'brien";
+    user.push_back('\0');
+    user += "z";
+    REQUIRE(fold_tick(t.db, process_pair(7, odd, 2000, 2060, user), 2060));
+    const auto key = yuzu::echo::usage::normalise_exe_key(odd);
+    std::string hex;
+    for (const unsigned char c : key)
+        hex += std::format("{:02X}", c);
+    auto r = t.db.execute_query("SELECT hex(exe_key), total_seconds FROM usage_daily");
+    REQUIRE(r.has_value());
+    REQUIRE(r->rows.size() == 1);
+    CHECK(r->rows[0][0] == hex);
+    CHECK(r->rows[0][1] == "60");
+    std::string user_hex;
+    for (const unsigned char c : user)
+        user_hex += std::format("{:02X}", c);
+    auto u = t.db.execute_query("SELECT hex(user) FROM usage_daily_user");
+    REQUIRE(u.has_value());
+    REQUIRE(u->rows.size() == 1);
+    CHECK(u->rows[0][0] == user_hex);
+}

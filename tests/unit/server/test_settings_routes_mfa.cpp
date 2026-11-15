@@ -39,9 +39,12 @@
 #include "update_registry.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
+#include "test_forced_csprng_failure.hpp"
+#include "test_pg_fault_triggers.hpp"
 #include "../test_log_capture.hpp"
 #include "source_scan.hpp"
 #include "test_principal_lock_gate.hpp" // SessionWipeFault
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -101,6 +104,8 @@ struct MfaSettingsHarness {
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    /// #6995: the registry the MFA counters land in; declared before `routes`, which holds it.
+    yuzu::MetricsRegistry metrics;
     SettingsRoutes routes;
 
     yuzu::server::test::TestRouteSink sink;
@@ -167,8 +172,7 @@ struct MfaSettingsHarness {
                                /*runtime_config_store=*/nullptr,
                                /*audit_store=*/nullptr,
                                /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider, /*metrics_registry=*/nullptr,
-                               std::move(step_up_fn));
+                               oidc_mu, oidc_provider, &metrics, std::move(step_up_fn));
     }
 
     /// True if any captured audit row matches action + result + (optional) target_id.
@@ -232,6 +236,20 @@ post_same_origin(yuzu::server::test::TestRouteSink& sink, const std::string& pat
                          {{"Host", "yuzu.example"}, {"Origin", "http://yuzu.example"}});
 }
 
+/// #6940: every MFA fragment response is uncacheable and private, whatever it renders: the MFA
+/// state of the account, a one-time secret or recovery codes. `set_header` appends and
+/// `get_header_value` returns the first, so each header is also counted.
+void check_mfa_no_store(const httplib::Response& res) {
+    CHECK(res.get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res.get_header_value("Vary") == "Cookie");
+    CHECK(res.get_header_value("Pragma") == "no-cache");
+    CHECK(res.get_header_value("Referrer-Policy") == "no-referrer");
+    CHECK(res.headers.count("Cache-Control") == 1);
+    CHECK(res.headers.count("Vary") == 1);
+    CHECK(res.headers.count("Pragma") == 1);
+    CHECK(res.headers.count("Referrer-Policy") == 1);
+}
+
 } // namespace
 
 TEST_CASE("GET /fragments/settings/mfa renders 'Not enrolled' panel for fresh admin",
@@ -242,6 +260,7 @@ TEST_CASE("GET /fragments/settings/mfa renders 'Not enrolled' panel for fresh ad
     CHECK(res->status == 200);
     CHECK(res->body.find("Not enrolled") != std::string::npos);
     CHECK(res->body.find("Set up two-factor") != std::string::npos);
+    check_mfa_no_store(*res);
     // GETs are not CSRF-sensitive — no csrf.denied should fire.
     CHECK_FALSE(h.has_audit("csrf.denied"));
 }
@@ -258,9 +277,7 @@ TEST_CASE("POST /api/settings/mfa/init reveals secret with Cache-Control: no-sto
     CHECK(res->body.find("Base32 secret") != std::string::npos);
     // The provisional reveal now renders the inline SVG QR (#1232 wiring).
     CHECK(res->body.find("<svg") != std::string::npos);
-    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
-    CHECK(res->get_header_value("Pragma") == "no-cache");
-    CHECK(res->get_header_value("Referrer-Policy") == "no-referrer");
+    check_mfa_no_store(*res);
     CHECK(h.has_audit("mfa.enroll.initiated", "ok", "admin"));
 }
 
@@ -281,6 +298,7 @@ TEST_CASE("POST /api/settings/mfa/init twice returns MfaAlreadyEnrolled with ope
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("MFA is already enabled") != std::string::npos);
+    check_mfa_no_store(*res); // a refusal re-render carries the same headers
     CHECK(h.has_audit("mfa.enroll.initiated", "error", "admin"));
 }
 
@@ -300,7 +318,7 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     auto res = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
     REQUIRE(res);
     CHECK(res->status == 200);
-    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    check_mfa_no_store(*res);
     // Each recovery code is XXXX-XXXX-XXXX-XXXX (19 chars). Look for a
     // representative bullet pattern.
     CHECK(res->body.find("Store these recovery codes now") != std::string::npos);
@@ -413,12 +431,62 @@ TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits m
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("already enrolled") != std::string::npos);
+    check_mfa_no_store(*res);
     CHECK_FALSE(has_step_up_proof(h, token));
     // Audited as the benign race, NOT as a rejected code or a verified enrollment,
     // and no store-outage path.
     CHECK(h.has_audit("mfa.enroll.race", "ok", "admin"));
     CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+}
+
+TEST_CASE("POST /api/settings/mfa/verify tells the operator to start again and audits "
+          "mfa.enroll.cancelled when a concurrent disable lands mid-verify (#3808)",
+          "[pg][mfa][routes][settings]") {
+    // The REAL race (see run_enroll_verify_race): a committed MFA disable lands between the
+    // verify's secret load and its guarded UPDATE. Before #3808 this graded WriteFailed, which
+    // the route reported as "authentication store is temporarily unavailable" and counted as a
+    // secret-unavailable degrade; the store was fine and the enrolment had simply been cancelled.
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+
+    std::unique_ptr<httplib::Response> res;
+    REQUIRE(yuzu::test::run_enroll_verify_race(
+        h.auth_db.dsn(), "admin",
+        {"UPDATE auth.users SET mfa_totp_secret = NULL, mfa_enrolled_at = NULL WHERE "
+         "username = $1"},
+        [&] { res = post_verify_with_cookie(h, code, token); }));
+
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("cancelled or replaced") != std::string::npos);
+    check_mfa_no_store(*res);
+    // Honest about what happened: not the store-outage wording, not "code rejected".
+    CHECK(res->body.find("temporarily unavailable") == std::string::npos);
+    CHECK(res->body.find("Code rejected") == std::string::npos);
+    // RECOVERABLE: the operator is told to start again, so the page must OFFER that. A
+    // non-empty `enrollment_pending_for_verify` forced the provisional confirm form instead
+    // (a code box whose secret is gone, a "wait for the next code" hint, no Set-up button;
+    // under enforcement not even Cancel). The not-enrolled state has the Set-up button.
+    CHECK(res->body.find("Set up two-factor") != std::string::npos);
+    CHECK(res->body.find("wait for the next code") == std::string::npos);
+    CHECK(res->body.find("Confirm code") == std::string::npos);
+    // The audit detail states only the observed fact and NEVER a cause: a named "disable"
+    // sends an auditor looking for an mfa.disabled row that may not exist (the stale-
+    // provisional sweep, `--mfa-reset` and a KEK rewrap reach this path with no disable).
+    CHECK(h.audit_detail("mfa.enroll.cancelled") ==
+          "reason=provisional_secret_changed; nothing enrolled");
+    CHECK(h.audit_detail("mfa.enroll.cancelled").find("disable") == std::string::npos);
+    CHECK_FALSE(has_step_up_proof(h, token)); // nothing enrolled, so no proof is earned
+    CHECK(h.has_audit("mfa.enroll.cancelled", "ok", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.race"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
 }
 
 
@@ -467,6 +535,7 @@ TEST_CASE("POST /api/settings/mfa/verify failure never stamps a step-up proof",
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("Code rejected") != std::string::npos);
+    check_mfa_no_store(*res);
     CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
     CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
     CHECK_FALSE(has_step_up_proof(h, token));
@@ -809,6 +878,7 @@ TEST_CASE("Settings MFA init/verify queued behind a password reset refuses with 
     INFO("body=" << racing->body);
     CHECK(racing->status == 200);
     CHECK(racing->body.find("Your password changed during enrolment") != std::string::npos);
+    check_mfa_no_store(*racing);
     CHECK(racing->body.find("otpauth://") == std::string::npos); // no reveal
     CHECK(racing->body.find("Store these recovery codes now") == std::string::npos); // no recovery codes
     CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
@@ -843,6 +913,7 @@ TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
     // exit: the cookie is dropped and htmx is sent to the landing page.
     CHECK(res->get_header_value("HX-Redirect") == "/home");
     CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
+    check_mfa_no_store(*res); // the sign-out reply too: ONE set of headers for every exit path
     CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
     // Two rows: the intent row is written BEFORE the clear, the outcome row after (#6079 au-F1).
     CHECK(disable_results(h) == std::vector<std::string>{"attempted", "ok"});
@@ -969,6 +1040,7 @@ TEST_CASE("POST /api/settings/mfa/disable reports a failed session delete and au
     REQUIRE(res);
     CHECK(res->get_header_value("HX-Redirect").empty());
     CHECK(res->body.find("sessions could not be ended") != std::string::npos);
+    check_mfa_no_store(*res);
     CHECK(res->body.find("Try again") == std::string::npos);
     CHECK(h.has_audit("mfa.disabled", "partial", "admin"));
     CHECK(disable_results(h) == std::vector<std::string>{"attempted", "partial"});
@@ -999,6 +1071,7 @@ TEST_CASE("POST /api/settings/mfa/disable cancelling an unfinished enrolment kee
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->get_header_value("HX-Redirect").empty());
+    check_mfa_no_store(*res);
     CHECK(h.has_audit("mfa.disabled", "ok", "admin"));
     CHECK(h.audit_detail("mfa.disabled") == "no verified factor to clear");
     CHECK(sessions.find(auth::AuthManager::sha256_hex(mine)).value().has_value());
@@ -1112,6 +1185,7 @@ TEST_CASE("POST /api/settings/mfa/disable says the state is unknown when neither
     REQUIRE(res);
     CHECK(res->get_header_value("HX-Redirect").empty());
     CHECK(res->body.find("state is unknown") != std::string::npos);
+    check_mfa_no_store(*res);
     CHECK(h.has_audit("mfa.disabled", "error", "admin"));
     CHECK(h.audit_detail("mfa.disabled") == "disable failed (sessions_ended=failed)");
 }
@@ -1151,6 +1225,7 @@ TEST_CASE("POST /api/settings/mfa/disable refuses to clear when the intent audit
     CHECK(res->get_header_value("HX-Redirect").empty());
     CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") == std::string::npos);
     CHECK(res->body.find("MFA was not changed") != std::string::npos);
+    check_mfa_no_store(*res);
     CHECK(res->get_header_value("Retry-After") == "5");
     // /settings drops a 5xx body, so the refusal also rides an HX-Trigger toast.
     const auto toast = nlohmann::json::parse(res->get_header_value("HX-Trigger"));
@@ -1243,6 +1318,7 @@ TEST_CASE("POST /api/settings/mfa/disable is blocked for self under enforcement 
     REQUIRE(res);
     CHECK(res->status == 200); // fragment-with-error convention, not a hard status
     CHECK(res->body.find("required by policy") != std::string::npos);
+    check_mfa_no_store(*res);
     // Audit captures the policy block.
     CHECK(h.has_audit("mfa.disabled", "error", "admin"));
     CHECK(h.audit_detail("mfa.disabled").find("blocked: mfa_enforcement=required") !=
@@ -1391,4 +1467,256 @@ TEST_CASE("Referer fallback also evaluated when Origin is absent",
     REQUIRE(bad);
     CHECK(bad->status == 403);
     CHECK(h2.has_audit("csrf.denied"));
+}
+
+// ── #6995: an MFA CSPRNG fault is its own signal, not a store outage ─────────
+//
+// Settings answers 200 with a fragment (not a 503), so the proof is the operator wording,
+// the audit detail and the counters: `yuzu_secure_random_failure_total{reason=prng_failure,
+// site}` moves; `yuzu_auth_secret_unavailable_total` does not.
+namespace {
+
+double prng_failures(MfaSettingsHarness& h, const char* site) {
+    return h.metrics
+        .counter("yuzu_secure_random_failure_total", {{"reason", "prng_failure"}, {"site", site}})
+        .value();
+}
+
+double secret_unavailable(MfaSettingsHarness& h, const char* route) {
+    return h.metrics.counter("yuzu_auth_secret_unavailable_total", {{"route", route}}).value();
+}
+
+/// Installs a trigger that makes every DELETE on the recovery-code table fail, so a regeneration
+/// fails as a genuine STORE fault (WriteFailed), the control for the CSPRNG cases above.
+void block_recovery_code_deletes(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult fn{PQexec(
+        conn.get(),
+        "CREATE OR REPLACE FUNCTION test_block_recovery_delete() RETURNS trigger AS $$ "
+        "BEGIN RAISE EXCEPTION 'test-induced write failure'; END; $$ LANGUAGE plpgsql")};
+    REQUIRE(fn.ok());
+    yuzu::server::pg::PgResult trg{PQexec(
+        conn.get(), "CREATE TRIGGER test_block_recovery_delete_trg BEFORE DELETE ON "
+                   "auth.mfa_recovery_codes FOR EACH ROW EXECUTE FUNCTION "
+                   "test_block_recovery_delete()")};
+    REQUIRE(trg.ok());
+}
+
+} // namespace
+
+TEST_CASE("POST /api/settings/mfa/init on a CSPRNG fault: retry wording, mfa_enroll prng_failure, "
+          "no store-outage count (#6995)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    auto res = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = post_same_origin(h.sink, "/api/settings/mfa/init");
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+    CHECK(res->body.find("otpauth://") == std::string::npos);
+    CHECK(h.has_audit("mfa.enroll.initiated", "error", "admin"));
+    CHECK(h.audit_detail("mfa.enroll.initiated").find("csprng_unavailable") != std::string::npos);
+
+    CHECK(prng_failures(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify on a recovery-code CSPRNG fault: enrolment rolled back, "
+          "mfa_recovery prng_failure, no store-outage count (#6995)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h);
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+
+    auto res = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = post_verify_with_cookie(h, code, token);
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+    CHECK(res->body.find("Code rejected") == std::string::npos);
+    CHECK(h.has_audit("mfa.enroll.failed", "error", "admin"));
+    CHECK(h.audit_detail("mfa.enroll.failed").find("csprng_unavailable") != std::string::npos);
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK_FALSE(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 0);
+}
+
+TEST_CASE("POST /api/settings/mfa/recovery-codes on a CSPRNG fault counts the refusal as "
+          "mfa_recovery prng_failure and keeps the existing codes (#6995)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h);
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+
+    auto res = [&] {
+        yuzu::test::ForcedCsprngFailure forced;
+        auto r = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
+        REQUIRE_FALSE(yuzu::server::test_hooks::is_failure_forced_for_this_thread());
+        return r;
+    }();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("Could not regenerate codes") != std::string::npos);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "error", "admin"));
+    CHECK(h.audit_detail("mfa.recovery_codes.generated").find("csprng_unavailable") !=
+          std::string::npos);
+
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_recovery") == 0.0);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK(status->recovery_codes_remaining == 10); // the txn rolled back
+}
+
+TEST_CASE("POST /api/settings/mfa/recovery-codes on a store fault counts "
+          "secret_unavailable{route=mfa_recovery}, not a CSPRNG fault (#6995 control)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h);
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+    block_recovery_code_deletes(h.auth_db.dsn());
+
+    auto res = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("Could not regenerate codes") != std::string::npos);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "error", "admin"));
+    CHECK(h.audit_detail("mfa.recovery_codes.generated").find("csprng_unavailable") ==
+          std::string::npos);
+
+    CHECK(secret_unavailable(h, "mfa_recovery") == 1.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+}
+
+TEST_CASE("POST /api/settings/mfa/init on a STORE write fault counts a store outage, not a CSPRNG "
+          "fault (#6995 control)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    yuzu::test::block_users_update_when(h.auth_db.dsn(),
+                            "NEW.mfa_totp_secret IS DISTINCT FROM OLD.mfa_totp_secret");
+    auto res = post_same_origin(h.sink, "/api/settings/mfa/init");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    // The audit detail must NOT claim an entropy fault for a database fault.
+    CHECK(h.audit_detail("mfa.enroll.initiated").find("csprng_unavailable") == std::string::npos);
+}
+
+TEST_CASE("POST /api/settings/mfa/verify on a STORE write fault counts a store outage, not a "
+          "CSPRNG fault (#6995 control)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h); // the secret mint passes; only the enrol stamp fails
+    const auto token = h.auth_mgr.create_local_session_for_test("admin", auth::Role::admin, false);
+    REQUIRE_FALSE(token.empty());
+    yuzu::test::block_users_update_when(h.auth_db.dsn(),
+                            "NEW.mfa_enrolled_at IS DISTINCT FROM OLD.mfa_enrolled_at");
+
+    auto res = post_verify_with_cookie(h, code, token);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("temporarily unavailable") != std::string::npos);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 1.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+    CHECK(h.audit_detail("mfa.enroll.failed").find("csprng_unavailable") == std::string::npos);
+}
+
+TEST_CASE("POST /api/settings/mfa/recovery-codes refused for a business reason (unknown account) "
+          "is audit-only and counted nowhere (#6995)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    h.session_user = "ghost"; // a valid username with no auth.users row -> UserNotFound
+    auto res = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("Could not regenerate codes") != std::string::npos);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "error", "ghost"));
+    CHECK(h.audit_detail("mfa.recovery_codes.generated") == "regeneration failed");
+    // The documented contract (metrics.md): a business outcome moves NO counter.
+    CHECK(secret_unavailable(h, "mfa_recovery") == 0.0);
+    CHECK(secret_unavailable(h, "mfa_enroll") == 0.0);
+    CHECK(prng_failures(h, "mfa_recovery") == 0.0);
+    CHECK(prng_failures(h, "mfa_enroll") == 0.0);
+}
+
+#ifndef _WIN32
+TEST_CASE("POST /api/settings/mfa/recovery-codes on a recovery-code SALT-draw failure is audited "
+          "and counted as mfa_recovery prng_failure; the old codes stand (#6995)",
+          "[pg][mfa][routes][settings][fail-closed]") {
+    MfaSettingsHarness h;
+    const auto code = begin_admin_enrolment(h);
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code, std::nullopt).has_value());
+
+    auto res = [&] {
+        yuzu::test::FailNthSaltDraw fail{3}; // the third code's salt: DELETE + 2 INSERTs have run
+        auto r = post_same_origin(h.sink, "/api/settings/mfa/recovery-codes");
+        REQUIRE(fail.fired());
+        return r;
+    }();
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    check_mfa_no_store(*res); // #6940: the failure re-render is uncacheable and private too
+    CHECK(res->body.find("Could not regenerate codes") != std::string::npos);
+    CHECK(h.has_audit("mfa.recovery_codes.generated", "error", "admin"));
+    CHECK(h.audit_detail("mfa.recovery_codes.generated").find("csprng_unavailable: mfa_recovery") !=
+          std::string::npos);
+    CHECK(prng_failures(h, "mfa_recovery") == 1.0);
+    CHECK(secret_unavailable(h, "mfa_recovery") == 0.0);
+    auto status = h.auth_db->mfa_status("admin");
+    REQUIRE(status.has_value());
+    CHECK(status->recovery_codes_remaining == 10); // rolled back, not 0 and not a partial set
+}
+#endif // !_WIN32
+
+// #6940: the four store-unavailable re-renders (no AuthDB behind the settings routes) show the
+// account's MFA panel, so they are uncacheable and private like every other MFA answer.
+// `set_auth_db(nullptr)` after construction reaches each branch (same idiom as
+// test_auth_routes_mfa.cpp).
+TEST_CASE("Settings MFA POST routes with no auth store answer the store-unavailable panel, "
+          "uncacheable and private",
+          "[pg][mfa][routes][settings][cache]") {
+    MfaSettingsHarness h;
+    h.auth_mgr.set_auth_db(nullptr);
+    for (const char* path : {"/api/settings/mfa/init", "/api/settings/mfa/verify",
+                             "/api/settings/mfa/recovery-codes", "/api/settings/mfa/disable"}) {
+        INFO(path);
+        auto res = post_same_origin(h.sink, path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("MFA store unavailable") != std::string::npos);
+        check_mfa_no_store(*res);
+    }
 }

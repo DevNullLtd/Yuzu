@@ -17,6 +17,7 @@
 #include "../../../server/core/src/execution_tracker.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
 #include "../test_helpers.hpp"
+#include "mcp_test_binding.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -34,6 +35,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace mcp = yuzu::server::mcp;
@@ -122,6 +124,9 @@ namespace {
 using yuzu::server::ExecutionEventBus;
 using Bridge = mcp::McpStreamBridge;
 
+// The principal-only fixture (an empty credential class); see mcp_test_binding.hpp.
+using yuzu::test::mcp_session::bound;
+
 /// Poll an eventually-true condition - the projector is asynchronous. Generous
 /// deadline, tight step: never false-RED on a loaded CI box, fast when green.
 template <typename F>
@@ -185,9 +190,18 @@ struct Fx {
         std::shared_ptr<mcp::McpStreamState> stream;
     };
     Session make_session(const std::string& principal = "alice") {
-        auto minted = sessions.mint(principal);
+        auto minted = sessions.mint(bound(principal));
         REQUIRE(minted.ok);
-        auto stream = sessions.stream_for(minted.session_id, principal);
+        auto stream = sessions.stream_for(minted.session_id, bound(principal));
+        REQUIRE(stream != nullptr);
+        return {minted.session_id, std::move(stream)};
+    }
+    /// A session minted under an explicit binding, so a test can carry a real credential
+    /// class (make_session above mints with an empty one).
+    Session make_session_as(const mcp::McpSessionBinding& binding) {
+        auto minted = sessions.mint(binding);
+        REQUIRE(minted.ok);
+        auto stream = sessions.stream_for(minted.session_id, binding);
         REQUIRE(stream != nullptr);
         return {minted.session_id, std::move(stream)};
     }
@@ -201,6 +215,19 @@ struct Fx {
             }
         }
         return n;
+    }
+
+    /// The actor of every captured row for `action`, in capture order. Lets a test pin
+    /// WHO a client-caused row is attributed to, not only that a row exists.
+    std::vector<std::string> audit_actors(const std::string& action) {
+        std::lock_guard<std::mutex> lk(audit_mu);
+        std::vector<std::string> out;
+        for (const auto& row : audits) {
+            if (row.action == action) {
+                out.push_back(row.actor);
+            }
+        }
+        return out;
     }
 };
 
@@ -287,7 +314,7 @@ TEST_CASE("bridge reserve - every reject reason is truthful and counted", "[mcp]
         yuzu::MetricsRegistry reg;
         mcp::McpSessionRegistry sessions{mcp::McpSessionRegistry::Config{}, {}, &reg};
         Bridge b{nullptr, &sessions, &reg};
-        auto r = b.reserve("s", "alice", json(1), std::nullopt, false);
+        auto r = b.reserve("s", bound("alice"), json(1), std::nullopt, false);
         CHECK_FALSE(r.ok);
         CHECK(std::string(r.reject_reason) == "disabled");
         CHECK(reg.counter("yuzu_mcp_bridge_reject_total", {{"reason", "disabled"}}).value() == 1.0);
@@ -295,40 +322,40 @@ TEST_CASE("bridge reserve - every reject reason is truthful and counted", "[mcp]
     SECTION("unknown session / wrong principal ⇒ unknown_session (no oracle)") {
         Fx fx;
         auto s = fx.make_session();
-        CHECK(std::string(fx.bridge->reserve("nope", "alice", json(1), std::nullopt, false)
+        CHECK(std::string(fx.bridge->reserve("nope", bound("alice"), json(1), std::nullopt, false)
                               .reject_reason) == "unknown_session");
-        CHECK(std::string(fx.bridge->reserve(s.id, "mallory", json(1), std::nullopt, false)
+        CHECK(std::string(fx.bridge->reserve(s.id, bound("mallory"), json(1), std::nullopt, false)
                               .reject_reason) == "unknown_session");
     }
     SECTION("duplicate key, global cap, pin slots; abandon frees them") {
         Fx fx{Bridge::Config{.global_record_cap = 5, .ring_only_pressure_cap = 64}};
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
-        CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true)
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
+        CHECK(std::string(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true)
                               .reject_reason) == "duplicate_request_id");
         // string "1" is a DIFFERENT key from integer 1
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("1"), json("t"), true).ok);
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("1"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(3), json("t"), true).ok);
         // 4 streamed records on one session: pin slots exhausted
-        CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true)
+        CHECK(std::string(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true)
                               .reject_reason) == "pin_slots");
         // …but a GET-only record is bounded by the global cap only
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), false).ok);
-        CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(6), json("t"), false)
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), false).ok);
+        CHECK(std::string(fx.bridge->reserve(s.id, bound("alice"), json(6), json("t"), false)
                               .reject_reason) == "global_cap");
         CHECK(fx.reg.counter("yuzu_mcp_bridge_reject_total", {{"reason", "pin_slots"}}).value() ==
               1.0);
         // abandon a streamed record: both the pin-slot charge and the map slot free up
         REQUIRE(fx.bridge->abandon(s.id, json(1)));
-        CHECK(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+        CHECK(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true).ok);
     }
 }
 
 TEST_CASE("bridge arming latch + abandon containment", "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-a"));
     CHECK(fx.bus.subscriber_count("exec-a") == 1);
 
@@ -343,7 +370,7 @@ TEST_CASE("bridge arming latch + abandon containment", "[mcp][bridge][2f]") {
     CHECK(fx.bus.subscriber_count("exec-a") == 0);
     CHECK(fx.bridge->record_count() == 0);
     CHECK(s.stream->next_event_id() == 1);  // ring untouched
-    CHECK(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);  // key freed
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);  // key freed
 }
 
 TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridge][2f]") {
@@ -363,7 +390,7 @@ TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridg
     // coalescing, which the flip-and-drain (H2) test below exercises instead.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-mono"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
     // Sequence: 1, 1(dup), 3, 2(decrease), 3(dup), 5, 4(decrease) / total 5.
@@ -416,7 +443,7 @@ TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridg
 TEST_CASE("bridge GET-only lifecycle - live progress, no final, no pin", "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(7), json(42), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(7), json(42), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(7), "exec-g"));
     REQUIRE(fx.bridge->arm(s.id, json(7), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
 
@@ -459,7 +486,7 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
     const std::string base =
         R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}],)"
         R"("structuredContent":{"execution_id":"exec-p"}})";
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("tok"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(9), json("tok"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(9), "exec-p"));
     REQUIRE(fx.bridge->arm(s.id, json(9), Bridge::ArmMode::kStreaming, base) ==
             Bridge::ArmOutcome::kArmed);
@@ -499,7 +526,7 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
 TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-h"));
     // DISTINCT strictly-increasing counts (1/12 .. 12/12), published pre-arm
     // (1-4, latched while kArming - project_record never visits a kArming
@@ -564,7 +591,7 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
 TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(3), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(3), "exec-f"));
     REQUIRE(fx.bridge->arm(s.id, json(3), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
 
@@ -590,13 +617,13 @@ TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every reco
     // whole assertion, and it is RED on the unfixed tree.
     Fx fx;
     auto a = fx.make_session("alice");
-    REQUIRE(fx.bridge->reserve(a.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(a.id, bound("alice"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(a.id, json(1), "exec-2411-a"));
     REQUIRE(fx.bridge->arm(a.id, json(1), Bridge::ArmMode::kGetOnly) ==
             Bridge::ArmOutcome::kArmed);
 
     auto b = fx.make_session("bob");
-    REQUIRE(fx.bridge->reserve(b.id, "bob", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(b.id, bound("bob"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(b.id, json(1), "exec-2411-b"));
     REQUIRE(fx.bridge->arm(b.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -719,7 +746,7 @@ TEST_CASE("bridge #2411 - a listener fault on one record still flushes via that 
     // the delta regardless of whether the catch path marks it dirty.
     Fx fx;
     auto a = fx.make_session("alice");
-    REQUIRE(fx.bridge->reserve(a.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(a.id, bound("alice"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(a.id, json(1), "exec-2411-flush-a"));
     REQUIRE(fx.bridge->arm(a.id, json(1), Bridge::ArmMode::kGetOnly) ==
             Bridge::ArmOutcome::kArmed);
@@ -735,7 +762,7 @@ TEST_CASE("bridge #2411 - a listener fault on one record still flushes via that 
     }));
 
     auto b = fx.make_session("bob");
-    REQUIRE(fx.bridge->reserve(b.id, "bob", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(b.id, bound("bob"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(b.id, json(1), "exec-2411-flush-b"));
     REQUIRE(fx.bridge->arm(b.id, json(1), Bridge::ArmMode::kGetOnly) ==
             Bridge::ArmOutcome::kArmed);
@@ -760,7 +787,7 @@ TEST_CASE("bridge immediate terminal via replay - subscribe after completion",
     // instant-execution class). subscribe_and_replay(0) routes the buffered
     // terminal through the normal listener.
     fx.bus.publish("exec-i", "execution-completed", kCompleted, /*is_terminal=*/true);
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(4), "exec-i"));
     REQUIRE(fx.bridge->arm(s.id, json(4), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -772,7 +799,7 @@ TEST_CASE("bridge immediate terminal via replay - subscribe after completion",
 TEST_CASE("bridge second-thread terminal vs park (TSan)", "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(5), "exec-t"));
     auto flood = std::async(std::launch::async, [&] {
         for (int i = 0; i < 20; ++i) {  // enough to race the arm; keeps Windows-debug wall-clock low
@@ -799,7 +826,7 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     std::vector<std::uint64_t> pinned;
     for (int i = 1; i <= 4; ++i) {
         const std::string exec = "exec-pin-" + std::to_string(i);
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
         REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -839,7 +866,7 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     // record_count alone would also pass if the WRONG key were erased, so name it.
     CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
     CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());
-    CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
     // ...and it was admitted by the ACK, not by #2740's displacement: with three
     // pins against a cap of four the admission sum is already under water, so no
     // pin was released to make room. Without this the assertion above would pass
@@ -882,7 +909,7 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         // client does exactly this on its Retry-After. Without the retry this
         // setup is flaky for a reason that has nothing to do with what the
         // sections below assert.
-        REQUIRE(poll_until([&] { return fx.bridge->reserve(s.id, "alice", json(id),
+        REQUIRE(poll_until([&] { return fx.bridge->reserve(s.id, bound("alice"), json(id),
                                                            json("t"), true).ok; }));
         REQUIRE(fx.bridge->subscribe(s.id, json(id), exec));
         REQUIRE(fx.bridge->arm(s.id, json(id), Bridge::ArmMode::kStreaming) ==
@@ -904,17 +931,22 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
             park_with_undelivered_final(i);
         }
         // the helper already settled each park; nothing further to wait for
-        auto fifth = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+        auto fifth = fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true);
         CHECK(fifth.ok);
         CHECK(displaced_count() == 1.0);
         CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
+        // Attributed to the admitting caller, not the empty "system" actor and not a
+        // moved-from binding (reserve takes the binding by value and moves it into the
+        // record before this row is written).
+        CHECK(fx.audit_actors("mcp.bridge.pin_displaced_for_admission") ==
+              std::vector<std::string>{"alice"});
         // The OLDEST parked record yields - its resume window is the one most
         // likely already gone - and the result stays fetchable by execution_id.
         CHECK(s.stream->pinned_count() == 3);
         // The lockout is gone for good, not merely deferred by one: each further
         // client-gone call displaces the next-oldest rather than refusing.
         for (int i = 6; i <= 8; ++i) {
-            auto rr = fx.bridge->reserve(s.id, "alice", json(i), json("t"), true);
+            auto rr = fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true);
             INFO("reserve " << i << " reject="
                             << (rr.reject_reason == nullptr ? "none" : rr.reject_reason)
                             << " pinned=" << s.stream->pinned_count());
@@ -927,7 +959,7 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
             park_with_undelivered_final(i);
         }
         REQUIRE(poll_until([&] { return s.stream->pinned_count() == 4; }));
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
         // Displacement removes the eviction EXEMPTION, nothing more: the frame is
         // still in the ring, so a resume from before it still replays it. This is
         // the whole reason displacement is acceptable rather than data loss.
@@ -940,12 +972,12 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         // refusal must say so in terms that are true.
         for (int i = 1; i <= 4; ++i) {
             const std::string exec = "exec-live-" + std::to_string(i);
-            REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+            REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok);
             REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
             REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
                     Bridge::ArmOutcome::kArmed);
         }
-        auto fifth = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+        auto fifth = fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true);
         CHECK_FALSE(fifth.ok);
         CHECK(std::string(fifth.reject_reason == nullptr ? "" : fifth.reject_reason) ==
               "pin_slots");
@@ -963,7 +995,7 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         // so it holds a charge rather than a pin. Three pins plus this one charge
         // is the cap, which is what puts admission on the reject path at all.
         const std::string live = "exec-live-4";
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(4), live));
         REQUIRE(fx.bridge->arm(s.id, json(4), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -977,7 +1009,7 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
             }
         }
         REQUIRE(parked.size() == 3);  // the live call holds a charge, not a pin
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
         CHECK(displaced_count() == 1.0);
         CHECK_FALSE(s.stream->is_pinned(parked.front()));  // oldest parked displaced
         CHECK(s.stream->is_pinned(parked[1]));             // the others untouched
@@ -993,7 +1025,7 @@ TEST_CASE("bridge admission - client-gone finals never lock a session out of str
         }
         auto victim_key = fx.bridge->record_key(s.id, json(1));
         REQUIRE(victim_key.has_value());
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
 
         // A pump that comes back from the dead after its record was displaced must
         // not resurrect anything: the unpin is id-targeted and the id is already
@@ -1027,7 +1059,7 @@ TEST_CASE("bridge admission - ORPHAN pins are reclaimed too (governance UP-1)",
     for (int i = 1; i <= 4; ++i) {
         const std::string exec = "exec-orphan-" + std::to_string(i);
         REQUIRE(poll_until([&] {
-            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+            return fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok;
         }));
         REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
         REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
@@ -1047,10 +1079,12 @@ TEST_CASE("bridge admission - ORPHAN pins are reclaimed too (governance UP-1)",
     REQUIRE(fx.bridge->record_count() == 0);  // ...and not one record to find them by
 
     // Admission must reclaim one anyway.
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(9), json("t"), true).ok);
     CHECK(displaced_total() == 1.0);
     CHECK(s.stream->pinned_count() == 3);
     CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
+    CHECK(fx.audit_actors("mcp.bridge.pin_displaced_for_admission") ==
+          std::vector<std::string>{"alice"});
 }
 
 TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final is never lost",
@@ -1059,13 +1093,13 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
         auto s = fx.make_session();
         // Record A (older): parked, never completes.
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-old"));
         REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
         // Record B (newer): parked with a real pinned final.
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-new"));
         REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1100,7 +1134,7 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
     SECTION("victim WITH a settled real final: torn down, NO synthesis, pin survives") {
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-s"));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1140,7 +1174,7 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
         // must not be asserted against; publish-then-race keeps the invariant exact.
         Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-r"));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1184,7 +1218,7 @@ TEST_CASE("bridge pressure #2409 - a terminal-flagged progress is never lost to 
     // exactly the property a regression test must have.
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2409"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -1218,7 +1252,7 @@ TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, ne
     // -32014 - releasing the streamed charge and auditing the disposition.
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-kl"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
@@ -1276,17 +1310,17 @@ TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, ne
     REQUIRE(att.status == mcp::McpStreamState::AttachStatus::kAttached);
     s.stream->detach(att.sink);
     CHECK(s.stream->pinned_count() == 0);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);  // 4th slot: only free if charge released
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(3), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);  // 4th slot: only free if charge released
 }
 
 TEST_CASE("bridge pressure - a visitor copy-OOM defers and keeps the listener (#2409 safety-S1)",
           "[mcp][bridge][2f][2409]") {
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-oom"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
@@ -1330,12 +1364,12 @@ namespace {
 /// visitor copy fault this is a deterministic "oldest defers forever, newer is
 /// reapable" shape - the only one that tells the two #2489 pressure defects apart.
 void park_deferring_a_and_claimable_b(Fx& fx, Fx::Session& s) {
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-a"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-b"));
     REQUIRE(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -1449,7 +1483,7 @@ TEST_CASE("bridge pressure - one sweep expires exactly down to the cap, no furth
     int n = 0;
     for (const auto& v : victims) {
         const std::string exec_id = "exec-cap-" + std::to_string(++n);
-        REQUIRE(fx.bridge->reserve(v.s->id, "alice", v.id, json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(v.s->id, bound("alice"), v.id, json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(v.s->id, v.id, exec_id));
         REQUIRE(fx.bridge->arm(v.s->id, v.id, Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1504,7 +1538,7 @@ TEST_CASE("bridge pressure - deferred victims consume visit budget without decre
     auto s2 = fx.make_session();
 
     auto park_deferring = [&](Fx::Session& s, const std::string& exec, int slot) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(slot), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(slot), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(slot), exec));
         REQUIRE(fx.bridge->arm(s.id, json(slot), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1514,7 +1548,7 @@ TEST_CASE("bridge pressure - deferred victims consume visit budget without decre
                        /*is_terminal=*/true);
     };
     auto park_claimable = [&](Fx::Session& s, const std::string& exec, int slot) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(slot), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(slot), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(slot), exec));
         REQUIRE(fx.bridge->arm(s.id, json(slot), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1600,7 +1634,7 @@ TEST_CASE("bridge pressure - one sweep is bounded by the population it started w
     }
     auto park = [&](const Fx::Session& s, int slot) {
         const auto j = json(slot);
-        if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
+        if (!fx.bridge->reserve(s.id, bound("alice"), j, json("t"), true).ok) {
             return false;
         }
         if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
@@ -1663,7 +1697,7 @@ TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#
           "[mcp][bridge][2f][2409]") {
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2s"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // never-terminal claimable victim
@@ -1690,7 +1724,7 @@ TEST_CASE("bridge pressure - a sweep claim racing shutdown reaps once, no double
           "[mcp][bridge][2f][2409]") {
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-sd"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // claimable never-terminal victim
@@ -1747,12 +1781,12 @@ TEST_CASE("bridge shutdown poisons a claimed-but-terminal-unresolved record and 
     // in the qa-B2 test above.
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-reap-a"));
     REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-reap-b"));
     REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -1800,12 +1834,12 @@ TEST_CASE("bridge shutdown does NOT reap a record whose terminal Step 1 already 
     // already resolved, so shutdown must leave it alone.
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-noreap-a"));
     REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-noreap-b"));
     REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -1830,7 +1864,7 @@ TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched"
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-d"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -1860,7 +1894,7 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record for retry, 
     SECTION("persistent fault exhausts the retry budget, then behaves exactly as before #2513") {
         Fx fx;  // default Config: teardown_retry_max == 3 -> 4 total attempts
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2487"));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -1953,7 +1987,7 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record for retry, 
     SECTION("a one-shot fault heals on the next sweep's retry pass") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-heal"));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -2005,12 +2039,12 @@ TEST_CASE("bridge teardown retry - a healed retry RE-PUBLISHES a terminal that n
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
     auto s = fx.make_session();
     // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-republish-a"));
     REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-republish-b"));
     REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2057,7 +2091,7 @@ TEST_CASE("bridge teardown retry - a healed retry RE-PUBLISHES a terminal that n
 namespace {
 Fx::Session make_retry_eligible_record(Fx& fx, const char* exec_id) {
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), exec_id));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2200,12 +2234,12 @@ TEST_CASE("bridge teardown retry - shutdown racing a retry whose terminal build 
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
     auto s = fx.make_session();
     // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-ch4-a"));
     REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-ch4-b"));
     REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2298,7 +2332,7 @@ TEST_CASE("bridge teardown - an entry-lock failure is CONTAINED, never terminate
     // not a crash - which is the whole point of containing it.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-entry-lock"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2365,7 +2399,7 @@ TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487
     SECTION("a second subscribe on the same record is refused") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-first"));
         REQUIRE(fx.bus.subscriber_count("exec-first") == 1);
 
@@ -2393,7 +2427,7 @@ TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487
         fx.bridge->set_clock_for_test(
             [base, offset] { return base + std::chrono::seconds(offset->load()); });
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         offset->store(101);  // past the reaper threshold, still pre-subscribe
         REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         fx.bridge->sweep();  // claims the orphan, then fails to erase it
@@ -2413,7 +2447,7 @@ TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487
         // ordering does not exercise this one.)
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
@@ -2425,7 +2459,7 @@ TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487
         // takes, and happy-path correctness matters more than the race it closes.
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         CHECK(fx.bridge->subscribe(s.id, json(1), "exec-normal"));
         CHECK(fx.bus.subscriber_count("exec-normal") == 1);
         CHECK(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
@@ -2454,12 +2488,12 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
     auto park_pair = [](Fx& fx, Fx::Session& s, const char* tag) {
         const std::string a = std::string("exec-") + tag + "-a";
         const std::string b = std::string("exec-") + tag + "-b";
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json("a"), a));
         REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json("b"), b));
         REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -2468,7 +2502,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
     };
     auto park_one = [](Fx& fx, Fx::Session& s) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-stage"));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -2642,7 +2676,7 @@ TEST_CASE("bridge teardown fault injector fails loudly on an out-of-range stage 
     // instead of vacuously green at the assertion site.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-oob"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2669,12 +2703,12 @@ TEST_CASE("bridge pressure - the decided terminal is published even if teardown 
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
     auto s = fx.make_session();
     // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-drop-a"));
     REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-drop-b"));
     REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2712,7 +2746,7 @@ TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
     SECTION("cancel then arm(kStreaming): degrade to GET-only, charge freed, audited once") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-c"));
         CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kAcceptedPending);
         CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);  // dup
@@ -2728,7 +2762,7 @@ TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
 
         // The streamed charge was released: four MORE streamed records fit.
         for (int i = 2; i <= 5; ++i) {
-            REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+            REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok);
         }
         // GET-only lifecycle to completion: no pin ever.
         fx.bus.publish("exec-c", "execution-completed", kCompleted, /*is_terminal=*/true);
@@ -2741,7 +2775,7 @@ TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
     SECTION("cancel then abandon: abandon wins, the pending cancel dies unaudited") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kAcceptedPending);
         REQUIRE(fx.bridge->abandon(s.id, json(1)));
         CHECK(fx.audit_count("mcp.bridge.cancel") == 0);  // no cancel audit for a dead request
@@ -2752,7 +2786,7 @@ TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
     SECTION("cancel after arm: kNoOp (nothing to detach in 3a)") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
                 Bridge::ArmOutcome::kArmed);
         CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
@@ -2764,7 +2798,7 @@ TEST_CASE("bridge cancel arbitration (C1) - pending intent, arm/abandon decide",
         // a handful of interleavings under TSan, and 100 thread spawn/joins on the
         // Windows-debug CI runner was material wall-clock (server suite 600s cap).
         for (int i = 0; i < 15; ++i) {
-            REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), false).ok);
+            REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), false).ok);
             std::atomic<bool> go{false};
             auto armer = std::async(std::launch::async, [&] {
                 while (!go.load(std::memory_order_acquire)) {
@@ -2802,30 +2836,155 @@ TEST_CASE("McpSessionRegistry::exists - non-touching, non-erasing, no oracle",
     mcp::McpSessionRegistry sessions{
         mcp::McpSessionRegistry::Config{},
         [base, offset] { return base + std::chrono::seconds(offset->load()); }, &reg};
-    auto minted = sessions.mint("alice");
+    auto minted = sessions.mint(bound("alice"));
     REQUIRE(minted.ok);
     const auto& id = minted.session_id;
 
-    CHECK(sessions.exists(id, "alice"));
-    CHECK_FALSE(sessions.exists(id, "mallory"));   // foreign principal reads as absent
-    CHECK_FALSE(sessions.exists("nope", "alice"));
+    CHECK(sessions.exists(id, bound("alice")));
+    CHECK_FALSE(sessions.exists(id, bound("mallory")));   // foreign principal reads as absent
+    CHECK_FALSE(sessions.exists("nope", bound("alice")));
 
     // Boundary: age == idle_ttl is still alive (gc expires strictly greater).
     offset->store(1800);
-    CHECK(sessions.exists(id, "alice"));
+    CHECK(sessions.exists(id, bound("alice")));
     // Hammer exists() at the boundary, then step past it: if exists() slid
     // last_seen, these reads would have kept the session alive forever.
     for (int i = 0; i < 5; ++i) {
-        CHECK(sessions.exists(id, "alice"));
+        CHECK(sessions.exists(id, bound("alice")));
     }
     offset->store(1801);
-    CHECK_FALSE(sessions.exists(id, "alice"));
+    CHECK_FALSE(sessions.exists(id, bound("alice")));
     // …and it erased NOTHING: the entry is still in the map until a touching
     // call runs gc.
     CHECK(sessions.active_count() == 1);
-    CHECK(sessions.validate_and_touch(id, "alice") ==
+    CHECK(sessions.validate_and_touch(id, bound("alice")) ==
           mcp::McpSessionRegistry::ValidateResult::kUnknown);
     CHECK(sessions.active_count() == 0);
+}
+
+TEST_CASE("bridge: a record binds to the session's credential class, not just the principal (#4754)",
+          "[mcp][bridge][2f][session][4754]") {
+    Fx fx;
+    auto s = fx.make_session(); // alice, no credential class
+    const mcp::McpSessionBinding weaker{.principal = "alice", .mcp_tier = "readonly"};
+
+    // A different class of the SAME principal reads as an unknown session: no record is
+    // created, so nothing it could ever publish reaches this session's ring.
+    auto refused = fx.bridge->reserve(s.id, weaker, json(1), json("t"), true);
+    CHECK_FALSE(refused.ok);
+    CHECK(std::string(refused.reject_reason) == "unknown_session");
+    CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_reject_total", {{"reason", "unknown_session"}}).value() ==
+          1.0);
+
+    // Same case, the minting class: admitted, and the record is live.
+    auto admitted = fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true);
+    CHECK(admitted.ok);
+    CHECK(fx.bridge->phase_for(s.id, json(1)).has_value());
+}
+
+namespace {
+// A class-bearing binding, as production mints it for an API token. The empty-class
+// fixtures elsewhere in this file cannot tell a record that kept its class from one that
+// silently degraded to the principal alone.
+mcp::McpSessionBinding readonly_api_token(std::string principal = "alice") {
+    return mcp::McpSessionBinding{.principal = std::move(principal),
+                                  .auth_source = "api_token",
+                                  .principal_kind = "human",
+                                  .mcp_tier = "readonly",
+                                  .token_scope_service = {}};
+}
+}  // namespace
+
+TEST_CASE("bridge sweep with a class-bearing mint: a live session's record is kept, a "
+          "terminated session's record is reaped as session_dead (#4754)",
+          "[mcp][bridge][2f][session][4754]") {
+    const auto owner = readonly_api_token();
+
+    SECTION("a different class of the same principal cannot reserve; the owner's class can") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        auto other_tier = owner;
+        other_tier.mcp_tier = "supervised";
+        auto other_source = owner;
+        other_source.auth_source = "mcp_token";
+        for (const auto& other : {other_tier, other_source, bound("alice")}) {
+            auto refused = fx.bridge->reserve(s.id, other, json(1), json("t"), true);
+            CHECK_FALSE(refused.ok);
+            CHECK(std::string(refused.reject_reason) == "unknown_session");
+        }
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        CHECK(fx.bridge->record_count() == 1);
+    }
+    SECTION("ring-only record: retained while the session is live") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-live"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        fx.bridge->sweep();
+        // A record whose stored binding had lost the class would read as a dead session
+        // here (exists() compares the whole binding) and be reaped while the session lives.
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
+    }
+    SECTION("ring-only record: reaped as session_dead once the owner terminates the session") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dead"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        REQUIRE(fx.sessions.terminate(s.id, owner) ==
+                mcp::McpSessionRegistry::ValidateResult::kValid);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 1);
+    }
+    SECTION("armed-get-only record: retained while live, reaped as session_dead after terminate") {
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), false).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-get"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kArmedGetOnly);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
+
+        REQUIRE(fx.sessions.terminate(s.id, owner) ==
+                mcp::McpSessionRegistry::ValidateResult::kValid);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.audit_count("mcp.bridge.session_dead") == 1);
+    }
+    SECTION("streaming record: left streaming while live, parked once the session is gone") {
+        // streaming_park_after is the default (600 s), so only session death can park it.
+        Fx fx;
+        auto s = fx.make_session_as(owner);
+        REQUIRE(fx.bridge->reserve(s.id, owner, json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-stream"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 0.0);
+
+        REQUIRE(fx.sessions.terminate(s.id, owner) ==
+                mcp::McpSessionRegistry::ValidateResult::kValid);
+        fx.bridge->sweep();
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);  // PARKED
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 1.0);
+    }
 }
 
 TEST_CASE("bridge progress slot - latest-wins, terminal never dropped",
@@ -2835,7 +2994,7 @@ TEST_CASE("bridge progress slot - latest-wins, terminal never dropped",
     // it now bounds THAT instead.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-m"));
     // 20 progress events latch during kArming, synchronously (bus.publish
     // invokes the listener inline, and nothing can drain until arm - see
@@ -2871,12 +3030,12 @@ TEST_CASE("bridge shutdown - idempotent, dtor-safe, gates every mutator", "[mcp]
     SECTION("explicit shutdown twice, then destruction") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-z"));
         fx.bridge->shutdown();
         fx.bridge->shutdown();  // idempotent
         CHECK(fx.bus.subscriber_count("exec-z") == 0);
-        CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false)
+        CHECK(std::string(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), false)
                               .reject_reason) == "shutdown");
         CHECK(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
               Bridge::ArmOutcome::kNotFound);
@@ -2889,7 +3048,7 @@ TEST_CASE("bridge shutdown - idempotent, dtor-safe, gates every mutator", "[mcp]
     SECTION("destruction WITHOUT explicit shutdown joins and unsubscribes") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-y"));
         fx.bus.publish("exec-y", "execution-progress", kProgress13);
         fx.bridge.reset();  // ~McpStreamBridge → shutdown(): joins projector, unsubscribes
@@ -2901,7 +3060,7 @@ TEST_CASE("bridge double terminal-publish failure - poison, counted, charge free
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-x"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -2921,7 +3080,7 @@ TEST_CASE("bridge double terminal-publish failure - poison, counted, charge free
     CHECK(fx.reg.counter("yuzu_mcp_stream_terminal_publish_failures_total").value() >= 2.0);
     // The charge settled pinless: the session's four streamed slots are free again.
     for (int i = 2; i <= 5; ++i) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok);
     }
 }
 
@@ -2955,12 +3114,12 @@ TEST_CASE("bridge pressure - the teardown audit names the ladder rung that actua
     // Two parked records so the pressure hatch has an oldest to pick; A never
     // completes, so its disposition is kSynthesizeUnavailable (the -32014 arm).
     auto build = [](Fx& fx, Fx::Session& s) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("a"), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-f4-a"));
         REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
         REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json("b"), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-f4-b"));
         REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -3036,7 +3195,7 @@ TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3
     auto s = fx.make_session();
     SECTION("a reject is still a reject when its counter throws") {
         fx.bridge->inject_observability_fault_for_test(1);
-        auto r = fx.bridge->reserve("nope", "alice", json(1), std::nullopt, false);
+        auto r = fx.bridge->reserve("nope", bound("alice"), json(1), std::nullopt, false);
         CHECK_FALSE(r.ok);
         CHECK(std::string(r.reject_reason) == "unknown_session");
         CHECK(fx.reg.counter("yuzu_mcp_bridge_reject_total", {{"reason", "unknown_session"}})
@@ -3049,7 +3208,7 @@ TEST_CASE("bridge observability faults - outcomes unchanged, deltas restored (D3
         // flush_record_obs/flush_core_obs, D3/C5) through the latest-wins
         // slot's supersede delta instead - a different source, identical
         // restore path.
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-o"));
         // Latch 20 progress events during kArming so the slot genuinely
         // coalesces (19 supersedes) - arming AFTER would let the projector
@@ -3083,7 +3242,7 @@ TEST_CASE("bridge arm() throw leaves the record cleanly abandonable (Sol finding
     // handler's guard can abandon it - no leaked global slot, no half-armed state.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-af"));
     fx.bridge->inject_arm_fault_for_test();
     CHECK_THROWS_AS(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly),
@@ -3097,7 +3256,7 @@ TEST_CASE("bridge arm() throw leaves the record cleanly abandonable (Sol finding
     CHECK(fx.bridge->record_count() == 0);
     CHECK(fx.bus.subscriber_count("exec-af") == 0);
     // The one-shot fault cleared: a fresh reserve+arm now succeeds.
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-af2"));
     CHECK(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
 }
@@ -3111,14 +3270,14 @@ TEST_CASE("bridge reserve()/subscribe() throw is contained by the caller (Sol/qu
     auto s = fx.make_session();
     SECTION("reserve throw leaves no record") {
         fx.bridge->inject_reserve_fault_for_test();
-        CHECK_THROWS_AS(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false),
+        CHECK_THROWS_AS(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false),
                         std::bad_alloc);
         CHECK(fx.bridge->record_count() == 0);  // threw after admission, before insert
         // one-shot cleared: a fresh reserve succeeds
-        CHECK(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+        CHECK(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
     }
     SECTION("subscribe throw leaves the record unsubscribed (caller abandons)") {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), false).ok);
         fx.bridge->inject_subscribe_fault_for_test();
         CHECK_THROWS_AS(fx.bridge->subscribe(s.id, json(2), "exec-sf"), std::bad_alloc);
         CHECK(fx.bus.subscriber_count("exec-sf") == 0);  // no listener installed
@@ -3143,7 +3302,7 @@ TEST_CASE("bridge kArming reaper - an orphaned reserved record is reclaimed (cpp
         [base, offset] { return base + std::chrono::seconds(offset->load()); });
 
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-orphan"));
     // Never armed. Before the threshold, sweep leaves it (it's "in flight").
     fx.bridge->sweep();
@@ -3160,7 +3319,7 @@ TEST_CASE("bridge kArming reaper - an orphaned reserved record is reclaimed (cpp
     CHECK(fx.audit_count("mcp.bridge.arming_reaped") == 1);
 
     // A record that IS armed within the window is never reaped by age.
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), false).ok);
     REQUIRE(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
     offset->store(500);
     fx.bridge->sweep();  // kArmedGetOnly is NOT kArming - age reaper does not touch it
@@ -3176,7 +3335,7 @@ TEST_CASE("bridge concurrent publish during shutdown - unsubscribe waits out lis
     // destroyed. Primary value is the TSan leg (no UAF, no race, no lost throw).
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cs"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
 
@@ -3202,7 +3361,7 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     // final, charge released exactly once. TSan is the point.
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);  // streamed_intent
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);  // streamed_intent
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cr"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly, charged
@@ -3236,9 +3395,9 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     const auto displaced_total = [&] {
         return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
     };
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(3), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true).ok);
     CHECK(displaced_total() == 0.0);  // all three fit in the free slots
     // The FOURTH is the cap probe. It used to be refused outright, which is the
     // #2740 lockout this branch removes: the slot is held by an ORPHAN pin whose
@@ -3247,7 +3406,7 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     // a leaked charge would have made this the FOURTH occupant rather than a
     // reclaim. (See the note above for what this does NOT catch: a single-site
     // double-release is absorbed by the ledger's own floor.)
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
     CHECK(displaced_total() == 1.0);
     CHECK(s.stream->pinned_count() == 0);  // the orphan yielded its slot
 }
@@ -3275,7 +3434,7 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
     for (int i = 1; i <= 4; ++i) {
         const std::string exec = "exec-r1-" + std::to_string(i);
         REQUIRE(poll_until([&] {
-            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+            return fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok;
         }));
         REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
         REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
@@ -3316,7 +3475,7 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
     int admitted = 0;
     int next_id = 100;
     for (int i = 0; i < 200; ++i) {
-        if (fx.bridge->reserve(s.id, "alice", json(next_id++), json("t"), true).ok) {
+        if (fx.bridge->reserve(s.id, bound("alice"), json(next_id++), json("t"), true).ok) {
             ++admitted;
         }
     }
@@ -3344,7 +3503,7 @@ TEST_CASE("bridge reserve races on_final_written releasing the pin it would recl
     CHECK(snap.unpinned == 4);
     // A ninth attempt (past the 200 already run) must decline cleanly - not crash,
     // not double-admit.
-    const auto over = fx.bridge->reserve(s.id, "alice", json(9999), json("t"), true);
+    const auto over = fx.bridge->reserve(s.id, bound("alice"), json(9999), json("t"), true);
     CHECK_FALSE(over.ok);
     CHECK(std::string(over.reject_reason) == "pin_slots");
 }
@@ -3361,7 +3520,7 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
     for (int i = 1; i <= 4; ++i) {
         const std::string exec = "exec-r2-" + std::to_string(i);
         REQUIRE(poll_until([&] {
-            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+            return fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok;
         }));
         REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
         REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
@@ -3413,7 +3572,7 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
     int admitted = 0;
     int next_id = 100;
     for (int i = 0; i < 200; ++i) {
-        if (fx.bridge->reserve(s.id, "alice", json(next_id++), json("t"), true).ok) {
+        if (fx.bridge->reserve(s.id, bound("alice"), json(next_id++), json("t"), true).ok) {
             ++admitted;
         }
     }
@@ -3433,7 +3592,7 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
     const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
     CHECK(snap.pinned == 0);
     CHECK(snap.unpinned == 4);
-    const auto over = fx.bridge->reserve(s.id, "alice", json(9999), json("t"), true);
+    const auto over = fx.bridge->reserve(s.id, bound("alice"), json(9999), json("t"), true);
     CHECK_FALSE(over.ok);
     CHECK(std::string(over.reject_reason) == "pin_slots");
 }
@@ -3469,7 +3628,7 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
 
         // Park a streamed record on that execution: kRingOnly is the phase whose
         // final goes through build_real_final.
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), *exec_id));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -3655,7 +3814,7 @@ TEST_CASE("McpPostPump: progress frames, then the final LAST, then EOF (C7)",
     // GET-after-response shape could not provide.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-pump"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -3693,7 +3852,7 @@ TEST_CASE("McpPostPump: the cap closes the response but never the execution (C7)
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cap2"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -3718,7 +3877,7 @@ TEST_CASE("McpPostPump: the cap closes the response but never the execution (C7)
     {
         Fx fx2;
         auto s2 = fx2.make_session();
-        REQUIRE(fx2.bridge->reserve(s2.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx2.bridge->reserve(s2.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx2.bridge->subscribe(s2.id, json(1), "exec-cap3"));
         REQUIRE(fx2.bridge->arm(s2.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -3758,7 +3917,7 @@ TEST_CASE("McpPostPump: a dead peer closes as client_gone, never as cap_expired 
     // never happened.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dead"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -3779,7 +3938,7 @@ TEST_CASE("McpPostPump: revocation and session death close the response (C7)",
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-rev"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -3919,7 +4078,7 @@ TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a 
     // runner where a wall-clock assertion would otherwise be a flake generator.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-bound"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -3999,7 +4158,7 @@ TEST_CASE("McpPostPump/CH-4: a revoked credential kills the streamed-POST within
     // to the wire (or vice versa) would pass the C7 SECTION and fail this one.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch4"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4025,7 +4184,7 @@ TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to th
     // live one. Both come from ONE projection pass, so they cannot disagree.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-tb"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4077,7 +4236,7 @@ TEST_CASE("bridge take_post_batch - a terminal beats an expired cap (C7)",
     // was holding.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cap"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4113,7 +4272,7 @@ TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later,
     // the pass after it settles.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-drain"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4185,7 +4344,7 @@ TEST_CASE("McpPostPump: wire frames carry the replay-ring event id (#2785)",
     // test compiles unchanged on the unfixed tree - where it fails.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-wireid"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4228,7 +4387,7 @@ TEST_CASE("bridge bind_post_sink - gates on kStreaming and hands off latched wor
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-bind"));
 
     auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
@@ -4279,7 +4438,7 @@ TEST_CASE("bridge streamed-POST close is allocation-free and keyed (C6c)",
     // that cost up front and the releaser closes with the string it returned.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-k"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4320,7 +4479,7 @@ TEST_CASE("on_final_written rejects a phase that never held a streamed wire (C6c
     // did not.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-getonly"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
             Bridge::ArmOutcome::kArmed);
@@ -4333,7 +4492,7 @@ TEST_CASE("take_post_batch reports record_gone, not a silent empty tick (C6c)",
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-rg"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4366,7 +4525,7 @@ TEST_CASE("take_post_batch reports record_gone for a record settled kDone but no
     // first two fixed sites in take_post_batch did not cover.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-settled"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4393,7 +4552,7 @@ TEST_CASE("bridge sweep backstop PARKS a stranded kStreaming record, never reaps
                          .ring_only_pressure_cap = 64,
                          .streaming_park_after = std::chrono::seconds(0)}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-strand"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4422,7 +4581,7 @@ TEST_CASE("bridge sweep backstop leaves a healthy kStreaming record alone (C6c)"
     // the sweep must NOT park a stream out from under its own pump.
     Fx fx;  // default streaming_park_after = 600s
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-live"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4440,7 +4599,7 @@ TEST_CASE("bridge park_after_dispatch_failure - parks, keeps the subscription, p
     // to make.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-park"));
     REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
     REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
@@ -4464,7 +4623,7 @@ TEST_CASE("bridge park_after_dispatch_failure - arbitration and the prebuilt fal
     SECTION("only kArming parks; a second call loses") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-1"));
         REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
         CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));  // no longer kArming
@@ -4473,7 +4632,7 @@ TEST_CASE("bridge park_after_dispatch_failure - arbitration and the prebuilt fal
     SECTION("an armed record cannot be parked - arm won the arbitration") {
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2"));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -4490,7 +4649,7 @@ TEST_CASE("bridge park_after_dispatch_failure - arbitration and the prebuilt fal
         // the only other place that fills fallback_final - never ran.
         Fx fx;
         auto s = fx.make_session();
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-fb"));
         REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
         // Fail the REAL final build so the projector publishes the prebuilt
@@ -4520,20 +4679,20 @@ TEST_CASE("bridge reserve - the streamed charge and the record commit together (
     Fx fx;
     auto s = fx.make_session();
     fx.bridge->inject_reserve_commit_fault_for_test();
-    REQUIRE_THROWS_AS(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true),
+    REQUIRE_THROWS_AS(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true),
                       std::bad_alloc);
     CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // no orphan record
 
     // The load-bearing half: the ledger is invisible from outside, so the only
     // way to prove it rolled back is to spend every slot. kMaxStreamedPostsPerSession
     // is 4 - if the failed reserve leaked a charge, the FOURTH of these rejects.
-    CHECK(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
-    CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(2), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(3), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true).ok);
     // ...and the cap itself still bites, so the test cannot pass by the ledger
     // simply never counting.
-    auto over = fx.bridge->reserve(s.id, "alice", json(6), json("t"), true);
+    auto over = fx.bridge->reserve(s.id, bound("alice"), json(6), json("t"), true);
     CHECK_FALSE(over.ok);
     CHECK(std::string(over.reject_reason == nullptr ? "" : over.reject_reason) == "pin_slots");
 }
@@ -4561,7 +4720,7 @@ TEST_CASE("bridge #2528 - a ClaimGuard lock failure still releases the claim",
     // never appeared.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), false).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cg"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
 
@@ -4599,7 +4758,7 @@ TEST_CASE("bridge #2528 - a terminal lost to the degraded settle publishes the f
     // kNone (which would answer the client nothing at all).
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-pl"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly
@@ -4662,10 +4821,10 @@ TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, t
     // Record 1 is the degrade victim; 2-4 spend the remaining pin slots so the cap
     // is exactly consumed and a further reserve becomes the ledger probe (the
     // ledger is invisible from outside - spending the cap is the only way to read it).
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2529"));
     for (int i = 2; i <= 4; ++i) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok);
     }
 
     // A cancel that lands BEFORE arm is the one path that returns a charge outside
@@ -4681,7 +4840,7 @@ TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, t
     // The charge was NOT returned and the ledger still counts it - they AGREE, so
     // the cap correctly still bites. This is NOT the load-bearing assertion: the
     // pre-fix code also rejected here (for the opposite, broken reason).
-    auto pin_reject3 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+    auto pin_reject3 = fx.bridge->reserve(s.id, bound("alice"), json(5), json("t"), true);
     // Null-guarded like the sibling at the C6a test: if the cap ever fails to
     // bite, std::string(nullptr) is UB and kills the whole binary instead of
     // failing this assertion cleanly.
@@ -4700,7 +4859,7 @@ TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, t
     fx.bridge->sweep();
     REQUIRE_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // reaped
     CHECK(s.stream->pinned_count() == 0);  // GET-only never pins, so this reads the ledger alone
-    CHECK(fx.bridge->reserve(s.id, "alice", json(6), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(6), json("t"), true).ok);
 }
 
 // ── C10: chaos P0 endpoint reproductions (docs/mcp-streamable-http-chaos-design.md) ──
@@ -4716,7 +4875,7 @@ TEST_CASE("CH-2: a parked streamed record survives a ring wrap - the pinned fina
     const auto drive = [](Fx& fx, Fx::Session& s, const char* exec,
                           std::shared_ptr<mcp::sse_bus::SseSinkState>& sink,
                           std::optional<std::string>& key) {
-        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
         REQUIRE(fx.bridge->subscribe(s.id, json(1), exec));
         REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
                 Bridge::ArmOutcome::kArmed);
@@ -4820,7 +4979,7 @@ TEST_CASE("CH-12: a duplicate cancel is a no-op - the detach is audited exactly 
     // releaser parks the record, which is later than the duplicate arrives.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dup"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4849,7 +5008,7 @@ TEST_CASE("CH-12: a cancel arriving after the pump already ended the response is
     // liveness into the same flag the cancel interlock reads.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-late"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4903,7 +5062,7 @@ TEST_CASE("CH-12: cancel mid-execution detaches the response but never the execu
     // client believe it had stopped a fleet-wide change it had not.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch12"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -4969,7 +5128,7 @@ TEST_CASE("CH-14: a stalled socket write must never block a publisher",
     // socket write must never block a publisher". The POST pump did not.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch14"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -5021,7 +5180,7 @@ TEST_CASE("CH-16: progress reaches the wire on publication, not on the tick",
     // function changes nothing, and that was mistaken for a timing subtlety.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch16"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -5101,7 +5260,7 @@ TEST_CASE("CH-15: pin slots are a concurrency limit, never a lifetime quota",
 
     for (int i = 1; i <= 12; ++i) {  // 3x the cap, sequentially
         const std::string exec = "exec-ch15-" + std::to_string(i);
-        auto rr = fx.bridge->reserve(s.id, "alice", json(i), json("t"), true);
+        auto rr = fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true);
         INFO("sequential completed streamed call #" << i
              << " reject=" << (rr.reject_reason == nullptr ? "" : rr.reject_reason));
         REQUIRE(rr.ok);
@@ -5145,7 +5304,7 @@ TEST_CASE("CH-14b: a cancel racing a completing tick must not claim a detach",
     // final, the response IS ending and there is nothing left to detach.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch14b"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -5178,7 +5337,7 @@ TEST_CASE("a client-driven bridge audit carries the caller, not \"system\"",
     // is indistinguishable from the bridge's own housekeeping.
     Fx fx;
     auto s = fx.make_session();
-    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-actor"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
@@ -5230,7 +5389,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         for (int i = 1; i <= 4; ++i) {
             const std::string exec = "exec-residual-" + std::to_string(i);
             REQUIRE(poll_until([&] {
-                return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+                return fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok;
             }));
             REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
             REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
@@ -5246,7 +5405,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         // Arm the residual, then make the admission that triggers the reclaim.
         s.stream->inject_unpin_fault_for_test(fault);
         Out out;
-        out.admitted = fx.bridge->reserve(s.id, "alice", json(99), json("t"), true).ok;
+        out.admitted = fx.bridge->reserve(s.id, bound("alice"), json(99), json("t"), true).ok;
         out.raced = fx.reg.counter("yuzu_mcp_bridge_pin_release_raced_total").value();
         out.failed = fx.reg.counter("yuzu_mcp_bridge_pin_release_failed_total").value();
         out.displaced =
@@ -5354,7 +5513,7 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     for (int i = 1; i <= 2; ++i) {
         const std::string exec = "exec-decline-" + std::to_string(i);
         REQUIRE(poll_until([&] {
-            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+            return fx.bridge->reserve(s.id, bound("alice"), json(i), json("t"), true).ok;
         }));
         REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
         REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
@@ -5372,7 +5531,7 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     // latched, then stalled after the ladder commits the frame (ring pin now live) and
     // before pinned_event_id is stamped - the phantom-double-count window.
     REQUIRE(poll_until([&] {
-        return fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok;
+        return fx.bridge->reserve(s.id, bound("alice"), json(3), json("t"), true).ok;
     }));
     REQUIRE(fx.bridge->subscribe(s.id, json(3), "exec-decline-3"));
     REQUIRE(fx.bridge->arm(s.id, json(3), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
@@ -5404,7 +5563,7 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     // FIRST admission check below even reaches selection.
     REQUIRE(fx.bridge->accounting_snapshot_for_test(s.id, s.stream).pinned == 3);
 
-    const auto res = fx.bridge->reserve(s.id, "alice", json(99), json("t"), true);
+    const auto res = fx.bridge->reserve(s.id, bound("alice"), json(99), json("t"), true);
     CHECK_FALSE(res.ok);
     CHECK(std::string(res.reject_reason) == "pin_slots");
     // No false credit for a release that did not happen: nothing was released, so
@@ -5427,7 +5586,7 @@ TEST_CASE("bridge admission declines rather than reclaiming while a candidate is
     // Once record 3 settles, the SAME admission that just declined succeeds - proving
     // the decline was about the window, not a permanent lockout, and that this session
     // is not left wedged by the seam.
-    CHECK(fx.bridge->reserve(s.id, "alice", json(100), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, bound("alice"), json(100), json("t"), true).ok);
 }
 
 // QA-1: the UnpinFault seam's own one-shot/disarm contract, tested directly on a bare

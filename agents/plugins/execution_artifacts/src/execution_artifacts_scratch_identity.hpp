@@ -52,7 +52,7 @@ using ScopedHandle = yuzu::agent::confined_fs::WinHandle;
 /// Returns the current process token's owner (TOKEN_OWNER) as an
 /// in-process buffer, or an empty vector on any failure -- the two-call
 /// GetTokenInformation idiom already used by process_enum.cpp/
-/// tar_proc_etw.cpp, requesting TokenOwner (a PSID) rather than TokenUser.
+/// echo_proc_etw.cpp, requesting TokenOwner (a PSID) rather than TokenUser.
 /// The PSID inside the returned buffer is only valid for the buffer's
 /// lifetime.
 inline std::vector<BYTE> current_process_token_owner_buf() {

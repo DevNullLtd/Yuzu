@@ -52,7 +52,7 @@ For example, if `jane.ops` holds the Operator role on the "London Office" group,
 > **When RBAC is disabled (the default posture):** management-group role
 > assignments are **not** consulted. Every authenticated user sees the full
 > enrolled agent set, matching the legacy-admin "full access" behaviour. The
-> dashboard agent list, the `/api/agents` endpoint, and the TAR fleet scan all
+> dashboard agent list, the `/api/agents` endpoint, and the Echo fleet scan all
 > draw from this path. If you later **enable** RBAC, visibility immediately
 > becomes role-scoped — ensure users have appropriate management-group role
 > assignments *before* enabling RBAC in production (see "Enabling RBAC" in
@@ -357,7 +357,7 @@ curl -s -b cookies.txt \
 
 ### Add a Role Assignment
 
-Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A service-scoped API token is refused outright, and the `ITServiceOwner` arm is also refused for any MCP-tier session and for an engine-classed session (those two need the global `ManagementGroup:Write` permission); the same refusals apply to listing and removing role assignments.
 
 ```bash
 curl -s -b cookies.txt -X POST \
@@ -405,7 +405,7 @@ Returns `200 OK`:
 }
 ```
 
-The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A caller admitted only as `ITServiceOwner` of the group can remove only `Operator` and `Viewer` assignments (`403` otherwise); removing an `ITServiceOwner` assignment needs the global `ManagementGroup:Write` permission.
 
 ## Service Groups
 
@@ -467,7 +467,9 @@ Now `emea.lead` can manage all devices in EMEA, and members of the `emea-helpdes
 
 ## Dashboard Management
 
-Management groups are managed through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
+The **Groups and enrolment** page (`/groups`, Estate) shows the management groups read-only: the tree with each group's type and member count, the selected group's details (parent, description, who created it and when, and the stored rule of a rule-based group, that is, one of type `dynamic`), and its member list. A group's members are shown only within the viewer's scope, and the panel says so without stating how many were left out. A panel that cannot be read says so with a Retry button rather than showing an empty tree or "0 members". Membership of a rule-based group is not kept up to date from its rule, so such a group may show no members; the Dynamic membership row under Concepts describes how each kind is filled.
+
+Groups are created and deleted through the **Settings** page in the HTMX dashboard. The Settings page displays all groups in a tree view with indentation reflecting the hierarchy. The root "All Devices" group is always displayed first.
 
 From the Settings page, administrators can:
 
@@ -499,7 +501,7 @@ Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
 | `DELETE` | `/api/v1/management-groups/{id}/members/{agent_id}` | Remove an agent from a group |
 | `GET` | `/api/v1/management-groups/{id}/roles` | List role assignments for a group |
 | `POST` | `/api/v1/management-groups/{id}/roles` | Add a role assignment to a group |
-| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group |
+| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group (a caller who is only the group's `ITServiceOwner` can remove only `Operator` and `Viewer`) |
 
 ## Constraints
 

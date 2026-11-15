@@ -150,7 +150,7 @@ TEST_CASE("#2500 — every emitted reason is a member of the closed label set",
 // Extracted from the dispatch closures during governance for one reason: it was
 // the highest-consequence decision in the change and nothing tested it. The
 // closures live inside `Server::start()`, unreachable by any harness (#2557 —
-// NOT #1786, which is the TAR dashboard fragments, closed by #2534),
+// NOT #1786, which is the Echo dashboard fragments, closed by #2534),
 // and the route tests assert against STUB dispatch closures — so reverting the
 // real sink's default would have broken no test at all.
 

@@ -5,7 +5,7 @@
 // projection.
 //
 // Windows-headers-free and I/O-free by design (mirrors users_macos_last.hpp /
-// tar_netconn.hpp's split): the Win32 shell (users_plugin.cpp) owns EvtQuery/
+// echo_netconn.hpp's split): the Win32 shell (users_plugin.cpp) owns EvtQuery/
 // EvtNext/EvtRender against the Security channel and hands this header the
 // rendered UTF-8 XML string; every parsing and selection decision lives here
 // so it is independently unit-testable on every host (test_users_win_events.cpp),

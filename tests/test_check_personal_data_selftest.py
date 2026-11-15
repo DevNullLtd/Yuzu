@@ -339,7 +339,7 @@ class T(unittest.TestCase):
         self.assertIn("oversize=1", out)
 
     # shrink-only ratchet
-    def _ratchet_repo(self, base_count, now_count):
+    def _ratchet_repo(self, base_count, now_count, moved_to=None):
         def lines(n):
             return "".join(f"{U}{REAL_USER}{i}/x\n" for i in range(n))
         self.r.write("a.md", lines(base_count))
@@ -348,7 +348,9 @@ class T(unittest.TestCase):
         subprocess.run(["git", "-C", self.r.root, "-c", "user.name=t", "-c", "user.email=t@example.com",
                         "commit", "-q", "-m", "base"], check=True)
         subprocess.run(["git", "-C", self.r.root, "branch", "-f", "basebr"], check=True)
-        self.r.write("a.md", lines(now_count))
+        if moved_to:
+            subprocess.run(["git", "-C", self.r.root, "mv", "a.md", moved_to], check=True)
+        self.r.write(moved_to or "a.md", lines(now_count))
         self.r.run("--update-baseline")
         subprocess.run(["git", "-C", self.r.root, "add", "-A", "-f"], check=True)
         subprocess.run(["git", "-C", self.r.root, "-c", "user.name=t", "-c", "user.email=t@example.com",
@@ -365,6 +367,17 @@ class T(unittest.TestCase):
         rc, out = self.r.run("--ratchet", "--base", "basebr")
         self.assertEqual(rc, 1, out)
         self.assertIn("baseline grew", out)
+    def test_ratchet_follows_a_rename(self):
+        # The baselined file moves; its allowance moves with it, so it is not a new entry.
+        self._ratchet_repo(2, 2, moved_to="b.md")
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 0, out)
+    def test_ratchet_rename_with_growth_still_fails(self):
+        self._ratchet_repo(2, 3, moved_to="b.md")
+        rc, out = self.r.run("--ratchet", "--base", "basebr")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("baseline grew", out)
+        self.assertIn("max_hits 2 -> 3", out)  # compared against the RENAMED path's allowance
     def test_ratchet_shrink_and_equal_pass(self):
         self._ratchet_repo(2, 1)
         rc, out = self.r.run("--ratchet", "--base", "basebr")

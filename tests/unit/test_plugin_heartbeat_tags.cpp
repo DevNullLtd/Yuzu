@@ -51,15 +51,15 @@ std::map<std::string, std::string> run(const Kv& kv, const std::vector<std::stri
 TEST_CASE("heartbeat bridge: heartbeat.* keys become yuzu.plugin.<plugin>.<key> tags",
           "[agent][heartbeat_tags]") {
     Kv kv;
-    kv["tar"]["heartbeat.db_corruption_total"] = "1";
-    kv["tar"]["heartbeat.db_quarantine_last"] = "1700000000:tar.db.corrupt-1700000000";
-    kv["tar"]["other_key"] = "ignored"; // no heartbeat. prefix
+    kv["echo"]["heartbeat.db_corruption_total"] = "1";
+    kv["echo"]["heartbeat.db_quarantine_last"] = "1700000000:echo.db.corrupt-1700000000";
+    kv["echo"]["other_key"] = "ignored"; // no heartbeat. prefix
     kv["wmi"]["unrelated"] = "x";
     std::vector<std::string> prefixes;
-    auto tags = run(kv, {"tar", "wmi"}, &prefixes);
+    auto tags = run(kv, {"echo", "wmi"}, &prefixes);
     CHECK(tags.size() == 2);
-    CHECK(tags["yuzu.plugin.tar.db_corruption_total"] == "1");
-    CHECK(tags["yuzu.plugin.tar.db_quarantine_last"] == "1700000000:tar.db.corrupt-1700000000");
+    CHECK(tags["yuzu.plugin.echo.db_corruption_total"] == "1");
+    CHECK(tags["yuzu.plugin.echo.db_quarantine_last"] == "1700000000:echo.db.corrupt-1700000000");
     for (const auto& p : prefixes)
         CHECK(p == "heartbeat.");
 }
@@ -101,8 +101,8 @@ TEST_CASE("heartbeat bridge: plugins_failed tag joins names, omitted when none",
     std::map<std::string, std::string> tags;
     emit_plugins_failed_tag(tags, {});
     CHECK(tags.empty());
-    emit_plugins_failed_tag(tags, {"tar"});
-    CHECK(tags["yuzu.plugins_failed"] == "tar");
-    emit_plugins_failed_tag(tags, {"tar", "wmi"});
-    CHECK(tags["yuzu.plugins_failed"] == "tar,wmi");
+    emit_plugins_failed_tag(tags, {"echo"});
+    CHECK(tags["yuzu.plugins_failed"] == "echo");
+    emit_plugins_failed_tag(tags, {"echo", "wmi"});
+    CHECK(tags["yuzu.plugins_failed"] == "echo,wmi");
 }

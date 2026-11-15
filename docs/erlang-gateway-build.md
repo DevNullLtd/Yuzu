@@ -14,6 +14,8 @@ rebar3 ct --dir apps/yuzu_gw/test/ct --suite <name>  # Common Test (ct does not 
 bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl in sync with priv/proto
 ```
 
+**Gateway image platforms (#6711).** `deploy/docker/Dockerfile.gateway` builds for `linux/amd64` only. Its pinned `erlang:28-alpine` index is mixed upstream (amd64 on Alpine 3.23, every other platform on 3.24), the runtime stage is Alpine 3.23, and the abi-guard requires the builder and runtime on the same Alpine release on every architecture, while the runtime cannot move to Alpine 3.24 before OTP 29.1 (musl 1.2.6 with an older OTP aborts at boot on AMX CPUs, #1743; AMX is x86-only, so for arm64 this is a lockstep policy), so the deps stage refuses any other `TARGETARCH` up front. This is a scoping choice: older `erlang:28-alpine` indexes keep both architectures on Alpine 3.23, and whether to re-pin to one is tracked in #6740. The supported list is the `# yuzu:gateway-platforms` marker in the Dockerfile; `scripts/ci/check-gateway-base-index.py` (run in `docker-healthcheck-invariants.yml`, fixture-tested by `tests/test_gateway_base_index.py`) fails when the pinned index does not annotate a listed platform as built on the runtime stage's Alpine release (it reads the publisher's annotation; the build's abi-guard remains the build-time check, and it exits 1 on a mismatch, 2 when the registry is unreadable and 3 on an input it does not understand). Lift the restriction with that re-pin (#6740) or with the move to OTP 29.1 or newer. The check covers the platforms on the marker line only: the others are reported as notes, not failures.
+
 `apps/yuzu_gw/test/ct` includes `yuzu_gw_scale_SUITE`, which starts the gateway, a fake server and a load generator as separate nodes and runs 500 simulated agents through seven scenarios (about 1 min of the CT run with the PR #5695 fixes); see `docs/testing/gateway-scale-tests.md` for the 5,000 and 25,000 sizes and the `gate` group.
 
 **Memory per idle agent connection.** The same suite's on-demand `idle_memory` case (not in the default run or CI) measures the gateway's marginal bytes per idle connection over TLS and plaintext, with real-shaped registrations, heartbeats and fleet snapshots, at N = 0 / 1k / 5k / 10k: run `scripts/test/gateway-idle-mem.sh` from the repo root (about 45 minutes). Linux is the platform the per-connection budget is judged on. What it reports, its settings and the ceiling file: `docs/testing/gateway-scale-tests.md`, "Idle memory per connection".
@@ -27,6 +29,17 @@ bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl i
 **`--dir apps/yuzu_gw/test` is mandatory on `rebar3 eunit`**, not optional. Without it, rebar3 3.27 intersects discovered test modules against the `src/`-derived `modules` list in `yuzu_gw.app` and rejects every orphan test module (`*_tests` without a 1:1 src counterpart, every `*_SUITE` file, helpers) with `Module X not found in project` before running a single test. Tracked as **#337**; `scripts/run-tests.sh erlang-unit` already applies the workaround, but if you invoke rebar3 directly you must pass the flag yourself.
 
 **`rebar3 eunit --module X` does NOT give you test isolation.** It runs the full `--dir` phase first, then the module filter, **in the same BEAM VM**. The second run inherits polluted state — meck mocks, registered names, leaked processes, send_after timers — from the first, so a passing filtered run does not prove the test is order-independent, and a failing filtered run may be failing because of pollution rather than the test itself. For real isolation, `rm -rf gateway/_build/test` between runs (forces a fresh BEAM) or drop into `erl -pa _build/test/lib/yuzu_gw/ebin -pa _build/test/lib/*/ebin` and call test functions directly. This gotcha wasted meaningful debugging time on #336.
+
+## The malloc_trim NIF
+
+The gateway's only C is `apps/yuzu_gw/c_src/yuzu_gw_mem_trim_nif.c`: one function, `malloc_trim(0)`, with no input, no state and no allocation, which `yuzu_gw_mem_reclaim` calls after a memory-reclaim pass (operator description: `docs/user-manual/gateway.md`, "Giving memory back after a drop").
+
+- **Where it is built.** `apps/yuzu_gw/rebar.config` has a `pre_hooks` entry keyed `"-linux-gnu-"`. rebar3 matches that as a regex against the Erlang target (`<otp>-<system_architecture>-<wordsize>`, e.g. `28.5.0.2-x86_64-pc-linux-gnu-64`), so the hook runs on glibc Linux and not on Alpine/musl (`-linux-musl-`), macOS (`-apple-darwin`) or Windows (`win32`). No Docker, Meson or CI change: the glibc builders (`Dockerfile.gateway.chisel`, `Dockerfile.ci-gateway`, the Meson `.gateway_built` target on Linux, `release.yml`'s gateway job) all have a C compiler, and the Alpine builder, macOS and Windows never need one. The `.so` lands in `apps/yuzu_gw/priv/` (gitignored, kept out of Docker contexts by `.dockerignore`) and ships in the release's `lib/yuzu_gw-*/priv`.
+- **It fails hard on glibc Linux.** The hook runs `c_src/build_mem_trim_nif.sh`, which fails `rebar3 compile` when no compiler is found (`CC` overrides it): a soft skip would ship a `.deb`, `.rpm` or chiselled image without the trim and nobody would notice. `yuzu_gw_mem_trim_tests:loaded_exactly_on_glibc_linux_test/0` fails on a glibc Linux eunit run whose NIF did not load. The script writes to a temporary name and renames, so the parallel Meson eunit shards (one rebar3 each, one shared `priv/`) never load a half-written file.
+- **A hook command runs only its first command.** rebar3 cut `"a && b"` and `"a; b"` to `a` (checked 2026-10-29 on rebar3 3.27.0), which is why the hook calls a script rather than an inline `mkdir ... && cc ...`.
+- **Loading is optional.** `yuzu_gw_mem_trim`'s `-on_load` always returns `ok`, so a missing or unloadable `.so` never stops the module (or, in an embedded release, the boot); `malloc_trim/0` then raises `error:nif_not_loaded`, which the reclaim pass turns into "garbage collection only" with one notice line.
+- **Why not `port_compiler` or a Makefile.** `pc` would be a new Hex plugin (supply-chain review, a pin, a PLT interaction) for one file; a Makefile adds a `make` requirement. A compiler alone is enough.
+- **Memory safety.** The C gets `cpp-safety` review. It was built once with `-fsanitize=address,undefined` and loaded into a BEAM with the sanitizer runtimes preloaded (gcc 14.2, Debian, 2026-10-29: 8,000 calls from four processes while eight others churned the heap, no report). It is not fuzzed: there is no input to fuzz (arity 0). Gateway C that handles peer input would need fuzzing as well; this function handles none.
 
 ## The gRPC layer and how listeners are started
 
@@ -166,16 +179,22 @@ Erlang/OTP 28.4 or later 28.x is the only supported toolchain for the gateway te
 override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
 
-**Meson runs the EUnit suite as two shards: `gateway eunit shard A` and
-`gateway eunit shard B`.** Each is `scripts/test_gateway.py gateway eunit
---shard K/2` with its own `REBAR_BASE_DIR` (`gateway/_build_eunit_1`,
-`_build_eunit_2`), a 540s wrapper deadline and a 600s meson timeout. The whole
-suite had outgrown one 540s run on the Windows leg (PR #5695). The partition is
-deterministic and weighted by measured per-module Windows times
-(`scripts/gateway_eunit_shards.py`). A new test module lands in a shard without
-any edit. Between them the two shards run exactly the module set that
-`rebar3 eunit --dir apps/yuzu_gw/test` runs, each module in its own test
-process, as under `--dir`. The shard's module list reaches rebar3 through
+**Meson runs the EUnit suite as three shards: `gateway eunit shard A`, `B`
+and `C`.** Each is `scripts/test_gateway.py gateway eunit --shard K/3` with its
+own `REBAR_BASE_DIR` (`gateway/_build_eunit_1` to `_build_eunit_3`), a 540s
+wrapper deadline and a 600s meson timeout. The whole suite had outgrown one
+540s run on the Windows leg (PR #5695). The partition is deterministic and
+weighted by measured per-module times (`scripts/gateway_eunit_shards.py`). A
+new test module lands in a shard without any edit. A shard runs with cover
+OFF (the config script below forces the test profile's `cover_enabled` to
+false): meck's cover preservation on every mock of a `src/` module made the
+suite take 459s instead of 268s, and nothing reads a shard's cover data. A
+plain `rebar3 eunit --dir apps/yuzu_gw/test` still runs with cover, so it is
+slower than the shards together.
+
+Between them the shards run exactly the module set that `rebar3 eunit --dir
+apps/yuzu_gw/test` runs, each module in its own test process, as under `--dir`.
+The shard's module list reaches rebar3 through
 `gateway/eunit_shard.config.script` (`REBAR_CONFIG`), not through `--module`,
 because `--module m1,m2` runs every listed module in one shared process.
 `tests/test_gateway_eunit_shards.py` pins this. `python3 scripts/test_gateway.py

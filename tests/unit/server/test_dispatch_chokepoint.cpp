@@ -127,7 +127,7 @@ TEST_CASE("ClassifiedCommand: only the test-only door can mint one outside Serve
     // has a real, linkable path to construct one.
     agent_pb::CommandRequest cmd;
     cmd.set_command_id("door-test");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("fleet_snapshot");
     cmd.set_dispatch_tag(
         encode_dispatch_tag(DispatchClass::ReadOnly, Mutability::None, std::string(32, 'a')));
@@ -197,7 +197,7 @@ inline constexpr std::array<CommandCapability, 4> kOperatorFixture{{
         .execute_gate = ExecuteGate::None,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "query",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -272,7 +272,7 @@ TEST_CASE("classify_and_authorize_dispatch: an ambiguous plugin.action is reject
     // per plugin.action, not a registry-wide poison (mirrors
     // test_command_capability.cpp's own equivalent assertion on `classify`
     // itself, one layer down).
-    auto other = classify_and_authorize_dispatch(registry, caller, "tar", "query", always_allow);
+    auto other = classify_and_authorize_dispatch(registry, caller, "echo", "query", always_allow);
     REQUIRE(other.has_value());
 }
 
@@ -389,10 +389,10 @@ TEST_CASE("classify_and_authorize_dispatch: a non-authorized operator principal 
     }
 
     SECTION("schedule-shaped: a scheduled bundle firing under its creating operator's recovered "
-            "principal, dispatching tar.query") {
+            "principal, dispatching echo.query") {
         DispatchCaller caller{.principal = "carol", .principal_role = "operator"};
         auto result =
-            classify_and_authorize_dispatch(registry, caller, "tar", "query", always_deny);
+            classify_and_authorize_dispatch(registry, caller, "echo", "query", always_deny);
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error().reason == DispatchDenialReason::Forbidden);
         CHECK(result.error().securable == "Infrastructure");
@@ -438,7 +438,7 @@ inline constexpr std::array<CommandCapability, 3> kGateFixture{{
         .execute_gate = ExecuteGate::AlwaysApproval,
     },
     {
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "sql",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -544,7 +544,7 @@ TEST_CASE("classify_and_authorize_dispatch: ExecuteGate::None never gates, regar
           "[server][dispatch][chokepoint][1398]") {
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGateFixture)};
     DispatchCaller caller{.principal = "alice", .principal_is_admin = false};
-    auto result = classify_and_authorize_dispatch(registry, caller, "tar", "sql", always_allow);
+    auto result = classify_and_authorize_dispatch(registry, caller, "echo", "sql", always_allow);
     REQUIRE(result.has_value());
 }
 
@@ -605,10 +605,10 @@ TEST_CASE("classify_and_authorize_dispatch: the three system dispatches succeed 
         std::span<const CommandCapability>(capdecls::core_dispatch_capabilities())};
     const DispatchCaller system_caller{.system = true};
 
-    SECTION("tar.fleet_snapshot") {
+    SECTION("echo.fleet_snapshot") {
         // has_permission ALWAYS DENIES — proves success is the STRUCTURAL
         // system-arm rule, not an accidental RBAC pass.
-        auto result = classify_and_authorize_dispatch(registry, system_caller, "tar",
+        auto result = classify_and_authorize_dispatch(registry, system_caller, "echo",
                                                        "fleet_snapshot", always_deny);
         REQUIRE(result.has_value());
         CHECK(result->securable == "Response");
@@ -642,11 +642,11 @@ TEST_CASE("classify_and_authorize_dispatch: the three system dispatches are deni
         std::span<const CommandCapability>(capdecls::core_dispatch_capabilities())};
     const DispatchCaller operator_caller{.principal = "alice", .system = false};
 
-    SECTION("tar.fleet_snapshot") {
+    SECTION("echo.fleet_snapshot") {
         // has_permission ALWAYS ALLOWS — proves the denial is the
         // system_reserved rule, not a missing RBAC grant an operator could
         // otherwise be given.
-        auto result = classify_and_authorize_dispatch(registry, operator_caller, "tar",
+        auto result = classify_and_authorize_dispatch(registry, operator_caller, "echo",
                                                        "fleet_snapshot", always_allow);
         REQUIRE_FALSE(result.has_value());
         CHECK(result.error().reason == DispatchDenialReason::Forbidden);
@@ -676,7 +676,7 @@ TEST_CASE("compute_dispatch_tag: decodes to the classification supplied, and its
           "matches compute_plan_hash over the same inputs",
           "[server][dispatch][chokepoint]") {
     constexpr CommandCapability cap{
-        .plugin = "tar",
+        .plugin = "echo",
         .action = "fleet_snapshot",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
@@ -687,25 +687,25 @@ TEST_CASE("compute_dispatch_tag: decodes to the classification supplied, and its
     };
     const std::map<std::string, std::string> params{{"a", "1"}, {"b", "2"}};
 
-    auto tag = compute_dispatch_tag(cap, "tar", "fleet_snapshot", params, "ids", "exec-1");
+    auto tag = compute_dispatch_tag(cap, "echo", "fleet_snapshot", params, "ids", "exec-1");
 
     auto decoded = decode_dispatch_tag(tag);
     REQUIRE(decoded.has_value());
     CHECK(decoded->dispatch_class == DispatchClass::ReadOnly);
     CHECK(decoded->mutability == Mutability::None);
     CHECK(decoded->plan_hash ==
-          compute_plan_hash("tar", "fleet_snapshot", params, "ids", "exec-1"));
+          compute_plan_hash("echo", "fleet_snapshot", params, "ids", "exec-1"));
 
     // Two dispatches differing ONLY in how targets were selected (target_arm)
     // mint distinct plan identities — the property build_classified_command
     // relies on `target_arm` for (spec item 1).
     auto tag_other_arm =
-        compute_dispatch_tag(cap, "tar", "fleet_snapshot", params, "scope", "exec-1");
+        compute_dispatch_tag(cap, "echo", "fleet_snapshot", params, "scope", "exec-1");
     CHECK(tag_other_arm != tag);
 
     // Likewise for execution_id.
     auto tag_other_exec =
-        compute_dispatch_tag(cap, "tar", "fleet_snapshot", params, "ids", "exec-2");
+        compute_dispatch_tag(cap, "echo", "fleet_snapshot", params, "ids", "exec-2");
     CHECK(tag_other_exec != tag);
 }
 
@@ -723,8 +723,8 @@ TEST_CASE("compute_dispatch_tag: decodes to the classification supplied, and its
 
 namespace {
 
-constexpr CommandCapability kTarPurgeCap{
-    .plugin = "tar",
+constexpr CommandCapability kEchoPurgeCap{
+    .plugin = "echo",
     .action = "purge_source",
     .dispatch_class = DispatchClass::Mutating,
     .mutability = Mutability::Reversible,
@@ -742,7 +742,7 @@ TEST_CASE("finalize_classified_command: the per-action kill switch refuses AFTER
     yuzu::server::detail::KillSwitchFn switch_off =
         [](std::string_view, std::string_view) { return std::nullopt; };
 
-    auto result = finalize_classified_command(kTarPurgeCap, switch_off, "tar", "purge_source",
+    auto result = finalize_classified_command(kEchoPurgeCap, switch_off, "echo", "purge_source",
                                                "cmd-1", {}, {}, 0, 0, {}, {});
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().reason == DispatchDenialReason::KillSwitched);
@@ -757,17 +757,17 @@ TEST_CASE("finalize_classified_command: the kill switch is consulted on the CLAS
           "not the caller's raw spelling",
           "[server][dispatch][chokepoint]") {
     // A callback that only recognizes the canonical spelling — if
-    // finalize_classified_command consulted the caller's raw "TAR"/"PURGE_SOURCE"
+    // finalize_classified_command consulted the caller's raw "Echo"/"PURGE_SOURCE"
     // instead of cap.plugin/cap.action, this would (wrongly) refuse.
     yuzu::server::detail::KillSwitchFn canonical_only =
         [](std::string_view plugin,
            std::string_view action) -> std::optional<std::unordered_set<std::string>> {
-        if (plugin == "tar" && action == "purge_source")
+        if (plugin == "echo" && action == "purge_source")
             return std::unordered_set<std::string>{};
         return std::nullopt;
     };
 
-    auto result = finalize_classified_command(kTarPurgeCap, canonical_only, "TAR", "PURGE_SOURCE",
+    auto result = finalize_classified_command(kEchoPurgeCap, canonical_only, "Echo", "PURGE_SOURCE",
                                                "cmd-2", {}, {}, 0, 0, {}, {});
     REQUIRE(result.has_value());
 }
@@ -777,7 +777,7 @@ TEST_CASE("finalize_classified_command: an unwired kill-switch callback is legac
           "[server][dispatch][chokepoint]") {
     yuzu::server::detail::KillSwitchFn unwired; // empty — no store wired
 
-    auto result = finalize_classified_command(kTarPurgeCap, unwired, "tar", "purge_source", "cmd-3",
+    auto result = finalize_classified_command(kEchoPurgeCap, unwired, "echo", "purge_source", "cmd-3",
                                                {}, {}, 0, 0, {}, {});
     REQUIRE(result.has_value());
     CHECK(result->kill_switched_os().empty());
@@ -791,7 +791,7 @@ TEST_CASE("finalize_classified_command: a per-OS switch OFF is carried on the cl
         return std::unordered_set<std::string>{"windows"};
     };
 
-    auto result = finalize_classified_command(kTarPurgeCap, per_os, "tar", "purge_source", "cmd-os",
+    auto result = finalize_classified_command(kEchoPurgeCap, per_os, "echo", "purge_source", "cmd-os",
                                                {}, {}, 0, 0, {}, {});
     REQUIRE(result.has_value());
     CHECK(result->kill_switched_os() == std::unordered_set<std::string>{"windows"});
@@ -806,12 +806,12 @@ TEST_CASE("finalize_classified_command: BR-009 — the wire command carries the 
         };
 
     // Caller dispatched with a differently-cased spelling — classify() is
-    // case-insensitive so this would have been authorized against kTarPurgeCap,
+    // case-insensitive so this would have been authorized against kEchoPurgeCap,
     // but the agent matches the wire fields case-SENSITIVELY.
-    auto result = finalize_classified_command(kTarPurgeCap, switch_on, "TAR", "Purge_Source",
+    auto result = finalize_classified_command(kEchoPurgeCap, switch_on, "Echo", "Purge_Source",
                                                "cmd-4", {}, {}, 0, 0, {}, {});
     REQUIRE(result.has_value());
-    CHECK(result->wire().plugin() == "tar");
+    CHECK(result->wire().plugin() == "echo");
     CHECK(result->wire().action() == "purge_source");
     CHECK(result->wire().command_id() == "cmd-4");
 }
@@ -827,7 +827,7 @@ TEST_CASE("finalize_classified_command: parameters, payload, stagger and delay r
     const std::unordered_map<std::string, std::string> params{{"path", "/var/log"}};
 
     auto result =
-        finalize_classified_command(kTarPurgeCap, switch_on, "TAR", "purge_source", "cmd-5",
+        finalize_classified_command(kEchoPurgeCap, switch_on, "Echo", "purge_source", "cmd-5",
                                     params, "payload-bytes", 5, 10, "ids", "exec-9");
     REQUIRE(result.has_value());
     CHECK(result->wire().parameters().at("path") == "/var/log");
@@ -838,11 +838,11 @@ TEST_CASE("finalize_classified_command: parameters, payload, stagger and delay r
     const std::map<std::string, std::string> ordered_params{{"path", "/var/log"}};
     auto decoded = decode_dispatch_tag(result->wire().dispatch_tag());
     REQUIRE(decoded.has_value());
-    // Composed over "TAR" (the raw caller spelling this test passed), the
+    // Composed over "Echo" (the raw caller spelling this test passed), the
     // SAME asymmetry build_classified_command has always had: the wire
     // fields are canonicalized, the plan-hash inputs are not.
     CHECK(decoded->plan_hash ==
-          compute_plan_hash("TAR", "purge_source", ordered_params, "ids", "exec-9"));
+          compute_plan_hash("Echo", "purge_source", ordered_params, "ids", "exec-9"));
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -862,7 +862,7 @@ agent_pb::AgentInfo make_agent_info(const std::string& id) {
 agent_pb::CommandRequest make_well_formed_cmd(const std::string& command_id) {
     agent_pb::CommandRequest cmd;
     cmd.set_command_id(command_id);
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("fleet_snapshot");
     cmd.set_dispatch_tag(
         encode_dispatch_tag(DispatchClass::ReadOnly, Mutability::None, std::string(32, 'a')));
@@ -881,7 +881,7 @@ TEST_CASE("AgentRegistry::send_to: the defensive tag check rejects an empty/malf
 
     agent_pb::CommandRequest cmd;
     cmd.set_command_id("bad-tag-cmd");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("fleet_snapshot");
     // dispatch_tag left unset — decode_dispatch_tag("") fails (empty hash field).
     auto classified = ClassifiedCommandTestAccess::make(cmd);
@@ -906,7 +906,7 @@ TEST_CASE("AgentRegistry::send_to_all: the defensive tag check is evaluated once
 
     agent_pb::CommandRequest cmd;
     cmd.set_command_id("bad-tag-broadcast");
-    cmd.set_plugin("tar");
+    cmd.set_plugin("echo");
     cmd.set_action("fleet_snapshot");
     auto classified = ClassifiedCommandTestAccess::make(cmd);
 

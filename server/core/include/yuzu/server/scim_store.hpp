@@ -164,7 +164,21 @@ public:
 
     /// Constant-time validate a raw Bearer token against every non-revoked
     /// token hash (via `CRYPTO_memcmp`). Empty input always rejects.
+    /// `true` only for `TokenCheck::Valid`: a store FAULT and a bad token both read `false` here,
+    /// so a caller that must tell "wrong credential" (401) from "could not check" (retryable 503)
+    /// uses `validate_token_checked` (#6835).
     bool validate_token(const std::string& raw) const;
+
+    /// The outcome of checking a Bearer token (#6835). `Unavailable` is a runtime store fault
+    /// (the pool could not lease a connection in time, or the query failed): the credential was
+    /// NOT checked, so it must never be answered as a credential failure. A store that is not
+    /// open, or an empty token, is `Invalid` (a permanent condition, as before).
+    /// `Invalid` is enumerator 0 ON PURPOSE: a value-initialised `TokenCheck{}` (a future struct
+    /// member default, `TokenCheck t{};`) must read "not accepted", never "accepted".
+    enum class TokenCheck { Invalid, Valid, Unavailable };
+
+    /// Same constant-time comparison as `validate_token`, with the fault separated out.
+    TokenCheck validate_token_checked(const std::string& raw) const;
 
     // ── SCIM resources ────────────────────────────────────────────────────
 
@@ -174,6 +188,9 @@ public:
     std::optional<ScimResource> create_resource(const std::string& username,
                                                 const std::string& external_id = {});
 
+    /// Plain read: `nullopt` is BOTH "no such row" and "the store failed". Fine for a display or a
+    /// post-mutation re-fetch; for any 404 / 409 / skip decision use `get_by_scim_id_checked`
+    /// (#6835).
     std::optional<ScimResource> get_by_scim_id(const std::string& scim_id) const;
 
     /// Tri-state existence check: `true` = a resource with this `scim_id`
@@ -191,6 +208,14 @@ public:
     /// feeds a write. Deliberately additive: `get_by_scim_id`'s many read-only
     /// call sites keep their existing contract.
     std::optional<bool> resource_exists(const std::string& scim_id) const;
+
+    /// Tri-state variant of `get_by_scim_id` (#6835), mirroring `get_by_username_checked`: the
+    /// OUTER `nullopt` is a store fault (lease timeout, query error, store not open: never
+    /// "not found"); an inner empty optional is a definitive "no such resource"; otherwise the
+    /// row. A route that answers 404 for a missing resource MUST use this form, so an outage is
+    /// a retryable 503 and not a "resource gone" the IdP may act on.
+    std::optional<std::optional<ScimResource>>
+    get_by_scim_id_checked(const std::string& scim_id) const;
     std::optional<ScimResource> get_by_username(const std::string& username) const;
 
     /// Tri-state variant of `get_by_username` distinguishing "the store
@@ -284,7 +309,16 @@ public:
     std::optional<ScimGroup> create_group(const std::string& display_name,
                                           const std::string& external_id = {});
 
+    /// Plain read, same caveat as `get_by_scim_id`: use `get_group_by_id_checked` for any
+    /// 404 / 409 / skip decision (#6835).
     std::optional<ScimGroup> get_group_by_id(const std::string& scim_id) const;
+
+    /// Tri-state variants of the two Group lookups (#6835); same contract as
+    /// `get_by_scim_id_checked`: outer `nullopt` = store fault, inner empty = definitive miss.
+    std::optional<std::optional<ScimGroup>>
+    get_group_by_id_checked(const std::string& scim_id) const;
+    std::optional<std::optional<ScimGroup>>
+    get_group_by_display_name_checked(const std::string& display_name) const;
 
     /// Exact-match lookup by `displayName` — used for idempotent create /
     /// uniqueness checks by the routes layer (no DB-level UNIQUE constraint

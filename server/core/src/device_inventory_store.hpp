@@ -10,8 +10,9 @@
 /// COEXISTS with `SoftwareInventoryStore` (the `installed_software` projection)
 /// and `AppPerfDailyStore` (`app_perf`) — each daily-sync source that needs typed
 /// fleet reads gets its own born-on-PG store. Device-CI is **1:1 per agent**
-/// (unlike software's 1:N rows), so the projection is a single table, replaced
-/// wholesale on change.
+/// (unlike software's 1:N rows), so the parent is a single row, replaced wholesale on
+/// change. The v2 blob adds typed per-kind child tables (cpu, dimm, disk, swap, volume,
+/// partition, topology) and a per-section status table, replaced in the same transaction.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement, uses
@@ -26,6 +27,7 @@
 ///     agent-supplied `collected_at` (the #1685 lesson, baked in from day one).
 
 #include "device_inventory_types.hpp"
+#include "digest_fn.hpp"                // DigestFn (the writer's test seam; no OpenSSL here)
 #include "inventory_ingest_outcome.hpp" // InventoryIngestOutcome (shared sync-ingest vocabulary)
 
 #include <cstdint>
@@ -61,8 +63,18 @@ public:
     /// single-threaded startup; read without synchronisation on serving threads.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
+    /// TEST SEAM (#7163): replace the digest provider the full-replace writer hashes section
+    /// rows with, so a test can fail it (return std::nullopt, as `sha256_hex` does when
+    /// `EVP_Digest` fails) and reach the `digest_provider_failed` abort. nullptr (the default)
+    /// means `sha256_hex`; production never calls this. Set before the store is used from other
+    /// threads, like `set_metrics`.
+    void set_digest_provider_for_test(DigestFn digest) noexcept { digest_fn_ = digest; }
+
     /// Canonical content hash over a device-CI record — the SAME bytes the agent
-    /// hashes (`device_ci_canonical_blob` + SHA-256). The record's fields are
+    /// hashes. PER VERSION: v1 (`blob_version` 1) = positional 22-field join + SHA-256
+    /// (`device_ci_canonical_blob`, unchanged so old agents never loop on need_full); v2 =
+    /// the sha256 of the received blob that the parser pinned into `content_hash` (empty if
+    /// the digest failed; the full-ingest path then answers kError). The record's fields are
     /// assumed already UTF-8-scrubbed + clamped by the ingest seam's parse (mirrors
     /// `SoftwareInventoryStore::canonical_hash`, which trusts the seam's clamp), so
     /// this joins positionally + hashes; it does NOT re-clamp. Pure/deterministic.
@@ -73,8 +85,9 @@ public:
     ///    the stored hash. Match → bump last_seen (kTouched); no row or mismatch →
     ///    kNeedFull.
     ///  - `rec` set → full payload: the server **recomputes** the canonical hash
-    ///    from the record (never trusts `claimed_hash`) and upserts the single row →
-    ///    kStored. `first_seen` is preserved across updates; `last_seen` is the
+    ///    from the record (never trusts `claimed_hash`) and replaces the parent row and
+    ///    every v2 child row in ONE transaction under a per-agent advisory lock →
+    ///    kStored (any failure rolls back, previous set intact, kError). `first_seen` is preserved across updates; `last_seen` is the
     ///    server receipt time.
     /// `collected_at` is part of the contract (proto-carried) but drives no
     /// persisted timestamp (#1685). `rec` is taken by value (moved into the upsert).
@@ -94,6 +107,38 @@ public:
     /// on a store/pool/query degrade, NEVER a silent empty. An empty value = no rows.
     [[nodiscard]] std::optional<std::vector<DeviceCiRecord>> list_device_ci(int limit);
 
+    /// One agent's v2 per-section statuses + list rows (cpu, dimm, disk, swap, volume,
+    /// partition, topology; chassis/baseboard/machine_id carry a status only), in the
+    /// registry order of `device_ci_kinds.hpp`. Read in ONE REPEATABLE READ transaction so
+    /// every section is from the same replace generation. An empty vector means nothing is
+    /// stored (a v1 agent, or no record) — NOT "the device has none"; a store/pool/query
+    /// failure is `std::unexpected(CiReadError::kDegraded)`, never an empty success.
+    /// No production caller: any production use MUST sit behind the fail-closed
+    /// `inventory.device.ci` audit and the Inventory:Read scope gate; reads DIMM serials. The
+    /// record routes use `get_device_ci_with_sections` below (one snapshot with the record).
+    /// The levels returned here are RAW: they are neither row-count nor content-digest verified.
+    /// Anything that serves them must pass each section through `verify_section_content`
+    /// (hardware_list_model.hpp; it applies `verify_section_row_count` first) or it re-opens the
+    /// lost-rows and same-count-drift read-as-complete defects.
+    [[nodiscard]] std::expected<std::vector<DeviceCiSection>, CiReadError>
+    get_device_ci_sections(std::string_view agent_id);
+
+    /// One agent's CI record AND its v2 sections from ONE REPEATABLE READ READ ONLY transaction
+    /// (one lease), so the scalars and the section rows can never come from two different
+    /// replace generations (two separate reads could pair gen N scalars with gen N+1 rows).
+    /// Served by GET /api/v1/hardware/{id} and MCP get_hardware_ci behind the audited
+    /// `inventory.device.ci` read (H.7); it reads DIMM serials, so any new caller needs the same
+    /// fail-closed audit and Inventory:Read scope gate.
+    /// The sections are read only when a record was found and `blob_version >= 2`; they land
+    /// in `record->sections`. Failure semantics:
+    ///   * the record read fails (closed store, pool timeout, query error) ->
+    ///     `std::unexpected(CiReadError::kDegraded)`;
+    ///   * the record read succeeded but a SECTION statement failed -> the record with
+    ///     `sections_failed = true` (never an empty-sections success);
+    ///   * no record -> `record == nullopt`, not an error.
+    [[nodiscard]] std::expected<DeviceCiWithSections, CiReadError>
+    get_device_ci_with_sections(std::string_view agent_id);
+
     /// Drop an agent's CI record (e.g. on agent removal). Returns true iff the
     /// DELETE executed (COMMAND_OK); false on a closed store, a lease timeout, or
     /// a SQL failure — so the decommission cascade records Failed, not a false
@@ -104,6 +149,7 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    DigestFn digest_fn_{nullptr}; // nullptr = sha256_hex; see set_digest_provider_for_test
 };
 
 } // namespace yuzu::server

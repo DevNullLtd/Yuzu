@@ -1,18 +1,18 @@
 // Integration: the agent's app_perf rollup query (sync_source_app_perf, DEX
-// app-perf-over-time B1) must survive the REAL TAR `sql` path end-to-end —
+// app-perf-over-time B1) must survive the REAL Echo `sql` path end-to-end —
 // `$ProcPerf_Hourly` translation, the SELECT validator, AND the read-only
 // authorizer — and return correctly-aggregated rows. The pure agent unit tests
 // only string-match `build_app_perf_query`; this is the one cross-module path
-// (agent query → tar validator/authorizer/SQLite) that would otherwise fail
+// (agent query → echo validator/authorizer/SQLite) that would otherwise fail
 // SILENTLY in production (B1 stays empty) with every unit test green. It lives in
-// the tar suite because only that exe compiles both agent-core (the query
-// builder) and the tar SQL executor + warehouse DB.
+// the echo suite because only that exe compiles both agent-core (the query
+// builder) and the echo SQL executor + warehouse DB.
 
 #include <catch2/catch_test_macros.hpp>
 
 #include "sync_source_app_perf.hpp" // build_app_perf_query (agent-core)
-#include "tar_db.hpp"               // TarDatabase
-#include "tar_sql_executor.hpp"     // validate_and_translate_sql
+#include "echo_db.hpp"               // EchoDatabase
+#include "echo_sql_executor.hpp"     // validate_and_translate_sql
 #include "test_helpers.hpp"
 
 #include <cmath>
@@ -22,14 +22,14 @@
 
 namespace fs = std::filesystem;
 using yuzu::agent::build_app_perf_query;
-using yuzu::tar::TarDatabase;
+using yuzu::echo::EchoDatabase;
 
 namespace {
 struct TestDb {
-    TarDatabase db;
+    EchoDatabase db;
     fs::path path;
     ~TestDb() {
-        { TarDatabase discard = std::move(db); }
+        { EchoDatabase discard = std::move(db); }
         std::error_code ec;
         fs::remove(path, ec);
         fs::remove(fs::path{path.string() + "-wal"}, ec);
@@ -38,14 +38,36 @@ struct TestDb {
     }
 };
 TestDb make_db() {
-    auto tmp = yuzu::test::unique_temp_path("tar_appperf_");
-    auto r = TarDatabase::open(tmp);
+    auto tmp = yuzu::test::unique_temp_path("echo_appperf_");
+    auto r = EchoDatabase::open(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }
+
+// One procperf hourly row written the way the fold writes it: dictionary-interned keys, and the
+// sums the generated *_avg columns divide by (cpu_avg = cpu_sum / samples, ws_avg_bytes =
+// ws_sum / samples), so a seed reads back as the averages the caller names.
+void seed_procperf_hour(EchoDatabase& db, std::int64_t hour_ts, const std::string& name,
+                        const std::string& version, int is_kthread, int samples,
+                        int instances_max, double cpu_avg, double cpu_max, std::int64_t ws_avg,
+                        std::int64_t ws_max) {
+    REQUIRE(db.execute_sql("INSERT OR IGNORE INTO echo_dict (text) VALUES ('" + name + "'), ('" +
+                           version + "')"));
+    const auto id_of = [](const std::string& text) {
+        return "(SELECT id FROM echo_dict WHERE text = '" + text + "')";
+    };
+    REQUIRE(db.execute_sql(
+        "INSERT INTO procperf_hourly_r (hour_ts, name_id, version_id, is_kthread, samples, "
+        "instances_max, cpu_sum, cpu_max, ws_sum, ws_max_bytes) VALUES (" +
+        std::to_string(hour_ts) + ", " + id_of(name) + ", " + id_of(version) + ", " +
+        std::to_string(is_kthread) + ", " + std::to_string(samples) + ", " +
+        std::to_string(instances_max) + ", " + std::to_string(cpu_avg * samples) + ", " +
+        std::to_string(cpu_max) + ", " + std::to_string(ws_avg * samples) + ", " +
+        std::to_string(ws_max) + ")"));
+}
 } // namespace
 
-TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_perf]") {
+TEST_CASE("app_perf rollup query survives the real Echo sql path", "[echo][app_perf]") {
     auto t = make_db();
     // 2025-01-01 00:00:00 UTC — exactly divisible by 86400, so (hour_ts/86400)*86400
     // == day_start for both seed rows.
@@ -54,28 +76,21 @@ TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_per
     const std::int64_t today_start = day_start + 86400; // half-open [day_start, +1d)
 
     // Seed two procperf_hourly rows: same (name, version), two hours of the same
-    // UTC day (trusted DML seed — what the rollup would have written).
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO procperf_hourly "
-        "(hour_ts, name, version, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, "
-        " ws_max_bytes) VALUES "
-        "(" +
-        std::to_string(day_start) +
-        ", 'chrome.exe', '119.0.0.0', 10, 2, 90.0, 95.0, 100, 200),"
-        "(" +
-        std::to_string(day_start + 3600) + ", 'chrome.exe', '119.0.0.0', 30, 5, 10.0, 20.0, 300, 400)"));
+    // UTC day (what the fold would have written).
+    seed_procperf_hour(t.db, day_start, "chrome.exe", "119.0.0.0", 0, 10, 2, 90.0, 95.0, 100, 200);
+    seed_procperf_hour(t.db, day_start + 3600, "chrome.exe", "119.0.0.0", 0, 30, 5, 10.0, 20.0, 300, 400);
 
     const std::string sql = build_app_perf_query(window_start, today_start);
 
     SECTION("translates $ProcPerf_Hourly and passes the SELECT validator") {
-        auto validated = yuzu::tar::validate_and_translate_sql(sql);
+        auto validated = yuzu::echo::validate_and_translate_sql(sql);
         REQUIRE(validated.has_value()); // SELECT-start, no dangerous kw, single stmt, <=4KB
         CHECK(validated->find("procperf_hourly") != std::string::npos); // $-name translated
         CHECK(validated->find('$') == std::string::npos);               // nothing left untranslated
     }
 
     SECTION("passes the authorizer and returns the sample-weighted aggregate row") {
-        auto validated = yuzu::tar::validate_and_translate_sql(sql);
+        auto validated = yuzu::echo::validate_and_translate_sql(sql);
         REQUIRE(validated.has_value());
         auto res = t.db.execute_user_query(*validated);
         REQUIRE(res.has_value()); // authorizer accepts (day-bucket arithmetic, aggregates, version col)
@@ -95,10 +110,10 @@ TEST_CASE("app_perf rollup query survives the real TAR sql path", "[tar][app_per
 }
 
 TEST_CASE("app_perf rollup query excludes is_kthread rows, keeps normal processes",
-          "[tar][app_perf][procperf]") {
+          "[echo][app_perf][procperf]") {
     // Kernel threads (Linux PF_KTHREAD) and the Windows System process (pid 4)
-    // are recorded unfiltered into procperf_hourly (the live TAR tier keeps
-    // them — tar_proc_perf.hpp's "Kernel-thread marker" note); this rollup
+    // are recorded unfiltered into procperf_hourly (the live Echo tier keeps
+    // them — echo_proc_perf.hpp's "Kernel-thread marker" note); this rollup
     // query is the ONE place that excludes them from the daily app-perf
     // history sent to the server.
     auto t = make_db();
@@ -106,19 +121,11 @@ TEST_CASE("app_perf rollup query excludes is_kthread rows, keeps normal processe
     const std::int64_t window_start = day_start;
     const std::int64_t today_start = day_start + 86400;
 
-    REQUIRE(t.db.execute_sql(
-        "INSERT INTO procperf_hourly "
-        "(hour_ts, name, version, is_kthread, samples, instances_max, cpu_avg, cpu_max, "
-        " ws_avg_bytes, ws_max_bytes) VALUES "
-        "(" +
-        std::to_string(day_start) +
-        ", 'kworker/0:1', '', 1, 10, 1, 5.0, 8.0, 0, 0)," // kernel thread — excluded
-        "(" +
-        std::to_string(day_start) +
-        ", 'normal.exe', '1.0.0.0', 0, 10, 2, 12.5, 20.0, 1024, 2048)")); // normal — included
+    seed_procperf_hour(t.db, day_start, "kworker/0:1", "", 1, 10, 1, 5.0, 8.0, 0, 0); // kernel thread: excluded
+    seed_procperf_hour(t.db, day_start, "normal.exe", "1.0.0.0", 0, 10, 2, 12.5, 20.0, 1024, 2048); // included
 
     const std::string sql = build_app_perf_query(window_start, today_start);
-    auto validated = yuzu::tar::validate_and_translate_sql(sql);
+    auto validated = yuzu::echo::validate_and_translate_sql(sql);
     REQUIRE(validated.has_value());
     CHECK(validated->find("is_kthread") != std::string::npos);
     auto res = t.db.execute_user_query(*validated);

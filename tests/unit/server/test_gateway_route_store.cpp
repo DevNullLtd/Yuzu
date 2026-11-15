@@ -3033,7 +3033,7 @@ TEST_CASE("GatewayRouteStore[pg]: migration v5 tombstones every row of a duplica
                                  "'gateway_route_store' AND indexname = "
                                  "'agent_routes_session_id_idx'") == "0");
     CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
-                                 "'gateway_route_store'") == "5");
+                                 "'gateway_route_store'") == "6");
 
     GatewayRouteStore reopened{pool};
     REQUIRE(reopened.is_open());
@@ -3143,7 +3143,7 @@ TEST_CASE("GatewayRouteStore[pg]: migration v5 tolerates a hand-dropped old sess
 
     auto conn = raw_connect(db.dsn());
     CHECK(raw_scalar(conn.get(), "SELECT version::text FROM public.schema_meta WHERE store = "
-                                 "'gateway_route_store'") == "5");
+                                 "'gateway_route_store'") == "6");
     CHECK(raw_scalar(conn.get(), "SELECT count(*) FROM pg_indexes WHERE schemaname = "
                                  "'gateway_route_store' AND indexname = "
                                  "'ux_agent_routes_session_id'") == "1");

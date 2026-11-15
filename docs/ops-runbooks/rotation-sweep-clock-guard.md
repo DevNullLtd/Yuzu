@@ -32,7 +32,7 @@ against a durable per-database anchor (`api_token_store.rotation_retention_meta`
 key `last_pass_now`), and classifies the tick through the same
 `audit_retention_rules.hpp::classify` pair `audit_store` uses — reused, not
 forked. This page deliberately does not restate that rule, the same way
-`docs/user-manual/audit-log.md` and `docs/user-manual/tar.md` do not for their
+`docs/user-manual/audit-log.md` and `docs/user-manual/echo.md` do not for their
 own clock guards — the canonical, tested definition is `classify()` itself and
 `ApiTokenStore::sweep_expired_rotations` (`api_token_store.cpp`), pinned by
 `tests/unit/server/test_api_token_store.cpp`. What differs from `audit_store`

@@ -16,7 +16,8 @@
 #include "device_routes.hpp"
 
 #include "dex_view_types.hpp"    // dex_signal_label for the DEX lens (store-free)
-#include "tar_process_tree.hpp"  // tar_is_suspicious_spawn — shared LOLBin/shell denylist
+#include "echo_process_tree.hpp"  // echo_is_suspicious_spawn — shared LOLBin/shell denylist
+#include "guardian_runbook_pointer.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -327,13 +328,13 @@ std::string render_device_dex_lens(const std::string& agent_id, int score,
     return h;
 }
 
-// Component CSS for the live-snapshot cards + the TAR-style process tree. Injected
+// Component CSS for the live-snapshot cards + the Echo-style process tree. Injected
 // inline by the shell fragment (the shared page shell carries only the `.gp-*`
-// component CSS; `.ls-*`/`.tar-tree-*` are feature-local). CSP allows inline <style>
-// (style-src 'unsafe-inline'). The tree classes mirror tar_page_ui.cpp (PR1551) so
-// the viewer matches /tar. Mockup: docs/mockups/device-live-snapshot.html.
+// component CSS; `.ls-*`/`.echo-tree-*` are feature-local). CSP allows inline <style>
+// (style-src 'unsafe-inline'). The tree classes mirror echo_page_ui.cpp (PR1551) so
+// the viewer matches /echo. Mockup: docs/mockups/device-live-snapshot.html.
 const char* live_snapshot_css() {
-    // Class names are unique (ls-*/tar-tree-*/tt-*) so the rules are GLOBAL, not
+    // Class names are unique (ls-*/echo-tree-*/tt-*) so the rules are GLOBAL, not
     // scoped to #device-live — the pop-out clones a card body into a <dialog> outside
     // that container and must stay styled. Generic names are prefixed (.ls-pill/.ls-sw)
     // and `.name` is scoped to `.ls-tbl` to avoid colliding with shared dashboard CSS.
@@ -378,16 +379,16 @@ const char* live_snapshot_css() {
     .ls-sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:2px;background:var(--raise)}
     .ls-sw.on::after{left:18px;background:var(--on-primary)}
     .src-on{color:var(--ok);font-weight:600}.src-off{color:var(--mut)}
-    .tar-tree-node{margin:0}
-    .tar-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:1px 0}
-    .tar-tree-node>summary::-webkit-details-marker{display:none}
-    .tar-tree-node>summary::before{content:"\25B8";flex:0 0 16px;text-align:center;color:var(--faint);font-size:12px}
-    .tar-tree-node[open]>summary::before{content:"\25BE"}
-    .tar-tree-children{margin-left:8px;padding-left:12px;border-left:1px solid var(--line2)}
-    .tar-tree-leaf{display:flex;align-items:center;padding:1px 0 1px 16px}
-    .tar-tree-row{display:inline-flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:1px 6px;border-radius:3px;color:var(--ink);font-size:13px}
-    .tar-tree-row:hover{background:var(--surface2)}
-    .tar-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--bad)}
+    .echo-tree-node{margin:0}
+    .echo-tree-node>summary{display:flex;align-items:center;list-style:none;cursor:pointer;padding:1px 0}
+    .echo-tree-node>summary::-webkit-details-marker{display:none}
+    .echo-tree-node>summary::before{content:"\25B8";flex:0 0 16px;text-align:center;color:var(--faint);font-size:12px}
+    .echo-tree-node[open]>summary::before{content:"\25BE"}
+    .echo-tree-children{margin-left:8px;padding-left:12px;border-left:1px solid var(--line2)}
+    .echo-tree-leaf{display:flex;align-items:center;padding:1px 0 1px 16px}
+    .echo-tree-row{display:inline-flex;align-items:center;gap:8px;flex:1 1 auto;min-width:0;padding:1px 6px;border-radius:3px;color:var(--ink);font-size:13px}
+    .echo-tree-row:hover{background:var(--surface2)}
+    .echo-tree-row[data-anom="1"]{box-shadow:inset 2px 0 0 var(--bad)}
     .tt-dot{flex:0 0 auto;width:8px;height:8px;background:var(--ok)}
     .tt-pid{flex:0 0 auto;min-width:54px;color:var(--mut);font-family:var(--mds-font-family-mono);font-size:12.5px;text-align:right;font-variant-numeric:tabular-nums}
     .tt-name{flex:1 1 auto;min-width:0;overflow:hidden;color:var(--ink);font-weight:600;text-overflow:ellipsis;white-space:nowrap}
@@ -461,7 +462,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
         // cards are behind a collapsed <details> by default, so lazy=true defers
         // dispatch to first expand (htmx 2.0.4 `EVENT MODIFIER from:SELECTOR`
         // grammar — see dashboard_ui.cpp/settings_ui.cpp's "... from:body" and
-        // tar_tree_routes.cpp's "change from:#tar-tree-host" for the same "from:"
+        // echo_tree_routes.cpp's "change from:#echo-tree-host" for the same "from:"
         // usage already relied on in this codebase; "closest details" is htmx's
         // standard extended CSS selector for the nearest ancestor <details>).
         c += "<span class=\"ls-prev\">" + std::string(preview) +
@@ -485,7 +486,7 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("dns_cache", "DNS cache", "Win &middot; Linux", "resolver cache");
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
-    h += card("capture_sources", "Capture sources", "", "TAR local capture");
+    h += card("capture_sources", "Capture sources", "", "Echo local capture");
     h += card("disk", "Disk space", "", "system volume only");
     h += "</div>"; // close .ls-grid (live)
     h += "</div>"; // close .ls-group[data-lsgroup=live]
@@ -574,7 +575,7 @@ std::string lc(std::string s) {
 }
 
 // A remote address that is NOT loopback / private / link-local / ULA. Drives the
-// public-endpoint highlight (mirrors tar_process_tree's remote_class "pub").
+// public-endpoint highlight (mirrors echo_process_tree's remote_class "pub").
 bool is_public_ip(const std::string& a) {
     if (a.empty() || a == "0.0.0.0" || a == "::" || a == "::1")
         return false;
@@ -598,7 +599,7 @@ std::string endpoint_label(const LiveConn& c) {
                        : (c.remote_addr + ":" + std::to_string(c.remote_port));
 }
 
-// Inline per-process network summary, byte-for-byte the TAR `tt-net` shape: count
+// Inline per-process network summary, byte-for-byte the Echo `tt-net` shape: count
 // badge + up to two distinct endpoints (public first) + "+N", full list in title.
 std::string live_net_cell(const std::vector<const LiveConn*>& conns) {
     if (conns.empty())
@@ -640,7 +641,7 @@ std::string live_net_cell(const std::vector<const LiveConn*>& conns) {
 
 constexpr std::size_t kLiveTreeMaxNodes = 50000;
 constexpr int kLiveTreeDepthCap = 64;
-constexpr std::size_t kLiveGroupThreshold = 5; // collapse N+ same-name siblings (TAR pattern)
+constexpr std::size_t kLiveGroupThreshold = 5; // collapse N+ same-name siblings (Echo pattern)
 
 struct TreeCtx {
     const std::vector<LiveProcNode>& nodes;
@@ -651,7 +652,7 @@ struct TreeCtx {
 };
 
 std::string live_proc_row(const LiveProcNode& n, const TreeCtx& ctx, bool suspicious) {
-    std::string r = "<span class=\"tar-tree-row\"";
+    std::string r = "<span class=\"echo-tree-row\"";
     if (suspicious)
         r += " data-anom=\"1\"";
     r += "><span class=\"tt-dot\"></span><span class=\"tt-pid\">" + std::to_string(n.pid) +
@@ -675,7 +676,7 @@ void render_tree_node(TreeCtx& ctx, std::size_t idx, int depth, const std::strin
 void render_tree_children(TreeCtx& ctx, const std::vector<std::size_t>& kids, int depth,
                           const std::string& parent_name, std::string& out) {
     // Bucket same-name siblings (first-appearance order); collapse a run of >= threshold
-    // into one "name ×N" group (cleans up dozens of svchost.exe), mirroring the TAR tree.
+    // into one "name ×N" group (cleans up dozens of svchost.exe), mirroring the Echo tree.
     std::vector<std::string_view> order;
     std::unordered_map<std::string_view, std::vector<std::size_t>> buckets;
     for (std::size_t i : kids) {
@@ -688,12 +689,12 @@ void render_tree_children(TreeCtx& ctx, const std::vector<std::size_t>& kids, in
     for (std::string_view nm : order) {
         const auto& g = buckets[nm];
         if (g.size() >= kLiveGroupThreshold) {
-            out += "<details class=\"tar-tree-node\"><summary><span class=\"tar-tree-row tt-group\">"
+            out += "<details class=\"echo-tree-node\"><summary><span class=\"echo-tree-row tt-group\">"
                    "<span class=\"tt-group-ico\">\xE2\x96\xA6</span><span class=\"tt-name\">" +
                    esc(nm.empty() ? "(unknown)" : std::string(nm)) +
                    "</span><span class=\"tt-group-count\">\xC3\x97" + std::to_string(g.size()) +
                    "</span><span class=\"tt-meta\">" + std::to_string(g.size()) +
-                   " running</span></span></summary><div class=\"tar-tree-children\">";
+                   " running</span></span></summary><div class=\"echo-tree-children\">";
             for (std::size_t i : g)
                 render_tree_node(ctx, i, depth + 1, parent_name, out);
             out += "</div></details>";
@@ -711,22 +712,22 @@ void render_tree_node(TreeCtx& ctx, std::size_t idx, int depth, const std::strin
     if (idx < ctx.visited.size() && ctx.visited[idx])
         return; // already rendered — a ppid cycle (A→B→A) terminates here
     if (depth > kLiveTreeDepthCap) {
-        out += "<div class=\"tar-tree-leaf tt-meta\">\xE2\x80\xA6 (depth capped)</div>";
+        out += "<div class=\"echo-tree-leaf tt-meta\">\xE2\x80\xA6 (depth capped)</div>";
         return;
     }
     if (idx < ctx.visited.size())
         ctx.visited[idx] = true;
     ++ctx.emitted;
     const LiveProcNode& n = ctx.nodes[idx];
-    const bool suspicious = !parent_name.empty() && tar_is_suspicious_spawn(parent_name, n.name);
+    const bool suspicious = !parent_name.empty() && echo_is_suspicious_spawn(parent_name, n.name);
     auto it = ctx.children.find(n.pid);
     const bool has_children = n.pid != 0 && it != ctx.children.end() && !it->second.empty();
     if (!has_children) {
-        out += "<div class=\"tar-tree-leaf\">" + live_proc_row(n, ctx, suspicious) + "</div>";
+        out += "<div class=\"echo-tree-leaf\">" + live_proc_row(n, ctx, suspicious) + "</div>";
         return;
     }
-    out += depth < 2 ? "<details open class=\"tar-tree-node\">" : "<details class=\"tar-tree-node\">";
-    out += "<summary>" + live_proc_row(n, ctx, suspicious) + "</summary><div class=\"tar-tree-children\">";
+    out += depth < 2 ? "<details open class=\"echo-tree-node\">" : "<details class=\"echo-tree-node\">";
+    out += "<summary>" + live_proc_row(n, ctx, suspicious) + "</summary><div class=\"echo-tree-children\">";
     render_tree_children(ctx, it->second, depth + 1, n.name, out);
     out += "</div></details>";
 }
@@ -984,51 +985,133 @@ std::string render_device_live_generic(const std::vector<std::string>& columns,
 
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows) {
     if (rows.empty())
-        return "<div class=\"gp-note\">TAR is not running on this device, or it reported no "
+        return "<div class=\"gp-note\">Echo is not running on this device, or it reported no "
                "capture sources.</div>";
     std::string h =
-        "<div class=\"gp-note\" style=\"margin-top:0\">TAR warehouse capture on this device "
+        "<div class=\"gp-note\" style=\"margin-top:0\">Echo warehouse capture on this device "
         "(background &middot; distinct from the live snapshot). Read-only here &mdash; "
-        "<a href=\"/tar\" style=\"color:var(--accent)\">configure on TAR &rarr;</a></div>";
+        "<a href=\"/echo\" style=\"color:var(--accent)\">configure on Echo &rarr;</a></div>";
     h += "<table class=\"ls-tbl\"><thead><tr><th></th><th>Source</th><th>Table</th>"
-         "<th class=\"ls-num\">Live rows</th><th>Category</th></tr></thead><tbody>";
+         "<th class=\"ls-num\">Rows</th><th>Category</th></tr></thead><tbody>";
     for (const auto& r : rows) {
         const std::string sw = "<span class=\"ls-sw" + std::string(r.enabled ? " on" : "") + "\"></span>";
         const std::string nm = "<span class=\"" + std::string(r.enabled ? "src-on" : "src-off") +
                                "\">" + esc(r.name) + "</span>";
-        const std::string rows_cell = r.live_rows < 0
-                                          ? "<span class=\"gp-mute\">&mdash;</span>"
-                                          : std::to_string(r.live_rows);
+        const std::string rows_cell = r.live_rows < 0 ? "<span class=\"gp-mute\">&mdash;</span>"
+                                                      : std::to_string(r.live_rows);
         h += "<tr><td>" + sw + "</td><td>" + nm + "</td><td><code>$" + esc(r.dollar) +
-             "_Live</code></td><td class=\"ls-num\">" + rows_cell +
+             "_Hourly</code></td><td class=\"ls-num\">" + rows_cell +
              "</td><td><span class=\"ls-pill\">" + esc(r.category) + "</span></td></tr>";
     }
     h += "</tbody></table>";
     return h;
 }
 
+namespace {
+
+// The Guardian lens lists at most this many unrepresented ids, each cut to kLensIdBytes (the ids
+// are agent-reported identifiers: they may match no rule and have no length bound), so one hostile
+// device cannot make the fragment arbitrarily large.
+constexpr std::size_t kLensIdsShown = 10;
+constexpr std::size_t kLensIdBytes = 64;
+
+// Cut at a UTF-8 boundary (never mid-sequence) and mark the cut. Escaping is the caller's job.
+std::string lens_id_text(const std::string& id) {
+    if (id.size() <= kLensIdBytes)
+        return id;
+    std::size_t cut = kLensIdBytes;
+    while (cut > 0 && (static_cast<unsigned char>(id[cut]) & 0xC0) == 0x80)
+        --cut;
+    return id.substr(0, cut) + "...";
+}
+
+// The notice for events the census does not reflect. Empty when there are none.
+std::string unrepresented_notice(std::int64_t count, const std::vector<std::string>& ids) {
+    if (count <= 0)
+        return {};
+    std::string h = "<div class=\"gp-banner\"><b>" + std::to_string(count) +
+                    (count == 1 ? " guard has" : " guards have") +
+                    " recorded events not yet reflected in the compliance census.</b> The "
+                    "compliance figures on this page do not include " +
+                    (count == 1 ? "it" : "them") +
+                    ", so this device is not shown as clean (all compliant). " +
+                    std::string(kUncertainRunbookPointer);
+    if (!ids.empty()) {
+        const std::size_t shown = std::min(ids.size(), kLensIdsShown);
+        h += "<div class=\"gp-mute\">Identifiers as reported by the device (they may match no "
+             "rule in the catalogue): ";
+        for (std::size_t i = 0; i < shown; ++i) {
+            if (i > 0)
+                h += ", ";
+            h += "<code>" + esc(lens_id_text(ids[i])) + "</code>";
+        }
+        if (static_cast<std::int64_t>(shown) < count)
+            h += " and " + std::to_string(count - static_cast<std::int64_t>(shown)) + " more";
+        h += "</div>";
+    }
+    h += "</div>";
+    return h;
+}
+
+} // namespace
+
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards, bool tabs) {
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs,
+                                        std::int64_t unrepresented_pending,
+                                        const std::vector<std::string>& unrepresented_ids) {
     std::string h = tabs ? device_lens_tabs("guardian", agent_id) : std::string();
+    const std::string notice = unrepresented_notice(unrepresented_pending, unrepresented_ids);
     if (guards.empty()) {
+        if (!notice.empty()) {
+            // Evidence exists that the census does not show: never "No guards evaluated".
+            h += notice;
+            h += "<div class=\"gp-placeholder\"><b>No guards in the compliance census</b>This "
+                 "device has no compliance census rows yet.</div>";
+            return h;
+        }
         h += "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards have been "
              "evaluated on this device yet.</div>";
         return h;
     }
-    int compliant = 0;
-    for (const auto& g : guards)
+    int compliant = 0, uncertain = 0;
+    for (const auto& g : guards) {
         if (g.state == "compliant")
             ++compliant;
+        if (g.order_uncertain || g.projection_pending)
+            ++uncertain;
+    }
     const int pct = static_cast<int>(100.0 * compliant / static_cast<double>(guards.size()) + 0.5);
+    // A clean tone is never shown over a guard whose ordering is uncertain or whose retained
+    // event is not yet reflected (#5690), nor over a pair whose retained events have no census row
+    // at all (#7217): the all-compliant state needs both to be absent. The wording is the overview
+    // badge's ("Compliant, ordering uncertain").
+    const bool unsettled = uncertain > 0 || unrepresented_pending > 0;
     h += "<div class=\"gp-tiles\"><div class=\"gp-tile\"><div class=\"n " +
-         std::string(pct >= 100 ? "good" : "warn") + "\">" + std::to_string(pct) +
-         "%</div><div class=\"l\">Compliant</div><div class=\"sx\">" + std::to_string(compliant) +
-         " of " + std::to_string(guards.size()) + " guards</div></div></div>";
+         std::string(pct >= 100 && !unsettled ? "good" : "warn") + "\">" + std::to_string(pct) +
+         "%</div><div class=\"l\">" +
+         std::string(pct >= 100 && unsettled ? "Compliant, ordering uncertain" : "Compliant") +
+         "</div><div class=\"sx\">" + std::to_string(compliant) + " of " +
+         std::to_string(guards.size()) + " guards" +
+         (uncertain > 0 ? ", " + std::to_string(uncertain) +
+                              " with uncertain ordering or an unreflected verdict"
+                        : std::string()) +
+         (unrepresented_pending > 0 ? ", " + std::to_string(unrepresented_pending) +
+                                          " more with events not yet in the census"
+                                    : std::string()) +
+         "</div></div></div>";
+    h += notice;
     h += "<div class=\"gp-sech\">Guards on this device</div>";
     h += "<table class=\"gp-table\"><thead><tr><th>Guard</th><th>State</th><th>Last evaluated</th>"
          "</tr></thead><tbody>";
     for (const auto& g : guards)
         h += "<tr><td class=\"name\">" + esc(g.name) + "</td><td>" + guard_state_badge(g.state) +
+             (g.order_uncertain || g.projection_pending
+                  ? " <span class=\"gp-mute\" title=\"The ordering of this verdict cannot be "
+                    "proven, "
+                    "or a retained event is not yet reflected. " +
+                        std::string(kUncertainRunbookPointer) +
+                        "\">&middot; ordering uncertain</span>"
+                  : std::string{}) +
              "</td><td class=\"gp-mute\">" + esc(g.updated_at) + "</td></tr>";
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Per-guard state from "
