@@ -133,7 +133,8 @@ public:
     /// MCP `get_guardian_status`. `agent_scope`: `nullopt` = whole fleet;
     /// engaged (including empty, ADR-0017 INV-2) = confine `errored_rules`
     /// to exactly these agents (applied in SQL, INV-3 — never a C++
-    /// post-filter). Returns `nullopt` on a degraded read (ADR-0038
+    /// post-filter); the same scope confines `unordered_agents` and its ids (a hidden agent is in
+    /// neither). Returns `nullopt` on a degraded read (ADR-0038
     /// catastrophic-read set) — the caller MUST refuse to render (503),
     /// never a silent 0 that would misreport the fleet as compliant.
     [[nodiscard]] virtual std::optional<GuardianStatusRollup>

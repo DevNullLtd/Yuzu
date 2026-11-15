@@ -4394,14 +4394,18 @@ public:
                           "counter");
         metrics_.describe(
             "yuzu_server_guardian_census_proj_failures_total",
-            "Compliance-census (guardian_agent_rule_status) writes that failed "
+            "Compliance-census (guardian_agent_rule_status) writes, and the per-agent "
+            "emit-order step that runs before each first-delivery write, that failed "
             "for a reason other than the rule not existing. The failure of a single "
             "event does not discard it: it stays stored with pending census "
             "evidence, and the pair keeps its previous state "
-            "until a redelivery of that event repairs it or a later event for the pair arrives. A "
+            "until a redelivery of that event repairs the census row or a later event for the "
+            "pair arrives. A repair runs no order step, so an event whose first delivery failed "
+            "that step never reaches the agent's order clock. A "
             "repair that fails is counted here again. >0 means the census may be "
             "stale; the server log line 'census upsert failed' names the agent "
-            "and rule. A write refused because the rule is not defined on this "
+            "and rule (the order step logs 'agent order step failed' with the agent and event). "
+            "A write refused because the rule is not defined on this "
             "server (the census foreign key, SQLSTATE 23503) is a normal "
             "outcome and is not counted; a failure to retire the evidence of "
             "such an event is an ingest error.",
@@ -4416,8 +4420,13 @@ public:
                           "rule is gone (not a fault); failed is a fault that leaves pending "
                           "evidence, except for source batch, whose failure rolls back the whole batch "
                           "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); abandoned aborted the "
-                          "transaction (counted again as an ingest error). Counted when the "
+                          "..._census_proj_failures_total); a failed per-agent emit-order step is "
+                          "also counted failed (on a first delivery the census write is then "
+                          "skipped); abandoned aborted the "
+                          "transaction (counted again as an ingest error); it includes a failed "
+                          "control statement of the emit-order step's savepoint and, on a first "
+                          "delivery, a failed write of the pending evidence after a failed order "
+                          "step. Counted when the "
                           "projection returns, before the transaction commits. Resets on server "
                           "restart.",
                           "counter");
@@ -4433,12 +4442,34 @@ public:
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
+        metrics_.describe(detail::kGuardianPairRejectedMetric,
+                          "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
+                          "withheld at ingest, by reason. half_set: exactly one of the two was "
+                          "set. out_of_range: a set pair had a value of 2^62 or more. The event "
+                          "is still stored, unpaired, and its verdict decision is unaffected (the "
+                          "census row's stored pair becomes NULL when that unpaired verdict is applied); "
+                          "this is not a refusal. "
+                          "Counted once per withheld pair: a redelivery of the same event does "
+                          "not count again. Resets on server restart.",
+                          "counter");
+        for (const char* reason : detail::kGuardianPairRejectReasons)
+            metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
-                          "write failed and no redelivery has repaired it. Not updated while "
+                          "write, or the per-agent emit-order step before it, failed and no "
+                          "redelivery has repaired it. Not updated while "
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
+                          "gauge");
+        metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
+                          "Agents whose latest accepted unpaired census-bearing event is later than "
+                          "the time their pair clock last advanced (an agent that never sent a "
+                          "pair counts; accepted means accepted for ordering). The pair is stored "
+                          "and counted, not yet compared: "
+                          "no verdict depends on it. Not updated while the store cannot answer, "
+                          "and absent until the first answered read. Per-agent detail is the "
+                          "ordering field of the per-device all-guards read.",
                           "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
@@ -4448,16 +4479,21 @@ public:
         // is the DEX/observation family (dex_read<>/dex_observation, fail-soft:
         // the caller gets an empty/degraded result and keeps serving); "guardian_rules"
         // is the AUTHORITATIVE rule/status reads (get_rule/list_rules/
-        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count, fail-hard: the
+        // agent_rule_statuses*/rule_names*/errored_rule_count/uncertain_rule_count and the
+        // request-path unordered_agents read behind the status rollup, fail-hard: the
         // caller gets a std::expected error and aborts the push/reconcile
         // rather than fan out empty/stale data); "guardian_census" (#5690) is the
-        // census pending-evidence COUNT read only (the gauge keeps its last value);
+        // census GAUGE reads only (the pending-evidence count and the unordered-agents count;
+        // each gauge keeps its last value);
         // "guardian_census_device" (#7217) is the per-device unrepresented-pending
-        // reads behind the device-compliance and all-guards routes (fail-hard: REST
-        // 503 / MCP error), and is the only source with the extra reason
-        // "statement_timeout" (SQLSTATE 57014, most likely a retained-backlog symptom whose
-        // retry usually fails identically). Pre-seeded below (same closed
-        // {reason x source} cross-product pre-seed pattern as
+        // read and the per-device emit-order read behind the device-compliance and
+        // all-guards routes (fail-hard: REST 503 / MCP error). The extra reason
+        // "statement_timeout" (SQLSTATE 57014) is counted on two sources:
+        // guardian_census_device (most likely a retained-backlog symptom whose retry usually
+        // fails identically; only the unrepresented-pending read sets a statement timeout, the
+        // order read does not) and guardian_state (the Apps read cancelled at the pool's 30 s
+        // statement timeout; a shorter window or less load clears it). Pre-seeded below (same
+        // closed {reason x source} cross-product pre-seed pattern as
         // yuzu_server_kek_operations_total above) so absent()/rate() alerting
         // is meaningful before the first degrade ever fires.
         metrics_.describe("yuzu_server_guardian_read_degrade_total",
@@ -4466,13 +4502,17 @@ public:
                           "(store_not_open/pool_acquire_timeout/query_error, plus "
                           "concurrency_budget for a guardian_state read refused over its "
                           "in-flight budget, plus statement_timeout for a guardian_census_device "
-                          "read that exceeded its time budget) and source "
+                          "read that exceeded its time budget or a guardian_state Apps read "
+                          "cancelled at the statement timeout) and source "
                           "(guardian_state = DEX/observation reads, fail-soft, empty result "
-                          "served; guardian_rules = authoritative rule/status reads, fail-hard, "
+                          "served; guardian_rules = authoritative rule/status reads, including "
+                          "the request-path unordered-agents read, fail-hard, "
                           "push/reconcile aborts rather than fans out empty; guardian_census = "
-                          "the census pending-evidence count read, whose gauge keeps its last "
+                          "the census gauge reads (the pending-evidence count and the "
+                          "unordered-agents count), whose gauges keep their last "
                           "value; guardian_census_device = the per-device unrepresented-pending "
-                          "reads, fail-hard, the device request is refused and a statement_timeout "
+                          "and emit-order reads, fail-hard, the device request is refused and a "
+                          "statement_timeout "
                           "most likely means a large retained pending backlog, which a retry usually "
                           "does not clear). "
                           "A sampled warn accompanies each new degrade episode.",
@@ -4485,9 +4525,12 @@ public:
         // The Apps stability read's in-flight budget refusal (guardian_state only).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "concurrency_budget"}, {"source", "guardian_state"}});
-        // The per-device unrepresented-pending read's statement timeout (guardian_census_device only).
+        // The statement timeout of the per-device unrepresented-pending read (guardian_census_device)
+        // and of the Apps stability read (guardian_state).
         metrics_.counter("yuzu_server_guardian_read_degrade_total",
                          {{"reason", "statement_timeout"}, {"source", "guardian_census_device"}});
+        metrics_.counter("yuzu_server_guardian_read_degrade_total",
+                         {{"reason", "statement_timeout"}, {"source", "guardian_state"}});
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
                           "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
@@ -10549,6 +10592,9 @@ public:
                     if (auto pending = guaranteed_state_store_->pending_projection_count_checked())
                         metrics_.gauge("yuzu_server_guardian_census_pending_events")
                             .set(static_cast<double>(*pending));
+                    // Same posture: the unordered-agents count is published only when read.
+                    detail::publish_guardian_census_unordered_gauge(metrics_,
+                                                                    *guaranteed_state_store_);
                 }
                 if (baseline_store_) {
                     metrics_.gauge("yuzu_server_guardian_baselines_total")
@@ -20197,8 +20243,13 @@ private:
             yuzu::server::DexScorePolicyFn dex_policy_fn;
             if (dex_score_policy_provider_)
                 dex_policy_fn = [p = dex_score_policy_provider_] { return p->current(); };
-            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn,
-                                         std::move(dex_policy_fn));
+            // The observer provider borrows health_store_, which is declared before every holder
+            // of this API (rest_api_v1_, mcp_server_, dex_routes_) and so outlives them.
+            dex_api = make_local_dex_api(
+                guaranteed_state_store_.get(), dex_fleet_fn, std::move(dex_policy_fn),
+                [this](const std::vector<std::string>& ids) {
+                    return health_store_.dex_observer_for(ids, detail::kAgentHealthStaleness);
+                });
         }
         // The Apps tab reads the same DexApi::apps model as REST and MCP (null store: its error panel).
         if (dex_routes_)
@@ -20369,18 +20420,25 @@ private:
             // Persisted endpoints within a 30-day window — OFFLINE-INCLUSIVE (the whole
             // point of the device tab: readable when a device is offline). Aged-out hosts
             // beyond the window are withheld so the list doesn't accrete dead hosts forever.
-            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+            // #7566: the same statement says which of the roster's rows are connected now
+            // (`OfflineEndpoint::live`, the `query_live_ids` predicate on the database clock), so
+            // Online/Offline no longer needs a SECOND read (the registry's cached presence read)
+            // that could fail or be truncated on its own and silently turn devices connected to
+            // another replica into Offline. The TTL is the registry's own presence window.
+            auto eps = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow,
+                                                                   cfg_.session_timeout);
             if (!apply_roster_read(result, eps)) // #5531: unread, not empty — no enrichment
                 return result;
-            // currently-connected agents (live registry). all_ids() copies only the ids
-            // under the registry lock — NOT to_json_obj()'s full 5-field-per-agent JSON
-            // serialisation under the heartbeat/dispatch hot-path mutex (gov perf-S2).
-            // all_ids() is this replica's local sessions UNION the cached durable presence
-            // (live_presence(), refreshed at most every kPresenceCacheTtl = 3 s): a device
-            // gracefully departed from another replica can still read online here for up to
-            // that TTL (#5678), after which its cleared session_id drops it from presence.
+            // A device is online if THIS replica holds its session (the one thing the database
+            // can lag on: a session whose row has not recorded a session id yet) or the database
+            // says it is live. local_ids() copies only the ids under the registry lock - NOT
+            // to_json_obj()'s full 5-field-per-agent JSON serialisation under the heartbeat/
+            // dispatch hot-path mutex (gov perf-S2) - and does no presence read, so nothing here
+            // can fail. A device gracefully departed from another replica reads offline as soon
+            // as its cleared session_id is written (#5678); one that dropped without a goodbye
+            // reads online for up to the TTL, the documented residual of the liveness predicate.
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
-            auto online_ids = registry_.all_ids();
+            auto online_ids = registry_.local_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
@@ -20395,7 +20453,7 @@ private:
                 // registry session's copy when the agent is currently online.
                 r.agent_version = e.agent_version;
                 r.arch = e.arch;
-                r.online = online.count(e.agent_id) > 0;
+                r.online = roster_row_online(e, online);
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > kHardwareStaleAfterMs; // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
@@ -20504,7 +20562,10 @@ private:
             }
             if (!offline_endpoint_store_)
                 return std::optional<InventoryDeviceRow>{};
-            const auto ep = offline_endpoint_store_->find_within(agent_id, kHardwareRosterWindow);
+            // #7551: asks the database whether the device is live on ANOTHER replica (no local
+            // session here), which the offline fallback used to hard-code as offline.
+            const auto ep = offline_endpoint_store_->find_within(agent_id, kHardwareRosterWindow,
+                                                                 cfg_.session_timeout);
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();

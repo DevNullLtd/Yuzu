@@ -45,6 +45,7 @@
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "outbound_url_policy.hpp"       // url_audit_detail: audit rows never carry a destination URL in full
+#include "guardian_order_json.hpp"       // UP-14: the shared JSON of a device's ordering block (REST twin)
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
 #include "result_set_matcher.hpp"        // validate_matcher: admission check of a caller matcher (#4644)
@@ -1860,11 +1861,17 @@ static const ToolDef kTools[] = {
      "0 does NOT prove the census is fresh or complete, since an event that never arrived leaves "
      "no trace, and a pending event whose pair has no census row is not counted (the per-device "
      "reads get_guardian_device_guards and get_guardian_device_compliance report those as "
-     "unrepresented_pending_guards). A service-scoped "
+     "unrepresented_pending_guards). unordered_agents counts agents whose latest event without "
+     "an emit-order pair is later than the time their pair clock last advanced (an agent that "
+     "never sent a pair counts), within the same scope; unordered_agent_ids lists the first 50 "
+     "in ascending byte order of agent id (a count above the list length means truncation). The "
+     "pair is stored and counted, not yet compared: no verdict depends on it. 0 does NOT prove "
+     "every agent sends a pair, since an agent with no census-bearing event has no order row. A "
+     "service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
      R"({"type":"object","properties":{}})",
-     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules"]})j"},
+     R"j({"type":"object","properties":{"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"uncertain_rules":{"type":"integer"},"unordered_agents":{"type":"integer","minimum":0},"unordered_agent_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},"note":{"type":"string"}},"required":["total_rules","compliant_rules","drifted_rules","errored_rules","uncertain_rules","unordered_agents","unordered_agent_ids"]})j"},
 
     {"list_guardian_rules",
      "List every Guaranteed State rule (Guard) in the catalogue — full rule bodies "
@@ -1918,11 +1925,19 @@ static const ToolDef kTools[] = {
      "non-atomic observations (a pair may appear in both guards[] and the unrepresented list); a "
      "zero count or false flag establishes neither freshness nor "
      "completeness. A pending-evidence read that times out answers a non-retryable error (no "
-     "retry hint): the most likely cause is a large retained pending backlog. Per-device scoped "
-     "(management-group aware) via the same "
+     "retry hint): the most likely cause is a large retained pending backlog. ordering is the "
+     "device's stored emit-order pair state, or null when the device has no order row (no "
+     "census-bearing event was ever accepted, or it was decommissioned): epoch, emit_seq_hwm "
+     "and epoch_recv_ns (server clock, nanoseconds) are the pair clock; unpaired_recv_ns is the "
+     "latest accepted event without a pair; currently_unordered is true when that is later than "
+     "epoch_recv_ns (a never-paired device counts). The counters count accepted events by the "
+     "kind of pair they carried against the clock. They are stored and counted, not yet "
+     "compared: no verdict was held or refused on them, and pair_duplicates stays 0 until the "
+     "comparator ships. The integers are 64-bit and can exceed 2^53, so read them as 64-bit "
+     "integers. Per-device scoped (management-group aware) via the same "
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
-     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids"]})j"},
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"},"order_uncertain":{"type":"boolean"},"projection_pending":{"type":"boolean"}},"required":["rule_id","name","state","updated_at","order_uncertain","projection_pending"]}},"total_guards":{"type":"integer"},"unrepresented_pending_guards":{"type":"integer","minimum":0},"unrepresented_pending_rule_ids":{"type":"array","maxItems":50,"uniqueItems":true,"items":{"type":"string"}},"ordering":{"type":["object","null"],"properties":{"epoch":{"type":["integer","null"]},"emit_seq_hwm":{"type":["integer","null"]},"epoch_recv_ns":{"type":["integer","null"]},"retired_epoch":{"type":["integer","null"]},"unpaired_recv_ns":{"type":["integer","null"]},"currently_unordered":{"type":"boolean"},"unpaired_events":{"type":"integer","minimum":0},"unpaired_held":{"type":"integer","minimum":0},"pair_regressions":{"type":"integer","minimum":0},"pair_stragglers":{"type":"integer","minimum":0},"pair_recoveries":{"type":"integer","minimum":0},"pair_duplicates":{"type":"integer","minimum":0},"retired_events":{"type":"integer","minimum":0}},"required":["epoch","emit_seq_hwm","epoch_recv_ns","retired_epoch","unpaired_recv_ns","currently_unordered","unpaired_events","unpaired_held","pair_regressions","pair_stragglers","pair_recoveries","pair_duplicates","retired_events"]}},"required":["agent_id","guards","total_guards","unrepresented_pending_guards","unrepresented_pending_rule_ids","ordering"]})j"},
 
     // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
     // Closes the remaining MCP gap on the Guaranteed State surface: the 6
@@ -2254,18 +2269,26 @@ static const ToolDef kTools[] = {
      "including agents whose operating system is not recognised, so not the sum of the per-platform "
      "results), windows, macos or linux. The population is that scope's devices online now "
      "(population: null = no fleet source wired, 0 = no device of the scope online now; "
-     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage says "
-     "per platform whether its crash sources are complete (windows) or partial (linux, macos), so "
-     "a short list for linux or macos is not proof of a healthy fleet. An empty apps list means no "
+     "population_basis names it, e.g. all_online or windows_online). crash_source_coverage is the "
+     "shipped design of the crash sources per platform, complete (windows) or partial (linux, macos), "
+     "not live collector health: it does not change when a collector is off or missing on a host, so "
+     "a short list for linux or macos is not proof of a healthy fleet. observer_state is the live "
+     "count: per platform in scope, how many online devices report the crash and hang observer "
+     "armed, disarmed or not at all (null when no observer source is wired); a device that is not "
+     "armed or not reporting may not be sending all of its crash and hang signals (collection can "
+     "be incomplete or unavailable), so a quiet list does not cover it. An empty apps list means no "
      "crash or hang signal in the window on that scope, not a failure. "
      "Pass platform=windows for the Windows scope only; get_dex_app is the per-application drill-down and counts every platform. An invalid platform or window is invalid params (-32602, terminal: do not retry it unchanged). No device floor is applied. "
      "The policy object names the score policy every figure was scored under (source default or custom, "
      "revision, fault - a reason string when a stored policy document was refused and the shipped "
-     "defaults are in force, otherwise null - and the four tier edges and display names); each "
-     "application's profile is override when a per-application override shaped its tiers or weights, "
+     "defaults are in force, otherwise null - interval_confidence, and the four tier edges and display "
+     "names); each score carries tier, the display name its band reads as for that row (null when "
+     "withheld); each application's profile is override when a per-application override shaped its tiers or weights, "
      "else default. No per-agent identity (a distinct-device "
      "COUNT, never an agent_id) - not audited. A degraded read, including a stored policy that cannot be "
-     "read within its staleness bound, is an error, never an empty list. "
+     "read within its staleness bound, is an error naming the reason (concurrency_budget, "
+     "pool_acquire_timeout, statement_timeout, query_error, store_not_open, score_policy_unavailable "
+     "or score_policy_invalid), never an empty list. "
      "Mirrors GET /api/v1/dex/apps. Not audited beyond the generic tool-call row. A degraded read "
      "is a retryable error (retry_after_ms). Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
@@ -2273,11 +2296,12 @@ static const ToolDef kTools[] = {
      R"j("window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Look-back window for crash and hang signals."})j"
      R"j(}})j",
      R"j({"type":"object","properties":{"window":{"type":"string"},"population":{"type":["integer","null"]},"population_basis":{"type":"string"},"crash_source_coverage":{"type":"object","additionalProperties":{"type":"string","enum":["complete","partial"]}},"apps_total":{"type":"integer"},"apps_truncated":{"type":"boolean"},)j"
-     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","tiers"]},)j"
+     R"j("policy":{"type":"object","properties":{"source":{"type":"string","enum":["default","custom"]},"revision":{"type":"string"},"fault":{"type":["string","null"]},"interval_confidence":{"type":"number"},"tiers":{"type":"object","properties":{"excellent":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"good":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"fair":{"type":"object","properties":{"edge":{"type":"number"},"name":{"type":"string"}},"required":["edge","name"]},"poor":{"type":"object","properties":{"edge":{"type":"number","description":"The fixed 0, not a stored value."},"name":{"type":"string"}},"required":["edge","name"]}},"required":["excellent","good","fair","poor"]}},"required":["source","revision","fault","interval_confidence","tiers"]},)j"
+     R"j("observer_state":{"type":["object","null"],"description":"Live observer counts per platform (windows, linux, macos, other under all); null when no observer source is wired.","additionalProperties":{"type":"object","properties":{"armed":{"type":"integer"},"disarmed":{"type":"integer"},"none_reported":{"type":"integer"}},"required":["armed","disarmed","none_reported"]}},)j"
      R"j("apps":{"type":"array","items":{"type":"object","properties":{"subject":{"type":"string"},"profile":{"type":"string","enum":["default","override"]},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
-     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
-     R"j("required":["window","apps","policy","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"tier":{"type":["string","null"],"description":"The tier name the band reads as under the policy that scored this row; null when withheld."},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","tier","withheld","deductions"]},"versions":{"type":"array","items":{"type":"object","properties":{"version":{"type":"string"},)j"
+     R"j("crashes":{"type":"integer"},"hangs":{"type":"integer"},"distinct_devices":{"type":"integer"},"distinct_devices_online":{"type":["integer","null"]},"last_seen":{"type":"string"},"share_affected":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"rate_per_1000":{"type":["object","null"],"properties":{"estimate":{"type":["number","null"]},"lower":{"type":"number"},"upper":{"type":["number","null"]},"reliable":{"type":"boolean"}},"required":["estimate","lower","upper","reliable"]},"score":{"type":"object","properties":{"score":{"type":["number","null"]},"band":{"type":["string","null"]},"tier":{"type":["string","null"],"description":"The tier name the band reads as under the policy that scored this row; null when withheld."},"withheld":{"type":["string","null"],"description":"Why no score: no_population, offline_affected (an affected device is offline now) or a core reason; not a failure and not healthy."},"deductions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"points":{"type":"number"},"assessed":{"type":"boolean"}},"required":["name","points","assessed"]}}},"required":["score","band","tier","withheld","deductions"]}},"required":["version","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score"]}},"version_count":{"type":"integer"},"versions_truncated":{"type":"boolean"}},"required":["subject","profile","crashes","hangs","distinct_devices","distinct_devices_online","last_seen","share_affected","rate_per_1000","score","versions","version_count","versions_truncated"]}}},)j"
+     R"j("required":["window","apps","policy","observer_state","population","population_basis","crash_source_coverage","apps_total","apps_truncated"]})j"},
 
     {"get_dex_catalogue",
      "Signal catalogue family cards (Catalogue View 1): every catalogued signal family's "
@@ -18441,6 +18465,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // UP-14: same ids as the REST twin (scoped by the same list-read gate, in SQL).
+                JArr unordered_ids;
+                for (const auto& agent : rollup->unordered_agent_ids)
+                    unordered_ids.add(agent);
                 mcp_audit("success");
                 res.set_content(
                     success_response(
@@ -18450,6 +18478,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                              .add("drifted_rules", rollup->drifted_rules)
                                              .add("errored_rules", rollup->errored_rules)
                                              .add("uncertain_rules", rollup->uncertain_rules)
+                                             .add("unordered_agents", rollup->unordered_agents)
+                                             .raw("unordered_agent_ids", unordered_ids.str())
                                              .str(),
                                         kObjectOutputSchema)),
                     "application/json");
@@ -18808,7 +18838,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     .raw("guards", arr.str())
                     .add("total_guards", static_cast<int64_t>(rows->guards.size()))
                     .add("unrepresented_pending_guards", rows->unrepresented_pending_guards)
-                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str());
+                    .raw("unrepresented_pending_rule_ids", unrepresented_ids.str())
+                    // UP-14: one rendering shared with the REST twin; null = no order row.
+                    .raw("ordering", rows->ordering
+                                         ? render_guardian_agent_order_json(*rows->ordering)
+                                         : std::string("null"));
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(
