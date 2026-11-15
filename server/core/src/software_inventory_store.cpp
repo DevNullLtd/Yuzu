@@ -2212,6 +2212,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     return out;
 }
 
+std::string SoftwareInventoryStore::query_software_purl_predicate_sql(int param) {
+    // `purl <> ''` is stated so the partial index qualifies for every plan, generic ones too.
+    return " AND i.purl = $" + std::to_string(param) + " AND i.purl <> ''";
+}
+
 std::string SoftwareInventoryStore::find_by_purl_sql() {
     // `purl <> ''` is stated so the partial index qualifies for every plan, generic ones too.
     return "SELECT agent_id, name, version, ecosystem, purl, install_id "
@@ -2298,7 +2303,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         "SELECT i.agent_id, i.name, i.version, i.publisher, i.install_date, i.kind, i.ecosystem, "
         "i.epoch, i.release, i.arch, i.signature_status, i.distro_id, i.distro_version, "
         "i.package_id, i.source, i.install_id, i.install_type, i.install_scope, "
-        "i.install_location, i.instance_key, fs.status, fs.enabled, fs.last_confirmed_at "
+        "i.install_location, i.instance_key, fs.status, fs.enabled, fs.last_confirmed_at, i.purl "
         "FROM software_inventory_store.installed_software i "
         "LEFT JOIN software_inventory_store.software_facet_state fs "
         "ON fs.agent_id = i.agent_id AND fs.facet = i.source WHERE 1=1";
@@ -2331,6 +2336,10 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     if (!q.source.empty()) {
         sql += " AND i.source = $" + std::to_string(++p);
         params.push_back(q.source);
+    }
+    if (!q.purl.empty()) {
+        sql += query_software_purl_predicate_sql(++p);
+        params.push_back(q.purl);
     }
     if (q.version) {
         // Present (even "") is an exact bucket; nullopt = any version.
@@ -2397,6 +2406,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
             row.facet_enabled = PQgetisnull(res.get(), i, 21) ||
                                 std::string_view(PQgetvalue(res.get(), i, 21)) == "t";
             row.last_confirmed_at = PQgetisnull(res.get(), i, 22) ? 0 : result_i64(res, i, 22);
+            row.entry.purl = PQgetvalue(res.get(), i, 23);
             out.push_back(std::move(row));
         }
         return out;
@@ -2406,7 +2416,8 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         // The shapes whose cost the name index does not bound (q, match=contains, match=prefix
         // under a locale collation, a status filter) run under the 5 s statement bound and
         // degrade to the audited 503, never to a pool lease held to the 30 s pool default. The
-        // reads below keep the bare lease: exact-name and agent_id/scope reads are index-driven;
+        // reads below keep the bare lease: exact-name and agent_id/scope reads are index-driven,
+        // and so is a purl filter (installed_software_purl_idx; it does not set scan_shaped);
         // a kind, ecosystem, source or exact version filter with no name is a filtered walk under
         // ORDER BY name, bounded only by the pool's 30 s statement_timeout (pre-existing shape,
         // unchanged by this change; version without a name is new but takes the same path).
@@ -3931,6 +3942,355 @@ SoftwareInventoryStore::count_stale_agents(std::int64_t stale_before_secs) {
         return true;
     });
     return result;
+}
+
+// ---------------------------------------------------------------------------------------------
+// SAM-33 reads: hosts, change feed, facet health, summary. Each is AUTHORITATIVE (nullopt on any
+// degrade, never a silent empty) and pushes the caller's `agent_ids` scope into the WHERE.
+// ---------------------------------------------------------------------------------------------
+
+std::optional<std::vector<SoftwareHostRow>>
+SoftwareInventoryStore::query_hosts(const SoftwareHostQuery& q) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_hosts degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    // ADR-0033 present-empty rule: an empty scope selects nothing -> an empty VALUE, no SQL.
+    if (q.agent_ids && q.agent_ids->empty())
+        return std::vector<SoftwareHostRow>{};
+    int limit = q.limit > 0 ? q.limit : 100;
+    if (limit > kFleetQueryRowCap)
+        limit = kFleetQueryRowCap;
+
+    std::string sql = "SELECT agent_id, last_seen FROM software_inventory_store.inventory_state "
+                      "WHERE source = $1";
+    std::vector<std::string> params{kSourceInstalledSoftware};
+    int p = 1;
+    if (!q.after_agent_id.empty()) {
+        sql += " AND agent_id > $" + std::to_string(++p);
+        params.push_back(q.after_agent_id);
+    }
+    if (q.last_synced_before > 0) {
+        sql += " AND last_seen < $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.last_synced_before));
+    }
+    if (q.agent_ids) {
+        std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        sql += " AND agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        params.push_back(pg::to_text_array(ids));
+    }
+    sql += " ORDER BY agent_id LIMIT $" + std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(limit));
+    if (q.skip > 0) {
+        sql += " OFFSET $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.skip));
+    }
+
+    auto parse_page = [](const pg::PgResult& res) {
+        std::vector<SoftwareHostRow> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareHostRow row;
+            row.agent_id = PQgetvalue(res.get(), i, 0);
+            row.last_seen = result_i64(res, i, 1);
+            out.push_back(std::move(row));
+        }
+        return out;
+    };
+    static SiteSamplers page_samplers;
+    auto page = bounded_query(pool_, metrics_, "query_hosts", page_samplers, sql, params,
+                              parse_page);
+    if (!page || page->empty())
+        return page;
+
+    // The page's facet rows, ONE statement on the (agent_id, facet) primary key.
+    std::vector<std::string_view> page_ids;
+    page_ids.reserve(page->size());
+    for (const auto& r : *page)
+        page_ids.emplace_back(r.agent_id);
+    auto parse_facets = [](const pg::PgResult& res) {
+        std::vector<std::pair<std::string, SoftwareHostFacet>> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareHostFacet f;
+            f.facet = PQgetvalue(res.get(), i, 1);
+            f.status = PQgetvalue(res.get(), i, 2);
+            f.token = PQgetvalue(res.get(), i, 3);
+            f.enabled = std::string_view(PQgetvalue(res.get(), i, 4)) == "t";
+            f.last_confirmed_at = result_i64(res, i, 5);
+            f.duration_ms = result_i64(res, i, 6);
+            f.bytes_read = result_i64(res, i, 7);
+            out.emplace_back(PQgetvalue(res.get(), i, 0), std::move(f));
+        }
+        return out;
+    };
+    static SiteSamplers facet_samplers;
+    auto facets = bounded_query(
+        pool_, metrics_, "query_hosts (facets)", facet_samplers,
+        "SELECT agent_id, facet, status, token, enabled, last_confirmed_at, duration_ms, "
+        "bytes_read FROM software_inventory_store.software_facet_state "
+        "WHERE agent_id = ANY($1::text[]) ORDER BY agent_id, facet",
+        std::vector<std::string>{pg::to_text_array(page_ids)}, parse_facets);
+    if (!facets)
+        return std::nullopt;
+    std::unordered_map<std::string, std::size_t> at;
+    at.reserve(page->size());
+    for (std::size_t i = 0; i < page->size(); ++i)
+        at.emplace((*page)[i].agent_id, i);
+    for (auto& [agent, f] : *facets) {
+        if (const auto it = at.find(agent); it != at.end())
+            (*page)[it->second].facets.push_back(std::move(f));
+    }
+    return page;
+}
+
+std::optional<std::vector<SoftwareChangeRow>>
+SoftwareInventoryStore::query_changes(const SoftwareChangesQuery& q) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: query_changes degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    // Present-empty scope, or a missing settle horizon (a precondition miss): empty VALUE, no SQL.
+    if ((q.agent_ids && q.agent_ids->empty()) || q.stable_before <= 0)
+        return std::vector<SoftwareChangeRow>{};
+    int limit = q.limit > 0 ? q.limit : 100;
+    if (limit > kFleetQueryRowCap)
+        limit = kFleetQueryRowCap;
+
+    std::string sql =
+        "SELECT change_id, agent_id, facet, kind, name, publisher, instance_key, "
+        "from_version, to_version, observed_at "
+        "FROM software_inventory_store.software_changes WHERE observed_at < $1::bigint";
+    std::vector<std::string> params{std::to_string(q.stable_before)};
+    int p = 1;
+    if (!q.agent_id.empty()) {
+        sql += " AND agent_id = $" + std::to_string(++p);
+        params.push_back(q.agent_id);
+    }
+    if (!q.kind.empty()) {
+        sql += " AND kind = $" + std::to_string(++p);
+        params.push_back(q.kind);
+    }
+    if (q.since > 0) {
+        sql += " AND observed_at >= $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.since));
+    }
+    if (q.agent_ids) {
+        std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        sql += " AND agent_id = ANY($" + std::to_string(++p) + "::text[])";
+        params.push_back(pg::to_text_array(ids));
+    }
+    if (q.after_observed_at != 0 || q.after_change_id != 0) {
+        // The row-value comparison is the keyset; the plain observed_at bound beside it is
+        // redundant for correctness and lets the single-column observed_at index seek.
+        const int a = p + 1;
+        sql += " AND observed_at >= $" + std::to_string(a) + "::bigint AND (observed_at, change_id) > ($" +
+               std::to_string(a) + "::bigint, $" + std::to_string(a + 1) + "::bigint)";
+        p += 2;
+        params.push_back(std::to_string(q.after_observed_at));
+        params.push_back(std::to_string(q.after_change_id));
+    }
+    sql += " ORDER BY observed_at, change_id LIMIT $" + std::to_string(++p) + "::bigint";
+    params.push_back(std::to_string(limit));
+    if (q.skip > 0) {
+        sql += " OFFSET $" + std::to_string(++p) + "::bigint";
+        params.push_back(std::to_string(q.skip));
+    }
+
+    auto parse = [](const pg::PgResult& res) {
+        std::vector<SoftwareChangeRow> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            SoftwareChangeRow row;
+            row.change_id = result_i64(res, i, 0);
+            row.agent_id = PQgetvalue(res.get(), i, 1);
+            row.facet = PQgetvalue(res.get(), i, 2);
+            row.kind = PQgetvalue(res.get(), i, 3);
+            row.name = PQgetvalue(res.get(), i, 4);
+            row.publisher = PQgetvalue(res.get(), i, 5);
+            row.instance_key = PQgetvalue(res.get(), i, 6);
+            row.from_version = PQgetvalue(res.get(), i, 7);
+            row.to_version = PQgetvalue(res.get(), i, 8);
+            row.observed_at = result_i64(res, i, 9);
+            out.push_back(std::move(row));
+        }
+        return out;
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "query_changes", samplers, sql, params, parse);
+}
+
+namespace {
+// A facet_state row that actually collected something: enabled and a status that ran the
+// collector (a disabled / not_collected / never-reported row has zero duration and bytes).
+constexpr std::string_view kFacetMeasuredSql =
+    "enabled AND status IN ('full', 'delta', 'constrained', 'timeout', 'oversize')";
+constexpr int kFacetSlowestPerFacet = 10;
+} // namespace
+
+std::optional<std::vector<FacetHealth>> SoftwareInventoryStore::facet_health(
+    const std::optional<std::vector<std::string>>& agent_ids) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: facet_health degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (agent_ids && agent_ids->empty())
+        return std::vector<FacetHealth>{};
+    std::vector<std::string> params;
+    std::string scope; // appended to a WHERE / used as the WHERE of the statement
+    if (agent_ids) {
+        std::vector<std::string_view> ids(agent_ids->begin(), agent_ids->end());
+        params.push_back(pg::to_text_array(ids));
+        scope = "agent_id = ANY($1::text[])";
+    }
+    const std::string measured(kFacetMeasuredSql);
+
+    // Statement 1: one row per facet. Columns: facet, 7 status counts (kV3AllStatuses order),
+    // duration p50/p95/max, bytes p50/p95/max.
+    std::string sql = "SELECT facet";
+    for (const auto st : kV3AllStatuses) {
+        const std::string name(v3_status_name(st));
+        // enabled = false is `disabled` whatever the stored status says.
+        sql += st == V3Status::kDisabled
+                   ? ", count(*) FILTER (WHERE NOT enabled OR status = 'disabled')"
+                   : ", count(*) FILTER (WHERE enabled AND status = '" + name + "')";
+    }
+    for (const char* col : {"duration_ms", "bytes_read"}) {
+        const std::string c(col);
+        sql += ", coalesce(percentile_disc(0.5) WITHIN GROUP (ORDER BY " + c + ") FILTER (WHERE " +
+               measured + "), 0)";
+        sql += ", coalesce(percentile_disc(0.95) WITHIN GROUP (ORDER BY " + c + ") FILTER (WHERE " +
+               measured + "), 0)";
+        sql += ", coalesce(max(" + c + ") FILTER (WHERE " + measured + "), 0)";
+    }
+    sql += " FROM software_inventory_store.software_facet_state";
+    if (!scope.empty())
+        sql += " WHERE " + scope;
+    sql += " GROUP BY facet ORDER BY facet";
+
+    auto parse = [](const pg::PgResult& res) {
+        std::vector<FacetHealth> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            FacetHealth h;
+            h.facet = PQgetvalue(res.get(), i, 0);
+            int col = 1;
+            for (const auto st : kV3AllStatuses)
+                h.devices_by_status[std::string(v3_status_name(st))] = result_i64(res, i, col++);
+            h.duration_ms_p50 = result_i64(res, i, col++);
+            h.duration_ms_p95 = result_i64(res, i, col++);
+            h.duration_ms_max = result_i64(res, i, col++);
+            h.bytes_read_p50 = result_i64(res, i, col++);
+            h.bytes_read_p95 = result_i64(res, i, col++);
+            h.bytes_read_max = result_i64(res, i, col++);
+            out.push_back(std::move(h));
+        }
+        return out;
+    };
+    static SiteSamplers samplers;
+    auto health = bounded_query(pool_, metrics_, "facet_health", samplers, sql, params, parse);
+    if (!health || health->empty())
+        return health;
+
+    // Statement 2: the top-N slowest measured rows per facet, one windowed pass.
+    const std::string slow_sql =
+        "SELECT facet, agent_id, duration_ms FROM ("
+        "SELECT facet, agent_id, duration_ms, "
+        "row_number() OVER (PARTITION BY facet ORDER BY duration_ms DESC, agent_id) AS rn "
+        "FROM software_inventory_store.software_facet_state WHERE " +
+        measured + (scope.empty() ? "" : " AND " + scope) +
+        ") t WHERE rn <= " + std::to_string(kFacetSlowestPerFacet) + " ORDER BY facet, rn";
+    auto parse_slow = [](const pg::PgResult& res) {
+        std::vector<std::pair<std::string, FacetSlowDevice>> out;
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i)
+            out.emplace_back(PQgetvalue(res.get(), i, 0),
+                             FacetSlowDevice{PQgetvalue(res.get(), i, 1), result_i64(res, i, 2)});
+        return out;
+    };
+    static SiteSamplers slow_samplers;
+    auto slow = bounded_query(pool_, metrics_, "facet_health (slowest)", slow_samplers, slow_sql,
+                              params, parse_slow);
+    if (!slow)
+        return std::nullopt;
+    std::unordered_map<std::string, std::size_t> at;
+    for (std::size_t i = 0; i < health->size(); ++i)
+        at.emplace((*health)[i].facet, i);
+    for (auto& [facet, dev] : *slow) {
+        if (const auto it = at.find(facet); it != at.end())
+            (*health)[it->second].slowest.push_back(std::move(dev));
+    }
+    return health;
+}
+
+std::optional<SoftwareSummary> SoftwareInventoryStore::software_summary(
+    std::int64_t now, const std::optional<std::vector<std::string>>& agent_ids) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: software_summary degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (agent_ids && agent_ids->empty())
+        return SoftwareSummary{};
+    constexpr std::int64_t kStaleSeconds = 172800; // 48 h
+    constexpr std::int64_t kDaySeconds = 86400;
+    std::vector<std::string> params{kSourceInstalledSoftware, std::to_string(now - kStaleSeconds),
+                                    std::to_string(now - kDaySeconds),
+                                    std::to_string(now - 7 * kDaySeconds)};
+    std::string scope;
+    if (agent_ids) {
+        std::vector<std::string_view> ids(agent_ids->begin(), agent_ids->end());
+        params.push_back(pg::to_text_array(ids));
+        scope = " AND agent_id = ANY($5::text[])";
+    }
+    // Two single-row aggregates (no GROUP BY), so the join yields exactly one row.
+    const auto changes = [](const char* kind, const char* bound) {
+        return std::string("count(*) FILTER (WHERE kind = '") + kind + "' AND observed_at >= " +
+               bound + "::bigint)";
+    };
+    const std::string sql =
+        "SELECT d.reporting, d.stale, c.i24, c.r24, c.u24, c.i7, c.r7, c.u7 FROM "
+        "(SELECT count(*) AS reporting, count(*) FILTER (WHERE last_seen < $2::bigint) AS stale "
+        "FROM software_inventory_store.inventory_state WHERE source = $1" +
+        scope + ") d, (SELECT " + changes("install", "$3") + " AS i24, " +
+        changes("remove", "$3") + " AS r24, " + changes("upgrade", "$3") + " AS u24, " +
+        changes("install", "$4") + " AS i7, " + changes("remove", "$4") + " AS r7, " +
+        changes("upgrade", "$4") +
+        " AS u7 FROM software_inventory_store.software_changes WHERE observed_at >= $4::bigint" +
+        scope + ") c";
+
+    auto parse = [](const pg::PgResult& res) {
+        SoftwareSummary s;
+        if (PQntuples(res.get()) != 1)
+            return s;
+        s.devices_reporting = result_i64(res, 0, 0);
+        s.devices_stale = result_i64(res, 0, 1);
+        s.changes_24h = {result_i64(res, 0, 2), result_i64(res, 0, 3), result_i64(res, 0, 4)};
+        s.changes_7d = {result_i64(res, 0, 5), result_i64(res, 0, 6), result_i64(res, 0, 7)};
+        return s;
+    };
+    static SiteSamplers samplers;
+    return bounded_query(pool_, metrics_, "software_summary", samplers, sql, params, parse);
 }
 
 } // namespace yuzu::server

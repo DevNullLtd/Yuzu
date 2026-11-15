@@ -1,0 +1,1 @@
+- **The installed-software lookup CSV export grows from 22 to 23 columns.** The `format=csv` export of `GET /api/v1/inventory/software` gains `purl` as its last column (after `instance_key`), and each JSON row gains a `purl` field, so a consumer that pinned a column count or position must read by header name.

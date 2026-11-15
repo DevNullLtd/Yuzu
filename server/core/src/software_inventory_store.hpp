@@ -38,6 +38,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -215,6 +216,9 @@ struct SoftwareFleetQuery {
     std::string kind;      ///< exact kind filter
     std::string ecosystem; ///< exact ecosystem filter
     std::string source;    ///< exact source filter
+    /// Exact purl filter ("" = none): byte equality with the stored canonical purl, served by the
+    /// partial index `installed_software_purl_idx`. Only blob-v3 rows carry a purl.
+    std::string purl;
     /// Exact version filter: nullopt = any version; present (including "") = that exact
     /// version, so "" selects only the empty-version rows.
     std::optional<std::string> version;
@@ -304,6 +308,111 @@ struct SoftwareTotals {
 /// Freshness stamp of the components rollup (refreshed_at == 0: never computed, "building").
 struct ComponentRollupMeta {
     std::int64_t refreshed_at{0};
+};
+
+/// One `software_facet_state` row as `query_hosts` returns it (the raw stored status; the wire
+/// `status` is that stored value as is, and the route derives only `row_status` from it).
+struct SoftwareHostFacet {
+    std::string facet;
+    std::string status;
+    std::string token;
+    bool enabled{true};
+    std::int64_t last_confirmed_at{0};
+    std::int64_t duration_ms{0};
+    std::int64_t bytes_read{0};
+};
+
+/// One reporting device: its `installed_software` receipt time and its facet state rows
+/// (name-sorted; empty for a device that has no state row yet).
+struct SoftwareHostRow {
+    std::string agent_id;
+    std::int64_t last_seen{0}; ///< inventory_state.last_seen: server receipt epoch seconds
+    std::vector<SoftwareHostFacet> facets;
+};
+
+/// Keyset page of reporting devices, ordered by agent_id. `agent_ids` is the scope push-down
+/// (SoftwareFleetQuery::agent_ids rule: nullopt = unfiltered, PRESENT-EMPTY = empty value with
+/// no SQL). `last_synced_before` > 0 keeps devices with last_seen < that epoch. Resume with
+/// `after_agent_id` = the last row's agent_id ("" = head). `limit` <= 0 means 100 and is clamped
+/// to kFleetQueryRowCap. `skip` > 0 passes over that many rows after the anchor.
+struct SoftwareHostQuery {
+    std::optional<std::vector<std::string>> agent_ids;
+    std::int64_t last_synced_before{0};
+    std::string after_agent_id;
+    int limit{100};
+    std::int64_t skip{0};
+};
+
+/// One change-ledger row (`software_changes`).
+struct SoftwareChangeRow {
+    std::int64_t change_id{0};
+    std::string agent_id;
+    std::string facet;
+    std::string kind; ///< install | remove | upgrade
+    std::string name;
+    std::string publisher;
+    std::string instance_key;
+    std::string from_version;
+    std::string to_version;
+    std::int64_t observed_at{0}; ///< the writing replica's clock, whole seconds
+};
+
+/// Change-feed page, ordered (observed_at, change_id). `agent_ids` is the scope push-down (same
+/// rule as SoftwareHostQuery); `agent_id`/`kind` are exact filters ("" = any). `since` > 0 keeps
+/// observed_at >= since. `stable_before` is REQUIRED > 0 (the settle horizon: rows with
+/// observed_at >= it are not yet published); <= 0 is a precondition miss -> empty value, no SQL.
+/// The keyset anchor is the composite (after_observed_at, after_change_id) of the previous
+/// page's last row; 0 and 0 = head. `limit` <= 0 means 100, clamped to kFleetQueryRowCap.
+struct SoftwareChangesQuery {
+    std::optional<std::vector<std::string>> agent_ids;
+    std::string agent_id;
+    std::string kind;
+    std::int64_t since{0};
+    std::int64_t stable_before{0};
+    std::int64_t after_observed_at{0};
+    std::int64_t after_change_id{0};
+    int limit{100};
+    std::int64_t skip{0};
+};
+
+/// One slow device in a facet's top-10 collection durations.
+struct FacetSlowDevice {
+    std::string agent_id;
+    std::int64_t duration_ms{0};
+};
+
+/// Fleet health of one facet (`software_facet_state` grouped by facet). `devices_by_status`
+/// always carries all seven v3 statuses (zero when none); a row with enabled = false counts as
+/// `disabled`. The duration/bytes figures are over MEASURED rows only: enabled and status one of
+/// full | delta | constrained | timeout | oversize (a disabled or not_collected row collected
+/// nothing, so its zeros must not drag the percentiles down). `slowest` is the top 10 measured
+/// rows by duration_ms (agent_id breaks ties).
+struct FacetHealth {
+    std::string facet;
+    std::map<std::string, std::int64_t> devices_by_status;
+    std::int64_t duration_ms_p50{0};
+    std::int64_t duration_ms_p95{0};
+    std::int64_t duration_ms_max{0};
+    std::int64_t bytes_read_p50{0};
+    std::int64_t bytes_read_p95{0};
+    std::int64_t bytes_read_max{0};
+    std::vector<FacetSlowDevice> slowest;
+};
+
+/// install | remove | upgrade ledger-row counts.
+struct SoftwareChangeCounts {
+    std::int64_t install{0};
+    std::int64_t remove{0};
+    std::int64_t upgrade{0};
+};
+
+/// Headline numbers for the software summary. `devices_stale` = reporting devices with
+/// last_seen < now - 172800 (48 h). The 24 h counts are a subset of the 7 d counts.
+struct SoftwareSummary {
+    std::int64_t devices_reporting{0};
+    std::int64_t devices_stale{0};
+    SoftwareChangeCounts changes_24h;
+    SoftwareChangeCounts changes_7d;
 };
 
 /// The row-status rule, ONE SQL fragment shared by every read and the rollup. Needs the facet
@@ -684,6 +793,10 @@ public:
     /// The `find_by_purl` statement (`$1` = purl, `$2` = limit). Exposed so a test can EXPLAIN it
     /// and pin that it reaches `installed_software_purl_idx`.
     [[nodiscard]] static std::string find_by_purl_sql();
+    /// The `purl` predicate `query_software` appends for `SoftwareFleetQuery::purl`
+    /// (`$<param>` = the purl, alias `i` = installed_software). Exposed so a test can EXPLAIN it
+    /// and pin that it reaches `installed_software_purl_idx`.
+    [[nodiscard]] static std::string query_software_purl_predicate_sql(int param);
 
     /// `inventory_state.last_seen` for one (agent, source) — the SERVER receipt
     /// epoch-seconds of the last ACCEPTED report (full or hash-only touch).
@@ -712,6 +825,50 @@ public:
     /// `agent_ids` or `versions` is an empty value with no SQL.
     [[nodiscard]] std::optional<std::vector<SoftwareComponentRow>>
     query_components(const SoftwareComponentQuery& q);
+
+    /// Keyset page of the devices that have reported `installed_software`, with each device's
+    /// facet state rows (SAM-33). Two statements: the agent-id page from `inventory_state`
+    /// (ORDER BY agent_id, served by inventory_state_source_agent_idx), then ONE read of those
+    /// ids' `software_facet_state` rows on the primary key. AUTHORITATIVE read: `std::nullopt`
+    /// on any store/pool/query degrade (incl. the 5 s bound), NEVER a silent empty; an empty
+    /// value = no devices. A present-empty `agent_ids` runs no SQL. Facet rows are not
+    /// transactionally tied to the page, so a concurrent sync may show a device's facets newer
+    /// than its `last_seen`.
+    [[nodiscard]] std::optional<std::vector<SoftwareHostRow>>
+    query_hosts(const SoftwareHostQuery& q);
+
+    /// The change feed (SAM-33): ledger rows ordered (observed_at, change_id) and paged by the
+    /// row-value keyset (observed_at, change_id) > (after_observed_at, after_change_id), so the
+    /// page order EQUALS the eligibility order (`observed_at < stable_before`). change_id is a
+    /// BIGSERIAL taken at insert while observed_at is the writing replica's own clock, so the two
+    /// can disagree; a change_id-only cursor would step over a lower id that becomes eligible
+    /// later. software_changes_observed_idx serves the fleet read and software_changes_agent_idx
+    /// the per-device (`agent_id`) read. LATENESS CONTRACT: a row is published once it is older
+    /// than the settle window on the serving replica's clock (the caller derives `stable_before`
+    /// from it). A row whose transaction commits later than that after its own observed_at lands
+    /// behind any cursor that already passed its position; it is recovered only by a re-read
+    /// with `since` at or before its observed_at, de-duplicated on change_id (unique and
+    /// stable). `limit` is clamped to kFleetQueryRowCap. AUTHORITATIVE: nullopt on any degrade;
+    /// a present-empty `agent_ids` or `stable_before` <= 0 -> empty value, no SQL.
+    [[nodiscard]] std::optional<std::vector<SoftwareChangeRow>>
+    query_changes(const SoftwareChangesQuery& q);
+
+    /// Per-facet fleet health (SAM-33), ordered by facet: ONE GROUP BY facet statement (status
+    /// counts via count(*) FILTER, percentile_disc over measured rows) and one windowed statement
+    /// for the top-10 slowest. No index serves it, so both run under the 5 s bound. `agent_ids`
+    /// is the scope push-down (nullopt = whole fleet; present-empty -> empty value, no SQL).
+    /// The two statements are separate snapshots: a facet that appears between them has no
+    /// `slowest`. AUTHORITATIVE: nullopt on any degrade.
+    [[nodiscard]] std::optional<std::vector<FacetHealth>>
+    facet_health(const std::optional<std::vector<std::string>>& agent_ids);
+
+    /// Headline summary (SAM-33) in ONE statement: reporting/stale devices from `inventory_state`
+    /// (stale = last_seen < now - 172800) plus the ledger counts over observed_at >= now - 7 d,
+    /// 24 h split from the same rows. `now` is the caller's epoch seconds (the same clock the
+    /// ledger's observed_at uses). 5 s bound. `agent_ids` as facet_health (present-empty ->
+    /// zeroed value, no SQL). AUTHORITATIVE: nullopt on any degrade.
+    [[nodiscard]] std::optional<SoftwareSummary>
+    software_summary(std::int64_t now, const std::optional<std::vector<std::string>>& agent_ids);
 
     /// Distinct non-empty versions of one installed title, LIVE from `installed_software` (served
     /// by installed_software_name_idx), ordered, at most kCatalogRowCap rows: a read that returns
