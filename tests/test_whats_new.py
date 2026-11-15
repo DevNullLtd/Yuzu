@@ -2286,6 +2286,20 @@ class MarkerAmbiguity(GitCase):
         sections = WN.release_sections("## [2.0]\n```\n## [9.9]\n```\n- real\n")
         self.assertEqual(sections["- real"], "9.9")
 
+    def test_the_same_version_repeated_keeps_the_version(self):
+        self.assertEqual(WN.release_sections("## [1.0]\n- a\n- a\n")["- a"], "1.0")
+
+    def test_only_exactly_unreleased_is_unreleased(self):
+        self.assertEqual(WN.release_sections("## [Unreleasedx]\n- a\n")["- a"], "Unreleasedx")
+
+    def test_a_bullet_that_merely_mentions_breaking_is_not_counted(self):
+        repo, old = self.base()
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Fixed a breaking-change banner.**\n")
+        self.commit(repo, "add")
+        out = self.ok(repo, "--since", old)
+        self.assertNotIn("Breaking  ", out)
+        self.assertRegex(out, r"Changelog entries added \(1\)")
+
     def test_a_sub_heading_does_not_end_the_section(self):
         repo, old = self.base()
         log = "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n### Added\n\n- **Shipped thing.**\n"
@@ -2401,6 +2415,7 @@ class VersionsModeNotices(GitCase):
         self.assertLess(out.index("with no '- ' bullet"), out.index("not named like fragments"))
         self.assertLess(out.index("not named like fragments"), out.index("over 1024 KiB"))
         self.assertIn("\n\nFragments the report could not use", out)
+        self.assertNotIn("\n\n\n", out)
 
     def test_no_notice_line_when_everything_was_read(self):
         repo, old = self.breaking_repo()
