@@ -1061,7 +1061,7 @@ an agent against the durable route directory in Postgres (batched reads of up to
 answer for it; a session the replica holds no local entry for is still ingested
 and is also reported in the `BatchHeartbeat` unknown-session list below. Run
 exactly one server replica until the HA safe-to-scale gate lifts
-([ADR-2002](../adr/2002-high-availability-architecture.md) section 7c).
+([ADR-2002](../adr/2002-high-availability-architecture.md) section 7c). With a second replica (unsupported), a `plugin_not_found` for a plugin an agent lacks is reported by a replica that does not hold the agent's session only for gateway-fronted agents, and only while the agent's route-directory row confirms it; otherwise the command is sent and the agent answers for itself (`yuzu_server_plugin_absence_confirm_total`).
 
 ### RPCs
 

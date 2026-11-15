@@ -1764,6 +1764,23 @@ void AgentRegistry::configure_presence_plugin_reader(PluginMissingReadFn reader,
     missing_plugin_cache_.clear();
 }
 
+void AgentRegistry::configure_route_session_reader(RouteSessionReadFn reader) {
+    // Closed outcome set, described and seeded whether or not a reader is bound, so absent()-based
+    // alerting is meaningful on every deployment (docs/observability-conventions.md).
+    metrics_.describe("yuzu_server_plugin_absence_confirm_total",
+                      "Cross-replica plugin-absence candidates by directory confirmation "
+                      "outcome: withheld (the directory row still names the session that "
+                      "published the list), not_confirmed (no routable row, a newer session, or "
+                      "the agent became local during the read), degraded (the confirmation read "
+                      "failed, nothing withheld), shed (too many confirmations in flight, "
+                      "nothing withheld), unwired (no confirmation reader, nothing withheld)",
+                      "counter");
+    for (const char* o : {"withheld", "not_confirmed", "degraded", "shed", "unwired"})
+        (void)metrics_.counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", o}});
+    std::lock_guard lock(missing_plugin_mu_);
+    route_session_reader_ = std::move(reader);
+}
+
 void AgentRegistry::configure_presence(OfflineEndpointStore* store, std::chrono::seconds ttl) {
     // Borrowed, not owning: `store` is `ServerImpl::offline_endpoint_store_`, and `server.cpp`
     // unwires it with configure_presence(nullptr) at stop, before the store is destroyed. The
@@ -1886,7 +1903,7 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
     // The cross-replica read runs OFF mu_ (same discipline as ids_with_os / all_ids) and shares
     // its cached result, so nothing here copies the id list.
     const MissingPluginIds remote = missing_plugin_from_presence(plugin);
-    std::vector<const std::string*> remote_only;
+    std::vector<const PluginAbsence*> remote_only;
     if (remote)
         remote_only.reserve(remote->size()); // a large allocation: never inside `mu_`
     {
@@ -1898,13 +1915,115 @@ std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_vi
                 missing.insert(id);
         }
         if (remote) {
-            for (const auto& id : *remote)
-                if (!agents_.contains(id)) // local wins
-                    remote_only.push_back(&id);
+            for (const auto& a : *remote)
+                if (!agents_.contains(a.agent_id)) // local wins
+                    remote_only.push_back(&a);
         }
     }
-    for (const auto* id : remote_only) // set inserts happen off mu_
+    if (remote_only.empty())
+        return missing;
+    // A cached absence is only a CANDIDATE: it was true of the session that published the list.
+    // Withhold the agent only while its ROUTABLE directory row, read NOW (never cached), still
+    // names that same session. `agent_routes.session_id` is written by the registration that
+    // creates a new session, before the agent is handed it, so a restarted agent's old list stops
+    // matching at that instant, with no dependence on a best-effort clear or on the new session's
+    // first heartbeat. No row (a direct agent), a tombstone, an expired or unplaced row, a
+    // different session, an unset reader or a degraded read all fail open. Off every lock.
+    RouteSessionReadFn route_reader;
+    {
+        std::lock_guard lock(missing_plugin_mu_);
+        route_reader = route_session_reader_;
+    }
+    const auto count = [this](const char* outcome, std::size_t n) {
+        if (n > 0)
+            metrics_.counter("yuzu_server_plugin_absence_confirm_total", {{"outcome", outcome}})
+                .increment(static_cast<double>(n));
+    };
+    // Rate-limited: one line per minute however many dispatches degrade (a burst must not become
+    // log spam, and the counter is the per-event record).
+    const auto warn_limited = [this](const char* why, std::size_t candidates) {
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+        auto last = confirm_warn_at_ms_.load(std::memory_order_relaxed);
+        if (now_ms - last >= 60'000 &&
+            confirm_warn_at_ms_.compare_exchange_strong(last, now_ms, std::memory_order_relaxed))
+            spdlog::warn("AgentRegistry: plugin-absence confirmation {} for {} candidate agent(s); "
+                         "no cross-replica plugin_not_found is reported for them "
+                         "(yuzu_server_plugin_absence_confirm_total)",
+                         why, candidates);
+    };
+    if (!route_reader) {
+        count("unwired", remote_only.size());
+        return missing;
+    }
+    // Admission: at most `kMaxConcurrentConfirms` reads in flight, so a dispatch burst cannot
+    // take the shared pool over. Past the cap the caller withholds nothing (fail open).
+    struct InFlight {
+        std::atomic<int>& n;
+        bool admitted;
+        ~InFlight() {
+            if (admitted)
+                n.fetch_sub(1, std::memory_order_relaxed);
+        }
+    } slot{confirms_in_flight_, false};
+    // Compare-and-swap, not add-then-undo: a shed caller never touches the count, so it cannot
+    // make another caller shed spuriously.
+    for (int cur = confirms_in_flight_.load(std::memory_order_relaxed);
+         cur < kMaxConcurrentConfirms;) {
+        if (confirms_in_flight_.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
+            slot.admitted = true;
+            break;
+        }
+    }
+    if (!slot.admitted) {
+        count("shed", remote_only.size());
+        warn_limited("shed (too many in flight)", remote_only.size());
+        return missing;
+    }
+    // The claims: when nothing was dropped as local the cached candidate vector is passed
+    // directly, otherwise a copy of the remote-only subset.
+    std::vector<PluginAbsence> subset;
+    std::span<const PluginAbsence> claims;
+    if (remote && remote_only.size() == remote->size()) {
+        claims = std::span<const PluginAbsence>(*remote);
+    } else {
+        subset.reserve(remote_only.size());
+        for (const auto* a : remote_only)
+            subset.push_back(*a);
+        claims = subset;
+    }
+    std::optional<std::unordered_set<std::string>> confirmed;
+    try {
+        confirmed = route_reader(claims);
+    } catch (...) {
+        // A throwing confirmation read is a degraded one: fail open.
+    }
+    if (!confirmed) {
+        count("degraded", remote_only.size());
+        warn_limited("degraded", remote_only.size());
+        return missing;
+    }
+    // Local wins, re-checked: an agent may have registered on THIS replica while the read was in
+    // flight (a direct register writes no route row, so an older routable row would still
+    // confirm). One short lock, no allocation under it.
+    std::vector<const std::string*> to_withhold;
+    to_withhold.reserve(confirmed->size());
+    for (const auto* a : remote_only)
+        if (confirmed->contains(a->agent_id))
+            to_withhold.push_back(&a->agent_id);
+    std::vector<const std::string*> still_remote;
+    still_remote.reserve(to_withhold.size());
+    {
+        std::lock_guard lock(mu_);
+        for (const auto* id : to_withhold)
+            if (!agents_.contains(*id))
+                still_remote.push_back(id);
+    }
+    for (const auto* id : still_remote)
         missing.insert(*id);
+    count("withheld", still_remote.size());
+    count("not_confirmed", remote_only.size() - still_remote.size());
     return missing;
 }
 
@@ -1946,7 +2065,7 @@ AgentRegistry::missing_plugin_from_presence(std::string_view plugin) const {
     MissingPluginIds ids;
     try {
         if (auto r = reader(ttl, plugin))
-            ids = std::make_shared<const std::vector<std::string>>(std::move(*r));
+            ids = std::make_shared<const std::vector<PluginAbsence>>(std::move(*r));
     } catch (...) {
         // A throwing reader is a failed read: fail open, never wedge the in-flight marker.
     }

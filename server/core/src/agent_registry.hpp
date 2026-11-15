@@ -1054,10 +1054,19 @@ public:
     /// `query_live_ids_without_plugin` seam). Bound by the store overload of `configure_presence`;
     /// tests may feed a stub through `configure_presence_plugin_reader`.
     using PluginMissingReadFn = std::function<
-        std::expected<std::vector<std::string>, PresenceReadError>(std::chrono::seconds,
-                                                                   std::string_view)>;
+        std::expected<std::vector<PluginAbsence>, PresenceReadError>(std::chrono::seconds,
+                                                                     std::string_view)>;
     void configure_presence_plugin_reader(PluginMissingReadFn reader,
                                           std::chrono::seconds ttl = std::chrono::hours{1});
+    /// Injectable CONFIRMATION read for a plugin-absence verdict (#5685 follow-up): given the
+    /// (agent, session) claims of the candidates, the ids whose ROUTABLE directory row
+    /// (`agent_routes`) still names that session; `nullopt` is a degraded read. Production binds
+    /// `make_route_session_confirmer(GatewayRouteStore&)` (plugin_absence_confirmation.hpp) in
+    /// `server.cpp`. It runs with NO registry lock held and must not call back into the registry.
+    /// Unset (or degraded) means no cross-replica absence is ever withheld: fail open. Counted on
+    /// `yuzu_server_plugin_absence_confirm_total{outcome}` (seeded here).
+    using RouteSessionReadFn = RouteSessionConfirmFn;
+    void configure_route_session_reader(RouteSessionReadFn reader);
     /// Test-facing overload: assigns the reader AND the TTL it is called with.
     void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
 
@@ -1111,6 +1120,12 @@ public:
     // wins (a local session is judged by its own list, as in `ids_with_os`); an agent with no
     // recorded list is unknown and fails open; a degraded read fails open too (the cached
     // failure is served for `kPresenceCacheTtl`, the store counts it).
+    //
+    // A cross-replica absence is only a CANDIDATE (cached for `kPresenceCacheTtl`): it is withheld
+    // only while the agent's ROUTABLE directory row, read per call through the
+    // `RouteSessionReadFn`, still names the session that published the list. A re-registered
+    // agent's row names the new session, so the old list stops applying at once; no row, an
+    // unroutable row, a degraded read or an unwired reader fail open.
     std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin,
                                                        std::string_view action) const;
 
@@ -1333,7 +1348,7 @@ private:
     /// `missing_plugin_inflight_`), so it can never stall `live_presence()` or an unrelated
     /// dispatch. A cached failure is a null pointer (callers fail open). The result is shared, not
     /// copied, because it can be fleet-sized.
-    using MissingPluginIds = std::shared_ptr<const std::vector<std::string>>;
+    using MissingPluginIds = std::shared_ptr<const std::vector<PluginAbsence>>;
     struct MissingPluginCacheEntry {
         std::chrono::steady_clock::time_point at{};
         MissingPluginIds ids;
@@ -1344,6 +1359,17 @@ private:
     static constexpr std::chrono::seconds kMaxStaleServe{30};
     mutable std::mutex missing_plugin_mu_;
     PluginMissingReadFn presence_missing_plugin_reader_;
+    RouteSessionReadFn route_session_reader_; ///< guarded by `missing_plugin_mu_`
+    /// At most this many confirmation reads may be in flight at once. Each holds a pool lease and
+    /// builds fleet-sized arrays, and the pool is shared with presence upserts, lease renewals and
+    /// registration, so a dispatch burst must not be able to take it over. A caller past the cap
+    /// is shed: it withholds nothing (fail open) and is counted `outcome="shed"`.
+    static constexpr int kMaxConcurrentConfirms = 2;
+    mutable std::atomic<int> confirms_in_flight_{0};
+    /// Steady-clock ms of the last warn for a degraded or shed confirmation (rate limit).
+    /// Starts one interval in the past so the FIRST warning is never suppressed, whatever the
+    /// steady clock reads at process start.
+    mutable std::atomic<std::int64_t> confirm_warn_at_ms_{-60'000};
     std::chrono::seconds missing_plugin_ttl_{};
     mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
     mutable std::unordered_set<std::string> missing_plugin_inflight_;

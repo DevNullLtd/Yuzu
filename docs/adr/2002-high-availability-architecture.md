@@ -2352,22 +2352,46 @@ a tripped batch or a failed upsert, can offset real remote rows and switch the w
 under-withhold, not a wrong refusal); a caller that arrives while a refresh is in flight
 is served a previous entry only if it is under 30 s old (else it fails open); a list the caps would cut (over 256
 names, an empty or over-64-byte name) is not stored in part, because a missing name would read as absent; the
-heartbeat publishes only for the registry's current session and backs off 60 s after a failed write. An ARRIVAL mirror
-(`mirror_arrival_to_presence`, the counterpart of the departure mirror, fired where a stream is established:
-direct Subscribe start and gateway CONNECTED on any replica, never in Register) deletes plugin lists published by
-OTHER sessions of the agent (`clear_plugins_of_other_sessions`, best effort, 250 ms acquire, counted
-`op="clear_plugins"`), so a restarted agent with a changed plugin set reads as unknown rather than being judged by
-its previous session's list while the endpoint row still names that session. Limits, not closed: if that
-best-effort arrival write fails inside the window (a store failure at that instant) the agent can still be judged
-by its OLD list on another replica until the first heartbeat of its new session (about one heartbeat plus the plugin-absence cache: 3 s, but up to
-`kMaxStaleServe` = 30 s while a refresh is in flight, since a caller then serves the previous entry; a false `plugin_not_found` that self-heals); a derived-HIGH residual of a partial failure that needs the
-project lead's risk acceptance before it is carried, and the unsupported second replica does not by itself cap it
-(no admission gate prevents one, #6528). The mirror closes the window only from the point a stream is
-established: between a restart's Register and its Subscribe start (direct), or between ProxyRegister and the
-first accepted CONNECTED (a droppable cast, refused on a degraded directory read, and resent up to about 10
-minutes later), the old list is still served, and a mirror delete is visible on other replicas up to 3 s late, or up to 30 s
-while a refresh is in flight, because of the plugin-absence cache; the mirror is skipped for a lost-race session, and the direct Subscribe
-call site is pinned by a source-text gate, not by a behavioural test; if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
+heartbeat publishes only for the registry's current session and backs off 60 s after a failed write. A published absence is only a CANDIDATE: the read returns each agent
+with the session that published the list, and `ids_missing_plugin` withholds it only while the agent's ROUTABLE
+directory row (`agent_routes`) still names that same session. The check is one narrow statement per dispatch
+(`GatewayRouteStore::confirm_sessions`: the candidates' (agent, session) pairs joined to the primary key, the
+routable predicate on the DB clock, only the matches returned, bounded to 2 s by `SET LOCAL statement_timeout`),
+never cached, run with no registry lock held, admitted at most twice at once (a caller past that withholds
+nothing and is counted `shed`) and counted on `yuzu_server_plugin_absence_confirm_total{outcome}`; an agent that
+registered on this replica while the read was in flight is re-checked and not withheld. The two stores stay single-schema owners and are
+composed in C++ through an injected reader (`make_route_session_confirmer`), not in SQL, so ADR-0012 §3's
+cross-store owner is not needed. The registration that creates a new session rewrites `agent_routes.session_id`
+before the agent is handed it (`register_fresh`, which fails closed on a store error) and leaves the row
+unplaced, so a restarted agent's old list stops matching at that instant: no dependence on a best-effort clear,
+on the new session's first heartbeat, or on the candidate cache (3 s, up to `kMaxStaleServe` = 30 s while a refresh is in flight, which is harmless here because the confirmation read is never cached). No row, a tombstone, an expired or unplaced
+row, a different session, a degraded or throwing confirmation read, or no wired reader all fail open (the agent
+is dispatched to and answers for itself): an under-withhold, never a wrong refusal. Two consequences. A
+direct-connect agent has no directory row, so cross-replica `plugin_not_found` applies to gateway-fronted agents
+only (consistent with §2: gateway-fronting is mandatory in HA, and a non-owning replica cannot deliver to a direct
+agent anyway); and an agent that was gateway-connected and then reconnects directly keeps its old row, so its old
+list can still match on a non-owning replica until the row is reaped, a wrong cause label on an agent that
+replica cannot reach. The confirmation is as of the moment of the read, so a session registered an instant
+later is the ordinary race any dispatch has.
+
+The ARRIVAL mirror (`mirror_arrival_to_presence`, fired where a
+stream is established: direct Subscribe start and gateway CONNECTED on any replica, never in Register) still
+deletes plugin lists published by OTHER sessions of the agent (`clear_plugins_of_other_sessions`, best effort,
+250 ms acquire, counted `op="clear_plugins"`) as housekeeping: its failure changes no verdict. It is skipped for
+a lost-race session (it would delete the winner's list), and the direct Subscribe call site is pinned by a
+source-text gate, not by a behavioural test.
+
+Cost and limits: one directory query per dispatch over the candidate ids (up
+to the 100,000-row cap of the candidate read), only when the durable presence holds rows beyond this replica's
+own sessions; measured on a scratch Postgres at about 60 ms for 50,000 ids and 100 to 120 ms for 100,000, with
+one pool lease held for it, and not measured end to end in the server (the pool is shared with presence upserts, lease renewals and registration; the cap of two in flight and the 2 s statement bound are what keep a dispatch burst from taking it over, at the price that under a burst the cross-replica `plugin_not_found` is switched off, visibly, on `shed`). Not done, to be tracked before the safe-to-scale gate lifts: confirming only the dispatch's resolved targets, a duration histogram, an alert on `degraded`/`shed`, and a TSan/ASan run of the new locking. An agent's plugin set is fixed for its process lifetime (`plugin_names_` is appended only by the startup plugin load in `agent.cpp`), so a published list cannot go stale inside one session. A gateway crash that leaves the old route row routable keeps the reconnect-directly case above alive for the 90 s lease.
+
+Reasoned, not tested end to end: an
+OLDER session can be written back into `agent_routes.session_id` only by `reclaim_tombstoned_session` (guarded
+on `session_id IS NULL`) after the newer session's row was tombstoned, which leaves the row unplaced (so it does
+not match; pinned by a test) and needs the agent to have no live stream; the reap paths that could tombstone a
+live session take at least 300 s, so the reading holds for the default 90 s `session_timeout` and weakens as
+that value approaches 300 s (the row is then still unroutable until a re-announce); if the `endpoint_plugins` row is removed (decommission or prune racing a live session) the list is
 not republished until the agent re-registers, so visibility fails open; sustained `truncated` on
 `query_without_plugin` (above 100,000 live agents) switches the cross-replica withhold off with no alert; while
 every session lacks a delivery path (after a directory outage) an unfiltered broadcast takes the per-id path with

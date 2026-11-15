@@ -244,23 +244,26 @@ public:
 
     /// The ARRIVAL mirror of `remove_if_session`: when `agent_id`'s stream for `current_session_id`
     /// is established (direct Subscribe, gateway CONNECTED), deletes any plugin list published by
-    /// a DIFFERENT session. The endpoint row's session only advances at the new session's first
-    /// heartbeat, so until then a replica without the session would still judge the agent by its
-    /// previous session's list and could refuse a plugin the new build has (a false
-    /// `plugin_not_found`). Best effort (250 ms acquire, counted `op="clear_plugins"`): a failure
-    /// leaves the window open until that first heartbeat. Returns true when the statement ran.
+    /// a DIFFERENT session, so a stale row is not left behind to be joined again. HYGIENE: the
+    /// verdict does not depend on it, because `AgentRegistry::ids_missing_plugin` withholds an
+    /// agent only while its directory row still names the session that published the list.
+    /// Best effort (250 ms acquire, counted `op="clear_plugins"`). Returns true when the
+    /// statement ran.
     bool clear_plugins_of_other_sessions(std::string_view agent_id,
                                          std::string_view current_session_id);
 
-    /// Ids of agents that are LIVE (the `query_live_ids` predicate) AND have a published plugin
-    /// list, from their CURRENT session, that does NOT contain `plugin`. An agent with no list, or
-    /// whose list came from an older session (a pre-v5 row, an agent with no inventory, a
-    /// re-registration whose owner has not heartbeated yet), is absent from the result: unknown is
+    /// Agents (each with the session that published the list) that are LIVE (the `query_live_ids`
+    /// predicate) AND have a published plugin list that does NOT contain `plugin`, where the list's
+    /// session equals the ENDPOINT ROW's session. That row's session only advances at the new
+    /// session's first heartbeat, so after a re-registration the OLD session's list still joins
+    /// until then: the result is only a set of CANDIDATES, which `AgentRegistry::ids_missing_plugin`
+    /// confirms against the agent's route-directory row before withholding anything. An agent with
+    /// no list (a pre-v5 row, an agent with no inventory) is absent from the result: unknown is
     /// not absent, so the caller fails open for it. Typed failure like `query_live_ids`
     /// (`Truncated` past `kQueryRowCap`); counted on
     /// `yuzu_server_agent_presence_store_failed_total{op="query_without_plugin"}`. Identity read
     /// only: it grants no authority.
-    [[nodiscard]] std::expected<std::vector<std::string>, PresenceReadError>
+    [[nodiscard]] std::expected<std::vector<PluginAbsence>, PresenceReadError>
     query_live_ids_without_plugin(std::chrono::seconds ttl, std::string_view plugin);
 
     /// The newest `kQueryRowCap` endpoints whose last heartbeat is within `window` of now, newest
