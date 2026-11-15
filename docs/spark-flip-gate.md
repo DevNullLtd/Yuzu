@@ -1837,7 +1837,10 @@ flip, with a red-first test each:
     cost statement covers are a herd of N watches that go blind together for up to 300 s under handle or memory pressure
     (review id UP-G8-3), and an SMB blip longer than the streak whose cancelled read then does not drain (the
     never-draining case below). A directory that stays unverifiable but openable will re-fault about every (3 intervals
-    plus the 30 s retry): bounded, not damped. A lost path whose cancelled read has
+    plus the retry). The retry is damped: it doubles 30 s, 60, 120, 240, then the 300 s cap across consecutive
+    losses with no decided (Same) check between them (counted in `path_lost_flaps`); a genuine rename after any Same,
+    or a first loss, restarts at 30 s. It adds no fault edge and changes no verdict. One route skips it: a throw while
+    the lost path drains recovers on the 50 ms admission backoff instead (above). A lost path whose cancelled read has
     not drained after 30 s is counted (`path_lost_stuck`) and warned once; there is no escalation.
     **Open residuals of the File fix** (none is claimed as covered): detection is sampled, so a watch can be deaf
     for up to one interval and then stays Faulted until the retry; a rename away and back between two samples is not
@@ -1846,26 +1849,33 @@ flip, with a red-first test each:
     parent rename is refused while the handle is open); a watch whose directory gives no usable file id is never
     verified (author-reported: on a FAT32 volume no verification ran and the rename went undetected; ReFS, SMB,
     OneDrive and other filesystems were not tested); a verification that hangs pins one of 4 verification slots, that
-    watch stays unverified, and 4 hung verifications disable verification for every other watch; when all slots are
-    busy a refused verification is retried after 50 ms (counted in `verify_refused`, not a fault); a launch failure
-    is retried the same way (counted in `verify_launch_failed`, which counts only launches that were attempted); the
+    watch stays unverified, and 4 hung verifications disable verification for every other watch; a due watch waits
+    for a free slot and is admitted least-recently-verified first (a queue, not a refusal); a wait of more than 3
+    intervals is counted (`verify_starved`) and warned once per episode; `verify_refused` is expected to stay 0 (it is
+    a tripwire that admission and the lane agree); least-recently-first turns starvation into lag, it does not remove
+    it, and the hung verification of a watch is not itself flagged; a launch failure
+    is retried after 50 ms (counted in `verify_launch_failed`, which counts only launches that were attempted); the
     stuck-drain wait has no deadline-driven recovery, only the observation, so a lost path whose cancelled read never
     drains stays Faulted with the sweep re-cancelling at 20 Hz (observe-only, accepted by owner ruling as a documented
     residual, #5719 PR-B review id UP-1; FOLLOW-UP-ISSUE-TBD(never-draining-read)); one not-found sample faults the
     watch with no hysteresis, and an atomic directory swap that spans a sample can leave a healthy watch Faulted for
     about 35 s (review id UP-4); a hung verification costs a standing 20 Hz sweep for as long as it is outstanding, and
-    a `CreateFileW` parked in a verification at agent stop races the F3 hard exit (review id UP-7); after a resume from
-    suspend or a network drop every watch falls due for verification together, a bunched burst of threads (review id
-    UP-8); a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
+    a `CreateFileW` parked in a verification at agent stop races the F3 hard exit (review id UP-7); a network path that
+    stops answering (`BAD_NETPATH`, `NETNAME_DELETED`, `BAD_NET_NAME`) is treated like any undecided result: the 3rd
+    consecutive undecided result faults the watch, about 10 to 15 s when the open returns promptly and longer if the
+    open hangs (unmeasured), and a hung open pins a slot, is not a result, and shows only as `verify_starved` on the
+    watches queued behind it; after a resume or network drop every watch falls due together, admission is capped at 4
+    concurrent workers and served least-recently-verified first, a queue and not a thread burst (review id UP-8); a
+    cancelled read on a dead SMB handle that never drains is the UP-1 residual above; a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
     (review id UP-9); renaming the parent of N watched directories gives N Faulted edges, N warns (one per Lost) and N
-    infos (one per drain), and N probes that all retry at the same instant against the probe lane (review id UP-10); a
-    refused verification is retried after a fixed 50 ms with no backoff, so each of N healthy watches re-stages its
-    verification at 20 Hz while the 4-slot lane stays pinned (round 2 review id UP-G8R2-1); and every re-fault cycle
+    infos (one per drain), and N probes that all retry at the same instant against the probe lane (review id UP-10); and every re-fault cycle
     delivers one resync `Fired` event per key when the watch is re-established.
     **Before any flip (File), not done here:** (1) the verification-failure signals (`verify_unverifiable`,
-    `verify_refused`, `verify_launch_failed`, `path_lost_stuck`) are debug counters visible only to tests; of these
-    only `verify_unverifiable` (one warn per run of undecided results) and `path_lost_stuck` (one warn per episode)
-    have a log line, and `verify_refused` and `verify_launch_failed` have none. They must be exported before any flip,
+    `verify_refused`, `verify_launch_failed`, `path_lost_stuck`, `verify_starved`, `path_lost_flaps`, and the
+    debug-only `sweep_passes`) are debug counters visible only to tests; of these only `verify_unverifiable` (one warn
+    per run of undecided results), `path_lost_stuck` (one warn per episode) and `verify_starved` (one warn per
+    episode) have a log line, and `verify_refused`, `verify_launch_failed` and `path_lost_flaps` have none (a flap shows
+    in the drain's info line). They must be exported before any flip,
     tracked with #7658 (the Spark counter-export follow-up; #7658 now also tracks these File debug counters, a
     comment saying so was posted). (2) The check opens every watched directory every 5 s and runs on a short-lived
     thread per directory: it can raise object-access audit events (4656 class, a handle request; 4663 only if an audited
@@ -1882,10 +1892,10 @@ flip, with a red-first test each:
     or a filter driver), including `stop()` with it outstanding; a `CreateFileW` hung inside a verification at `stop()`
     or `unwatch()` while all 4 verification slots are pinned; a handle or memory-pressure herd of watches going blind
     together; an in-place DENY ACL applied to a live watch's directory; and a pinned verification lane with N healthy
-    watches (the fixed 50 ms retry in the residuals above). (5) Two test gaps: the DENY-ACL case has not been measured
+    watches (expected: the starvation signal and no refusal churn). (5) Two test gaps: the DENY-ACL case has not been measured
     under LOCAL SYSTEM, the identity of the Windows CI runner (`deploy/windows/README.md`), so a red first CI run there
     would mean the case itself does not hold under that identity (a broken leg), not that the mechanism regressed; and
-    `verify_refused` and `verify_launch_failed` have no test.
+    `verify_launch_failed` has no test (`verify_refused` is only asserted to stay 0 under a saturated lane).
     **Runs.** Author-reported (pre-governance, logs not retained): the cancelled read's completion was consumed in
     the same millisecond as detection in the one run whose log was read; the identity read was stable across
     repeated opens on the NTFS temp volume (about 5300 verifications, none unverifiable) and the four File identity
@@ -1894,37 +1904,41 @@ flip, with a red-first test each:
     about 0.95 s more at 200 (3864 verifications), with run-to-run noise about 0.3 s, so an order-of-magnitude
     figure, not a budget; five mutations of the first version, four caught and "restrict the drain branch to aborts"
     not caught.
-    Governance round 3, rig bytes: `spark_file.cpp` and `spark_mechanism.hpp` as committed in `4e9a5c3ca1` (the round 3
-    production commit, whole-repo tree `ccd9c27d1055ee4235662aeb63c308bc9af98815`) and `test_spark_mechanism.cpp` as
-    committed in `3ae43cb810` (the round 3 test commit, whole-repo tree `62aae921baa4f36fcf81a7678973d8e43c95658d`). The
-    rig tree was a `git archive` of `040071560b` with those three files copied over, and only those three files were
-    md5-compared with the committed files (equal); the tree hashes name the whole repository at those commits and were
-    not themselves checked on the rig. The later commit `74923f4616` changes one comment in the test file and was not
-    re-run, so the rig bytes are the round 3 production and test commits and nothing else; figures from earlier rounds
-    are superseded. Linux debug: `[mechanism]` 62 cases, `[5719]` 43 cases and `[4415prA]` 105 cases all green (the File
-    mechanism is Windows-only, so the new cases do not run there). Windows (MSVC, weecolin, debug-type build without
-    debug info): `[mechanism]` 183 cases (5377 assertions), `[5719]` 58 cases (1800 assertions) and `[4415prA]` 105
-    cases (3544 assertions) all green, the parked Registry case excluded from all three and red (1 case, 2 assertions)
-    when run explicitly by tag (its absence from `--list-tests` for the three agent shard specs and the reference spec
-    of `tests/meson.build` was checked in round 2 and not re-run); each of the 16 File cases 20 of 20 green in a loop,
-    and each of the
-    throw-while-draining, renamed-away, OK-completion-drain (the case with a fixed 150 ms notification allowance) and
-    retry-window cases also 50 of 50 green while one busy-loop process per logical core (16) kept the box saturated.
-    Twelve mutations of that tree, M1 to M12 (3 runs of each of the 16 File cases per mutation; M1 to M11 are those of
-    the earlier rounds, re-run, and M12 is new): M1 to M11 were each caught by at least one case, with the same cases
-    red as in round 2: removing the idle-watch wake clause (13 of the 16 cases red); treating every verification as lost
-    (10 red); comparing existence instead of identity (only the replaced-directory case); restricting the drain branch
-    to aborts (only the OK-completion case, 3 of 3); routing detection through the generic backend failure path instead
-    of the path-lost drain (9 red, in a build with assertions on, where the `assert` in `attach_dir_locked` that no
-    handle is installed over a live read may be one of the catchers; a build without assertions was not measured);
-    dropping the undecidable streak to 1 (3 red); never faulting an undecidable watch (2 red); the stuck-drain
-    observation never firing (2 red: the stuck-drain case and the held-back-completion `stop()` case); reverting the
-    grace fix (the retry-window case); not resetting the streak on a decided result (the one-or-two case); and removing
-    the unwind failed-arm grace guard (M11: only the throw-while-draining case). M12, removing the new guard on the
-    unwind OK-completion arm's reissue-failure sub-branch, was NOT caught: all 16 cases passed 3 of 3. That guard has no
-    test, because forcing a real-directory ReadDirectoryChangesW failure on that arm needs a seam that does not exist;
-    it mirrors the failed-arm guard that M11 covers. The mutated sources were restored and the rig tree rebuilt from the
-    unmutated source after each. The set of cases is not a proof that no other deaf path exists in any mechanism.
+    Fix round 4, rig bytes: `spark_file.cpp` and `spark_mechanism.hpp` as committed in `aef43b21ac` (the round 4
+    production commit, whole-repo tree `6c43d2fbd956f9864542a2e58841cc1de6ca4a80`) and `test_spark_mechanism.cpp` as
+    committed in `133cd5c27f` (the round 4 test commit, whole-repo tree `99ca6f47bb3308af325d023b338a5a1c2b63dbcf`). The
+    rig tree was a tar of the tracked files of the working tree at `aa16689bef` with those three files copied over, and
+    only those three files were md5-compared with the committed files (equal); the tree hashes name the whole repository
+    at those commits and were not themselves checked on the rig. The docs commit that follows changes no source, so the
+    rig bytes are the round 4 production and test commits and nothing else; figures from earlier rounds are superseded.
+    Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 cases (1262 assertions) and `[4415prA]` 105
+    cases (3544 assertions) all green (the File mechanism is Windows-only, so the new cases do not run there; only the
+    `spark_mechanism.hpp` counter fields compile there). Windows (MSVC, weecolin, debug-type build without debug info):
+    `[mechanism]` 187 cases (5629 assertions), `[5719]` 62 cases (2052 assertions) and `[4415prA]` 105 cases (3544
+    assertions) all green, the parked Registry case excluded from all three and red (1 case, 2 assertions) when run
+    explicitly by tag (its absence from `--list-tests` for the three agent shard specs and the reference spec of
+    `tests/meson.build` was checked in round 2 and not re-run); each of the 20 File cases 20 of 20 green in a loop; and
+    each of the throw-while-draining, renamed-away, replaced-directory, junction, OK-completion-drain (the case with a
+    fixed 150 ms notification allowance), retry-window, network-error, the two damping and the saturated-lane cases also
+    50 of 50 green while one busy-loop process per logical core kept the box saturated. The saturated-lane case's
+    not-spinning bound (100 sweep passes in 500 ms) was set from one measurement of 16 passes on the rig.
+    Twenty-two mutations of that tree (up to 3 runs of each of the 20 File cases per mutation, stopping at a case's
+    first red run, so "red" below means red on its first run and an unlisted case was green 3 of 3): M1 to M12 are
+    those of the earlier rounds, re-run on the new bytes, and M1 to M11 were each caught by at least one case (the
+    idle-watch wake clause removed: 17 cases red; every verification treated as lost: 13; existence compared instead of
+    identity: only the replaced-directory case; the drain branch restricted to aborts: only the OK-completion case;
+    detection routed through the generic backend failure: 12; streak 1: 4; streak never: 3; stuck-drain observation
+    never firing: 2; stale grace fix reverted: the retry-window case and the consecutive-loss damping case; streak not
+    reset on a decided result: the one-or-two case; unwind failed-arm grace guard removed: only the throw-while-draining
+    case). M12, removing the guard on the unwind OK-completion arm's reissue-failure sub-branch, was again NOT caught
+    (untested guard, no seam). The ten new mutations were each caught by the intended case: no seed from `lost_flaps`
+    into `backend_attempts` (consecutive-loss case only), the flap rule without the decided-verify gate and a decided
+    verify that never sets the flag (each: the decided-verify case only), `lost_flaps` reset at commit again
+    (consecutive-loss case only), admission in map order, admission ignoring free slots, the starvation check deleted,
+    and the lane wake clause dropped (each: the saturated-lane case only), network errors that leave the streak
+    untouched (network case only) and streak 4 (the stays-undecidable case and the network case). The mutated sources
+    were restored and the rig tree rebuilt from the unmutated source after each. The set of cases is not a proof that
+    no other deaf path exists in any mechanism.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
