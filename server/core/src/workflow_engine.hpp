@@ -33,6 +33,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 struct pg_conn; // libpq's PGconn (typedef struct pg_conn PGconn)
@@ -167,6 +168,15 @@ public:
     /// as "no workflows".
     std::expected<std::vector<Workflow>, std::string> list_workflows(
         const WorkflowQuery& q = {}) const;
+
+    /// Ids of the live (not soft-deleted) workflows with a step that runs `instruction_id`, at
+    /// most `limit` of them, oldest first. `exclude_ids` are left out INSIDE the query, so an
+    /// excluded row never takes one of the `limit` slots. `unexpected(msg)` (prefixed
+    /// `kDbErrorPrefix`) = the question could not be answered; never read it as "no workflow
+    /// references it".
+    std::expected<std::vector<std::string>, std::string> workflows_referencing_instruction(
+        const std::string& instruction_id, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
 
     /// `nullopt` = a successful read finding none (or the workflow is soft-deleted — ADR-0064).
     /// `unexpected(msg)` (prefixed `kDbErrorPrefix`) = a genuine read failure — never treat the

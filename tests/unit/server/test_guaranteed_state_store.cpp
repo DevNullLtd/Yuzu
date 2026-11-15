@@ -3875,7 +3875,7 @@ TEST_CASE("GuaranteedStateStore: migration v3 deletes orphan census rows and add
     GuaranteedStateStore store(pool);
     REQUIRE(store.is_open());
     CHECK(query_scalar(db.dsn(), "SELECT version FROM public.schema_meta "
-                                 "WHERE store = 'guaranteed_state_store'") == "4");
+                                 "WHERE store = 'guaranteed_state_store'") == "5");
     CHECK(census_count(db.dsn()) == "1");
     CHECK(census_state(db.dsn(), "agent-A", "r1") == "compliant");
     CHECK(query_scalar(db.dsn(), "SELECT confdeltype FROM pg_constraint WHERE conname = "

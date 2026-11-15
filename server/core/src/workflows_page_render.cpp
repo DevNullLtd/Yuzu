@@ -1,5 +1,6 @@
 #include "workflows_page_render.hpp"
 
+#include "plural.hpp"
 #include "web_utils.hpp" // html_escape, format_iso_utc, truncate_utf8
 
 #include <nlohmann/json.hpp>
@@ -29,10 +30,6 @@ std::string pill(std::string_view cls, std::string_view label) {
 
 std::string esc(std::string_view s) { return html_escape(std::string(s)); }
 
-std::string plural(int n, std::string_view one, std::string_view many) {
-    return std::to_string(n) + " " + std::string(n == 1 ? one : many);
-}
-
 // "-" for a missing instant, else the ISO text with the epoch the controller localises.
 std::string time_cell(int64_t secs, std::string_view data_c = {}) {
     const std::string c =
@@ -52,7 +49,7 @@ std::string step_subtitle(const WorkflowStepView& s) {
     if (!s.condition.empty())
         t += " &middot; if " + esc(truncate_utf8(s.condition, kConditionChars));
     if (s.retry_count > 0)
-        t += " &middot; up to " + plural(s.retry_count, "retry", "retries") + ", " +
+        t += " &middot; up to " + plural_count(s.retry_count, "retry", "retries") + ", " +
              std::to_string(s.retry_delay_seconds) + " s apart";
     if (!s.foreach_source.empty())
         t += " &middot; for each " + esc(truncate_utf8(s.foreach_source, kConditionChars));
@@ -252,7 +249,7 @@ std::string step_detail(const RunStepView& s, bool confined) {
             }
         }
         if (any)
-            return "Reached " + plural(static_cast<int>(reached), "device", "devices");
+            return "Reached " + plural_count(static_cast<int>(reached), "device", "devices");
     }
     return "";
 }
@@ -389,7 +386,7 @@ std::string render_schedules_page(const ScheduleListView& v) {
         if (s.owner && s.requires_approval)
             extra += " &middot; Approval required";
         if (s.owner && s.parameter_count > 0)
-            extra += " &middot; " + plural(s.parameter_count, "parameter", "parameters");
+            extra += " &middot; " + plural_count(s.parameter_count, "parameter", "parameters");
 
         out += "<tr class=\"row\" data-schedule-id=\"" + esc(s.id) + "\" data-owner=\"" +
                (s.owner ? "1" : "0") + "\" data-enabled=\"" + (s.enabled ? "1" : "0") +

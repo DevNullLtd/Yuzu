@@ -137,7 +137,13 @@ public:
     /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity),
     /// per application and per version. `degraded` = null store, failed read,
     /// invalid score policy or unreadable stored policy: the handler must refuse
-    /// it, never render it as an empty or perfect list.
+    /// it, never render it as an empty or perfect list. `degraded_reason` names the
+    /// cause (see `DexAppsModel::degraded_reason`: a `dex_read_fault_token` or one of
+    /// invalid_scope, score_policy_unavailable, score_policy_invalid), and the page and
+    /// the REST and MCP error text each say which one. A healthy model carries
+    /// `observer_state`, the live observer counts per platform, when the implementation
+    /// has an observer source (nullopt otherwise: unknown, never zero); it is read only
+    /// after a successful read, from the same fleet snapshot as the population.
     /// Scoped to `platform_scope` (all|windows|macos|linux): the population and every
     /// figure are over that scope's online devices. An unknown token is degraded
     /// (`invalid_scope`), never defaulted to a platform.

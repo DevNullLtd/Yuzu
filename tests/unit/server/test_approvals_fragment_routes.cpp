@@ -19,6 +19,7 @@
 #include "test_route_sink.hpp"
 
 #include "approval_manager.hpp"
+#include "approvals_page_render.hpp" // kScopeAttrBytes
 #include "instruction_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -33,6 +34,7 @@
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -801,11 +803,11 @@ TEST_CASE("approvals_fragment_routes: a degraded read is a note and never an emp
     }
 }
 
-TEST_CASE("approvals_fragment_routes: the page view carries scope and comment once and "
-          "escapes every field",
+TEST_CASE("approvals_fragment_routes: the page view carries the comment once; clips the scope "
+          "and escapes every field",
           "[pg][server][routes][approvals_fragment_routes]") {
     yuzu::test::ApprovalManagerPg mgr;
-    const std::string big_scope(10000, 'S');
+    const std::string big_scope(yuzu::server::operate_pages::kScopeAttrBytes + 5000, 'S');
     const std::string evil = "<img src=x onerror=1>";
     auto big = mgr->submit("def-big", "submitter1", big_scope, "", ApprovalOrigin::kInstruction);
     auto xss = mgr->submit(evil, evil, evil, "", ApprovalOrigin::kInstruction);
@@ -819,13 +821,98 @@ TEST_CASE("approvals_fragment_routes: the page view carries scope and comment on
     h.wire();
     auto res = h.sink.Get("/fragments/approvals?view=page&status=");
     REQUIRE(res);
-    // Full text exactly once (the data attribute); the cell shows a clipped copy.
-    CHECK(count_of(res->body, big_scope) == 1);
+    // The comment appears in full once (the data attribute); the scope is clipped to
+    // kScopeAttrBytes there and shorter in the cell.
+    CHECK(count_of(res->body, big_scope) == 0);
+    CHECK(count_of(res->body, std::string(yuzu::server::operate_pages::kScopeAttrBytes, 'S')) == 1);
     CHECK(count_of(res->body, big_comment) == 1);
     CHECK(res->body.find(std::string(120, 'S') + "\xE2\x80\xA6") != std::string::npos);
     // Escaped on every sink; the raw tag never appears.
     CHECK(res->body.find("&lt;img src=x onerror=1&gt;") != std::string::npos);
     CHECK(res->body.find("<img") == std::string::npos);
+}
+
+// D3: a scope clipped to kScopeAttrBytes cannot be read in full on the tab or the page, so Approve
+// is withheld there with a notice carrying the true size and the way to read it; Reject stays. A
+// scope at the bound (a 16 KiB bound ticket included) is shown whole with Approve offered. Turns
+// red if the tab's Approve guard drops scope_is_clipped, or if the clip returns to 4096.
+TEST_CASE("approvals_fragment_routes: a clipped scope withholds Approve and says why; a scope at "
+          "the bound does not",
+          "[pg][server][routes][approvals_fragment_routes]") {
+    using yuzu::server::operate_pages::kScopeAttrBytes;
+    yuzu::test::ApprovalManagerPg mgr;
+    // A full-size bound ticket (16 KiB) must never be clipped, whatever the clip is tuned to.
+    const std::string at_bound(
+        std::max<std::size_t>(kScopeAttrBytes, yuzu::server::kMaxRequestJsonBytes), 'A');
+    const std::string over(kScopeAttrBytes + 1, 'O');
+    const std::string huge(4u * 1024 * 1024, 'H');
+    REQUIRE(mgr->submit("def-at", "submitter1", at_bound, "", ApprovalOrigin::kInstruction)
+                .has_value());
+
+    Harness h;
+    h.approval_manager = mgr.get();
+    h.auth_username = "reviewer1";
+    h.wire();
+
+    SECTION("at the bound: whole scope, Approve offered, no notice") {
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(count_of(tab->body, at_bound) == 1);
+        CHECK(tab->body.find("/approve\"") != std::string::npos);
+        CHECK(tab->body.find("Scope clipped") == std::string::npos);
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find("data-scope-clipped") == std::string::npos);
+    }
+    SECTION("a 16 KiB bound-size scope: whole, Approve offered") {
+        const std::string bound(yuzu::server::kMaxRequestJsonBytes, 'B');
+        REQUIRE(mgr->submit("def-bound", "submitter4", bound, "", ApprovalOrigin::kInstruction)
+                    .has_value());
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(count_of(tab->body, bound) >= 1);
+        CHECK(tab->body.find("Scope clipped") == std::string::npos);
+    }
+    SECTION("one byte over: notice with the true size, no Approve, Reject kept (tab and page)") {
+        REQUIRE(mgr->submit("def-over", "submitter2", over, "", ApprovalOrigin::kInstruction)
+                    .has_value());
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find("Scope clipped: it is " + std::to_string(over.size()) + " bytes") !=
+              std::string::npos);
+        // The at-bound row still has its Approve; the over row has exactly one fewer Approve.
+        CHECK(count_of(tab->body, "/approve\"") == 1);
+        CHECK(count_of(tab->body, "/reject\"") == 2);
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.find(" data-scope-clipped=\"" + std::to_string(over.size()) + "\"") !=
+              std::string::npos);
+    }
+    SECTION("a clip that falls inside a multi-byte character backs off to the boundary (tab)") {
+        // The legacy tab clips with truncate_utf8, as the page does: a two-byte character
+        // straddling the bound is dropped whole, never half kept (invalid UTF-8 in the markup).
+        const std::string straddle =
+            std::string(kScopeAttrBytes - 1, 'a') + "\xC3\xA9" + std::string(50, 'b');
+        REQUIRE(mgr->submit("def-utf", "submitter5", straddle, "", ApprovalOrigin::kInstruction)
+                    .has_value());
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.find(std::string(kScopeAttrBytes - 1, 'a') + "\xE2\x80\xA6") !=
+              std::string::npos);
+        CHECK(tab->body.find("\xC3<") == std::string::npos); // no lone lead byte before markup
+        CHECK(tab->body.find("Scope clipped") != std::string::npos);
+    }
+    SECTION("a 4 MiB scope: the page and the tab stay bounded") {
+        REQUIRE(mgr->submit("def-huge", "submitter3", huge, "", ApprovalOrigin::kInstruction)
+                    .has_value());
+        auto page = h.sink.Get("/fragments/approvals?view=page");
+        REQUIRE(page);
+        CHECK(page->body.size() < 128 * 1024);
+        CHECK(page->body.find(" data-scope-clipped=\"4194304\"") != std::string::npos);
+        auto tab = h.sink.Get("/fragments/approvals");
+        REQUIRE(tab);
+        CHECK(tab->body.size() < 128 * 1024);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
