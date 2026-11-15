@@ -2272,6 +2272,15 @@ class MarkerAmbiguity(GitCase):
         self.assertIn("- **Shipped thing.**  [released]\n", out)
         self.assertNotIn("[released 0.9.0]", out)
 
+    def test_a_crlf_changelog_still_names_the_version(self):
+        repo, old = self.base()
+        self.release_into(repo, "## [1.0.0] - 2026-09-01\r\n\r\n- **Shipped thing.**\r\n", old)
+        self.assertIn("- **Shipped thing.**  [released 1.0.0]\n", self.ok(repo, "--since", old))
+
+    def test_a_line_under_unreleased_and_an_unnamed_heading_is_unknown(self):
+        sections = WN.release_sections("## [Unreleased]\n- a\n\n## Notes\n- a\n")
+        self.assertEqual(sections["- a"], "")
+
     def test_a_sub_heading_does_not_end_the_section(self):
         repo, old = self.base()
         log = "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n### Added\n\n- **Shipped thing.**\n"
