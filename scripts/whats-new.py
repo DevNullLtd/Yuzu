@@ -437,7 +437,7 @@ def plugin_abi(repo: Repo, ref: str) -> dict[str, str]:
 def released_version(repo: Repo, ref: str) -> dict[str, str]:
     text = repo.show(ref, "CHANGELOG.md") or ""
     m = re.search(r"^## \[(\d[^\]\n]*)\]", text, re.M)
-    return {"latest released CHANGELOG section": m.group(1)} if m else {}
+    return {"latest released CHANGELOG section": cut_version(m.group(1))} if m else {}
 
 
 def _vcpkg_deps(deps: object, where: str, out: dict[str, str]) -> None:
@@ -920,13 +920,16 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
 TAG_VERSION_MAX = 40
 
 
-def tag_for(version: str) -> str:
-    """The `[released X]` suffix of an entry; a version heading is repository text of any length, and the
-    tag is printed once per entry, so it is cut."""
-    if not version:
-        return "  [released]"
+def cut_version(version: str) -> str:
+    """A version heading is repository text of any length; it is printed in the version bumps and once per
+    entry in a `[released X]` tag, so it is cut."""
     v = one(version)
-    return f"  [released {v[:TAG_VERSION_MAX - 3] + '...' if len(v) > TAG_VERSION_MAX else v}]"
+    return v[:TAG_VERSION_MAX - 3] + "..." if len(v) > TAG_VERSION_MAX else v
+
+
+def tag_for(version: str) -> str:
+    """The `[released X]` suffix of an entry; empty when the version cannot be told."""
+    return f"  [released {cut_version(version)}]" if version else "  [released]"
 
 
 def name_list(names: list[str], limit: int = 20) -> str:

@@ -2311,6 +2311,19 @@ class MarkerAmbiguity(GitCase):
         self.release_into(repo, "- **Shipped thing.**\n\n## [1.0.0] - 2026-09-01\n\n- **Other.**\n", old)
         self.assertIn("- **Shipped thing.**  [released]\n", self.ok(repo, "--since", old))
 
+    def test_the_latest_released_section_line_is_cut_too(self):
+        repo, old = self.base()
+        self.put(repo, "CHANGELOG.md", "# Changelog\n\n## [1.3.0" + "x" * 300_000 + "] - 2026-10-30\n\n- **A.**\n")
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        line = [ln for ln in out.splitlines() if ln.lstrip().startswith("~ latest released CHANGELOG section")
+                or "latest released CHANGELOG section" in ln]
+        self.assertEqual(len(line), 1)
+        self.assertLess(len(line[0]), 200)
+        self.assertIn("...", line[0])
+        self.assertEqual(WN.cut_version("1.2.3"), "1.2.3")
+        self.assertEqual(len(WN.cut_version("1" * 41)), 40)
+
     def test_the_tag_cut_is_at_forty_characters(self):
         self.assertEqual(WN.tag_for("x" * 40), "  [released " + "x" * 40 + "]")
         self.assertEqual(WN.tag_for("x" * 41), "  [released " + "x" * 37 + "...]")
