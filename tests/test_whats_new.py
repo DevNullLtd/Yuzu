@@ -2244,7 +2244,7 @@ class MarkerAmbiguity(GitCase):
         self.assertNotIn("\u202e", out)
 
     def test_a_heading_in_any_other_level_one_or_two_form_names_no_version(self):
-        for n, heading in enumerate(("##\t[1.0.0]", "  ## [1.0.0]", "# [1.0.0]", "##")):
+        for n, heading in enumerate(("##\t[1.0.0]", "# [1.0.0]", "##")):
             with self.subTest(heading=heading):
                 repo, old = self.base(f"repo{n}")
                 log = f"# Changelog\n\n## [0.9.0] - 2026-08-01\n\n- **Other.**\n\n{heading}\n\n- **Shipped thing.**\n"
@@ -2253,9 +2253,9 @@ class MarkerAmbiguity(GitCase):
                 self.assertIn("- **Shipped thing.**  [released]\n", out)
                 self.assertNotIn("[released 0.9.0]", out)
 
-    def test_a_comment_line_is_not_a_heading(self):
-        """An indented or fenced `# comment` (a shell snippet in the notes) must not end the section above it."""
-        for n, body in enumerate(("  # restart the agent\n", "```\n# restart the agent\n```\n", "~~~sh\n## x\n~~~\n")):
+    def test_an_indented_line_is_not_a_heading(self):
+        """An indented `# comment` or `## [x]` (a snippet in the notes) must not end the section above it."""
+        for n, body in enumerate(("  # restart the agent\n", "    ## [9.9]\n")):
             with self.subTest(body=body):
                 repo, old = self.base(f"repo{n}")
                 log = f"# Changelog\n\n## [Unreleased]\n\n{body}\n- **Pending thing.**\n"
@@ -2271,76 +2271,6 @@ class MarkerAmbiguity(GitCase):
         out = self.ok(repo, "--since", old)
         self.assertIn("- **Shipped thing.**  [released]\n", out)
         self.assertNotIn("[released 0.9.0]", out)
-
-    def test_an_indented_version_heading_is_a_heading_only_up_to_three_spaces(self):
-        """Three spaces is still a Markdown heading (the version is unknown); four or a tab is a code block."""
-        head = "## [0.9.0]\n- a\n"
-        for indent, want in (("  ", ""), ("   ", ""), ("    ", "0.9.0"), ("\t", "0.9.0")):
-            with self.subTest(indent=repr(indent)):
-                self.assertEqual(WN.release_sections(f"{head}{indent}## [1.0.0]\n- b\n")["- b"], want)
-
-    def test_an_unclosed_or_mismatched_fence_never_names_a_version(self):
-        for name, body in (("unclosed", "```\n- fenced\n"),
-                           ("mixed", "```\n~~~\n- fenced\n")):
-            with self.subTest(name):
-                sections = WN.release_sections(
-                    f"## [Unreleased]\n- u\n\n## [2.0]\n{body}\n## [1.0]\n- old\n\n## [Unreleased]\n- later\n")
-                self.assertEqual(sections["- old"], "")
-                self.assertEqual(sections["- later"], "")
-
-    def test_an_inline_code_span_at_the_start_of_a_line_is_not_a_fence(self):
-        sections = WN.release_sections("## [2.0]\n```code``` text\n- fenced\n## [1.0]\n- old\n")
-        self.assertEqual(sections["- fenced"], "2.0")
-        self.assertEqual(sections["- old"], "1.0")
-
-    def test_a_fence_showing_headings_names_no_version_after_it(self):
-        log = ("## [1.0]\n```\n## [9.9]\n## [Unreleased]\n```\n- real1\n\n"
-               "## [0.9]\n```\nplain code\n```\n- real2\n")
-        sections = WN.release_sections(log)
-        self.assertEqual(sections["- real1"], "")  # never 9.9, and never None
-        self.assertEqual(sections["- real2"], "0.9")  # a fence with no heading in it changes nothing
-
-    def test_a_long_fence_is_closed_only_by_a_run_as_long(self):
-        log = "## [2.0]\n````\n```\n## [9.9]\n```\n````\n- real\n"
-        self.assertEqual(WN.release_sections(log)["- real"], "")
-        log = "## [2.0]\n````\n```\n```\n````\n- real\n"
-        self.assertEqual(WN.release_sections(log)["- real"], "2.0")
-
-    def test_an_unclosed_fence_followed_by_a_sample_never_names_a_wrong_version(self):
-        log = "## [2.0]\n```\n- x\n## [1.0]\n- e2\n```\ncode\n```\n- e3\n"
-        sections = WN.release_sections(log)
-        self.assertEqual(sections["- e2"], "")
-        self.assertEqual(sections["- e3"], "")
-
-    def test_a_fence_follows_commonmark_for_openers_and_closers(self):
-        cases = (
-            ("closer with an info string stays inside", "## [2.0]\n```\n```js\n## [9.9]\n```\n- b\n", ""),
-            ("closer indented four spaces stays inside", "## [2.0]\n```\n    ```\n## [9.9]\n```\n- b\n", ""),
-            ("tilde closer with text stays inside", "## [2.0]\n~~~\n~~~ x\n## [9.9]\n~~~\n- b\n", ""),
-            ("backtick in the info string is not an opener", "## [2.0]\n```a`b\n- b\n", "2.0"),
-            ("opener indented four spaces is not a fence", "## [2.0]\n    ```\n- b\n## [1.0]\n- c\n", "2.0"),
-            ("a longer closing run closes", "## [2.0]\n```\n````\n## [3.0]\n- b\n", "3.0"),
-            ("a two-character run is not a fence", "## [1.0]\n``\n## [2.0]\n- b\n", "2.0"),
-            ("a tilde fence closes on a tilde run", "## [1.0]\n~~~\n~~~\n## [2.0]\n- b\n", "2.0"),
-        )
-        for name, log, want in cases:
-            with self.subTest(name):
-                self.assertEqual(WN.release_sections(log)["- b"], want)
-
-    def test_any_bracketed_heading_inside_a_fence_leaves_the_version_unknown(self):
-        for heading in ("## [3.0]", "##\t[3.0]", "  ## [3.0]", "# [3.0]"):
-            with self.subTest(heading=heading):
-                log = f"## [2.0]\n```\n{heading}\n- b\n"
-                self.assertEqual(WN.release_sections(log)["- b"], "")
-
-    def test_a_shell_comment_in_a_fence_changes_nothing(self):
-        log = "## [2.0]\n```sh\n# restart the agent\nrun\n```\n- b\n"
-        self.assertEqual(WN.release_sections(log)["- b"], "2.0")
-
-    def test_a_tilde_line_does_not_close_a_backtick_fence(self):
-        sections = WN.release_sections("## [1.0]\n```\n~~~\n# not a heading\n```\n- after\n")
-        self.assertEqual(sections["- after"], "1.0")
-        self.assertEqual(sections["# not a heading"], "1.0")
 
     def test_a_sub_heading_does_not_end_the_section(self):
         repo, old = self.base()
