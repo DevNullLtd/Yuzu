@@ -1764,6 +1764,9 @@ void count_decision(yuzu::MetricsRegistry* metrics,
 struct RepairOrderStep {
     bool enabled{true};
     int lock_timeout_ms{1000};
+    // The statement timeout a Repair applies to its census statements (P-1). Ignored for a first
+    // delivery or batch row, which keep the connection's own.
+    int statement_timeout_ms{GuaranteedStateStore::kRepairStatementTimeoutMs};
 };
 
 // Read the mode and the retired epoch off a one-row result whose columns are (mode, retired_epoch).
@@ -2485,6 +2488,18 @@ project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
         };
         pair = census_pair(stored_col(0), stored_col(1));
         decision = default_pair_decision(pair.boot_epoch != 0);
+        // P-1: bound every census statement of a Repair, inside this savepoint. A Repair holds the
+        // agent's order row FOR SHARE from its clock read to the end of the transaction, so a
+        // pathological statement would otherwise hold that lock and a pooled connection for the
+        // pool's 30 s statement timeout, and every first delivery of the agent would time out on
+        // the row behind it and be stored pending. At the bound the statement fails with 57014, the
+        // savepoint rolls back (undoing this SET LOCAL) and the Repair is Failed, its evidence
+        // kept. The success path restores the connection's own bound before the RELEASE, which
+        // keeps a SET LOCAL, exactly as the lock_timeout below does.
+        if (!control(("SET LOCAL statement_timeout = " +
+                      std::to_string(repair_step.statement_timeout_ms))
+                         .c_str()))
+            return CensusOutcome::Abandoned;
         if (repair_step.enabled) {
             if (!control(("SET LOCAL lock_timeout = " + std::to_string(repair_step.lock_timeout_ms))
                              .c_str()))
@@ -2628,6 +2643,10 @@ project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
         if (clear.status() != PGRES_COMMAND_OK)
             return fail(clear);
     }
+    // RELEASE keeps a SET LOCAL: give a Repair's statement bound back before it (a first delivery
+    // or batch row set none).
+    if (source == ProjectionSource::Repair && !control("SET LOCAL statement_timeout TO DEFAULT"))
+        return CensusOutcome::Abandoned;
     if (!control("RELEASE SAVEPOINT census_upsert"))
         return CensusOutcome::Abandoned;
     counted = decision_label; // the write stands: its decision is countable
@@ -2876,7 +2895,8 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                         false, PairDecision{}, false,
                         RepairOrderStep{
                             agent_step_enabled_.load(std::memory_order_relaxed),
-                            agent_step_lock_timeout_ms_.load(std::memory_order_relaxed)},
+                            agent_step_lock_timeout_ms_.load(std::memory_order_relaxed),
+                            repair_statement_timeout_ms_.load(std::memory_order_relaxed)},
                         decision);
                     count_projection(metrics_, ProjectionSource::Repair, repaired);
                     count_decision(metrics_, decision);

@@ -336,6 +336,23 @@ public:
         agent_step_lock_timeout_ms_.store(ms, std::memory_order_relaxed);
     }
 
+    /// The statement timeout a Repair of a pending event applies to its census statements, in
+    /// milliseconds, next to the step's lock bound above. A Repair holds the agent's order row
+    /// `FOR SHARE` from its clock read to the end of its transaction, so an unbounded census
+    /// statement (P-1) would hold that lock, and a pooled connection, for the pool's 30 s
+    /// statement timeout. At this bound the Repair is `Failed` instead (SQLSTATE 57014 rolled back
+    /// to its savepoint, the evidence kept for the next redelivery). First deliveries and batch
+    /// rows keep the connection's own statement timeout.
+    static constexpr int kRepairStatementTimeoutMs = 2000;
+
+    /// Test seam: the statement timeout a Repair applies, in milliseconds (default
+    /// `kRepairStatementTimeoutMs`). A test lowers it to reach SQLSTATE 57014 in a fraction of a
+    /// second. Production never sets it. Atomic, so a setter never races an ingest on another
+    /// thread.
+    void set_repair_statement_timeout_ms_for_test(int ms) noexcept {
+        repair_statement_timeout_ms_.store(ms, std::memory_order_relaxed);
+    }
+
     /// The census statements whose PLANS a test pins (P-1), exactly as the store sends them: the
     /// upsert (`$1`..`$12`) and the fold (`$1`..`$4`). A read of two string constants, no state.
     struct CensusSqlForTest {
@@ -734,6 +751,7 @@ private:
     std::function<void()> census_lock_barrier_;     // test seam, empty in production
     std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
     std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
+    std::atomic<int> repair_statement_timeout_ms_{kRepairStatementTimeoutMs};   // test seam, 2000
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
