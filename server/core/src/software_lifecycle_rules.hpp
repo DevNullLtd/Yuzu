@@ -30,6 +30,7 @@
 /// `end_of_support`; else any resolved date -> `supported`; no date at all -> `unknown`, never
 /// `supported`. Dates are `YYYY-MM-DD` text, compared lexicographically.
 
+#include "ascii_fold.hpp"
 #include "model_param_helpers.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -305,19 +306,13 @@ parse_lifecycle_rules_csv(std::string_view text, LifecycleSource source) {
 /// Linux distro id is unknown.
 [[nodiscard]] inline std::string os_lifecycle_key(std::string_view os_family,
                                                   std::string_view distro_id) {
-    const auto lower = [](std::string_view s) {
-        std::string o{s};
-        for (auto& c : o)
-            c = static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
-        return o;
-    };
-    const std::string fam = lower(os_family);
+    const std::string fam = ascii_lower(os_family);
     if (fam == "windows")
         return "os:windows";
     if (fam == "darwin" || fam == "macos")
         return "os:macos";
     if (fam == "linux" && !distro_id.empty())
-        return "os:" + lower(distro_id);
+        return "os:" + ascii_lower(distro_id);
     return {};
 }
 
