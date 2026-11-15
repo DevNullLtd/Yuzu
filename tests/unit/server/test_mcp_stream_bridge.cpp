@@ -5879,3 +5879,93 @@ TEST_CASE("bridge unrestricted dispatcher (#7817) - frames are byte-identical wi
           R"("content":[{"text":"x","type":"text"}],"execution_id":"exec-n","status":"completed"},)"
           R"("id":3})");
 }
+
+TEST_CASE("bridge confined dispatcher (#7817) - a buffered terminal with no status latches \"unknown\", not \"completed\"",
+          "[mcp][bridge][7817][2409]") {
+    // Parity with an unrestricted record, whose build_real_final defaults a missing status
+    // to "unknown": the pressure visitor's sanitize must not invent "completed".
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-7817u"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.bus.publish("exec-7817u", "execution-progress",
+                   R"({"agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
+                   /*is_terminal=*/true);
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    REQUIRE(count_results(frames) == 1);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "unknown");
+    check_no_count_keys(*result);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - a listener fault on the terminal latches nothing; the retry delivers it sanitized",
+          "[mcp][bridge][7817]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(4), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(4), "exec-7817f"));
+    REQUIRE(fx.bridge->arm(s.id, json(4), Bridge::ArmMode::kStreaming, kConfinedBase) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(4)));
+
+    fx.bridge->inject_listener_fault_for_test();
+    fx.bus.publish("exec-7817f", "execution-completed", kCompleted, /*is_terminal=*/true);
+    // The fault is counted (the projector flushes it) and nothing was latched or published.
+    REQUIRE(poll_until([&] {
+        return fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() >= 1.0;
+    }));
+    CHECK(s.stream->pinned_count() == 0);
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 0);
+
+    // The one-shot fault is spent: a later terminal latches, sanitized.
+    fx.bus.publish("exec-7817f", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    const auto result = final_result_of(ring_frames(*s.stream, "alice"));
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "completed");
+    check_no_count_keys(*result);
+}
+
+TEST_CASE("bridge confined dispatcher (#7817) - a pressure-visitor copy fault defers, and the retry latches the sanitized terminal",
+          "[mcp][bridge][7817][2409]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true,
+                               confined_to({"agent-1"}))
+                .ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-7817v"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.bus.publish(
+        "exec-7817v", "execution-progress",
+        R"({"status":"succeeded","agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
+        /*is_terminal=*/true);
+
+    fx.bridge->inject_visit_copy_fault_for_test(1);
+    fx.bridge->sweep();
+    // The copy threw: nothing secured, the record and its listener are kept, no final yet.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 0);
+
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return fx.bridge->record_count() == 0;
+    }));
+    auto frames = ring_frames(*s.stream, "alice");
+    REQUIRE(count_results(frames) == 1);
+    const auto result = final_result_of(frames);
+    REQUIRE(result.has_value());
+    CHECK((*result)["status"] == "succeeded");
+    check_no_count_keys(*result);
+}

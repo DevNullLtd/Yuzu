@@ -53903,6 +53903,8 @@ TEST_CASE("MCP list_executions: a service-scoped session admitted without a scop
 TEST_CASE("MCP execute_instruction bridge: a scope-confined dispatcher gets no progress and a count-free final (#7817)",
           "[pg][mcp][integration][execute][bridge][7817]") {
     namespace smcp = yuzu::server::mcp;
+    using yuzu::server::authz::FleetReadGate;
+    using yuzu::server::authz::VisibleSet;
 
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
@@ -53942,6 +53944,7 @@ TEST_CASE("MCP execute_instruction bridge: a scope-confined dispatcher gets no p
         auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
         return text["execution_id"].get<std::string>();
     };
+    // One success and one failure: the terminal is "completed" with counts 1 and 1.
     const auto finish = [&](const std::string& exec_id) {
         yuzu::server::AgentExecStatus a1;
         a1.agent_id = "agent-001";
@@ -53961,107 +53964,137 @@ TEST_CASE("MCP execute_instruction bridge: a scope-confined dispatcher gets no p
         }
         return n;
     };
-
-    SECTION("GET-only: an admitted, scoped gate - no progress frame, the record still settles") {
-        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                       const std::string& type, const std::string& op)
-            -> yuzu::server::authz::FleetReadGate {
-            CHECK(type == "Execution");
-            CHECK(op == "Read");
-            return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-001"}}};
-        };
-        ts.start_with_dispatch(dispatch, "operator");
-        ts.mcp.set_stream_bridge(&bridge);
-
-        auto res = ts.call_raw("POST", exec_body(7817), {{"Mcp-Session-Id", sid}});
-        REQUIRE(res->status == 200);
-        const auto exec_id = exec_of(res->body);
-        // S4.5's refresh_counts has already published a 0/2 progress during dispatch (the
-        // unrestricted GET-only test relies on that frame), and a further one is published
-        // here; a confined record receives neither.
-        bus.publish(exec_id, "execution-progress", R"({"agents_responded":1,"agents_targeted":2})");
-        CHECK_FALSE(bridge_poll([&] { return progress_frames() > 0; },
-                                std::chrono::milliseconds(200)));
-        finish(exec_id);
-        REQUIRE(bridge_poll([&] {
-            auto p = bridge.phase_for(sid, nlohmann::json(7817));
-            return p.has_value() && *p == smcp::McpStreamBridge::Phase::kDone;
-        }));
-        CHECK(progress_frames() == 0);
-    }
-
-    const auto expect_fail_closed = [&](int request_id) {
+    const auto wait_phase = [&](int request_id, smcp::McpStreamBridge::Phase want) {
+        return bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(request_id));
+            return p.has_value() && *p == want;
+        });
+    };
+    const auto confined_to_agent_001 = [](const httplib::Request&, httplib::Response&,
+                                          const std::string&, const std::string&) -> FleetReadGate {
+        return {true, VisibleSet{std::unordered_set<std::string>{"agent-001"}}};
+    };
+    const auto unfiltered = [](const httplib::Request&, httplib::Response&, const std::string&,
+                               const std::string&) -> FleetReadGate {
+        return {true, std::nullopt};
+    };
+    // GET-only: dispatch, publish progress, settle the execution, then assert on the settled
+    // state (no bare absence poll). `expect_progress` is the positive control.
+    const auto run_get_only = [&](int request_id, bool expect_progress) {
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
         auto res = ts.call_raw("POST", exec_body(request_id), {{"Mcp-Session-Id", sid}});
         REQUIRE(res->status == 200); // the dispatch itself is unaffected
         const auto exec_id = exec_of(res->body);
         bus.publish(exec_id, "execution-progress", R"({"agents_responded":1,"agents_targeted":2})");
-        CHECK_FALSE(bridge_poll([&] { return progress_frames() > 0; },
-                                std::chrono::milliseconds(200)));
+        finish(exec_id);
+        REQUIRE(wait_phase(request_id, smcp::McpStreamBridge::Phase::kDone));
+        if (expect_progress)
+            CHECK(progress_frames() > 0);
+        else
+            CHECK(progress_frames() == 0);
     };
+    // Streamed: the response is released at the end of the inner block, which parks the record
+    // (as the pin-slot tests above rely on); the agents answer only afterwards. Returns the
+    // pinned final's result object.
+    const auto run_streamed = [&](int request_id) {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        {
+            auto res = ts.call_raw("POST", exec_body(request_id),
+                                   {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+            REQUIRE(res->status == 200);
+        }
+        REQUIRE(wait_phase(request_id, smcp::McpStreamBridge::Phase::kRingOnly));
+        const auto rows = tracker.query_executions({});
+        REQUIRE(!rows.empty());
+        const std::string exec_id = rows.front().id;
+        finish(exec_id);
+        REQUIRE(bridge_poll([&] { return stream->pinned_count() == 1; }));
+        std::optional<nlohmann::json> result;
+        for (const auto& f : bridge_ring(*stream, "test-user")) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (j.is_object() && j.contains("result"))
+                result = j["result"];
+        }
+        REQUIRE(result.has_value());
+        CHECK((*result)["execution_id"] == exec_id);
+        return *result;
+    };
+    const auto check_count_free = [](const nlohmann::json& result) {
+        CHECK(result["status"] == "completed");
+        CHECK_FALSE(result.contains("agents_success"));
+        CHECK_FALSE(result.contains("agents_failure"));
+        CHECK_FALSE(result.contains("agents_responded"));
+    };
+
+    SECTION("GET-only: an admitted, scoped gate - no progress frame, the record still settles") {
+        // Recorded on the httplib worker thread and asserted here on the main thread.
+        std::mutex asked_mu;
+        std::vector<std::pair<std::string, std::string>> asked;
+        ts.fleet_read_fn_for_test = [&](const httplib::Request& rq, httplib::Response& rs,
+                                        const std::string& type,
+                                        const std::string& op) -> FleetReadGate {
+            {
+                std::lock_guard<std::mutex> lk(asked_mu);
+                asked.emplace_back(type, op);
+            }
+            return confined_to_agent_001(rq, rs, type, op);
+        };
+        run_get_only(7817, /*expect_progress=*/false);
+        std::lock_guard<std::mutex> lk(asked_mu);
+        REQUIRE(asked.size() >= 1);
+        CHECK(std::find(asked.begin(), asked.end(),
+                        std::pair<std::string, std::string>{"Execution", "Read"}) != asked.end());
+    }
 
     SECTION("GET-only: a gate that refuses fails CLOSED, never unrestricted") {
         ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                       const std::string&, const std::string&)
-            -> yuzu::server::authz::FleetReadGate { return {false, std::nullopt}; };
-        expect_fail_closed(7818);
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            return {false, std::nullopt};
+        };
+        run_get_only(7818, false);
     }
 
     SECTION("GET-only: an unwired gate fails CLOSED, never unrestricted") {
         ts.fleet_read_fn_for_test = {};
-        expect_fail_closed(7820);
+        run_get_only(7820, false);
     }
 
-    SECTION("streamed: the pinned final carries the real status and no counts") {
+    SECTION("GET-only: a gate that THROWS fails CLOSED and the dispatch still answers 200") {
         ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
-                                       const std::string&, const std::string&)
-            -> yuzu::server::authz::FleetReadGate {
-            return {true, yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-001"}}};
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            throw std::runtime_error("rbac read failed");
         };
-        ts.start_with_dispatch(dispatch, "operator");
-        ts.mcp.set_stream_bridge(&bridge);
+        run_get_only(7821, false);
+    }
 
-        {
-            // The response is released at the end of this block, which parks the record
-            // (as the pin-slot tests above rely on); the agents answer only afterwards.
-            auto res = ts.call_raw("POST", exec_body(7819),
-                                   {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
-            REQUIRE(res->status == 200);
-        }
-        // The record is parked, so its final is pinned in the session ring when the
-        // terminal lands.
-        REQUIRE(bridge_poll([&] {
-            auto p = bridge.phase_for(sid, nlohmann::json(7819));
-            return p.has_value() && *p == smcp::McpStreamBridge::Phase::kRingOnly;
-        }));
-        std::string exec_id;
-        {
-            // The execution id is in the ring's progress frames for an unrestricted caller;
-            // for a confined one the bridge holds it, so read it from the record's tracker row.
-            auto rows = tracker.query_executions({});
-            REQUIRE(!rows.empty());
-            exec_id = rows.front().id;
-        }
-        finish(exec_id);
-        REQUIRE(bridge_poll([&] { return stream->pinned_count() == 1; }));
-        std::optional<nlohmann::json> result;
-        std::size_t progress = 0;
-        for (const auto& f : bridge_ring(*stream, "test-user")) {
-            auto j = nlohmann::json::parse(f.data, nullptr, false);
-            if (!j.is_object())
-                continue;
-            if (j.value("method", "") == "notifications/progress")
-                ++progress;
-            if (j.contains("result"))
-                result = j["result"];
-        }
-        CHECK(progress == 0);
-        REQUIRE(result.has_value());
-        CHECK((*result)["status"] == "completed");
-        CHECK_FALSE(result->contains("agents_success"));
-        CHECK_FALSE(result->contains("agents_failure"));
-        CHECK_FALSE(result->contains("agents_responded"));
-        CHECK((*result)["execution_id"] == exec_id);
+    SECTION("GET-only positive control: an admitted, UNFILTERED gate still gets progress") {
+        ts.fleet_read_fn_for_test = unfiltered;
+        run_get_only(7822, /*expect_progress=*/true);
+    }
+
+    SECTION("streamed: a scoped gate - the pinned final has the real status and no counts") {
+        ts.fleet_read_fn_for_test = confined_to_agent_001;
+        const auto result = run_streamed(7819);
+        check_count_free(result);
+        CHECK(progress_frames() == 0);
+    }
+
+    SECTION("streamed: a gate that THROWS - the pinned final is count-free too") {
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            throw std::runtime_error("rbac read failed");
+        };
+        check_count_free(run_streamed(7823));
+        CHECK(progress_frames() == 0);
+    }
+
+    SECTION("streamed positive control: an UNFILTERED gate's final carries the counts") {
+        ts.fleet_read_fn_for_test = unfiltered;
+        const auto result = run_streamed(7824);
+        CHECK(result["status"] == "completed");
+        CHECK(result["agents_success"] == 1);
+        CHECK(result["agents_failure"] == 1);
     }
 }
