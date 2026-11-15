@@ -142,6 +142,13 @@ jobs:
       - name: RBAC cross-schema query-owner seam (ADR-0012 s3)
         run: python3 tests/test_rbac_query_owner_seam.py
 
+      # #7223: the durable-session account gate keeps its wiring shape (one soft-delete literal,
+      # the owner's session generation bump, the mode ternary, the gate position, the cache
+      # epoch guard and increment). Also registered in tests/meson.build for local
+      # `meson test --suite docs` parity.
+      - name: Session account gate wiring (#7223)
+        run: python3 -I tests/test_session_account_gate_wiring.py
+
       # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
       # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
       # regexes still refuse a forged rule-id/Spark-key free-text injection. Also registered
@@ -269,6 +276,11 @@ jobs:
       - name: Changelog promote --append
         run: python3 tests/test_assemble_changelog_append.py
 
+      # scripts/whats-new.py: collated "what changed since my last pull" view
+      # (version bumps + changelog.d fragments). Builds a throwaway git repo.
+      - name: What's-new script
+        run: python3 tests/test_whats_new.py
+
       # Windows agent installer trust-anchor lockdown (#5196). The .iss is
       # compiled only by release.yml, never on a PR; this lints its source
       # text (no /T on the icacls grant, a Constrained-Language-safe exact
@@ -300,6 +312,13 @@ jobs:
           # the behavioural server-DLL refusal test cannot skip silently.
           YUZU_REQUIRE_PWSH_TEST: '1'
         run: python3 -I tests/test_release_agent_only.py
+
+      # Agent-bundle release verification (#7529): build-agent-bundle.sh
+      # verifies SHA256SUMS' cosign signature (exact identity per signing era)
+      # before use and matches each file to its own line. Offline: stub gh and
+      # cosign, asserts cosign's argv; mutation-tests itself. Stdlib only.
+      - name: Agent bundle release verification
+        run: python3 -I tests/test_build_agent_bundle_verify.py
 
       # The `server` feature option (ADR-0035 ladder step 3): lexical pins on
       # meson.options and meson.build's guard, with a mutation self-test. The

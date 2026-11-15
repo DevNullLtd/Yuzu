@@ -686,17 +686,24 @@ TEST_CASE("AuthManager+SessionStore: a LOWER durable generation clears the repli
     }
 }
 
-// ── #2343: a stored session the engine token authenticated is an engine at every gate ───────
+// ── #2343 / #7223: a stored (engine_token source, human kind) row is refused before any gate ──
 //
 // The bearer path cannot produce a Session whose stored kind says human while its source is
 // engine_token (synthesize_token_session sets both together), so the only way to put one in
 // front of the gates is the durable row, restored by a fresh (cold-cache) AuthManager. The v2
 // CHECK forbids the row, so the test drops it first, exactly as a hand edit of an older
-// database would. With RBAC off (the default), an engine-classed session is refused 403 by the
-// engine branch of every gate, while an ordinary human admin is admitted by the legacy path
-// (or, for require_fleet_read, reaches the 503 arm of an unwired store), so reverting any one
-// site to the raw stored-kind compare turns its assertion red.
-TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the engine branch",
+// database would. Before #7223 such a row was served and every gate took the engine branch
+// (403). The durable-session account gate is now a closed three-way on the stored auth source
+// (local, oidc, saml), so the row is refused at validation: no session resolves, every gate
+// answers 401 and the audit class stays at the cookie presentation ("human"). That is the
+// stronger outcome: a stored engine-source row never reaches a gate in either class. The engine
+// branch of each gate is pinned by the synthesized-session tests in
+// test_engine_principal_integration.cpp (require_permission, require_scoped_permission,
+// require_list_read, require_fleet_read, make_audit_event) and the engine audit class by
+// test_auth_routes.cpp (the audit_as_session_fn case for an engine-source, human-kind
+// session). An ordinary human admin is still admitted by the legacy path (or,
+// for require_fleet_read, reaches the 503 arm of an unwired store) as the control.
+TEST_CASE("Gates: a restored (engine_token source, human kind) session is refused at validation",
           "[auth_session_store][pg][engine_principal]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -753,7 +760,7 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         auto sreq = request_for(split_token);
         httplib::Response sres;
         CHECK_FALSE(ar.require_permission(sreq, sres, "Infrastructure", "Read"));
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("require_scoped_permission") {
         auto req = request_for(human_token);
@@ -764,7 +771,7 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         httplib::Response sres;
         CHECK_FALSE(
             ar.require_scoped_permission(sreq, sres, "Execution", "Execute", "agent-1"));
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("require_list_read") {
         auto req = request_for(human_token);
@@ -774,14 +781,15 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         auto sreq = request_for(split_token);
         httplib::Response sres;
         CHECK_FALSE(ar.require_list_read(sreq, sres, "GuaranteedState", "Read").admitted);
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("require_fleet_read") {
         auto req = request_for(human_token);
         httplib::Response res;
         // No management-group store is wired here, so a human session stops at that
-        // check and is answered 503; the engine branch answers first with 403. The two statuses
-        // differ, so the 403 below is the engine branch and not the human arm.
+        // check and is answered 503; the refused split row never resolves a session and is
+        // answered 401. The two statuses differ, so the 401 below is the refusal and not the
+        // human arm.
         auto control = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
         CHECK_FALSE(control.has_value());
         CHECK(res.status == 503);
@@ -789,17 +797,17 @@ TEST_CASE("Gates: a restored (engine_token source, human kind) session takes the
         auto sreq = request_for(split_token);
         httplib::Response sres;
         CHECK_FALSE(ar.require_fleet_read(sreq, sres, "GuaranteedState", "Read").has_value());
-        CHECK(sres.status == 403);
+        CHECK(sres.status == 401); // no session resolved: the engine-source row was refused
     }
     SECTION("make_audit_event") {
         // The audit class starts from the credential presentation (a cookie reads "human") and
-        // is re-stamped "engine" from the resolved session's is_engine(). The split session
-        // carries a human stored kind, so only the predicate, not the stored kind, yields it.
+        // is re-stamped "engine" only from a RESOLVED session's is_engine(). The split row
+        // resolves no session, so it stays at the presentation class.
         auto req = request_for(human_token);
         CHECK(ar.make_audit_event(req, "test.action", "success").principal_class == "human");
 
         auto sreq = request_for(split_token);
-        CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "engine");
+        CHECK(ar.make_audit_event(sreq, "test.action", "success").principal_class == "human");
     }
 }
 

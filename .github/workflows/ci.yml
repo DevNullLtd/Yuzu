@@ -642,6 +642,7 @@ jobs:
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
+          bash tests/shell/test_integration_port_retry.sh        # integration-test.sh lost-port-race classifier + process-ownership guard (#7538)
           bash tests/shell/test_pr2_gates.sh CH-18 CH-20 CH-21 CH-22 CH-24  # local coverage gate: fast subset of the mock chaos harness, ~25 s (#5803; the full harness is #6116)
 
       # Prometheus HELP-text ASCII gate (#2128). Source-only, no build deps,
@@ -1052,7 +1053,7 @@ jobs:
 
       # OTP + rebar3 for the gateway test legs. Without these, meson's
       # `find_program('rebar3', required: false)` returns not-found,
-      # the `gateway eunit shard A/B` and `gateway ct` tests are silently skipped, and the
+      # the `gateway eunit shard <X>` and `gateway ct` tests are silently skipped, and the
       # Linux matrix can't catch gateway regressions until they hit the
       # Windows leg (where rebar3 is pre-baked via choco). Pin matches
       # release.yml's "Build Gateway (Erlang)" job so any OTP bump moves
@@ -1793,10 +1794,11 @@ jobs:
             full|smoke) ;;
             *) echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke'"; exit 1 ;;
           esac
-          # A measurement-only knob (docs/testing/unit-test-conventions.md); if the
-          # runner's environment leaks it in, every [pg] template clone uses it.
+          # The pg half sets YUZU_TEST_PG_CLONE_STRATEGY=file_copy itself (see
+          # pg_half); a value leaking in from the runner's environment is
+          # overridden there, but say so rather than ignore it silently.
           if [[ -n "${YUZU_TEST_PG_CLONE_STRATEGY:-}" ]]; then
-            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; [pg] template clones use it (a measurement knob, not a CI setting)"
+            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; the pg half overrides it with file_copy"
           fi
           # Isolation 2: build every test prerequisite once, serially, so the
           # concurrent invocations below can all run with --no-rebuild.
@@ -1824,6 +1826,18 @@ jobs:
           pg_half() {
             set -e
             export GITHUB_STEP_SUMMARY="$LOGS/ci-half-pg.summary.md"
+            # Every template-cloned [pg] case clones with STRATEGY FILE_COPY
+            # (docs/testing/unit-test-conventions.md). Measured on Big Tam in
+            # two same-job A/B runs (#7701): the server-pg suite ran about 6-7%
+            # faster in wall time than with the server default (WAL_LOG). Each
+            # runner has its own Postgres container, so the checkpoint FILE_COPY
+            # forces stays inside this job's cluster. Needs PostgreSQL 15+, and
+            # is only a gain with fsync off, as ensure-postgres.sh's Docker
+            # cluster runs (with fsync on, each clone measured ~9x slower).
+            # Revert: `git revert -m 1` the merge commit of the PR that added
+            # this line (the step's contract test and the leak warning above
+            # change with it). YUZU_CI_SEQUENTIAL_HALVES=1 does not undo it.
+            export YUZU_TEST_PG_CLONE_STRATEGY=file_copy
             if [[ "$PG_MODE" == "full" ]]; then
               bash scripts/ci/with-test-slot.sh 3 -- \
                 python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs --num-processes 4 --suite server-pg
@@ -2514,12 +2528,22 @@ jobs:
         run: |
           $scope = $env:YUZU_TEST_REGISTRY_SCOPE
           $script = './scripts/ci/check-registry-test-leftovers.ps1'
-          # one probe under EACH root the script scans, so dropping a root from it turns this step red
+          # one probe under EACH root the script scans, so dropping a root from it turns this step red. A runner account
+          # can be refused (error 5) creating a key under a bam root (#7637; an elevated non-SYSTEM user on a test host was
+          # refused under bam\State\UserSettings and allowed directly under bam): a refused root is held to a weaker proof
+          # (a text check that the script still names the root; it proves presence, not scanning, #7761); the three other roots
+          # always need a live probe. Only a permission refusal is tolerated: any other error (e.g. a probe that already
+          # exists, there being no -Force) still fails the step.
           $probes = [ordered]@{
             'HKCU:\Software' = "YuzuTest-selftest-$scope-probe-hkcu"
             'HKLM:\SOFTWARE' = "YuzuTest-selftest-$scope-probe-hklm"
             'HKLM:\SOFTWARE\Wow6432Node' = "YuzuTest-selftest-$scope-probe-wow"
+            'HKLM:\SYSTEM\CurrentControlSet\Services\bam' = "YuzuTest-selftest-$scope-probe-bamroot"
+            'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings' = "YuzuTest-selftest-$scope-probe-bamstate"
           }
+          $bamRoots = @('HKLM:\SYSTEM\CurrentControlSet\Services\bam', 'HKLM:\SYSTEM\CurrentControlSet\Services\bam\State\UserSettings')
+          $planted = [ordered]@{}
+          $who = [Security.Principal.WindowsIdentity]::GetCurrent()
           function Arm($s, $want, $kind, $name) {
             $out = & pwsh -NoProfile -NonInteractive -File $script -Scope $s 2>&1 | Out-String
             $rc = $LASTEXITCODE
@@ -2527,7 +2551,7 @@ jobs:
             if ($rc -ne $want) {
               throw "registry leftover check self-test, $name arm: expected exit $want, got exit $rc"
             }
-            foreach ($p in $probes.Values) {
+            foreach ($p in $planted.Values) {
               if ($out -notmatch ($kind + '.*' + [regex]::Escape($p))) {
                 throw "registry leftover check self-test, $name arm: expected exit $want naming $p, got exit $rc"
               }
@@ -2536,10 +2560,20 @@ jobs:
           # no -Force: a probe that already exists fails the step and, not in $made, is never removed by it
           $made = @()
           try {
-            foreach ($root in $probes.Keys) { $p = Join-Path $root $probes[$root]; New-Item -Path $p | Out-Null; $made += $p }
+            foreach ($root in $probes.Keys) {
+              $p = Join-Path $root $probes[$root]
+              try { New-Item -Path $p -ErrorAction Stop | Out-Null; $made += $p; $planted[$root] = $probes[$root] }
+              catch {
+                if ($bamRoots -notcontains $root -or $_.CategoryInfo.Category -ne 'PermissionDenied') { throw }
+                Write-Host "::warning::registry leftover check self-test: cannot plant a probe under $root ($($_.Exception.Message)); proving only that the script lists it. The Echo bam live case is expected to SKIP too, so the bam exclusion is not proven live in this job (runner account is LOCAL SYSTEM: $($who.IsSystem); #7637)"
+                if (-not (Select-String -LiteralPath $script -SimpleMatch -Quiet -Pattern "'$root'")) {
+                  throw "registry leftover check self-test: $script does not list $root"
+                }
+              }
+            }
             Arm "selftest-$scope" 1 '::error::leftover registry key ' 'own-scope'
             Arm $scope 0 '::warning::' 'other-scope'
-            foreach ($root in $probes.Keys) {
+            foreach ($root in $planted.Keys) {
               if (-not (Test-Path -LiteralPath (Join-Path $root $probes[$root]))) {
                 throw "registry leftover check self-test: the check removed its probe under $root"
               }
@@ -2598,10 +2632,14 @@ jobs:
       - name: Test (non-pg suites)
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
-          # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp
-          # skip_or_fail, tests/unit/test_registry_win_internals.cpp skip_or_fail) WARN-and-skip when registry.dll is
-          # missing or the process cannot write HKLM, and a skip is green. This job runs as LOCAL SYSTEM (see the
-          # shell comment above), which is elevated, so a skip here is a regression: "1" turns it into a FAIL.
+          # #6488: the registry plugin's real-registry cases (tests/unit/test_registry_write_local_dispatcher.cpp and
+          # tests/unit/test_registry_win_internals.cpp, skip_or_fail) WARN when registry.dll is missing or the process cannot
+          # write HKLM, and the Echo bam live case (tests/unit/test_echo_registry_bam_live.cpp, skip_or_fail) SKIPs when the
+          # process is not elevated, bam\State cannot be opened or a scratch key under bam is refused; without the flag these are green.
+          # In this job a skip is a regression, so "1" turns each into a FAIL. The one exception is the bam live case's
+          # scratch-key create refused with ACCESS_DENIED (measured for this leg's non-SYSTEM account at
+          # bam\State\UserSettings, CI run 43294719354, #7637), which SKIPs even with "1"; a refusal to open bam\State
+          # for reading has not been measured and still FAILs.
           YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS: "1"
           # The fixtures' key-name scope (YUZU_TEST_REGISTRY_SCOPE) is the job-level env above.
         run: |
@@ -2647,13 +2685,15 @@ jobs:
           python scripts/ci/test-durations-summary.py --builddir build-windows-agent-${{ matrix.build_type }} --label "Windows non-pg"
 
       # #6488: the registry plugin's tests create scratch keys under HKLM\SOFTWARE (and Wow6432Node) and HKCU\Software
-      # (HKU\.DEFAULT for LOCAL SYSTEM) and each fixture removes its own; this step is the tripwire that notices one that
+      # (HKU\.DEFAULT for LOCAL SYSTEM), and the Echo bam live case (#6898) two under
+      # HKLM\SYSTEM\CurrentControlSet\Services\bam and its State\UserSettings; each fixture removes its own; this step is the tripwire that notices one that
       # did not. Only a key of THIS job's scope (YuzuTest-<scope>-..., see the job-level env) fails the job. Any other
       # YuzuTest-* key is a ::warning only: an orphan of a cancelled or crashed job (a cancelled job skips this step), a
       # concurrent job's live key on the shared box, or the nightly windows-asan leg's unscoped keys. It REPORTS and
       # never deletes: a leftover can be a registry link, and every tree delete follows links (the plugin's own rule),
       # so removal is left to a human. The scan is scripts/ci/check-registry-test-leftovers.ps1, whose two decisions the
-      # self-test step before the suite proves on every run.
+      # self-test step before the suite proves on every run (for a bam root the runner account is refused under, only
+      # that the script still lists the root).
       - name: Assert this job left no YuzuTest-* registry keys behind
         if: success() || failure()
         shell: pwsh

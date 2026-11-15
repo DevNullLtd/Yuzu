@@ -15,7 +15,7 @@ out/
 
 # Agent-bundle delivery image: build context staged by scripts/build-agent-bundle.sh
 # (downloaded release archives + the laid-out /opt/yuzu-agents tree). Large, derived.
-deploy/docker/.agent-bundle-build/
+deploy/docker/.agent-bundle-build*/
 
 # Erlang / rebar3
 # `_build/` is the canonical rebar3 base dir. `_build_eunit_<K>/` (one per

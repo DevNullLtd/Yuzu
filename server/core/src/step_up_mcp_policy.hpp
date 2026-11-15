@@ -62,11 +62,11 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 7> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 8> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
     step_up_detail::kCancelsRecord,     step_up_detail::kCreatesRerunRecord,
-    kReadOnlyOperation,
+    kReadOnlyOperation,                 step_up_detail::kContentAuthoring,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -124,6 +124,19 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("delete_offload_target",                "DELETE", R"(/api/v1/offload-targets/(\d+))"),
     step_up_mcp_detail::exempt ("pin_result_set",                       step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)"),
     step_up_mcp_detail::exempt ("unpin_result_set",                     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)"),
+    // InstructionDefinition:Delete / Write (#2146 batch C): content authoring, the REST twins' class.
+    // The MCP tier ladder is stricter than the REST row: each of these is ticketed at the
+    // supervised tier (mcp_policy.hpp requires_approval), so a human approves each write.
+    step_up_mcp_detail::exempt ("create_definition",                    step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions)"),
+    step_up_mcp_detail::exempt ("delete_definition",                    step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instructions/([^/]+))"),
+    step_up_mcp_detail::exempt ("import_definition",                    step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions/import)"),
+    step_up_mcp_detail::exempt ("save_definition_yaml",                 step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions/yaml)"),
+    step_up_mcp_detail::exempt ("update_definition",                    step_up_detail::kContentAuthoring,  "PUT",    R"(/api/v1/instructions/([^/]+))"),
+    // InstructionSet:Delete / Write (#2146 batch C). delete_instruction_set is ticketed at the
+    // supervised tier; create_instruction_set is NOT (InstructionSet:Write is deliberately not
+    // gated, see mcp_policy.hpp).
+    step_up_mcp_detail::exempt ("create_instruction_set",               step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instruction-sets)"),
+    step_up_mcp_detail::exempt ("delete_instruction_set",               step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instruction-sets/([^/]+))"),
     // Inventory:Write
     step_up_mcp_detail::exempt ("create_result_set_from_inventory_query", step_up_detail::kOperationalData, "POST",   R"(/api/v1/result-sets/from-inventory-query)"),
     // License:Write

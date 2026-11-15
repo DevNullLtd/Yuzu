@@ -215,6 +215,9 @@ struct SoftwareFleetQuery {
     std::string kind;      ///< exact kind filter
     std::string ecosystem; ///< exact ecosystem filter
     std::string source;    ///< exact source filter
+    /// Exact purl filter ("" = none): byte equality with the stored canonical purl, served by the
+    /// partial index `installed_software_purl_idx`. Only blob-v3 rows carry a purl.
+    std::string purl;
     /// Exact version filter: nullopt = any version; present (including "") = that exact
     /// version, so "" selects only the empty-version rows.
     std::optional<std::string> version;
@@ -684,6 +687,10 @@ public:
     /// The `find_by_purl` statement (`$1` = purl, `$2` = limit). Exposed so a test can EXPLAIN it
     /// and pin that it reaches `installed_software_purl_idx`.
     [[nodiscard]] static std::string find_by_purl_sql();
+    /// The `purl` predicate `query_software` appends for `SoftwareFleetQuery::purl`
+    /// (`$<param>` = the purl, alias `i` = installed_software). Exposed so a test can EXPLAIN it
+    /// and pin that it reaches `installed_software_purl_idx`.
+    [[nodiscard]] static std::string query_software_purl_predicate_sql(int param);
 
     /// `inventory_state.last_seen` for one (agent, source) — the SERVER receipt
     /// epoch-seconds of the last ACCEPTED report (full or hash-only touch).

@@ -3975,7 +3975,11 @@ void SettingsRoutes::register_routes(
                  const bool admin = session->token_scope_service.empty() &&
                                     session->mcp_tier.empty() &&
                                     auth::effective_role(*session) == auth::Role::admin;
-                 std::string html = dex_subnav("alerts", 7) + dex_alerts_style();
+                 // The sub-navigation carries the chosen window on, like the other DEX tabs; the
+                 // canonical resolver maps a missing or unknown value to 7 days.
+                 const int window_days = dex_window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d");
+                 std::string html = dex_subnav("alerts", window_days) + dex_alerts_style();
                  if (!admin) {
                      html += "<div class=\"note\" data-denied=\"admin\"><b>Alert settings need the "
                              "Administrator role.</b> Ask an administrator to change DEX alert "
@@ -4221,7 +4225,11 @@ void SettingsRoutes::register_routes(
             return;
         httplib::Response scratch; // the probe's refusal lands here, never on the page
         const bool editable = read_perm(req, scratch, "Infrastructure", "Write");
-        std::string html = dex_subnav("scoring", 7) + dex_alerts_style();
+        // The sub-navigation carries the chosen window on, like the other DEX tabs; the canonical
+        // resolver maps a missing or unknown value to 7 days.
+        const int window_days =
+            dex_window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        std::string html = dex_subnav("scoring", window_days) + dex_alerts_style();
         // #dex-scoring-section is the inner swap target of every POST; the sub-nav above it is
         // never re-rendered.
         html += "<div id=\"dex-scoring-section\">";
@@ -5709,8 +5717,9 @@ void SettingsRoutes::register_routes(
                      "credentials were revoked. Try again");
             return;
         case auth::RemoveUserOutcome::RemovedSessionWipeFailed:
-            // The account IS deactivated (committed) but the durable session wipe failed, so a
-            // live session may survive: a repeated DELETE finishes the wipe.
+            // The account IS deactivated (committed) but the durable session wipe failed, so the
+            // session row may survive (a local session is refused at validation): a repeated
+            // DELETE finishes the wipe.
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }

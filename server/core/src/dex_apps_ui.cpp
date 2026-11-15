@@ -10,11 +10,15 @@
 /// Honesty rules: every withheld or unknown state reads in words (never blank, never 0);
 /// a figure that rounds to zero but is not zero prints "<0.1"; share and rate each name
 /// the online-device population they were divided by; a degraded model prints NOTHING
-/// derived from it. Every agent-reported or customer-authored string passes html_escape
-/// before markup, and subjects pass url_query_value before an hx-get.
+/// derived from it, and its panel says WHICH cause (the model's `degraded_reason`) so the one
+/// lever that helps is named. Every agent-reported or customer-authored string passes html_escape
+/// before markup (printed names also mark bidirectional-control and zero-width characters as
+/// visible text), and subjects pass url_query_value before an hx-get.
 
 #include "dex_apps_ui.hpp"
 
+#include "dex_pane.hpp"
+#include "plural.hpp"
 #include "web_utils.hpp"
 
 #include <cmath>
@@ -36,6 +40,8 @@ std::string dex_subnav(const std::string& active, int window_days);
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+// Printed text of an agent-reported name: control characters shown as markers. Never inside a tag.
+std::string esc_text(const std::string& s) { return html_escape_marked(s); }
 std::string n(int64_t v) { return std::to_string(v); }
 
 // One decimal. A positive figure that would read as zero prints "<0.1", never "0.0".
@@ -88,8 +94,7 @@ const char* const kAppsCss = R"CSS(<style>
 .gp-sub.dx-cl{max-width:none;margin-top:2px;font-size:13px}
 .gp-sub:not(.dx-cl)+.gp-sub.dx-cl{margin-top:8px}
 .gp-sub.dx-cl b{font-weight:600}
-button.gp-chip{line-height:inherit;font-variant-numeric:inherit}
-.gp-chip:focus-visible,.dx-vx>summary:focus-visible,summary.dx-sc:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.dx-vx>summary:focus-visible,summary.dx-sc:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .gp-filters .dx-lbl.sp{margin-left:14px}
 .dx-fault{margin:0 0 12px}
 .dx-tw{overflow-x:auto}
@@ -103,7 +108,7 @@ button.gp-chip{line-height:inherit;font-variant-numeric:inherit}
 .gp-table.dx-apps th:last-child,.gp-table.dx-apps td:last-child{padding-right:16px}
 .gp-table.dx-apps td.dx-indent{padding-left:36px}
 .gp-table.dx-apps td:first-child{overflow-wrap:anywhere}
-.gp-table.dx-apps td:first-child>a{display:inline-block;margin-right:6px}
+.gp-table.dx-apps td:first-child>:is(a,.dx-lk){display:inline-block;margin-right:6px}
 .gp-table.dx-apps tbody tr:last-child td{border-bottom:1px solid var(--line)}
 .gp-table.dx-apps tbody:last-child tr:last-child td,.gp-table.dx-apps tbody:last-child:not(:has(.dx-vx[open])) .dx-apphead td{border-bottom:0}
 .dx-apps .dx-ver{display:none}
@@ -143,10 +148,7 @@ details[open]>summary.dx-sc::after{margin-top:3px;transform:rotate(-135deg)}
 
 std::string chip(const char* label, bool on, const std::string& window, const std::string& platform) {
     // `window` and `platform` are literals from the two closed sets, never request text.
-    return std::string("<button type=\"button\" class=\"gp-chip") + (on ? " on" : "") +
-           "\" aria-pressed=\"" + (on ? "true" : "false") +
-           "\" hx-get=\"/fragments/dex/apps?window=" + window + "&amp;platform=" + platform +
-           "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</button>";
+    return dex_pane_chip("/fragments/dex/apps?window=" + window + "&amp;platform=" + platform, label, on);
 }
 
 std::string filters(const std::string& window, const std::string& scope) {
@@ -170,7 +172,25 @@ struct Coverage {
     std::vector<std::string> partial;  ///< platforms whose crash sources are partial
 };
 
-Coverage coverage(const std::string& scope) {
+// "Observers now: Windows 3 armed, 0 not armed, 1 not reporting; macOS ...". Counts only.
+std::string observer_text(const std::vector<DexObserverSplit>& split, bool& any_quiet) {
+    std::string t = "Observers now: ";
+    bool first = true;
+    for (const auto& o : split) {
+        const std::string label = o.platform == "other" ? std::string("Other platforms")
+                                                        : std::string(os_label(o.platform));
+        if (!first)
+            t += "; ";
+        first = false;
+        t += (label.empty() ? esc(o.platform) : label) + " " + n(o.armed) + " armed, " + n(o.disarmed) +
+             " not armed, " + n(o.none_reported) + " not reporting";
+        any_quiet = any_quiet || o.disarmed > 0 || o.none_reported > 0;
+    }
+    return t + ".";
+}
+
+Coverage coverage(const std::string& scope,
+                  const std::optional<std::vector<DexObserverSplit>>& observers = std::nullopt) {
     std::vector<std::pair<std::string, std::vector<std::string>>> groups; // state -> platform names
     Coverage c;
     for (const auto& [os, state] : dex_apps_crash_source_coverage(scope)) {
@@ -193,8 +213,22 @@ Coverage coverage(const std::string& scope) {
     }
     if (scope == kDexAppsScopeLinux && !c.partial.empty())
         c.line = "Linux partial: it needs systemd-coredump as the active handler";
-    // The table is the shipped design of the crash and hang sources, not live collector health.
-    c.line += ". This is what the agent collects on each platform, not a live check of each device.";
+    // The table is the shipped design of the crash and hang sources, not live collector health;
+    // the observer counts, when a source is wired, are the live half.
+    if (observers) {
+        bool any_quiet = false;
+        c.line += ". Complete and partial describe what the agent collects on each platform by design. " +
+                  observer_text(*observers, any_quiet);
+        // "&#39;" is what html_escape writes for an apostrophe; this sentence is emitted unescaped.
+        c.line += " Armed means the device&#39;s observer is running with at least one source; it does "
+                  "not confirm that every crash source on the device is readable.";
+        if (any_quiet)
+            c.line += " A device that is not armed or not reporting may not be sending all of its crash "
+                      "and hang signals (collection can be incomplete or unavailable), so a quiet list "
+                      "does not cover it.";
+    } else {
+        c.line += ". This is what the agent collects on each platform, not a live check of each device.";
+    }
     if (!c.partial.empty())
         c.line += scope == kDexAppsScopeAll
                       ? " An empty list on a partial platform is not proof of stability."
@@ -216,11 +250,12 @@ std::string captions(const DexAppsModel& m, const std::string& scope, const std:
         h += "<div class=\"gp-sub dx-cl\"><b>Population</b> 0 devices online now (" + basis +
              "). Shares, rates and scores need at least one online device.</div>";
     else
-        h += "<div class=\"gp-sub dx-cl\"><b>Population</b> " + n(*m.population) + " device" +
-             (*m.population == 1 ? "" : "s") + " online now (" + basis +
+        h += "<div class=\"gp-sub dx-cl\"><b>Population</b> " +
+             plural_count(*m.population, "device", "devices") + " online now (" + basis +
              "). Share and rate count online devices only.</div>";
 
-    h += "<div class=\"gp-sub dx-cl\"><b>Crash and hang sources</b> " + coverage(scope).line + "</div>";
+    h += "<div class=\"gp-sub dx-cl\"><b>Crash and hang sources</b> " + coverage(scope, m.observer_state).line +
+         "</div>";
 
     const auto& pol = m.policy;
     const auto& t = pol.policy.tiers;
@@ -237,8 +272,8 @@ std::string captions(const DexAppsModel& m, const std::string& scope, const std:
          ", " + esc(t.names[2]) + " from " + edge_text(t.edges.fair) + ", " + esc(t.names[3]) +
          " below " + edge_text(t.edges.fair) + ". Intervals at " +
          std::format("{:g}", std::round(pol.policy.interval_confidence * 1000.0) / 10.0) +
-         "% confidence. <a hx-get=\"/fragments/dex/scoring?window=" + window +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">Change in Scoring</a></div>";
+         "% confidence. " + dex_pane_link("/fragments/dex/scoring?window=" + window, "Change in Scoring") +
+         "</div>";
     return h;
 }
 
@@ -246,22 +281,45 @@ std::string placeholder(const std::string& title_html, const std::string& body_h
     return "<div class=\"gp-placeholder\"><b>" + title_html + "</b>" + body_html + "</div>";
 }
 
+// The token as a code element, for any panel that names its cause.
+std::string reason_note(const std::string& reason) {
+    return " <span class=\"gp-mute\">(reason: <code class=\"dx-code\">" + esc(reason) + "</code>)</span>";
+}
+
+// One panel per cause. The model's `degraded_reason` is the store's metric label (budget, pool,
+// statement timeout, query error, store not open) or one of the page's own tokens, so the text names
+// the lever that helps: wait, a shorter window, the policy, or the database.
 std::string error_panel(const std::string& reason, const std::string& window) {
     if (reason == "invalid_scope")
         return placeholder("Unknown platform",
                            "The platform filter must be one of all, windows, macos or linux, so no "
                            "figures are shown. Choose a platform above.");
+    if (reason == "concurrency_budget" || reason == "pool_acquire_timeout")
+        return placeholder("Application stability is busy",
+                           "The server is running as many of these reads as it allows, so no figures are "
+                           "shown. Try again in a moment." + reason_note(reason));
+    if (reason == "statement_timeout")
+        return placeholder("Application stability is unavailable",
+                           std::string("The read took too long for this window, so no figures are shown. ") +
+                               (window == "24h" ? "This is already the shortest window; check PostgreSQL health."
+                                                : "Choose a shorter window (30d and All are the slowest).") +
+                               reason_note(reason));
+    if (reason == "score_policy_unavailable" || reason == "score_policy_invalid")
+        return placeholder("Application stability is unavailable",
+                           "The stored score policy could not be used, so no figures are shown. Check it in "
+                           "Scoring." + reason_note(reason));
+    if (reason == "store_not_open" || reason == "query_error")
+        return placeholder("Application stability is unavailable",
+                           "The database read failed, so no figures are shown. Check PostgreSQL health." +
+                               reason_note(reason));
     std::string body = "The read could not be completed, so no figures are shown. Try again in a moment";
     if (reason.empty()) {
-        // A busy or unavailable store arrives with no reason token; a shorter window is then the one
-        // lever, except at 24h, the shortest.
+        // No cause known; a shorter window is then the one lever, except at 24h, the shortest.
         if (window != "24h")
             body += "; a shorter window reads faster (30d and All are the slowest)";
         body += ". If it keeps failing, check PostgreSQL health.";
     } else
-        body += ". If it keeps failing, check PostgreSQL health <span class=\"gp-mute\">(reason: <code "
-                "class=\"dx-code\">" +
-                esc(reason) + "</code>)</span>.";
+        body += ". If it keeps failing, check PostgreSQL health" + reason_note(reason) + ".";
     return placeholder("Application stability is unavailable", body);
 }
 
@@ -269,7 +327,6 @@ std::string error_panel(const std::string& reason, const std::string& window) {
 
 struct RowCtx {
     std::optional<int64_t> population;
-    const DexEffectivePolicy& eff;
 };
 
 bool is_floor(const DexStabilityFigures& f) {
@@ -329,7 +386,7 @@ std::string rate_cell(const DexStabilityFigures& f, const RowCtx& c) {
     std::string tag = i.reliable ? "" : "<span class=\"gp-derived\">under 20 online events</span>";
     return "<td class=\"gp-num dx-fig\"><span class=\"v\">" + estimate_text(i, 1.0, "") +
            " <span class=\"gp-mute nw\">" + interval_text(i, 1.0, "") + "</span></span><span class=\"s\">per 1,000 of " +
-           n(*c.population) + " online device" + (*c.population == 1 ? "" : "s") + "</span>" + tag + "</td>";
+           plural_count(*c.population, "online device", "online devices") + "</span>" + tag + "</td>";
 }
 
 const char* deduction_label(const std::string& name) {
@@ -351,9 +408,9 @@ std::string withheld_words(const DexStabilityFigures& f, const RowCtx& c) {
                             : "Population unknown, so there is nothing to measure against.";
     if (w == "offline_affected") {
         const int64_t online = f.distinct_devices_online.value_or(0);
-        return n(f.distinct_devices - online) + " of " + n(f.distinct_devices) + " affected device" +
-               (f.distinct_devices == 1 ? "" : "s") + (f.distinct_devices - online == 1 ? " is" : " are") +
-               " offline, so no score is given.";
+        return n(f.distinct_devices - online) + " of " +
+               plural_count(f.distinct_devices, "affected device", "affected devices") +
+               plural_word(f.distinct_devices - online, " is", " are") + " offline, so no score is given.";
     }
     if (w == "below_floor")
         return "Below the reporting floor: count only.";
@@ -372,8 +429,9 @@ std::string score_cell(const DexStabilityFigures& f, const RowCtx& c) {
         return "<td><span class=\"dx-sc\">Withheld</span><span class=\"dx-scw\">" + withheld_words(f, c) +
                "</span></td>";
     const double shown = stability_display_score(*s.score);
-    // The tone follows the closed band token; the label is the policy's own tier name.
-    const std::string tier = esc(dex_tier_name(c.eff.tiers, *s.band));
+    // The tone follows the closed band token; the label is the policy's own tier name, resolved once
+    // by the model (the same value the payload carries).
+    const std::string tier = esc(f.tier);
     std::string ded = "<div class=\"dx-ded\"><div class=\"h\">Starts at 100, minus:</div>";
     for (const auto& d : s.deductions) {
         const char* known = deduction_label(d.name);
@@ -409,40 +467,41 @@ std::string figure_cells(const DexStabilityFigures& f, const RowCtx& c) {
 }
 
 std::string app_body(const DexAppStability& a, const DexAppsModel& m, const std::string& window) {
-    // Named local: the rvalue overloads of dex_tier_name are deleted on purpose.
-    const DexEffectivePolicy eff = resolve_dex_score_policy(m.policy.policy, a.subject);
-    const RowCtx ctx{m.population, eff};
+    const RowCtx ctx{m.population};
 
     const std::string label =
         a.subject.empty()
             ? std::string("&lt;unknown&gt;")
-            : "<a hx-get=\"/fragments/dex/app?name=" + url_query_value(a.subject) + "&amp;window=" + window +
-                  "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" +
-                  esc(a.subject) + "</a>";
+            : dex_pane_link("/fragments/dex/app?name=" + url_query_value(a.subject) + "&amp;window=" + window,
+                            esc_text(a.subject));
     std::string first = label;
     if (a.profile == DexPolicyProfile::Override)
         first += " <span class=\"dx-tag\">override</span>";
     if (a.version_count == 0)
         first += " <span class=\"gp-mute\">version not collected</span>";
     else
-        first += "<details class=\"dx-vx\"><summary>" + n(a.version_count) + " version" +
-                 (a.version_count == 1 ? "" : "s") + "</summary></details>";
+        // The sentence inside the details is visually hidden: collapsed it is not rendered, expanded
+        // the region is never empty to assistive technology (the rows follow in the table).
+        first += "<details class=\"dx-vx\"><summary>" +
+                 plural_count(a.version_count, "version", "versions") +
+                 "</summary><span class=\"vh\">The version rows follow this row in the table.</span></details>";
 
     std::string out = "<tbody class=\"dx-app\"><tr class=\"dx-apphead\"><td>" + first + "</td>" +
                       figure_cells(a.figures, ctx) + "</tr>";
     for (const auto& v : a.versions) {
         const std::string vn = v.version.empty() ? "<span class=\"dx-vn unk\">unknown version</span>"
-                                                 : "<span class=\"dx-vn\">" + esc(v.version) + "</span>";
+                                                 : "<span class=\"dx-vn\">" + esc_text(v.version) + "</span>";
         out += "<tr class=\"dx-ver\"><td class=\"dx-indent\">" + vn + "</td>" + figure_cells(v.figures, ctx) +
                "</tr>";
     }
     if (a.versions_truncated) {
         const int64_t shown = static_cast<int64_t>(a.versions.size());
         const int64_t cut = a.version_count - shown;
-        out += "<tr class=\"dx-ver dx-vcap\"><td colspan=\"8\">Showing the " + n(shown) + " version" +
-               (shown == 1 ? "" : "s") + " with the most devices affected; " + n(cut) + " more version" +
-               (cut == 1 ? " has" : "s have") + " crashes or hangs in this window and " +
-               (cut == 1 ? "is" : "are") + " not listed.</td></tr>";
+        out += "<tr class=\"dx-ver dx-vcap\"><td colspan=\"8\">Showing the " +
+               plural_count(shown, "version", "versions") + " with the most devices affected; " +
+               plural_count(cut, "more version has", "more versions have") +
+               " crashes or hangs in this window and " + plural_word(cut, "is", "are") +
+               " not listed.</td></tr>";
     }
     return out + "</tbody>";
 }
@@ -461,7 +520,7 @@ std::string notes(const DexAppsModel& m, const std::string& scope) {
         h += "<div class=\"gp-note\">Showing " + n(shown) + " of " + n(m.apps_total) +
              " applications: the " + n(shown) +
              " with the most devices affected, listed by crashes plus hangs. " + n(cut) +
-             (cut == 1 ? " is" : " are") + " not listed.</div>";
+             plural_word(cut, " is", " are") + " not listed.</div>";
     }
     h += "<div class=\"gp-note\"><b>Window-wide figures:</b> crashes, hangs, devices affected and last seen "
          "cover every device in the window, online or not. Share, rate and score count online devices only, "
