@@ -2422,3 +2422,171 @@ TEST_CASE("census pair order, A1: a refused-regression Repair never retires its 
     run.expect_order("5|10|-|1|1|1|0|0|0|0");
     CHECK(verdict(db.dsn(), "a", "r1") == "C - 5/10");
 }
+
+// ── P-1: the census statements' plans, and the Repair's statement bound ──────────────────────────
+
+TEST_CASE("census plan, P-1: the seen-events max of the census upsert and fold never scans "
+          "idx_gse_ingest_seq backward",
+          PAIR_TAGS) {
+    // `max(s.ingest_seq)` over `event_id = ANY($8)` can be planned as a BACKWARD scan of
+    // idx_gse_ingest_seq with a heap filter on event_id, which reads every event newer than the
+    // oldest seen one (measured 10.9 s at 5.3 M events for 10 000 old pending events). The shape
+    // that triggers it is many OLD pending events of one (agent, rule) with a large body of NEWER
+    // events: 150 pending ones, then 200 000 others, then ANALYZE. The assertion is structural (the
+    // plan text), which does not move with machine load; the wall-clock bound below is a second,
+    // loose net (the fixed plan runs in about 10 ms here, the backward scan took seconds at the
+    // measured scale).
+    PAIR_FIXTURE();
+    // The census row and the agent's order row exist, so the timed upsert takes its conflict arm
+    // and evaluates every expansion of the macro.
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("e0", "r1", "a", kCompliant, 900), 5, 1))
+            .outcome == EventInsertOutcome::Inserted);
+    const std::string events = std::string(kSchema) + ".guaranteed_state_events";
+    const std::string cols =
+        " (event_id, rule_id, agent_id, event_type, severity, guard_type, guard_category, "
+        "detected_value, expected_value, remediation_action, remediation_success, "
+        "detection_latency_us, remediation_latency_us, timestamp, ttl_expires_at, detail_json, "
+        "proj_key, proj_key_capped, projection_pending, boot_epoch, emit_seq) ";
+    const auto fill = [&](const char* id_prefix, const char* rule, const char* agent_expr,
+                          const char* pending, int from, int to) {
+        exec_sql(db.dsn(), "INSERT INTO " + events + cols + "SELECT '" + id_prefix + "' || i, '" +
+                               rule + "', " + agent_expr +
+                               ", 'drift.detected', 'high', 'g', 'c', 'a', 'b', '', false, 1, 1, "
+                               "'2026-11-15T00:00:00Z', 0, '{}', i, false, " +
+                               pending + ", NULL, NULL FROM generate_series(" +
+                               std::to_string(from) + ", " + std::to_string(to) + ") AS i");
+    };
+    constexpr int kPending = 150;
+    fill("pend-", "r1", "'a'", "true", 1, kPending);             // the OLD pending set
+    fill("bulk-", "r2", "'b' || (i % 100)", "false", 1, 200000); // the NEWER body
+    exec_sql(db.dsn(), "ANALYZE " + events);
+
+    std::string seen_arr = "{";
+    for (int i = 1; i <= kPending; ++i)
+        seen_arr += (i == 1 ? "pend-" : ",pend-") + std::to_string(i);
+    seen_arr += "}";
+
+    const auto sql = GuaranteedStateStore::census_sql_for_test();
+    const std::vector<std::string> upsert_params{
+        "a",    "r1",     "drifted", "2026-11-15T00:00:00Z",
+        "1000", "400000", "false",   seen_arr,
+        "5",    "10",     "current", "0"};
+    const std::vector<std::string> fold_params{"a", "r1", seen_arr, "0"};
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    const auto plan_of = [&](const char* statement, const std::vector<std::string>& params) {
+        pg::PgResult r =
+            pg::exec_params(conn.get(), (std::string("EXPLAIN ") + statement).c_str(), params);
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        std::string text;
+        for (int i = 0; i < PQntuples(r.get()); ++i)
+            text += std::string(PQgetvalue(r.get(), i, 0)) + "\n";
+        return text;
+    };
+    const std::string upsert_plan = plan_of(sql.upsert, upsert_params);
+    const std::string fold_plan = plan_of(sql.fold, fold_params);
+    INFO("upsert plan:\n" << upsert_plan);
+    INFO("fold plan:\n" << fold_plan);
+    // Anchor: the plan really is of the statements that read the seen events by id.
+    CHECK(upsert_plan.find("guaranteed_state_events") != std::string::npos);
+    CHECK(fold_plan.find("guaranteed_state_events") != std::string::npos);
+    for (const std::string* plan : {&upsert_plan, &fold_plan}) {
+        CHECK(plan->find("Index Scan Backward") == std::string::npos);
+        CHECK(plan->find("idx_gse_ingest_seq") == std::string::npos);
+    }
+
+    // The loose time net: the real upsert, run for real inside a transaction that is rolled back.
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(conn.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    const auto t0 = std::chrono::steady_clock::now();
+    pg::PgResult up = pg::exec_params(conn.get(), sql.upsert, upsert_params);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    INFO(PQresultErrorMessage(up.get()));
+    CHECK(up.status() == PGRES_TUPLES_OK);
+    pg::exec_params(conn.get(), "ROLLBACK", std::vector<std::string>{});
+    CHECK(took < std::chrono::seconds(2));
+}
+
+TEST_CASE("census pair order, P-1: a Repair whose census statement exceeds its statement bound is "
+          "Failed with its evidence kept, and the bound leaks into nothing",
+          PAIR_TAGS) {
+    // A Repair holds the agent's order row FOR SHARE from its clock read to the end of the
+    // transaction, so its census statements are bounded (`kRepairStatementTimeoutMs`, 2 s) inside
+    // its savepoint. Here the census upsert is made slow by a trigger and the bound lowered, so
+    // SQLSTATE 57014 is reached at once; the Repair is Failed like any other Repair failure.
+    PAIR_FIXTURE();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    const std::string order_before = order_snapshot(db.dsn());
+    const auto failures_before = store.census_proj_failures_total();
+    // A trigger records `statement_timeout` as each census-row write runs, and sleeps while the
+    // slow switch is on.
+    const std::string log = std::string(kSchema) + ".yuzu_test_st_log";
+    const std::string slow = std::string(kSchema) + ".yuzu_test_st_slow";
+    exec_sql(db.dsn(), "CREATE TABLE " + log + " (val text)");
+    exec_sql(db.dsn(), "CREATE TABLE " + slow + " (x int)");
+    exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                           ".yuzu_test_st_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                           "INSERT INTO " +
+                           log +
+                           " VALUES (current_setting('statement_timeout')); IF EXISTS "
+                           "(SELECT 1 FROM " +
+                           slow + ") THEN PERFORM pg_sleep(3); END IF; RETURN NEW; END $$");
+    exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_st_note BEFORE INSERT OR UPDATE ON ") +
+                           kSchema + ".guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION " +
+                           kSchema + ".yuzu_test_st_note()");
+
+    SECTION("the slow statement is cut at the bound: Failed, evidence kept, nothing half done") {
+        store.set_repair_statement_timeout_ms_for_test(300);
+        exec_sql(db.dsn(), "INSERT INTO " + slow + " VALUES (1)");
+        const auto t0 = std::chrono::steady_clock::now();
+        const EventInsertResult res = store.insert_event_classified(e1);
+        const auto took = std::chrono::steady_clock::now() - t0;
+        CHECK(res.outcome == EventInsertOutcome::Redelivered); // a failed Repair is still acked
+        CHECK(took < std::chrono::seconds(2));                 // cut at 300 ms, not the 3 s sleep
+        CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "1");
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "0");
+        CHECK(store.census_proj_failures_total() == failures_before + 1);
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent");
+        CHECK(pending_count(db.dsn()) == "1"); // the evidence stays for the next redelivery
+        CHECK(order_snapshot(db.dsn()) == order_before);
+        // The next redelivery, the statement fast again, repairs on a fresh transaction: the
+        // failed one left no bound behind.
+        exec_sql(db.dsn(), "DELETE FROM " + slow);
+        store.set_repair_statement_timeout_ms_for_test(
+            GuaranteedStateStore::kRepairStatementTimeoutMs);
+        CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+        CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+
+    SECTION("a Repair that succeeds runs its census write under the bound and hands the "
+            "connection's own back before it commits") {
+        std::string at_commit;
+        store.set_pre_commit_hook_for_test([&](void* c) {
+            auto* conn = static_cast<PGconn*>(c);
+            pg::PgResult r{PQexec(conn, "SHOW statement_timeout")};
+            if (r.ok() && PQntuples(r.get()) == 1)
+                at_commit = PQgetvalue(r.get(), 0, 0);
+        });
+        const EventInsertResult res = store.insert_event_classified(e1);
+        store.set_pre_commit_hook_for_test({});
+        CHECK(res.outcome == EventInsertOutcome::Redelivered);
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+        // The census row's write ran under the Repair's 2 s bound ...
+        CHECK(query_scalar(db.dsn(), "SELECT string_agg(DISTINCT val, ',') FROM " + log) == "2s");
+        // ... and the transaction went on under the pool's own 30 s.
+        CHECK(at_commit == "30s");
+    }
+}
