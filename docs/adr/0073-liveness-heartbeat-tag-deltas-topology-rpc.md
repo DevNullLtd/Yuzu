@@ -18,9 +18,17 @@
     remove it from the protobufs" (recorded in #6555 and enforced by `proto/buf.yaml`).
 
   The reviewers this ADR routes to are listed under *Routed concerns*.
-- **Amends:** `docs/fleet-viz-invariants.md` "Push-ingestion invariants — PR 10". That section is the
-  only design record for the current topology vehicle, which arrived in `ba7e34a8d` (2026-05-12,
-  merged in PR #1032) with no ADR.
+- **Amends:**
+  - `docs/fleet-viz-invariants.md` "Push-ingestion invariants — PR 10" (D6: evict-on-disconnect
+    becomes retain-on-disconnect; the legacy heartbeat-body path is removed, D10). That section is
+    the only design record for the current topology vehicle, which arrived in `ba7e34a8d`
+    (2026-05-12, merged in PR #1032) with no ADR.
+  - ADR-2002 (Accepted) WS-4: the gateway's circuit-recovery replay of the stored `RegisterRequest`
+    through `ProxyRegister` becomes an id-only `ProxyReattach` (D14); the ProxyRegister replay
+    branch stays only for the `NO_RECORD` re-registration.
+
+  Both carry an "Amendment pending: ADR-0073" banner from this PR, removed when this ADR is
+  Accepted and the amended text is rewritten (*Docs to update*).
 - **Related:**
   - ADR-0074 (`0074-gateway-transport-security-and-topology.md`, PR #6703): its D14 sets the gateway
     budget this ADR is measured against, its D5 decides which messages are signed, and its Conflicts
@@ -45,7 +53,7 @@ D1-D16; each item names the D-sections that hold its detail, and terms such as `
 
 1. **The heartbeat becomes a liveness message.** It carries `session_id`, `sent_at`, a
    `StatusTags` delta serialized into an **opaque `bytes` field** the gateway never decodes (D2),
-   and a ~70-byte `TopologyDigest` (D5).
+   and a ~50-byte `TopologyDigest` (D5).
    - "Liveness-only", here and in the title, means no bulk body. The heartbeat still carries
      liveness plus state-tag deltas and a topology digest. That state content, and the topology
      report, are signed by the agent from ADR-0074 wave 2 (owner decision, 2026-10-30; D16); the
@@ -98,8 +106,8 @@ D1-D16; each item names the D-sections that hold its detail, and terms such as `
       registers again on its own.
     - Enrollment tokens are no longer retained in gateway memory. A Register's token still passes
       through the gateway transiently, while the request is decoded and forwarded.
-13. **The agent's reconnect backoff gets full jitter** (D9). Today it is a pure power of two, which
-    phase-aligns the fleet after a mass disconnect.
+13. **Every new timer is jittered through one shared pure helper** (D9). The agent's reconnect
+    backoff already is (decorrelated jitter, `reconnect_backoff.hpp`, #5990) and is not changed here.
 14. **No proto subtraction; deprecate and ignore** (owner ruling 2026-10-26). A field, RPC or message
     this ADR retires stays in the `.proto`: fields are marked `[deprecated = true]`, RPCs and messages
     `option deprecated = true;`, each with a comment naming ADR-0073. Senders stop populating them
@@ -183,7 +191,7 @@ Its sole consumer is `FleetTopologyStore`, which feeds:
 | Plugin facts | `yuzu.plugin.<p>.<k>` (bounded `heartbeat.*` KV facts) | plugins via KV | **`yuzu.plugin.echo.db_corruption_total` + `db_quarantine_last` drive the Echo corruption audit sink on every heartbeat** (`AgentHealthStore::upsert`, #1567; `server/core/src/echo_corruption_audit.hpp`). `upsert` rewrites a pre-rename agent's `yuzu.plugin.tar.` prefix to `yuzu.plugin.echo.` at ingest (`agent_registry.cpp`, an upgrade-window shim). |
 | Daily-sync skips | `yuzu.sync.<source>.skip_streak`, `.last_skip` | `emit_sync_skip_tags` | fleet gauge, inventory runbook |
 | Perf (interval) | `yuzu.perf_cpu_pct`, `_commit_pct`, `_disk_lat_ms` | agent core, per-interval deltas | `yuzu_fleet_perf_*`, `/dex` performance (`server/core/src/dex_perf_rules.hpp`) |
-| Network quality (interval) | `yuzu.net_rtt_p50_ms`, `_retrans_pct`, `_throughput_bps`, pinned to `kNetTag*` by `static_assert` (`server/core/src/network_perf_rules.hpp`) | agent core, interval deltas over `steady_clock` baselines | `yuzu_fleet_net_*` (absent-not-zero), `/network` read model (`docs/user-manual/network.md`) |
+| Network quality (interval) | `yuzu.net_rtt_p50_ms`, `_retrans_pct`, `_throughput_bps`, defined as `kNetTag*` in `server/core/src/network_perf_rules.hpp` and pinned by `static_assert` in `tests/unit/server/test_network_perf_model.cpp` | agent core, interval deltas over `steady_clock` baselines | `yuzu_fleet_net_*` (absent-not-zero), `/network` read model (`docs/user-manual/network.md`) |
 
 The server stores them with `AgentHealthStore::upsert` (`server/core/src/agent_registry.hpp`), which
 **clears and replaces** the agent's map on every beat. Fleet gauges are rebuilt from that map on a
@@ -825,7 +833,7 @@ When several conditions hold, the first in this order wins:
 | 8 | `not_reported` | connected, no slot, and no non-empty digest: no field, an empty digest, `DISABLED`, or no heartbeat on this replica yet | today's roster placeholder |
 
 - **IP-claim reclaim** stays at 300 s, keyed on `confirmed_at`. A quiet host keeps its claim with a
-  ~70-byte field; a silent host loses it at 300 s, as today.
+  ~50-byte field; a silent host loses it at 300 s, as today.
 - **Retain on disconnect** replaces evict-on-disconnect (`FleetTopologyStore::evict_pushed`). This
   **amends** fleet-viz invariant UP-5 ("Eviction on disconnect", `docs/fleet-viz-invariants.md`):
   its claim-release half stands, and its slot-drop half is replaced (open point 2). On stream close,
@@ -1031,7 +1039,7 @@ joined on disconnect). These reasons make a report due:
   the STARTUP-done flag but no pending reasons.
 
 It does not send on reconnect; the heartbeat digest lets the server decide. Failures back off
-exponentially with full jitter (base 15 s, cap 15 min). `UNIMPLEMENTED` is logged once per
+exponentially with full jitter (base 15 s, cap 15 min), drawn through D9's shared jitter helper. `UNIMPLEMENTED` is logged once per
 connection, counted, and retried only at the floor; it is never a fallback. `IP_CONFLICT` waits a
 full floor.
 
@@ -1049,7 +1057,7 @@ today.
 ### D8. Resync: a reserved Subscribe command, `__resync__`
 
 The server needs a way to tell one agent "send me your full tag set" or "send me your topology"
-without per-agent gateway state. Four options were weighed:
+without per-agent gateway state. Five options were weighed:
 
 **(a) Piggyback the verdict on a synchronous response.**
 - `HeartbeatResponse` is answered locally by the gateway, so it cannot carry the verdict without
@@ -1111,10 +1119,32 @@ relayed by the gateway like any command (no new gateway state).
 force a reconnect. That tears down the connection, costing the gateway a TLS handshake and per-agent
 process churn, to fix a 4 KB discrepancy. **Rejected.**
 
+**(e) Extend `__sync__.now`** (ADR-0016 update) instead of adding a name: either `tags` and
+`topology` as further `source` values of `now`, or as further actions of `__sync__`. What D8 does
+share with it is listed under *Mechanism*: the system caller, `send_system_reserved`, a
+`SystemReservedPush` enumerator per action, the id-mint convention, the dedup-claimed branch and the
+pure decision function. What it cannot share:
+- **As sources of `now`.** `decide_sync_now` (`agents/core/src/sync_now_decision.hpp`) arms
+  `SyncScheduler::request_now` and answers FAILURE when the scheduler is not running, so a tag
+  resync would be refused on every `--inventory-disable` agent, and its sources ship over
+  `ReportInventory` from the scheduler thread, while tags ride the heartbeat and topology its own
+  sender. `__sync__.now` is also operator-reachable: the hardware sync routes gate the operator and
+  then dispatch it as the system, with an operator-chosen `source` (`hardware_routes.cpp`, the
+  `kSources` check), so a tag or topology source would either widen that route or need a deny-list
+  in it.
+- **As further `__sync__` actions.** `__sync__-` ids are an operator-queryable namespace: the
+  hardware sync-status route accepts any command id starting `__sync__-` (`hardware_routes.cpp`,
+  about l.345), and `__sync__.now` replies are ingested and tracked. A resync is neither: its ids
+  are skipped by `notify_exec_tracker` and its replies are dropped at ingest by plugin name
+  (below). Sharing the name would turn both into prefix-and-action carve-outs inside a namespace an
+  operator route reads.
+- **Rejected**, on those grounds; the separate name costs one `kReservedPluginNames` entry and one
+  branch in the reserved-name dispatch.
+
 **Mechanism.**
 - **Reserved name `__resync__`**, actions `tags` and `topology` (parameter `window_s`, default 60).
   It is handled in the agent's Subscribe command loop alongside `__sync__` (`agent.cpp`, the
-  reserved-name dispatch from about l.3430, with `__sync__` at about l.3490-3531). The decision logic is a pure, unit-tested function,
+  reserved-name dispatch, `__sync__` at about l.3660-3710 at `origin/dev` of 2026-11-15). The decision logic is a pure, unit-tested function,
   like `agents/core/src/sync_now_decision.hpp`.
 - **Dedup.** The command is **dedup-claimed**; only `__guard__` bypasses the claim (ADR-2002 WS-0).
   `record_command_terminal` runs **before** the stream write.
@@ -1158,7 +1188,15 @@ process churn, to fix a 4 KB discrepancy. **Rejected.**
     `tests/test_capability_catalogue_complete.py`.
   - Operator surfaces (REST `/api/command`, MCP `execute_instruction`, workflows, dashboard) are
     refused centrally: `classify_and_authorize_dispatch` (`agent_registry.hpp`) denies any
-    non-system caller a `system_reserved` row. No per-surface rule is added.
+    non-system caller a `system_reserved` row. No per-surface rule is added. That catalogue flag is
+    the one enforcement site; "system-only" rests on it, not on a reserved-name rule
+    (`reserved_definition_id.hpp` reserves instruction-definition id prefixes, `mcp.` and
+    `guardian.`, and is not involved). A test dispatches each pair as an operator through the
+    shared dispatch chokepoint and asserts the refusal.
+  - **Contained devices.** A `SystemReservedPush` passes the containment gate by the SCOPE OF THE
+    BYPASS rule in `dispatch_confined_arms.hpp`, so a quarantined device is sent `__resync__` like
+    any other: it only arms a full-tag heartbeat or a topology report and runs no code
+    (*Security*).
   - They are built with `build_classified_command(DispatchCaller{.system = true}, ...)` and sent
     with `send_system_reserved` to the agent's own stream, as `__sync__.now` is. For a gateway
     agent, today's `send_system_reserved` goes through `AgentRegistry::send_to`, which pushes the
@@ -1410,9 +1448,25 @@ path and a command on the other.
 | Startup report | uniform 0-60 s |
 | Resync report | uniform `[0, window_s]` from `__resync__.topology`, default 60 s |
 | Server `kReportGrace` | 120 s |
-| Agent reconnect backoff | full jitter: uniform [0, min(2^n, 300) s]. Today it is exactly `min(2^n, 300)` (`agent.cpp`, `kMaxReconnectDelaySecs` and the backoff at about l.1725-1760), so every agent dropped by one gateway restart retries on the same schedule. |
+| Agent reconnect backoff | unchanged by this ADR: decorrelated jitter, `min(300, uniform[1, 3 × previous])` s (`agents/core/include/yuzu/agent/reconnect_backoff.hpp`, #5990, HA WS-13). An earlier draft of this row proposed full jitter over a `min(2^n, 300)` ladder; that ladder (whose exponent clamped at 8, so its ceiling was 256 s) is already gone. |
+| Topology report failure backoff | full jitter, base 15 s, cap 15 min (D7) |
 
-Every timer is re-drawn per cycle. None is derived from wall-clock boundaries. Server-originated
+Every timer is re-drawn per cycle. None is derived from wall-clock boundaries.
+
+**One jitter helper.** Every new agent timer in this table draws through one pure header,
+`agents/core/include/yuzu/agent/jitter.hpp`, written in the style of `reconnect_backoff.hpp`: no
+I/O, no clock, no platform dependency, and the random source **injected** with the same
+`uniform_in(lo, hi)` shape `ReconnectBackoff::next` takes, so each timer is unit-tested without
+waiting. It offers two functions, a multiplicative spread (`base × uniform[lo, hi]`, the heartbeat
+and pump sleeps) and a window draw (`uniform[lo, hi]`, the first beat, the startup, change, floor
+and resync delays), plus the full-jitter capped exponential the topology sender's failure backoff
+uses. The agent owns one seeded engine, seeded as the reconnect jitter's is (`agent.cpp`, OS entropy
+with the logged clock fallback). It does not re-home the existing sites: `sync_scheduler.cpp`'s
+offsets are a **stable** per-(agent, source) FNV hash by design (a deterministic spread, not a
+random draw), `reconnect_backoff.hpp` owns its own stateful scheme, Guardian's maintenance jitter is
+ADR-0021's, and the gateway's (`yuzu_gw_mgmt_crl_source:jittered_ms/2`,
+`yuzu_grpc_client_channel`) are Erlang. A later change that touches one of the agent-side random
+draws moves it onto the helper; none is copied. Server-originated
 work is rate-limited at the source (D8). Reviewers reject any new heartbeat or topology timer that
 lacks jitter. ADR-0074 D11's two-phase jittered drain follows the same rule.
 
@@ -1555,6 +1609,12 @@ count-valued histograms here are not latencies, so they declare their own:
   same timer and published at 0;
 - `yuzu_server_agent_reattach_total{outcome}`, with
   `accepted|no_record|not_enrolled|superseded|malformed_session|degraded|rate_limited` (D14);
+- gauge `yuzu_server_agents_tags_unserved{reason}`, with `no_base|diverged|withheld|unverifiable`:
+  the agents with a live session on this replica whose state map is not being served as current
+  (D3: no base, diverged awaiting a full set, withheld after three rejections, or an unverifiable
+  digest prefix), on the fleet-gauge timer and published at 0. It is the count behind "state-derived
+  gauges are absent" (*Fleet-gauge semantics*), so an operator can tell missing posture from a
+  healthy fleet;
 - `yuzu_server_agent_registration_store_failed_total{op}`, with `write|read` (the registration
   transaction, and the reattach read; D14);
 - `yuzu_viz_topology_pushed_total{via,reason}` (gains `reason`: `changed|refresh|startup|resync`);
@@ -1684,6 +1744,22 @@ on the sustained condition and staying quiet on the expected one.
   registration storms, so the next restart repeats the storm for them. Responder: check Postgres
   pool saturation and the store's logs; the agents recover on their next registration. Tests:
   quiet at 0; fires on one failed write.
+- `YuzuHeartbeatTagsRejected` (ticket):
+  `sum(increase(yuzu_server_heartbeat_tags_total{outcome="rejected"}[1h])) > 0` `and on()`
+  `max(yuzu_server_agents_tags_unserved{reason="withheld"}) > 0`. Meaning: an agent's payload
+  failed the caps, the class check or its own full-set digest three times running, which is an agent
+  or canonical-form defect (D1, D3), never load; its posture is withheld. Responder: find the agent
+  in the WARN log, compare its version with the `v1` golden vectors. Tests: quiet on one rejection
+  followed by a synced heartbeat; fires once an agent is withheld.
+- `YuzuAgentReattachDegraded` (ticket):
+  `sum(increase(yuzu_server_agent_reattach_total{outcome="degraded"}[5m])) > 0` for 15 min.
+  Meaning: the registration-store read is failing, so gateway agents are answered `DEGRADED`
+  (retried every 5 s, fail-closed) and get no installed session, which holds their commands and
+  containment pushes on this replica. Responder: check Postgres pool saturation and
+  `yuzu_server_agent_registration_store_failed_total{op="read"}`. `no_record` is not alerted: it is
+  the expected answer for an agent whose record was never written (first start on this release, or
+  a write failure, which `YuzuAgentRegistrationStoreWriteFailing` already raises), and it recovers
+  by re-registration. Tests: quiet on a 2-minute degraded burst; fires at 15 min.
 - `YuzuStateSignatureRefused` (ticket; slice 11, from ADR-0074 wave 2):
   `increase(yuzu_server_heartbeat_tags_total{outcome="bad_signature"}[30m]) > 0` or the same on
   `yuzu_viz_topology_digest_total` and `yuzu_viz_topology_report_rejected_total{reason="bad_signature"}`,
@@ -2668,9 +2744,28 @@ lands. The two are kept consistent as follows.
 2. **Agent-only topology hash-skip** (attach the body only on content change, no server change).
    Rejected. Both topology liveness rules are keyed on body arrival, so every quiet host goes stale
    at 90 s and its IP claim lapses at 300 s, a quiet anti-spoof regression.
-3. **ADR-0016 daily sync for topology.** Rejected. ADR-0016 deliberately excludes volatile data (IP
-   addresses included) from hashed sources, and its cadence is daily. Its principle is adopted; its
-   transport is not.
+3. **ADR-0016's transport for topology** (`ReportInventory` / `ProxyInventory`, a proxied unary
+   with `content_hashes` and `need_full`): a `fleet_topology` key in `plugin_data`, sent by the
+   topology sender rather than the daily scheduler, dispatched out of the inventory handler as a
+   typed source is (`typed_inventory_sources.hpp`). Rejected; the cadence is not the blocker (the
+   sender, not the scheduler, would decide when to send). The blockers are:
+   - **no refusal home.** `InventoryAck` is `received` plus `need_full` (`agent.proto`). D7's
+     agent behaviour turns on the reason: `IP_CONFLICT` waits a full floor, `OVERSIZE` and `PARSE`
+     are defects, `UNKNOWN_SESSION` retries, and from wave 2 `REPLAYED` re-signs and
+     `UNVERIFIED_SESSION` waits for the challenge (D16). Carrying that needs a per-key refusal map
+     on `InventoryAck`, read by one source only;
+   - **the hash contract inverts.** ADR-0016 §4 never stores the agent's claimed hash as
+     authoritative; the server recomputes it from the rows. The topology digest is server-opaque by
+     design (D5: Echo computes it, the server never does). One source would hold the opposite rule
+     on the same field;
+   - **the handler is a Postgres ingest.** Inventory reports take per-source store paths and
+     advisory locks (for example the certificate-inventory store's per-agent lock) for daily data; topology is an
+     in-memory `FleetTopologyStore` write every few minutes per changed host, and ADR-0016 keeps
+     volatile data such as IP addresses out of its hashed sources.
+
+   Its principle (cost tracks change; hash always, body on change) is adopted; its message is not.
+   What D7 does share is the shape: `ProxyTopology` resolves sessions exactly as `ProxyInventory`
+   does, and both handlers start with the same `onbehalf::enforce` and revoked-peer checks.
 4. **Server-pull as the topology main path.** Rejected. At 10k agents × 150 KB, one refresh is a
    1.5 GB burst through the Subscribe streams. Pull-on-view as an addition is deferred (D12).
 5. **Topology digest as a status tag** (the ruling's wording). Not chosen; D5 gives the reasons.
@@ -2719,6 +2814,28 @@ lands. The two are kept consistent as follows.
       full enrollment paths, where a primary-key read suffices. It would also spend ADR-0074 D14's
       reconnect budget on every server restart.
     - Kept only as the `NO_RECORD` fallback.
+20. **Full state set on digest change** (ADR-0016's hash-skip shape for tags): every beat carries
+    the interval tags and the state digest; the full state set rides only on a beat whose digest
+    changed, and the server replaces its map whenever a full set verifies. Not chosen yet; the
+    owner decides after slice 2's measurement (open point 22). The gateway saving is the same
+    either way, because it comes from the opaque `bytes` (D2), not from deltas. What it removes:
+    `base_digest`, `removed`, the acknowledged-base ownership (D2, D8), and D3 step 6's
+    merge branches and their reorder hazard. What it keeps: the class split, the digest, and
+    `__resync__.tags`, because a coalesced or lost full set is followed by digest-only beats
+    the server cannot repair alone. Fleet bandwidth into the server at 100,000 agents (3,333
+    beats/s), with today's full map about 4 KB (about 3.8 KB of it state), about 0.25 KB of
+    interval tags, digest and framing per beat, a delta of about 0.2 KB, and `f` the share of
+    beats on which any state tag changed:
+
+    | `f` | today | full on change | deltas |
+    |---|---|---|---|
+    | 0.01 | 13.3 MB/s | 0.96 MB/s | 0.84 MB/s |
+    | 0.1 | 13.3 MB/s | 2.1 MB/s | 0.90 MB/s |
+    | 0.5 | 13.3 MB/s | 7.2 MB/s | 1.2 MB/s |
+
+    The figures are arithmetic, not measured. `f` is what `yuzu_agent_heartbeat_would_be_delta_bytes`
+    and `yuzu_agent_heartbeat_tag_upserts` (D13, slice 2) measure; at an `f` near 0.01 the two are
+    within about 15 % and the simpler shape wins. Slice 3 (proto) waits on that decision, so the shape is chosen once.
 
 ## Consequences
 
@@ -2794,8 +2911,12 @@ It should say:
 - `yuzu.uptime_s` is replaced by `yuzu.started_at`;
 - the gateway management RPCs `ListAgents`, `GetAgent` and `QueryInventory` stay in the proto,
   deprecated, but the gateway answers them `UNIMPLEMENTED`; use the server's REST or MCP agent views;
-- a gateway from before this release cannot reattach to the new server (no `ProxyReattach`), and
-  the new gateway cannot replay to an old server.
+- a gateway from before this release does not reattach (it has no `ProxyReattach` client); it
+  replays its stored `RegisterRequest` through `ProxyRegister`, which the new server still serves,
+  so its agents keep their sessions, at today's replay cost, until the gateway is upgraded (and
+  from slice 11 a pre-wave-2 gateway is refused outright, D16 *old gateways*). The new gateway
+  cannot replay to an old server: it holds no `RegisterRequest`, and the old server has no
+  `ProxyReattach`.
 
 The *Version Compatibility* table's row states minimum agent and gateway versions equal to this
 release. Changelog: every implementing PR adds its own fragment, `changelog.d/<PR#>-<slug>.<section>.md`,
@@ -2864,7 +2985,7 @@ Idle connections stop receiving:
 - a 50-800 KB body every 30 s;
 - a ~97-tag map every 30 s.
 
-A quiet host sends six interval tags, a digest and about 70 bytes of topology digest each beat, one
+A quiet host sends six interval tags, a digest and about 50 bytes of topology digest each beat, one
 body per 12-18 min, and changes.
 
 Expectation, to be measured rather than claimed:
@@ -3354,7 +3475,9 @@ of every ~30 s. The content is unchanged.
   `viz.fleet_topology.invalidate` row, which today says the request forced a cache invalidation
   and now records a rebuild from stored bodies with no agent contacted; `topology.push.rejected`'s
   `reason` detail (`ip_conflict`, `reclaim_conflict`) and the paths that write each topology verb.
-- The ADR-2002 incident paragraph: a pointer to this ADR.
+- The ADR-2002 incident paragraph: a pointer to this ADR. ADR-2002's WS-4 replay text and
+  `docs/fleet-viz-invariants.md`'s PR-10 section: rewritten, and their "Amendment pending:
+  ADR-0073" banners (added with this ADR) removed.
 
 The same changes fix known truth-drift:
 - the proto comment's "5-20 KB" and "once per two heartbeats" (`agent.proto:155-159`);
@@ -3401,7 +3524,8 @@ renewal (D16, *key*).
     peer calling a retired path gets `UNIMPLEMENTED` and a refused peer `UNAUTHENTICATED`, or the
     probe moves to `WatchEvents`. It is independent of every other slice.
 1. **Agent jitter and measurement.**
-   - Jittered heartbeat and pump sleeps (D9).
+   - `agents/core/include/yuzu/agent/jitter.hpp` with its unit tests (injected source), then the
+     jittered heartbeat and pump sleeps through it (D9).
    - `yuzu_agent_heartbeat_bytes`. The would-be-delta histogram needs slice 2's class table, so it
      lands there.
    - An audit that no server heartbeat-age threshold sits under 1.2 × 30 s plus margin.
@@ -3482,7 +3606,7 @@ renewal (D16, *key*).
     - Gateway: the per-session `RATE_LIMITED`/`DEGRADED` requeue timer that clears
       `recent_replays`, with full jitter and a 0 floored at 1 s; replay sends ids; all three Register copies and the plugin-name lists removed; owner
       restart from ids; `NO_RECORD` closes the stream.
-    - Agent: reconnect backoff with full jitter.
+    - Agent: no reconnect change (already jittered, `reconnect_backoff.hpp`, #5990).
 8. **Server topology.** `ReportTopology`, digest confirm, the D6 slot changes, `stale_reason`,
    retain-on-disconnect, age rebasing, the topology resync trigger, the fetcher removed, server
    topology metrics; the re-claim audit queue, its drain on the issuer and
@@ -3604,7 +3728,8 @@ make a new choice.
 9. **`observed_peer` stays at the gateway and is sent on reattach.** It is the one registration-time
    fact the server cannot rebuild.
 10. **`yuzu.uptime_s` retired for `yuzu.started_at`** (D1).
-11. **Pump default 60 s**: changed-host topology lags up to about 82 s instead of about 40 s.
+11. **Pump default 60 s**: changed-host topology lags up to about 82 s instead of up to about 60 s
+    today (a 30 s pump, `agent.cpp`'s snapshot pump, then up to one 30 s heartbeat to carry it).
 12. **Unsigned state content on the heartbeat, and the unsigned topology body** (D16). *Decided by
     the owner on 2026-10-30:* the agent signs its `StatusTags` deltas and full sets, the
     `TopologyDigest` and the `TopologyReport`, and the server rejects anything a gateway altered.
@@ -3656,3 +3781,14 @@ make a new choice.
     kill switch, and no unreadable switch, can hold it back, and containment always reaches
     gateway agents. Lands in ADR-0074 wave 2 (slice 11). Kept here, numbered, so references stay
     stable.
+22. **Deltas or full set on digest change** (D2, D3; *Considered options* 20). Deltas are the
+    drafted shape; the alternative removes the base, `removed` and the merge at the cost the table
+    there shows. Recommended: decide on slice 2's measured `f`, before slice 3 fixes the proto shape, and adopt the full-set shape if the
+    fleet's `f` is below about 0.04, where the difference is under about 0.5 MB/s per 100,000
+    agents. The owner decides, and names the threshold.
+23. **`__resync__` as its own reserved name** (D8 (e)). Recommended: keep it, for the reasons D8
+    gives; the alternative is further `__sync__` actions with a carve-out in the hardware
+    sync-status route. The owner confirms.
+24. **Topology on its own unary rather than `ReportInventory`** (*Considered options* 3).
+    Recommended: keep `ReportTopology`; the alternative adds a per-key refusal map to
+    `InventoryAck` and one source whose claimed hash is authoritative. The owner confirms.

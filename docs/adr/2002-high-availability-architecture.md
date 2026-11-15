@@ -6,6 +6,13 @@ owner: Fraser Jarvis (@fjarvis)
 ---
 
 **Authors:** Fraser Jarvis (@fjarvis)
+
+> **Amendment pending: ADR-0073 (liveness-only heartbeat, proposed 2026-10-29, PR #6704).** ADR-0073
+> D14 replaces the gateway's replay of the stored `RegisterRequest` through `ProxyRegister` (the WS-4
+> replay path described below) with an id-only `GatewayUpstream.ProxyReattach`; the gateway then keeps
+> no `RegisterRequest`. The `ProxyRegister` replay branch stays only for an agent the server has no
+> registration record for. Nothing has changed in the product yet: until ADR-0073 is Accepted and
+> lands, this ADR describes what ships.
 **Review:** hardened after adversarial review by the `enterprise-architect` validator and
 `gpt-5.6-sol` (both read the codebase), then revised again per the PR #3320 `CHANGES_REQUESTED`
 review; see *Guarantees and non-guarantees*, *Deployment topology and replication axes*, and the two
