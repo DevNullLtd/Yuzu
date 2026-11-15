@@ -5307,6 +5307,87 @@ TEST_CASE("registry source: a Winlogon DefaultPassword leaves no trace in any ro
     CHECK_FALSE(carries_secret(everything(), "changed-synthetic-secret"));
 }
 
+namespace {
+
+// The cursor text an earlier build wrote for a held DefaultPassword change: the encoder of this
+// build masks the candidate, so the legacy fields are written back over the encoded form.
+std::string legacy_cursor_with_secret() {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 7;
+    cur.hku = {"S-1-5-21-1"};
+    auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
+    held.key = kWinlogon;
+    cur.held = {held};
+    auto j = nlohmann::json::parse(encode_registry_cursor(cur));
+    j["held"][0]["d"] = kLogonSecret;
+    j["held"][0]["s"] = utf16(kLogonSecret).size();
+    j["held"][0]["pd"] = kLogonSecret;
+    return j.dump();
+}
+
+} // namespace
+
+TEST_CASE("masked_registry_cursor: rewrites a legacy cursor at the same position and nothing else",
+          "[echo][registry][pure]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    REQUIRE(carries_secret(legacy, kLogonSecret));
+
+    const auto clean = masked_registry_cursor(legacy);
+    REQUIRE(clean.has_value());
+    CHECK_FALSE(carries_secret(*clean, kLogonSecret));
+    const auto back = decode_registry_cursor(*clean);
+    REQUIRE_FALSE(back.malformed);
+    CHECK(back.tick == 7);
+    CHECK(back.hku == std::vector<std::string>{"S-1-5-21-1"});
+    REQUIRE(back.held.size() == 1);
+    CHECK(back.held[0].window_lo == 10);
+    CHECK(back.held[0].data == kRegistryMaskedData);
+
+    CHECK_FALSE(masked_registry_cursor(*clean).has_value()); // its own output: nothing to rewrite
+
+    // A held change under an ordinary name, or no held change at all: left byte for byte alone.
+    RegistryCursor other;
+    other.present = true;
+    other.held = {cand("changed", "DefaultUserName", 1, 22, 10, 20)};
+    CHECK_FALSE(masked_registry_cursor(encode_registry_cursor(other)).has_value());
+    CHECK_FALSE(masked_registry_cursor(encode_registry_cursor(RegistryCursor{})).has_value());
+    // A cursor that does not decode is collect()'s to report, never replaced here.
+    CHECK_FALSE(masked_registry_cursor("{not json").has_value());
+}
+
+TEST_CASE("registry source: start() masks a legacy cursor with no tick, which a disabled source never has",
+          "[echo][registry][lifecycle]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    auto t = make_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({}, legacy, {}).has_value());
+    REQUIRE(carries_secret(*t.db.get_cursor("registry").value(), kLogonSecret)); // seeded
+
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    src->start(t.db); // no collect: a disabled source never ticks, so start() is the only chance
+    const std::string stored = *t.db.get_cursor("registry").value();
+    CHECK_FALSE(carries_secret(stored, kLogonSecret));
+    const auto back = decode_registry_cursor(stored);
+    REQUIRE_FALSE(back.malformed);
+    CHECK(back.tick == 7);
+    CHECK(back.hku == std::vector<std::string>{"S-1-5-21-1"});
+
+    // A second start finds nothing to rewrite: the row is byte-identical.
+    Fake f2;
+    auto src2 = make_registry_cursor_source(scope1(), f2.reader());
+    src2->start(t.db);
+    CHECK(*t.db.get_cursor("registry").value() == stored);
+
+    // A cursor that does not decode stays exactly as stored: collect() reports and re-baselines it.
+    auto bad = make_db();
+    REQUIRE(bad.db.insert_registry_events_and_cursor({}, "{not json", {}).has_value());
+    Fake f3;
+    auto src3 = make_registry_cursor_source(scope1(), f3.reader());
+    src3->start(bad.db);
+    CHECK(*bad.db.get_cursor("registry").value() == "{not json");
+}
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // [windows] live cases: the real key watch and the real Kernel-Registry ETW session.

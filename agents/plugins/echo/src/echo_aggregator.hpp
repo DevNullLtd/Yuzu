@@ -336,8 +336,9 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
  *
  * The baseline holds pid, ppid, name and user ONLY -- never the command line (#3864).
  * echo_state is readable through echo.sql and a command line routinely carries credentials
- * (`psql postgresql://user:pw@host`); the process diff keys on pid and name, so no diff
- * outcome changes.
+ * (`psql postgresql://user:pw@host`); the process diff keys on pid and name, so the same
+ * events are emitted. A stopped event takes its command line from the baseline, which now
+ * holds none, so that field is empty; the roll-up tiers keep no command line either way.
  *
  *   decode -- malformed JSON gives an empty vector, a malformed entry keeps the entries
  *             before it, and a `cmdline` key is never read.

@@ -87,6 +87,16 @@ void RegistryCursorSource::start(EchoDatabase& db) {
         gap_cause_ = GapCause::Restart;
         force_all_ = true;
     }
+    // #6634: a cursor an earlier build left can hold a sensitive value's bytes in a held change,
+    // and only a committed tick re-encodes the row, which a disabled source never has. Rewrite
+    // it here at the same position; a failed write changes nothing and is tried again at the
+    // next start.
+    if (cursor && cursor->has_value())
+        if (const auto clean = masked_registry_cursor(**cursor);
+            clean && !db.insert_registry_events_and_cursor({}, *clean, {}))
+            spdlog::warn("Echo registry: a cursor row written by an earlier build still holds a "
+                         "masked-name value and could not be rewritten; tried again at the next "
+                         "start");
     reader_.start(); // a session that cannot open degrades to the key watch (rows attr:off)
     // Nothing before this instant is in the buffer: every candidate read earlier (the held
     // ones, and the force_all_ reconcile reads) finalises as lost-restart.

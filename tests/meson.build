@@ -4925,6 +4925,14 @@ test('dashboard audit checked lexical',
   suite: 'docs',
   timeout: 30,
 )
+# #7075/#3864: the Echo process baseline codec and the capture-sources push's session-bound
+# audit writer, both in files no Mac unit binary builds; the script self-checks its detector.
+test('Echo security wiring lexical gate',
+  _python3_test,
+  args: [files('test_echo_security_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # Personal-data commit guard (scripts/ci/check-personal-data.py) and its
 # self-test. Both also run in .github/workflows/docs-lint.yml on every PR.

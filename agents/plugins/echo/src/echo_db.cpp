@@ -2457,6 +2457,13 @@ EchoDatabase::execute_user_query(const std::string& sql, int max_rows,
     // pointer into the object would dangle). Covers prepare and every step.
     const auto until = std::chrono::steady_clock::now() + deadline;
     ScopedProgressHandler guard(query_db_, [until] { return std::chrono::steady_clock::now() >= until; });
+    // One answer for a deadline hit, whether it interrupted the prepare (a schema reload) or a step.
+    const auto deadline_exceeded = [&deadline] {
+        // The SQL text is deliberately not logged.
+        spdlog::warn("execute_user_query: statement deadline ({} ms) exceeded", deadline.count());
+        return std::unexpected(std::format("query exceeded the {} s statement deadline",
+                                           std::chrono::duration<double>(deadline).count()));
+    };
 
     sqlite3_stmt* raw_stmt = nullptr;
     const char* tail = nullptr;
@@ -2471,6 +2478,8 @@ EchoDatabase::execute_user_query(const std::string& sql, int max_rows,
         // a probe can't use the message to enumerate tables or columns.
         if (rc == SQLITE_AUTH)
             return std::unexpected("query rejected: operation or table not permitted");
+        if (rc == SQLITE_INTERRUPT)
+            return deadline_exceeded();
         auto err = std::string(sqlite3_errmsg(query_db_));
         spdlog::warn("execute_user_query prepare failed: {}", err);
         return std::unexpected(std::format("query failed: {}", err));
@@ -2514,13 +2523,8 @@ EchoDatabase::execute_user_query(const std::string& sql, int max_rows,
     // Anything other than end-of-data (or the deliberate row cap) is an error: a deadline hit
     // or a step failure must not read as a short, complete result.
     if (!truncated && rc != SQLITE_DONE) {
-        if (rc == SQLITE_INTERRUPT) {
-            // The SQL text is deliberately not logged.
-            spdlog::warn("execute_user_query: statement deadline ({} ms) exceeded",
-                         deadline.count());
-            return std::unexpected(std::format("query exceeded the {} s statement deadline",
-                                               std::chrono::duration<double>(deadline).count()));
-        }
+        if (rc == SQLITE_INTERRUPT)
+            return deadline_exceeded();
         auto err = std::string(sqlite3_errmsg(query_db_));
         spdlog::warn("execute_user_query step failed: {}", err);
         return std::unexpected(std::format("query failed: {}", err));

@@ -14,7 +14,9 @@ namespace yuzu::echo {
 // Installs a progress handler for the guard's lifetime and clears it on every exit path.
 // `expired` is polled every 1000 VM instructions; a true result interrupts the running
 // statement (SQLITE_INTERRUPT). The handler is per-connection, so the guard must not
-// outlive `db`, and `expired` must not throw (a throw is treated as expired).
+// outlive `db`, and `expired` must not throw (a throw is treated as expired). Not re-entrant: at
+// most one guard per connection at a time (a nested guard replaces the outer handler and its
+// destructor clears it).
 struct ScopedProgressHandler {
     std::function<bool()> expired;
     sqlite3* db;

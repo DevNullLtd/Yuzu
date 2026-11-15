@@ -21390,6 +21390,8 @@ private:
         // round — see the recorded-exception comment at their registration.
         echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
         echo_tree_routes_->set_metrics(&metrics_); // yuzu_echo_sources_push_total
+        // The capture-sources push stamps its rows from the session it resolved (never re-resolved).
+        echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
         // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
@@ -21426,8 +21428,8 @@ private:
         // ADR-0033 section 9: every DashboardRoutes mutation (each console send,
         // group-from-results, Echo re-enable and purge) writes its `attempted` row through this
         // persist-reporting sink BEFORE it acts (#3619; unwired = those mutations refuse with
-        // 503). EchoTreeRoutes' capture-sources push does the same through the audit_fn it was
-        // registered with (this same sink).
+        // 503). EchoTreeRoutes' capture-sources push does the same, but writes through the
+        // session-bound writer wired above and refuses (503) when that is unset.
         dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined

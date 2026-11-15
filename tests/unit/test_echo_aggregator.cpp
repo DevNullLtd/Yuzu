@@ -3411,3 +3411,28 @@ TEST_CASE("process baseline: scrub rewrites a legacy row once and is then a no-o
     CHECK_FALSE(scrub_process_baseline(db));
     CHECK(db.get_state("process") == cleaned);
 }
+
+TEST_CASE("process baseline: a scrub that cannot write leaves the row and succeeds on a later start",
+          "[echo][aggregator][process-baseline]") {
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_pbscrub_fault_"}};
+    auto opened = EchoDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.set_state("process", kLegacyBaseline));
+
+    // A store fault from a second connection: writes to echo_state fail at step, reads still work.
+    const auto exec = [&](const char* sql) {
+        yuzu::test::SqliteHandleOwner<sqlite3> owner;
+        REQUIRE(sqlite3_open(tmp.path.string().c_str(), &owner.db) == SQLITE_OK);
+        sqlite3_busy_timeout(owner.db, 5000);
+        REQUIRE(sqlite3_exec(owner.db, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    exec("CREATE TRIGGER yuzu_test_state_fault BEFORE INSERT ON echo_state "
+         "BEGIN SELECT RAISE(FAIL, 'store fault'); END;");
+    CHECK_FALSE(scrub_process_baseline(db));
+    CHECK(db.get_state("process") == kLegacyBaseline); // the disclosed residual: unchanged
+
+    exec("DROP TRIGGER yuzu_test_state_fault;");
+    CHECK(scrub_process_baseline(db)); // the next start
+    CHECK(db.get_state("process").find("S3cret") == std::string::npos);
+}

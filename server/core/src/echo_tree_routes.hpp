@@ -199,9 +199,22 @@ public:
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
     /// Counts the capture-sources push by outcome (`yuzu_echo_sources_push_total{result}`:
-    /// pushed / none_applied / audit_unavailable / permission_revoked). Post-registration
-    /// setter like set_fleet_read_fn; every use is guarded, so an unset registry counts nothing.
+    /// pushed / none_applied / audit_unavailable / permission_revoked / dispatch_denied /
+    /// dispatch_exception). Post-registration setter like set_fleet_read_fn; every use is
+    /// guarded, so an unset registry counts nothing.
     void set_metrics(yuzu::MetricsRegistry* m);
+
+    /// Audit writer for a session the handler already resolved, used by the capture-sources push
+    /// for every row it writes: the request-resolving `AuditFn` stamps an empty principal once
+    /// the session is gone, which is exactly when the push writes its `permission_revoked` row.
+    /// Same `std::function` type as `AuthRoutes::AuditAsSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_as_session_fn()`. Unset = the push refuses (503), like an `attempted`
+    /// row that cannot be stored. No other route reads it.
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
     /// External colleague review on PR #4143 (Doomgoose, BLOCKING, confirmed
     /// against ADR-0017 INV-4/INV-7 by direct source inspection): the two REST
@@ -334,6 +347,7 @@ private:
     AuditFn audit_fn_;
     CallerFn caller_fn_;
     yuzu::MetricsRegistry* metrics_{nullptr};
+    AuditAsSessionFn audit_as_session_fn_;
 
     std::mutex cache_mu_;
     std::unordered_map<std::string, ReconEntry> cache_;

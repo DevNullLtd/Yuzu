@@ -1518,6 +1518,25 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
     return j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
+/// The text to store in place of the cursor @p stored when it holds a change to a sensitive
+/// value (is_sensitive_reg_value) in a form this build would not write: an earlier build kept
+/// the rendered value in a held candidate, and only a committed tick re-encodes the row, which
+/// a disabled source never has. nullopt when there is nothing to rewrite, and for a cursor that
+/// does not decode: that one is collect()'s to report (gap:cursorlost) and re-baseline, never
+/// replaced here. The rewrite is the decoded cursor re-encoded, so the position (tick, roots,
+/// held windows, loss epochs, hku, offline) is unchanged and nothing is replayed.
+[[nodiscard]] inline std::optional<std::string> masked_registry_cursor(const std::string& stored) {
+    const RegistryCursor cur = decode_registry_cursor(stored);
+    if (cur.malformed ||
+        std::none_of(cur.held.begin(), cur.held.end(),
+                     [](const RegistryCandidate& c) { return is_sensitive_reg_value(c.value); }))
+        return std::nullopt;
+    std::string clean = encode_registry_cursor(cur);
+    if (clean == stored)
+        return std::nullopt;
+    return clean;
+}
+
 struct DecodedBaseline {
     bool malformed{false};
     RegistryBaseline baseline;
@@ -1528,7 +1547,11 @@ struct DecodedBaseline {
     for (const auto& [k, values] : b.keys) {
         auto vj = nlohmann::json::object();
         for (const auto& [n, e] : values) {
-            const BaselineEntry& w = is_sensitive_reg_value(n) ? masked_baseline_entry(e.t) : e;
+            // Bound without a copy for the unmasked entry: a conditional with a prvalue arm
+            // would copy every `e`.
+            const bool masked = is_sensitive_reg_value(n);
+            const BaselineEntry clean = masked ? masked_baseline_entry(e.t) : BaselineEntry{};
+            const BaselineEntry& w = masked ? clean : e;
             vj[n] = {{"t", w.t}, {"s", w.s}, {"h", w.h}, {"d", w.d}, {"dt", w.dt}};
         }
         keys[k] = std::move(vj);

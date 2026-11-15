@@ -5663,3 +5663,26 @@ TEST_CASE("re-eval: a dropped denied row keeps the 400 and flags Sec-Audit-Faile
     CHECK(status == 400);
     CHECK(h.last_sec_audit_failed == "true");
 }
+
+TEST_CASE("instruction-result sets: a stale-source refusal writes one denied row on create and on re-eval",
+          "[pg][result_set][async][echo][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
+    int status = 0;
+    SECTION("from-instruction-result") {
+        h.post("/api/v1/result-sets/from-instruction-result",
+               nlohmann::json{{"instruction_id", iid}}.dump(), status);
+    }
+    SECTION("re-eval of a stored instruction_result set") {
+        const auto id = seed_instruction_result(h, iid, nlohmann::json::object());
+        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+    }
+    CHECK(status == 400);
+    const auto rows = denied_rows(h);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail == "reason=stale_source source_kind=instruction_result");
+    CHECK(h.calls.empty());
+}

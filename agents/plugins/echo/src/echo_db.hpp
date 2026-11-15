@@ -897,10 +897,11 @@ public:
      * unavailable for the process lifetime (fail closed); restart the agent to
      * retry.
      *
-     * `deadline` is a wall-clock bound on statement execution, checked every 1000
-     * VM instructions. It does not include the wait for query_mu_ or a busy wait
-     * (those are bounded separately by busy_timeout). A hit returns an error and
-     * discards any rows read so far; a short result is never presented as complete.
+     * `deadline` is elapsed time on the steady clock, checked every 1000 VM
+     * instructions. It does not include the wait for query_mu_ (bounded by the
+     * holder's own deadline and busy wait) or a busy wait (bounded by busy_timeout).
+     * A hit returns an error and discards any rows read so far; a short result is
+     * never presented as complete.
      */
     std::expected<QueryResult, std::string>
     execute_user_query(const std::string& sql, int max_rows = 10000,
