@@ -371,8 +371,8 @@ row first).
   is a failure of the step, never a default. Two unpaired events keep the key rule. A decision that is not a
   clean in-order pair apply flags the row. The decision label of each census write is a metric (it is not
   logged), never an input to a row decision; the durable evidence is the `order_uncertain` flag and `ts_hwm`
-  on the census row. The metric resets on a server restart, and a refused event expires with the 30-day
-  reaper.
+  on the census row. The metric resets on a server restart, and a refused event expires with the event
+  retention (30 days by default, `--guardian-event-retention-days`).
 - The pair clock is fresh for one hour (`YUZU_CENSUS_STALE_NS_`, reused) of DATABASE time and not when it is
   recorded more than five minutes (`YUZU_CENSUS_FUTURE_SLACK_NS_`) in the database's future. Only a `current`
   event or a re-base refreshes it; a refused, straggler or unpaired event never does. A re-base to a lower
@@ -414,7 +414,10 @@ row first).
   `guaranteed_state_store.cpp`, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
   holding such a pending unpaired event. It is not part of this change.
 - A Repair holds one pooled connection for the sum of its statements: the Ensure and the clock read, each
-  under the 1 s lock bound, then five census statements under 2 s each, about 12 s in the worst case. Those
+  under the 1 s lock bound per wait, then five census statements under 2 s each, about 12 s in the worst case,
+  or about 14 s when the Repair loop's one retry (the Ensure and the clock read run again when the agent's
+  row is deleted mid-Repair) is taken. A Repair can also wait on the unique index when a redelivery overlaps
+  an in-flight first delivery of the same event id (before the cap check, bounded by the other transaction). Those
   are per-statement bounds, not a deadline for the whole Repair (a whole-Repair deadline is a follow-up, issue
   to be filed). At most `kRepairMaxConcurrent` (4, a compile-time constant with no operator setting) Repairs
   run at once in one server process, because the pool (16 connections by default) is shared with auth and
@@ -424,12 +427,27 @@ row first).
   sampled WARN (`repair shed`; the first after a quiet minute, then every 100th). Ingest outcomes never reach
   the agent in this tree (`ingest_guardian_response` returns void and the Guardian RPC is acknowledged
   unconditionally), so backpressure cannot be expressed, and a shed Repair is stranded evidence of the #7147
-  class: the agent does not resend it, and a later applying verdict for the pair or an agent replaying its
-  journal clears it. Only Repairs are capped; a first delivery or a batch row never is. The first delivery's
-  order step also runs under `SET LOCAL statement_timeout` equal to its lock bound plus 500 ms
-  (`kAgentStepStatementMarginMs`), 1.5 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
+  class: the agent does not resend it, and a later applying verdict on that (agent, rule), a rule delete, a
+  decommission or, only when the agent's lifecycle journal is active (currently inert in production), a journal
+  replay clears it. The shed has its own counter, `yuzu_server_guardian_repairs_shed_total` (no labels, present at
+  0 from boot), which tells a shed from a fault; the failed-Repair series still counts a shed. The cap is
+  process-wide with no per-agent share (one agent's blocked or redelivered Repairs can shed other agents'
+  Repairs, and the WARN names the victim, not the slot holders); the shed is instant with no bounded wait (a
+  50-wide replay admits about 4); the cap is a fixed constant 4, not scaled to `--postgres-pool-size`, and
+  assumes the default pool of 16; first deliveries, batch rows and `delete_rule` holders are not capped.
+  Per-agent sub-cap, a pool-scaled cap, a bounded admission wait and backpressure are follow-ups (issue to be
+  filed). Only Repairs are capped; a first delivery or a batch row never is. The first delivery's
+  order step also runs under `SET LOCAL statement_timeout` equal to its lock bound plus 2 s
+  (`kAgentStepStatementMarginMs`), 3 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
   wait and a `FOR SHARE` locker does not queue behind a waiting `FOR UPDATE`, so a rolling chain of Repair
-  share locks on one agent could otherwise keep a first delivery waiting past its 1 s bound. A statement that
+  share locks on one agent could otherwise keep a first delivery waiting past its 1 s bound. The lock bound ends a
+  single wait and the statement bound is the total ceiling for the step's statements. The margin is 2 s because one
+  statement can wait in two stages (the tuple-lock queue, then the holder's transaction), each with its own
+  `lock_timeout`: measured on a toy schema with the real Ensure and DECIDE shapes, a 1.5 s statement bound
+  failed 12 to 37 of about 50 first deliveries on one agent row (each holding it for a 10 to 20 ms commit) with
+  57014 although every individual wait was under 1 s. A same-agent burst whose waits still exceed the ceiling
+  stores the delivery pending, and that event is stranded (acks are unconditional); backpressure is a follow-up
+  (issue to be filed). A statement that
   reaches either bound takes the failed-step path (the event is stored pending). No alert rule ships for any
   of these signals.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
@@ -469,11 +487,11 @@ how long one repair held the order row `FOR SHARE` before the P-1 fix: 275 ms (1
 million events); after it the census upsert over 1.3 million events with 150 old pending events measured
 0.16 ms (it was 115 ms). The margin depends on the size of the events table relative to the age of the pending
 rows, not on the pending count alone, and all of these are single measurements, to be repeated on a release
-build with fsync on. The Repair cap (above) bounds how many repairs contend at once, and the step's 1.5 s statement bound ends
+build with fsync on. The Repair cap (above) bounds how many repairs contend at once, and the step's 3 s statement bound ends
 a wait that a chain of repair share locks would otherwise extend; a first delivery that reaches either bound
 is stored pending. (4) A pair clock pinned
 by a value inside the plausibility bound heals when the hold expires, one hour after the last accepted event.
-(5) The retired-epoch fence is permanent and holds ONE slot. It ignores the clock's freshness, so a sustained
+(5) The retired-epoch fence is permanent and holds ONE slot, with no operator clear and no TTL. It ignores the clock's freshness, so a sustained
 `refused_retired` rate can mean a live agent is fenced (an orphan process or a second sender still using the
 retired epoch, or an agent started from a restored data directory that carries it). The exits are an agent
 restart (its new epoch claim is above the retired one) or decommissioning the device; after a second re-base

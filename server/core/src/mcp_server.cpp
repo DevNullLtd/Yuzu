@@ -1873,10 +1873,9 @@ static const ToolDef kTools[] = {
      "every agent sends a pair, since an agent with no census-bearing event has no order row. An "
      "agent whose first deliveries all failed the per-agent order step has no order row, or only "
      "a blank one a redelivery repair left, so it is in neither figure and not in "
-     "unordered_agent_ids until its next successful first delivery; the operator's metrics "
-     "scrape has yuzu_server_guardian_census_proj_failures_total and "
-     "yuzu_server_guardian_census_pending_events to read the count with (they are Prometheus "
-     "series, not available through MCP). A "
+     "unordered_agent_ids until its next successful first delivery; to read the count alongside "
+     "them, use the Prometheus series yuzu_server_guardian_census_proj_failures_total and "
+     "yuzu_server_guardian_census_pending_events (not available through MCP). A "
      "service-scoped "
      "API token is refused outright (this is a fleet rollup with no per-service slice to narrow "
      "to).",
