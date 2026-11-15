@@ -555,7 +555,7 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 reply();
                 return std::nullopt;
             }
-            auto set = swl::resolve_version_range(*distinct, rq.version_min, rq.version_max);
+            auto set = swl::resolve_version_range(*distinct, *rq.range);
             if (!set) {
                 d.caveat = set.error();
                 reply();
