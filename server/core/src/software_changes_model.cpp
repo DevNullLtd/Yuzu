@@ -94,6 +94,8 @@ decode_changes_cursor(std::string_view token, std::string_view fp) {
         return std::unexpected(swc::CursorError::kMalformed);
     if (parts[1] != fp)
         return std::unexpected(swc::CursorError::kFilterMismatch);
+    if (*skip > swc::kWideScopeMaxSkip) // no request's OFFSET exceeds the bound (as the hosts cursor)
+        return std::unexpected(swc::CursorError::kScanLimit);
     return std::pair{ChangesAnchor{*at, *id}, *skip};
 }
 

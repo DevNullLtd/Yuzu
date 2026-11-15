@@ -31,6 +31,7 @@
 
 #include "authz_gates.hpp"
 #include "http_route_sink.hpp"
+#include "offline_endpoint_types.hpp"
 #include "software_catalog_rollup.hpp"
 #include "software_catalogue_model.hpp"
 #include "software_changes_model.hpp"
@@ -60,11 +61,13 @@ public:
     using AuditFn = std::function<bool(const httplib::Request& req, const std::string& action,
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
-    /// agent_id -> hostname: the device table's roster (the one the UI device table reads). A
-    /// failed read is nullopt, not an empty map: the hosts search decides from the roster, so it
-    /// must tell "no such device" from "the roster could not be read". Where the roster only names
-    /// devices, a failed or unwired read leaves the names null.
-    using RosterFn = std::function<std::optional<std::unordered_map<std::string, std::string>>()>;
+    /// The device table's roster (the one the UI device table reads): the newest rows seen in the
+    /// last 30 days, and whether MORE existed (`truncated`, #5712). A failed read is nullopt, not an
+    /// empty roster: the hosts search decides from the roster, so it must tell "no such device"
+    /// from "the roster could not be read". A truncated roster is served and flagged
+    /// (`roster_truncated`), never refused. Where the roster only names devices, a failed or
+    /// unwired read leaves the names null.
+    using RosterFn = std::function<std::optional<OfflineRoster>()>;
     /// The current fleet snapshot, or null before the first successful refresh.
     using SnapshotFn = std::function<std::shared_ptr<const SoftwareFleetSnapshot>()>;
     using NowFn = std::function<std::int64_t()>; ///< epoch seconds; empty = the system clock

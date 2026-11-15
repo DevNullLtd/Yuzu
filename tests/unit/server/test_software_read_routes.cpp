@@ -103,6 +103,7 @@ struct Harness {
     // The data and the read counters.
     std::unordered_map<std::string, std::string> roster;
     bool roster_fails{false}; ///< the roster read reports a failure (nullopt)
+    bool roster_truncated{false}; ///< the roster read hit its row cap (a typed partial, #5712)
     std::vector<SoftwareHostRow> hosts;
     std::vector<SoftwareChangeRow> changes;
     std::vector<SoftwareFleetRow> installs;
@@ -137,10 +138,14 @@ struct Harness {
             return audit_persists;
         };
         if (wire_roster)
-            deps.roster_fn = [this]() -> std::optional<std::unordered_map<std::string, std::string>> {
+            deps.roster_fn = [this]() -> std::optional<OfflineRoster> {
                 if (roster_fails)
                     return std::nullopt;
-                return roster;
+                OfflineRoster out;
+                out.truncated = roster_truncated;
+                for (const auto& [id, hostname] : roster)
+                    out.rows.push_back({.agent_id = id, .hostname = hostname});
+                return out;
             };
         deps.snapshot_fn = [this] {
             ++snapshot_reads;
@@ -437,6 +442,47 @@ TEST_CASE("hosts: a search over a roster that could not be read is a 503, never 
     h.roster_fails = false;
     CHECK(ids_of(body_of(*h.sink.Get("/api/v1/inventory/software/hosts?q=alpha")).at("data").at("hosts")) ==
           std::vector<std::string>{"a1"});
+}
+
+TEST_CASE("hosts: a roster cut at the cap is served and flagged, never refused",
+          "[software][routes][software_read_routes]") {
+    Harness h;
+    h.hosts = {host_row("a1"), host_row("a2")};
+    h.roster = {{"a1", "alpha"}};
+
+    SECTION("an untruncated roster reports false") {
+        const auto res = h.sink.Get("/api/v1/inventory/software/hosts?q=alpha");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        const auto data = body_of(*res).at("data");
+        CHECK(data.at("roster_truncated") == false);
+        CHECK(data.at("roster_cap") == kOfflineRosterRowCap);
+        CHECK(h.audit_log.back().detail.find("roster_truncated") == std::string::npos);
+    }
+    SECTION("a search over a truncated roster is a 200 with the flag, the cap and an audit marker") {
+        h.roster_truncated = true;
+        const auto res = h.sink.Get("/api/v1/inventory/software/hosts?q=nomatch");
+        REQUIRE(res);
+        REQUIRE(res->status == 200); // a miss in a partial roster is not a refusal
+        const auto data = body_of(*res).at("data");
+        CHECK(data.at("hosts").empty());
+        CHECK(data.at("roster_truncated") == true);
+        CHECK(data.at("roster_cap") == kOfflineRosterRowCap);
+        REQUIRE(h.audits("inventory.software.hosts", "success") == 1);
+        CHECK(h.audit_log.back().detail.find(" roster_truncated=1 ") != std::string::npos);
+
+        // Without q the flag is still reported (the names come from the same partial roster).
+        const auto plain = h.sink.Get("/api/v1/inventory/software/hosts");
+        REQUIRE(plain);
+        CHECK(body_of(*plain).at("data").at("roster_truncated") == true);
+    }
+    SECTION("an unwired or failed roster without q reports false and null names") {
+        h.roster_fails = true;
+        const auto res = h.sink.Get("/api/v1/inventory/software/hosts");
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        CHECK(body_of(*res).at("data").at("roster_truncated") == false);
+    }
 }
 
 TEST_CASE("host detail: out-of-scope and unknown hosts answer the same 404",

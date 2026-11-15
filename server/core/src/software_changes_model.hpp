@@ -10,7 +10,12 @@
 ///    pair taken from the last row of the page. change_id is a BIGSERIAL taken at insert while
 ///    observed_at is the writing replica's clock, so a change_id-only cursor could step over a lower
 ///    id that becomes eligible later. Both anchor fields are required in a cursor and are
-///    non-negative; anything else is an invalid cursor.
+///    non-negative; anything else is an invalid cursor. A scope of more than
+///    software_catalogue::kScopePushdownMaxIds devices is paged by the cursor's count of passed-over
+///    rows (the shared read_scoped_page helper): a row deleted inside that span between two pages
+///    can make the next page skip a row, and a count above software_catalogue::kWideScopeMaxSkip
+///    is a scan limit. Recover by re-reading from an earlier `since` and de-duplicating on
+///    change_id (tracked by #7789).
 ///  * SETTLE WINDOW: a row is published once it is older than kSettleSecs. The model only derives
 ///    `stable_before = now - kSettleSecs` and hands it to the query; it never filters rows. The
 ///    cursor is NOT bound to `stable_before` (it advances on every request), so a cursor survives
@@ -82,7 +87,8 @@ struct ChangesRequest {
 /// `g1:<fp16>:<b64url(length-prefixed {observed_at, change_id, skip})>`.
 [[nodiscard]] std::string encode_changes_cursor(const ChangesAnchor& after, std::int64_t skip,
                                                 std::string_view fp);
-/// Refusal order: malformed -> filter mismatch. A missing or negative anchor field is malformed.
+/// Refusal order: malformed -> filter mismatch -> scan limit (a skip above
+/// software_catalogue::kWideScopeMaxSkip). A missing or negative anchor field is malformed.
 [[nodiscard]] std::expected<std::pair<ChangesAnchor, std::int64_t>, software_catalogue::CursorError>
 decode_changes_cursor(std::string_view token, std::string_view fp);
 

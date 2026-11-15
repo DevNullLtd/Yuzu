@@ -20814,18 +20814,17 @@ private:
                     .audit_fn = audit_fn,
                     // The hosts `q` search decides from the roster, so unlike the display-only
                     // hw_hostnames_fn a failed read is reported (the route answers 503), never an
-                    // empty roster that would read as "no such device". The same reader names the
-                    // devices on every page, where a failed read leaves the names null.
-                    .roster_fn = [this]() -> std::optional<std::unordered_map<std::string, std::string>> {
+                    // empty roster that would read as "no such device", and a roster cut at the
+                    // cap keeps its `truncated` flag (the route serves it flagged, as the hardware
+                    // list does). The same reader names the devices on every page, where a failed
+                    // read leaves the names null.
+                    .roster_fn = [this]() -> std::optional<OfflineRoster> {
                         if (!offline_endpoint_store_)
                             return std::nullopt;
                         auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
                         if (!roster)
                             return std::nullopt;
-                        std::unordered_map<std::string, std::string> out;
-                        for (auto& e : roster->rows)
-                            out.emplace(std::move(e.agent_id), std::move(e.hostname));
-                        return out;
+                        return std::move(*roster);
                     },
                     .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
                     .store = software_inventory_store_.get(),

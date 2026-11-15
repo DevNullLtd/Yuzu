@@ -9020,7 +9020,7 @@ tests:
         exp_samples: []
 
   # Two replicas each export 19 collecting devices, 10 of them timing out. A bare sum would read
-  # 38 devices at 52% and fire; collapsing the replicas with max keeps the 20-device floor real.
+  # 38 devices at 52% and fire; judging each replica's own 20-device floor keeps it real.
   - interval: 1m
     name: software facet alerts - two replicas of 19 collecting devices never fire
     input_series:
@@ -9032,6 +9032,25 @@ tests:
         values: "9x1800"
       - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="timeout"}'
         values: "10x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
+  # Two replicas hold DIFFERENT snapshots of the same 19 devices: core-a saw all 19 collect fully,
+  # core-b saw all 19 time out. A per-status max across replicas would read 38 collecting devices,
+  # 50% timing out, and fire both rules; each replica's own snapshot is 19 devices, under the floor.
+  - interval: 1m
+    name: software facet alerts - replicas with different snapshots of 19 devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "19x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "0x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "0x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "19x1800"
     promql_expr_test:
       - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
         eval_time: 29h

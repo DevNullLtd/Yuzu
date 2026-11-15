@@ -9000,7 +9000,7 @@ Lists the devices that have reported installed software, with the state of each 
 
 **Permission and scope:** `Inventory:Read` through `require_fleet_read` as the sole gate. Rows are confined to the caller's management groups and service tag on every page; a device outside the scope takes no part in the search or in any count. `devices_omitted` counts devices dropped by the scope post-filter. Every served page is audited as `inventory.software.hosts` (see [audit-log.md](audit-log.md)).
 
-**Query parameters:** `q` (case-insensitive literal substring over hostname and agent id, clamped to 128 bytes; applied to the caller's devices only), `last_synced_before` (a non-negative epoch: keeps devices whose last accepted report is older than that), `limit` (default 100, max 1000), `cursor`. Repeated parameters keep the first value.
+**Query parameters:** `q` (case-insensitive literal substring over hostname and agent id, clamped to 128 bytes; applied to the caller's devices that the device roster holds: seen in the last 30 days, the newest 100,000), `last_synced_before` (a non-negative epoch: keeps devices whose last accepted report is older than that), `limit` (default 100, max 1000), `cursor`. Repeated parameters keep the first value.
 
 **Response (200):**
 
@@ -9020,14 +9020,17 @@ Lists the devices that have reported installed software, with the state of each 
     ],
     "count": 1,
     "next_cursor": null,
-    "devices_omitted": 0
+    "devices_omitted": 0,
+    "roster_truncated": false,
+    "roster_cap": 100000
   },
   "meta": { "api_version": "v1" }
 }
 ```
 
 - `last_seen` is the server's receipt time of the device's last accepted installed-software report (epoch seconds).
-- `hostname` is `null` when the device roster does not know the device.
+- `hostname` is `null` when the device roster does not know the device. A device quiet for over 30 days is listed with `hostname` `null` and is not matched by `q` (tracked by #7790).
+- `roster_truncated` is `true` (and `roster_cap` is `100000`) when more devices were seen in the 30-day window than the roster holds, which is the newest 100,000. The list is still served, and then a `q` that finds nothing does not prove a device is absent: read one device with `GET /api/v1/inventory/software/hosts/{agent_id}`. The flag clears by itself when the fleet is back under the cap (the cap is also tracked by #7567).
 - Per facet: `status` is the last reported collection status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or `disabled`); `row_status` is the status the software list shows for rows of that facet (`current`, `unconfirmed` or `disabled`); `token` is the short reason code the collector reported (empty when none); `last_confirmed_at` is `null` until the facet has been confirmed; `duration_ms` and `bytes_read` are the last collection's cost.
 - A device with no facet state yet has `facets: []`.
 
@@ -9057,11 +9060,13 @@ The install-change feed: one row per install, removal or upgrade of a package th
 
 **Settle window.** A change is published only once it is more than 60 seconds old: `stable_before` in the response is the horizon applied to that request (now minus 60 seconds), and every row on the page has `observed_at` below it. A change stamped in the last minute appears on a later request.
 
-**Order and paging.** Rows are ordered by `(observed_at, change_id)`, and the cursor is that pair taken from the last row of the page, so a page never skips or repeats a row that was visible when it was read. `observed_at` is the clock of the server that wrote the row and `change_id` is assigned at insert, so ordering by `change_id` alone could step over a lower id that becomes visible later. The cursor is not tied to `stable_before`: it stays valid on the next request. A page carries `next_cursor` only when it is full, so page until `next_cursor` is `null`, which marks a caught-up feed. To follow the feed, start the next poll from `since` set to the `stable_before` of the previous response (earlier by whatever overlap you want) and de-duplicate on `change_id`.
+**Order and paging.** Rows are ordered by `(observed_at, change_id)`, and the cursor is that pair taken from the last row of the page, so for a caller served by push-down (unconfined, or confined to at most 10,000 devices) a page never skips or repeats a row that was visible when it was read. `observed_at` is the clock of the server that wrote the row and `change_id` is assigned at insert, so ordering by `change_id` alone could step over a lower id that becomes visible later. The cursor is not tied to `stable_before`: it stays valid on the next request. A page carries `next_cursor` only when it is full, so page until `next_cursor` is `null`, which marks a caught-up feed. To follow the feed, start the next poll from `since` set to the `stable_before` of the previous response (earlier by whatever overlap you want) and de-duplicate on `change_id`.
+
+**Wide scope.** For a caller confined to more than 10,000 devices the cursor is the last row served plus a count of rows passed over, as on the other wide-scope reads, so a page can be empty with a non-null `next_cursor`, and a row deleted inside the passed-over span between two pages (a decommissioned device, or the 400-day prune) can make the next page skip a row. A cursor that would pass over more than 100,000 rows is a `400`, and the consumer restarts from a later `since`. Recover from a skip by re-reading from an earlier `since` and de-duplicating on `change_id`; the replacement is tracked by #7789.
 
 **Lateness contract.** The 60-second window is the contract and there is no watermark. A row that commits more than 60 seconds after its own `observed_at` (a slow writer, or a clock behind the others) can land behind a cursor that has already passed its position, and a consumer walking forward on that cursor will not see it. To recover, re-read from an earlier `since` and de-duplicate on `change_id`: `change_id` is unique, so a row seen twice is the same row. A consumer that must not miss a change re-reads a trailing overlap of at least the lateness it is willing to tolerate on every poll. Nothing counts late rows today; that is tracked by #7766.
 
-**Errors:** `400` (malformed `since`, `limit` or `cursor`, invalid `kind`), `401`, `403`, `503` with `retry_after_ms`, never an empty 200.
+**Errors:** `400` (malformed `since`, `limit` or `cursor`, a cursor that passes over more than 100,000 rows, invalid `kind`), `401`, `403`, `503` with `retry_after_ms`, never an empty 200.
 
 #### `GET /api/v1/inventory/software/summary`
 

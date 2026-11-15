@@ -118,6 +118,17 @@ TEST_CASE("changes cursor: round trip, fingerprint, refusals", "[software][chang
     CHECK(decode_changes_cursor("g1:zz", fp).error() == swc::CursorError::kMalformed);
 }
 
+TEST_CASE("changes cursor: a skip above the wide-scope bound is a scan limit", "[software][changes]") {
+    const std::string fp = changes_fingerprint(parse_changes_params(params({}), 1000)->query);
+    const auto at_bound = decode_changes_cursor(encode_changes_cursor({1, 2}, swc::kWideScopeMaxSkip, fp), fp);
+    REQUIRE(at_bound);
+    CHECK(at_bound->second == swc::kWideScopeMaxSkip);
+    const auto over = encode_changes_cursor({1, 2}, swc::kWideScopeMaxSkip + 1, fp);
+    CHECK(decode_changes_cursor(over, fp).error() == swc::CursorError::kScanLimit);
+    // The fingerprint is checked first, as in the hosts cursor.
+    CHECK(decode_changes_cursor(over, "0123456789abcdef").error() == swc::CursorError::kFilterMismatch);
+}
+
 TEST_CASE("changes cursor: missing or negative anchor is malformed", "[software][changes]") {
     const std::string fp = "0123456789abcdef";
     const auto forge = [&](std::initializer_list<const std::string*> f) {

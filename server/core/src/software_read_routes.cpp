@@ -33,6 +33,12 @@ constexpr const char* kVerbSummary = "inventory.software.summary";
 constexpr const char* kVerbPluginHealth = "inventory.software.plugin_health";
 constexpr const char* kTargetType = "Inventory";
 
+// One roster read: the names, and whether MORE devices existed than the read returns.
+struct RosterView {
+    swh::Roster names;
+    bool truncated{false};
+};
+
 // What every handler captures: the deps with the store reads resolved, and the "is anything to
 // read from" decision made once.
 struct Ctx {
@@ -46,11 +52,21 @@ struct Ctx {
 
     [[nodiscard]] std::int64_t now() const { return now_fn ? now_fn() : now_epoch_seconds(); }
     // For a decision made FROM the roster (the `q` search): nullopt = unwired, or the read failed.
-    [[nodiscard]] std::optional<swh::Roster> checked_roster() const {
-        return roster_fn ? roster_fn() : std::nullopt;
+    [[nodiscard]] std::optional<RosterView> checked_roster() const {
+        auto read = roster_fn ? roster_fn() : std::nullopt;
+        if (!read)
+            return std::nullopt;
+        RosterView view{.truncated = read->truncated};
+        view.names.reserve(read->rows.size());
+        for (auto& e : read->rows)
+            view.names.emplace(std::move(e.agent_id), std::move(e.hostname));
+        return view;
     }
     // Display-only: a roster that is not wired or cannot be read leaves the names null.
-    [[nodiscard]] swh::Roster roster() const { return checked_roster().value_or(swh::Roster{}); }
+    [[nodiscard]] swh::Roster roster() const {
+        auto view = checked_roster();
+        return view ? std::move(view->names) : swh::Roster{};
+    }
 };
 
 // Bind every read the caller left empty to the store.
@@ -158,13 +174,14 @@ bool page_usable(const Ctx& c, const httplib::Request& req, httplib::Response& r
 template <class Page>
 bool audit_page(const Ctx& c, const httplib::Request& req, const char* verb,
                 const std::string& target, const Page& page, bool continuation,
-                const std::string& cid) {
+                const std::string& cid, bool roster_truncated = false) {
     bool ok = true;
     if (const auto denied = swc::denied_detail(page); !denied.empty())
         ok = audit(c, req, verb, "denied", target, denied + "; cid=" + cid);
     return audit(c, req, verb, "success", target,
                  "rows=" + std::to_string(page.rows.size()) +
-                     (continuation ? " page=continuation" : "") + " cid=" + cid) &&
+                     (continuation ? " page=continuation" : "") +
+                     (roster_truncated ? " roster_truncated=1" : "") + " cid=" + cid) &&
            ok;
 }
 
@@ -254,13 +271,15 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           {.retry_after_ms = 5000, .remediation = "retry the request"});
                      return;
                  }
-                 const auto checked = rq.q.empty() ? std::optional(ctx->roster()) : ctx->checked_roster();
-                 if (!checked) {
+                 // A roster cut at the cap is served and flagged (roster_truncated), never refused.
+                 const auto checked = ctx->checked_roster();
+                 if (!checked && !rq.q.empty()) {
                      degraded(*ctx, req, res, cid, kVerbHosts, target, "device roster read");
                      return;
                  }
-                 const auto& roster = *checked;
-                 const auto scope = swh::resolve_host_search(rq.q, roster, gate.scope);
+                 const RosterView none{};
+                 const auto& roster = checked ? *checked : none;
+                 const auto scope = swh::resolve_host_search(rq.q, roster.names, gate.scope);
                  if (!scope) {
                      fail(res, 400, scope.error());
                      return;
@@ -268,11 +287,12 @@ void SoftwareReadRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  const auto page = swh::read_hosts_page(ctx->reads.hosts, rq, *scope);
                  if (!page_usable(*ctx, req, res, cid, kVerbHosts, target, page, "hosts read"))
                      return;
-                 const bool audit_ok =
-                     audit_page(*ctx, req, kVerbHosts, target, *page, !rq.cursor.empty(), cid);
+                 const bool audit_ok = audit_page(*ctx, req, kVerbHosts, target, *page,
+                                                  !rq.cursor.empty(), cid, roster.truncated);
                  respond(res,
-                         swh::hosts_response_json(page->rows, facts_for(page->rows, roster),
-                                                  page->next_cursor, page->devices_omitted),
+                         swh::hosts_response_json(page->rows, facts_for(page->rows, roster.names),
+                                                  page->next_cursor, page->devices_omitted,
+                                                  roster.truncated),
                          audit_ok);
              });
 

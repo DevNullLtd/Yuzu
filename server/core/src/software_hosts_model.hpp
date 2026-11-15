@@ -9,6 +9,9 @@
 ///  * SEARCH SCOPE: `q` is resolved against the device roster AFTER the roster is cut to the
 ///    caller's scope, so a device outside the scope takes no part in the match or in the cap. The
 ///    "search matches too many devices" refusal is therefore a fact about the caller's own rows.
+///    The roster is the 30-day, newest-100,000 read, so `q` finds only devices it holds: a roster
+///    cut at the cap is served with `roster_truncated` (a miss then proves nothing), and a device
+///    quiet for over 30 days is listed with a null hostname and not matched (tracked by #7790).
 ///  * ROW STATUS: each facet carries the raw stored `status` and the derived `row_status`
 ///    (software_list::derive_status); there is no per-host rollup field.
 ///  * CURSOR: `h1:<fp16>:<b64url(length-prefixed {agent_id, skip})>`, bound to `q` and
@@ -113,11 +116,13 @@ read_hosts_page(const HostsReader& read, const HostsRequest& rq, const authz::Vi
 /// duration_ms, bytes_read}]}`.
 [[nodiscard]] nlohmann::json host_row_json(const SoftwareHostRow& r,
                                            const software_list::DeviceFacts& facts);
-/// `{hosts, count, next_cursor (null when empty), devices_omitted}`.
+/// `{hosts, count, next_cursor (null when empty), devices_omitted, roster_truncated, roster_cap}`.
+/// The last two are the roster read's own flag and cap (kOfflineRosterRowCap), as the hardware list.
 [[nodiscard]] nlohmann::json hosts_response_json(const std::vector<SoftwareHostRow>& rows,
                                                  const software_list::DeviceFacts& facts,
                                                  std::string_view next_cursor,
-                                                 std::int64_t devices_omitted);
+                                                 std::int64_t devices_omitted,
+                                                 bool roster_truncated);
 /// `{host, software, count, next_cursor}` from a host_row_json and a
 /// software_list::list_response_json page.
 [[nodiscard]] nlohmann::json host_detail_json(const nlohmann::json& host,

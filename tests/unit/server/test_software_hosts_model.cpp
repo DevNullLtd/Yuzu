@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "offline_endpoint_types.hpp"
 #include "software_hosts_model.hpp"
 
 #include <string>
@@ -230,12 +231,15 @@ TEST_CASE("host_row_json: row_status equals derive_status for every combination"
 
 TEST_CASE("hosts_response_json and host_detail_json shapes", "[server][software_hosts_model]") {
     const std::vector<SoftwareHostRow> rows{host_row("a"), host_row("b")};
-    auto j = hosts_response_json(rows, {}, "", 4);
+    auto j = hosts_response_json(rows, {}, "", 4, false);
     CHECK(j["count"] == 2);
     CHECK(j["hosts"].size() == 2);
     CHECK(j["next_cursor"].is_null());
     CHECK(j["devices_omitted"] == 4);
-    CHECK(hosts_response_json(rows, {}, "h1:x", 0)["next_cursor"] == "h1:x");
+    CHECK(j["roster_truncated"] == false);
+    CHECK(j["roster_cap"] == kOfflineRosterRowCap);
+    CHECK(hosts_response_json(rows, {}, "h1:x", 0, true)["next_cursor"] == "h1:x");
+    CHECK(hosts_response_json(rows, {}, "", 0, true)["roster_truncated"] == true);
 
     SoftwareFleetRow inst;
     inst.agent_id = "a";

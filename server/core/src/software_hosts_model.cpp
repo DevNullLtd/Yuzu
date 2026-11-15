@@ -3,6 +3,7 @@
 #include "ascii_fold.hpp"
 #include "list_keyset.hpp"
 #include "model_param_helpers.hpp"
+#include "offline_endpoint_types.hpp"
 #include "software_catalog_rules.hpp"
 
 #include <yuzu/log_token.hpp>
@@ -173,7 +174,8 @@ nlohmann::json host_row_json(const SoftwareHostRow& r, const software_list::Devi
 
 nlohmann::json hosts_response_json(const std::vector<SoftwareHostRow>& rows,
                                    const software_list::DeviceFacts& facts,
-                                   std::string_view next_cursor, std::int64_t devices_omitted) {
+                                   std::string_view next_cursor, std::int64_t devices_omitted,
+                                   bool roster_truncated) {
     nlohmann::json hosts = nlohmann::json::array();
     for (const auto& r : rows)
         hosts.push_back(host_row_json(r, facts));
@@ -181,7 +183,9 @@ nlohmann::json hosts_response_json(const std::vector<SoftwareHostRow>& rows,
             {"count", rows.size()},
             {"next_cursor", next_cursor.empty() ? nlohmann::json(nullptr)
                                                 : nlohmann::json(std::string(next_cursor))},
-            {"devices_omitted", devices_omitted}};
+            {"devices_omitted", devices_omitted},
+            {"roster_truncated", roster_truncated},
+            {"roster_cap", kOfflineRosterRowCap}};
 }
 
 nlohmann::json host_detail_json(const nlohmann::json& host, const nlohmann::json& installs_page) {

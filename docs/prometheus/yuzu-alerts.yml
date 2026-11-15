@@ -8124,22 +8124,30 @@ groups:
     # rules: a facet the OS does not support reports not_collected permanently, and a disabled
     # facet collected nothing on purpose. The 20-device floor keeps a small cohort from paging
     # on one slow device. A device reports about once a day, so a 24h hold means the share
-    # survived a full reporting cycle. Every replica recomputes and exports the same fleet
-    # figure, so each count is collapsed across replicas with max by (job, facet, status)
-    # before it is summed over the statuses: a bare sum over N replicas would turn the
-    # 20-device floor into 20/N real devices (docs/observability-conventions.md, "Alerts
-    # over a row shared by every replica take max by (job)").
+    # survived a full reporting cycle. Every replica recomputes its own snapshot of the fleet
+    # and exports it, and two replicas can hold different snapshots of the same devices. So
+    # each replica's share and 20-device floor are judged on that replica's own snapshot
+    # (sum without (status), per instance), and only the verdicts are collapsed with
+    # max by (job, facet), leaving one alert per facet: a bare sum over N replicas would turn
+    # the floor into 20/N real devices, and a max taken per status before the sum would mix
+    # two snapshots into a population no replica holds (docs/observability-conventions.md,
+    # "Alerts over a row shared by every replica take max by (job)"). Residual: a replica that
+    # cannot refresh keeps exporting its last snapshot
+    # (yuzu_software_fleet_snapshot_total{outcome="error"}), so an alert it raises holds until
+    # it refreshes or restarts.
     rules:
       - alert: YuzuSoftwareFacetTimeoutShareHigh
         expr: |
-          (
-            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status="timeout"}))
-            / sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}))
-            > 0.05
-          )
-          and
-          (
-            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})) >= 20
+          max by (job, facet) (
+            (
+              sum without (status) (yuzu_software_facet_devices{status="timeout"})
+              / sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})
+              > 0.05
+            )
+            and
+            (
+              sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}) >= 20
+            )
           )
         for: 24h
         labels:
@@ -8154,14 +8162,16 @@ groups:
             percentiles and its slowest devices.
       - alert: YuzuSoftwareFacetFailingShareHigh
         expr: |
-          (
-            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"constrained|timeout|oversize"}))
-            / sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}))
-            > 0.20
-          )
-          and
-          (
-            sum by (job, facet) (max by (job, facet, status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})) >= 20
+          max by (job, facet) (
+            (
+              sum without (status) (yuzu_software_facet_devices{status=~"constrained|timeout|oversize"})
+              / sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})
+              > 0.20
+            )
+            and
+            (
+              sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}) >= 20
+            )
           )
         for: 24h
         labels:
