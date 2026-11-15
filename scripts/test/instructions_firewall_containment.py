@@ -43,7 +43,10 @@ match, `localhost` and an empty name never bind); a probe-only run picks the age
 exactly one is registered. A passing apply also needs a release command of its own to succeed and undo
 something: an `inactive` read after a refused release, or after the time limit or another actor had
 already released the host (`no_state_record`, `state_unreadable`), exits 1 ("release unproven"), not 0.
-A login that does not yield an authenticated session exits 2.
+A login that does not yield an authenticated session exits 2. The host binding trusts the hostname each agent
+reported about itself: it stops a mistyped or remote agent id, it is not an authentication (a remote clone with
+the same default name, while this host's own agent is not registered, would bind). The release is never skipped
+by a failing terminal: every message after the apply goes through a print that cannot raise.
 
 The ceremony dispatches `quarantine`, `release` and `quarantine_status` only. `quarantine_allow` (the
 fourth containment action) is not exercised here: it has no ceremony coverage, only its unit tests.
@@ -94,6 +97,16 @@ DEFAULT_TTL_S = 600
 # CommandResponse.status (proto/yuzu/agent/v1/agent.proto): only SUCCESS is an answer; RUNNING is an
 # interim row to poll past; FAILURE, TIMEOUT and REJECTED carry no usable status.
 STATUS_RUNNING, STATUS_SUCCESS = 0, 1
+
+
+def say(*args, **kw) -> None:
+    """print() that cannot raise. After the apply a containment may be on the host, and the release must run
+    whatever happens to the terminal: a hung-up pty raises OSError(EIO) and a closed pipe BrokenPipeError
+    (both OSError), a closed stream ValueError. A message that cannot be written is dropped."""
+    try:
+        print(*args, **kw)
+    except (OSError, ValueError):
+        pass
 
 
 # What to run on the host when the ceremony cannot confirm a release (the names are the plugin's own).
@@ -156,7 +169,7 @@ class Client:
                 lost = e  # a reset, a timeout, a short read or a non-JSON 200 is one lost poll, not the answer
             time.sleep(0.5)
         if lost is not None:  # say why a poll ended without an answer (an expired session reads 401/403)
-            print(f"poll for {command_id}: last transport error: {lost!r}", file=sys.stderr)
+            say(f"poll for {command_id}: last transport error: {lost!r}", file=sys.stderr)
         return last
 
 
@@ -232,17 +245,22 @@ def apply_was_not_ours(answer, agent_id: str) -> bool:
     plugin said the host was already contained or converged (`already_active`, `repaired`,
     `incomplete_apply_converged`), or it answered anything a first clean apply cannot (`degraded`, `busy`,
     `refused`, `update_failed`: another actor's apply or record got there first). A lost or unreadable answer
-    (no status line at all) is NOT a verdict: the apply may still be landing, so the release runs."""
+    (no status line at all) and an apply that threw (`degraded|exception`) are NOT a verdict: the apply may
+    still be landing or may have landed before the throw, so the release runs."""
     lines: list[str] = []
     for r in (answer.get("responses") if isinstance(answer, dict) else None) or []:
         if isinstance(r, dict) and r.get("agent_id") == agent_id:
             for field in ("output", "error_detail"):  # a non-zero rc keeps its rows in either field
                 if isinstance(r.get(field), str):
                     lines.extend(line.strip().lower() for line in r[field].splitlines())
-    statuses = {m.group(1) for line in lines if (m := _STATUS_ROW.fullmatch(line))}
-    if not statuses:
+    if any(line in _NOT_OURS_NOTES for line in lines):
+        return True
+    if "status|degraded|exception" in lines:
+        # The plugin threw; the throw can follow the `applying` record and part of the mutation, so this
+        # run may have made a containment it cannot see: ownership is unknown, like a lost answer.
         return False
-    return any(line in _NOT_OURS_NOTES for line in lines) or not statuses <= _OWN_APPLY_STATUSES
+    statuses = {m.group(1) for line in lines if (m := _STATUS_ROW.fullmatch(line))}
+    return bool(statuses) and not statuses <= _OWN_APPLY_STATUSES
 
 
 def release_proven(answer, agent_id: str) -> bool:
@@ -276,14 +294,14 @@ def release_and_confirm(client: Client, agent_id: str) -> tuple[bool, bool]:
         try:
             proven = release_proven(dispatch(client, agent_id, "release", {}), agent_id) or proven
         except Exception as e:  # noqa: BLE001 - the next attempt and the status reads still run
-            print(f"release call {attempt + 1} failed: {e}", file=sys.stderr)
+            say(f"release call {attempt + 1} failed: {e}", file=sys.stderr)
         for _ in range(RELEASE_READS):
             time.sleep(2)
             try:
                 if status_token(client, agent_id) == "inactive":
                     return True, proven
             except Exception as e:  # noqa: BLE001
-                print(f"status read failed: {e}", file=sys.stderr)
+                say(f"status read failed: {e}", file=sys.stderr)
     return False, proven
 
 
@@ -355,24 +373,24 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     why = refusal(args)
     if why:
-        print(f"refused: {why}", file=sys.stderr)
+        say(f"refused: {why}", file=sys.stderr)
         return EXIT_PRECONDITION
     if args.apply_containment and args.ttl_seconds < MIN_TTL_S:
-        print(f"refused: --ttl-seconds must be at least {MIN_TTL_S}: a shorter limit could end the containment "
+        say(f"refused: --ttl-seconds must be at least {MIN_TTL_S}: a shorter limit could end the containment "
               "before the release confirmation finishes, and none (0 or negative) would leave a SIGKILL or a "
               "power loss with nothing to end it", file=sys.stderr)
         return EXIT_PRECONDITION
     if args.apply_containment and not args.agent_id:
-        print("refused: --agent-id is required with --apply-containment (the ceremony contains exactly the "
+        say("refused: --agent-id is required with --apply-containment (the ceremony contains exactly the "
               "host you name, never the first agent the dashboard lists)", file=sys.stderr)
         return EXIT_PRECONDITION
     if args.apply_containment and not dashboard_is_local(args.dashboard):
-        print("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
+        say("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
               "while this host is contained", file=sys.stderr)
         return EXIT_PRECONDITION
     rc, last = install_check()
     if rc != 0:
-        print(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
+        say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
         return EXIT_PRECONDITION
     base = args.dashboard.rstrip("/")
     client = Client(base)
@@ -383,26 +401,26 @@ def main(argv=None) -> int:
         agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
         if args.apply_containment and not agent_is_this_host(agents, agent_id, this_host_names(), this_host_os()):
             reg = [a.get("hostname") for a in agents or [] if isinstance(a, dict) and a.get("agent_id") == agent_id]
-            print(f"refused: agent {agent_id!r} is not the only agent registered under this host's name and "
+            say(f"refused: agent {agent_id!r} is not the only agent registered under this host's name and "
                   f"OS (registry says {reg or 'no such agent'}, this host is {this_host_names()} / "
                   f"{this_host_os()}); the ceremony only contains the box you are sitting at", file=sys.stderr)
             return EXIT_PRECONDITION
         if not agent_id:
             if len(agents or []) != 1:
-                print(f"precondition failed: {len(agents or [])} agents registered; pass --agent-id "
+                say(f"precondition failed: {len(agents or [])} agents registered; pass --agent-id "
                       "(the probe picks one only when exactly one is registered)", file=sys.stderr)
                 return EXIT_PRECONDITION
             agent_id = agents[0].get("agent_id") or agents[0].get("id", "")
         before = status_token(client, agent_id)
         if not before:
-            print("precondition failed: firewall.quarantine_status got no agent answer (plugin or grant missing?)", file=sys.stderr)
+            say("precondition failed: firewall.quarantine_status got no agent answer (plugin or grant missing?)", file=sys.stderr)
             return EXIT_PRECONDITION
-        print("probe ok: firewall.quarantine_status answered")
+        say("probe ok: firewall.quarantine_status answered")
         if not args.apply_containment:
-            print("probe-only: nothing was changed (--apply-containment runs the live ceremony)")
+            say("probe-only: nothing was changed (--apply-containment runs the live ceremony)")
             return EXIT_OK
         if before != "inactive":
-            print(f"precondition failed: the host already reads status={before}; the ceremony would "
+            say(f"precondition failed: the host already reads status={before}; the ceremony would "
                   "release a containment it did not apply. Release it by hand first.", file=sys.stderr)
             return EXIT_PRECONDITION
         # From here a containment may be on the host. SIGINT/SIGTERM/SIGHUP only NOTE the signal, for the
@@ -424,47 +442,48 @@ def main(argv=None) -> int:
                     token = status_token(client, agent_id)
                     ok = token == "active" or (token == "active_unproven" and not args.probe_target)
                     if token == "active_unproven" and ok:
-                        print("note: contained but unproven (no --probe-target); pass one to require a verified containment")
-                    print(f"contained: {ok}")
+                        say("note: contained but unproven (no --probe-target); pass one to require a verified containment")
+                    say(f"contained: {ok}")
             except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure
                 err = e
             if err is not None:
-                print(f"containment step failed: {err!r}", file=sys.stderr)
+                say(f"containment step failed: {err!r}", file=sys.stderr)
             if not_ours:
                 # Somebody else's containment (or one this run did not create): releasing it would lift
                 # a containment the ceremony never applied.
-                print("the containment is not this run's (the apply answered already_active / repaired / "
+                say("the containment is not this run's (the apply answered already_active / repaired / "
                       "incomplete_apply_converged, or something a clean first apply cannot: degraded, busy, "
                       "refused, update_failed): NOT released. Its own time limit, or a hand release "
                       f"({HAND_RELEASE}), ends it{signal_note(got)}.", file=sys.stderr)
                 return EXIT_FAIL
             # ALWAYS release, then re-raise whatever stopped the containment step.
             released, proven = release_and_confirm(client, agent_id)
-        print(f"released: {released}")
+        say(f"released: {released}")
         if not released:
-            print("RELEASE NOT CONFIRMED: the host did not read inactive after "
+            say("RELEASE NOT CONFIRMED: the host did not read inactive after "
                   f"{RELEASE_ATTEMPTS} release attempts; clear the firewall by hand ({HAND_RELEASE})"
                   + signal_note(got), file=sys.stderr)
             return EXIT_RELEASE_FAILED
         if not proven:
-            print("release unproven: the host reads inactive, but no release command of this run succeeded and "
+            say("release unproven: the host reads inactive, but no release command of this run succeeded and "
                   "undid anything (it was refused or failed, found nothing to undo because the dead-man limit "
                   "or another actor had already ended the containment, or this run's own apply had already "
-                  f"rolled itself back){signal_note(got)}", file=sys.stderr)
+                  f"rolled itself back; or the apply's answer was lost and the apply is still landing: check "
+                  f"quarantine_status, the dead-man limit ends it){signal_note(got)}", file=sys.stderr)
             return EXIT_FAIL
         if got:
-            print(f"interrupted by signal {got[0]}; containment released", file=sys.stderr)
+            say(f"interrupted by signal {got[0]}; containment released", file=sys.stderr)
             return EXIT_FAIL
         if err is not None:
             raise err
         return EXIT_OK if ok else EXIT_FAIL
     except LoginError as e:
-        print(f"precondition failed: {e}", file=sys.stderr)
+        say(f"precondition failed: {e}", file=sys.stderr)
         return EXIT_PRECONDITION
     except KeyboardInterrupt:
         return EXIT_FAIL
     except Exception as e:  # noqa: BLE001 - a script exit code, not a library
-        print(f"failed: {e}", file=sys.stderr)
+        say(f"failed: {e}", file=sys.stderr)
         return EXIT_FAIL
 
 

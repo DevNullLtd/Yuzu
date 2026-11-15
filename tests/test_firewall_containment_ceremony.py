@@ -507,13 +507,32 @@ class Flow(unittest.TestCase):
                                            "release": [REL]})
                 self.assertNotEqual(rc, fc.EXIT_OK)
                 self.assertNotIn("release", calls)
-        # ... while our own answers, a rolled-back apply and a lost one all reach the release
+        # ... while our own answers, a rolled-back apply, an apply that threw (it can follow part of the
+        # mutation: the plugin's real `status|degraded|exception` rows) and a lost one all reach the release
         for own in ({"responses": [{"agent_id": "a", "status": 2, "output": "status|rolled_back|x"}]}, EMPTY,
+                    {"responses": [{"agent_id": "a", "status": 1, "output": "status|degraded|exception"}]},
+                    {"responses": [{"agent_id": "a", "status": 2, "output": "status|degraded|exception\nnote|x=1"}]},
                     {"responses": [{"agent_id": "a", "status": 3, "output": ""}]}):
             with self.subTest(own=own):
                 rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive")],
                                            "quarantine": [own], "release": [REL]})
                 self.assertIn("release", calls)
+
+    def test_a_terminal_that_cannot_be_written_never_skips_the_release(self):
+        class Dead:
+            def write(self, *_a):
+                raise BrokenPipeError(32, "gone")
+
+            def flush(self):
+                raise BrokenPipeError(32, "gone")
+        for boom in (RuntimeError("x"), OSError(5, "EIO")):
+            with self.subTest(boom=type(boom).__name__), mock.patch.object(sys, "stdout", Dead()), \
+                    mock.patch.object(sys, "stderr", Dead()):
+                rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive"), row("inactive")],
+                                           "quarantine": [boom], "release": [REL]})
+                self.assertEqual(rc, fc.EXIT_FAIL)
+                self.assertIn("release", calls)
+                self.assertEqual(calls[-1], "quarantine_status")  # and the release was confirmed
 
     def test_a_signal_is_named_on_the_not_ours_and_unproven_exits(self):
         for answer, release in (({"responses": [{"agent_id": "a", "status": 2, "output": "status|busy"}]}, REL),
