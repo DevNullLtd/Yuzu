@@ -850,7 +850,7 @@ TEST_CASE("TriggerEngine: registration rejected at max_triggers cap", "[trigger_
     overflow.plugin = "p";
     overflow.action = "a";
     overflow.interval_seconds = 60;
-    engine.register_trigger(overflow);
+    CHECK_FALSE(engine.register_trigger(overflow)); // the caller is told: nothing was registered
 
     CHECK(engine.trigger_count() == 5); // still 5
 }
@@ -876,7 +876,7 @@ TEST_CASE("TriggerEngine: replacement at cap still works", "[trigger_engine][cap
     replacement.type = TriggerType::AgentStartup;
     replacement.plugin = "new";
     replacement.action = "b";
-    engine.register_trigger(replacement);
+    CHECK(engine.register_trigger(replacement)); // a replace is accepted at the cap
 
     CHECK(engine.trigger_count() == 3); // still 3, replaced not added
 }
@@ -906,9 +906,9 @@ TEST_CASE("TriggerEngine: set_max_triggers changes effective cap", "[trigger_eng
     c3.action = "act";
     c3.interval_seconds = 60;
 
-    engine.register_trigger(c1);
-    engine.register_trigger(c2);
-    engine.register_trigger(c3); // rejected: cap is 2
+    CHECK(engine.register_trigger(c1));
+    CHECK(engine.register_trigger(c2));
+    CHECK_FALSE(engine.register_trigger(c3)); // rejected: cap is 2
     CHECK(engine.trigger_count() == 2);
 
     // Raise the cap

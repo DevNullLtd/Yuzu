@@ -1,0 +1,1 @@
+- Dashboard: clicking a result in the Ctrl+K command palette now selects it (previously only the arrow keys and Enter worked), and the About dialog's GitHub link points at the project repository.
