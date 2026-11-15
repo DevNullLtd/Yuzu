@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Pin the gateway EUnit shard partition (scripts/gateway_eunit_shards.py).
 
-Meson runs the gateway eunit suite as shards (`gateway eunit shard A`, `...
-shard B`; root meson.build), each `scripts/test_gateway.py <gw> eunit
+Meson runs the gateway eunit suite as shards (`gateway eunit shard A` to
+`C`; root meson.build), each `scripts/test_gateway.py <gw> eunit
 --shard K/N`. A shard split is only safe if the shards together run exactly
 what the whole-suite `rebar3 eunit --dir apps/yuzu_gw/test` run did. This
 file pins:
@@ -203,6 +203,11 @@ class ShardConfigScript(unittest.TestCase):
         self.assertIn('os:getenv("YUZU_GW_EUNIT_SHARD_MODULES"', src)
         self.assertIn('{eunit_tests, [{spawn, {module, M}} || M <- Mods]}', src)
         self.assertIn('"rebar.config"', src)
+        # Cover is off in a shard (the test profile's cover_enabled forced to
+        # false, applied to the terms the script returns); why, and what it
+        # saves, in scripts/gateway_eunit_shards.py ("COVER").
+        self.assertIn('{cover_enabled, false}', src)
+        self.assertIn('lists:keystore(eunit_tests, 1, NoCover(Base),', src)
         wrapper = _read(WRAPPER)
         self.assertIn('env["YUZU_GW_EUNIT_SHARD_MODULES"]', wrapper)
         self.assertIn('env["REBAR_CONFIG"]', wrapper)

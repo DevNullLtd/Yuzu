@@ -926,6 +926,26 @@ place, **Hardware** and **Software**, each its own page:
   distinct from a single device that simply hasn't synced yet, which still shows a plain
   `—` placeholder in just that cell.
 
+  **Online** on the Hardware list means the device holds a session on the
+  server answering the request, or the database says it is connected to some server (it has
+  recorded a session and been seen within the presence window, the server's session timeout,
+  90 seconds by default). The database half is read in the same statement as the roster, so
+  there is no second read to fail: on a deployment with more than one server replica a device
+  connected to another replica reads Online, on the list, the per-device record, `GET
+  /api/v1/hardware/{id}` and MCP `get_hardware_ci` alike, and the Online/Offline filter, the
+  status sort and the Online and Offline tiles agree with it. Limits that remain: a device that
+  drops without saying goodbye reads Online until the window passes; a device that has just
+  connected or reconnected to one replica (its first heartbeat there has not recorded a session
+  yet, at most one heartbeat interval, 30 seconds by default) reads Offline on the other
+  replicas until it does; and a device connected to another replica reads Online but is not
+  reachable from this one, so actions that need a connection to the answering server, such as
+  **Sync now**, stay unavailable on its record (the sync route answers 503, "agent is not
+  connected"). The Hardware list reads the session timeout as currently configured; the
+  registry's own presence read, which the Home figure uses whenever it can answer (and the
+  Home page caches that figure for 60 seconds), keeps the value the server started
+  with until it is restarted, so the two can differ after a runtime change of
+  `heartbeat_timeout`.
+
   **Click a device** (or visit `/hardware/ci?id=`) for its record — a seven-tab CI
   record, gated per device on `Inventory:Read` for the device's management group
   (`scoped_perm_fn`, the same per-device chokepoint the old drill used):
@@ -1204,12 +1224,6 @@ The roster cap is a display and read cap, not a tested capacity. Above it:
 - The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
   the Software page, show only devices inside the capped roster (a host outside it appears as
   its `agent_id`, or not at all in the type-ahead).
-- The CI record's online state comes from the local session map of the replica serving the
-  request (#7551).
-- Online and Offline on the list derive from the live-presence read. On a deployment with more
-  than one server replica, if that read fails, or the fleet has more than 100,000 live agents (in
-  which case it is refused every time, not just briefly), agents connected to another replica
-  read Offline with no flag, and the Offline tile is not a true lower bound (#7566).
 - Search, filter and sort run over the capped set, and there is no way to page past the cap
   (#7567). A device seen within the window is always reachable by its id.
 

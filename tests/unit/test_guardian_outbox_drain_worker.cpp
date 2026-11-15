@@ -3248,7 +3248,7 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
                         ++failures;
                 }
                 // A scoped full_sync detach: everything live is kept, nothing may re-arm.
-                f.rt->detach_rules_except(live);
+                (void)f.rt->detach_rules_except(live);
             }
             chaos.nap(30ms);
         }
@@ -3266,7 +3266,7 @@ TEST_CASE("#3972 chaos: identical re-pushes and detach_rules_except under a jamm
                 }
                 if (j > 0) {
                     live.erase("c" + std::to_string(j - 1));
-                    f.rt->detach_rules_except(live);
+                    (void)f.rt->detach_rules_except(live);
                     ++removals;
                 }
             }
