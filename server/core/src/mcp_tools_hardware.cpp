@@ -415,7 +415,7 @@ constexpr ToolRecord kToolRecords[] = {
      "snapshot: a device registered, removed or newly in your scope during the walk can be missed "
      "or can vanish, so confirm a device with agent_id before you retire it, and never retire a device "
      "only because it is absent from a walk: after a database collation change, writes can leave duplicate "
-     "rows or devices that were decommissioned (see the server administration guide). The data is each "
+     "rows and keep decommissioned devices stored (see the server administration guide). The data is each "
      "device's last daily-sync snapshot: normally refreshed daily while the agent reports, but a "
      "record can be arbitrarily old until the device is decommissioned, and last_seen is the "
      "staleness signal. "

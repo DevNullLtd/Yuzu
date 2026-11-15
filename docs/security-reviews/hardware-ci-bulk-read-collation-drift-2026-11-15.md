@@ -5,7 +5,7 @@
 `device_inventory_store.device_ci`, built for a daily pull into an external CMDB), with migration
 `device_inventory_store` v4. Code commits under test: `390104150e` (the byte-ordered keyset), `e40adb34a9` (the byte-ordered
 named read, the robust migration and the index check at open) and `fd490b9d31` (the exact index-shape
-check).
+check), `f025c558a0` (the WARN text) and `a8bea07368` (the route rename to `GET /api/v1/hardware-ci`).
 **Branch:** `feat/hardware-ci-bulk-read`
 **Status:** implemented; the residual exposures below were accepted by the owner for release on 2026-11-15, with the review trigger the merge of PR 3 (the `device_ci` write pause). The acceptance is recorded in the section "Owner acceptance of the residual" and is not posted to GitHub.
 **Author of the measurements:** the change author's governance run (Claude Code session). The
@@ -92,7 +92,7 @@ What the table shows, in terms of mechanism:
   refused with `unique_violation`, which is a failed ingest for that device (the measured outcome;
   the path inside the index that produces it was not analysed).
 - The byte-ordered walk reads the table in an order the stale primary key does not govern, so it
-  sees every physical row: duplicate rows for one device are served, with different content, and the
+  sees nearly every physical row (37,668 of 37,842 in the run below: a `>` cursor drops a copy that shares its `agent_id` with a page boundary) and every device: duplicate rows for one device are served, with different content, and the
   copy served need not be the newest.
 - The decommission statement succeeds and reports success whether or not it removed a row
   (`device_inventory_store.cpp`, near line 1176), so a device the stale primary key cannot find is
@@ -183,10 +183,11 @@ write-side behaviour) for release.
   is not a signature and not an external approval.
 - Owner: the repository owner (Dave).
 - Date: 2026-11-15.
-- Scope: the residual list above (items 1 to 5).
+- Scope: residual exposures 1 to 4 above. Item 5 (a walk is not a snapshot) is a rule for consumers of
+  the read, not an accepted exposure.
 - Review trigger: the merge of PR 3, the change that adds the `device_ci` write pause. The
-  acceptance is revisited then, and ends if PR 3 does not follow quickly.
-- Not posted to GitHub; to be mirrored in the PR body.
+  acceptance is revisited then. The owner set no end date.
+- No GitHub comment was made. The pull request description is expected to repeat this record.
 
 ## Appendix: reproduction
 
