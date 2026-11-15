@@ -1294,11 +1294,12 @@ TEST_CASE("census pair order: F6-A, an older unpaired event that commits after a
             .outcome == EventInsertOutcome::Inserted);
     EventInsertResult res_u;
     BarrierHold hold;
+    AgentHookGuard hook_guard(store); // armed BEFORE the hook is installed, so nothing between
+                                      // the two can leave a dangling callback
     store.set_agent_step_gap_hook_for_test([&](AgentStepGap gap, const std::string&) {
         if (gap == AgentStepGap::EnsureToDecide)
             hold.hit();
     });
-    AgentHookGuard hook_guard(store);
     WriterThreads writers(store, &hold);
     writers.start(
         [&] { res_u = store.insert_event_classified(stamped("u1", "r1", "a", kErrored, 2000)); });
@@ -2242,11 +2243,12 @@ TEST_CASE("census pair order, B3: a lower-epoch pending event that commits after
     FailSwitch fail(db.dsn());
     EventInsertResult res_w;
     BarrierHold hold;
+    AgentHookGuard hook_guard(store); // armed BEFORE the hook is installed, so nothing between
+                                      // the two can leave a dangling callback
     store.set_agent_step_gap_hook_for_test([&](AgentStepGap gap, const std::string&) {
         if (gap == AgentStepGap::EnsureToDecide)
             hold.hit();
     });
-    AgentHookGuard hook_guard(store);
     WriterThreads writers(store, &hold);
     writers.start([&] {
         res_w = store.insert_event_classified(
