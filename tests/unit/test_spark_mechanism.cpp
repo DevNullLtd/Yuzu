@@ -16866,14 +16866,18 @@ TEST_CASE("File spark (real mechanism): consecutive loss episodes with no decide
     REQUIRE(eventually(
         [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
 
-    hook_state->forced.store(1'000'000, std::memory_order_release);
+    // EXACTLY three lost verdicts (a count, consumed one per verification): the fourth
+    // verification runs the real check and decides Same. A "forever" count would let a fourth
+    // loss land whenever this thread stalls longer than the third retry (800 ms) before the
+    // counter read below, so the exact flaps CHECKs would be a latent flake.
+    hook_state->forced.store(3, std::memory_order_release);
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 3; },
                        kDeafBound));
-    // Two of the three losses followed a re-establishment with no decided verify: flaps.
-    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_flaps) == 2);
-    hook_state->forced.store(0, std::memory_order_release); // let the third episode recover
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Recovered) >= 3; },
                        kDeafBound));
+    // Two of the three losses followed a re-establishment with no decided verify: flaps. The
+    // hook is exhausted, so no fourth loss can follow and the count is exact.
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_flaps) == 2);
 
     // Lower bounds only (the real gap also holds the drain and scheduling): the Faulted ->
     // Recovered gap of episode n is at least 0.8 x base x 2^(n-1). Episode 1 is the ordinary
@@ -17028,8 +17032,16 @@ TEST_CASE("File spark (real mechanism): a saturated verification lane serves wat
     // A controls call without a hook clears it, so the hook is passed again.
     REQUIRE(set_file_test_controls_for_test(*raw, make_ctl(100ms)));
 
-    // All ten are due together; the lane takes exactly four and pins.
-    REQUIRE(eventually([&] { return st->inside.load() == static_cast<int>(kLane); }, kDeafBound));
+    // All ten are due together; the lane takes exactly four and pins. `arrived` is bumped
+    // AFTER the hook's push to `order` (inside is bumped before it), so waiting on it makes the
+    // order.size() read below race-free: a worker preempted between the inside increment and
+    // the push cannot make that REQUIRE throw spuriously.
+    REQUIRE(eventually(
+        [&] {
+            return st->inside.load() == static_cast<int>(kLane) &&
+                   st->arrived.load() >= static_cast<int>(kLane);
+        },
+        kDeafBound));
     const auto index_of = [&](const std::wstring& dir) {
         const std::wstring d = lower_ws(dir);
         for (std::size_t i = 0; i < kDirs; ++i)
@@ -17064,6 +17076,9 @@ TEST_CASE("File spark (real mechanism): a saturated verification lane serves wat
     CHECK(passes <= 100);
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_starved) == kDirs - kLane);
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_refused) == 0);
+    // max_inside only pins the lane cap constant (the lane's own CAS caps its workers at four, so
+    // it cannot exceed kLane whatever the admission order does). The real admission oracles are
+    // verify_refused == 0, the arrival order checked below and inside == kLane above.
     CHECK(st->max_inside.load() <= static_cast<int>(kLane));
 
     // One permit at a time: arrivals 5..10 are exactly dirs 5..10, in arm order.
@@ -17083,6 +17098,22 @@ TEST_CASE("File spark (real mechanism): a saturated verification lane serves wat
     st->release_all.store(true, std::memory_order_release);
     engine.stop();
 }
+
+// What the round-4 File cases above (network error, damping A and B, saturated lane) do NOT pin.
+// None is a defect; each is a stated residual, and a later change that depends on one of them
+// must add its own case.
+//  - Flaps whose verdict is Unverifiable rather than Lost (damping is verdict-agnostic, but only
+//    the Lost route is driven here).
+//  - The kMaxLostFlaps ceiling and the 300 s retry cap: reaching them takes minutes of real time.
+//  - verified_at versus last_verify_at ordering: the lane case arms watches serially, so the
+//    two stamps are equal there and cannot tell the admission key apart from the retry clock.
+//  - verify_wait_since being reset at launch, and verify_starved being cleared at a decided Same
+//    (the lane case counts one warn per watch and never revisits the same watch afterwards).
+//  - The more-due-than-slots zero-timeout branch of wait_timeout_locked beyond the sweep_passes
+//    bound (the bound catches a spin, not a mis-chosen timeout that is still above 20 ms).
+//  - Damping restart routes (failed re-establishment, Ancestor shelter commit, unwind recovery)
+//    and a replace loop faster than the verify interval: documented in the flip gate as
+//    residuals and Gate 5 scenarios.
 
 TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing re-probe faults "
           "the watch inside the bound and recovers (#5719 item 5)",
