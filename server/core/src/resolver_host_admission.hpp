@@ -43,8 +43,8 @@
 /// same reason text as a full pool, so no caller learns a new failure kind. Nothing here returns an
 /// address, so a refusal can never become a success.
 
-// First, before the standard headers: on Windows bounded_resolver.hpp must see winsock2.h before any
-// header that pulls in windows.h.
+// First, before the standard headers: on Windows bounded_resolver.hpp must see winsock2.h before
+// any header that pulls in windows.h.
 #include "bounded_resolver.hpp"
 
 #include <chrono>

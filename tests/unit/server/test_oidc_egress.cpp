@@ -2230,8 +2230,8 @@ TEST_CASE("OIDC resolver limit: the production admission is one process-wide obj
           "documented limits",
           "[oidc][oidc_egress][oidc_resolver][oidc_name_limit][wiring]") {
     // The adapter chooses it only when no test installed a lookup or a pool; that choice is checked
-    // by a source-text test in test_resolver_host_admission.cpp, because no test can drive the production lookup without
-    // DNS. This reads the object that choice returns.
+    // by a source-text test in test_resolver_host_admission.cpp, because no test can drive the
+    // production lookup without DNS. This reads the object that choice returns.
     const auto first = OidcProvider::production_lookup_admission_for_test();
     const auto second = OidcProvider::production_lookup_admission_for_test();
     REQUIRE(first != nullptr);

@@ -1130,14 +1130,15 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 }
 #else
 // Whether a lookup goes through the admission (the per-name limit and the refusal memory). The
-// NAT64 probe is exempt: it takes no lease, is not refused by the admission and does not feed it, so
-// only the pool's cap applies to it, as before the admission existed. Its only bound is the pool's
-// cap; a probe that started and failed arms the 1 minute negative window below, and one the pool
-// refused arms none.
+// NAT64 probe is exempt: it takes no lease, is not refused by the admission and does not feed it,
+// so only the pool's cap applies to it, as before the admission existed. Its only bound is the
+// pool's cap; a probe that started and failed arms the 1 minute negative window below, and one the
+// pool refused arms none.
 enum class LookupAdmission { kApply, kExempt };
 
-// The throttled warning for a lookup refused before the pool was asked: a name refused or timed out
-// moments ago, or a name already at its limit of outstanding lookups. The keys are fixed, never
+// The throttled warning for a lookup refused before the pool was asked: a name already at its
+// limit of outstanding lookups, a full table of names with lookups outstanding, a name refused or
+// timed out moments ago, or an admission check that did not complete. The keys are fixed, never
 // derived from the host, so the throttle's key set stays bounded.
 void log_lookup_refused_before_pool(const std::string& host,
                                     net::HostLookupAdmission::Verdict verdict,
@@ -2756,8 +2757,9 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             // A refusal because the lookup pool was full, no worker could be created, the name
             // already had 8 lookups outstanding, lookups for 64 names were already outstanding,
             // the name was refused or timed out moments ago or the admission check did not
-            // complete learned nothing about the issuer: retried next attempt, not remembered. Matched by equality
-            // with the one text http_get_bounded composes, so IdP-controlled text cannot match.
+            // complete learned nothing about the issuer: retried next attempt, not remembered.
+            // Matched by equality with the one text http_get_bounded composes, so IdP-controlled
+            // text cannot match.
             const std::string busy_error =
                 std::string("request failed: ") + kEgressLookupBusyReason;
             if (doc.error() != busy_error)
