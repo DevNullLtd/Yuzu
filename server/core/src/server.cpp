@@ -4437,8 +4437,6 @@ public:
                           "counter");
         for (const char* reason : detail::kGuardianPairRejectReasons)
             metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
-        metrics_.counter(detail::kGuardianPairRejectedMetric,
-                         {{"reason", detail::kGuardianPairRejectImplausible}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
                           "write, or the per-agent emit-order step before it, failed and no "

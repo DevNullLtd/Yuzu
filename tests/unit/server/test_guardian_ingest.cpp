@@ -866,10 +866,10 @@ TEST_CASE("guardian ingest: apply_wire_pair fills the row and returns why a pair
     row.event_id = "evt-pair";
     row.agent_id = "agent-A";
     // The pre-seed contract (server.cpp warms one series per entry): the closed reason set is
-    // exactly the two labels this code counts on, and every reject maps to its own entry.
+    // exactly the three labels this code counts on, and every reject maps to its own entry.
     CHECK(std::vector<std::string>(std::begin(yuzu::server::detail::kGuardianPairRejectReasons),
                                    std::end(yuzu::server::detail::kGuardianPairRejectReasons)) ==
-          std::vector<std::string>{"half_set", "out_of_range"});
+          std::vector<std::string>{"half_set", "out_of_range", "implausible"});
     CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::HalfSet)) ==
           "half_set");
     CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::OutOfRange)) ==
@@ -1110,7 +1110,6 @@ TEST_CASE("guardian ingest: the implausible reason has its own label and is coun
     using yuzu::server::detail::report_pair_reject;
     CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::Implausible)) ==
           "implausible");
-    CHECK(std::string(yuzu::server::detail::kGuardianPairRejectImplausible) == "implausible");
     GuaranteedStateEventRow row;
     row.event_id = "evt-implausible";
     row.agent_id = "agent-A";

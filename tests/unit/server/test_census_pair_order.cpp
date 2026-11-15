@@ -1919,8 +1919,7 @@ TEST_CASE("census pair order, UP-5: currently unordered is ONE SQL predicate, re
         const auto row = store.agent_order_for_agent(agent);
         REQUIRE(row.has_value());
         REQUIRE(row->has_value());
-        REQUIRE((*row)->unordered_by_store.has_value()); // the store decided it, not C++
-        CHECK((*row)->currently_unordered() == (expected.count(agent) == 1));
+        CHECK((*row)->currently_unordered == (expected.count(agent) == 1)); // the store's answer
     }
     const auto list = store.unordered_agents(std::nullopt);
     REQUIRE(list.has_value());

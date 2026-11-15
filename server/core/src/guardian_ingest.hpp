@@ -136,11 +136,8 @@ struct WirePair {
 /// (server.cpp) from `kGuardianPairRejectReasons` so each series reads 0, not absent. Never
 /// labelled by agent.
 inline constexpr char kGuardianPairRejectedMetric[] = "yuzu_server_guardian_pair_rejected_total";
-inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of_range"};
-/// The third reason (UP-9). Kept apart from the array above, which holds the two structural
-/// reasons; the pre-seed (server.cpp) warms the array and this one, and `pair_reject_reason` maps
-/// every `PairReject` to exactly one of them.
-inline constexpr char kGuardianPairRejectImplausible[] = "implausible";
+inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of_range",
+                                                             "implausible"};
 
 /// The ONE place a `PairReject` becomes its label, so the counter series, the pre-seed loop and the
 /// log line cannot drift from `kGuardianPairRejectReasons`. `None` has no reason (empty).
@@ -151,18 +148,15 @@ inline constexpr char kGuardianPairRejectImplausible[] = "implausible";
     case PairReject::OutOfRange:
         return kGuardianPairRejectReasons[1];
     case PairReject::Implausible:
-        return kGuardianPairRejectImplausible;
+        return kGuardianPairRejectReasons[2];
     case PairReject::None:
         break;
     }
     return "";
 }
 static_assert(std::size(kGuardianPairRejectReasons) ==
-                  static_cast<std::size_t>(PairReject::OutOfRange),
+                  static_cast<std::size_t>(PairReject::Implausible),
               "one reason label per PairReject value other than None");
-static_assert(static_cast<std::size_t>(PairReject::Implausible) ==
-                  static_cast<std::size_t>(PairReject::OutOfRange) + 1,
-              "Implausible is the one reason outside kGuardianPairRejectReasons");
 static_assert(std::string_view(pair_reject_reason(PairReject::HalfSet)) == "half_set" &&
                   std::string_view(pair_reject_reason(PairReject::OutOfRange)) == "out_of_range" &&
                   std::string_view(pair_reject_reason(PairReject::Implausible)) == "implausible",

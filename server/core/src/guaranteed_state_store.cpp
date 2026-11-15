@@ -4347,7 +4347,7 @@ GuaranteedStateStore::agent_order_for_agent(std::string_view agent_id) const {
     o.pair_recoveries = num(10);
     o.pair_duplicates = num(11);
     o.retired_events = num(12);
-    o.unordered_by_store = to_bool(PQgetvalue(r, 0, 13));
+    o.currently_unordered = to_bool(PQgetvalue(r, 0, 13));
     return std::optional<GuardianAgentOrder>{std::move(o)};
 }
 
