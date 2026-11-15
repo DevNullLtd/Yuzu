@@ -232,7 +232,7 @@ constexpr std::size_t kVerifyLaneCap = 4;
 /// exhaustion (handle or memory pressure), so after this many such results a watch whose
 /// handle may still be working is cancelled and dropped and re-established on the ordinary
 /// retry (30 s, doubling to a 300 s cap on repeated failure); excluding resource errors
-/// from the streak is FOLLOW-UP-ISSUE-TBD(verify-streak-resource-errors).
+/// from the streak is tracked in #7874.
 constexpr unsigned kVerifyUnverifiableFaultStreak = 3;
 /// A due verification that has not been LAUNCHED for this many path_verify_interval()s is
 /// counted (verify_starved) and warned once per episode. Observation only: no fault, no
