@@ -1794,6 +1794,12 @@ flip, with a red-first test each:
     author-reported too: held in the author's scratch area, not committed to the repository, and not reproducible from
     it. No figure here is a macOS or CI result; the only sanitizer result is the MSVC AddressSanitizer one of fix
     round 8, on the Windows rig.
+    The commits after `6f10e561f6` (the last wording fixes from the round-9 re-review and the governance ledger rows)
+    change comments, documentation and the ledger only, and were not run on the rig. The rig-run bytes are those of
+    `9ae268a80b` (`spark_file.cpp` md5 `809af7a9e2e01387e80db677fd5f883b`, `spark_mechanism.hpp`
+    `f74eeae461ece34dc0f3f99a0c95d035`, `test_spark_mechanism.cpp`
+    `9a68a170a1805af64909cb33c5e11723`); `spark_file.cpp` and `spark_mechanism.hpp` now differ from those md5s by comment lines only (checked with a diff that ignores
+    comment lines), and the test file is byte-identical.
     The oracle is the literal one in (e): within a bound the mechanism calls `fault()`. A watch that only drops
     its coverage, or only stops delivering, is a red case, not a pass; delivery after the object is repaired is a
     secondary check. The File cases LATCH on the Collector's Faulted event (the delivery of that `fault()` call)
@@ -1805,7 +1811,7 @@ flip, with a red-first test each:
     child process (hidden `[.][5719-service-child]`, selected by exact name) whose `DBUS_SYSTEM_BUS_ADDRESS` points
     at it; the parent kills the daemon and the child reaches `armed_faulted == 1`. It SKIPs where `dbus-daemon` is
     not installed or the socket path is too long, unless `YUZU_REQUIRE_SPARK_DBUS_TESTS` is set (then it FAILs);
-    no CI leg sets that variable yet (tracked in #7901), so in CI a missing daemon is a silent skip. Windows File, 24
+    no CI leg sets that variable yet (tracked in #7901), so in CI a missing daemon is a silent skip. Windows File, 25
     cases: a parent directory held pending-delete by a second handle; a failed ancestor re-arm plus a failing
     re-probe; the parent directory renamed away; replaced by a different directory at the same path; reached
     through a junction whose target is renamed; renamed away and back between two verifications (not a fault); an
@@ -1815,17 +1821,21 @@ flip, with a red-first test each:
     a network path that stops answering takes the same streak and is never counted as a decided loss (one case run for
     three error values),
     a DENY-ACL replacement the agent may not open (the real-world twin; the case switches the process's
-    SeBackupPrivilege and SeRestorePrivilege off for its duration, because an elevated session bypasses a
-    directory DACL through them), a lost path whose cancelled read never drains (a hook-held completion) is counted once
+    SeBackupPrivilege and SeRestorePrivilege off for its duration, because the identity check opens with backup
+    semantics, which bypass a directory DACL while either privilege is enabled; both are present but typically
+    disabled in an elevated token, so the guard switches both off and checks the result),
+    a lost path whose cancelled read never drains (a hook-held completion) is counted once
     and recovers when it does, `stop()` while that completion is held back is prompt (model-limited: the case swallows
     the completion with a
     test hook, so by `stop()` no read is outstanding and the 2 s drain wait and the quarantine path are never reached;
     it does NOT model a read the OS never completes, which is a Gate 5 flip-time chaos scenario, a never-completing
-    cancelled read including `stop()`, not run), the test-control completion stash cannot outlive its watch (three cases:
-    a completion handed back and then unwatched is harmless; one handed back and then followed by `stop()` with a
-    second watch's read outstanding charges nothing to that read, which pins the contract but cannot go red on the old
-    code by itself; and the hook swallows at most eight completions, processes the ninth normally, and a release
-    replays each swallowed one once), an OK completion queued on the stale read when the path is found
+    cancelled read including `stop()`, not run), the test-control completion stash cannot outlive its watch (four cases:
+    a completion handed back and then unwatched is dropped and counted by `stash_dropped`; one handed back and then
+    followed by `stop()` with a second watch's read outstanding completes within the bound and quarantines nothing,
+    a contract pin that cannot go red on the old code by itself; a release after `stop()` replays nothing, delivers
+    no event and drops nothing; and the hook swallows at most eight completions, processes the ninth normally, and
+    after a release each replayed watch's Fired count equals that of the unswallowed ninth watch), an OK completion
+    queued on the stale read when the path is found
     lost is drained and never fired, a throw while the lost path's read drains still ends in one Recovered, a throw
     on the OK completion of a lost path whose old handle can no longer be read (the unwind's OK-completion arm, its
     reissue-failure sub-branch) still ends in one Recovered with the slow-establishment count
@@ -2120,7 +2130,7 @@ flip, with a red-first test each:
     are stashed, so a ninth is not swallowed) and the banner states the File mechanism's own 5 s verification sampling.
     **The defect was reproduced.** Three new cases (24 item-5 File cases now, 21 before; the "20 File cases" of fix rounds
     4 to 6 above were the count at those rounds). MSVC AddressSanitizer build (debugoptimized, `/fsanitize=address /MD`,
-    string and vector annotations disabled, `halt_on_error=1`) of the PREVIOUS production bytes (`e850a0f387`) plus the
+    string and vector annotations disabled, `halt_on_error=1`) of the production bytes before the stash cure (`e850a0f387`) plus the
     new test file: the unwatch case reports a heap-use-after-free, WRITE of size 1, at `spark_file.cpp:3871` in `run()`,
     freed from `unwatch()` via `SparkEngine::disarm`; the stop case and the ninth-swallow case are green there. The stop
     case cannot go red on the old code by itself, because the kernel's write into freed memory is invisible to ASan; it
@@ -2157,8 +2167,9 @@ flip, with a red-first test each:
     nightly leg (main only). The stop case is a contract pin, not an observer: the premature-reap half of the old defect
     (a reap that ended while another watch's read was pending) has no test observer, because a kernel write into freed
     memory is invisible to ASan and no counter or stat shows that no watch is `io_pending` when the reap ends; its
-    closure rests on the cure (a release posts nothing) and on code reading. A fourth case (25 item-5 File cases now, 24 before) pins that a release after
-    `stop()` is harmless (no crash, no event, nothing dropped, nothing quarantined; that the stash was cleared is not
+    closure rests on the cure (a release posts nothing) and on code reading. A fourth case (25 item-5 File cases now,
+    24 before) pins that a release after `stop()` is harmless (no crash, no event, nothing dropped, nothing
+    quarantined; that the stash was cleared is not
     directly observable). The ninth-swallow case now states "replayed once" against a control, the unswallowed ninth
     watch, because one change yields two Fired events per completion on the rig, not one; its post-release check on the
     hook's call count was trivially true and was removed. Test-only wording and ordering fixes: the park guard is declared
@@ -2178,13 +2189,29 @@ flip, with a red-first test each:
     (the default-leg observer is real). Reverting the lookup to id-only (dropping the removing and `io_pending`
     predicates) turned NO case red (3 of 3 green on every stash and lost-path case): the two extra predicates have no
     test observer, and the existing seams do not reach a stash entry whose watch is removing or re-armed, so they are
-    hardening by construction, not a tested guard. **The old bytes in a non-ASan build.** The previous production bytes
-    (`e850a0f387`) with the previous test file (`be187fea47`, whose unwatch case reproduced the heap-use-after-free under
-    ASan in fix round 8) in the NORMAL build: the unwatch, stop and ninth-swallow cases each passed 5 of 5. So without
+    hardening by construction, not a tested guard. **The old bytes in a non-ASan build.** The production bytes before
+    the stash cure (`e850a0f387`) with the first stash test file (`be187fea47`, whose unwatch case reproduced the
+    heap-use-after-free under ASan in fix round 8) in the NORMAL build: the unwatch, stop and ninth-swallow cases each passed 5 of 5. So without
     the sanitizer the old defect is silent in these cases, which is why the counter assertion (on the old bytes there is
-    no drop to count: the entry's watch is dereferenced) and the windows-asan leg are the observers. Not run: the retired-watch and
-    re-armed-watch arms of the lookup (no existing seam reaches them), any TSan run, and the flip-time chaos scenarios. No
-    agent re-review covered this round.
+    no drop to count: the entry's watch is dereferenced) and the windows-asan leg are the observers. That the counter
+    assertion would turn red on the old design is by construction (the old design has no drop arm), not a measured
+    mutation: the old bytes cannot compile against a test that reads `stash_dropped`. Not run: the retired-watch and
+    re-armed-watch arms of the lookup (no existing seam reaches them), any TSan run, and the flip-time chaos
+    scenarios. **Corrections to the commit bodies (which are immutable).** The note in the `9ae268a80b` and
+    `b2344dc3c8` commit bodies that a stash push "cannot throw within the reserved capacity" holds only while
+    `replay_` is empty: a second release could push `replay_` past its reserve of 8, and that allocation would
+    happen on the test thread, under the lock, never on the worker. The statement in the `9ae268a80b` commit message
+    that nothing re-arms a swallowed watch in place (a resync builds a new watch with a new id) is unverified for
+    its resync part: the cpp-safety code reading of round 9 found that every site that sets `io_pending = true`
+    needs a consumed completion or a probe commit. The stricter lookup's removing and `io_pending` predicates are
+    by-construction hardening with no test observer (a mutation to id-only keeps every case green). A second entry
+    for the same watch id (swallow, re-arm, swallow again) is legitimately dropped after the first replay re-arms
+    the watch, so a test that asserts an exact `stash_dropped` count must allow for it. Deferred to #7877: the
+    ninth-swallow oracle reads once after a fixed 500 ms sleep (it should poll with `eventually` and the slow-leg
+    scale factor), the release-after-stop case is a labelled contract pin, and an optional true mutation run of the
+    counter assertion. No agent re-review covered the rig-run round; the round-9 re-review by cpp-safety,
+    security-guardian and quality-engineer found no blocking finding, and the wording and ledger commits after
+    `6f10e561f6` were not re-reviewed.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then

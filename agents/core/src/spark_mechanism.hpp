@@ -635,6 +635,8 @@ struct FileMechanismTestControls {
     /// FileMechanismDebugCounters::stash_dropped. An entry for a watch that was
     /// unwatched still occupies a stash slot until a release or stop() clears it, so
     /// such stale entries count against the capacity. stop() discards the stash.
+    /// By-construction hardening: the removing and io_pending predicates of the lookup
+    /// have no test observer (a mutation to id-only keeps every case green).
     std::function<bool(std::wstring_view dir, bool ok, unsigned long bytes)> completion_suppress_hook;
     /// One-shot: hand every swallowed completion back so the worker processes it
     /// with its original result and byte count, in the order swallowed, when its
@@ -687,7 +689,10 @@ struct FileMechanismDebugCounters {
     std::uint64_t verify_starved{0};       ///< due verifications not launched for 3 intervals (once per episode)
     std::uint64_t sweep_passes{0};         ///< sweep passes run (debug: a test asserts the sweep does not spin)
     std::uint64_t stash_dropped{0};        ///< test-control stash entries handed back but dropped, not replayed
-                                           ///< (watch gone, removing or re-armed); a replayed entry is not counted
+                                           ///< (watch gone, removing or re-armed); a replayed entry is not counted.
+                                           ///< A second entry for the same watch id (swallow, re-arm, swallow
+                                           ///< again) is legitimately dropped after the first replay re-arms it,
+                                           ///< so a test asserting an exact count must allow for it
 };
 
 /// Returns true if `mech` is the Windows File mechanism and the controls were

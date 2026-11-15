@@ -3848,7 +3848,9 @@ private:
     /// completion leaves exactly that state. One already retired to retiring_ is deliberately
     /// not found (its read is cancelled and owned by the drain), and one re-armed since the
     /// swallow is not either (a second completion for it would be a second one in flight). In
-    /// both cases the handed-back completion is dropped, never replayed.
+    /// both cases the handed-back completion is dropped, never replayed. By-construction
+    /// hardening: the removing and io_pending predicates have no test observer (a mutation
+    /// to id-only keeps every case green).
     static bool can_take_replay(const std::unique_ptr<DirWatch>& slot, std::uint64_t id) noexcept {
         return slot && slot->id == id && !slot->removing && !slot->io_pending;
     }
