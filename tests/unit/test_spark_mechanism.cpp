@@ -16717,8 +16717,9 @@ TEST_CASE("File spark (real mechanism): a throw while the lost path's cancelled 
     // completion_hook throws once, as the first thing process_completion_locked does with the
     // cancelled read's completion: the pass unwinds and unwind_pass_locked's failed-completion
     // arm resets the handle and defers the retry WITHOUT clearing path_lost; the later probe
-    // commit clears it. (The ok-completion twin, which reissues a read on the invalidated
-    // handle and converges through the sweep's re-cancel, is not exercised here.)
+    // commit clears it. (The ok-completion twin reissues a read on the invalidated handle: its
+    // reissue-FAILURE sub-branch is the next case below; its reissue-SUCCESS sub-branch, which
+    // converges through the sweep's re-cancel, is exercised by no case.)
     DeafWatchTree tree("drain_throw");
     const auto renamed = tree.root / "renamed";
     auto th = std::make_shared<ThrowState>();
