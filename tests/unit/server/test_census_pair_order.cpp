@@ -52,6 +52,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1870,4 +1871,235 @@ TEST_CASE("census pair order, already holds: a Repair queued behind a concurrent
         CHECK(order_text(db.dsn(), "a").empty()); // no order row: the Repair did not re-create it
     }
     CHECK(decision_delta(counts, decision_counts(metrics)) == "-"); // nothing was decided
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// Commit B2 additions: the cases the B2 production code adds beyond the rows above. None of them
+// depends on the census statements reading the pair mode.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+std::string repair_outcome_count_text(yuzu::MetricsRegistry& m, const char* source,
+                                      const char* outcome) {
+    return std::to_string(
+        static_cast<long long>(m.counter("yuzu_server_guardian_census_projection_total",
+                                         {{"source", source}, {"outcome", outcome}})
+                                   .value()));
+}
+
+} // namespace
+
+TEST_CASE("census pair order, UP-5: currently unordered is ONE SQL predicate, read the same by the "
+          "per-device row, the id list and the count",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    const std::string now_ns =
+        "(floor(extract(epoch FROM clock_timestamp()) * 1000000000))::bigint";
+    const auto put = [&](const char* agent, const std::string& epoch_recv,
+                         const std::string& unpaired_recv) {
+        exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                               ".guardian_agent_order (agent_id, epoch_recv_ns, unpaired_recv_ns) "
+                               "VALUES ('" +
+                               agent + "', " + epoch_recv + ", " + unpaired_recv + ")");
+    };
+    put("blank", "NULL", "NULL");       // a blank row reads false, never NULL
+    put("never_paired", "NULL", "100"); // a NULL clock reads as 0
+    put("equal", "100", "100");         // strict: equal is not unordered
+    put("clock_later", "101", "100");
+    put("unpaired_later", "100", "101");
+    put("future_clock", now_ns + " + 600000000000", "1"); // recorded 600 s ahead: beyond the slack
+    put("future_no_unpaired", now_ns + " + 600000000000", "NULL"); // needs an unpaired event too
+    put("inside_slack", now_ns + " + 60000000000", "1"); // 60 s ahead: a lock wait, not a step
+
+    const std::set<std::string> expected{"never_paired", "unpaired_later", "future_clock"};
+    for (const char* agent : {"blank", "never_paired", "equal", "clock_later", "unpaired_later",
+                              "future_clock", "future_no_unpaired", "inside_slack"}) {
+        INFO(agent);
+        const auto row = store.agent_order_for_agent(agent);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        REQUIRE((*row)->unordered_by_store.has_value()); // the store decided it, not C++
+        CHECK((*row)->currently_unordered() == (expected.count(agent) == 1));
+    }
+    const auto list = store.unordered_agents(std::nullopt);
+    REQUIRE(list.has_value());
+    CHECK(std::set<std::string>(list->ids.begin(), list->ids.end()) == expected);
+    CHECK(list->count == 3);
+    const auto count = store.unordered_agent_count();
+    REQUIRE(count.has_value());
+    CHECK(*count == 3);
+}
+
+TEST_CASE("census pair order: a Repair whose agent-row lock wait times out is Failed with its "
+          "evidence kept, never a default mode, and the bound does not leak",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    REQUIRE(order_text(db.dsn(), "a") == "5|10|-|0|0|0|0|0|0|0");
+    const std::string order_before = order_snapshot(db.dsn());
+    const auto failures_before = store.census_proj_failures_total();
+    {
+        HeldSession holder(db.dsn());
+        REQUIRE(holder.run("BEGIN"));
+        REQUIRE(holder.run(std::string("SELECT 1 FROM ") + kSchema +
+                           ".guardian_agent_order WHERE agent_id = 'a' FOR UPDATE"));
+        AgentStepLockWait short_bound(store, 200);
+        const auto t0 = std::chrono::steady_clock::now();
+        const EventInsertResult res = store.insert_event_classified(e1);
+        const auto waited = std::chrono::steady_clock::now() - t0;
+        CHECK(res.outcome == EventInsertOutcome::Redelivered); // a failed Repair is still acked
+        CHECK(waited < std::chrono::seconds(5));
+        CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "1");
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "0");
+        CHECK(store.census_proj_failures_total() == failures_before + 1);
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent"); // not decided as `current`
+        CHECK(pending_count(db.dsn()) == "1");           // the evidence stays
+        CHECK(holder.run("ROLLBACK"));
+    }
+    CHECK(order_snapshot(db.dsn()) == order_before);
+    // The next redelivery, with the row free again, repairs: the failed one left no timeout behind
+    // and nothing half done.
+    CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+    CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+    CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+    CHECK(pending_count(db.dsn()) == "0");
+}
+
+TEST_CASE("census pair order: a Repair of a brand-new agent's event that finds its evidence "
+          "retired gives back the order row its Ensure made",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    ScheduleRun run(store, db.dsn(), metrics);
+    run.run(deliver_step_failed(1000, "r1", 'C', 1000, 5, 10, "absent", 1));
+    REQUIRE(order_text(db.dsn(), "a").empty()); // the failed step left no order row
+    const GuaranteedStateEventRow e1 = run.event(1);
+    EventInsertResult res;
+    bool retired = false;
+    std::atomic<bool> retire_done{false};
+    std::atomic<bool> repair_done{false};
+    WriterThreads writers(store, nullptr);
+    HeldSession holder(db.dsn());
+    REQUIRE(holder.run("BEGIN"));
+    REQUIRE(holder.run(std::string("SELECT event_id FROM ") + kSchema +
+                       ".guaranteed_state_events WHERE event_id = 'e1' FOR UPDATE"));
+    writers.start([&] {
+        retired = try_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                                        ".guaranteed_state_events SET projection_pending = false "
+                                        "WHERE event_id = 'e1'");
+        retire_done.store(true);
+    });
+    REQUIRE(wait_parked_or_done(db.dsn(), 1, retire_done));
+    writers.start([&] {
+        res = store.insert_event_classified(e1);
+        repair_done.store(true);
+    });
+    REQUIRE(wait_parked_or_done(db.dsn(), 2, repair_done));
+    REQUIRE(holder.run("COMMIT"));
+    writers.join_all();
+
+    CHECK(retired);
+    CHECK(res.outcome == EventInsertOutcome::Redelivered);
+    CHECK(repair_outcome_count_text(metrics, "repair", "pending_retired") == "1");
+    CHECK(verdict(db.dsn(), "a", "r1") == "absent");
+    CHECK(order_text(db.dsn(), "a")
+              .empty()); // the Repair's Ensure was rolled back with its savepoint
+}
+
+TEST_CASE("census pair order: with the agent step off a Repair does no Ensure and takes no share "
+          "lock",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    store.set_agent_step_enabled_for_test(false);
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    REQUIRE(order_text(db.dsn(), "a").empty()); // no step, no order row
+    // A holder on a (non-existent here) order row would be irrelevant; the proof is that the
+    // Repair creates none and still projects with the default decision.
+    CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+    CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+    CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+    CHECK(order_text(db.dsn(), "a").empty()); // still none
+    CHECK(pending_count(db.dsn()) == "0");
+}
+
+TEST_CASE("census pair order, UP-9: an implausible pair is ALWAYS held at first delivery and a "
+          "Repair judges the stored unpaired event as any other",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    const auto held_event = [&](std::string id, const char* rule, char type, std::int64_t ts) {
+        auto e = stamped(std::move(id), rule, "a", type == 'C' ? kCompliant : kErrored, ts);
+        e.pair_implausible = true; // the ingest boundary withheld the pair
+        return e;
+    };
+    const auto held_count = [&](const char* source) {
+        return repair_outcome_count_text(metrics, source, "held");
+    };
+
+    SECTION(
+        "no clock at all: stored, pending, the census untouched, the step saw an unpaired event") {
+        REQUIRE(store.insert_event_classified(held_event("h1", "r1", 'E', 1000)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(held_count("first_delivery") == "1");
+        CHECK(pending_count(db.dsn()) == "1");
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent");
+        CHECK(order_text(db.dsn(), "a") == "-|-|-|1|0|0|0|0|0|0");
+        CHECK(event_pair_text(db.dsn(), "h1") == "-/-");
+        CHECK(store.census_proj_failures_total() == 0); // a hold is not a failure
+    }
+    SECTION("a stale clock does not release it, and a verdict already held is not changed") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(stamped("p1", "r1", "a", kCompliant, 1000), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        age_pair_clock(db.dsn(), "a"); // an unpaired event now would NOT be held by the clock
+        REQUIRE(store.insert_event_classified(held_event("h1", "r1", 'E', 1100)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(held_count("first_delivery") == "1");
+        CHECK(verdict(db.dsn(), "a", "r1") == "C - 5/10");
+        CHECK(pending_count(db.dsn()) == "1");
+    }
+    SECTION("the step seam off: still held") {
+        store.set_agent_step_enabled_for_test(false);
+        REQUIRE(store.insert_event_classified(held_event("h1", "r1", 'E', 1000)).outcome ==
+                EventInsertOutcome::Inserted);
+        CHECK(held_count("first_delivery") == "1");
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent");
+        CHECK(pending_count(db.dsn()) == "1");
+    }
+    SECTION("a Repair reuses the stored unpaired event: it is judged as an unpaired one") {
+        const auto h1 = held_event("h1", "r1", 'E', 1000);
+        REQUIRE(store.insert_event_classified(h1).outcome == EventInsertOutcome::Inserted);
+        REQUIRE(pending_count(db.dsn()) == "1");
+        // The redelivery carries the flag again; it must not matter: a Repair decides from the
+        // stored (unset) pair and holds nothing on the flag.
+        CHECK(store.insert_event_classified(h1).outcome == EventInsertOutcome::Redelivered);
+        CHECK(held_count("repair") == "0");
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+        CHECK(verdict(db.dsn(), "a", "r1") == "E - -/-");
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+    SECTION("the batch cannot hold, so it aborts and stores nothing") {
+        std::vector<GuaranteedStateEventRow> rows{
+            stamped("b1", "r1", "a", kCompliant, 1000),
+            held_event("b2", "r1", 'E', 1010),
+        };
+        const auto r = store.insert_events(rows);
+        CHECK_FALSE(r.has_value());
+        CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
+                                         ".guaranteed_state_events") == "0");
+    }
 }

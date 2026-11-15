@@ -11,6 +11,7 @@
  */
 
 #include "guardian_ingest.hpp"
+#include "guardian_pair_mode.hpp"
 
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
@@ -1031,4 +1032,116 @@ TEST_CASE("guardian ingest: a rejected pair does not refuse the event (UP-14 D5)
     // A different event with the same half pair is a new withheld pair and counts.
     ingest("p-half-2", 3, 0);
     CHECK(pair_rejected_count(metrics, "half_set") == 2);
+}
+
+// ── UP-14 PR B B2: the absolute plausibility bound (UP-9) and the closed pair mode ────────────
+
+TEST_CASE("guardian ingest: pair_from_wire with a receipt applies the absolute plausibility bound "
+          "(UP-9)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::detail::kEmitSeqCeiling;
+    using yuzu::server::detail::kEpochSkewSeconds;
+    using yuzu::server::detail::pair_from_wire;
+    using yuzu::server::detail::PairReject;
+    constexpr std::int64_t receipt = 1'800'000'000; // Unix seconds
+    const auto epoch_at = [&](std::int64_t delta) {
+        return static_cast<std::uint64_t>(receipt + kEpochSkewSeconds + delta);
+    };
+
+    // emit_seq: 2^40 - 1 is the largest plausible value, 2^40 is not.
+    CHECK(pair_from_wire(7, kEmitSeqCeiling - 1, receipt).paired);
+    CHECK_FALSE(pair_from_wire(7, kEmitSeqCeiling, receipt).paired);
+    CHECK(pair_from_wire(7, kEmitSeqCeiling, receipt).reject == PairReject::Implausible);
+    // epoch: receipt + ten years is the largest plausible value, one second more is not.
+    CHECK(pair_from_wire(epoch_at(0), 1, receipt).paired);
+    CHECK(pair_from_wire(epoch_at(1), 1, receipt).reject == PairReject::Implausible);
+    CHECK_FALSE(pair_from_wire(epoch_at(1), 1, receipt).paired);
+    // The receipt is what moves the epoch bound.
+    CHECK(pair_from_wire(epoch_at(1), 1, receipt + 1).paired);
+    // The structural checks keep their precedence: half_set, then out_of_range, then implausible.
+    CHECK(pair_from_wire(5, 0, receipt).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire(0, kEmitSeqCeiling, receipt).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire(std::uint64_t{1} << 62, kEmitSeqCeiling, receipt).reject ==
+          PairReject::OutOfRange);
+    // 0/0 stays an unpaired sender, not a rejection.
+    CHECK(pair_from_wire(0, 0, receipt).reject == PairReject::None);
+    // A receipt before 1970 never lowers the bound below the skew itself.
+    CHECK(pair_from_wire(static_cast<std::uint64_t>(kEpochSkewSeconds), 1, -5).paired);
+    // The two-argument form is structural only: it does not apply the bound.
+    CHECK(pair_from_wire(7, kEmitSeqCeiling).paired);
+}
+
+TEST_CASE("guardian ingest: apply_wire_pair with a receipt sets pair_implausible only for an "
+          "implausible pair and withholds the pair (UP-9)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::apply_wire_pair;
+    using yuzu::server::detail::kEmitSeqCeiling;
+    using yuzu::server::detail::PairReject;
+    constexpr std::int64_t receipt = 1'800'000'000;
+    GuaranteedStateEventRow row;
+
+    CHECK(apply_wire_pair(row, 7, kEmitSeqCeiling, receipt) ==
+          std::optional<PairReject>{PairReject::Implausible});
+    CHECK(row.pair_implausible);
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    // A later call on the same row clears the flag and sets the pair.
+    CHECK_FALSE(apply_wire_pair(row, 7, 11, receipt).has_value());
+    CHECK_FALSE(row.pair_implausible);
+    CHECK(row.boot_epoch == 7);
+    CHECK(row.emit_seq == 11);
+    // half_set and out_of_range are withheld but are NOT held.
+    CHECK(apply_wire_pair(row, 5, 0, receipt) == std::optional<PairReject>{PairReject::HalfSet});
+    CHECK_FALSE(row.pair_implausible);
+    CHECK(apply_wire_pair(row, k2p62, 5, receipt) ==
+          std::optional<PairReject>{PairReject::OutOfRange});
+    CHECK_FALSE(row.pair_implausible);
+    // The three-argument form never sets the flag.
+    CHECK_FALSE(apply_wire_pair(row, 7, kEmitSeqCeiling).has_value());
+    CHECK_FALSE(row.pair_implausible);
+}
+
+TEST_CASE("guardian ingest: the implausible reason has its own label and is counted by "
+          "report_pair_reject (UP-9)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::PairReject;
+    using yuzu::server::detail::report_pair_reject;
+    CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::Implausible)) ==
+          "implausible");
+    CHECK(std::string(yuzu::server::detail::kGuardianPairRejectImplausible) == "implausible");
+    GuaranteedStateEventRow row;
+    row.event_id = "evt-implausible";
+    row.agent_id = "agent-A";
+    yuzu::MetricsRegistry metrics;
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    report_pair_reject(PairReject::Implausible, row, &metrics);
+    cap.stop();
+    CHECK(pair_rejected_count(metrics, "implausible") == 1);
+    CHECK(cap.text().find("withholding the emit-order pair (implausible)") != std::string::npos);
+}
+
+TEST_CASE("guardian pair mode: the SQL's mode set is closed, an unknown or empty label never "
+          "parses and implausible_held is never read from SQL",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::PairMode;
+    using yuzu::server::parse_pair_mode;
+    for (const char* label : {"unpaired", "unpaired_held", "refused_retired", "current",
+                              "current_straggler", "current_rebase", "refused_regression"}) {
+        INFO(label);
+        const auto m = parse_pair_mode(label);
+        REQUIRE(m.has_value());
+        CHECK(std::string(yuzu::server::pair_mode_label(*m)) == label);
+    }
+    for (const char* bad : {"", "Current", "CURRENT", "current ", " current", "current_",
+                            "refused_duplicate", "implausible_held", "unknown", "0"}) {
+        INFO("[" << bad << "]");
+        CHECK_FALSE(parse_pair_mode(bad).has_value());
+    }
+    CHECK(std::string(yuzu::server::pair_mode_label(PairMode::ImplausibleHeld)) ==
+          "implausible_held");
+    CHECK(yuzu::server::default_pair_decision(false).mode == PairMode::Unpaired);
+    CHECK(yuzu::server::default_pair_decision(true).mode == PairMode::Current);
+    CHECK_FALSE(yuzu::server::default_pair_decision(true).retired_epoch.has_value());
 }
