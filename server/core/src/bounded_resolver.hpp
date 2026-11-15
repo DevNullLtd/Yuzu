@@ -86,7 +86,10 @@ enum class ResolveStatus {
     kNotFound,  ///< the resolver answered definitively: no such name / no address
     kTemporary, ///< the resolver failed transiently (EAI_AGAIN / EAI_FAIL): retry, not a "no"
     kTimeout,   ///< no answer within the bound (the lookup may still be running)
-    kBusy       ///< the pool's cap of lookups are already outstanding; nothing was started
+    kBusy,      ///< the pool's cap of lookups are already outstanding; nothing was started
+    /// NOT a status: the number of statuses above, kept LAST so that it moves when an enumerator is
+    /// added before it. Never returned by a lookup; `kResolveStatusCount` is derived from it.
+    kCount
 };
 
 struct ResolveResult {
@@ -96,11 +99,13 @@ struct ResolveResult {
 
 using LookupFn = std::function<ResolveResult(const std::string& host)>;
 
-/// The five outcomes a call can have, one per `ResolveStatus` member. The count is tied to the last
-/// enumerator, so a new status cannot be added without widening the per-outcome counters.
-inline constexpr std::size_t kResolveStatusCount = 5;
-static_assert(static_cast<std::size_t>(ResolveStatus::kBusy) + 1 == kResolveStatusCount,
-              "a new ResolveStatus needs a slot in ResolverPool::outcomes and a label");
+/// The outcomes a call can have, one per real `ResolveStatus` member, derived from the `kCount`
+/// sentinel: adding a status before it widens the per-outcome counters, and the fixed-size users of
+/// this count (the `std::array<std::uint64_t, 5>` accessor in oidc_provider.hpp and its
+/// `static_assert`) stop compiling until each is widened with it. `kCount` must stay the last
+/// enumerator; that is not machine-checked, and a value after it is outside the count, so
+/// `note_outcome` folds it into `kTemporary`.
+inline constexpr std::size_t kResolveStatusCount = static_cast<std::size_t>(ResolveStatus::kCount);
 
 /// The metric label of a status: the closed outcome set of `resolver_pool_metrics.hpp`.
 [[nodiscard]] constexpr const char* resolve_status_label(ResolveStatus s) noexcept {
@@ -115,6 +120,8 @@ static_assert(static_cast<std::size_t>(ResolveStatus::kBusy) + 1 == kResolveStat
         return "timeout";
     case ResolveStatus::kBusy:
         return "busy";
+    case ResolveStatus::kCount:
+        break;
     }
     return "unknown";
 }
@@ -133,8 +140,13 @@ struct ResolverPool {
     std::array<std::atomic<std::uint64_t>, kResolveStatusCount> outcomes{};
     explicit ResolverPool(int c = kMaxInFlightLookups) : cap(c) {}
 
+    /// A status outside the closed set (the sentinel, or a value cast in from elsewhere) is counted
+    /// as `kTemporary` rather than indexing past the array.
     void note_outcome(ResolveStatus s) noexcept {
-        outcomes[static_cast<std::size_t>(s)].fetch_add(1, std::memory_order_relaxed);
+        auto i = static_cast<std::size_t>(s);
+        if (i >= kResolveStatusCount)
+            i = static_cast<std::size_t>(ResolveStatus::kTemporary);
+        outcomes[i].fetch_add(1, std::memory_order_relaxed);
     }
 
     /// A snapshot of the per-status counts, in `ResolveStatus` order.

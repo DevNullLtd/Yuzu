@@ -58,6 +58,8 @@ class ResolverPoolPublisher {
 public:
     explicit ResolverPoolPublisher(const ResolverPoolMetricNames& names) noexcept
         : names_(&names) {}
+    /// The publisher keeps a pointer to the names, so a temporary would leave it dangling.
+    explicit ResolverPoolPublisher(const ResolverPoolMetricNames&&) = delete;
 
     /// Describe the three families and pre-seed every series: both gauges and all five `outcome`
     /// members of the counter at 0, the capacity at `capacity`. Without the pre-seed a fresh server

@@ -695,6 +695,9 @@ EgressEnv::Resolved system_resolve(const std::string& host, std::chrono::millise
     case net::ResolveStatus::kBusy:
         out.status = EgressEnv::ResolveStatus::kBusy;
         break;
+    case net::ResolveStatus::kCount: // not a status; treated as a failed lookup
+        out.status = EgressEnv::ResolveStatus::kUnavailable;
+        break;
     }
     return out;
 }

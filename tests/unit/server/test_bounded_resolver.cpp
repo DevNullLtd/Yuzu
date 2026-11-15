@@ -244,6 +244,21 @@ TEST_CASE("bounded resolver: every call is counted exactly once, by the status i
     CHECK(pool->outcome_counts() == std::array<std::uint64_t, 5>{1, 1, 1, 1, 2});
 }
 
+TEST_CASE("bounded resolver: a status outside the closed set is counted as temporary, not out of bounds",
+          "[bounded_resolver]") {
+    namespace net = yuzu::server::net;
+    // The sentinel is not a status: its count is the number of statuses and its label is "unknown".
+    CHECK(static_cast<std::size_t>(net::ResolveStatus::kCount) == net::kResolveStatusCount);
+    CHECK(std::string(net::resolve_status_label(net::ResolveStatus::kCount)) == "unknown");
+    net::ResolverPool pool(1);
+    pool.note_outcome(net::ResolveStatus::kCount);
+    pool.note_outcome(static_cast<net::ResolveStatus>(net::kResolveStatusCount + 7));
+    pool.note_outcome(static_cast<net::ResolveStatus>(-1));
+    CHECK(pool.outcome_counts() == std::array<std::uint64_t, 5>{0, 0, 3, 0, 0});
+    pool.note_outcome(net::ResolveStatus::kOk);
+    CHECK(pool.outcome_counts() == std::array<std::uint64_t, 5>{1, 0, 3, 0, 0});
+}
+
 TEST_CASE("bounded resolver: a lookup that throws is counted as temporary", "[bounded_resolver]") {
     namespace net = yuzu::server::net;
     using namespace std::chrono_literals;

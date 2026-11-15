@@ -1148,6 +1148,8 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
     case net::ResolveStatus::kNotFound:
     case net::ResolveStatus::kTemporary:
         return resolved.status;
+    case net::ResolveStatus::kCount: // not a status; treated as a failed lookup
+        return net::ResolveStatus::kTemporary;
     }
     // The worker returns numeric text; the vetting classifies bytes, so convert back. Text that
     // does not parse is skipped.
