@@ -25,6 +25,15 @@ namespace yuzu::server {
 /// derived from the model (no population, coverage, policy or interval line, no table):
 /// a degraded read carries a default policy and no population, so printing them would
 /// state a policy and a population that were never read. It is never an empty list.
+///
+/// The panel's text depends on the model's `degraded_reason`: concurrency_budget and
+/// pool_acquire_timeout say the server is busy; statement_timeout says the read took too long and
+/// points at a shorter window (at 24h, at the database); score_policy_unavailable and
+/// score_policy_invalid point at Scoring; store_not_open and query_error point at the database;
+/// invalid_scope names the platform filter; an empty reason gets the generic text and any other
+/// token the generic text with the token shown. Every panel but invalid_scope's prints the token as
+/// a code element (an empty reason has none to print); invalid_scope's names the platform filter
+/// instead.
 std::string render_dex_apps_fragment(const DexAppsModel& model, int window_days,
                                      const std::string& platform);
 

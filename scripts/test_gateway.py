@@ -60,7 +60,7 @@ of the top-level test modules, each module in its own test process (via
 gateway/eunit_shard.config.script); the N shards together run exactly what
 the whole-suite `--dir` run does. The partition, and why it is faithful to
 `--dir`, is in scripts/gateway_eunit_shards.py. Meson runs the gateway eunit suite as
-shards (`gateway eunit shard A`, `... shard B`; root meson.build) so each
+shards (`gateway eunit shard A` to `C`; root meson.build) so each
 stays well inside the per-run deadline below on the Windows MSVC leg.
 """
 import os
