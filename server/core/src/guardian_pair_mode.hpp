@@ -85,13 +85,17 @@ struct PairDecision {
 /// for any other mode, or a label outside this set, as a failure of the census write.
 enum class CensusDecision {
     AppliedPair,       // a pair-mode event became the verdict in the live epoch order
-    AppliedKey,        // a key-mode event became the verdict (v4 rule)
+    AppliedKey,        // an unpaired event became the verdict by the key rule, over an unpaired row
+                       // or no row (an `unpaired_held` event over such a row included)
     TransitionToPair,  // a pair-mode event replaced an unpaired verdict
     TransitionToKey,   // an unpaired event replaced a paired verdict after the hold expired
     Rebase,            // a stale clock re-based the row: applied by arrival, flagged
-    HeldUnpaired,      // an unpaired event refused while the pair clock is fresh
-    RefusedRegression, // a lower epoch refused while the pair clock is fresh
-    RefusedRetired,    // an event of the retired epoch refused
+    HeldUnpaired,      // an unpaired event refused over a paired row: while the pair clock is
+                       // fresh, or, once the hold has expired, when the event is older by arrival
+                       // than the paired verdict (a Repair, a late-committing pending event)
+    RefusedRegression, // a lower epoch refused while the pair clock is fresh; over an ABSENT row
+                       // it is an applied, flagged insert (projection outcome `applied`)
+    RefusedRetired,    // an event of the retired epoch refused; an absent row: as above
     RefusedDuplicate,  // an equal pair refused (two processes, one epoch)
     RefusedStraggler,  // a same-epoch lower sequence refused while the pair clock is fresh
 };

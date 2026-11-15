@@ -1600,7 +1600,8 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // delivery and batch row takes it `FOR UPDATE` in the agent step (above `kAgentOrderEnsure`)
 // BEFORE the pair's pending rows, the census row and the rule row, and holds it to the end of the
 // transaction, so every rule of one agent serialises on it: the order is agent row, pending rows,
-// census row, rule row. No counter on it is written outside the DECIDE statement. A Repair runs
+// census row, rule row. No counter on it is written outside the DECIDE statement except
+// pair_duplicates, which the post-upsert UPDATE inside the census savepoint writes. A Repair runs
 // Ensure and takes the row `FOR SHARE` as its first lock (see `project_rule_status`); it writes no
 // clock or counter, and gives back what it did to the order table unless it touched the census
 // row. `delete_agent` is the one other
@@ -2120,6 +2121,14 @@ constexpr const char* kCensusUpsert =
 // (or it carries the retired epoch, against any row); an unpaired event against a paired row is
 // retired (its doubt is already folded into the flag and `ts_hwm`); a paired event against an
 // unpaired row stays pending for its redelivery; both unpaired: the v4 key test.
+// KNOWN, documented, not fixed (a member of the #7147 stranded-evidence class): that last paired-
+// against-unpaired arm never retires a paired event whose row is unpaired. If such an event's
+// first delivery fails and every Repair of it is decided refused_regression (a lower epoch than
+// the agent's live one; a Repair never re-bases, so ageing the clock changes nothing), each Repair
+// flags the row, counts a decision and is acked Redelivered (the agent stops resending), yet the
+// event stays pending, retention skips pending rows, and `census_pending_events` stays above 0
+// until a paired event applies on that (agent, rule). Pinned by the A1 case in
+// test_census_pair_order.cpp so a future change is deliberate.
 constexpr const char* kCensusClear =
     "UPDATE guaranteed_state_store.guaranteed_state_events p SET projection_pending = false "
     "FROM guaranteed_state_store.guardian_agent_rule_status c "
@@ -2158,7 +2167,8 @@ constexpr const char* kCensusMarkPending =
 // DECIDE).
 // DECIDE locks that row `FOR UPDATE`, derives the pair-clock mode from the OLD row in one
 // CASE, and writes the clock and the per-agent counters in the same statement; it is the ONLY
-// writer of those columns (a counter written anywhere else could double-count a retry). $1 agent,
+// writer of those columns except pair_duplicates, written by the post-upsert UPDATE inside the
+// census savepoint (a counter written anywhere else could double-count a retry). $1 agent,
 // $2 boot_epoch (0 = unpaired), $3 emit_seq. It RETURNS the mode and the epoch the agent's most
 // recent lower-epoch recovery retired; the census write binds both (`kCensusUpsert` $11 and $12,
 // `kCensusFold` $4, `kCensusClear` $5).
