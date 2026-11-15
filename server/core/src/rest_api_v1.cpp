@@ -4788,11 +4788,12 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         if (session)
             g.created_by = session->username;
-        // The two `*_revoked` failure rows below are written after the session may be gone, when
-        // the re-resolving `audit_fn` would stamp an empty principal: they are stamped from the
-        // session resolved here, before the `attempted` row (the same one the attempted row
-        // names). Without a session writer wired (tests) they fall back to `audit_fn`.
-        const AuditFn revoked_audit =
+        // EVERY row after the `attempted` row (the `*_revoked` failure rows and the outcome row)
+        // is written after the session may be gone (the recheck below and create_group's pool
+        // wait both come first), when the re-resolving `audit_fn` would stamp an empty principal:
+        // they are stamped from the session resolved here, before the `attempted` row (the one
+        // that row names). Without a session writer wired (tests) they fall back to `audit_fn`.
+        const AuditFn bound_audit =
             (session && audit_as_session) ? audit_as(audit_as_session, *session) : audit_fn;
 
         if (!detail::audit_attempted(audit_fn, req, res, "management_group.create",
@@ -4803,7 +4804,7 @@ void RestApiV1::register_routes(
         // session invalidated or a grant revoked during the wait creates nothing.
         const auto fresh_session = auth_fn(req, res);
         if (!fresh_session) {
-            (void)detail::emit_behavioral_audit(revoked_audit, req, res, "management_group.create",
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 "session_revoked");
             if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
@@ -4814,7 +4815,7 @@ void RestApiV1::register_routes(
             return;
         }
         if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
-            (void)detail::emit_behavioral_audit(revoked_audit, req, res, "management_group.create",
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 "permission_revoked");
             return;
@@ -4827,7 +4828,7 @@ void RestApiV1::register_routes(
             // never the store text (which can carry database error output).
             const auto token = create_failure_token(result.error());
             const bool fault = token == kMgmtGroupTokenStoreError;
-            (void)detail::emit_behavioral_audit(audit_fn, req, res, "management_group.create",
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
                                                 std::string(token));
             if (fault) {
@@ -4844,7 +4845,7 @@ void RestApiV1::register_routes(
         }
         // The group exists: a lost outcome row keeps the 201 and marks the response
         // `Sec-Audit-Failed` (the `attempted` row stands as "started, outcome unknown").
-        (void)detail::emit_behavioral_audit(audit_fn, req, res, "management_group.create",
+        (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                             "success", "ManagementGroup", *result, g.name);
         res.status = 201;
         res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
@@ -5057,15 +5058,16 @@ void RestApiV1::register_routes(
     // on the audit pool), `session_revoked` / `permission_revoked` failure rows; then the
     // mutation; then the outcome row. Failure rows carry FIXED detail tokens only. This is the
     // post-attempted re-check, the member twin of the one in POST /api/v1/management-groups.
-    // `revoked_audit` stamps the two `*_revoked` failure rows from the session the route resolved
-    // BEFORE the `attempted` row (see the create route): the re-resolving `audit_fn` would stamp
-    // an empty principal once the session is gone.
+    // `bound_audit` stamps every row after the `attempted` row (these two `*_revoked` failure
+    // rows and the outcome row) from the session the route resolved BEFORE the `attempted` row
+    // (see the create route): the re-resolving `audit_fn` would stamp an empty principal once
+    // the session is gone.
     const auto mgmt_member_recheck = [auth_fn, perm_fn](const httplib::Request& req,
                                                         httplib::Response& res, const char* action,
                                                         const std::string& group_id,
-                                                        const AuditFn& revoked_audit) {
+                                                        const AuditFn& bound_audit) {
         if (!auth_fn(req, res)) {
-            (void)detail::emit_behavioral_audit(revoked_audit, req, res, action, "failure",
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
                                                 "ManagementGroup", group_id, "session_revoked");
             if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                 res.status = 401;
@@ -5075,7 +5077,7 @@ void RestApiV1::register_routes(
             return false;
         }
         if (!perm_fn(req, res, "ManagementGroup", "Write")) { // writes its own 403
-            (void)detail::emit_behavioral_audit(revoked_audit, req, res, action, "failure",
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
                                                 "ManagementGroup", group_id, "permission_revoked");
             return false;
         }
@@ -5154,17 +5156,17 @@ void RestApiV1::register_routes(
                   // outcome refuses the add. Unreadable is recorded as neither known nor unknown.
                   const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
                   // The session the `attempted` row names, resolved before it (see the create
-                  // route): the `*_revoked` failure rows below are stamped from it.
+                  // route): every row after the `attempted` row is stamped from it.
                   const auto session = auth_fn(req, res); // writes its own 401
                   if (!session)
                       return;
-                  const AuditFn revoked_audit =
+                  const AuditFn bound_audit =
                       audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
                   if (!detail::audit_attempted(audit_fn, req, res, "management_group.add_member",
                                                "ManagementGroup", group_id, agent_id))
                       return;
                   if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id,
-                                           revoked_audit))
+                                           bound_audit))
                       return;
                   if (auto added = mgmt_store->add_member(group_id, agent_id); !added) {
                       // The group vanished between the check above and the insert (the
@@ -5173,13 +5175,13 @@ void RestApiV1::register_routes(
                       // never left without one.
                       if (mgmt_group_confirmed_absent(mgmt_store, group_id)) {
                           (void)detail::emit_behavioral_audit(
-                              audit_fn, req, res, "management_group.add_member", "failure",
+                              bound_audit, req, res, "management_group.add_member", "failure",
                               "ManagementGroup", group_id, "group_not_found");
                           mgmt_group_not_found(res);
                           return;
                       }
                       spdlog::warn("management_group.add_member store failure: {}", added.error());
-                      (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                      (void)detail::emit_behavioral_audit(bound_audit, req, res,
                                                           "management_group.add_member", "failure",
                                                           "ManagementGroup", group_id,
                                                           "store_error");
@@ -5191,7 +5193,7 @@ void RestApiV1::register_routes(
                   // The success row's detail ends with the `agent_known=` flag (see
                   // mgmt_group_agent_known.hpp for how a reader takes it).
                   (void)detail::emit_behavioral_audit(
-                      audit_fn, req, res, "management_group.add_member", "success",
+                      bound_audit, req, res, "management_group.add_member", "success",
                       "ManagementGroup", group_id, add_member_success_detail(agent_id, agent_known));
                   res.status = 201;
                   res.set_content(ok_json(JObj().add("added", true).str()), "application/json");
@@ -5237,23 +5239,23 @@ void RestApiV1::register_routes(
             const auto session = auth_fn(req, res); // writes its own 401
             if (!session)
                 return;
-            const AuditFn revoked_audit =
+            const AuditFn bound_audit =
                 audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
             if (!detail::audit_attempted(audit_fn, req, res, "management_group.remove_member",
                                          "ManagementGroup", group_id, agent_id))
                 return;
             if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id,
-                                     revoked_audit))
+                                     bound_audit))
                 return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
                 spdlog::warn("management_group.remove_member store failure: {}", removed.error());
-                (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                (void)detail::emit_behavioral_audit(bound_audit, req, res,
                                                     "management_group.remove_member", "failure",
                                                     "ManagementGroup", group_id, "store_error");
                 mgmt_write_failed(res);
                 return;
             }
-            (void)detail::emit_behavioral_audit(audit_fn, req, res,
+            (void)detail::emit_behavioral_audit(bound_audit, req, res,
                                                 "management_group.remove_member", "success",
                                                 "ManagementGroup", group_id, agent_id);
             res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");

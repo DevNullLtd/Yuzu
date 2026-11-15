@@ -90,6 +90,12 @@ struct AuditFirstHarness {
     /// every auth_fn / perm_fn call from then on answers that way.
     bool session_gone_after_attempted = false;
     bool perm_revoked_after_attempted = false;
+    /// The session is gone only AFTER the route's post-attempted re-check has passed (the
+    /// re-check is the first auth_fn call once an attempted row is stored): the window in which
+    /// the outcome row is written. A row the re-resolving `audit_fn` stamps from then on names
+    /// nobody, so a row that names the session was written through the session-bound writer.
+    bool session_gone_after_recheck = false;
+    std::size_t post_attempted_auth_calls = 0;
     /// Runs ONCE, between the `attempted` row and the membership write (the first auth_fn call
     /// after the attempted row is stored): the deterministic injection point for a change that
     /// lands between the route's checks and its write, e.g. deleting the group.
@@ -142,6 +148,8 @@ struct AuditFirstHarness {
             }
             if (session_gone_after_attempted && attempted_stored())
                 return std::nullopt; // writes no response of its own: the route covers the 401
+            if (attempted_stored())
+                ++post_attempted_auth_calls;
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::user;
@@ -165,7 +173,8 @@ struct AuditFirstHarness {
                 return false;
             // Production re-resolves the session from the request at write time: once it is
             // gone the row names nobody.
-            const bool session_alive = !(session_gone_after_attempted && attempted_stored());
+            const bool session_alive = !(session_gone_after_attempted && attempted_stored()) &&
+                                       !(session_gone_after_recheck && post_attempted_auth_calls > 0);
             audits.push_back({action, result, target_type, target_id, detail,
                               session_alive ? "tester" : "", /*bound=*/false});
             return true;
@@ -1401,5 +1410,113 @@ TEST_CASE("POST and DELETE members: the session_revoked failure row names the pr
         CHECK(rows[1].principal == "tester");
         CHECK(rows[1].principal == rows[0].principal);
         CHECK(h.member_count(gid) == 1);
+    }
+}
+
+// ── Every row after the attempted row is written through the session-bound writer ───────────────
+// The re-check passes, then the session lapses (create_group and add_member can wait up to 4 s on
+// the pool): an outcome row stamped by the re-resolving `audit_fn` would name nobody. The harness's
+// `audit_fn` models that (principal "" once `session_gone_after_recheck`), so these cases fail on a
+// route that writes any outcome row through it.
+
+TEST_CASE("POST /management-groups: the success and failure outcome rows are session-bound and "
+          "name the attempted row's principal",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    h.session_gone_after_recheck = true;
+
+    SECTION("success row") {
+        auto res = h.create(R"({"name":"bound-success"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[0].principal == "tester");
+        CHECK(h.audits[1].result == "success");
+        CHECK(h.audits[1].bound);
+        CHECK(h.audits[1].principal == "tester");
+        CHECK(h.audits[1].principal == h.audits[0].principal);
+    }
+    SECTION("name_conflict failure row") {
+        make_group(h, "bound-dup");
+        auto res = h.create(R"({"name":"bound-dup"})");
+        REQUIRE(res);
+        REQUIRE(h.create_rows() == 2);
+        const auto rows = h.rows_of(kCreate);
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+    SECTION("store_error failure row") {
+        drop_mgmt_table(h, "management_group_store.management_groups");
+        auto res = h.create(R"({"name":"bound-fault"})");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kCreate);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+}
+
+TEST_CASE("POST /management-groups/{id}/members: the success and group_not_found rows are "
+          "session-bound and name the attempted row's principal",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    h.session_gone_after_recheck = true;
+    const std::string gid = make_group(h, "bound-add");
+
+    SECTION("success row") {
+        auto res = h.add_member(gid, R"({"agent_id":"agent-b1"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        const auto rows = h.rows_of(kAdd);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].result == "success");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+    SECTION("group_not_found failure row") {
+        h.after_attempted_hook = [&h, &gid]() { CHECK(h.mgmt_bundle->delete_group(gid).has_value()); };
+        auto res = h.add_member(gid, R"({"agent_id":"agent-b2"})");
+        REQUIRE(res);
+        CHECK(res->status == 404);
+        const auto rows = h.rows_of(kAdd);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "group_not_found");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: the success and store_error rows are "
+          "session-bound and name the attempted row's principal",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    h.session_gone_after_recheck = true;
+    const std::string gid = make_group(h, "bound-remove");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-b3").has_value());
+
+    SECTION("success row") {
+        auto res = h.remove_member(gid, "agent-b3");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kRemove);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].result == "success");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+    SECTION("store_error failure row") {
+        drop_mgmt_table(h, "management_group_store.management_group_members");
+        auto res = h.remove_member(gid, "agent-b3");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kRemove);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "store_error");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == rows[0].principal);
     }
 }

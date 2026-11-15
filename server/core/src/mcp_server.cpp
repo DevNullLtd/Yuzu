@@ -8562,16 +8562,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     detail_text);
             };
 
-            // The two `*_revoked` failure rows are written after the session may be gone, when the
-            // re-resolving `audit_fn` would stamp an empty principal. They go through the
-            // session-bound writer (`ToolDeps::audit_as_session_fn`, the one REST binds its
-            // session-bound rows to) with the session this call resolved BEFORE the `attempted`
-            // row, so they name the same principal as that row. server.cpp binds the writer only
-            // where the runtime-config store is open (the DEX score policy tools' deps, whose
-            // tripwire pins that wiring); with none wired (that deployment, tests) they use
-            // mg_audit, whose row re-resolves the session. Any exception from the writer is
-            // caught like mg_audit's.
-            auto mg_audit_pre_wait = [&](const char* action, const char* result_status,
+            // EVERY management-group row after the `attempted` row (the `*_revoked` failure rows
+            // and the outcome row) is written after the session may be gone (the recheck and the
+            // store's pool wait both come first), when the re-resolving `audit_fn` would stamp an
+            // empty principal. They go through the session-bound writer
+            // (`ToolDeps::audit_as_session_fn`, the one REST binds its session-bound rows to)
+            // with the session this call resolved BEFORE the `attempted` row, so they name the
+            // same principal as that row. server.cpp binds the writer only where the
+            // runtime-config store is open (the DEX score policy tools' deps, whose tripwire pins
+            // that wiring); with none wired (that deployment, tests) they use mg_audit, whose row
+            // re-resolves the session. Any exception from the writer is caught like mg_audit's.
+            auto mg_audit_bound = [&](const char* action, const char* result_status,
                                          const std::string& target_id,
                                          const std::string& detail_text) -> bool {
                 if (!tool_deps_.audit_as_session_fn)
@@ -13824,7 +13825,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
                 const auto fresh = auth_fn(req, res);
                 if (!fresh || fresh->username != session->username) {
-                    (void)mg_audit_pre_wait("management_group.create", "failure", "",
+                    (void)mg_audit_bound("management_group.create", "failure", "",
                                             "session_revoked");
                     if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                         res.status = 401;
@@ -13835,7 +13836,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write")) {
-                    (void)mg_audit_pre_wait("management_group.create", "failure", "",
+                    (void)mg_audit_bound("management_group.create", "failure", "",
                                             "permission_revoked");
                     return;
                 }
@@ -13846,8 +13847,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto token = create_failure_token(result.error());
                     const bool conflict = token == kMgmtGroupTokenNameConflict;
                     const bool fault = token == kMgmtGroupTokenStoreError;
-                    const bool audit_ok = mg_audit("management_group.create", "failure", "",
-                                                   std::string(token));
+                    const bool audit_ok = mg_audit_bound("management_group.create", "failure", "",
+                                                         std::string(token));
                     mcp_audit("failure", conflict ? std::string(kMgmtGroupTokenNameConflict)
                                                   : (fault ? std::string(kMgmtGroupTokenStoreError)
                                                            : result.error()));
@@ -13863,7 +13864,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = mg_audit("management_group.create", "success", *result, name);
+                const bool audit_ok =
+                    mg_audit_bound("management_group.create", "success", *result, name);
                 JObj payload;
                 payload.add("id", *result);
                 if (!audit_ok)
@@ -14242,7 +14244,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // `auth_fn` / `perm_fn` write their own 401 / 403 into `res`.
                 const auto fresh = auth_fn(req, res);
                 if (!fresh || fresh->username != session->username) {
-                    (void)mg_audit_pre_wait("management_group.add_member", "failure", group_id,
+                    (void)mg_audit_bound("management_group.add_member", "failure", group_id,
                                             "session_revoked");
                     if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                         res.status = 401;
@@ -14253,7 +14255,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write")) {
-                    (void)mg_audit_pre_wait("management_group.add_member", "failure", group_id,
+                    (void)mg_audit_bound("management_group.add_member", "failure", group_id,
                                             "permission_revoked");
                     return;
                 }
@@ -14265,16 +14267,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     // `failure` outcome row with a fixed token so the `attempted` row is never
                     // left without one.
                     if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
-                        (void)mg_audit("management_group.add_member", "failure", group_id,
-                                       "group_not_found");
+                        (void)mg_audit_bound("management_group.add_member", "failure", group_id,
+                                             "group_not_found");
                         mcp_audit("denied", "group not found");
                         res.set_content(a4_error(kInvalidParams, "group not found"),
                                         "application/json");
                         return;
                     }
                     spdlog::warn("add_management_group_member store failure: {}", result.error());
-                    const bool audit_ok =
-                        mg_audit("management_group.add_member", "failure", group_id, "store_error");
+                    const bool audit_ok = mg_audit_bound("management_group.add_member", "failure",
+                                                         group_id, "store_error");
                     res.set_content(
                         a4_error(info.code, "management group store unavailable", "retry shortly",
                                  /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
@@ -14284,8 +14286,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // The success row's detail ends with the `agent_known=` flag (see
                 // mgmt_group_agent_known.hpp for how a reader takes it).
-                const bool audit_ok = mg_audit("management_group.add_member", "success", group_id,
-                                               add_member_success_detail(agent_id, agent_known));
+                const bool audit_ok =
+                    mg_audit_bound("management_group.add_member", "success", group_id,
+                                   add_member_success_detail(agent_id, agent_known));
                 JObj payload;
                 payload.add("added", true);
                 if (!audit_ok)

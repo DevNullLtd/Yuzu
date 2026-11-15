@@ -30741,6 +30741,108 @@ TEST_CASE("MCP add_management_group_member: authority is decided again after the
     }
 }
 
+// ── Every row after the attempted row is written through the session-bound writer ─────────────
+// The re-check passes, then the credential lapses before the outcome row is written. The
+// re-resolving `audit_fn` of the fixture names nobody once `mock_auth_enabled` is false, so these
+// cases fail on a handler that writes any outcome row through it.
+
+namespace {
+
+/// Revoke the credential the moment the post-attempted re-check has PASSED: the permission check
+/// is its last step, and the first one made once the `attempted` row of `attempted_row` is stored.
+/// Captures only `ts` (a free function, see mg_attempted_stored).
+void mg_credential_lapses_after_recheck(McpTestServer& ts, const std::string& attempted_row) {
+    ts.perm_override_for_test = [&ts, attempted_row](const std::string& securable,
+                                                     const std::string& op) {
+        if (securable == "ManagementGroup" && op == "Write" &&
+            mg_attempted_stored(ts, attempted_row))
+            ts.mock_auth_enabled = false;
+        return true;
+    };
+}
+
+} // namespace
+
+TEST_CASE("MCP create_management_group: the success and failure outcome rows are session-bound "
+          "and name the attempted row's principal",
+          "[mcp][pg][management_group][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    wire_mg_session_writer(ts);
+    mg_credential_lapses_after_recheck(ts, "management_group.create|attempted");
+
+    SECTION("success row") {
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", "bound-success"}}));
+        REQUIRE(res);
+        CHECK(store.list_groups().size() == 1);
+        REQUIRE(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                               "management_group.create|success"});
+        CHECK(mg_create_row_field(ts, ts.audit_principals, 0) == "test-user");
+        CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == "test-user");
+    }
+    SECTION("name_conflict failure row") {
+        yuzu::server::ManagementGroup first;
+        first.name = "bound-dup";
+        first.membership_type = "static";
+        REQUIRE(store.create_group(first).has_value());
+        ts.start();
+        auto res = ts.call(mg_create_body({{"name", "bound-dup"}}));
+        REQUIRE(res);
+        REQUIRE(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                               "management_group.create|failure"});
+        CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == "test-user");
+    }
+}
+
+TEST_CASE("MCP add_management_group_member: the success and failure outcome rows are "
+          "session-bound and name the attempted row's principal",
+          "[mcp][pg][management_group][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+
+    // Declared before `ts`: the callback below captures them and `ts` is destroyed first.
+    bool deleted = false;
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    wire_mg_session_writer(ts);
+    mg_credential_lapses_after_recheck(ts, "management_group.add_member|attempted");
+
+    SECTION("success row") {
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-b1"));
+        REQUIRE(res);
+        CHECK(f.store.get_members(f.gid).size() == 1);
+        REQUIRE(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                            "management_group.add_member|success"});
+        CHECK(mg_add_row_field(ts, ts.audit_principals, 0) == "test-user");
+        CHECK(mg_add_row_field(ts, ts.audit_principals, 1) == "test-user");
+    }
+    SECTION("group_not_found failure row") {
+        ts.audit_succeeds_for_action_ = [&](const std::string& action) {
+            if (action == "management_group.add_member" && !deleted) {
+                deleted = true;
+                (void)f.store.delete_group(f.gid);
+            }
+            return true;
+        };
+        ts.start();
+        auto res = ts.call(mg_add_body(f.gid, "agent-b2"));
+        REQUIRE(res);
+        REQUIRE(deleted);
+        REQUIRE(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                            "management_group.add_member|failure"});
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "group_not_found");
+        CHECK(mg_add_row_field(ts, ts.audit_principals, 1) == "test-user");
+    }
+}
+
 TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallback admits "
           "without UserManagement:Read (compound gate)",
           "[mcp][pg][management_group]") {

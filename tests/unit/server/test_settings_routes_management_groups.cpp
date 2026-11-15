@@ -91,6 +91,12 @@ struct MgmtGroupsHarness {
     // 403 into the response, as the production callbacks do.
     bool session_gone_after_attempt{false};
     bool perm_revoked_after_attempt{false};
+    /// The session is gone only AFTER the route's post-attempted re-check passed (the re-check is
+    /// the first session resolution once an `attempted` row is stored): the window in which the
+    /// outcome row is written. A row the re-resolving hook stamps from then on names nobody, so a
+    /// row that names the session went through the session-bound writer.
+    bool session_gone_after_recheck{false};
+    std::size_t post_attempted_auth_calls{0};
     /// Runs ONCE, the first time the session is resolved after an `attempted` row is stored: the
     /// deterministic injection point for a change that lands between the route's pre-check and
     /// its insert (e.g. deleting the parent group).
@@ -134,6 +140,8 @@ struct MgmtGroupsHarness {
                 res.status = 401;
                 return std::nullopt;
             }
+            if (attempted_stored())
+                ++post_attempted_auth_calls;
             auth::Session s;
             s.username = "admin";
             s.role = auth::Role::admin;
@@ -158,20 +166,22 @@ struct MgmtGroupsHarness {
                                     const std::string& detail) -> bool {
             const bool attempted = result == "attempted";
             const bool ok = attempted ? attempt_audit_ok : outcome_audit_ok;
-            const bool alive = !(session_gone_after_attempt && attempted_stored());
+            const bool alive = !(session_gone_after_attempt && attempted_stored()) &&
+                               !(session_gone_after_recheck && post_attempted_auth_calls > 0);
             calls.push_back({action, result, target_type, target_id, detail, ok,
                              alive ? "admin" : "", /*bound=*/false});
             return ok;
         };
         // The session-bound writer, as `AuthRoutes::audit_as_session_fn()` is wired in production.
+        // It only ever writes rows AFTER the `attempted` row, so `outcome_audit_ok` governs it.
         routes.set_audit_as_session_fn(
             [this](const httplib::Request&, const auth::Session& session, const std::string&,
                    const std::string& action, const std::string& result,
                    const std::string& target_type, const std::string& target_id,
                    const std::string& detail) -> bool {
-                calls.push_back({action, result, target_type, target_id, detail, true,
+                calls.push_back({action, result, target_type, target_id, detail, outcome_audit_ok,
                                  session.username, /*bound=*/true});
-                return true;
+                return outcome_audit_ok;
             });
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve,
@@ -755,4 +765,43 @@ TEST_CASE("Settings group create: the session_revoked and permission_revoked fai
         CHECK(rows[1].principal == "admin");
     }
     CHECK(h.group_names().empty());
+}
+
+// ── Every row after the attempted row is written through the session-bound writer ──────────────
+// The re-check passes, then the session lapses (create_group can wait up to 4 s on the pool). The
+// harness's re-resolving hook models production (it names nobody once the session is gone), so
+// these cases fail on a route that writes any outcome row through `audit_read_fn_`.
+
+TEST_CASE("Settings group create: the success and failure outcome rows are session-bound and name "
+          "the attempted row's principal",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.session_gone_after_recheck = true;
+
+    SECTION("success row") {
+        auto res = h.create("Bound Success");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[0].principal == "admin");
+        CHECK(rows[1].result == "success");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == "admin");
+        CHECK(rows[1].principal == rows[0].principal);
+    }
+    SECTION("name_conflict failure row") {
+        ManagementGroup first;
+        first.name = "Bound Dup";
+        first.membership_type = "static";
+        REQUIRE(h.mgmt_group_store.create_group(first).has_value());
+        auto res = h.create("Bound Dup");
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].result == "failure");
+        CHECK(rows[1].bound);
+        CHECK(rows[1].principal == rows[0].principal);
+    }
 }
