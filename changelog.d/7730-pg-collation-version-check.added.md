@@ -1,9 +1,9 @@
 - **The server now checks the PostgreSQL collation version at start and repeats the check.**
   On the first start after the upgrade, a database that has already drifted logs one error naming the database and both versions and sets `yuzu_pg_collation_version_mismatch` to `1`; nothing else changes, because the check only reports and does not stop the server or change the database.
   The check compares the database's recorded collation version with the version the operating system of the PostgreSQL server reports, which can differ after an operating-system or libc upgrade without a reindex.
-  The first check runs in the server's constructor and can delay the listener bind by about 15 seconds (about 35 seconds on a network that drops packets) when the database answers slowly.
+  The first check runs in the server's constructor and can delay the listener bind by about 15 seconds in practice (about 35 seconds on a network that drops packets) when the database answers slowly.
   The check repeats every hour once a readable check has concluded, and every minute while a mismatch stands, no check has concluded yet or the latest one could not run.
-  The gauge is `1` on a mismatch, `0` on a match, absent until a check learns something, and removed again when the check does not apply (a `C` or `POSIX` collation, PostgreSQL before 15, or no recorded version).
+  The gauge is `1` on a mismatch, `0` on a match, absent until a check learns something, and removed again when the check does not apply (a libc `C` or `POSIX` collation, PostgreSQL before 15, or no recorded version).
   A check that could not run leaves the gauge as it was.
   The counter `yuzu_pg_collation_check_total{result}` counts every check by `ok`, `mismatch`, `not_applicable` or `unreadable`, and the gauge `yuzu_pg_collation_check_last_completed_timestamp_seconds` gives the time of the latest completed check.
   Three alerts ship in `docs/prometheus/yuzu-alerts.yml` and fire only when that file is loaded.

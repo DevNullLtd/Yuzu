@@ -11158,7 +11158,7 @@ public:
             if (software_normalization_job_)
                 software_normalization_job_->request_stop();
             // The collation recheck is told to stop here too, without a join: a check in flight can
-            // take about 15 s (up to about 35 s on a network that drops packets, see the join
+            // take about 15 s in practice (up to about 35 s on a network that drops packets, see the join
             // below) and signalled now it overlaps the drain and the web server stop instead of
             // being added after them. Its join is the LAST step before pg_pool_ is reset.
             if (pg_collation_recheck_)
@@ -12483,8 +12483,9 @@ public:
         // flush above (an orchestrator kill during the wait would skip them). request_stop() was
         // called at the start of the drain, so the check has been running alongside the drain and
         // the rest of teardown; the join waits only for what is left of it. With the pool defaults
-        // that is bounded by about 15 s (the 5 s acquire and two 5 s statements,
-        // pg_collation_check.hpp), up to about 35 s if the network drops packets (a new connection
+        // that is about 15 s in practice (the 5 s acquire and two 5 s statements,
+        // pg_collation_check.hpp; the BEGIN and SET LOCAL before them run under the pool's 30 s
+        // statement timeout and normally return at once), up to about 35 s if the network drops packets (a new connection
         // adds the pool's 10 s connect timeout and a silent connection is given up on by
         // tcp_user_timeout_ms, 10 s by default, which statement_timeout cannot enforce;
         // pg_pool.hpp). It is NOT bounded against a backend that is frozen while its connection

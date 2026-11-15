@@ -33,8 +33,11 @@
 /// the check function borrows is reset, after the leader lease is released and the audit and
 /// offload flushes have run (a wait there must not be able to skip them). The split exists because
 /// the join can wait out the check in flight. With the pool defaults that wait is about 15 seconds
-/// (the acquire and each of the two statements are bounded at 5 seconds in
-/// `pg_collation_check.hpp`; a saturated pool fails the acquire sooner), and up to about 35 seconds
+/// in practice (the acquire and each of the two statements are bounded at 5 seconds in
+/// `pg_collation_check.hpp`; a saturated pool fails the acquire sooner; the `BEGIN` and the
+/// `SET LOCAL` that sets the 5 second bound run first, under the pool's 30 second statement
+/// timeout, and normally return at once; a connection string with its own `options` gets no pool
+/// statement timeout at all), and up to about 35 seconds
 /// if the network drops packets (a new connection adds the pool's 10 second connect timeout, and a
 /// silent connection is given up on by `tcp_user_timeout_ms`, 10 seconds by default, which
 /// `statement_timeout` cannot enforce; `pg_pool.hpp`). It is NOT bounded against a backend that is

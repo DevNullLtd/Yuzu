@@ -43,7 +43,8 @@
 /// Verdicts:
 ///   - Ok: the recorded and the actual version are equal.
 ///   - NotApplicable: this PostgreSQL has no `datcollversion` column (before 15), or the recorded
-///     version is NULL (a database on the `C`/`POSIX` collation or the builtin provider has none).
+///     version is NULL (a database on the libc `C`/`POSIX` collation has none; a database on the
+///     builtin provider records a version and is checked, measured on PostgreSQL 18.4).
 ///   - Mismatch: both are known and they differ.
 ///   - Unreadable: the facts could not be read, or the recorded version is set but the operating
 ///     system could not report the actual one.

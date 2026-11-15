@@ -4644,7 +4644,7 @@ groups:
         # database's recorded collation version differs from the one the operating system of
         # the PostgreSQL server reports, 0 when they match. A check that could not run leaves
         # the gauge as it was, so a standing 1 keeps firing and the rule cannot clear on
-        # "unknown". The series is ABSENT when no check has learned anything (a C/POSIX
+        # "unknown". The series is ABSENT when no check has learned anything (a libc C/POSIX
         # collation, a server before PostgreSQL 15, or checks that cannot run): an absent
         # series means the check could not run or does not apply, NOT that the database is
         # healthy, and this rule is silent on it: the alert YuzuPgCollationCheckBlind covers
