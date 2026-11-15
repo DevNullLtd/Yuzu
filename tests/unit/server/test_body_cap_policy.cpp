@@ -182,6 +182,7 @@ constexpr ExpectedResolution kExpected[] = {
     // (looser) catch-all.
     {"GET",    "/api/v1/hardware",                        4u * 1024,          true,  "hardware"},
     {"GET",    "/api/v1/hardware/agent-1",                4u * 1024,          true,  "hardware"},
+    {"GET",    "/api/v1/hardware/ci",                     4u * 1024,          true,  "hardware"},
     {"POST",   "/api/v1/hardware/agent-1/sync",           4u * 1024,          true,  "hardware"},
     {"POST",   "/api/v1/hardware/sync",                   4u * 1024,          true,  "hardware"},
     // body_cap_policy.hpp rbac_role_assignment row — A2 global human role

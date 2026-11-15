@@ -20617,6 +20617,15 @@ private:
             }
             return detail;
         };
+        // The keyset read of the stored CI rows behind GET /api/v1/hardware/ci and the MCP
+        // list_hardware_ci_records twin: ONE closure for both, so they page the same table the same
+        // way. An unwired store reads as a degrade (nullopt), never an empty page.
+        auto hw_ci_page_reader =
+            [this](const DeviceCiKeysetQuery& q) -> std::optional<std::vector<DeviceCiRecord>> {
+            if (!device_inventory_store_)
+                return std::nullopt;
+            return device_inventory_store_->list_device_ci_after(q);
+        };
         // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
         // devices tables and the Quarantined devices panel.
         auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
@@ -20803,6 +20812,7 @@ private:
                              .audit_fn = audit_fn,
                              .roster_fn = build_hw_roster,
                              .ci_detail_fn = hw_ci_detail_fn,
+                             .ci_page_reader = hw_ci_page_reader,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -23670,6 +23680,7 @@ private:
             tool_deps.audit_fn = audit_fn;
             tool_deps.roster_fn = build_hw_roster;
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
+            tool_deps.ci_page_reader = hw_ci_page_reader;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2

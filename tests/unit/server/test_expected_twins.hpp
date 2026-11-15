@@ -222,6 +222,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // same Inventory:Read gate through fleet_read_fn.
     {"list_hardware_ci", "Inventory", "Read", true},
     {"get_hardware_ci", "Inventory", "Read", true},
+    // The bulk CI page, pinned against GET /api/v1/hardware/ci (hardware_routes.cpp): the same
+    // Inventory:Read gate through fleet_read_fn.
+    {"list_hardware_ci_records", "Inventory", "Read", true},
     // Seam PR2: list_quarantined_devices, pinned against GET /api/v1/quarantine
     // (rest_api_v1.cpp): the same Security:Read gate through require_fleet_read.
     {"list_quarantined_devices", "Security", "Read", true},

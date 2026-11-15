@@ -2798,6 +2798,10 @@ std::optional<std::string> failing_digest_provider(std::string_view) {
 // cause is named in the log.
 TEST_CASE("a failing digest provider aborts the full replace and leaves the previous set intact",
           "[pg][device_ci][v2][digest]") {
+// ── list_device_ci_after: the keyset read behind GET /api/v1/hardware/ci ──────────────────────
+
+TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in SQL",
+          "[pg][device_ci][keyset]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 3}};
     REQUIRE(pool.valid());
@@ -2855,6 +2859,285 @@ TEST_CASE("the read-degrade counter tells a failed record read from a failed sec
           "[pg][device_ci][v2][metrics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    // Five agents stored out of key order; agent-c is a v1 record, the rest are v2. Every id
+    // carries its own content hash so a row can be told from its neighbour by it.
+    std::map<std::string, std::string> hash_of;
+    for (const char* id : {"agent-d", "agent-b", "agent-e", "agent-a", "agent-c"}) {
+        DeviceCiRecord r = std::string(id) == "agent-c" ? parse_device_ci_blob(sample_blob())
+                                                        : distinct_v2_record("A");
+        r.hostname = std::string("host-") + id;
+        if (r.blob_version >= 2)
+            r.content_hash = std::string("hash-") + id;
+        hash_of[id] = DeviceInventoryStore::canonical_hash(r);
+        REQUIRE(store.apply_device_ci(id, hash_of[id], std::optional<DeviceCiRecord>{r}, 1) ==
+                InventoryIngestOutcome::kStored);
+    }
+    const auto ids_of = [](const std::vector<DeviceCiRecord>& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows)
+            out.push_back(r.agent_id);
+        return out;
+    };
+
+    SECTION("walking with after = the last id visits every row once, in agent_id order") {
+        std::vector<std::string> seen;
+        std::string after;
+        int pages = 0;
+        for (;;) {
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.after = after;
+            q.limit = 2;
+            const auto page = store.list_device_ci_after(q);
+            REQUIRE(page.has_value());
+            REQUIRE(++pages < 10);
+            if (page->empty())
+                break;
+            for (const auto& r : *page)
+                seen.push_back(r.agent_id);
+            after = page->back().agent_id;
+        }
+        CHECK(seen == std::vector<std::string>{"agent-a", "agent-b", "agent-c", "agent-d", "agent-e"});
+        CHECK(pages == 4); // 2 + 2 + 1, then the empty read that ends the walk
+    }
+
+    SECTION("a row carries its scalar fields, the stored hash and its blob version") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 5);
+        for (const auto& r : *page) {
+            INFO(r.agent_id);
+            CHECK(r.content_hash == hash_of[r.agent_id]);
+            CHECK(r.hostname == "host-" + r.agent_id);
+            CHECK(r.serial == "ABC123");
+            CHECK(r.sections.empty()); // scalars only: the sections stay on the per-id read
+        }
+        const auto& v1 = (*page)[2];
+        REQUIRE(v1.agent_id == "agent-c");
+        CHECK(v1.blob_version == 1);
+        CHECK(v1.chassis_type.empty());
+        CHECK(v1.machine_id_hash.empty());
+        const auto& v2 = (*page)[0];
+        CHECK(v2.blob_version == 2);
+        CHECK(v2.chassis_type == "chassis-type-A");
+        // the keyset read and the per-id read agree on the scalars
+        const auto one = store.get_device_ci("agent-a");
+        REQUIRE(one.has_value());
+        REQUIRE(one->has_value());
+        CHECK((**one).serial == v2.serial);
+        CHECK((**one).last_seen == v2.last_seen);
+    }
+
+    SECTION("after is exclusive, and a limit bounds the page") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.after = "agent-b";
+        q.limit = 2;
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c", "agent-d"});
+        q.after = "agent-e"; // the last key: nothing follows
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+        q.after = "agent-bz"; // between two keys: the next key above it
+        q.limit = 1;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-c"});
+    }
+
+    // Kills: dropping `agent_id > after` when an agent_id filter is also set (the combined WHERE
+    // is built from independent clauses, so each must survive the other).
+    SECTION("agent_id and after combine: the named device is served only beyond the bound") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_id = "agent-d";
+        q.after = "agent-c";
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d"});
+        q.after = "agent-d";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("agent_id and agent_ids narrow the read") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_id = "agent-d";
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-d"});
+
+        q.agent_id = "no-such-agent";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+
+        q.agent_id.reset();
+        q.agent_ids = std::vector<std::string>{"agent-e", "agent-a", "ghost"};
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-a", "agent-e"});
+
+        q.after = "agent-a"; // the keyset bound and the id set compose
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(ids_of(*page) == std::vector<std::string>{"agent-e"});
+
+        // agent_id inside agent_ids is an intersection
+        q.after.clear();
+        q.agent_id = "agent-b";
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("a present-empty agent_ids is an empty page") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_ids = std::vector<std::string>{};
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->empty());
+    }
+
+    SECTION("a limit of zero or below is the store's row ceiling, not zero rows") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 0;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 5);
+    }
+
+    SECTION("ids with quote, backslash, comma and brace characters travel as data") {
+        const std::string odd = "we\"ird,\\id{}";
+        DeviceCiRecord r = distinct_v2_record("A");
+        r.hostname = "odd-host";
+        r.content_hash = "hash-odd";
+        REQUIRE(store.apply_device_ci(odd, DeviceInventoryStore::canonical_hash(r),
+                                      std::optional<DeviceCiRecord>{r}, 1) ==
+                InventoryIngestOutcome::kStored);
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = 10;
+        q.agent_ids = std::vector<std::string>{odd, "agent-a"};
+        auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 2);
+        q.agent_ids.reset();
+        q.agent_id = odd;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        REQUIRE(page->size() == 1);
+        CHECK((*page)[0].agent_id == odd);
+        q.agent_id.reset();
+        q.after = odd;
+        page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value()); // a bound parameter, not SQL text
+    }
+}
+
+// Kills: setting the timeout with a session-level SET (it would leak onto the pooled connection
+// every other store shares).
+TEST_CASE("list_device_ci_after's statement timeout is transaction-local",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto show_timeout = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = yuzu::server::pg::exec_params(lease.get(), "SHOW statement_timeout",
+                                                 std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return PQgetvalue(res.get(), 0, 0);
+    };
+    const std::string before = show_timeout();
+    REQUIRE(store.list_device_ci_after({}).has_value()); // the one connection runs the read
+    CHECK(show_timeout() == before);
+}
+
+// Kills: removing the SET LOCAL statement_timeout, which would let a stalled read hold one of the
+// shared pool's connections for the pool's own (longer) default. The stall is a table lock held by
+// another connection; the read gives up at the store's cap (5 s), which costs this test about 5 s.
+TEST_CASE("list_device_ci_after gives up at its statement timeout and reads again afterwards",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    // The pool's own lock_timeout (10 s by default) is switched off so only a statement timeout can
+    // end the stall: with it on, the lock wait would end the read at 10 s whatever the store sets.
+    PgPool pool{{.conninfo = db.dsn(), .size = 3, .lock_timeout_ms = 0}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.content_hash = "hash-t";
+    REQUIRE(store.apply_device_ci("agent-t", DeviceInventoryStore::canonical_hash(r),
+                                  std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+
+    auto holder = pool.acquire();
+    REQUIRE(holder);
+    const auto run = [&](const char* sql) {
+        auto res = yuzu::server::pg::exec_params(holder.get(), sql, std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    };
+    run("BEGIN");
+    run("LOCK TABLE device_inventory_store.device_ci IN ACCESS EXCLUSIVE MODE");
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto stalled = store.list_device_ci_after({});
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    CHECK_FALSE(stalled.has_value()); // a timeout is a degrade, never an empty page
+    CHECK(waited >= std::chrono::seconds(4));
+    CHECK(waited < std::chrono::seconds(15)); // the pool's own statement timeout is 30 s
+
+    run("ROLLBACK");
+    const auto after = store.list_device_ci_after({});
+    REQUIRE(after.has_value());
+    CHECK(after->size() == 1);
+}
+
+TEST_CASE("list_device_ci_after degrades (not empty) on a closed store", "[device_ci][keyset]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+    yuzu::server::DeviceCiKeysetQuery deny_all;
+    deny_all.agent_ids = std::vector<std::string>{};
+    // a closed store is a degrade even for a deny-all read
+    CHECK_FALSE(store.list_device_ci_after(deny_all).has_value());
+}
+
+namespace {
+
+double ci_read_degrades(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_inventory_read_degrade_total", {{"reason", reason}, {"source", "device_ci"}})
+        .value();
+}
+
+} // namespace
+
+// The keyset read's three degrade causes are counted under three different reason labels, which is
+// what lets an operator tell a closed store from a saturated pool from a failing query.
+TEST_CASE("list_device_ci_after counts a closed store as store_not_open", "[device_ci][keyset]") {
+    PgPool pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=x user=x", .size = 1}};
+    DeviceInventoryStore store{pool};
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+    REQUIRE(!store.is_open());
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
+    CHECK(ci_read_degrades(metrics, "store_not_open") == 1.0);
+    CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+    CHECK(ci_read_degrades(metrics, "query_error") == 0.0);
+}
+
+TEST_CASE("list_device_ci_after counts a saturated pool as pool_acquire_timeout and a failing query as query_error",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(pool.valid());
     DeviceInventoryStore store{pool};
     REQUIRE(store.is_open());
@@ -2894,5 +3177,28 @@ TEST_CASE("the read-degrade counter tells a failed record read from a failed sec
         REQUIRE_FALSE(got.has_value());
         CHECK(degrades("query_error") == 1.0);
         CHECK(degrades("sections_query_error") == 0.0);
+
+    SECTION("the only connection is held elsewhere") {
+        auto held = pool.acquire();
+        REQUIRE(held);
+        CHECK_FALSE(store.list_device_ci_after({}).has_value());
+        CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 1.0);
+        CHECK(ci_read_degrades(metrics, "query_error") == 0.0);
+        CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
+    }
+    SECTION("the SELECT itself fails") {
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                "ALTER TABLE device_inventory_store.device_ci RENAME TO device_ci_renamed_away",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(store.list_device_ci_after({}).has_value());
+        CHECK(ci_read_degrades(metrics, "query_error") == 1.0);
+        CHECK(ci_read_degrades(metrics, "pool_acquire_timeout") == 0.0);
+        CHECK(ci_read_degrades(metrics, "store_not_open") == 0.0);
     }
 }

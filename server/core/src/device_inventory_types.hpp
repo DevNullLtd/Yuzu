@@ -84,7 +84,9 @@ struct DeviceCiRecord {
     // ── v2 additions (appended AFTER last_seen so existing designated initialisers
     //    keep compiling). Blank on a v1 record. ──
     int blob_version{1};       ///< 1 = positional 22-field blob, 2 = versioned blob
-    std::string content_hash;  ///< v2 only: sha256 of the received blob (set by the parser)
+    /// v2 only: sha256 of the received blob (set by the parser). `list_device_ci_after` (the
+    /// keyset read) also fills it from the stored column; the other reads leave it empty.
+    std::string content_hash;
     std::string chassis_type;  ///< wire position 22
     std::string chassis_serial;
     std::string chassis_asset_tag;
@@ -119,6 +121,20 @@ enum class CiReadError { kDegraded };
 struct DeviceCiWithSections {
     std::optional<DeviceCiRecord> record;
     bool sections_failed{false};
+};
+
+/// One keyset page of the stored device-CI rows, ordered by `agent_id` ascending
+/// (`DeviceInventoryStore::list_device_ci_after`). Scalar columns only: no v2 sections.
+struct DeviceCiKeysetQuery {
+    /// Exclusive lower bound on `agent_id`; empty = from the first row.
+    std::string after;
+    /// Rows wanted; the store clamps it to its own row ceiling.
+    int limit{100};
+    /// Only this agent's row, when set.
+    std::optional<std::string> agent_id;
+    /// Only these agents' rows, when set. Present-and-empty means "none": the store answers
+    /// an empty page without running SQL, which is how a deny-all scope reads.
+    std::optional<std::vector<std::string>> agent_ids;
 };
 
 } // namespace yuzu::server

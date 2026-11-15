@@ -27,6 +27,7 @@
 #include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
 #include "forensics_visibility.hpp"  // ForensicsVisibilityFn (#4990)
 #include "hardware_action_form.hpp"  // ActionFormSpec
+#include "hardware_ci_page_model.hpp" // hardware_ci_page::Reader (the bulk CI page)
 #include "hardware_list_model.hpp"
 #include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
 #include "quarantine_visible.hpp"    // QuarantineListFn (list pill)
@@ -328,6 +329,10 @@ public:
         AuditFn audit_fn;
         RosterFn roster_fn;
         CiDetailFn ci_detail_fn;
+        /// GET /api/v1/hardware/ci: the keyset read of the stored CI rows (production binds
+        /// `DeviceInventoryStore::list_device_ci_after`). Reads the CI table directly, never
+        /// the roster. Empty == the route answers 503.
+        hardware_ci_page::Reader ci_page_reader;
         ActionsFn actions_fn;
         ClassifyFn classify_fn;
         SchemaFn schema_fn;

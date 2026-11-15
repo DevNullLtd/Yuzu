@@ -2,6 +2,13 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## ⚠️ Breaking: `GET /api/v1/hardware/ci` is now the bulk CI page (a device whose agent id is `ci` is read with `?agent_id=ci`)
+
+**What changed.** `GET /api/v1/hardware/ci` now names the bulk device-CI read: one keyset page of the stored CI records of every device (the scalar CI block, the stored `content_hash` and the `blob_version`, no sections), with the MCP twin `list_hardware_ci_records`. Before this release the same URL was the per-device route `GET /api/v1/hardware/{id}` for a device whose agent id is literally `ci`.
+
+**Who is affected.** Only a deployment that has a device whose agent id is exactly `ci`. Read that device's CI row with `GET /api/v1/hardware/ci?agent_id=ci`. Its sections and installed software are then reachable only through the MCP tool `get_hardware_ci`. Every other agent id is unaffected.
+
+**Cursors and rolling upgrades.** A pagination cursor issued by this route does not survive an upgrade: start the walk again from the first page. During a rolling upgrade a replica that is still on the earlier build answers `404` for the route, so a client that gets a `404` mid-walk restarts the walk rather than retrying the cursor.
 ## ⚠️ Breaking: result sets that are pending, failed or incomplete are refused where they could be misread
 
 **What changed.**
@@ -1811,7 +1818,7 @@ bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 | Source | REST | MCP |
 |---|---|---|
 | `installed_software` | `GET /api/v1/inventory/software` | `query_installed_software` |
-| `device_ci` | `GET /api/v1/hardware/{id}` | `get_hardware_ci`, `list_hardware_ci` |
+| `device_ci` | `GET /api/v1/hardware/{id}`, `GET /api/v1/hardware/ci` (bulk) | `get_hardware_ci`, `list_hardware_ci`, `list_hardware_ci_records` (bulk) |
 | `app_perf` | `GET /api/v1/dex/perf/apps` and the other `/api/v1/dex/perf/app*` routes | `list_dex_perf_apps`, `get_dex_app_perf` |
 | `software_licensing` | `GET /api/v1/sle/agents/{agent_id}` | `query_software_licenses` |
 | `app_usage` | `GET /api/v1/forensics/agents/{agent_id}/app-usage` | `get_agent_app_usage` |
