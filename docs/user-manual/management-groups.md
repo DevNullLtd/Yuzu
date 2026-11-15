@@ -104,6 +104,8 @@ All list endpoints return a paginated envelope:
 
 ### Create a Group
 
+Creating a group is audit-first: an `attempted` audit row is stored before the group is created. If it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and creates nothing. A fault of the group store also answers `503` (with a fixed message), including a failed read of the parent group, while an empty name, a name already in use, an unknown parent or a hierarchy that is too deep answers `400`. A name over 256 bytes or holding a control character (a tab or newline, for example) answers `400` too, as does a parent id over 256 bytes or holding one (`parent group not found`); nothing is written for those. The Settings form shows the refusal text for those two inline (HTTP 200, no toast) rather than answering `400`. The Settings form and the MCP tool `create_management_group` follow the same order. A supervised MCP call that is refused because the audit row cannot be stored has already used its one-time approval, so retry it with a new approval. Management-group creation and member add and remove (REST, MCP and Settings) are audit-first and refused with `503` when the audit row cannot be stored. Group update, group delete, role assignment and unassignment, Settings delete and automatic service groups are audited after the change, or not at all, and proceed during an audit outage; they are tracked as follow-ups. This applies to both static and dynamic groups. The rows and their details are listed in [Audit Log](audit-log.md).
+
 #### Static Membership
 
 ```bash
@@ -119,8 +121,6 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/management-groups \
 ```
 
 The `created_by` field is set automatically from the authenticated session.
-
-Creating a group is audit-first: an `attempted` audit row is stored before the group is created. If it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and creates nothing. A fault of the group store also answers `503` (with a fixed message), including a failed read of the parent group, while an empty name, a name already in use, an unknown parent or a hierarchy that is too deep answers `400`. A name over 256 bytes or holding a control character (a tab or newline, for example) answers `400` too, as does a parent id over 256 bytes or holding one (`parent group not found`); nothing is written for those. The Settings form shows the refusal text for those two inline (HTTP 200, no toast) rather than answering `400`. The Settings form and the MCP tool `create_management_group` follow the same order. A supervised MCP call that is refused because the audit row cannot be stored has already used its one-time approval, so retry it with a new approval. The rows and their details are listed in [Audit Log](audit-log.md).
 
 Returns `201 Created`:
 
@@ -307,7 +307,7 @@ Returns `201 Created`:
 
 An agent id with no enrolment record is still added, so you can place a device in a group before it first appears. Whether the id has an enrolment record (pending, approved or denied) is recorded on the success audit row (`agent_known=<1|0|unreadable>` as the last token of its `detail`; filter on `result=success` before parsing it, see [Audit Log](audit-log.md)), not returned in the response. Matching is exact, letter case included, so an id in the wrong case is still added and reads `agent_known=0`. The flag is a point-in-time lookup and is not evidence that the device is enrolled; `0` is also the normal value when you stage a membership ahead of the device, so it does not by itself protect a group's scope. An `agent_id` over 256 bytes answers `400` and writes nothing.
 
-Adding and removing a member are audit-first like creating a group: an `attempted` audit row is stored before the change, and if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and changes nothing.
+Adding and removing a member are audit-first like creating a group: an `attempted` audit row is stored before the change, and if it cannot be stored the call answers `503` with `Sec-Audit-Failed: true` and changes nothing. Other group writes are not audit-first; see [Create a Group](#create-a-group).
 
 This endpoint is intended for static membership groups. For a dynamic group the server computes members only for the root group (filled at enrollment) and, as a one-time snapshot at creation, for the `Service: {name}` groups it creates itself when a `service` tag is first written; for any other dynamic group created through the API, members are not computed from the scope expression.
 
@@ -481,7 +481,7 @@ From the Settings page, administrators can:
 
 - **Create groups** -- specify name, description, parent, and membership type. If the audit row for the create cannot be stored the form shows an error toast and creates nothing.
 - **View member counts** -- each group row shows the number of member agents.
-- **Delete groups** -- a delete button appears on every group except the root group.
+- **Delete groups** -- a delete button appears on every group except the root group. The delete is audited after the change, not before.
 
 Group updates (rename, re-parent, membership type changes) are performed via the REST API `PUT` endpoint.
 
@@ -521,6 +521,7 @@ Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
 | Cascade delete | Deleting a group cascade-deletes all children, memberships, and role assignments |
 | Dynamic scope syntax | Same as the scope engine (see `docs/yaml-dsl-spec.md` section on scope expressions) |
 | Visibility filtering | Non-admin users see only agents in groups where they hold a role assignment |
+| Text bounds | A group name, a parent id, a group id and an agent id are each at most 256 bytes. A group name and a parent id must not contain control characters or invalid UTF-8. A value that breaks a bound is refused with `400` (`404` for a group id over 256 bytes in a member path) before any audit row is written; the Settings form shows the refusal text inline instead of answering `400`. An agent id with a control byte or invalid UTF-8 is also `400`, but writes a `denied` audit row (`detail=invalid_agent_id`) |
 
 ## Planned Features
 
