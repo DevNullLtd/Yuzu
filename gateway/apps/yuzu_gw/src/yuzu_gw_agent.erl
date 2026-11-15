@@ -104,6 +104,10 @@
 -export([callback_mode/0, init/1, terminate/3, code_change/4, format_status/1]).
 -export([registering/3, recovering/3, connecting/3, streaming/3, disconnected/3]).
 
+-ifdef(TEST).
+-export([hostname_of/1]).
+-endif.
+
 %% How long a caller of await_registration/2 waits. The agent's registry call
 %% gives up after 30 s (yuzu_gw_registry:register_agent/7) and the agent then
 %% answers, so this is only reached by an agent that cannot run at all.
@@ -1041,9 +1045,15 @@ ensure_binary(undefined) -> <<>>;
 ensure_binary(B) when is_binary(B) -> B.
 
 %% The hostname from an AgentInfo map (atom keys from gpb, binary keys from a
-%% hand-built map in tests).
+%% hand-built map in tests). gpb always yields a binary (a missing hostname
+%% decodes to <<>>); a non-binary value from a hand-built map becomes <<>> so
+%% the record's `hostname :: binary()' type holds.
+-spec hostname_of(map()) -> binary().
 hostname_of(AgentInfo) ->
-    maps:get(<<"hostname">>, AgentInfo, maps:get(hostname, AgentInfo, <<>>)).
+    case maps:get(<<"hostname">>, AgentInfo, maps:get(hostname, AgentInfo, <<>>)) of
+        H when is_binary(H) -> H;
+        _ -> <<>>
+    end.
 
 extract_plugin_names(AgentInfo) ->
     Plugins = maps:get(<<"plugins">>, AgentInfo,

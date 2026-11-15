@@ -645,3 +645,12 @@ wait_for_death(Pid, Timeout) ->
         demonitor(MonRef, [flush]),
         ?assert(false, {process_still_alive, Pid})
     end.
+
+%% hostname_of/1 keeps the record's `hostname :: binary()' type true: a
+%% binary under either key passes through, anything else becomes <<>>.
+hostname_of_is_always_binary_test_() ->
+    [?_assertEqual(<<"h1">>, yuzu_gw_agent:hostname_of(#{hostname => <<"h1">>})),
+     ?_assertEqual(<<"h2">>, yuzu_gw_agent:hostname_of(#{<<"hostname">> => <<"h2">>})),
+     ?_assertEqual(<<>>, yuzu_gw_agent:hostname_of(#{})),
+     ?_assertEqual(<<>>, yuzu_gw_agent:hostname_of(#{hostname => undefined})),
+     ?_assertEqual(<<>>, yuzu_gw_agent:hostname_of(#{hostname => "a-list"}))].

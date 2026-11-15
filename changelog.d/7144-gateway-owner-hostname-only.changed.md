@@ -4,7 +4,6 @@
   with 69 plugins. It now keeps the hostname alone. The saving scales with the
   size of the agent's AgentInfo (its plugins and their descriptions and
   capabilities): measured at 3,000 agents with 69 plugins each, live memory
-  per agent fell from 122.4 to 99.5 KiB, and at 6 plugins it is about 2 KiB
-  per agent (measured in a scratch module). ListAgents, GetAgent and
-  QueryInventory answers are unchanged. Hot code loading stays unsupported:
-  upgrade the gateway by restarting it.
+  per agent fell from 122.4 to 99.5 KiB; for a smaller AgentInfo the saving
+  is approximately one AgentInfo copy per agent. ListAgents, GetAgent and
+  QueryInventory answers are unchanged. Hot code loading stays unsupported.
