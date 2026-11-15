@@ -215,7 +215,7 @@ constexpr const char* kMigrationV3Sql =
 // orders and compares `agent_id COLLATE "C"` (byte order). Its CORRECTNESS comes from that
 // spelling in the query: the primary key's index is built under the DATABASE collation, so a
 // libc/ICU upgrade under an existing volume (no REINDEX) leaves it stale, and a keyset walk
-// ordered by it can skip rows with no error (measured: 24% of 50,030 ids at limit 1). "C" is byte
+// ordered by it can skip rows with no error (measured on a mechanical emulation of a collation change: 11,945 of 50,030 ids at limit 1; see docs/security-reviews/hardware-ci-bulk-read-collation-drift-2026-11-15.md). "C" is byte
 // comparison, which no library upgrade changes, so the query stays correct without this index. The
 // index keeps each page an index scan: only an index on that exact expression can serve the
 // query, and without it every page is a scan plus a sort (about 317 ms a page at 1M rows).
@@ -407,8 +407,10 @@ void warn_if_agent_id_c_index_unusable(PGconn* conn) {
     spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware/ci and list_hardware_ci_"
                  "records stay correct but every page becomes a scan plus a sort of device_ci "
                  "(about 317 ms a page at 1M devices), which can exhaust the database pool under "
-                 "load. Create it as the table owner (DROP INDEX device_inventory_store.{} first if "
-                 "it exists but is invalid or differs): {};",
+                 "load. Create it as the table owner, in a session that first ran SET lock_timeout = '30s' "
+                 "(a plain build queues behind any session holding a lock on device_ci, and every "
+                 "writer queues behind it); DROP INDEX device_inventory_store.{} first if it exists "
+                 "but is invalid or differs: {};",
                  kAgentIdCIndexName, problem, kAgentIdCIndexName, kAgentIdCIndexCreateSql);
 }
 
@@ -877,7 +879,8 @@ DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q)
           ", content_hash FROM device_inventory_store.device_ci WHERE true";
     // Byte order, not the database collation: every `agent_id` comparison and the ORDER BY are
     // spelled `agent_id COLLATE "C"`. That keeps a collation change under the primary key's index
-    // from making the walk skip or repeat a row, from making the single-device read miss an
+    // from making the walk skip or miss a row (a duplicate row that a write admitted through a stale
+    // primary key is a write-side residual and would still be served twice), from making the single-device read miss an
     // existing id (a plain `agent_id = $n` is served by that same primary key), and lets the
     // planner use the v4 expression index, which serves only a query spelling exactly this
     // expression. All four sites must keep it.

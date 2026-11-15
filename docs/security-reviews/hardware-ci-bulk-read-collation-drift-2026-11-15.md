@@ -3,8 +3,9 @@
 **Date:** 2026-11-15
 **Change:** `GET /api/v1/hardware/ci` and the MCP tool `list_hardware_ci_records` (a keyset walk over
 `device_inventory_store.device_ci`, built for a daily pull into an external CMDB), with migration
-`device_inventory_store` v4. Code commits under test: `390104150e` (the byte-ordered keyset) and
-`e40adb34a9` (the byte-ordered named read, the robust migration and the index check at open).
+`device_inventory_store` v4. Code commits under test: `390104150e` (the byte-ordered keyset), `e40adb34a9` (the byte-ordered
+named read, the robust migration and the index check at open) and `fd490b9d31` (the exact index-shape
+check).
 **Branch:** `feat/hardware-ci-bulk-read`
 **Status:** implemented; owner acceptance of the residual exposures below is PENDING and not recorded.
 **Author of the measurements:** the change author's governance run (Claude Code session). The
@@ -102,13 +103,13 @@ PR 3 owns the write-side control. For this read it must:
 - **Not bind an ordering epoch into this read's cursor.** If it binds anything, it must bump the
   cursor prefix from `h1` to `h2`, because `h1` now means "the last device in byte order" and an old
   cursor would otherwise be read under a different meaning.
-- **Keep the `device_ci` write pause.** Writes and the primary key remain exposed (residual 1), and
+- **Ship the `device_ci` write pause.** Writes and the primary key remain exposed (residual 1), and
   the pause is the control for them.
 - **Leave the keyset SQL and the C index expression untouched.** The query's `COLLATE "C"`
   spellings and the `((agent_id COLLATE "C"))` index must stay byte-for-byte what they are, or the
   index stops serving the query.
 - **Rewrite the "only reports" sentences in the docs** (`rest-api.md`, `inventory.md`,
-  `server-admin.md`, the SOC 2 answer, the changelog fragment and the OpenAPI description) once
+  `mcp.md`, `server-admin.md`, the SOC 2 answer, the changelog fragment and the OpenAPI description) once
   the pause ships, because "the server only reports a mismatch and stops no write" stops being true.
 
 ## Owner acceptance of the residual: PENDING, not recorded
