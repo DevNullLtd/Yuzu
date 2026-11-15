@@ -404,7 +404,7 @@ TEST_CASE("dashboard_api_routes: /api/export/json-to-csv transforms a JSON array
     CHECK(r->body == "name\r\nwidget\r\ngadget\r\n");
 }
 
-// Review fix: a few KB of JSON can name thousands of columns; the route must answer 413 (not 400,
+// A few KB of JSON can name thousands of columns; the route must answer 413 (not 400,
 // not a multi-hundred-MB body) when the CSV would pass 16 MiB.
 TEST_CASE("dashboard_api_routes: /api/export/json-to-csv answers 413 when the CSV output would exceed "
           "its limit",

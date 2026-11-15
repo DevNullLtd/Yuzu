@@ -296,7 +296,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // caller ran) to CSV. It was pinned at httplib's 100 MiB backstop on the
     // reasoning that an export's size has no natural line, but the raw body is
     // PARSED into an nlohmann tree 16 to 27 times its size, so 100 MiB was a
-    // 1.6 to 2.7 GiB allocation per request (#2146). Owner ruling 2026-11-15:
+    // 1.6 to 2.7 GiB allocation per request (#2146). Chosen:
     // 16 MiB (a tree of at most about 430 MiB) plus a value budget of one
     // million values (about 100 MiB of tree); a larger export is split into
     // several requests. A streaming (`json::sax_parse`) rewrite would lift the

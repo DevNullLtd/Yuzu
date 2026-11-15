@@ -997,7 +997,7 @@ TEST_CASE("Pre-routing body cap: a non-chunked Transfer-Encoding does NOT suppre
     // branch and reads that many bytes.
     //
     // So while the size check was gated on `!unmeasurable`, one header
-    // suppressed the cap on all 24 classes that do not set
+    // suppressed the cap on all 24 classes (34 today) that do not set
     // requires_measurable, including the probe paths,
     // while httplib went on to read the declared body in full. Production now
     // gates the size check on `content_length_is_authoritative` instead, which
@@ -1484,11 +1484,26 @@ TEST_CASE("data_export::json_array_to_csv_checked: a wide header with many empty
         wide += std::string(i ? "," : "") + "\"k" + std::to_string(i) + "\":1";
     wide += "}";
     for (int i = 0; i < 20000; ++i)
-        wide += ",{}"; // 20000 rows x 5000 columns = about 100 MB of commas at the default limit
+        wide += ",{}"; // 20000 rows x 5000 columns = about 100 MB of commas, over the 16 MiB limit
     wide += "]";
     const auto big = json_array_to_csv_checked(wide);
     CHECK(big.status == CsvStatus::kTooLarge);
     CHECK(big.csv.empty());
+    // The limit itself is pinned (a revert to 64 MiB would still refuse the 100 MB case above) and
+    // tied to the table row for the route's own input cap; a mid-size shape (5000 columns x 5000
+    // rows, about 25 MB of output) discriminates 16 from 64 MiB.
+    CHECK(yuzu::server::data_export::kMaxCsvOutputBytes == 16u * 1024 * 1024);
+    CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_body_bytes ==
+          yuzu::server::data_export::kMaxCsvOutputBytes);
+    std::string mid = "[{";
+    for (int i = 0; i < 5000; ++i)
+        mid += std::string(i ? "," : "") + "\"k" + std::to_string(i) + "\":1";
+    mid += "}";
+    for (int i = 0; i < 5000; ++i)
+        mid += ",{}";
+    mid += "]";
+    CHECK(json_array_to_csv_checked(mid).status == CsvStatus::kTooLarge);
+    CHECK(json_array_to_csv_checked(mid, 64u * 1024 * 1024).status == CsvStatus::kOk);
     // An explicit small limit refuses a small output the same way.
     CHECK(json_array_to_csv_checked(R"([{"a":"x","b":"y"},{"a":"1","b":"2"}])", 8).status ==
           CsvStatus::kTooLarge);

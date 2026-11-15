@@ -739,13 +739,16 @@ TEST_CASE("instruction_routes: the YAML save refuses a create with a bad action 
                                 std::vector<std::string>{id})
                     .status() == PGRES_COMMAND_OK);
     }
+    std::string upd_yaml = yaml_for(id, "\"odd plugin;x\"", "os_name");
+    upd_yaml.replace(upd_yaml.find("displayName: Odd"), 16, "displayName: Odd Updated");
     auto upd = h.sink.Post("/api/instructions/yaml",
-                           "yaml_source=" + url_encode_form(yaml_for(id, "\"odd plugin;x\"", "os_name")) +
+                           "yaml_source=" + url_encode_form(upd_yaml) +
                                "&id=" + id,
                            "application/x-www-form-urlencoded");
     REQUIRE(upd);
     CHECK(upd->body.find("Create failed") == std::string::npos);
-    CHECK((**w.store.get_definition(id)).plugin == "odd plugin;x");
+    CHECK(upd->body.find("Definition updated") != std::string::npos);
+    CHECK((**w.store.get_definition(id)).name == "Odd Updated");
 }
 
 // UP-5 on the legacy route (Gate 8 F2). Turns red if the legacy PUT handler stops calling

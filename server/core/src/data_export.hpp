@@ -81,8 +81,8 @@ struct CsvResult {
     std::string csv;
 };
 
-/// Convert a JSON array of objects (uniform keys) to CSV with a header row. `kInvalid`: not a non-empty array whose first element is
-/// a non-empty object. `kTooLarge`: the CSV would exceed `max_output_bytes`; the build stops at the
+/// Convert a JSON array of objects (uniform keys) to CSV with a header row. `kInvalid`: not a
+/// non-empty array whose first element is a non-empty object. `kTooLarge`: the CSV would exceed `max_output_bytes`; the build stops at the
 /// first row that crosses it, so the memory is bounded by the limit plus one row, not by the input's
 /// shape.
 [[nodiscard]] CsvResult
