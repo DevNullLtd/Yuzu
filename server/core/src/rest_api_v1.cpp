@@ -4840,9 +4840,10 @@ void RestApiV1::register_routes(
             return;
         }
 
-        auto session = auth_fn(req, res);
-        if (session)
-            g.created_by = session->username;
+        const auto session = auth_fn(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
         // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
         // failure rows and the outcome row) is stamped from the session resolved here: each can
         // be written after the session is gone (the audit pool wait, the recheck below and
@@ -4850,7 +4851,7 @@ void RestApiV1::register_routes(
         // principal and break principal-based pairing of the rows. Without a session writer
         // wired (tests) they fall back to `audit_fn`.
         const AuditFn bound_audit =
-            (session && audit_as_session) ? audit_as(audit_as_session, *session) : audit_fn;
+            audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
 
         if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
                                      "ManagementGroup", "", g.name))

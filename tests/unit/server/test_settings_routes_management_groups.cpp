@@ -104,6 +104,11 @@ struct MgmtGroupsHarness {
     /// row, so a row that names the session went through the session-bound writer.
     bool session_gone_at_attempted{false};
     std::size_t post_attempted_auth_calls{0};
+    /// The FIRST session resolution answers no session and writes the 401 itself, as the
+    /// production callback does; every later call would answer a session. A route that carries on
+    /// past that first answer would store rows and create the group.
+    bool no_session_on_first_auth_call{false};
+    std::size_t auth_calls{0};
     /// Runs ONCE, the first time the session is resolved after an `attempted` row is stored: the
     /// deterministic injection point for a change that lands between the route's pre-check and
     /// its insert (e.g. deleting the parent group).
@@ -138,6 +143,10 @@ struct MgmtGroupsHarness {
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
+            if (no_session_on_first_auth_call && auth_calls++ == 0) {
+                res.status = 401;
+                return std::nullopt;
+            }
             if (after_attempted_hook && attempted_stored()) {
                 auto hook = std::move(after_attempted_hook);
                 after_attempted_hook = nullptr;
@@ -604,6 +613,21 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         CHECK(rows[1].detail == "permission_revoked Grant Gone");
         CHECK(rows[1].bound);
     }
+    CHECK(h.group_names().empty());
+}
+
+TEST_CASE("Settings group create: no session on the first resolution answers the 401 before any "
+          "audit row and creates nothing",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.no_session_on_first_auth_call = true;
+
+    auto res = h.create("Never Authenticated");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.calls.empty()); // neither an attempted row nor a failure row, stored or refused
+    CHECK(h.auth_calls == 1); // the route stopped at the first answer
     CHECK(h.group_names().empty());
 }
 

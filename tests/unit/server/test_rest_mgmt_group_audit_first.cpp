@@ -102,6 +102,11 @@ struct AuditFirstHarness {
     /// refuses at the re-check.
     bool session_gone_at_attempted = false;
     std::size_t post_attempted_auth_calls = 0;
+    /// The FIRST auth_fn call answers no session and writes the 401 itself, as the production
+    /// callback does; every later call would answer a session. A route that carries on past that
+    /// first answer would store rows and create the group.
+    bool no_session_on_first_auth_call = false;
+    std::size_t auth_calls = 0;
     /// Runs ONCE, between the `attempted` row and the membership write (the first auth_fn call
     /// after the attempted row is stored): the deterministic injection point for a change that
     /// lands between the route's checks and its write, e.g. deleting the group.
@@ -146,7 +151,12 @@ struct AuditFirstHarness {
             auth_db_pg.emplace();
 
         auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response&) -> std::optional<auth::Session> {
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            if (no_session_on_first_auth_call && auth_calls++ == 0) {
+                res.status = 401;
+                res.set_content(R"({"error":"authentication required"})", "application/json");
+                return std::nullopt;
+            }
             if (after_attempted_hook && attempted_stored()) {
                 auto hook = std::move(after_attempted_hook);
                 after_attempted_hook = nullptr;
@@ -500,6 +510,22 @@ TEST_CASE("POST /management-groups: a session gone after the attempted row creat
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].detail == "session_revoked session-gone");
+}
+
+TEST_CASE("POST /management-groups: no session on the first resolution answers the 401 before any "
+          "audit row and creates nothing",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    h.no_session_on_first_auth_call = true;
+    const auto before = h.group_count();
+
+    auto res = h.create(R"({"name":"never-authenticated"})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    CHECK(h.audits.empty()); // neither an attempted row nor a failure row
+    CHECK(h.auth_calls == 1); // the route stopped at the first answer
+    CHECK(h.group_count() == before);
+    CHECK_FALSE(h.group_exists("never-authenticated"));
 }
 
 TEST_CASE("POST /management-groups: a permission revoked after the attempted row creates nothing "

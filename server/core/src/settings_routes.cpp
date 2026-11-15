@@ -7075,16 +7075,17 @@ void SettingsRoutes::register_routes(
             return;
         }
 
-        auto session = auth_fn_(req, res);
-        if (session)
-            g.created_by = session->username;
+        const auto session = auth_fn_(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
         // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
         // failure rows and the outcome row) is stamped from the session resolved here, as the MFA
         // disable does: each can be written after the session is gone, when the re-resolving
         // `audit_read_fn_` would stamp an empty principal and break principal-based pairing of
         // the rows. Without a session writer wired (tests) they use `audit_read_fn_`.
         const AuditReadFn bound_audit = [&]() -> AuditReadFn {
-            if (!session || !audit_as_session_fn_)
+            if (!audit_as_session_fn_)
                 return audit_read_fn_;
             return [writer = audit_as_session_fn_, who = *session,
                     role = auth::role_to_string(auth::effective_role(*session))](
