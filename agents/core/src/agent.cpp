@@ -71,7 +71,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
-#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_persist_heartbeat_tags (#4045)
+#include "guardian_baseline_heartbeat.hpp" // emit_guardian_baseline_* heartbeat tags (#4045, #5605)
 #include "guardian_baseline_persister.hpp" // kBaselineShutdownGrace (#4045; static_assert below)
 #include "guardian_boot_epoch.hpp"         // claim_guardian_boot_epoch (UP-14)
 #include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
@@ -3084,7 +3084,20 @@ public:
                               // E23 and the doc-scrape test), the call itself is verified by
                               // reading. Deliberately no source-grep pin: it would break
                               // out-of-tree and packaged builds that carry no source tree.
+                              //
+                              // #5605: the same group also carries the CURRENT unpersisted
+                              // backlog (present only on a live prefer_spark agent with a
+                              // published persister; a present 0 means "no capture waiting at
+                              // this persister", NOT "Spark is healthy") and the boot-scan
+                              // count (sparse, live on every agent: a boot re-arm found no
+                              // persisted baseline, which is not proof a capture was lost).
+                              // Both accessors are lock-free. One try for all three: a throw
+                              // drops the group's tags for one tick, counted once.
                               try {
+                                emit_guardian_baseline_unpersisted_heartbeat_tag(
+                                    tags, guardian_->baseline_unpersisted());
+                                emit_guardian_baseline_rebaselined_heartbeat_tag(
+                                    tags, guardian_->baseline_rebaselined_at_boot());
                                 emit_guardian_baseline_persist_heartbeat_tags(
                                     tags, guardian_->baseline_persist_failures());
                               } catch (...) {

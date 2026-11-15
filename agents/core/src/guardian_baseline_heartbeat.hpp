@@ -17,11 +17,11 @@
 /// SCOPE, stated plainly: this tag covers the SPARK path only. A legacy FileGuard persist
 /// failure is logged and not counted, so an ABSENT tag is not evidence that baselines
 /// persisted. It is cumulative since boot (a flat non-zero value does not say whether a
-/// failure is still open), and it mixes retryable failures with permanent losses. No server
-/// gauge, alert rule or reader exists for it in this change: the tag rides the per-agent
-/// heartbeat status tags only, so the agent's own error log
-/// ("failed to persist captured baseline") is the primary operator signal until a
-/// fleet-visible signal ships (an F14 precondition, docs/spark-flip-gate.md).
+/// failure is still open), and it mixes retryable failures with permanent losses. #5605 adds the
+/// two tags below beside it (the CURRENT unpersisted backlog and the boot-scan count) and a
+/// server-side rollup of all three into fleet gauges; the agent's own error log
+/// ("failed to persist captured baseline") remains the per-incident evidence, and this tag
+/// stays the monitor-only cumulative signal, never a sustained-condition alert source.
 ///
 /// A persist failure is a DELIBERATE fail-open (the rule keeps running on its in-memory
 /// baseline, and the capture stays staged for a retry), so it must not be silent. Until the
@@ -33,9 +33,20 @@
 /// deliberately NOT a field of GuardianJournalStats: that struct is pinned 1:1 to the server's
 /// kGuardianJournalMetrics fleet-gauge table by a sizeof static_assert
 /// (tests/unit/server/test_guardian_journal_fleet_tags.cpp), so a field there would force a
-/// server-side gauge this change does not add (a deliberate non-goal of this change).
+/// journal-table gauge. All three baseline tags have their own table instead.
+///
+/// The two #5605 tags and what each does NOT say:
+///  - kGuardianBaselineUnpersistedTag is a CURRENT value (GuardianEngine::baseline_unpersisted():
+///    captures staged and not yet written), optional-gated like the arm pair: ABSENT means
+///    dormant (prefer_spark off, or no published persister), a present 0 means "no capture
+///    waiting at this persister", never "Spark is healthy". It covers the Spark path only.
+///  - kGuardianBaselineRebaselinedAtBootTag is sparse (0 omits;
+///    GuardianEngine::baseline_rebaselined_at_boot()): rules whose boot re-arm seed lookup found
+///    no persisted baseline. It is live on every agent, legacy path included, and is NOT proof
+///    that a capture was lost.
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace yuzu::agent {
@@ -52,6 +63,30 @@ template <typename TagMap>
 void emit_guardian_baseline_persist_heartbeat_tags(TagMap& tags, std::uint64_t persist_failures) {
     if (persist_failures != 0)
         tags[kGuardianBaselinePersistFailuresTag] = std::to_string(persist_failures);
+}
+
+/// #5605: the heartbeat key for the CURRENT unpersisted-capture count.
+inline constexpr char kGuardianBaselineUnpersistedTag[] = "yuzu.guardian_baseline_unpersisted";
+
+/// #5605: the heartbeat key for the boot-scan "no persisted baseline" count.
+inline constexpr char kGuardianBaselineRebaselinedAtBootTag[] =
+    "yuzu.guardian_baseline_rebaselined_at_boot";
+
+/// Populate `tags` with GuardianEngine::baseline_unpersisted(). std::nullopt (dormant) emits
+/// NOTHING; a present value emits INCLUDING a genuine 0, so "checked, nothing waiting" reads
+/// differently from "dormant" (the guardian_arm_heartbeat.hpp pattern).
+template <typename TagMap>
+void emit_guardian_baseline_unpersisted_heartbeat_tag(TagMap& tags,
+                                                      const std::optional<std::uint64_t>& v) {
+    if (v)
+        tags[kGuardianBaselineUnpersistedTag] = std::to_string(*v);
+}
+
+/// Populate `tags` with GuardianEngine::baseline_rebaselined_at_boot(). Sparse: 0 omits the tag.
+template <typename TagMap>
+void emit_guardian_baseline_rebaselined_heartbeat_tag(TagMap& tags, std::uint64_t count) {
+    if (count != 0)
+        tags[kGuardianBaselineRebaselinedAtBootTag] = std::to_string(count);
 }
 
 } // namespace yuzu::agent
