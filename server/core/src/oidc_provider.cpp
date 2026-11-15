@@ -972,9 +972,11 @@ const std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
 }
 
 // The pool-full warning and the NAT64 "not started" warning are written at most once per 60 s each
-// (one key each); later ones in the window go to debug. The lookups counter and the failing
-// request's own error carry every occurrence. The timeout warning is not throttled. A leaked
-// function-local static, like the pool.
+// (one key each); later ones in the window go to debug. The lookups counter carries every
+// occurrence, and for a host lookup so does the failing request's own error. The timeout warning is
+// not throttled. A leaked function-local static, with the same precedent and reason as the pool
+// above and `detail::process_pool()` in bounded_resolver.hpp: a request thread can log through it
+// while statics are being destroyed at exit, so it is never destroyed.
 RefusalLogThrottle& oidc_resolver_log_throttle() {
     static RefusalLogThrottle& t = *new RefusalLogThrottle(std::chrono::seconds(60), 4);
     return t;
@@ -1133,8 +1135,8 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
                         ? spdlog::level::warn
                         : spdlog::level::debug,
                     "OIDC egress: the name lookup for '{}' was not started: the lookup pool ({} "
-                    "slots) is full or a worker could not be created (this line is written at "
-                    "most once per 60 s; yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} "
+                    "slots) is full or a worker could not be created (this warning is written "
+                    "at most once per 60 s; yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} "
                     "has the full count)",
                     ::yuzu::log_key_token(host), pool_cap);
         return net::ResolveStatus::kBusy;
@@ -1276,7 +1278,7 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
                         : spdlog::level::debug,
                     "OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) was not started; it "
                     "will be retried on the next fetch, and IPv6 destinations are classified "
-                    "without it until then (this line is written at most once per 60 s)");
+                    "without it until then (this warning is written at most once per 60 s)");
         std::lock_guard lock(cache.mu);
         if (cache.overflowed)
             return std::nullopt;

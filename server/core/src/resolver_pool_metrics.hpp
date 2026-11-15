@@ -45,8 +45,9 @@ inline constexpr ResolverPoolMetricNames kOidcResolverMetrics{
     "s; a value at the pool's cap means new OIDC lookups fail at once until lookups return; "
     "non-zero only on POSIX builds, so a reading of 0 on another build does not show that no "
     "lookup is outstanding",
-    "Slots in the resolver pool the OIDC egress path uses, published every 15 s; non-zero only "
-    "on POSIX builds",
+    "Slots in the resolver pool the OIDC egress path uses, published every 15 s; the same "
+    "value on every build, while the in-flight gauge and the lookups counter are fed only on "
+    "POSIX builds",
     "Name lookups made through the OIDC resolver pool, by outcome: ok, not_found (the resolver "
     "answered that the name has no address), temporary (the resolver failed transiently), "
     "timeout (no answer within the bound), busy (the pool was full or a worker could not be "

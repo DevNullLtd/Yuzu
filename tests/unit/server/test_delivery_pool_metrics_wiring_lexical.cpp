@@ -1,6 +1,8 @@
 /**
  * test_delivery_pool_metrics_wiring_lexical.cpp -- a LEXICAL pin of how server.cpp wires the
- * webhook and offload delivery pool metrics (#7153).
+ * webhook and offload delivery pool metrics, and of the OIDC resolver pool publisher that shares
+ * the same 15 s tick (#7153). The file keeps its delivery-pool name: the resolver cases live here
+ * because they pin the same tick, and a CRL-source twin has its own file.
  *
  * WHAT THIS IS, AND IS NOT. A source-text scan (the test_hw_ci_detail_wiring_lexical.cpp style),
  * NOT a behavioural test: ServerImpl is not unit-constructible, so nothing here runs the 15 s

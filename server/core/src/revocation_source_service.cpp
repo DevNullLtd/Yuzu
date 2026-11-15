@@ -536,8 +536,9 @@ std::expected<void, ServiceError> load_own(Ctx& ctx) {
     }
     if (!addrs) {
         spdlog::error("revocation source: this server's own addresses could not be determined "
-                      "(interface enumeration or a listen host failed); refusing registrations "
-                      "until it can");
+                      "(interface enumeration failed, or a listen host lookup failed, timed out "
+                      "or was not started because the resolver pool was at its cap or a worker "
+                      "could not be started); refusing registrations until it can");
         // A refusal because the resolver pool was at its cap is counted like a refused URL host
         // lookup; the answer to the caller is the same retryable 503 either way.
         ctx.degrade(addrs.error() == EgressEnv::OwnAddressesError::kBusy
