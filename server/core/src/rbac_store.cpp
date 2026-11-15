@@ -2397,10 +2397,12 @@ std::expected<bool, std::string> RbacStore::provision_first_admin(const std::str
 // §3 cross-schema query owner, constructed per call exactly as `unassign_role` does. None of
 // them changes a `principal_roles` / `rbac_meta` row, so none applies a local cache generation.
 
-AccountDeactivationResult RbacStore::deactivate_account(const std::string& username) {
+AccountDeactivationResult RbacStore::deactivate_account(const std::string& username,
+                                                        SessionGenerationMode session_mode) {
     if (!open_)
         return {AccountDeactivationResult::Kind::kStoreFailure, std::string(kRbacErrStoreNotOpen)};
-    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.deactivate_account(username);
+    return RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.deactivate_account(username,
+                                                                                      session_mode);
 }
 
 LocalRoleChangeResult RbacStore::set_local_role(const std::string& username, auth::Role role) {

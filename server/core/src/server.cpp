@@ -250,6 +250,7 @@
 #include "hardware_section_integrity.hpp"
 #include "software_collection_settings_routes.hpp"
 #include "software_collection_settings_store.hpp"
+#include "software_lifecycle_store.hpp"
 #include "software_curation_routes.hpp"
 #include "home_routes.hpp" // Dashboard summary fragment (readout, attention, estate) over injected seams
 #include "home_ui.hpp"     // sign_in_location: where a signed-out page request goes
@@ -259,6 +260,7 @@
 #include "software_catalog_rollup.hpp"
 #include "software_normalization_job.hpp"
 #include "software_normalization_pack.hpp"
+#include "software_read_routes.hpp"
 #include "software_title_dimension.hpp"
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
@@ -685,6 +687,23 @@ public:
                                                  .burst = 2.0 * cfg_.principal_rate_limit}) {
         // Register metric descriptions
         metrics_.describe("yuzu_agents_connected", "Number of currently connected agents", "gauge");
+        metrics_.describe("yuzu_server_software_lifecycle_store_read_degrade_total",
+                          "Software lifecycle store reads that could not be answered, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error/corrupt_row/row_cap)",
+                          "counter");
+        metrics_.describe("yuzu_server_software_lifecycle_store_write_degrade_total",
+                          "Software lifecycle store writes that failed, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error/txn_failed)",
+                          "counter");
+        // Pre-seed every reason so the first degrade reads as an increase from 0.
+        for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                   "corrupt_row", "row_cap"})
+            metrics_.counter("yuzu_server_software_lifecycle_store_read_degrade_total",
+                             {{"reason", reason}});
+        for (const char* reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "txn_failed"})
+            metrics_.counter("yuzu_server_software_lifecycle_store_write_degrade_total",
+                             {{"reason", reason}});
         metrics_.describe("yuzu_server_revocation_source_degrade_total",
                           "CRL source registrations refused for a retryable reason, by reason "
                           "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
@@ -2717,6 +2736,20 @@ public:
                           "guarded by > 0 (a failing refresh leaves the components totals aging or "
                           "building)",
                           "gauge");
+        metrics_.describe("yuzu_software_fleet_snapshot_total",
+                          "Fleet facet-health and summary snapshot refresh outcomes, by outcome "
+                          "(success/error), on the catalogue rollup thread. Keep-last-good on "
+                          "error; both series are seeded at 0.",
+                          "counter");
+        metrics_.describe("yuzu_software_facet_devices",
+                          "Devices per installed-software collection facet and status (full, delta, "
+                          "constrained, timeout, oversize, not_collected, disabled), fleet-wide, "
+                          "refreshed with the catalogue rollup. No agent label.",
+                          "gauge");
+        metrics_.describe("yuzu_software_facet_duration_ms",
+                          "Collection duration of a facet over its measured devices, by quantile "
+                          "(0.5, 0.95), fleet-wide, refreshed with the catalogue rollup",
+                          "gauge");
         metrics_.describe("yuzu_software_normalization_pass_total",
                           "Software-title normalisation ticks by outcome (success/error); hourly, "
                           "or every 60 s while a backlog remains or the catalogue rollup has not "
@@ -3720,14 +3753,26 @@ public:
             "Durable session-store operations that hit a degraded PostgreSQL read/"
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-            "elevate); a validate degrade fails the request closed, and elevate / "
-            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "elevate / account_state, the last being the read of the account store "
+            "that gates a durable local session); a validate degrade fails the request "
+            "closed, and elevate / revoke (via invalidate_user) degrades fail the "
+            "privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
-                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+                        "invalidate_user", "invalidate", "mark_mfa", "elevate", "account_state"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_account_inactive_total",
+                          "Durable local sessions refused at validation because their account "
+                          "is not active (inactive or deleted)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_account_inactive_total");
+        metrics_.describe("yuzu_auth_session_unknown_source_total",
+                          "Durable sessions refused at validation because the stored auth "
+                          "source is not local, oidc or saml",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_unknown_source_total");
         // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
         // shared by every replica) and fail CLOSED on any store failure. This
         // counts each degrade so an operator can tell "agents cannot enroll /
@@ -8428,6 +8473,10 @@ public:
                 software_catalog_rollup_ = std::make_unique<SoftwareCatalogRollup>(
                     *software_inventory_store_,
                     std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
+                // SAM-33: the rollup thread publishes the fleet facet-health/summary snapshot
+                // into this holder, a plain member that outlives the thread (stop() resets the
+                // rollup first) and the routes that read it.
+                software_catalog_rollup_->set_snapshot_holder(&software_fleet_snapshot_);
                 software_catalog_rollup_->start();
             }
         }
@@ -8656,6 +8705,43 @@ public:
                             std::chrono::seconds{kCatalogueRefreshIntervalSeconds}, &metrics_);
                         software_normalization_job_->start();
                     }
+                }
+            }
+        }
+
+        // SoftwareLifecycleStore - software lifecycle rules and host-declared facts (SAM-23).
+        // Authoritative reference data, so construction and the seed load are fail-closed like the
+        // product registry (ADR-0012 s1): the seed is build-embedded, so a parse failure is a
+        // defective build and a load failure is a database fault; either refuses the boot, and a
+        // newer binary's seed replaces the stored shipped rules in one transaction. No reader
+        // exists yet (SAM-24); /readyz alone borrows it.
+        if (pg_pool_ && !startup_failed_) {
+            software_lifecycle_store_ = std::make_unique<SoftwareLifecycleStore>(*pg_pool_);
+            if (!software_lifecycle_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: software lifecycle store migration/open "
+                              "failed (database reachable but the software_lifecycle_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                software_lifecycle_store_->set_metrics(&metrics_);
+                auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed,
+                                                      LifecycleSource::shipped);
+                if (!seed) {
+                    spdlog::error("[PG] Refusing to start: embedded software lifecycle seed is "
+                                  "invalid: {}",
+                                  seed.error());
+                    startup_failed_ = true;
+                } else if (seed->empty()) {
+                    // A header-only seed parses cleanly and would delete every shipped rule.
+                    spdlog::error("[PG] Refusing to start: embedded software lifecycle seed has "
+                                  "no rules");
+                    startup_failed_ = true;
+                } else if (auto loaded = software_lifecycle_store_->replace_rules(
+                               LifecycleSource::shipped, *seed);
+                           !loaded) {
+                    spdlog::error("[PG] Refusing to start: software lifecycle seed load failed: {}",
+                                  loaded.error());
+                    startup_failed_ = true;
                 }
             }
         }
@@ -11837,7 +11923,8 @@ public:
         // handler, but it matches the offline-store contract and is safe if the store
         // ever gains a pool-touching dtor).
         // Stop the catalogue rollup thread (borrows software_inventory_store_ + the pool)
-        // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent.
+        // BEFORE the store/pool tear down — the dtor signals stop + joins. Idempotent. It also
+        // publishes into software_fleet_snapshot_, a member that outlives it.
         software_catalog_rollup_.reset();
         // SAM.4 normalisation job + its owner borrow software_inventory_store_,
         // product_registry_store_ and the pool - join/drop them before any of the three.
@@ -11893,6 +11980,9 @@ public:
         // SAM-34 collection settings store: its routes capture it and are served only until
         // web_server_->stop(); drop it ahead of the pool with the other born-on-PG stores.
         software_collection_settings_store_.reset();
+        // SAM-23 lifecycle store: only /readyz borrows it (HealthRoutes deps), and that server is
+        // stopped above; drop it ahead of the pool.
+        software_lifecycle_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
         app_perf_fleet_store_.reset();
@@ -17760,6 +17850,7 @@ private:
                              .product_registry_store = product_registry_store_.get(),
                              .software_collection_settings_store =
                                  software_collection_settings_store_.get(),
+                             .software_lifecycle_store = software_lifecycle_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
                              .analytics_store = analytics_store_.get(),
@@ -20961,6 +21052,40 @@ private:
                     .store = software_collection_settings_store_.get(),
                     .mgmt_store = mgmt_group_store_.get(),
                     .plugin_config_store = plugin_config_store_.get(),
+                });
+        }
+
+        // Installed-software v3 reads REST (SAM-33): hosts, host detail, change feed, summary,
+        // plugin health. Registered here, ahead of rest_api_v1_->register_routes, for the same
+        // reason as the collection-settings routes above: the generic
+        // GET /api/v1/inventory/{a}/{b} would take the two-segment paths. fleet_read_fn is the
+        // sole gate. The routes borrow software_inventory_store_ and, through snapshot_fn,
+        // software_fleet_snapshot_ (a member, declared ahead of the rollup thread that writes it);
+        // stop() joins the web thread ahead of resetting the store, and the class holds no state
+        // of its own.
+        {
+            HttplibRouteSink software_read_sink{*web_server_};
+            SoftwareReadRoutes{}.register_routes(
+                software_read_sink,
+                SoftwareReadRoutes::Deps{
+                    .fleet_read_fn = fleet_read_fn,
+                    .audit_fn = audit_fn,
+                    // The hosts `q` search decides from the roster, so unlike the display-only
+                    // hw_hostnames_fn a failed read is reported (the route answers 503), never an
+                    // empty roster that would read as "no such device", and a roster cut at the
+                    // cap keeps its `truncated` flag (the route serves it flagged, as the hardware
+                    // list does). The same reader names the devices on every page, where a failed
+                    // read leaves the names null.
+                    .roster_fn = [this]() -> std::optional<OfflineRoster> {
+                        if (!offline_endpoint_store_)
+                            return std::nullopt;
+                        auto roster = offline_endpoint_store_->query_stale_within(kHardwareRosterWindow);
+                        if (!roster)
+                            return std::nullopt;
+                        return std::move(*roster);
+                    },
+                    .snapshot_fn = [this] { return software_fleet_snapshot_.get(); },
+                    .store = software_inventory_store_.get(),
                 });
         }
 
@@ -25231,6 +25356,9 @@ private:
     // Typed software-inventory projection — born-on-Postgres (ADR-0016).
     // Declared after pg_pool_ so it destructs before the pool.
     std::unique_ptr<SoftwareInventoryStore> software_inventory_store_;
+    // The rollup thread's publish target for the SAM-33 fleet snapshot: declared BEFORE the
+    // rollup so it is destroyed after it (the thread is joined in stop() and by the rollup's dtor).
+    SoftwareFleetSnapshotHolder software_fleet_snapshot_;
     std::unique_ptr<SoftwareCatalogRollup> software_catalog_rollup_;
     // /crypto slice 1 (the CryptoApi seam over software_inventory_store_). crypto_api_ BORROWS
     // the store and crypto_device_api_ (hostnames for the drill), and crypto_routes_ /
@@ -25267,6 +25395,9 @@ private:
     // module's evaluator writes it, out-of-server).
     std::unique_ptr<ProductRegistryStore> product_registry_store_;
     std::unique_ptr<SoftwareCollectionSettingsStore> software_collection_settings_store_;
+    // SAM-23 software lifecycle rules + host-declared facts. Declared after pg_pool_ so it
+    // destructs before the pool; no route or job reads it yet (only /readyz borrows it).
+    std::unique_ptr<SoftwareLifecycleStore> software_lifecycle_store_;
     // SAM.4: declared AFTER the stores they borrow so they destruct first; stop() also
     // resets them explicitly before the stores and pool.
     std::unique_ptr<SoftwareTitleDimension> software_title_dimension_;

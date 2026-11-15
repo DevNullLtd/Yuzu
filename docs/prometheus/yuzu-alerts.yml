@@ -7575,7 +7575,10 @@ groups:
             the session's stored MFA proof); `create`/`elevate`/`mark_mfa`/`invalidate`/
             `invalidate_user` degrades fail the privileged op closed, except an
             `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`; a single
+            disable), which leaves the clear in place and ends `partial`;
+            `account_state` (the read of `auth.users` that gates a durable local
+            session) fails the request closed (401), and the failing store for
+            that op is the account store, not session_store; a single
             event does not hold this alert's 10m condition, so look for
             `mfa.disabled` rows with result `partial` in the audit log; a sustained
             `generation_refresh` degrade drops the validate cache past the
@@ -8374,6 +8377,73 @@ groups:
             evidence. Look for
             the gate warning in the server log; a persistent error means
             cookie-session requests are failing for every operator.
+
+  - name: yuzu-software-facet-health
+    # Installed-software v3 plugin health (SAM-33): yuzu_software_facet_devices{facet,status}
+    # counts devices by the status each facet last reported. "Collecting" = full + delta +
+    # constrained + timeout + oversize. not_collected and disabled are excluded from both
+    # rules: a facet the OS does not support reports not_collected permanently, and a disabled
+    # facet collected nothing on purpose. The 20-device floor keeps a small cohort from paging
+    # on one slow device. A device reports about once a day, so a 24h hold means the share
+    # survived a full reporting cycle. Every replica recomputes its own snapshot of the fleet
+    # and exports it, and two replicas can hold different snapshots of the same devices. So
+    # each replica's share and 20-device floor are judged on that replica's own snapshot
+    # (sum without (status), per instance), and only the verdicts are collapsed with
+    # max by (job, facet), leaving one alert per facet: a bare sum over N replicas would turn
+    # the floor into 20/N real devices, and a max taken per status before the sum would mix
+    # two snapshots into a population no replica holds (docs/observability-conventions.md,
+    # "Alerts over a row shared by every replica take max by (job)"). Residual: a replica that
+    # cannot refresh keeps exporting its last snapshot
+    # (yuzu_software_fleet_snapshot_total{outcome="error"}), so an alert it raises holds until
+    # it refreshes or restarts.
+    rules:
+      - alert: YuzuSoftwareFacetTimeoutShareHigh
+        expr: |
+          max by (job, facet) (
+            (
+              sum without (status) (yuzu_software_facet_devices{status="timeout"})
+              / sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})
+              > 0.05
+            )
+            and
+            (
+              sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}) >= 20
+            )
+          )
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of a software facet's collecting devices are timing out"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/inventory.md#software-facet-timeout-share"
+          description: >-
+            More than 5% of the devices collecting the facet label reported status timeout
+            (the collector ran past its deadline), with at least 20 collecting devices, for
+            24h. Read GET /api/v1/inventory/software/plugin-health for the facet's duration
+            percentiles and its slowest devices.
+      - alert: YuzuSoftwareFacetFailingShareHigh
+        expr: |
+          max by (job, facet) (
+            (
+              sum without (status) (yuzu_software_facet_devices{status=~"constrained|timeout|oversize"})
+              / sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"})
+              > 0.20
+            )
+            and
+            (
+              sum without (status) (yuzu_software_facet_devices{status=~"full|delta|constrained|timeout|oversize"}) >= 20
+            )
+          )
+        for: 24h
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 20% of a software facet's collecting devices are constrained, timing out or oversize"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/inventory.md#software-facet-failing-share"
+          description: >-
+            More than 20% of the devices collecting the facet label reported constrained,
+            timeout or oversize, with at least 20 collecting devices, for 24h. Read
+            GET /api/v1/inventory/software/plugin-health for the per-status split.
 
   - name: yuzu-delivery
     # Webhook and offload-target delivery backlog. Each store hands deliveries to its own

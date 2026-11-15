@@ -6,6 +6,8 @@
 #include "background_jobs.hpp"
 
 #include "software_inventory_store.hpp"
+#include "software_plugin_health_model.hpp"
+#include "web_utils.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -46,6 +48,33 @@ void SoftwareCatalogRollup::stop() {
         thread_.join();
 }
 
+// ponytail: the fleet facet health and summary are recomputed by every replica on every tick (two
+// bounded GROUP BY reads, 5 s statement bound each) and held in process memory. If that costs at
+// fleet scale, move them into a rollup table written under an advisory lock like the two above and
+// serve the table instead.
+void SoftwareCatalogRollup::refresh_fleet_snapshot() {
+    if (!metrics_ && !snapshot_)
+        return;
+    const auto now = now_epoch_seconds();
+    // Both reads are authoritative (nullopt on any degrade): a failure of either keeps the last
+    // good snapshot and the last gauge values, rather than publishing half a picture.
+    auto facets = store_.facet_health(std::nullopt);
+    auto summary = facets ? store_.software_summary(now, std::nullopt) : std::nullopt;
+    const bool ok = facets && summary;
+    if (metrics_)
+        metrics_->counter("yuzu_software_fleet_snapshot_total", {{"outcome", ok ? "success" : "error"}})
+            .increment();
+    if (!ok) {
+        spdlog::warn("Software fleet snapshot: refresh failed — keeping last-good snapshot");
+        return;
+    }
+    if (metrics_)
+        software_plugin_health::publish_facet_health_gauges(*metrics_, *facets);
+    if (snapshot_)
+        snapshot_->publish(std::make_shared<const SoftwareFleetSnapshot>(
+            SoftwareFleetSnapshot{std::move(*facets), *summary, now}));
+}
+
 void SoftwareCatalogRollup::run() {
     spdlog::info("Software catalogue rollup thread started (interval={}s)", interval_.count());
     // Seed the liveness gauge to 0 BEFORE the first refresh (gov UP-2): otherwise the
@@ -60,7 +89,8 @@ void SoftwareCatalogRollup::run() {
     // a rate rule can see (observability-conventions.md, #5177), not the birth of a series.
     if (metrics_) {
         metrics_->gauge("yuzu_inventory_component_rollup_last_success_timestamp").set(0);
-        for (const char* stem : {"yuzu_inventory_catalog_rollup", "yuzu_inventory_component_rollup"})
+        for (const char* stem : {"yuzu_inventory_catalog_rollup", "yuzu_inventory_component_rollup",
+                                 "yuzu_software_fleet_snapshot"})
             for (const char* outcome : {"success", "error"})
                 metrics_->counter(std::string(stem) + "_total", {{"outcome", outcome}}).increment(0);
     }
@@ -133,6 +163,14 @@ void SoftwareCatalogRollup::run() {
                             [this](auto&& cancelled) {
                                 return store_.refresh_component_rollup(cancelled);
                             });
+
+            // The fleet snapshot (SAM-33) rides this tick and runs whatever the two refreshes
+            // returned. Read-only and per-replica: it writes gauges and an in-process pointer
+            // swap, no shared state, and must never be leader-gated.
+            YUZU_ASSERT_BACKGROUND_JOB(
+                "software_catalog_rollup.refresh_fleet_snapshot"); // WS-10 ReplicaSafe (per-replica)
+            if (!stop_.load(std::memory_order_acquire))
+                refresh_fleet_snapshot();
         } catch (const std::exception& e) {
             spdlog::error("Software catalogue rollup: tick threw ({}) — thread continuing",
                           e.what());
