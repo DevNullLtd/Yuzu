@@ -692,19 +692,21 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
     be told: the line sits under a `#` or `##` heading that is not `## [X]` (tab-separated, a title, indented
     by one to three spaces before a bracket), before any heading, or under more than one version (a generic
     bullet repeated across releases), so naming one version could name the wrong one. Headings inside a code
-    fence are ignored; a fence left open ends at the next `## [X]` heading, so it costs at most one section."""
+    fence are ignored and the version in force before it is restored when it closes; a `## [X]` line inside
+    one that never closes names no version."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
     fenced = ""  # the character of the code fence open at this line, "" when none
+    outside = version  # the version in force where that fence opened
     for line in lines_of((changelog or "").removeprefix("\ufeff")):
-        if line.startswith("## ["):
-            fenced = ""  # a version heading cannot be inside a fence, so an unclosed one ends here
-        mark = line.lstrip()[:1]
+        text = line.lstrip()
         if fenced:
-            if line.lstrip().startswith(fenced * 3):
-                fenced = ""
-        elif mark in ("`", "~") and line.lstrip().startswith(mark * 3):
-            fenced = mark
+            if text.startswith(fenced * 3):
+                fenced, version = "", outside  # sample headings inside a balanced fence change nothing
+            elif line.startswith("## ["):
+                version = ""  # a heading or sample text, and an unclosed fence cannot be told apart: name no version
+        elif text[:1] in ("`", "~") and text.startswith(text[:1] * 3):
+            fenced, outside = text[0], version
         elif re.match(r"(?:#{1,2}(?:[ \t\r]|$)| {1,3}##[ \t]*\[)", line):
             m = re.match(r"## \[([^\]\n]*)\]", line)
             name = m.group(1).strip() if m else ""

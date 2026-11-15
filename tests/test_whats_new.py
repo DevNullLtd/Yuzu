@@ -2279,15 +2279,22 @@ class MarkerAmbiguity(GitCase):
             with self.subTest(indent=repr(indent)):
                 self.assertEqual(WN.release_sections(f"{head}{indent}## [1.0.0]\n- b\n")["- b"], want)
 
-    def test_an_unclosed_or_mismatched_fence_costs_at_most_one_section(self):
+    def test_an_unclosed_or_mismatched_fence_never_names_a_version(self):
         for name, body in (("unclosed", "```\n- fenced\n"),
                            ("inline span", "```code``` text\n- fenced\n"),
                            ("mixed", "```\n~~~\n- fenced\n")):
             with self.subTest(name):
                 sections = WN.release_sections(
                     f"## [Unreleased]\n- u\n\n## [2.0]\n{body}\n## [1.0]\n- old\n\n## [Unreleased]\n- later\n")
-                self.assertEqual(sections["- old"], "1.0")
-                self.assertIsNone(sections["- later"])
+                self.assertEqual(sections["- old"], "")
+                self.assertEqual(sections["- later"], "")
+
+    def test_a_balanced_fence_showing_headings_changes_nothing(self):
+        log = ("## [1.0]\n```\n## [9.9]\n## [Unreleased]\n```\n- real1\n\n"
+               "## [Unreleased]\n~~~md\n## [1.0]\n~~~\n- pending\n")
+        sections = WN.release_sections(log)
+        self.assertEqual(sections["- real1"], "1.0")
+        self.assertIsNone(sections["- pending"])
 
     def test_a_tilde_line_does_not_close_a_backtick_fence(self):
         sections = WN.release_sections("## [1.0]\n```\n~~~\n# not a heading\n```\n- after\n")
