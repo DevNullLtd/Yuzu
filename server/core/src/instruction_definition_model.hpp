@@ -117,8 +117,8 @@ inline constexpr std::size_t kMaxDefinitionInstructionSetIdLen = 128;   ///< `in
 /// A definition is a few hundred values; the largest bundled one is far below this.
 inline constexpr std::size_t kMaxDefinitionJsonValues = 100'000;
 /// True when `body` holds more than `max_values` structural values: the shared raw-text counter
-/// (`json_value_budget.hpp`, which also backs the body-cap chokepoint) with this module's default
-/// budget. It runs BEFORE any parse, skips string literals and does not validate the JSON.
+/// (`json_value_budget.hpp`, `json_exceeds_value_count`, which also backs the body-cap chokepoint)
+/// with this module's default budget. It runs BEFORE any parse, skips string literals and does not validate the JSON.
 [[nodiscard]] bool json_exceeds_value_budget(std::string_view body,
                                              std::size_t max_values = kMaxDefinitionJsonValues) noexcept;
 /// The `type` values the store's create accepts (`validate_and_prepare`); `update_definition` does

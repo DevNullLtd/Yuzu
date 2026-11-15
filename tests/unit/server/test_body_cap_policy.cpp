@@ -1410,6 +1410,9 @@ TEST_CASE("resolve_body_cap: the JSON value budgets of the named classes",
           kJsonValuesOff); // its own small row
     CHECK(resolve_body_cap("POST", "/api/v1/commands").max_json_values == 30'000);
     CHECK(resolve_body_cap("POST", "/api/v1/bundles").max_json_values == 5'000);
+    CHECK(resolve_body_cap("POST", "/api/nvd/match").max_json_values == 600'000);
+    CHECK(resolve_body_cap("POST", "/api/v1/result-sets/rs_abc/pin").max_json_values ==
+          kJsonValuesMcp); // the subtree, not only the create
     CHECK(resolve_body_cap("POST", "/api/instructions/import").max_json_values ==
           kJsonValuesDefault);
     CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_body_bytes == 16u * 1024 * 1024);
@@ -1461,6 +1464,13 @@ bool refused_for_json_values(const StageRun& r) {
     return r.result == httplib::Server::HandlerResponse::Handled && r.status == 413 &&
            r.body.find("JSON values") != std::string::npos;
 }
+
+/// The stage let the request through to the handler (no matched route here, so the step-up
+/// chokepoint does not apply): not refused for ANY reason, so a 413 over-cap or with other text
+/// cannot make a "within budget" case pass.
+bool passed_stage(const StageRun& r) {
+    return r.result == httplib::Server::HandlerResponse::Unhandled && r.status != 413;
+}
 } // namespace
 
 TEST_CASE("Post-read JSON value budget: a body within the size cap but over its class's budget is "
@@ -1468,7 +1478,7 @@ TEST_CASE("Post-read JSON value budget: a body within the size cap but over its 
           "[body_cap][post_read][json_budget]") {
     yuzu::MetricsRegistry metrics;
     // The catch-all: 100000 passes, 100001 does not (both far under the 4 MiB size cap).
-    CHECK_FALSE(refused_for_json_values(
+    CHECK(passed_stage(
         run_stage("POST", "/api/no/such/route", flat_array_with(kJsonValuesDefault), metrics)));
     const auto over = run_stage("POST", "/api/no/such/route",
                                 flat_array_with(kJsonValuesDefault + 1), metrics);
@@ -1476,11 +1486,11 @@ TEST_CASE("Post-read JSON value budget: a body within the size cap but over its 
     CHECK(over.body.find("split the request") != std::string::npos);
 
     // The MCP envelope and result-sets carry 200000: 150000 passes where the catch-all refuses.
-    CHECK_FALSE(refused_for_json_values(
+    CHECK(passed_stage(
         run_stage("POST", "/mcp/v1/", flat_array_with(150'000), metrics)));
     CHECK(refused_for_json_values(run_stage("POST", "/mcp/v1/", flat_array_with(kJsonValuesMcp + 1),
                                             metrics)));
-    CHECK_FALSE(refused_for_json_values(
+    CHECK(passed_stage(
         run_stage("POST", "/api/v1/result-sets", flat_array_with(150'000), metrics)));
     CHECK(refused_for_json_values(
         run_stage("POST", "/api/v1/result-sets", flat_array_with(kJsonValuesMcp + 1), metrics)));
@@ -1489,9 +1499,9 @@ TEST_CASE("Post-read JSON value budget: a body within the size cap but over its 
 
     // A class that is not scanned (a 256 KiB CA body; the YAML-or-JSON workflow create) is not
     // refused by the budget however many values the body holds.
-    CHECK_FALSE(refused_for_json_values(
+    CHECK(passed_stage(
         run_stage("POST", "/api/v1/ca/import-chain", flat_array_with(120'000), metrics)));
-    CHECK_FALSE(refused_for_json_values(
+    CHECK(passed_stage(
         run_stage("POST", "/api/workflows", flat_array_with(300'000), metrics)));
 
     // The Content-Type does not matter: a handler parses whatever it is sent.
@@ -1515,6 +1525,34 @@ TEST_CASE("Post-read JSON value budget: a body within the size cap but over its 
               .counter("yuzu_body_cap_rejected_total",
                        {{"path_class", "mcp"}, {"reason", "over_json_values_post_read"}})
               .value() == 1);
+}
+
+// Every scanning row: exactly its budget passes, one more is refused, at a path that resolves to
+// that row's own class (so a wrong number on any row, or a row that stops scanning, is caught).
+TEST_CASE("Post-read JSON value budget: every scanning row passes at its budget and refuses one "
+          "more",
+          "[body_cap][post_read][json_budget]") {
+    std::size_t checked = 0;
+    for (const auto& entry : kBodyCapTable) {
+        if (entry.max_json_values == kJsonValuesOff)
+            continue;
+        INFO("path_class=" << entry.path_class << " prefix=" << entry.path_prefix);
+        const std::string method =
+            entry.method == kBodyCapAnyMethod ? std::string("POST") : std::string(entry.method);
+        const std::string path =
+            entry.path_prefix.empty() ? std::string("/no/such/route") : std::string(entry.path_prefix);
+        REQUIRE(resolve_body_cap(method, path).path_class == entry.path_class);
+
+        const auto flat = [](std::size_t values) { return flat_array_with(values); };
+        const auto at = flat(entry.max_json_values);
+        const auto over = flat(entry.max_json_values + 1);
+        REQUIRE(over.size() <= entry.max_body_bytes); // refused for the budget, never the size cap
+        yuzu::MetricsRegistry metrics;
+        CHECK(passed_stage(run_stage(method, path, at, metrics)));
+        CHECK(refused_for_json_values(run_stage(method, path, over, metrics)));
+        ++checked;
+    }
+    CHECK(checked >= 9); // default, mcp, result_sets, commands, bundles, nvd, rules x2, import, csv
 }
 
 TEST_CASE("Post-read JSON value budget: a hostile 4 MiB body of [],[],... is refused on the "

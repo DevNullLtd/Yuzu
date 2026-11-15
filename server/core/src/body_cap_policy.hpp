@@ -144,14 +144,26 @@
 /// without a real contract to measure against, and do not read their
 /// presence as license to guess a number for any OTHER class; every other
 /// entry below mirrors a cited, decoded-equals-raw byte count exactly. A
-/// THIRD, distinct category — `ota_upload` and `json_to_csv_export` — is
-/// pinned at httplib's own 100 MiB backstop rather than squeezed OR given a
-/// judgment-call MiB number: both carry content whose legitimate size is a
-/// direct function of something this table cannot bound (an installer
-/// binary's real size; an export's size following directly from the
-/// operator's own prior query), so there is no smaller number to reason
-/// toward — the entry's only job is making that an explicit, reviewed
-/// decision instead of an accidental fallthrough to the catch-all.
+/// THIRD, distinct category — `ota_upload` — is pinned at httplib's own
+/// 100 MiB backstop rather than squeezed OR given a judgment-call MiB
+/// number: an installer binary's real size is something this table cannot
+/// bound, so there is no smaller number to reason toward — the entry's only
+/// job is making that an explicit, reviewed decision instead of an
+/// accidental fallthrough to the catch-all. (`json_to_csv_export` left this
+/// category: it is parsed into a tree 16 to 27 times its size, so #2146
+/// lowered it to 16 MiB and gave it a value budget.)
+///
+/// JSON VALUE BUDGET (#2146). A size cap does not bound a parse tree: a body
+/// of `[],[],...` builds one 16 to 27 times its size. Every row therefore
+/// states `max_json_values`, counted on the raw text by `run_post_read_stage`
+/// before any handler parses (`json_value_budget.hpp`), or `kJsonValuesOff`.
+/// Two classes are NOT scanned centrally although their JSON form is
+/// parsed: `workflow_yaml` and `product_pack_yaml`, whose other form is raw
+/// YAML text (a count of `[`, `{` and `,` over YAML prose would refuse real
+/// documents, and the stage keys on the route class, never on Content-Type).
+/// Their JSON form (`{"yaml_source": ...}`) is bounded in the handler,
+/// `kYamlEnvelopeMaxJsonValues` in workflow_routes.cpp: a recorded exception
+/// to "this table is the one place", pinned by a test there.
 namespace yuzu::server {
 
 /// Sentinel method value meaning "matches every HTTP method". Used ONLY
@@ -290,7 +302,7 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // this specific content's realistic scale, not borrowed from the
     // arbitrary-YAML judgment-call classes below; still two orders of
     // magnitude below httplib's 100 MiB backstop.
-    {"POST", "/api/nvd/match", 8u * 1024 * 1024, false, "nvd_match", 200'000},
+    {"POST", "/api/nvd/match", 8u * 1024 * 1024, false, "nvd_match", 600'000},
 
     // POST /api/v1/ca/import-chain — subordinate CA chain import, JSON body
     // (ca_routes.cpp:24 kMaxImportBody, enforced at :516). Mirrors the

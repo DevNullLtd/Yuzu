@@ -10,8 +10,9 @@
 /// applied. It is NOT a `set_pre_request_handler` body: from cpp-httplib v0.47.0 that handler runs
 /// before the body is read, so `req.body.size()` below would always be 0.
 ///
-/// Stage order, fixed: the post-read body cap (413 on an over-cap body), then
-/// `apply_step_up_chokepoint` for a body within the cap. The whole block is contained: a throw
+/// Stage order, fixed: the post-read body cap (413 over the size cap), then the class's JSON value
+/// budget (413 `over_json_values_post_read`), then `apply_step_up_chokepoint` for a body within
+/// both. The whole block is contained: a throw
 /// answers 413 (fail closed) rather than reaching an httplib call site. The caller builds `deps`
 /// per request (the auth store pointer is re-read each time so a nulled store answers 503).
 /// See `server.cpp` at the `PostReadStageRegistry::install` call for the capture contract and the

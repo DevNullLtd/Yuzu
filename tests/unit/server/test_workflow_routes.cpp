@@ -7163,6 +7163,36 @@ TEST_CASE("N2-3: a failing policy read 503s the uninstall of a pack with a defin
     CHECK(still_frag->has_value());
 }
 
+// The JSON form of POST /api/workflows and POST /api/product-packs is `{"yaml_source": ...}`; the
+// central body-cap stage does not scan these classes (their other form is raw YAML), so each handler
+// bounds the JSON form at kYamlEnvelopeMaxJsonValues = 1000 counted values. A VALID JSON body with a
+// padding array makes the guard the only reason for the 400 text. Turns red if either guard is
+// removed (the over-budget body is then parsed and answered by the create instead).
+TEST_CASE("the JSON form of a workflow and a product pack create is bounded at 1000 values",
+          "[pg][workflow][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true);
+    // `{`, the comma between the two fields and `[` count 3; every further `,1` adds one.
+    const auto body_with = [](std::size_t counted) {
+        std::string pad = "1";
+        for (std::size_t i = 3; i < counted; ++i)
+            pad += ",1";
+        return R"({"yaml_source":"x","pad":[)" + pad + "]}";
+    };
+    for (const char* route : {"/api/workflows", "/api/product-packs"}) {
+        INFO(route);
+        auto at = h.sink.Post(route, body_with(1'000), "application/json");
+        REQUIRE(at);
+        CHECK(at->body.find("invalid request body") == std::string::npos); // reached the create
+        auto over = h.sink.Post(route, body_with(1'001), "application/json");
+        REQUIRE(over);
+        CHECK(over->status == 400);
+        CHECK(over->body.find("invalid request body") != std::string::npos);
+    }
+}
+
 // N4-1: UP-1. PolicyStore::delete_fragment answers a bare false for a database fault as well as for
 // "absent" and "a policy still uses it", and the uninstall used to read every such false as a
 // tolerated not_found: it answered 200 and tombstoned the pack over a fragment that still named the
