@@ -2272,6 +2272,13 @@ class MarkerAmbiguity(GitCase):
         self.assertIn("- **Shipped thing.**  [released]\n", out)
         self.assertNotIn("[released 0.9.0]", out)
 
+    def test_an_indented_version_heading_is_a_heading_only_up_to_three_spaces(self):
+        """Three spaces is still a Markdown heading (the version is unknown); four or a tab is a code block."""
+        head = "## [0.9.0]\n- a\n"
+        for indent, want in (("  ", ""), ("   ", ""), ("    ", "0.9.0"), ("\t", "0.9.0")):
+            with self.subTest(indent=repr(indent)):
+                self.assertEqual(WN.release_sections(f"{head}{indent}## [1.0.0]\n- b\n")["- b"], want)
+
     def test_a_sub_heading_does_not_end_the_section(self):
         repo, old = self.base()
         log = "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n### Added\n\n- **Shipped thing.**\n"

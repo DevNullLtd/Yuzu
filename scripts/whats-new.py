@@ -690,7 +690,7 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
 
     None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
     be told: the line sits under a `#` or `##` heading that is not `## [X]` (tab-separated, a title, indented
-    before a bracket), before any heading, or under more than one version (a generic bullet repeated across releases), so naming
+    by one to three spaces before a bracket), before any heading, or under more than one version (a generic bullet repeated across releases), so naming
     one version could name the wrong one."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
