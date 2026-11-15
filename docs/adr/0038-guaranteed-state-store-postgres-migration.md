@@ -384,9 +384,19 @@ row first).
   by every exit that projects nothing, so a blank order row survives only a Repair that touched the census
   row. A blank row is never "currently unordered". The consequence recorded in the 2026-11-12 Update stands:
   an event whose first delivery failed the order step is never counted in the agent's clock or counters, so
-  the unordered count can undercount for an agent whose first deliveries all failed it. That Update says the
-  gap must be closed before the comparison ships; this change does not close it, and it stays an open item
-  for the owner, not a withdrawn one.
+  the unordered count can undercount for an agent whose first deliveries all failed it. The sentence of the
+  2026-11-12 Update that this gap "must be closed before the comparison ships" is superseded by an owner
+  ruling of 2026-11-15: the gap ships documented, and the comparison is not held for it. The gap is this: an
+  agent whose first deliveries all failed the order step has no order row (or a blank one a Repair left),
+  so the fleet unordered count and the agent's per-agent counters do not include it, and it is not listed
+  in `unordered_agent_ids`, until its next first delivery writes the clock and counters. Its failed events
+  are stored with pending evidence, so they show on `yuzu_server_guardian_census_pending_events`. The
+  follow-up (issue to be filed) is a schema v6 change: a database-clock receipt column
+  (`recv_ns`) on `guaranteed_state_events` written in the event INSERT, plus a partial index leading with
+  `agent_id` on `projection_pending AND boot_epoch IS NULL` (the only pending index today is
+  `idx_gse_pending (rule_id, agent_id)`; the 2026-11-06 owner ruling declined an `agent_id`-leading pending
+  index, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
+  holding such a pending unpaired event. It is not part of this change.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
   more than ten years past receipt, is `implausible` and is HELD at first delivery whatever the clock says:
   stored with pending evidence, the census untouched, counted as an unpaired event for the agent. The flag is
