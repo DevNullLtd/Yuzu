@@ -624,18 +624,24 @@ struct FileMechanismTestControls {
     /// try, so it must NEVER throw (a throw ends the process): a test-only seam.
     /// It is consulted only for a completion that is NOT itself a handed-back one,
     /// whose watch is not being removed, while the mechanism is not stopping, and
-    /// only while fewer than 8 completions are stashed (the stash is sized once, so
-    /// the worker never allocates): a ninth swallow does not happen, the ninth
-    /// completion is processed normally. The stash names a watch by a never-reused
-    /// id, never by address, and nothing is posted to the IOCP, so releasing after
-    /// the watch was unwatched or after stop() is safe: an entry whose watch is gone
-    /// is dropped and nothing is dereferenced. stop() discards the stash.
+    /// only while fewer than the stash capacity are stashed (8 on the MSVC STL, the
+    /// reserve(8) result; the stash is sized once, so the worker never allocates): a
+    /// swallow beyond that does not happen, the completion is processed normally. The
+    /// stash names a watch by a never-reused id, never by address, and nothing is
+    /// posted to the IOCP, so releasing after the watch was unwatched or after stop()
+    /// is memory-safe: nothing is dereferenced for an entry whose watch is gone. An
+    /// entry whose watch is gone, is being removed, or has been re-armed since (a read
+    /// outstanding) is dropped, not replayed, and counted in
+    /// FileMechanismDebugCounters::stash_dropped. An entry for a watch that was
+    /// unwatched still occupies a stash slot until a release or stop() clears it, so
+    /// such stale entries count against the capacity. stop() discards the stash.
     std::function<bool(std::wstring_view dir, bool ok, unsigned long bytes)> completion_suppress_hook;
     /// One-shot: hand every swallowed completion back so the worker processes it
     /// with its original result and byte count, in the order swallowed, when its
-    /// watch is still armed. Safe at any time (see completion_suppress_hook). A
-    /// completion handed back for a watch that has since been retired to the drain
-    /// list is dropped, not replayed.
+    /// watch is still armed. Memory-safe at any time (see completion_suppress_hook:
+    /// what it guarantees and when an entry is dropped). A completion handed back
+    /// for a watch that has since been retired to the drain list is dropped, not
+    /// replayed.
     bool release_suppressed_completions{false};
 };
 
@@ -680,6 +686,8 @@ struct FileMechanismDebugCounters {
                                            ///< (the retry doubles 30 s to 300 s across them)
     std::uint64_t verify_starved{0};       ///< due verifications not launched for 3 intervals (once per episode)
     std::uint64_t sweep_passes{0};         ///< sweep passes run (debug: a test asserts the sweep does not spin)
+    std::uint64_t stash_dropped{0};        ///< test-control stash entries handed back but dropped, not replayed
+                                           ///< (watch gone, removing or re-armed); a replayed entry is not counted
 };
 
 /// Returns true if `mech` is the Windows File mechanism and the controls were

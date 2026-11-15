@@ -209,7 +209,9 @@ constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached discovery-pro
 
 /// How often an idle, healthy watch re-opens its directory path to confirm the
 /// path still names the directory its handle was opened on (#5719 item 5). A
-/// SAMPLED check: a rename is noticed up to one interval late, and a rename away
+/// SAMPLED check: a rename is noticed up to one interval late (at up to a few hundred
+/// watched directories; beyond that the lag grows with the directory count,
+/// docs/spark-flip-gate.md, cost item), and a rename away
 /// and back between two samples is not noticed at all (nothing was lost). Not a
 /// measured value; the test control FileMechanismTestControls::
 /// path_verify_interval overrides it.
@@ -555,13 +557,6 @@ struct KeyBinding {
     }
 };
 
-/// One watched directory: its overlapped read, its buffer, and (for a real
-/// dir) the set of spark keys interested in each (lower-cased) filename
-/// inside it. Heap-owned and kept alive until its outstanding I/O drains —
-/// the IOCP teardown contract. Every field is guarded by the mechanism's mu_
-/// EXCEPT that a retired watch (removing=true, moved into retiring_) is owned
-/// by whichever code eventually reaps it (run()'s own drop_watch(), or
-/// stop()'s reap loop) — touched only for its OS handles from that point on.
 /// A never-reused watch identity. The test-control completion stash names a watch by this,
 /// never by address: an address can be freed and reused, an id cannot.
 inline std::uint64_t next_watch_id() noexcept {
@@ -569,6 +564,13 @@ inline std::uint64_t next_watch_id() noexcept {
     return counter.fetch_add(1, std::memory_order_relaxed) + 1;
 }
 
+/// One watched directory: its overlapped read, its buffer, and (for a real
+/// dir) the set of spark keys interested in each (lower-cased) filename
+/// inside it. Heap-owned and kept alive until its outstanding I/O drains —
+/// the IOCP teardown contract. Every field is guarded by the mechanism's mu_
+/// EXCEPT that a retired watch (removing=true, moved into retiring_) is owned
+/// by whichever code eventually reaps it (run()'s own drop_watch(), or
+/// stop()'s reap loop) — touched only for its OS handles from that point on.
 struct DirWatch {
     const std::uint64_t id{next_watch_id()}; ///< stash identity only (see next_watch_id)
     DirHandle handle;               ///< CreateFileW(FILE_LIST_DIRECTORY, OVERLAPPED), IOCP-associated
@@ -1467,6 +1469,7 @@ public:
         d.path_lost_flaps = path_lost_flaps_.load(std::memory_order_relaxed);
         d.verify_starved = verify_starved_.load(std::memory_order_relaxed);
         d.sweep_passes = sweep_passes_.load(std::memory_order_relaxed);
+        d.stash_dropped = stash_dropped_.load(std::memory_order_relaxed);
         d.probe_workers_active = probe_lane_.active_workers();
         std::lock_guard lk(mu_);
         d.pass_failures_consecutive = pass_failures_;
@@ -1785,8 +1788,10 @@ private:
     // open); a watch whose directory gave no usable identity (never verified); a
     // rename away and back between two samples (nothing was lost); and a
     // verification that hangs (it pins one of kVerifyLaneCap slots and that watch
-    // stays unverified). Detection is sampled: up to one interval deaf, then
-    // Faulted until the ordinary retry shelters or re-attaches the watch.
+    // stays unverified). Detection is sampled: up to one interval deaf (at up to a few
+    // hundred watched directories; beyond that the lag grows with the directory count,
+    // docs/spark-flip-gate.md, cost item), then Faulted until the ordinary retry shelters
+    // or re-attaches the watch.
     //
     // Damping: a loss is a FLAP when the watch was just re-established from a
     // path-loss fault and no verify decided Same since that commit (so a genuine
@@ -3837,15 +3842,22 @@ private:
         return false;
     }
 
-    /// Test seam only (the completion stash), under mu_: the armed watch with this id, or null.
-    /// A watch already retired to retiring_ is deliberately not found: its read is cancelled and
-    /// owned by the drain, so a handed-back completion for it is dropped, never replayed.
+    /// Test seam only (the completion stash), under mu_: the armed watch with this id that can
+    /// accept a handed-back completion, or null. A watch qualifies only when it is in dirs_ or
+    /// ancestors_, is not `removing` and has no read outstanding (`io_pending`): a swallowed
+    /// completion leaves exactly that state. One already retired to retiring_ is deliberately
+    /// not found (its read is cancelled and owned by the drain), and one re-armed since the
+    /// swallow is not either (a second completion for it would be a second one in flight). In
+    /// both cases the handed-back completion is dropped, never replayed.
+    static bool can_take_replay(const std::unique_ptr<DirWatch>& slot, std::uint64_t id) noexcept {
+        return slot && slot->id == id && !slot->removing && !slot->io_pending;
+    }
     DirWatch* find_watch_by_id_locked(std::uint64_t id) const {
         for (const auto& [k, slot] : dirs_)
-            if (slot && slot->id == id)
+            if (can_take_replay(slot, id))
                 return slot.get();
         for (const auto& [k, slot] : ancestors_)
-            if (slot && slot->id == id)
+            if (can_take_replay(slot, id))
                 return slot.get();
         return nullptr;
     }
@@ -3892,6 +3904,8 @@ private:
                     ckey = reinterpret_cast<ULONG_PTR>(rw);
                     ov = &rw->ov;
                     replayed = true;
+                } else {
+                    stash_dropped_.fetch_add(1, std::memory_order_relaxed);
                 }
             }
             const bool real_completion = (ov != nullptr);
@@ -4146,6 +4160,7 @@ private:
     std::atomic<std::uint64_t> path_lost_flaps_{0};      ///< losses counted as flaps (backoff seeded)
     std::atomic<std::uint64_t> verify_starved_{0};       ///< due verifications unlaunched past the threshold
     std::atomic<std::uint64_t> sweep_passes_{0};         ///< sweep_probes_locked passes (debug: spin check)
+    std::atomic<std::uint64_t> stash_dropped_{0};        ///< handed-back stash entries dropped, not replayed
 
     std::atomic<std::size_t> retiring_cap_override_{0}; ///< 0 = use kRetiringCap
     std::atomic<std::int64_t> caller_wait_ms_{kFileCallerWaitBudget.count()};
