@@ -3530,7 +3530,8 @@ tests:
   # unordered-agents read), "guardian_census" (the two census gauge reads:
   # the pending-evidence count and the unordered-agents count, #5690) and
   # "guardian_census_device" (the per-device unrepresented-pending read and
-  # the per-device order read, #7217, whose reasons add statement_timeout)
+  # the per-device order read, #7217, whose reasons add statement_timeout, as does the Apps read on
+  # guardian_state)
   # - each pages on a sustained non-zero rate, keyed by both
   # labels (the expr has no source filter; the cases below exercise
   # guardian_state, guardian_rules and guardian_census_device).

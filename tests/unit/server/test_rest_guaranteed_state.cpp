@@ -2882,8 +2882,20 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     // The operation description names the policy block, the profile marker, the
     // refused-policy fault and the 60 s staleness bound behind the 503.
     const auto op_desc = spec["paths"]["/dex/apps"]["get"]["description"].get<std::string>();
-    for (const char* concept_word : {"data.policy", "profile", "fault", "staleness bound (60 s)"})
+    for (const char* concept_word : {"data.policy", "profile", "fault", "staleness bound (60 s)",
+                                     "observer_state", "statement_timeout", "interval_confidence"})
         CHECK(op_desc.find(concept_word) != std::string::npos);
+    // The schemas the payload keys belong to describe them (#7504, #7519, #7537).
+    const auto& schemas = spec["components"]["schemas"];
+    CHECK(schemas["DexAppsList"]["properties"].contains("observer_state"));
+    CHECK(schemas["DexAppsList"]["properties"]["policy"]["properties"].contains("interval_confidence"));
+    CHECK(schemas["DexAppsStabilityScore"]["properties"].contains("tier"));
+    const auto withheld = schemas["DexAppsStabilityScore"]["properties"]["withheld"]["description"].get<std::string>();
+    for (const char* token : {"no_population", "invalid_weights", "invalid_edges", "invalid_model", "inconsistent",
+                              "below_floor", "offline_affected"})
+        CHECK(withheld.find(token) != std::string::npos);
+    CHECK(schemas["DexAppPerfInterval"]["properties"]["reliable"]["description"].get<std::string>().find(
+              "affected online devices") != std::string::npos);
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
@@ -3060,6 +3072,16 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
         CHECK(policy["tiers"][t]["edge"].is_number());
         CHECK(policy["tiers"][t]["name"].is_string());
     }
+    // #7504, #7519: the interval level, the resolved tier name per score, the live observer split.
+    CHECK(policy["interval_confidence"].get<double>() == Catch::Approx(0.95));
+    REQUIRE(j["data"].contains("observer_state"));
+    CHECK(j["data"]["observer_state"].is_null()); // no observer source in this harness
+    for (const auto& a : j["data"]["apps"]) {
+        REQUIRE(a["score"].contains("tier"));
+        CHECK((a["score"]["tier"].is_string() == !a["score"]["score"].is_null()));
+        for (const auto& v : a["versions"])
+            CHECK(v["score"].contains("tier"));
+    }
 }
 
 TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",
@@ -3093,6 +3115,8 @@ TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, neve
     CHECK(j["error"]["code"] == 503);
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(res->body.find("\"apps\"") == std::string::npos);
+    // The message names the cause (#7520): a dropped table is a query error.
+    CHECK(j["error"]["message"].get<std::string>().find("(query_error)") != std::string::npos);
 }
 
 TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason and never an empty list",
