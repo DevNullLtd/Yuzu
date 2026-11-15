@@ -173,13 +173,34 @@ namespace lifecycle_detail {
     return sanitize_utf8_strict(s) == s;
 }
 
+/// The shape of a STORED key, the one `product_lifecycle_key` and `os_lifecycle_key` build: a
+/// `product:` or `os:` prefix, a non-empty remainder and no ASCII upper-case letter. A key of any
+/// other shape (`Product:x`, `os:Ubuntu`, a bare `x`) could never equal a built lookup key, so it
+/// would sit in the table matching nothing. Non-ASCII bytes are allowed: a normalised title key can
+/// carry them. Writes only; a lookup that misses is an honest `unknown`.
+[[nodiscard]] inline bool key_shape_ok(std::string_view key) {
+    std::string_view rest;
+    if (key.starts_with("product:"))
+        rest = key.substr(8);
+    else if (key.starts_with("os:"))
+        rest = key.substr(3);
+    return !rest.empty() &&
+           std::none_of(key.begin(), key.end(), [](char c) { return c >= 'A' && c <= 'Z'; });
+}
+
+inline constexpr std::string_view kKeyShapeRefusal =
+    "product_key must be 'product:' or 'os:' followed by a lower-case key";
+
 } // namespace lifecycle_detail
 
-/// First defect of a rule, or nullopt. The store and the CSV parser share this one check.
+/// First defect of a rule, or nullopt. The store and the CSV parser share this one check. A
+/// `product_key` must have the stored shape (`lifecycle_detail::key_shape_ok`).
 [[nodiscard]] inline std::optional<std::string> validate_lifecycle_rule(const LifecycleRule& r) {
     using lifecycle_detail::text_ok;
     if (r.product_key.empty() || !text_ok(r.product_key))
         return "product_key is empty, too long or not printable text";
+    if (!lifecycle_detail::key_shape_ok(r.product_key))
+        return std::string{lifecycle_detail::kKeyShapeRefusal};
     if (!text_ok(r.version_prefix) || r.version_prefix.starts_with('.') ||
         r.version_prefix.ends_with('.'))
         return "version_prefix is too long, not printable text, or starts or ends with a dot";
@@ -192,10 +213,13 @@ namespace lifecycle_detail {
     return std::nullopt;
 }
 
+/// First defect of a declared fact, or nullopt; the key shape rule is the rule's.
 [[nodiscard]] inline std::optional<std::string> validate_declared_fact(const DeclaredFact& f) {
     using lifecycle_detail::text_ok;
     if (f.product_key.empty() || !text_ok(f.product_key))
         return "product_key is empty, too long or not printable text";
+    if (!lifecycle_detail::key_shape_ok(f.product_key))
+        return std::string{lifecycle_detail::kKeyShapeRefusal};
     if (f.version.empty() || !text_ok(f.version))
         return "version is empty, too long or not printable text";
     if (!is_lifecycle_date(f.date))
@@ -220,8 +244,9 @@ validate_lifecycle_lookup(std::string_view product_key, std::string_view version
 /// Parse a rule file. `#` lines and blank lines are skipped; the first other line must be
 /// `kLifecycleCsvHeader`; fields are plain comma-separated text (no quoting, so no field holds a
 /// comma). The whole file is refused on the first defect: over 256 KiB, over 5000 rows, a field
-/// over 256 bytes, a control byte, invalid UTF-8, a non-calendar date, an event outside
-/// {end_of_support,end_of_life}, a wrong column count, or a repeated
+/// over 256 bytes, a control byte, invalid UTF-8, a product_key that is not `product:` or `os:`
+/// followed by a lower-case key (it could never match a built lookup key), a non-calendar date, an
+/// event outside {end_of_support,end_of_life}, a wrong column count, or a repeated
 /// (product_key, version_prefix, event).
 [[nodiscard]] inline std::expected<std::vector<LifecycleRule>, std::string>
 parse_lifecycle_rules_csv(std::string_view text, LifecycleSource source) {

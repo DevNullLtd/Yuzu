@@ -14,7 +14,7 @@
 /// lease, schema-qualifies every runtime statement and binds every value with `exec_params`. No
 /// secrets are stored. Failure posture (ADR-0012 §1):
 ///   - **Construction:** fail-closed. The server refuses to start when the store cannot open or
-///     when the embedded seed cannot be parsed or loaded.
+///     when the embedded seed cannot be parsed, has no rules, or cannot be loaded.
 ///   - **Seed load (`replace_rules`):** fail-closed. It reports its failure as an error the caller
 ///     turns into a refused start; a newer binary's seed therefore always replaces the stored
 ///     `shipped` rows, in one transaction under an advisory lock.
@@ -125,7 +125,8 @@ public:
     declared_for(const std::vector<LifecycleLookup>& lookups);
 
     /// Resolve each lookup with the pure evaluator over the stored rows, in input order. At most
-    /// `kLifecycleBatchMax` lookups per call: this is the bounded pass.
+    /// `kLifecycleBatchMax` lookups per call: this is the bounded pass. All or nothing: one invalid
+    /// lookup or one failed read refuses the whole batch (an error, never a partial answer).
     [[nodiscard]] std::expected<std::vector<LifecycleEvaluation>, Error>
     evaluate_batch(const std::vector<LifecycleLookup>& lookups, std::string_view today,
                    std::int64_t now_secs);

@@ -258,6 +258,55 @@ TEST_CASE("lifecycle: keys", "[lifecycle][rules]") {
     CHECK(os_lifecycle_key("plan9", "x").empty());
 }
 
+TEST_CASE("lifecycle: a stored key has the shape the key helpers build", "[lifecycle][rules]") {
+    const auto rule_with = [](std::string key) {
+        return LifecycleRule{std::move(key), "", kEol, "2026-02-01", LifecycleSource::external,
+                             "ref", 0};
+    };
+    const auto fact_with = [](std::string key) {
+        return DeclaredFact{std::move(key), "16", kEol, "2026-02-01", 1};
+    };
+    for (const std::string& key :
+         {product_lifecycle_key("postgresql:postgresql"), os_lifecycle_key("linux", "Ubuntu"),
+          os_lifecycle_key("Windows", ""), std::string{"product:caf\xc3\xa9"}}) {
+        INFO(key);
+        CHECK_FALSE(validate_lifecycle_rule(rule_with(key)).has_value());
+        CHECK_FALSE(validate_declared_fact(fact_with(key)).has_value());
+    }
+    for (const char* key :
+         {"Product:x", "product:X", "os:Ubuntu", "OS:ubuntu", "x", "os:", "product:"}) {
+        INFO(key);
+        const auto r = validate_lifecycle_rule(rule_with(key));
+        REQUIRE(r.has_value());
+        CHECK(r->find("lower-case") != std::string::npos);
+        const auto f = validate_declared_fact(fact_with(key));
+        REQUIRE(f.has_value());
+        CHECK(f->find("lower-case") != std::string::npos);
+    }
+}
+
+TEST_CASE("lifecycle: a lookup is bounded printable text and may have an empty version",
+          "[lifecycle][rules]") {
+    const std::string key_at_cap = "product:" + std::string(kLifecycleFieldMaxBytes - 8, 'x');
+    const std::string version_at_cap(kLifecycleFieldMaxBytes, '1');
+    CHECK_FALSE(validate_lifecycle_lookup(kKey, "").has_value());
+    CHECK_FALSE(validate_lifecycle_lookup(key_at_cap, version_at_cap).has_value());
+    CHECK(validate_lifecycle_lookup(key_at_cap + "x", "1").has_value());
+    CHECK(validate_lifecycle_lookup(kKey, version_at_cap + "1").has_value());
+    CHECK(validate_lifecycle_lookup("", "1").has_value());
+    CHECK(validate_lifecycle_lookup(kKey, "1\x01").has_value());    // control byte
+    CHECK(validate_lifecycle_lookup(kKey, "1\x7f").has_value());    // DEL
+    CHECK(validate_lifecycle_lookup(kKey, "\xc3\x28").has_value()); // invalid UTF-8
+    CHECK(validate_lifecycle_lookup("product:a\x01!", "1").has_value());
+
+    SECTION("an empty version matches only an empty prefix") {
+        CHECK(eval("", {rule(LifecycleSource::shipped, "", kEol, "2020-01-01")}).state ==
+              LifecycleState::end_of_life);
+        CHECK(eval("", {rule(LifecycleSource::shipped, "16", kEol, "2020-01-01")}).state ==
+              LifecycleState::unknown);
+    }
+}
+
 namespace {
 const std::string kHeader{kLifecycleCsvHeader};
 std::string csv(const std::string& rows) { return "# comment\n\n" + kHeader + "\n" + rows; }
@@ -286,25 +335,25 @@ TEST_CASE("lifecycle csv: each defect refuses the whole file with a reason", "[l
         CHECK_FALSE(r.error().empty());
         return r.error();
     };
-    SECTION("bad date") { CHECK(refused(csv("a,,end_of_life,2026-02-30,r\n")).find("date") != std::string::npos); }
+    SECTION("bad date") { CHECK(refused(csv("os:a,,end_of_life,2026-02-30,r\n")).find("date") != std::string::npos); }
     SECTION("unknown event") {
-        CHECK(refused(csv("a,,retired,2026-02-01,r\n")).find("event") != std::string::npos);
+        CHECK(refused(csv("os:a,,retired,2026-02-01,r\n")).find("event") != std::string::npos);
     }
     SECTION("duplicate key") {
-        CHECK(refused(csv("a,1,end_of_life,2026-02-01,r\na,1,end_of_life,2027-02-01,r\n"))
+        CHECK(refused(csv("os:a,1,end_of_life,2026-02-01,r\nos:a,1,end_of_life,2027-02-01,r\n"))
                   .find("duplicate") != std::string::npos);
     }
     SECTION("same key with a different event or prefix is not a duplicate") {
-        CHECK(parse_lifecycle_rules_csv(csv("a,1,end_of_life,2026-02-01,r\n"
-                                            "a,1,end_of_support,2026-01-01,r\n"
-                                            "a,2,end_of_life,2026-02-01,r\n"),
+        CHECK(parse_lifecycle_rules_csv(csv("os:a,1,end_of_life,2026-02-01,r\n"
+                                            "os:a,1,end_of_support,2026-01-01,r\n"
+                                            "os:a,2,end_of_life,2026-02-01,r\n"),
                                         LifecycleSource::shipped)
                   .has_value());
     }
     SECTION("file over the byte cap, one byte past an accepted file") {
         // A valid file padded with a trailing comment line to an exact size.
         const auto sized = [](std::size_t total) {
-            const std::string base = csv("a,,end_of_life,2026-02-01,r\n");
+            const std::string base = csv("os:a,,end_of_life,2026-02-01,r\n");
             return base + "#" + std::string(total - base.size() - 1, 'x');
         };
         const auto at_cap = parse_lifecycle_rules_csv(sized(kLifecycleCsvMaxBytes),
@@ -317,7 +366,7 @@ TEST_CASE("lifecycle csv: each defect refuses the whole file with a reason", "[l
         const auto rows_of = [](std::size_t n) {
             std::string rows;
             for (std::size_t i = 0; i < n; ++i)
-                rows += "k" + std::to_string(i) + ",,end_of_life,2026-02-01,r\n";
+                rows += "os:k" + std::to_string(i) + ",,end_of_life,2026-02-01,r\n";
             return csv(rows);
         };
         const auto at_cap = parse_lifecycle_rules_csv(rows_of(kLifecycleCsvMaxRows),
@@ -327,31 +376,42 @@ TEST_CASE("lifecycle csv: each defect refuses the whole file with a reason", "[l
         CHECK(refused(rows_of(kLifecycleCsvMaxRows + 1)).find("rows") != std::string::npos);
     }
     SECTION("control byte") {
-        refused(csv("a,,end_of_life,2026-02-01,r\x01x\n"));
-        refused(csv("a,,end_of_life,2026-02-01,r\tx\n"));
-        refused(csv(std::string("a,,end_of_life,2026-02-01,r") + '\0' + "x\n"));
+        refused(csv("os:a,,end_of_life,2026-02-01,r\x01x\n"));
+        refused(csv("os:a,,end_of_life,2026-02-01,r\tx\n"));
+        refused(csv(std::string("os:a,,end_of_life,2026-02-01,r") + '\0' + "x\n"));
     }
-    SECTION("invalid UTF-8") { refused(csv("a,,end_of_life,2026-02-01,r\xc3\x28\n")); }
+    SECTION("invalid UTF-8") { refused(csv("os:a,,end_of_life,2026-02-01,r\xc3\x28\n")); }
     SECTION("field over 256 bytes, one byte past an accepted field") {
         CHECK(parse_lifecycle_rules_csv(
-                  csv("a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes, 'r') +
+                  csv("os:a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes, 'r') +
                       "\n"),
                   LifecycleSource::shipped)
                   .has_value());
-        refused(csv("a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes + 1, 'r') +
+        refused(csv("os:a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes + 1, 'r') +
                     "\n"));
     }
     SECTION("wrong column count") {
-        refused(csv("a,end_of_life,2026-02-01,r\n"));
-        refused(csv("a,,end_of_life,2026-02-01,r,extra\n"));
+        refused(csv("os:a,end_of_life,2026-02-01,r\n"));
+        refused(csv("os:a,,end_of_life,2026-02-01,r,extra\n"));
     }
     SECTION("empty product key") { refused(csv(",,end_of_life,2026-02-01,r\n")); }
+    SECTION("a key that could never equal a built lookup key") {
+        for (const char* key : {"Product:x", "product:X", "os:Ubuntu", "x", "os:", "product:"}) {
+            INFO(key);
+            CHECK(refused(csv(std::string{key} + ",,end_of_life,2026-02-01,r\n"))
+                      .find("lower-case") != std::string::npos);
+        }
+        // Non-ASCII bytes are allowed: a normalised title key can carry them.
+        CHECK(parse_lifecycle_rules_csv(csv("product:caf\xc3\xa9,,end_of_life,2026-02-01,r\n"),
+                                        LifecycleSource::shipped)
+                  .has_value());
+    }
     SECTION("prefix that starts or ends with a dot") {
-        refused(csv("a,3.,end_of_life,2026-02-01,r\n"));
-        refused(csv("a,.3,end_of_life,2026-02-01,r\n"));
+        refused(csv("os:a,3.,end_of_life,2026-02-01,r\n"));
+        refused(csv("os:a,.3,end_of_life,2026-02-01,r\n"));
     }
     SECTION("wrong or missing header") {
-        refused("product_key,version,event,date,source_reference\na,,end_of_life,2026-02-01,r\n");
+        refused("product_key,version,event,date,source_reference\nos:a,,end_of_life,2026-02-01,r\n");
         refused("# only a comment\n");
         refused("");
     }
@@ -389,4 +449,21 @@ TEST_CASE("lifecycle csv: every seed product key is a canonical key of the alias
         CHECK(canonical.contains(r.product_key));
     }
     CHECK(product_rows > 0); // the loop above must not pass by finding nothing to check
+}
+
+TEST_CASE("lifecycle csv: the seed ends Python 3.10 on the date its policy page gives",
+          "[lifecycle][rules][csv][seed]") {
+    // One boundary case for the row a date defect was fixed on (PEP 619: 2026-10-01). A golden copy
+    // of the whole file would only restate the CSV.
+    const auto seed = parse_lifecycle_rules_csv(kSoftwareLifecycleSeed, LifecycleSource::shipped);
+    REQUIRE(seed.has_value());
+    const auto at = [&](std::string_view today) {
+        return evaluate_lifecycle("product:python:python", "3.10.1", *seed, {}, today, kNow, kWindow);
+    };
+    CHECK(at("2026-09-30").state == LifecycleState::supported);
+    const auto on = at("2026-10-01");
+    CHECK(on.state == LifecycleState::end_of_life);
+    REQUIRE(on.end_of_life.has_value());
+    CHECK(on.end_of_life->date == "2026-10-01");
+    CHECK(on.end_of_life->source == LifecycleSource::shipped);
 }

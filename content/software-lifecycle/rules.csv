@@ -21,9 +21,10 @@
 # Every date was read from the page named on its row; a release whose date could not be confirmed
 # there is absent (its state reads unknown) rather than estimated. Windows and macOS releases are
 # absent for that reason. Java runtimes (Oracle JDK and JRE in the alias pack) have no rows yet
-# because their dates differ by vendor and support tier; they read unknown. A page that gives only
-# a month is recorded as the last day of that month and says so on the row. Ubuntu rows end
-# standard security maintenance; Expanded Security Maintenance (a paid add-on) is not modelled.
+# because their dates differ by vendor and support tier; they read unknown. A future row whose
+# page gives only a month is recorded as the last day of that month and says so on the row.
+# Ubuntu rows end standard security maintenance; Expanded Security Maintenance (a paid add-on) is
+# not modelled.
 product_key,version_prefix,event,date,source_reference
 product:postgresql:postgresql,12,end_of_life,2024-11-21,https://www.postgresql.org/support/versioning/ final release
 product:postgresql:postgresql,13,end_of_life,2025-11-13,https://www.postgresql.org/support/versioning/ final release
