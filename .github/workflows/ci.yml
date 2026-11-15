@@ -1993,13 +1993,16 @@ jobs:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
           # Keep opt-in options out of the branch-shared standard build (#4851).
+          # Gateway registration is asserted, not required by a project option
+          # (#4841; pinned by tests/test_gateway_test_summary.py).
           reconfig=""
           [[ -d "$CONTRACT_BUILD/meson-info" ]] && reconfig="--reconfigure"
           meson setup $reconfig "$CONTRACT_BUILD" \
             --native-file meson/native/linux-gcc15.ini --buildtype=debug \
             -Dcmake_prefix_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux" \
             -Dpkg_config_path="$GITHUB_WORKSPACE/vcpkg_installed/x64-linux/lib/pkgconfig" \
-            -Dbuild_tests=true -Dbuild_contract_tests=true -Drequire_gateway=true
+            -Dbuild_tests=true -Dbuild_contract_tests=true
+          python3 scripts/ci/assert-gateway-tests.py "$CONTRACT_BUILD"
           rc=0
           bash scripts/ci/with-test-slot.sh 3 -- \
             python3 scripts/test/contract-evidence.py run \
