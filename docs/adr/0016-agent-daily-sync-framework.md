@@ -1807,6 +1807,32 @@ routes accept a `vers:` range. No schema change: the `purl` column and its parti
   2048 bytes, about 245 MB per request by the same cap arithmetic as above (22 x 1024 + 2048
   bytes, 10,000 rows).
 
+### 2026-11-14 — the host, change-feed, summary and plugin-health read surface
+
+Five REST v1 reads over the typed installed-software store, all `Inventory:Read` through the fleet-read gate as the sole authority, all audited per page, all `503` with a retry hint on a degraded read and never an empty `200` (§7):
+
+- `GET /api/v1/inventory/software/hosts` and `/hosts/{agent_id}`: reporting devices ordered by `agent_id`, each with its facet state rows. The host detail answers an unknown device, a device that has never reported and a device outside the caller's scope with the same `404`, decided before any store read for the out-of-scope case, so the response does not say whether a device outside the scope exists.
+- `GET /api/v1/inventory/software/changes`: the change ledger, scoped on every page.
+- `GET /api/v1/inventory/software/summary` and `/plugin-health`: fleet aggregates.
+
+**Settle window and feed order.** The feed publishes a row only once its `observed_at` is more than 60 seconds old (`stable_before` = now minus 60 seconds, returned in the response) and is ordered `(observed_at, change_id)`; the keyset anchor is that pair taken from the last row served. `change_id` is assigned at insert and `observed_at` is the writing replica's clock, so a `change_id`-only anchor could step over a lower id that becomes visible later. The cursor is bound to `since`, `agent_id` and `kind` but not to `stable_before` (which moves on every request), so it stays valid on the next request.
+
+**Lateness contract (decided, not a defect).** There is no watermark. A row that commits more than 60 seconds after its own `observed_at` lands behind a cursor that has already passed it and is not delivered to a consumer walking forward. Recovery is a re-read with `since`, de-duplicating on `change_id`. Ruled at the plan gate in preference to a watermark. Nothing yet counts rows that breach the window; that measurement is tracked by #7766, and the window or a watermark is revisited from it.
+
+**Known limits (tracked, not defects).** The hosts `q` search matches the device roster (seen in the last 30 days, the newest 100,000), so a roster cut at the cap is served with `roster_truncated` and `roster_cap` and a device quiet for over 30 days is listed with a null hostname and not matched; matching agent ids in the store is #7790. For a caller confined to more than 10,000 devices the change feed continues on the shared wide-scope cursor (last row served plus a count of passed-over rows, refused above 100,000 as a `400`), so a row deleted inside the passed-over span between two pages can make the next page skip a row; recovery is a re-read from an earlier `since`, de-duplicating on `change_id`, and the replacement is #7789.
+
+**Snapshot and confinement rule.** The summary and plugin-health figures for an unconfined caller come from one in-memory fleet snapshot, recomputed by the catalogue rollup thread on its hourly tick; a failed recompute publishes nothing and the last good snapshot stays, and the same tick sets the `yuzu_software_facet_*` gauges. The snapshot is fleet-wide and is therefore served ONLY to a caller whose scope is unconfined. A confined caller is never given a figure derived from the snapshot: with up to 10,000 visible devices the figure is computed live over exactly those devices, with the scope pushed into the query; with more, the blocks are `null` with `omitted` of `scope`. A block whose input is absent renders `null` with `omitted` of `scope` or `building`, never zeros. The catalogue block is the fleet rollup's own figure and is given to unconfined callers only.
+
+**Dropped from the earlier read-model plan, with reasons.**
+
+- Tombstones for removed packages: dropped. A removal is already a hard delete plus a `remove` ledger row carrying the name, publisher and version, so no read needs a `removed_at` filter and the change feed is the record of removals.
+- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it.
+- A separate freshness field per row: dropped. The row `status` (`current`, `unconfirmed`, `disabled`) and `last_confirmed_at`, derived from the facet state, already say how fresh a row is, and the hosts read exposes both per facet.
+- Device record fields on the host rows (OS, serial, system UUID, MAC addresses, agent version): dropped. A host row carries `agent_id`, the roster `hostname`, `last_seen` and the facet states, the same hostname join the lookup rows use. The full device record is served by the hardware list under the behavioural-PII access audit (`emit_behavioral_audit`), while these five routes audit set-and-proceed, so joining those fields here would change this route's audit contract and data tier, which this change neither planned nor reviewed. The runbook sends the operator to `GET /api/v1/devices/{id}` for the OS and the agent version. Which fields belong on a host row is tracked by #7784.
+- A `scope` parameter on the hosts list: dropped as unbacked, the same ruling that leaves `scope=expr` off the installs route; nothing in this read model resolves a scope expression. The hosts list reads `q`, `last_synced_before`, `limit` and `cursor` only, and the caller's gate scope is applied on every page, so a request cannot widen or narrow it.
+
+The MCP twins of the five routes are not part of this change (#7765).
+
 ## Routed-concern invariants
 
 Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.

@@ -354,8 +354,8 @@ struct ScopedPage {
     bool hit_cap{false};               ///< the same condition as next_cursor being non-empty
     /// DISTINCT devices hidden by the post-filter within the scanned window(s) (0 under push-down).
     std::int64_t devices_omitted{0};
-    /// The request named an `agent_id` outside the caller's scope. Under push-down the SQL then
-    /// returns nothing and devices_omitted stays 0; the transports still audit it as a denial.
+    /// The request named an `agent_id` outside the caller's scope: the page is empty (nothing is
+    /// read, devices_omitted 0, no cursor) for every scope class; the transports still audit it.
     bool target_denied{false};
 };
 using DevicesPage = ScopedPage<SoftwareFleetRow>;
@@ -372,7 +372,9 @@ using ScopedReader = std::function<std::optional<std::vector<typename Ops::Row>>
     const typename Ops::Query&)>;
 
 /// One scoped keyset page: decode the cursor (bound to the filter set, never to the scope), push
-/// the caller's scope into the query, read, then post-filter. The scope: TOP -> unfiltered;
+/// the caller's scope into the query, read, then post-filter. A named `agent_id` outside the scope
+/// is answered first with the empty denied page and no read, whatever the scope's size. The scope:
+/// TOP -> unfiltered;
 /// engaged-empty -> agent_ids = {} (the store returns empty without SQL); engaged and
 /// <= kScopePushdownMaxIds -> agent_ids = the set (complete pages, nothing hidden; one read, the
 /// cursor is the last row); larger -> the rows are filtered here with authz::in_scope and
@@ -401,6 +403,8 @@ read_scoped_page(const ScopedReader<Ops>& read, typename Ops::Query q, const std
         q.after = incoming_after;
     ScopedPage<typename Ops::Row> out;
     out.target_denied = !q.agent_id.empty() && !authz::in_scope(scope, q.agent_id);
+    if (out.target_denied) // every scope class, no read: empty page, devices_omitted 0, no cursor
+        return out;
     // TOP leaves the query alone; engaged-empty is agent_ids = {} (the store returns empty without
     // SQL); a bounded set is pushed into SQL; a wider one is post-filtered below.
     const bool filter = scope && scope->size() > kScopePushdownMaxIds;
