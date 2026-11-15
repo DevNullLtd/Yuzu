@@ -13,6 +13,11 @@ context-refs: epic #6060, #6061 (PR #6163, merged), #6062, #6063, #6064, #6065, 
 
 ## Binding status
 
+> **Note (2026-11-14, against dev @ 2c49b4ea0).** The status stays `proposed` under the acceptance
+> rule below. PR1 (#6163) and PR2 (#6062) are merged; PR2's storage and redemption primitives are
+> in `approval_manager.cpp` and are dormant: no production code mints a bound ticket
+> (`ApprovalManager::submit_bound` has no caller outside `approval_manager.cpp`).
+
 **Proposed, not accepted.** The delivery map below is the plan for epic #6060. PR1 (#6163) is
 merged and PR2 (#6062) puts the storage and redemption primitives of D2 to D4 in the tree with
 this ADR. Anything attributed to PR3 to PR7 is **intent**, not shipped behaviour, and so is every
