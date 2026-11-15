@@ -16147,7 +16147,8 @@ private:
 /// switch-off cannot throw and leave a privilege off with nothing recorded to turn it back
 /// on (the one remaining throw-hole of the ctor). The identity check opens the path
 /// with FILE_FLAG_BACKUP_SEMANTICS, which bypasses a directory's DACL while either privilege
-/// is ENABLED (an elevated administrator session has both enabled), so a DENY ACE can only
+/// is ENABLED (both are present but typically disabled in an elevated token; this guard
+/// switches both off and checks the result, so it is safe either way), so a DENY ACE can only
 /// refuse the open with them off. Process-wide, which is what the mechanism's worker threads
 /// need; the binary runs one test at a time. `ok()` is false when the token could not be
 /// opened or adjusted (a privilege the token does not hold at all is not a failure).
@@ -16631,13 +16632,23 @@ TEST_CASE("File spark (real mechanism): stop() with a lost path whose completion
 
 // ── #5719 item 5: the test-control completion stash cannot outlive its watch ──────────────
 //
-// The three cases below pin the lifetime contract of completion_suppress_hook /
+// The four cases below pin the lifetime contract of completion_suppress_hook /
 // release_suppressed_completions (spark_mechanism.hpp): the stash names a watch by a
-// never-reused id, nothing is posted to the IOCP, and a release after the watch is gone is
-// harmless. Two of them need the owner worker PARKED while the test thread acts, so they
-// park it inside an INLINE handler (an inline handler runs on the owner worker, off the
-// mechanism's lock) on a Fired event of a third, sacrificial watch.
+// never-reused id, nothing is posted to the IOCP, and a release after the watch is gone, or
+// after stop(), is harmless. Two of them need the owner worker PARKED while the test thread
+// acts, so they park it inside an INLINE handler (an inline handler runs on the owner worker,
+// off the mechanism's lock) on a Fired event of a third, sacrificial watch.
+//
+// Which leg observes what (the unwatch case): the FileMechanismDebugCounters::stash_dropped
+// counter is read on EVERY Windows leg, so a stash entry that is dropped (watch gone) is seen
+// everywhere; a dereference of the freed watch is only a heap-use-after-free REPORT on the
+// windows-asan leg (nightly, main only). The stop case is a contract pin, not an observer (see
+// its comment); the premature-reap half of the old defect has no test observer at all.
 namespace {
+/// The stash cases' wait bound, scaled for the slow legs (nightly windows-asan) as the older
+/// cases scale theirs. Liveness bound only.
+constexpr auto kStashBound = kDeafBound * yuzu::test::kSpinScale;
+
 /// State shared with the parking inline handler. The handler captures a shared_ptr to it BY
 /// VALUE (the engine owns the handler copy), so nothing it touches can dangle.
 struct OwnerParkState {
@@ -16666,8 +16677,9 @@ SparkEngine::InlineHandler park_on_fire_handler(std::shared_ptr<OwnerParkState> 
     };
 }
 /// Releases a parked worker and waits (bounded) for it to leave the handler, on every exit
-/// path. Declare it AFTER the state it names and BEFORE the engine, so it runs while the
-/// engine can still be stopped.
+/// path. Declare it AFTER the state it names AND AFTER the engine: it is then destroyed
+/// BEFORE ~SparkEngine, so the worker is released while the engine can still be stopped (the
+/// engine's stop() joins that worker, and a parked one would hold it for up to 30 s).
 struct OwnerParkGuard {
     std::shared_ptr<OwnerParkState> st;
     ~OwnerParkGuard() {
@@ -16678,6 +16690,28 @@ struct OwnerParkGuard {
             std::this_thread::sleep_for(1ms);
     }
 };
+/// Waits (bounded) until the parking handler's Fired count has not moved for 200 ms, then
+/// returns it: a settle so a late notification of an EARLIER write cannot be mistaken for the
+/// effect of a later one. A settle window, not a proof of quiescence.
+int settled_fires(const OwnerParkState& st) {
+    int last = st.fires.load(std::memory_order_acquire);
+    auto stable_since = std::chrono::steady_clock::now();
+    const auto until = std::chrono::steady_clock::now() + kStashBound;
+    while (std::chrono::steady_clock::now() < until) {
+        std::this_thread::sleep_for(10ms);
+        const int now = st.fires.load(std::memory_order_acquire);
+        if (now != last) {
+            last = now;
+            stable_since = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - stable_since >= 200ms) {
+            break;
+        }
+    }
+    return last;
+}
+std::uint64_t stash_dropped(ISparkMechanism& mech) {
+    return verify_counter(mech, &FileMechanismDebugCounters::stash_dropped);
+}
 
 /// A completion_suppress_hook that swallows every completion it is consulted for and counts
 /// the consultations. It never throws (it runs on the owner thread outside run()'s try).
@@ -16715,13 +16749,19 @@ TEST_CASE("File spark (real mechanism): releasing a swallowed completion and the
     // its watch by id, the released completion was a packet in the IOCP carrying the freed
     // watch's address, and the worker's next dequeue wrote into freed memory (a heap
     // use-after-free under ASan). Now the entry is dropped because its watch is gone.
+    //
+    // What observes it, by leg: `stash_dropped == 1` is asserted here, so EVERY Windows leg
+    // sees the entry being dropped (on the old bytes there was no drop: the freed watch was
+    // dereferenced); the heap-use-after-free REPORT itself exists only on the windows-asan
+    // nightly leg (main only). The dropped counter proves the drop arm ran, not that nothing
+    // was touched: that second half rests on the sanitizer leg and on code reading.
     DeafWatchTree t1("stash_unwatch_a"), t3("stash_unwatch_c");
     const auto renamed = t1.root / "renamed";
     auto sup = std::make_shared<SuppressState>();
     auto park = std::make_shared<OwnerParkState>();
     Collector got;
-    OwnerParkGuard park_guard{park};
     SparkEngine engine;
+    OwnerParkGuard park_guard{park};
     auto mech = make_file_mechanism();
     ISparkMechanism* raw = mech.get();
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
@@ -16744,7 +16784,7 @@ TEST_CASE("File spark (real mechanism): releasing a swallowed completion and the
             return deaf_coverage(engine, *sub1) == SparkCoverage::Notification &&
                    deaf_coverage(engine, *sub3) == SparkCoverage::Notification;
         },
-        kDeafBound));
+        kStashBound));
 
     // Watch 1's cancelled read completes aborted and is swallowed: it is now a stashed entry.
     sup->swallow_armed.store(true, std::memory_order_release);
@@ -16752,15 +16792,16 @@ TEST_CASE("File spark (real mechanism): releasing a swallowed completion and the
     std::filesystem::rename(t1.parent, renamed, ec);
     REQUIRE_FALSE(ec);
     REQUIRE(eventually([&] { return sup->swallowed.load(std::memory_order_acquire) == 1; },
-                       kDeafBound));
+                       kStashBound));
     REQUIRE(eventually([&] { return count_kind(got, key1, SparkEventKind::Faulted) >= 1; },
-                       kDeafBound));
+                       kStashBound));
+    REQUIRE(stash_dropped(*raw) == 0);
 
     // Park the owner worker (a Fired event of watch 3), then hand the completion back and
     // unwatch watch 1 while the worker cannot dequeue anything.
     park->park_armed.store(true, std::memory_order_release);
     { std::ofstream(t3.file) << "wake"; }
-    REQUIRE(eventually([&] { return park->parked.load(std::memory_order_acquire); }, kDeafBound));
+    REQUIRE(eventually([&] { return park->parked.load(std::memory_order_acquire); }, kStashBound));
     {
         FileMechanismTestControls ctl;
         ctl.release_suppressed_completions = true;
@@ -16768,36 +16809,48 @@ TEST_CASE("File spark (real mechanism): releasing a swallowed completion and the
     }
     engine.disarm(*sub1);
 
-    // Let the worker go: it must survive and keep serving watch 3.
-    const int fires_before = park->fires.load(std::memory_order_acquire);
+    // Let the worker go: it must drop the entry (its watch is gone), survive, and keep
+    // serving watch 3.
     park->release.store(true, std::memory_order_release);
     REQUIRE(eventually([&] { return park->inside.load(std::memory_order_acquire) == 0; },
-                       kDeafBound));
+                       kStashBound));
+    REQUIRE(eventually([&] { return stash_dropped(*raw) == 1; }, kStashBound));
+    // The baseline is taken AFTER the handler has left and its own notifications have
+    // settled, so a late event of the first write cannot satisfy the check below.
+    const int fires_before = settled_fires(*park);
     { std::ofstream(t3.file) << "wake again"; }
     REQUIRE(eventually(
-        [&] { return park->fires.load(std::memory_order_acquire) > fires_before; }, kDeafBound));
+        [&] { return park->fires.load(std::memory_order_acquire) > fires_before; }, kStashBound));
+    CHECK(stash_dropped(*raw) == 1); // dropped once, never replayed
     CHECK(raw->stats().quarantined_total == 0);
     engine.disarm(*sub3);
     engine.stop();
 }
 
 TEST_CASE("File spark (real mechanism): releasing a swallowed completion and then stopping with "
-          "a second watch's read outstanding charges nothing to that read (#5719 item 5)",
+          "a second watch's read outstanding completes within the bound and quarantines nothing "
+          "(a contract pin, #5719 item 5)",
           "[spark][mechanism][windows][5719]") {
-    // A handed-back completion used to be a packet in the IOCP. A stop() while it was still
-    // queued made the reap count that packet against ANOTHER watch's cancelled read, so the
-    // reap could end while that read was still pending and the watch's buffer and OVERLAPPED
-    // were then freed under the kernel. The kernel's write into freed memory is not visible
-    // to ASan, so this case pins the contract (a stop that returns, nothing quarantined, no
-    // sanitizer report) and cannot by itself turn red on the old code; the unwatch case above
-    // is the one that does. Nothing is posted any more, so there is no packet to miscount.
+    // THIS CASE IS A CONTRACT PIN, NOT AN OBSERVER OF THE OLD DEFECT. A handed-back
+    // completion used to be a packet in the IOCP. A stop() while it was still queued made the
+    // reap count that packet against ANOTHER watch's cancelled read, so the reap could end
+    // while that read was still pending and the watch's buffer and OVERLAPPED were then freed
+    // under the kernel. Nothing is posted any more, so there is no packet to miscount.
+    // The premature-reap half of the old defect has NO test observer: a kernel write into
+    // freed memory is invisible to ASan, nothing readable (a debug counter, a stat) says "no
+    // watch is io_pending when the reap ends", and a premature end would not quarantine
+    // anything. Closure of that half rests on the cure (release posts nothing, so the reap's
+    // arithmetic cannot be skewed) plus code review. What this case does pin: stop() with a
+    // handed-back entry queued and a second watch's read live returns within the bound, with
+    // nothing quarantined and no sanitizer report; it cannot by itself turn red on the old
+    // code (the unwatch case above is the one that can, on the windows-asan leg).
     DeafWatchTree t1("stash_stop_a"), t2("stash_stop_b"), t3("stash_stop_c");
     const auto renamed = t1.root / "renamed";
     auto sup = std::make_shared<SuppressState>();
     auto park = std::make_shared<OwnerParkState>();
     Collector got;
-    OwnerParkGuard park_guard{park};
     SparkEngine engine;
+    OwnerParkGuard park_guard{park};
     auto mech = make_file_mechanism();
     ISparkMechanism* raw = mech.get();
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
@@ -16823,20 +16876,20 @@ TEST_CASE("File spark (real mechanism): releasing a swallowed completion and the
                    deaf_coverage(engine, *sub2) == SparkCoverage::Notification &&
                    deaf_coverage(engine, *sub3) == SparkCoverage::Notification;
         },
-        kDeafBound));
+        kStashBound));
 
     sup->swallow_armed.store(true, std::memory_order_release);
     std::error_code ec;
     std::filesystem::rename(t1.parent, renamed, ec);
     REQUIRE_FALSE(ec);
     REQUIRE(eventually([&] { return sup->swallowed.load(std::memory_order_acquire) == 1; },
-                       kDeafBound));
+                       kStashBound));
     REQUIRE(eventually([&] { return count_kind(got, key1, SparkEventKind::Faulted) >= 1; },
-                       kDeafBound));
+                       kStashBound));
 
     park->park_armed.store(true, std::memory_order_release);
     { std::ofstream(t3.file) << "wake"; }
-    REQUIRE(eventually([&] { return park->parked.load(std::memory_order_acquire); }, kDeafBound));
+    REQUIRE(eventually([&] { return park->parked.load(std::memory_order_acquire); }, kStashBound));
     {
         FileMechanismTestControls ctl;
         ctl.release_suppressed_completions = true;
@@ -16851,22 +16904,79 @@ TEST_CASE("File spark (real mechanism): releasing a swallowed completion and the
         stopped.store(true, std::memory_order_release);
     });
     JoinOnExit join_stopper{stopper, park};
+    // The negative check is a LOWER bound: a stop() that returned within 200 ms despite the
+    // parked worker would fail it, but passing proves only that it had not returned by then.
+    // The positive evidence is the bounded wait after the release below.
     std::this_thread::sleep_for(200ms);
     CHECK_FALSE(stopped.load(std::memory_order_acquire)); // blocked on the parked worker
     park->release.store(true, std::memory_order_release);
-    REQUIRE(eventually([&] { return stopped.load(std::memory_order_acquire); },
-                       kDeafBound * yuzu::test::kSpinScale));
+    REQUIRE(eventually([&] { return stopped.load(std::memory_order_acquire); }, kStashBound));
+    CHECK(raw->stats().quarantined_total == 0);
+}
+
+TEST_CASE("File spark (real mechanism): releasing a swallowed completion after stop() is "
+          "harmless and replays nothing (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    // The header says a release after stop() is safe. A watch's aborted completion is
+    // swallowed, the mechanism is stopped (stop() clears the stash after the worker joined),
+    // and only then the completion is handed back. There is no worker left to replay or drop
+    // anything: the case asserts the release neither crashes, nor delivers a stray event, nor
+    // quarantines, and that nothing was counted as dropped. That the stash really was cleared
+    // is NOT directly observable (the vectors are private and a stopped mechanism cannot be
+    // restarted); it follows from stop() clearing them and from the absence of any worker.
+    DeafWatchTree t1("stash_after_stop");
+    const auto renamed = t1.root / "renamed";
+    auto sup = std::make_shared<SuppressState>();
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        auto ctl = identity_controls(50ms);
+        ctl.completion_suppress_hook = swallow_once_hook(sup);
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec1 = file_spec(t1.file.string());
+    const std::string key1 = spark_key(spec1);
+    auto sub1 = engine.arm(*c, spec1);
+    REQUIRE(sub1.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub1) == SparkCoverage::Notification; }, kStashBound));
+
+    sup->swallow_armed.store(true, std::memory_order_release);
+    std::error_code ec;
+    std::filesystem::rename(t1.parent, renamed, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE(eventually([&] { return sup->swallowed.load(std::memory_order_acquire) == 1; },
+                       kStashBound));
+    REQUIRE(eventually([&] { return count_kind(got, key1, SparkEventKind::Faulted) >= 1; },
+                       kStashBound));
+    const auto fired_before = count_kind(got, key1, SparkEventKind::Fired);
+
+    engine.stop();
+    {
+        FileMechanismTestControls ctl;
+        ctl.release_suppressed_completions = true;
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    std::this_thread::sleep_for(300ms); // a settle: nothing is expected to happen
+    CHECK(count_kind(got, key1, SparkEventKind::Fired) == fired_before);
+    CHECK(stash_dropped(*raw) == 0);
     CHECK(raw->stats().quarantined_total == 0);
 }
 
 TEST_CASE("File spark (real mechanism): the stash swallows at most eight completions, then "
-          "processes the ninth normally, and a release replays each swallowed one once "
-          "(#5719 item 5)",
+          "processes the ninth normally, and a release replays each swallowed one once, with the "
+          "effect of an unswallowed completion (#5719 item 5)",
           "[spark][mechanism][windows][5719]") {
-    // The suppress hook is consulted only while fewer than 8 completions are stashed (the
-    // stash is reserved once, so the worker never allocates): the ninth completion is NOT
-    // swallowed. The capacity of 8 is the MSVC reserve(8) result (exact), pinned here on
-    // purpose. Nine watches, one change each, in order.
+    // The suppress hook is consulted only while fewer than the stash capacity are stashed
+    // (the stash is reserved once, so the worker never allocates): the ninth completion is
+    // NOT swallowed. The capacity of 8 is the MSVC STL's reserve(8) result (exact), pinned
+    // here on purpose. Nine watches, one change each.
     constexpr int kWatches = 9;
     std::vector<std::unique_ptr<DeafWatchTree>> trees;
     for (int i = 0; i < kWatches; ++i)
@@ -16901,33 +17011,49 @@ TEST_CASE("File spark (real mechanism): the stash swallows at most eight complet
                     return false;
             return true;
         },
-        kDeafBound * yuzu::test::kSpinScale));
+        kStashBound));
 
     sw->on.store(true, std::memory_order_release);
-    for (int i = 0; i < kWatches - 1; ++i) {
+    for (int i = 0; i < kWatches - 1; ++i)
         { std::ofstream(trees[i]->file) << "change"; }
-        REQUIRE(eventually([&, i] { return sw->calls.load(std::memory_order_acquire) == i + 1; },
-                           kDeafBound));
-    }
+    // One bounded wait for the whole set of eight swallows.
+    REQUIRE(eventually([&] { return sw->calls.load(std::memory_order_acquire) == kWatches - 1; },
+                       kStashBound));
     // The ninth change is not swallowed: its watch fires normally.
     { std::ofstream(trees[kWatches - 1]->file) << "change"; }
     REQUIRE(eventually(
         [&] { return count_kind(got, keys[kWatches - 1], SparkEventKind::Fired) >= 1; },
-        kDeafBound));
-    CHECK(sw->calls.load(std::memory_order_acquire) == 8);
+        kStashBound));
+    CHECK(sw->calls.load(std::memory_order_acquire) == kWatches - 1);
     for (int i = 0; i < kWatches - 1; ++i)
         CHECK(count_kind(got, keys[i], SparkEventKind::Fired) == 0);
 
-    // Release: every swallowed completion is replayed with its original result, once.
+    // Release: every swallowed completion is replayed with its original result. One bounded
+    // wait for the whole set, then a settle (a lower bound: a second replay would arrive
+    // within it). A single change produces MORE than one Fired event per completion here (two
+    // were observed on the rig for each of the nine watches, so "exactly once" is not an
+    // event count), so "replayed once" is stated against a control: each replayed watch ends
+    // with the same number of Fired events as the ninth watch, whose one completion was
+    // processed normally. A completion replayed twice would exceed it.
     {
         FileMechanismTestControls ctl;
         ctl.release_suppressed_completions = true;
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
     }
+    REQUIRE(eventually(
+        [&] {
+            for (int i = 0; i < kWatches - 1; ++i)
+                if (count_kind(got, keys[i], SparkEventKind::Fired) < 1)
+                    return false;
+            return true;
+        },
+        kStashBound));
+    std::this_thread::sleep_for(500ms);
+    const auto control = count_kind(got, keys[kWatches - 1], SparkEventKind::Fired);
+    CHECK(control >= 1);
     for (int i = 0; i < kWatches - 1; ++i)
-        REQUIRE(eventually([&, i] { return count_kind(got, keys[i], SparkEventKind::Fired) >= 1; },
-                           kDeafBound));
-    CHECK(sw->calls.load(std::memory_order_acquire) == 8); // the cleared hook is never consulted
+        CHECK(count_kind(got, keys[i], SparkEventKind::Fired) == control);
+    CHECK(stash_dropped(*raw) == 0); // every swallowed entry was replayed, none dropped
     for (const auto& sub : subs)
         engine.disarm(sub);
     engine.stop();
