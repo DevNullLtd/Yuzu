@@ -2362,8 +2362,8 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
                     const std::function<void()>& lock_barrier, const GuaranteedStateEventRow& row,
                     const char* state, ProjectionSource source, std::int64_t key, std::int64_t seq,
-                    bool capped, const PairDecision& decided, const RepairOrderStep& repair_step,
-                    std::optional<CensusDecision>& counted) {
+                    bool capped, const PairDecision& decided, bool order_row_held,
+                    const RepairOrderStep& repair_step, std::optional<CensusDecision>& counted) {
     counted.reset();
     const auto control = [conn](const char* sql) {
         return pg::exec_params(conn, sql, std::vector<std::string>{}).status() ==
@@ -2566,13 +2566,24 @@ project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
             return fail_with("", "", why);
         // A refused equal pair counts on the agent's order row. First delivery and batch only:
         // they hold the row FOR UPDATE already (the order step), a Repair holds it FOR SHARE and
-        // this UPDATE would upgrade the lock.
+        // this UPDATE would upgrade the lock. Only when the step ran (`order_row_held`): with the
+        // seam off nothing holds or maintains the row. The row the step just wrote must be there
+        // to count on: anything but exactly one affected row fails the census write (savepoint
+        // rolled back, the event stored pending), never a count that silently went nowhere.
+        // A duplicate whose first-delivery census write fails later is therefore counted only by
+        // the process decision metric if at all (the column count rolls back with the savepoint,
+        // and the Repair that redelivers it never writes the column).
         if (decision_label == CensusDecision::RefusedDuplicate &&
-            source != ProjectionSource::Repair) {
+            source != ProjectionSource::Repair && order_row_held) {
             pg::PgResult dup = pg::exec_params(conn, kAgentOrderCountDuplicate,
                                                std::vector<std::string>{row.agent_id});
             if (dup.status() != PGRES_COMMAND_OK)
                 return fail(dup);
+            if (std::string_view(PQcmdTuples(dup.get())) != "1")
+                return fail_with("", "",
+                                 "the pair_duplicates count touched " +
+                                     std::string(PQcmdTuples(dup.get())) +
+                                     " agent order rows, expected 1");
         }
     }
     // Fold AGAIN, now that the row exists and is final for this statement: the first fold ran
@@ -2626,6 +2637,7 @@ enum class AgentStepOutcome {
 struct AgentStepResult {
     AgentStepOutcome outcome{AgentStepOutcome::Failed};
     PairDecision decision;
+    bool ran{false}; // the step's statements ran: the agent's order row is held FOR UPDATE
 };
 
 // The per-agent order step of ONE census-bearing first delivery or batch row (statements and the
@@ -2716,7 +2728,7 @@ agent_order_step(PGconn* conn,
         if (!control("SET LOCAL lock_timeout TO DEFAULT"))
             return {AgentStepOutcome::Abandoned, {}};
         return control("RELEASE SAVEPOINT agent_step")
-                   ? AgentStepResult{AgentStepOutcome::Decided, decision}
+                   ? AgentStepResult{AgentStepOutcome::Decided, decision, true}
                    : AgentStepResult{AgentStepOutcome::Abandoned, {}};
     }
     if (rows >= 0)
@@ -2843,7 +2855,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                     const CensusOutcome repaired = project_rule_status(
                         conn, census_proj_failures_, census_lock_barrier_, row,
                         event_state_from_type(row.event_type), ProjectionSource::Repair, 0, 0,
-                        false, PairDecision{},
+                        false, PairDecision{}, false,
                         RepairOrderStep{
                             agent_step_enabled_.load(std::memory_order_relaxed),
                             agent_step_lock_timeout_ms_.load(std::memory_order_relaxed)},
@@ -2975,11 +2987,11 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             count_projection(metrics_, ProjectionSource::FirstDelivery, CensusOutcome::Held);
         } else {
             std::optional<CensusDecision> decision;
-            const CensusOutcome projected =
-                project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,
-                                    event_state_from_type(row.event_type),
-                                    ProjectionSource::FirstDelivery, ordering.key, ingest_seq,
-                                    ordering.capped, step.decision, RepairOrderStep{}, decision);
+            const CensusOutcome projected = project_rule_status(
+                conn, census_proj_failures_, census_lock_barrier_, row,
+                event_state_from_type(row.event_type), ProjectionSource::FirstDelivery,
+                ordering.key, ingest_seq, ordering.capped, step.decision, step.ran,
+                RepairOrderStep{}, decision);
             count_projection(metrics_, ProjectionSource::FirstDelivery, projected);
             count_decision(metrics_, decision);
             if (projected == CensusOutcome::Abandoned)
@@ -3125,7 +3137,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             const CensusOutcome projected = project_rule_status(
                 conn, census_proj_failures_, census_lock_barrier_, row,
                 event_state_from_type(row.event_type), ProjectionSource::Batch, ordering.key,
-                ingest_seq, ordering.capped, step.decision, RepairOrderStep{}, decision);
+                ingest_seq, ordering.capped, step.decision, step.ran, RepairOrderStep{}, decision);
             count_projection(metrics_, ProjectionSource::Batch, projected);
             count_decision(metrics_, decision);
             if (projected == CensusOutcome::Abandoned)

@@ -2231,3 +2231,53 @@ TEST_CASE("census pair order, B3: a lower-epoch pending event that commits after
             .outcome == EventInsertOutcome::Inserted);
     CHECK(verdict(db.dsn(), "a", "r1") == "E - 5/5");
 }
+
+// ── B3 fix round: the order row count, the batch's decided mode, the retired epoch ───────────
+
+TEST_CASE("census pair order, B3 fix: a refused duplicate whose pair_duplicates count touches no "
+          "row fails the census write",
+          PAIR_TAGS) {
+    // A BEFORE UPDATE trigger cancels any update that moves pair_duplicates (DECIDE never does), so
+    // the count's UPDATE affects zero rows. The step ran, so the row must be there to count on:
+    // the census write fails (savepoint rolled back, the event stored pending), the decision is
+    // not counted and the verdict and the column stay as they were.
+    PAIR_FIXTURE();
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("e1", "r1", "a", kCompliant, 1000), 5, 3))
+            .outcome == EventInsertOutcome::Inserted);
+    exec_sql(db.dsn(),
+             std::string("CREATE FUNCTION ") + kSchema +
+                 ".yuzu_test_skip_dup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                 "IF NEW.pair_duplicates <> OLD.pair_duplicates THEN RETURN NULL; END IF; "
+                 "RETURN NEW; END $$");
+    exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_skip_dup BEFORE UPDATE ON ") +
+                           kSchema + ".guardian_agent_order FOR EACH ROW EXECUTE FUNCTION " +
+                           kSchema + ".yuzu_test_skip_dup()");
+    const DecisionCounts counts = decision_counts(metrics);
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    REQUIRE(store.insert_event_classified(with_pair(stamped("e2", "r1", "a", kDrifted, 1010), 5, 3))
+                .outcome == EventInsertOutcome::Inserted);
+    cap.stop();
+    CHECK(cap.text().find("expected 1") != std::string::npos);
+    CHECK(verdict(db.dsn(), "a", "r1") == "C - 5/3");
+    CHECK(pending_count(db.dsn()) == "1");
+    CHECK(order_text(db.dsn(), "a") == "5|3|-|0|0|0|1|0|0|0"); // the step's straggler stands
+    CHECK(decision_delta(counts, decision_counts(metrics)) == "-");
+}
+
+TEST_CASE("census pair order, B3 fix: with the agent step off a refused duplicate is decided and "
+          "counted on the metric, and no order row is touched",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    store.set_agent_step_enabled_for_test(false);
+    const DecisionCounts counts = decision_counts(metrics);
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("e1", "r1", "a", kCompliant, 1000), 5, 3))
+            .outcome == EventInsertOutcome::Inserted);
+    REQUIRE(store.insert_event_classified(with_pair(stamped("e2", "r1", "a", kDrifted, 1010), 5, 3))
+                .outcome == EventInsertOutcome::Inserted);
+    CHECK(verdict(db.dsn(), "a", "r1") == "C F 5/3");
+    CHECK(pending_count(db.dsn()) == "0");
+    CHECK(order_text(db.dsn(), "a").empty()); // no order row was made or counted on
+    CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate");
+}
