@@ -1794,10 +1794,11 @@ jobs:
             full|smoke) ;;
             *) echo "::error::pg_mode is '$PG_MODE', expected 'full' or 'smoke'"; exit 1 ;;
           esac
-          # A measurement-only knob (docs/testing/unit-test-conventions.md); if the
-          # runner's environment leaks it in, every [pg] template clone uses it.
+          # The pg half sets YUZU_TEST_PG_CLONE_STRATEGY=file_copy itself (see
+          # pg_half); a value leaking in from the runner's environment is
+          # overridden there, but say so rather than ignore it silently.
           if [[ -n "${YUZU_TEST_PG_CLONE_STRATEGY:-}" ]]; then
-            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; [pg] template clones use it (a measurement knob, not a CI setting)"
+            echo "::warning::YUZU_TEST_PG_CLONE_STRATEGY='${YUZU_TEST_PG_CLONE_STRATEGY//[^A-Za-z0-9_]/?}' is set in this step's environment; the pg half overrides it with file_copy"
           fi
           # Isolation 2: build every test prerequisite once, serially, so the
           # concurrent invocations below can all run with --no-rebuild.
@@ -1825,6 +1826,18 @@ jobs:
           pg_half() {
             set -e
             export GITHUB_STEP_SUMMARY="$LOGS/ci-half-pg.summary.md"
+            # Every template-cloned [pg] case clones with STRATEGY FILE_COPY
+            # (docs/testing/unit-test-conventions.md). Measured on Big Tam in
+            # two same-job A/B runs (#7701): the server-pg suite ran about 6-7%
+            # faster in wall time than with the server default (WAL_LOG). Each
+            # runner has its own Postgres container, so the checkpoint FILE_COPY
+            # forces stays inside this job's cluster. Needs PostgreSQL 15+, and
+            # is only a gain with fsync off, as ensure-postgres.sh's Docker
+            # cluster runs (with fsync on, each clone measured ~9x slower).
+            # Revert: `git revert -m 1` the merge commit of the PR that added
+            # this line (the step's contract test and the leak warning above
+            # change with it). YUZU_CI_SEQUENTIAL_HALVES=1 does not undo it.
+            export YUZU_TEST_PG_CLONE_STRATEGY=file_copy
             if [[ "$PG_MODE" == "full" ]]; then
               bash scripts/ci/with-test-slot.sh 3 -- \
                 python3 scripts/ci/flake-retry.py --builddir "$BUILDDIR" -- --no-rebuild --logbase testlog-pg --print-errorlogs --num-processes 4 --suite server-pg
