@@ -5188,7 +5188,8 @@ void RestApiV1::register_routes(
                           mgmt_group_not_found(res);
                           return;
                       }
-                      spdlog::warn("management_group.add_member store failure: {}", added.error());
+                      spdlog::warn("management_group.add_member store failure: {}",
+                                   ::yuzu::log_key_token(added.error()));
                       (void)detail::emit_behavioral_audit(bound_audit, req, res,
                                                           "management_group.add_member", "failure",
                                                           "ManagementGroup", group_id,
@@ -5257,7 +5258,8 @@ void RestApiV1::register_routes(
                                      agent_id, bound_audit))
                 return;
             if (auto removed = mgmt_store->remove_member(group_id, agent_id); !removed) {
-                spdlog::warn("management_group.remove_member store failure: {}", removed.error());
+                spdlog::warn("management_group.remove_member store failure: {}",
+                             ::yuzu::log_key_token(removed.error()));
                 (void)detail::emit_behavioral_audit(bound_audit, req, res,
                                                     "management_group.remove_member", "failure",
                                                     "ManagementGroup", group_id,

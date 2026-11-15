@@ -1616,13 +1616,15 @@ TEST_CASE("POST /management-groups/{id}/members: the group read failure log line
     const auto text = cap.text();
     const auto at = text.find("management_group.add_member group read failure: query failed");
     REQUIRE(at != std::string::npos);
-    std::size_t pos = 0;
-    while (pos < text.size()) {
-        const auto eol = text.find('\n', pos);
-        const auto line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
-        if (!line.empty())
-            CHECK(line.front() == '['); // every line begins with its own timestamp
-        pos = eol == std::string::npos ? text.size() : eol + 1;
-    }
+    // Only the route's OWN record is checked. The capture also holds the store's own
+    // "get_group_checked: query failed" warn (logged once per degrade episode, then sampled;
+    // process-wide), which this route does not control. PQerrorMessage text ends in a newline
+    // (and a failed statement adds a second line), so an unsanitised argument leaves a stray
+    // physical line after the first line of the route's record: the next line must be empty or
+    // begin with its own timestamp.
+    const auto eol = text.find('\n', at);
+    REQUIRE(eol != std::string::npos); // spdlog ends every record with a newline
+    const auto next_line = text.substr(eol + 1, text.find('\n', eol + 1) - (eol + 1));
+    CHECK((next_line.empty() || next_line.front() == '['));
     CHECK(h.audits.empty()); // refused before any row
 }

@@ -14277,7 +14277,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    spdlog::warn("add_management_group_member store failure: {}", result.error());
+                    spdlog::warn("add_management_group_member store failure: {}",
+                                 ::yuzu::log_key_token(result.error()));
                     const bool audit_ok = mg_audit_bound(
                         "management_group.add_member", "failure", group_id,
                         mgmt_group_failure_detail("store_error", agent_id));

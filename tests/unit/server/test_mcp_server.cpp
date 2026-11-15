@@ -30945,15 +30945,16 @@ TEST_CASE("MCP add_management_group_member: the group read failure log line hold
     const auto text = cap.text();
     REQUIRE(text.find("add_management_group_member group read failure: query failed") !=
             std::string::npos);
-    // PQerrorMessage text ends in a newline: an unsanitised argument leaves a stray line.
-    std::size_t pos = 0;
-    while (pos < text.size()) {
-        const auto eol = text.find('\n', pos);
-        const auto line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
-        if (!line.empty())
-            CHECK(line.front() == '['); // every line begins with its own timestamp
-        pos = eol == std::string::npos ? text.size() : eol + 1;
-    }
+    // Only the route's OWN record is checked: the capture also holds the store's own
+    // "get_group_checked: query failed" warn (logged once per degrade episode, then sampled;
+    // process-wide), which this tool does not control. PQerrorMessage text ends in a newline, so
+    // an unsanitised argument leaves a stray physical line after the first line of the route's
+    // record: the next line must be empty or begin with its own timestamp.
+    const auto at = text.find("add_management_group_member group read failure: query failed");
+    const auto eol = text.find('\n', at);
+    REQUIRE(eol != std::string::npos); // spdlog ends every record with a newline
+    const auto next_line = text.substr(eol + 1, text.find('\n', eol + 1) - (eol + 1));
+    CHECK((next_line.empty() || next_line.front() == '['));
     CHECK(mg_add_rows(ts).empty()); // refused before any management_group row
 }
 
