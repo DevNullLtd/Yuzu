@@ -9459,6 +9459,112 @@ tests:
         eval_time: 250m
         exp_samples: []
 
+  # SAM-33 plugin-health alerts. Series are the yuzu_software_facet_devices gauge: 30 collecting
+  # devices of which 3 time out (10%) and 0 are otherwise failing. Timeout share 10% > 5% but
+  # failing share 10% < 20%. The series are one sample per minute (the rule file's evaluation
+  # interval) because a sparser series goes stale after 5 minutes and would restart the 24h hold.
+  - interval: 1m
+    name: software facet timeout share - fires after 24h, not at 23h
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "27x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="timeout"}'
+        values: "3x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="not_collected"}'
+        values: "500x1550"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 23h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing", facet="installed_software.dpkg", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples: []
+
+  # Two replicas export the same fleet figure: the share is unchanged and exactly one alert fires
+  # (no duplicate per instance).
+  - interval: 1m
+    name: software facet failing share - fires after 24h, not at 23h, one alert for two replicas
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "20x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="constrained"}'
+        values: "5x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="oversize"}'
+        values: "5x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "20x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="constrained"}'
+        values: "5x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="oversize"}'
+        values: "5x1550"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 23h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing", facet="installed_software.dpkg", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples: []
+
+  # Low volume: 19 collecting devices, 50% timing out -> neither rule fires.
+  - interval: 1m
+    name: software facet alerts - fewer than 20 collecting devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "9x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
+  # Two replicas each export 19 collecting devices, 10 of them timing out. A bare sum would read
+  # 38 devices at 52% and fire; judging each replica's own 20-device floor keeps it real.
+  - interval: 1m
+    name: software facet alerts - two replicas of 19 collecting devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "9x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "9x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
+  # Two replicas hold DIFFERENT snapshots of the same 19 devices: core-a saw all 19 collect fully,
+  # core-b saw all 19 time out. A per-status max across replicas would read 38 collecting devices,
+  # 50% timing out, and fire both rules; each replica's own snapshot is 19 devices, under the floor.
+  - interval: 1m
+    name: software facet alerts - replicas with different snapshots of 19 devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "19x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "0x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "0x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "19x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
   # ── yuzu-delivery: webhook and offload delivery backlog ─────────────────────────────────────
   #
   # Which case is meant to catch which change to which rule (reasoned, NOT mutation-run):
