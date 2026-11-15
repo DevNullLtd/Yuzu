@@ -21,6 +21,9 @@
 #   stale logbase files              -> removed before the halves start
 #   YUZU_CI_SEQUENTIAL_HALVES=true   -> ::warning:: (only 1 enables it); the
 #                                       halves still run concurrently
+#   the pg half (full or smoke)      -> runs with YUZU_TEST_PG_CLONE_STRATEGY=
+#                                       file_copy; the non-pg half does not; a
+#                                       leaked value is warned and overridden
 #   stale logbase files              -> removed even when the step fails before
 #                                       any half starts (legacy testlog.* too)
 #   a half's own shell SIGKILLed     -> that half's stub children are stopped
@@ -89,6 +92,7 @@ var="STUB_SLEEP_${base//-/_}"
 if [ -n "${STUB_TERM_DELAY:-}" ]; then trap 'exec sleep "$STUB_TERM_DELAY"' TERM; fi
 echo "$$" | tee -a "$STUB_DIR/pids" >> "$STUB_DIR/pids-$base"
 echo "start $base" >> "$STUB_DIR/order"
+echo "$base ${YUZU_TEST_PG_CLONE_STRATEGY:-<unset>}" >> "$STUB_DIR/clone"
 echo "flake-retry stub running $base"
 sleep "${!var:-0}" &
 echo "$!" | tee -a "$STUB_DIR/pids" >> "$STUB_DIR/pids-$base"
@@ -228,10 +232,22 @@ check "halves still concurrent (pg started before non-pg ended)" yes \
 run_step
 check "no kill-switch warning when unset" no "$(yes_no out_has "::warning::YUZU_CI_SEQUENTIAL_HALVES")"
 
-echo "-- clone-strategy leak is warned --"
-run_step YUZU_TEST_PG_CLONE_STRATEGY=file_copy
+echo "-- clone strategy: the pg half clones with file_copy --"
+run_step
 check "rc 0" 0 "$rc"
-check "warning names the value" yes "$(yes_no out_has "::warning::YUZU_TEST_PG_CLONE_STRATEGY='file_copy'")"
+check "pg invocation sees file_copy" "testlog-pg file_copy" "$(grep '^testlog-pg ' "$TMP/stub/clone")"
+check "non-pg invocations do not" "testlog-nonpg-cheap <unset>,testlog-nonpg-server <unset>" \
+  "$(grep '^testlog-nonpg' "$TMP/stub/clone" | sort | paste -sd,)"
+check "no clone-strategy warning when unset" no "$(yes_no out_has "::warning::YUZU_TEST_PG_CLONE_STRATEGY")"
+run_step PG_MODE=smoke
+check "smoke pg invocation sees file_copy too" "testlog-pg file_copy" "$(grep '^testlog-pg ' "$TMP/stub/clone")"
+
+echo "-- clone-strategy leak is warned and overridden --"
+run_step YUZU_TEST_PG_CLONE_STRATEGY=wal_log
+check "rc 0" 0 "$rc"
+check "warning names the value" yes "$(yes_no out_has "::warning::YUZU_TEST_PG_CLONE_STRATEGY='wal_log'")"
+check "warning says it is overridden" yes "$(yes_no out_has "the pg half overrides it with file_copy")"
+check "pg invocation still sees file_copy" "testlog-pg file_copy" "$(grep '^testlog-pg ' "$TMP/stub/clone")"
 
 echo "-- a half's own shell is SIGKILLed: its children are stopped --"
 start_step STUB_SLEEP_testlog_nonpg_cheap=60 STUB_SLEEP_testlog_pg=4
