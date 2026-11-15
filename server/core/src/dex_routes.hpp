@@ -34,6 +34,7 @@
 #include "dex_perf_api.hpp" // ADR-0031 WS-A4 (sixth family): the public in-process DEX app-perf-over-time API seam (#4626)
 #include "dex_perf_model.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
+#include "refusal_log_throttle.hpp" // bounds the Apps route's repeated error lines
 #include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
 // `dex_read_builders.hpp` (`dex_device_score` + the `build_dex_*_model` builders)
 // is DELIBERATELY NOT included here (ADR-0031 WS-A4 PR-1 F1 fix, Fable review
@@ -365,7 +366,9 @@ public:
     /// A setter, not a `register_routes` parameter: server.cpp registers this object before
     /// it builds the DexApi. It follows the convention of `McpServer::set_dex_api` and
     /// `SettingsRoutes::set_dex_apps_fn`: set once before the listener starts, read
-    /// unsynchronised per request. Unset: the Apps tab answers an error panel.
+    /// unsynchronised per request. Unset: the Apps tab answers an error panel with reason
+    /// `not_wired` and logs it (one line per interval). The wiring is pinned by
+    /// tests/test_dex_apps_wiring_lexical.py: server.cpp must hand this route its DexApi.
     void set_dex_api(std::shared_ptr<const DexApi> api) { dex_api_ = std::move(api); }
 
     /// Register the DEX routes. The page shell is auth-only static chrome; the
@@ -421,6 +424,7 @@ private:
     ResponsesFn responses_fn_;
     DexPerfApiPtr dex_perf_api_;
     std::shared_ptr<const DexApi> dex_api_;
+    RefusalLogThrottle apps_error_log_; ///< one error line per interval for the Apps route
     GroupListFn group_list_fn_;
     FleetReadFn fleet_read_fn_;
 };

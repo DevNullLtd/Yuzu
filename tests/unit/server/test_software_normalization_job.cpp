@@ -150,6 +150,10 @@ TEST_CASE("SoftwareNormalizationJob thread lifecycle", "[pg][product_registry][n
     REQUIRE(reg.is_open());
     SoftwareTitleDimension owner{pool, reg, inv};
     const auto interval = std::chrono::hours{1}; // one immediate tick, then park
+    // The parked thread re-checks its stop flag every 50 ms instead of production's 5 s
+    // (kNormalizationStopPoll), so each stop() below joins at once rather than waiting out a step:
+    // the joins are still real (a thread parked in the wait loop), only the wait step is shorter.
+    const auto stop_poll = std::chrono::milliseconds{50};
 
     // Each section waits for a tick the thread actually completed (no pack is loaded in this
     // template, so that tick is a clean `errored` one) instead of assuming start() ran one.
@@ -184,7 +188,7 @@ TEST_CASE("SoftwareNormalizationJob thread lifecycle", "[pg][product_registry][n
 
     SECTION("start then stop joins cleanly and double stop is a no-op") {
         Ticks ticks;
-        SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer()};
+        SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer(), stop_poll};
         job.start();
         job.start(); // idempotent: still exactly one thread, one first tick
         REQUIRE(ticks.wait_for_ticks(1));
@@ -194,7 +198,7 @@ TEST_CASE("SoftwareNormalizationJob thread lifecycle", "[pg][product_registry][n
     }
     SECTION("start after stop restarts the thread and it ticks again") {
         Ticks ticks;
-        SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer()};
+        SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer(), stop_poll};
         job.start();
         REQUIRE(ticks.wait_for_ticks(1));
         job.stop();
@@ -206,7 +210,7 @@ TEST_CASE("SoftwareNormalizationJob thread lifecycle", "[pg][product_registry][n
     SECTION("destructor joins without an explicit stop") {
         Ticks ticks;
         {
-            SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer()};
+            SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer(), stop_poll};
             job.start();
             REQUIRE(ticks.wait_for_ticks(1));
             expect_a_tick(ticks);
@@ -214,7 +218,7 @@ TEST_CASE("SoftwareNormalizationJob thread lifecycle", "[pg][product_registry][n
     }
     SECTION("request_stop without join leaves stop to join later") {
         Ticks ticks;
-        SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer()};
+        SoftwareNormalizationJob job{owner, interval, nullptr, ticks.observer(), stop_poll};
         job.start();
         REQUIRE(ticks.wait_for_ticks(1));
         job.request_stop();

@@ -157,6 +157,58 @@ TEST_CASE("known_agent_count is local UNION presence, deduped, and typed on a de
     }
 }
 
+// #7566: the Hardware list takes "online" from the roster read's own `live` column plus THIS
+// replica's sessions. local_ids() is the second half: it must be exactly the local sessions, must
+// never include a presence-only agent, and must not depend on the presence read at all, so a failed
+// or truncated presence read cannot change it.
+TEST_CASE("local_ids is the local sessions only and ignores the presence read", "[ha][presence]") {
+    using yuzu::server::PresenceIdentity;
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry(bus, metrics);
+
+    SECTION("empty registry") {
+        CHECK(registry.local_ids().empty());
+    }
+
+    (void)registry.register_agent(make_agent_info("local-1", "linux", "h1"));
+    (void)registry.register_agent(make_agent_info("local-2", "windows", "h2"));
+
+    SECTION("no presence configured: the local ids") {
+        auto ids = registry.local_ids();
+        std::sort(ids.begin(), ids.end());
+        CHECK(ids == std::vector<std::string>{"local-1", "local-2"});
+    }
+    SECTION("a presence-only agent is in all_ids() but never in local_ids()") {
+        std::expected<std::vector<PresenceIdentity>, PresenceReadError> reply =
+            std::vector<PresenceIdentity>{{"remote-1", "h3", "windows", "", ""}};
+        registry.configure_presence([&reply](std::chrono::seconds) { return reply; },
+                                    std::chrono::hours(1));
+        CHECK(contains(registry.all_ids(), "remote-1"));
+        const auto ids = registry.local_ids();
+        CHECK_FALSE(contains(ids, "remote-1"));
+        CHECK(ids.size() == 2);
+    }
+    SECTION("a failed or truncated presence read does not change it, and is not even asked") {
+        int reads = 0;
+        registry.configure_presence(
+            [&reads](std::chrono::seconds)
+                -> std::expected<std::vector<PresenceIdentity>, PresenceReadError> {
+                ++reads;
+                return std::unexpected(PresenceReadError::Truncated);
+            },
+            std::chrono::hours(1));
+        auto ids = registry.local_ids();
+        std::sort(ids.begin(), ids.end());
+        CHECK(ids == std::vector<std::string>{"local-1", "local-2"});
+        CHECK(reads == 0); // the whole point: nothing here can fail
+    }
+    SECTION("a departed session leaves the list") {
+        registry.remove_agent("local-1");
+        CHECK(registry.local_ids() == std::vector<std::string>{"local-2"});
+    }
+}
+
 TEST_CASE("HA WS-5: evaluate_scope resolves a remote-only agent's identity attributes",
           "[pg][ha][presence]") {
     YUZU_REQUIRE_PG_DB_TPL(db, presence_tpl);
