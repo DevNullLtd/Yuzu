@@ -3918,6 +3918,7 @@ TEST_CASE("Service spark (real mechanism, private bus): losing the bus faults an
     for (auto& e : env_store)
         envp.push_back(e.data());
     envp.push_back(nullptr);
+    // argv is non-const by the C signature; the macro is a string literal posix_spawn only reads.
     char* cargv[] = {exe, const_cast<char*>(YUZU_SPARK_5719_SERVICE_CHILD_CASE_NAME), nullptr};
     pid_t cpid = -1;
     {
@@ -5102,6 +5103,13 @@ struct ScratchRegKey {
     }
     ScratchRegKey(const ScratchRegKey&) = delete;
     ScratchRegKey& operator=(const ScratchRegKey&) = delete;
+    /// Closes the handle early (the destructor still deletes the key by name); idempotent.
+    void close() {
+        if (h) {
+            ::RegCloseKey(h);
+            h = nullptr;
+        }
+    }
     void write(DWORD v) const {
         ::RegSetValueExA(h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
     }
@@ -15549,14 +15557,19 @@ std::uint64_t verify_counter(ISparkMechanism& mech, std::uint64_t FileMechanismD
     return (*d).*field;
 }
 
-/// After the watched path is repaired: wait for the watch to be healthy with
-/// Notification coverage again AND for the resync fires the mechanism staged SINCE THIS
-/// CALL to have been delivered (Fired delta >= synthetic_fires delta, one key), then make
-/// one real change and require it to fire. Both baselines are taken at entry, so a real
-/// Fired from before the repair cannot stand in for a staged synthetic one, and the
-/// post-barrier `before` is taken only after the synthetic fires landed, so a late resync
-/// delivery cannot satisfy the final check. Replaces a fixed sleep. (A real fire after
-/// entry would count toward the barrier; the callers make no change before this call.)
+/// After the watched path is repaired: wait for the watch to be healthy with Notification
+/// coverage again, then for every resync fire STAGED SO FAR since this call to have been
+/// delivered, then make one real change and require it to fire. What the barrier does and does
+/// not prove: both baselines (`fired0`, `syn0`) are taken at entry, so a Fired from before
+/// the call cannot stand in for a synthetic one staged after it; the wait is
+/// `Fired - fired0 >= synthetic_fires - syn0`, so it is TRIVIALLY true when nothing has been
+/// staged yet and it cannot know that none is still to come. It relies on the commit staging
+/// its resync fire under the same lock, in the same pass, that publishes Notification
+/// coverage (commit_probe_locked), so the staged count is final by the time the coverage
+/// check passes; a resync restored after a failed emit and re-staged later is NOT covered,
+/// and a late such delivery could satisfy the last check. Replaces a fixed sleep. (A real
+/// fire after entry would count toward the barrier; the callers make no change before this
+/// call.)
 void expect_fire_after_repair(ISparkMechanism& mech, SparkEngine& engine, Collector& got,
                               SparkEngine::SubscriptionId sub, const SparkSpec& spec,
                               const std::filesystem::path& file) {
@@ -15991,9 +16004,11 @@ TEST_CASE("File spark (real mechanism): a watched directory reached through a ju
 // FileMechanismTestControls): verify_hook forces or parks the detached identity check,
 // completion_suppress_hook swallows a dequeued completion, pass_fail_hook (which never
 // throws here) runs code at the top of an owner pass, completion_hook throws inside
-// the drain. Each hook is installed with ONE controls call and steered by atomics;
-// a later controls call without a hook CLEARS it (null clears), so none of these cases
-// uses set_verify_interval after installing hooks.
+// the drain. Each hook is installed with ONE controls call and steered by atomics held
+// in a shared_ptr state the hook captures BY VALUE (no hook captures a local by
+// reference: a verify or probe hook runs on a detached, never-joined worker); a later
+// controls call without a hook CLEARS it (null clears), so none of these cases uses
+// set_verify_interval after installing hooks.
 namespace {
 /// kVerifyUnverifiableFaultStreak in spark_file.cpp. Pinned here on purpose: a change to
 /// the constant must change these cases with it.
@@ -16034,9 +16049,24 @@ FaultWindow fault_window(Collector& got, const std::string& key) {
     return w;
 }
 
-/// Owns a DENY ACE for the current user on a directory (a protected DACL holding only
-/// that ACE) and, on destruction, puts back full control for the user so the tree can be
-/// removed. API calls only, no shell. `applied()` is false when any step failed.
+/// Owns a DENY ACE for the current user on a directory: the ctor REPLACES the directory's
+/// DACL with a PROTECTED DACL holding exactly one entry (a DENY of FILE_LIST_DIRECTORY for
+/// the user), and the destructor REPLACES it again with a PROTECTED DACL holding exactly
+/// one entry (an ALLOW of FILE_ALL_ACCESS for the user) so the scratch tree can be removed.
+/// The original DACL is NOT restored; the directory lives inside a scratch tree that is
+/// deleted afterwards. API calls only, no shell. `applied()` is false when any step failed.
+///
+/// Resource ledger (every one is RAII or a plain value, no manual release):
+///   - the process-token HANDLE: `UniqueHandle token`, closed at the end of the ctor.
+///   - the TOKEN_USER buffer: `std::vector<std::byte> user_`, a member; the SID lives inside
+///     it and `set()` reads it only while the object is alive.
+///   - the PACL from SetEntriesInAclW: `LocalFreed` (the file's LocalAlloc owner), one per
+///     `set()` call, freed on every path including the early return.
+///   - the DACL on the directory is an effect on the world, not a resource: it is put back
+///     by the destructor, and a failed put-back is reported on stderr (it cannot throw).
+/// Ctor throw safety: the only fallible allocation is `user_.resize`, and the DACL is
+/// changed by the LAST step (`set(DENY)`, which does not throw), so a throw earlier in the
+/// ctor leaves the directory untouched and every member destroyed by the unwinding.
 class ScratchDenyAcl {
 public:
     explicit ScratchDenyAcl(std::filesystem::path dir) : dir_(std::move(dir)) {
@@ -16045,37 +16075,47 @@ public:
             return;
         UniqueHandle token(raw);
         DWORD len = 0;
-        ::GetTokenInformation(token.h, TokenUser, nullptr, 0, &len);
+        ::GetTokenInformation(token.h, TokenUser, nullptr, 0, &len); // size probe: fails by design
         user_.resize(len);
         if (len == 0 || !::GetTokenInformation(token.h, TokenUser, user_.data(), len, &len))
             return;
         applied_ = set(DENY_ACCESS, FILE_LIST_DIRECTORY);
     }
     ~ScratchDenyAcl() {
-        if (applied_)
-            set(GRANT_ACCESS, FILE_ALL_ACCESS);
+        if (applied_ && !set(GRANT_ACCESS, FILE_ALL_ACCESS)) {
+            // A destructor cannot fail the test; say so, because the scratch tree below this
+            // directory will then not be removable.
+            std::fprintf(stderr, "ScratchDenyAcl: could not put back full control on %ls\n",
+                         dir_.c_str()); // c_str() is wchar_t on Windows: no narrowing, no throw
+        }
     }
     ScratchDenyAcl(const ScratchDenyAcl&) = delete;
     ScratchDenyAcl& operator=(const ScratchDenyAcl&) = delete;
     [[nodiscard]] bool applied() const { return applied_; }
 
 private:
-    bool set(ACCESS_MODE mode, DWORD mask) {
+    bool set(ACCESS_MODE mode, DWORD mask) noexcept {
         EXPLICIT_ACCESSW ea{};
         ea.grfAccessPermissions = mask;
         ea.grfAccessMode = mode;
         ea.grfInheritance = NO_INHERITANCE;
         ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
         ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
-        ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(reinterpret_cast<TOKEN_USER*>(user_.data())->User.Sid);
+        // user_ is a std::vector<std::byte> that GetTokenInformation filled with a TOKEN_USER
+        // (operator new storage, aligned for it); the API takes the SID through the
+        // name-typed pointer member when TrusteeForm is TRUSTEE_IS_SID.
+        ea.Trustee.ptstrName =
+            reinterpret_cast<LPWSTR>(reinterpret_cast<TOKEN_USER*>(user_.data())->User.Sid);
         PACL acl = nullptr;
         if (::SetEntriesInAclW(1, &ea, nullptr, &acl) != ERROR_SUCCESS)
             return false;
+        LocalFreed owned_acl(acl); // freed on every path below
+        // SetNamedSecurityInfoW declares its name parameter non-const but documents it as an
+        // input it does not write through.
         const DWORD rc = ::SetNamedSecurityInfoW(const_cast<LPWSTR>(dir_.c_str()), SE_FILE_OBJECT,
                                                  DACL_SECURITY_INFORMATION |
                                                      PROTECTED_DACL_SECURITY_INFORMATION,
                                                  nullptr, nullptr, acl, nullptr);
-        ::LocalFree(acl);
         return rc == ERROR_SUCCESS;
     }
     std::filesystem::path dir_;
@@ -16084,7 +16124,10 @@ private:
 };
 
 /// Switches the process's SeBackupPrivilege and SeRestorePrivilege OFF for its lifetime and
-/// puts each back to its previous state on destruction. The identity check opens the path
+/// puts each back to its previous state on destruction. Resource ledger: the process-token
+/// HANDLE is `token_` (UniqueHandle, a member); the `was_enabled_` entries point at string
+/// literals; each AdjustTokenPrivileges result is checked, and a failed put-back is reported
+/// on stderr by the destructor. The identity check opens the path
 /// with FILE_FLAG_BACKUP_SEMANTICS, which bypasses a directory's DACL while either privilege
 /// is ENABLED (an elevated administrator session has both enabled), so a DENY ACE can only
 /// refuse the open with them off. Process-wide, which is what the mechanism's worker threads
@@ -16102,8 +16145,12 @@ public:
             ok_ = adjust(name, false) && ok_;
     }
     ~ScopedBackupPrivilegesOff() {
-        for (const wchar_t* name : was_enabled_)
-            adjust(name, true);
+        for (const wchar_t* name : was_enabled_) {
+            // A destructor cannot fail the test; a privilege that does not come back is only
+            // reported (it affects later cases of this process, never this one).
+            if (!adjust(name, true))
+                std::fprintf(stderr, "ScopedBackupPrivilegesOff: could not re-enable %ls\n", name);
+        }
     }
     ScopedBackupPrivilegesOff(const ScopedBackupPrivilegesOff&) = delete;
     ScopedBackupPrivilegesOff& operator=(const ScopedBackupPrivilegesOff&) = delete;
@@ -16132,16 +16179,76 @@ private:
     bool ok_{false};
 };
 
-/// Releases a parked hook and waits for the worker to leave it, on every exit path: a
-/// detached verification worker still inside a hook that captures the test's locals by
-/// reference would otherwise outlive them. Declare it AFTER the atomics it names.
+/// State shared between a test body and the hooks it installs (#5719 item 5, governance round
+/// 2). A hook is copied into the mechanism, and a verify_hook or probe_hook runs on a DETACHED
+/// worker that nothing joins: a hook that captured the test's locals by reference would
+/// dangle if that worker were still inside it when the case returns. So every hook below
+/// captures a `std::shared_ptr<...State>` BY VALUE (the worker's copy of the hook keeps the
+/// state alive for as long as it can run) and NO hook captures a local by reference. The
+/// other hooks (completion, suppress, pass) run on the owner thread, which stop() joins; they
+/// follow the same rule so the rule has no exceptions to remember.
+struct VerifyHookState {
+    std::atomic<int> forced{0}; ///< verifications still to fail with ERROR_ACCESS_DENIED
+};
+/// A verify_hook that fails the next `st->forced` verifications with ERROR_ACCESS_DENIED
+/// (undecidable) and lets every later one run the real check.
+std::function<unsigned long(std::wstring_view)>
+forced_verify_hook(std::shared_ptr<VerifyHookState> st) {
+    return [st = std::move(st)](std::wstring_view) -> unsigned long {
+        int n = st->forced.load(std::memory_order_acquire);
+        while (n > 0 && !st->forced.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel)) {
+        }
+        return n > 0 ? ERROR_ACCESS_DENIED : 0;
+    };
+}
+
+struct SuppressState {
+    std::atomic<bool> swallow_armed{false};
+    std::atomic<int> swallowed{0};
+};
+/// A completion_suppress_hook that swallows the next FAILED (aborted) completion once, after
+/// `st->swallow_armed` is set. It never throws: it runs on the owner thread inside run(),
+/// outside run()'s try, so a throw would end the process.
+std::function<bool(std::wstring_view, bool, unsigned long)>
+swallow_once_hook(std::shared_ptr<SuppressState> st) {
+    return [st = std::move(st)](std::wstring_view, bool ok, unsigned long) {
+        if (!ok && st->swallow_armed.exchange(false, std::memory_order_acq_rel)) {
+            st->swallowed.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+        return false;
+    };
+}
+
+struct OkDrainState {
+    std::filesystem::path renamed; ///< where the watched directory was renamed to; set before use
+    std::atomic<bool> park_armed{false}, parked{false}, release{false};
+    std::atomic<bool> want_write{false}, wrote{false};
+    std::atomic<int> inside{0}; ///< workers currently between hook entry and hook exit
+};
+
+struct ThrowState {
+    std::atomic<bool> throw_armed{false};
+    std::atomic<int> threw{0};
+};
+
+struct AncestorRearmState {
+    std::wstring root_w; ///< the ancestor whose re-arm is forced to fail; set before use
+    std::atomic<bool> fail_rearm{false};
+    std::atomic<bool> fail_probes{false};
+    std::atomic<int> rearm_hits{0};
+};
+
+/// Releases a parked hook and waits (bounded) for the worker to leave it, on every exit
+/// path, so a parked detached verification worker does not linger past the case still
+/// holding a verify-lane slot. The hook's state is shared (see the states above), so nothing
+/// it touches can dangle either way. Declare it AFTER the state it names.
 struct HookParkGuard {
-    std::atomic<bool>& release;
-    std::atomic<int>& inside;
+    std::shared_ptr<OkDrainState> st;
     ~HookParkGuard() {
-        release.store(true, std::memory_order_release);
+        st->release.store(true, std::memory_order_release);
         const auto until = std::chrono::steady_clock::now() + 5s;
-        while (inside.load(std::memory_order_acquire) != 0 &&
+        while (st->inside.load(std::memory_order_acquire) != 0 &&
                std::chrono::steady_clock::now() < until)
             std::this_thread::sleep_for(1ms);
     }
@@ -16152,7 +16259,7 @@ TEST_CASE("File spark (real mechanism): one or two undecidable verifications in 
           "fault the watch, and a decided one resets the run (#5719 item 5)",
           "[spark][mechanism][windows][5719]") {
     DeafWatchTree tree("unverifiable_short");
-    std::atomic<int> forced{0}; // verifications still to fail with ACCESS_DENIED
+    auto hook_state = std::make_shared<VerifyHookState>();
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16160,13 +16267,7 @@ TEST_CASE("File spark (real mechanism): one or two undecidable verifications in 
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
     {
         auto ctl = identity_controls(30ms);
-        ctl.verify_hook = [&](std::wstring_view) -> unsigned long {
-            int n = forced.load(std::memory_order_acquire);
-            while (n > 0 &&
-                   !forced.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel)) {
-            }
-            return n > 0 ? ERROR_ACCESS_DENIED : 0;
-        };
+        ctl.verify_hook = forced_verify_hook(hook_state);
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
     }
     auto c = engine.register_consumer("c", got.handler());
@@ -16183,7 +16284,8 @@ TEST_CASE("File spark (real mechanism): one or two undecidable verifications in 
     for (int round = 0; round < 2; ++round) {
         const auto unv0 = verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable);
         const auto same0 = verify_counter(*raw, &FileMechanismDebugCounters::verify_same);
-        forced.store(static_cast<int>(kUnverifiableStreak) - 1, std::memory_order_release);
+        hook_state->forced.store(static_cast<int>(kUnverifiableStreak) - 1,
+                                 std::memory_order_release);
         REQUIRE(eventually(
             [&] {
                 return verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) >=
@@ -16208,7 +16310,7 @@ TEST_CASE("File spark (real mechanism): a watch whose verification stays undecid
           "(#5719 item 5)",
           "[spark][mechanism][windows][5719]") {
     DeafWatchTree tree("unverifiable_fault");
-    std::atomic<bool> fail{false};
+    auto hook_state = std::make_shared<VerifyHookState>();
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16216,9 +16318,7 @@ TEST_CASE("File spark (real mechanism): a watch whose verification stays undecid
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
     {
         auto ctl = identity_controls(30ms);
-        ctl.verify_hook = [&](std::wstring_view) -> unsigned long {
-            return fail.load(std::memory_order_acquire) ? ERROR_ACCESS_DENIED : 0;
-        };
+        ctl.verify_hook = forced_verify_hook(hook_state);
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
     }
     auto c = engine.register_consumer("c", got.handler());
@@ -16232,13 +16332,17 @@ TEST_CASE("File spark (real mechanism): a watch whose verification stays undecid
         [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
     REQUIRE(engine.stats().armed_faulted == 0); // precondition
 
-    fail.store(true, std::memory_order_release); // every verification now fails to decide
+    // EXACTLY the streak's worth of verifications fail to decide, then every later one
+    // decides. Together with the case above (streak - 1 never faults) this pins the streak
+    // from both sides: a fault at exactly kUnverifiableStreak results, not earlier, and no
+    // fourth result is needed.
+    hook_state->forced.store(static_cast<int>(kUnverifiableStreak), std::memory_order_release);
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
                        kDeafBound));
-    fail.store(false, std::memory_order_release); // decidable again before the ordinary retry
     CHECK(first_detail(got, key, SparkEventKind::Faulted) == kReasonUndecidable);
-    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) >=
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) ==
           kUnverifiableStreak);
+    CHECK(hook_state->forced.load(std::memory_order_acquire) == 0);
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 0);
 
     // The ordinary retry re-establishes the watch on the same (healthy) directory.
@@ -16246,6 +16350,11 @@ TEST_CASE("File spark (real mechanism): a watch whose verification stays undecid
                        kDeafBound));
     expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
     expect_verified_stable_after_recovery(*raw, engine);
+    // One episode, one pair, and still exactly the streak's worth of undecidable results.
+    CHECK(count_kind(got, key, SparkEventKind::Faulted) == 1);
+    CHECK(count_kind(got, key, SparkEventKind::Recovered) == 1);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) ==
+          kUnverifiableStreak);
     engine.disarm(*sub);
     engine.stop();
 }
@@ -16257,6 +16366,11 @@ TEST_CASE("File spark (real mechanism): a replacement directory the agent may no
     // replacement is planted at the path with a DENY ACE for the current user, so the identity
     // check's open is refused (ACCESS_DENIED: undecidable, never "lost"). The interval is held
     // long while the world is changed, so no sample can see the half-built replacement.
+    // Measured on one rig, as a normal user account, with the backup privileges
+    // switched off (see ScopedBackupPrivilegesOff). The SYSTEM / LocalSystem identity a CI
+    // runner may run as is UNMEASURED: neither this DENY ACE's effect nor the privilege
+    // handling has been observed under it, so a runner installed as a service needs its own
+    // measurement before this case is relied on there.
     DeafWatchTree tree("unverifiable_acl");
     const auto renamed = tree.root / "renamed";
     Collector got;
@@ -16281,12 +16395,17 @@ TEST_CASE("File spark (real mechanism): a replacement directory the agent may no
     std::filesystem::create_directories(tree.parent, ec);
     REQUIRE_FALSE(ec);
     { std::ofstream(tree.file) << "the replacement"; }
-    // Declared after the engine: the ACL is restored while it still runs, the privileges
+    // Declared after the engine: the DACL is replaced (a protected DACL with one allow entry
+    // for the user, see ScratchDenyAcl) while the engine still runs, the privileges
     // (declared first of the two) after that.
     ScopedBackupPrivilegesOff no_backup_privileges;
     REQUIRE(no_backup_privileges.ok());
     ScratchDenyAcl deny(tree.parent);
     REQUIRE(deny.applied());
+    // Taken before the interval is shortened, so no verification or retry has run since the
+    // baseline: the counter then moves by exactly two backend deferrals, the lost path's
+    // drain (defer_backend_retry_locked, log off) and the refused re-attach below.
+    const auto backend0 = verify_counter(*raw, &FileMechanismDebugCounters::probe_backend_failed);
 
     set_verify_interval(*raw, 30ms);
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
@@ -16295,9 +16414,15 @@ TEST_CASE("File spark (real mechanism): a replacement directory the agent may no
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) >=
           kUnverifiableStreak);
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 0);
-    // The re-attach cannot open the path either, so the watch stays faulted through the retry
-    // (identity_controls' 1.5 s base) instead of reading healthy.
-    std::this_thread::sleep_for(2000ms);
+    // The re-attach cannot open the path either (identity_controls' 1.5 s retry base): wait
+    // for that refusal to be counted as a second backend deferral, bounded, no fixed sleep,
+    // and only then require the watch to still be faulted rather than reading healthy.
+    REQUIRE(eventually(
+        [&] {
+            return verify_counter(*raw, &FileMechanismDebugCounters::probe_backend_failed) >=
+                   backend0 + 2;
+        },
+        kDeafBound));
     CHECK(engine.stats().armed_faulted == 1);
     CHECK(count_kind(got, key, SparkEventKind::Recovered) == 0);
     engine.disarm(*sub);
@@ -16314,8 +16439,7 @@ TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never d
     // 2 s drain wait, then quarantine) is not exercised here.
     DeafWatchTree tree("path_lost_stuck");
     const auto renamed = tree.root / "renamed";
-    std::atomic<bool> swallow_armed{false};
-    std::atomic<int> swallowed{0};
+    auto sup = std::make_shared<SuppressState>();
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16324,13 +16448,7 @@ TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never d
     {
         auto ctl = identity_controls(50ms);
         ctl.path_lost_stuck_deadline = 300ms;
-        ctl.completion_suppress_hook = [&](std::wstring_view, bool ok, unsigned long) {
-            if (!ok && swallow_armed.exchange(false, std::memory_order_acq_rel)) {
-                swallowed.fetch_add(1, std::memory_order_acq_rel);
-                return true;
-            }
-            return false;
-        };
+        ctl.completion_suppress_hook = swallow_once_hook(sup);
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
     }
     auto c = engine.register_consumer("c", got.handler());
@@ -16343,11 +16461,12 @@ TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never d
     REQUIRE(eventually(
         [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
 
-    swallow_armed.store(true, std::memory_order_release);
+    sup->swallow_armed.store(true, std::memory_order_release);
     std::error_code ec;
     std::filesystem::rename(tree.parent, renamed, ec);
     REQUIRE_FALSE(ec);
-    REQUIRE(eventually([&] { return swallowed.load(std::memory_order_acquire) == 1; }, kDeafBound));
+    REQUIRE(eventually([&] { return sup->swallowed.load(std::memory_order_acquire) == 1; },
+                       kDeafBound));
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
                        kDeafBound));
     REQUIRE(eventually(
@@ -16358,7 +16477,10 @@ TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never d
     CHECK(count_kind(got, key, SparkEventKind::Recovered) == 0);
     CHECK(deaf_coverage(engine, *sub) == SparkCoverage::None);
 
-    // The completion finally arrives: the drain recovers the watch.
+    // The completion finally arrives: the drain recovers the watch. The release comes BEFORE
+    // the disarm/unwatch below on purpose: the mechanism's stash holds a raw DirWatch*, and a
+    // release after the watch was dropped would post a completion for freed memory. The
+    // suppress hook never throws (it runs inside run(), outside run()'s try).
     {
         FileMechanismTestControls ctl;
         ctl.release_suppressed_completions = true;
@@ -16375,13 +16497,23 @@ TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never d
     engine.stop();
 }
 
-TEST_CASE("File spark (real mechanism): stop() while a lost path is waiting for its drain "
-          "returns promptly and leaves nothing quarantined (#5719 item 5)",
+TEST_CASE("File spark (real mechanism): stop() with a lost path whose completion is held back "
+          "returns promptly and leaves nothing quarantined (model-limited, #5719 item 5)",
           "[spark][mechanism][windows][5719]") {
+    // MODEL LIMIT, read before trusting this case: it does NOT model a cancelled read the OS
+    // never completes. run() clears the watch's io_pending when it dequeues the cancelled
+    // read's completion and BEFORE completion_suppress_hook swallows it, so by the time
+    // stop() runs there is no outstanding read for stop()'s cancel-and-reap to wait for
+    // (the 2 s drain wait and the quarantine path are never reached). What it proves is
+    // narrower: stop() on a lost-path watch whose completion is being held back returns
+    // promptly and quarantines nothing. The real case (a read that never completes, so
+    // stop() waits and then quarantines) needs a blackholed redirector or a minifilter and
+    // is Gate 5 chaos scenario C-1. The completion is deliberately never released here:
+    // the stash then holds a raw DirWatch* that is never dereferenced (a release after
+    // unwatch/stop would be a use-after-free; see the paired case above).
     DeafWatchTree tree("path_lost_stop");
     const auto renamed = tree.root / "renamed";
-    std::atomic<bool> swallow_armed{false};
-    std::atomic<int> swallowed{0};
+    auto sup = std::make_shared<SuppressState>();
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16390,13 +16522,7 @@ TEST_CASE("File spark (real mechanism): stop() while a lost path is waiting for 
     {
         auto ctl = identity_controls(50ms);
         ctl.path_lost_stuck_deadline = 300ms;
-        ctl.completion_suppress_hook = [&](std::wstring_view, bool ok, unsigned long) {
-            if (!ok && swallow_armed.exchange(false, std::memory_order_acq_rel)) {
-                swallowed.fetch_add(1, std::memory_order_acq_rel);
-                return true;
-            }
-            return false;
-        };
+        ctl.completion_suppress_hook = swallow_once_hook(sup);
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
     }
     auto c = engine.register_consumer("c", got.handler());
@@ -16407,11 +16533,12 @@ TEST_CASE("File spark (real mechanism): stop() while a lost path is waiting for 
     engine.start();
     REQUIRE(eventually(
         [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
-    swallow_armed.store(true, std::memory_order_release);
+    sup->swallow_armed.store(true, std::memory_order_release);
     std::error_code ec;
     std::filesystem::rename(tree.parent, renamed, ec);
     REQUIRE_FALSE(ec);
-    REQUIRE(eventually([&] { return swallowed.load(std::memory_order_acquire) == 1; }, kDeafBound));
+    REQUIRE(eventually([&] { return sup->swallowed.load(std::memory_order_acquire) == 1; },
+                       kDeafBound));
     REQUIRE(eventually(
         [&] { return verify_counter(*raw, &FileMechanismDebugCounters::path_lost_stuck) >= 1; },
         kDeafBound));
@@ -16421,6 +16548,8 @@ TEST_CASE("File spark (real mechanism): stop() while a lost path is waiting for 
     const auto took = std::chrono::steady_clock::now() - t0;
     INFO("stop() took " << std::chrono::duration_cast<std::chrono::milliseconds>(took).count()
                         << " ms");
+    // Both assertions are model-limited (see the comment at the top of this case): they hold
+    // because nothing is outstanding to wait for, not because a stuck read was reaped.
     CHECK(took < 2500ms * yuzu::test::kSpinScale);
     CHECK(raw->stats().quarantined_total == 0);
 }
@@ -16442,9 +16571,8 @@ TEST_CASE("File spark (real mechanism): an OK completion already queued on the s
     // the case fail loudly (counter), not pass vacuously.
     DeafWatchTree tree("ok_drain");
     const auto renamed = tree.root / "renamed";
-    std::atomic<bool> park_armed{false}, parked{false}, release{false};
-    std::atomic<bool> want_write{false}, wrote{false};
-    std::atomic<int> inside{0};
+    auto st = std::make_shared<OkDrainState>();
+    st->renamed = renamed;
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16452,23 +16580,25 @@ TEST_CASE("File spark (real mechanism): an OK completion already queued on the s
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
     {
         auto ctl = identity_controls(50ms);
-        ctl.verify_hook = [&](std::wstring_view) -> unsigned long {
-            if (!park_armed.exchange(false, std::memory_order_acq_rel))
+        // Both hooks capture the shared state by value. verify_hook runs on a detached,
+        // never-joined worker; pass_fail_hook runs on the owner thread and never throws.
+        ctl.verify_hook = [st](std::wstring_view) -> unsigned long {
+            if (!st->park_armed.exchange(false, std::memory_order_acq_rel))
                 return 0;
-            inside.fetch_add(1, std::memory_order_acq_rel);
-            parked.store(true, std::memory_order_release);
-            while (!release.load(std::memory_order_acquire))
+            st->inside.fetch_add(1, std::memory_order_acq_rel);
+            st->parked.store(true, std::memory_order_release);
+            while (!st->release.load(std::memory_order_acquire))
                 std::this_thread::sleep_for(1ms);
-            inside.fetch_sub(1, std::memory_order_acq_rel);
+            st->inside.fetch_sub(1, std::memory_order_acq_rel);
             return 0; // then the real check: the path is gone, so it reads lost
         };
-        ctl.pass_fail_hook = [&] { // never throws: a general "run at the top of a pass" seam
-            if (!want_write.exchange(false, std::memory_order_acq_rel))
+        ctl.pass_fail_hook = [st] { // never throws: a general "run at the top of a pass" seam
+            if (!st->want_write.exchange(false, std::memory_order_acq_rel))
                 return;
-            { std::ofstream(renamed / "file.txt", std::ios::app) << "x"; }
-            release.store(true, std::memory_order_release);
+            { std::ofstream(st->renamed / "file.txt", std::ios::app) << "x"; }
+            st->release.store(true, std::memory_order_release);
             std::this_thread::sleep_for(150ms);
-            wrote.store(true, std::memory_order_release);
+            st->wrote.store(true, std::memory_order_release);
         };
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
     }
@@ -16478,18 +16608,18 @@ TEST_CASE("File spark (real mechanism): an OK completion already queued on the s
     const std::string key = spark_key(spec);
     auto sub = engine.arm(*c, spec);
     REQUIRE(sub.has_value());
-    HookParkGuard park_guard{release, inside};
+    HookParkGuard park_guard{st};
     engine.start();
     REQUIRE(eventually(
         [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
 
-    park_armed.store(true, std::memory_order_release);
-    REQUIRE(eventually([&] { return parked.load(std::memory_order_acquire); }, kDeafBound));
+    st->park_armed.store(true, std::memory_order_release);
+    REQUIRE(eventually([&] { return st->parked.load(std::memory_order_acquire); }, kDeafBound));
     std::error_code ec;
     std::filesystem::rename(tree.parent, renamed, ec);
     REQUIRE_FALSE(ec);
-    want_write.store(true, std::memory_order_release);
-    REQUIRE(eventually([&] { return wrote.load(std::memory_order_acquire); }, kDeafBound));
+    st->want_write.store(true, std::memory_order_release);
+    REQUIRE(eventually([&] { return st->wrote.load(std::memory_order_acquire); }, kDeafBound));
 
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
                        kDeafBound));
@@ -16515,8 +16645,7 @@ TEST_CASE("File spark (real mechanism): a throw while the lost path's cancelled 
     // handle and converges through the sweep's re-cancel, is not exercised here.)
     DeafWatchTree tree("drain_throw");
     const auto renamed = tree.root / "renamed";
-    std::atomic<bool> throw_armed{false};
-    std::atomic<int> threw{0};
+    auto th = std::make_shared<ThrowState>();
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16524,9 +16653,9 @@ TEST_CASE("File spark (real mechanism): a throw while the lost path's cancelled 
     REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
     {
         auto ctl = identity_controls(50ms);
-        ctl.completion_hook = [&](std::wstring_view) {
-            if (throw_armed.exchange(false, std::memory_order_acq_rel)) {
-                threw.fetch_add(1, std::memory_order_acq_rel);
+        ctl.completion_hook = [th](std::wstring_view) {
+            if (th->throw_armed.exchange(false, std::memory_order_acq_rel)) {
+                th->threw.fetch_add(1, std::memory_order_acq_rel);
                 throw std::runtime_error("injected throw while draining a lost path");
             }
         };
@@ -16541,17 +16670,24 @@ TEST_CASE("File spark (real mechanism): a throw while the lost path's cancelled 
     engine.start();
     REQUIRE(eventually(
         [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    const auto slow0 = raw->stats().slow_op_total;
 
-    throw_armed.store(true, std::memory_order_release);
+    th->throw_armed.store(true, std::memory_order_release);
     std::error_code ec;
     std::filesystem::rename(tree.parent, renamed, ec);
     REQUIRE_FALSE(ec);
-    REQUIRE(eventually([&] { return threw.load(std::memory_order_acquire) == 1; }, kDeafBound));
+    REQUIRE(eventually([&] { return th->threw.load(std::memory_order_acquire) == 1; },
+                       kDeafBound));
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
                        kDeafBound));
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Recovered) >= 1; },
                        kDeafBound));
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::pass_failed) >= 1);
+    // The failed-completion unwind arm defers the retry like the ordinary drain does, so its
+    // wait is not a slow establishment either (the health grace is spent), and the fault
+    // reason stays the one detection stamped.
+    CHECK(first_detail(got, key, SparkEventKind::Faulted) == kReasonLost);
+    CHECK(raw->stats().slow_op_total == slow0);
 
     std::filesystem::create_directories(tree.parent, ec);
     { std::ofstream(tree.file) << "recreated"; }
@@ -16628,10 +16764,8 @@ TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing 
     // re-probe is what makes this scenario a deaf one.
     DeafWatchTree tree("ancestor_rearm");
     const auto missing_file = tree.root / "absent_dir" / "file.txt";
-    const std::wstring root_w = tree.root.wstring();
-    std::atomic<bool> fail_rearm{false};
-    std::atomic<bool> fail_probes{false};
-    std::atomic<int> rearm_hits{0};
+    auto an = std::make_shared<AncestorRearmState>();
+    an->root_w = tree.root.wstring();
     Collector got;
     SparkEngine engine;
     auto mech = make_file_mechanism();
@@ -16642,15 +16776,16 @@ TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing 
         ctl.health_grace = 100ms;
         ctl.backend_retry_base = 100ms;
         ctl.sweep_cadence = 20ms;
-        ctl.ancestor_rearm_fail_hook = [&](std::wstring_view dir) {
-            if (dir == root_w && fail_rearm.load(std::memory_order_acquire)) {
-                rearm_hits.fetch_add(1, std::memory_order_acq_rel);
+        // probe_hook runs on a detached, never-joined probe worker: shared state, by value.
+        ctl.ancestor_rearm_fail_hook = [an](std::wstring_view dir) {
+            if (dir == an->root_w && an->fail_rearm.load(std::memory_order_acquire)) {
+                an->rearm_hits.fetch_add(1, std::memory_order_acq_rel);
                 return true;
             }
             return false;
         };
-        ctl.probe_hook = [&](std::wstring_view) {
-            if (fail_probes.load(std::memory_order_acquire))
+        ctl.probe_hook = [an](std::wstring_view) {
+            if (an->fail_probes.load(std::memory_order_acquire))
                 throw std::runtime_error("injected re-probe failure");
         };
         REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
@@ -16669,10 +16804,10 @@ TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing 
         kDeafBound));
     REQUIRE(engine.stats().armed_faulted == 0); // precondition: sheltered and healthy
 
-    fail_rearm.store(true, std::memory_order_release);
-    fail_probes.store(true, std::memory_order_release);
+    an->fail_rearm.store(true, std::memory_order_release);
+    an->fail_probes.store(true, std::memory_order_release);
     { std::ofstream(tree.root / "unrelated.txt") << "x"; } // a real completion on the ancestor
-    REQUIRE(eventually([&] { return rearm_hits.load(std::memory_order_acquire) >= 1; },
+    REQUIRE(eventually([&] { return an->rearm_hits.load(std::memory_order_acquire) >= 1; },
                        kDeafBound)); // the forced re-arm failure really ran
 
     // Oracle: the dependent cannot re-establish, so it is faulted.
@@ -16686,8 +16821,8 @@ TEST_CASE("File spark (real mechanism): a failed ancestor re-arm plus a failing 
     }
 
     // Secondary: lift both injections; the watch recovers and the repaired path fires.
-    fail_probes.store(false, std::memory_order_release);
-    fail_rearm.store(false, std::memory_order_release);
+    an->fail_probes.store(false, std::memory_order_release);
+    an->fail_rearm.store(false, std::memory_order_release);
     CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, kDeafBound));
     std::error_code ec;
     std::filesystem::create_directories(missing_file.parent_path(), ec);
@@ -16717,6 +16852,7 @@ RegRenameKeyFn resolve_reg_rename_key() {
     const HMODULE adv = ::GetModuleHandleW(L"advapi32.dll");
     if (adv == nullptr)
         return nullptr;
+    // GetProcAddress returns an untyped FARPROC; the exported signature is RegRenameKeyFn's.
     return reinterpret_cast<RegRenameKeyFn>(::GetProcAddress(adv, "RegRenameKey"));
 }
 } // namespace
@@ -16726,9 +16862,11 @@ RegRenameKeyFn resolve_reg_rename_key() {
 // (`yuzu_agent_tests "[known-gap-5719]"`) it is RED on Windows: a Registry watch whose
 // parent key is renamed away stays Healthy and silent (the handle follows the key). It is
 // NOT a regression of the File fix and not fixed here: the legacy guard_registry.cpp
-// (lines 25-32) carries the same KNOWN RESIDUAL note, so Spark is at parity. Keep it
-// runnable and keep it red until the gap is fixed; do not turn it into [!mayfail] or
-// [!shouldfail] (the former hides a real failure, the latter passes vacuously).
+// (lines 25-32) discloses a residual of the same class (a rename of the watched KEY goes
+// undetected; this test renames the key's PARENT), and the legacy guard was not run on this
+// case. Tracked as #7836. Keep it runnable and keep it red until the gap is fixed; do not
+// turn it into [!mayfail] or [!shouldfail] (the former hides a real failure, the latter
+// passes vacuously).
 TEST_CASE("Registry spark (real mechanism): a parent key renamed away faults the watch inside "
           "the bound (#5719 item 5, known gap, parked)",
           "[.][known-gap-5719]") {
@@ -16739,8 +16877,7 @@ TEST_CASE("Registry spark (real mechanism): a parent key renamed away faults the
     // ORIGINAL name, so the renamed tree is removed by its own guard below.
     ScratchRegKey parent("deaf5719_rename");
     REQUIRE(parent.h != nullptr);
-    ::RegCloseKey(parent.h); // keep the mechanism's handle the only one open on the tree
-    parent.h = nullptr;
+    parent.close(); // keep the mechanism's handle the only one open on the tree
     const std::string child = parent.sub + "\\Child";
     {
         RegKeyOwner ch;
@@ -16829,6 +16966,8 @@ TEST_CASE("Registry spark (real mechanism): a parent key renamed away faults the
         kDeafBound));
     const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
     const DWORD v = 7;
+    // The API takes the value as raw bytes; reading a DWORD through a BYTE (unsigned char)
+    // pointer is the sanctioned aliasing.
     ::RegSetValueExA(again.h, "V", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v));
     CHECK(eventually(
         [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; },
