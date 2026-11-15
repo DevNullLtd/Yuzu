@@ -1610,6 +1610,33 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
        "GET /api/v1/inventory/software/components".
      - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-14 - the software lookup gains purl and `vers:` ranges (SAM-43;
+     REST only, the MCP twin is a recorded exception).** Rows of
+     `GET /api/v1/inventory/software` gain a `purl` field (the canonical Package
+     URL, `null` when the row has none) and the CSV export a 23rd column; the
+     route gains a `purl` filter (byte equality on the stored value); and both
+     lookup routes (`GET /api/v1/inventory/software` and
+     `GET /api/v1/inventory/software/components`) gain a `vers` filter (a
+     `vers:<scheme>/...` range resolved by the same evaluator as `version_min`
+     and `version_max`). None of this is reachable over MCP:
+     `query_installed_software` keeps its 14 fields and five arguments, and the
+     components route has no tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked by
+       issue **#7749**, which rides with the SAM-17 twin (#7396, delivery row
+       SAM-21): the twin takes the same pure model (`software_list_model.hpp`,
+       `vers_range.hpp`), so no second copy of any rule is created. **Revisit by
+       2026-12-31.** This entry retires when the twin merges. The parity ledger
+       (`docs/api-parity-ledger.md`, "Known asymmetry on purl and vers") points
+       here.
+     - **The exception relaxes no control.** Both routes keep the SAM-17
+       posture: `require_fleet_read` (`Inventory:Read`) as the sole gate, the
+       composed management-group and service scope pushed into every page read
+       and into the version-range read, the `purl` filter ANDed with that scope,
+       every served call audited with the new filters in its target, and a
+       malformed `vers` or `purl` a `400` in the A4 envelope. Wire reference:
+       `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
+       "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
    - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
      `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
      This entry retires the 2026-10-23 and 2026-11-02 #6087 exceptions above.

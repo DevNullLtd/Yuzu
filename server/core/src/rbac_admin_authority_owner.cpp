@@ -6,6 +6,8 @@
 #include "pg/pg_raii.hpp"
 #include "rbac_store_sql_helpers.hpp"
 #include "rbac_text.hpp"
+// session_sql::bump_generation_in_txn (deactivate_account, LAST)
+#include "session_store_sql_helpers.hpp"
 
 #include <yuzu/server/auth_db.hpp> // is_valid_username — provision_first_admin's own
                                     // pre-INSERT guard (rbac_admin_predicate.hpp already
@@ -161,9 +163,12 @@ constexpr std::chrono::milliseconds kLifecycleIdleInTxnTimeout{15000};
 // (and is not injected at all when the DSN or `PGOPTIONS` carries its own), so without this a
 // stuck lock holder could pin a pooled connection for 10 s per lock or unbounded. There is no
 // ordering constraint on the value against `AuthDB::recheck_role_locked` (2000 ms) or
-// `CredentialChangeOwner` (1500 ms): those wait on the `auth.users` row this owner takes LAST
-// and holds only across lock-free recounts and the COMMIT, and this owner never waits on a lock
-// either of them holds while holding the `auth.users` row, so no chain of waits forms.
+// `CredentialChangeOwner` (1500 ms): those wait on the `auth.users` row this owner takes after
+// the grant rows and holds across lock-free recounts, the step 8 `session_meta` wait and the
+// COMMIT. In `kBumpSessionGeneration` mode this owner DOES wait, at step 8, on the
+// `session_meta` row, which `CredentialChangeOwner` holds; that holder takes it LAST and waits
+// on nothing after taking it, so the chain of waits ends there and no cycle forms (the banner in
+// rbac_admin_authority_owner.hpp states the order).
 //
 // SQL: "SELECT set_config('lock_timeout', $1, true)" and the idle-in-transaction setting: both
 // transaction-local (never leak to the pooled connection), bound parameters, the same shape
@@ -809,7 +814,8 @@ RbacAdminAuthorityOwner::provision_first_admin(const std::string& username,
 // UPDATE. A recount folded into the write's statement (or issued before it) would count the
 // target itself.
 AccountDeactivationResult
-RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
+RbacAdminAuthorityOwner::deactivate_account(const std::string& username,
+                                            SessionGenerationMode session_mode) const {
     // A name `is_valid_username` rejects can never be a stored account (every writer validates),
     // so it is `kNotFound` BEFORE any statement runs: an embedded NUL would truncate at the libpq
     // parameter boundary and an over-long name is not a row. Same gate `provision_first_admin`
@@ -881,6 +887,23 @@ RbacAdminAuthorityOwner::deactivate_account(const std::string& username) const {
                 refused = true;
                 return false;
             }
+        }
+
+        // 8. The session write-generation bump, the LAST statement. It commits together with the
+        // account going inactive, so every replica's validate cache is cleared by its next
+        // generation poll whether or not the caller's later durable session wipe succeeds. It
+        // takes the `session_store.session_meta` row, which every session create/revoke in the
+        // fleet shares and holds to COMMIT: nothing may wait after it (see the banner for the
+        // order). The `lock_timeout` installed at step 0 bounds EACH lock wait in this
+        // transaction, not their sum (up to about five waits plus the pool acquire), and the
+        // session writers that queue behind this row set no transaction timeout of their own.
+        // Reached only when a row was deactivated and neither floor refused: a no-op or a
+        // refusal bumps nothing.
+        // A failure aborts the transaction (the account stays active, `kStoreFailure`).
+        if (session_mode == SessionGenerationMode::kBumpSessionGeneration &&
+            !session_sql::bump_generation_in_txn(c)) {
+            err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
+            return false;
         }
         removed = true;
         return true;

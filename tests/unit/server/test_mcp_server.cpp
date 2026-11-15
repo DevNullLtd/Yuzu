@@ -41,6 +41,7 @@
 #include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
@@ -5413,7 +5414,8 @@ TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner a
     grant.principal_type = "user";
     grant.principal_id = "test-user";
     grant.role_name = "ITServiceOwner";
-    REQUIRE(mgmt.assign_role(grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this mint arm.
+    yuzu::test::plant_group_role_row(db.dsn(), grant);
 
     yuzu::test::ApprovalManagerPg allowed_appr_bundle;
     yuzu::server::ApprovalManager& allowed_appr = *allowed_appr_bundle;
@@ -11508,10 +11510,28 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
     CHECK(payload["policy"]["fault"].is_null());
     CHECK(payload["policy"]["tiers"].contains("poor"));
     CHECK(payload["apps"][0]["profile"] == "default");
+    // #7504, #7519: the confidence level, the resolved tier name and the live observer split.
+    CHECK(payload["policy"]["interval_confidence"].get<double>() == Catch::Approx(0.95));
+    CHECK(payload["apps"][0]["score"].contains("tier"));
+    REQUIRE(payload.contains("observer_state")); // null here: no observer source in this harness
+    CHECK(payload["observer_state"].is_null());
     // Fleet aggregate — only the generic tool-call audit, never a domain verb.
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.app.view") == std::string::npos);
+
+    // The served payload validates against the output schema the tool declares. The schema is
+    // fetched from tools/list and must be an object, so the check can never pass vacuously.
+    {
+        auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7504})");
+        REQUIRE(listed);
+        nlohmann::json schema;
+        for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"])
+            if (t["name"] == "list_dex_apps")
+                schema = t["outputSchema"];
+        REQUIRE(schema.is_object());
+        CHECK(yuzu::test::schema_violation(schema, payload) == "");
+    }
 
     // Rule 1: the MCP payload's key sets equal the shared serializer's.
     yuzu::server::DexAppsModel one;
@@ -11558,9 +11578,38 @@ TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an 
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["code"] == kInternalError);
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    // The message ends with the cause token (#7520): a dropped table is a query error.
+    CHECK(body["error"]["message"].get<std::string>().ends_with("(query_error)"));
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.list_dex_apps|success");
+}
+
+TEST_CASE("MCP DEX: list_dex_apps declares the new payload fields and the coverage wording",
+          "[mcp][integration][dex][a5]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7519})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "list_dex_apps")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto& props = (*tool)["outputSchema"]["properties"];
+    CHECK(props.contains("observer_state"));
+    CHECK(props["policy"]["properties"].contains("interval_confidence"));
+    CHECK(props["apps"]["items"]["properties"]["score"]["properties"].contains("tier"));
+    CHECK(props["apps"]["items"]["properties"]["versions"]["items"]["properties"]["score"]["properties"]
+              .contains("tier"));
+    const auto required = (*tool)["outputSchema"]["required"].dump();
+    CHECK(required.find("observer_state") != std::string::npos);
+    // The description says what crash_source_coverage is, and what observer_state is.
+    const auto d = (*tool)["description"].get<std::string>();
+    CHECK(d.find("shipped design") != std::string::npos);
+    CHECK(d.find("not live collector health") != std::string::npos);
+    CHECK(d.find("observer_state is the live count") != std::string::npos);
 }
 
 TEST_CASE("MCP DEX: list_dex_apps names an unreadable score policy in its error",
@@ -11761,11 +11810,13 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
-              nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
-                                     "crash_source_coverage", "apps_total", "apps_truncated"}));
+              nlohmann::json::array({"window", "apps", "policy", "observer_state", "population",
+                                     "population_basis", "crash_source_coverage", "apps_total",
+                                     "apps_truncated"}));
         CHECK(out["properties"].contains("crash_source_coverage"));
         const auto& policy = out["properties"]["policy"];
-        CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
+        CHECK(policy["required"] ==
+              nlohmann::json::array({"source", "revision", "fault", "interval_confidence", "tiers"}));
         CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));
         CHECK(policy["properties"]["fault"]["type"] == nlohmann::json::array({"string", "null"}));
         // The tier block is typed, not a bare object: four tiers, each a numeric edge and a string name.
@@ -29270,7 +29321,8 @@ TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallbac
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user"; // matches McpTestServer's default mock_username
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
@@ -29321,7 +29373,8 @@ TEST_CASE("MCP list_management_group_roles: ManagementGroup:Read leading gate de
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user";
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
@@ -29396,7 +29449,8 @@ TEST_CASE("MCP management-group roles tools: the owner arm refuses an engine-cla
     owner_grant.principal_type = "user";
     owner_grant.principal_id = "test-user";
     owner_grant.role_name = "ITServiceOwner";
-    REQUIRE(store.assign_role(owner_grant).has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+    yuzu::test::plant_group_role_row(db.dsn(), owner_grant);
     // assign_management_group_role needs a non-null rbac_store and never dereferences it on this
     // path (see the happy-path case below).
     yuzu::server::pg::PgPool bad_pool{

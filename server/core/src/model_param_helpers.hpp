@@ -73,6 +73,12 @@ template <class Src>
     return it != p.end() && it->first == key ? &it->second : nullptr;
 }
 
+/// The first value of `key` under the same rule as first_param, or "" when absent.
+[[nodiscard]] inline std::string first_param_or_empty(const Params& p, const std::string& key) {
+    const auto* v = first_param(p, key);
+    return v ? *v : std::string{};
+}
+
 /// `s` split on every `d` (an empty input is one empty field). The views point into `s`.
 [[nodiscard]] inline std::vector<std::string_view> split(std::string_view s, char d) {
     std::vector<std::string_view> out;

@@ -53,6 +53,138 @@ filename.
    agent would notice the change, write one.
 4. Lint locally before pushing: `python3 scripts/assemble-changelog.py --check`
 
+## Reading unreleased changes (following `dev`)
+
+Fragments are only collated into `CHANGELOG.md` at release. To see what a
+`git pull` of `dev` just brought, run this after the pull:
+
+```bash
+python3 scripts/whats-new.py                          # since your last pull
+python3 scripts/whats-new.py --since v0.15.0          # since a tag, branch or commit
+python3 scripts/whats-new.py --since "2 weeks ago"    # or YYYY-MM-DD
+python3 scripts/whats-new.py --full                   # whole bullets, every dependency bump
+python3 scripts/whats-new.py --versions               # version bumps, rebuild notes, Docker image bumps (see below)
+```
+
+On Windows, where `python3` is often not on `PATH`, use the launcher:
+`py -3 scripts\whats-new.py`. The script uses only the standard library
+(Python 3.9 or later, for `str.removeprefix`) and needs `git` on `PATH`.
+
+The header counts the entries that start `**Breaking` (a `Breaking` line,
+shown only when there are some), so you see them before reading further.
+`--versions` prints that header, the version bumps, the rebuild / redeploy
+notes and the Docker image bumps. It leaves out the changelog entries, and
+shows the other dependency bumps only as a count (`--full` lists them under
+their own heading). It is a quick look at what may need a rebuild, not a
+proof that nothing does: the rebuild notes watch `vcpkg`, `proto/`,
+`gateway/`, `sdk/` and the deploy files, and say nothing about `server/`,
+`agents/` or `common/` source changes, which only the file counts in the
+header show. Fragments the script could not read or list still get their
+`!` line in `--versions` mode, because the `Breaking` count leaves them out.
+
+It prints, in this order:
+
+- **Version bumps:** the project version, the plugin ABI, the vcpkg baseline
+  and dependency constraints (including per-feature ones), the gateway
+  packages, and the latest released `CHANGELOG.md` version.
+- **Rebuild / redeploy:** the surfaces the range touched that may need a
+  rebuild (vcpkg, `proto/`, `gateway/`, `sdk/`, deploy and compose files).
+- **Dependency bumps:** commits titled `build(deps):` or `chore(deps):`.
+  Dockerfile and compose bumps are listed; the rest (workflows, pip, npm) are
+  counted, and `--full` lists them.
+- **Changelog entries:** the fragments this range adds, grouped security,
+  removed, deprecated, changed, added, fixed. The heading counts them, and
+  says how many are already released and how many are breaking. An entry a
+  release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
+  when its first line sits under one `## [X.Y.Z]` heading at `HEAD` (each bullet
+  of a multi-bullet fragment is judged by its own first line, so a bullet the
+  release editor cut, or reworded in the release commit itself, gets no marker:
+  the two cannot be told apart), and
+  `[released]` when the version cannot be told: the release editorial pass
+  reworded the line (the usual cause), the line is under two versions, under
+  a column-0 `#` or `##` heading that is not `## [X]`, or before any heading,
+  or `CHANGELOG.md` is gone. A line only under `[Unreleased]` has no marker,
+  and neither has an entry no release in the range moved (the usual case for
+  a pull of `dev`). A heading is a column-0 `## [X]` line, as
+  `scripts/assemble-changelog.py` reads it, so a sample heading inside a code
+  fence counts as one. The marker is a reading aid, not release evidence.
+  Each shows its first line, cut at
+  200 characters (a marker follows the cut). Security, removed and deprecated entries, and entries starting
+  `**Breaking` (in any case), are shown whole, continuation lines included;
+  other entries show their continuation lines only with `--full`. A fragment
+  replaced, reworded or withdrawn inside the range is shown once in its final
+  form, or not at all. A fragment that reached its path only through renames
+  git saw as identical, from a path you already had, and still has those exact
+  bytes is not new (a rename into `security`, `removed` or `deprecated` is a
+  reclassification and is listed); one renamed and then edited is listed, and so
+  is an identical fragment added in a different commit from the deletion of the
+  old one. A fragment added after your base and since promoted by a release is
+  shown, under its last path and section, when its first line is a line a commit
+  in the range added to `CHANGELOG.md`, even if the line was edited by hand after
+  the release (unless a merge commit was the only commit that added the line, see
+  below); a name a release promoted twice in the range is shown each time
+  (once, if the two texts are identical). A promoted entry shows the fragment's
+  wording as it was promoted, not a later hand edit of the release text, so a
+  note says so and `CHANGELOG.md` has the final text. A release that deletes a
+  fragment and adds a similar one in the same commit still counts as promoting
+  the first unless the new file keeps its first bullet.
+  A path you had and edited is not listed, nor is its promotion. A path you had,
+  that a release promoted and that was added back with different text, is
+  listed; added back with identical text, it is not. A fragment you had, moved
+  out of `changelog.d/` and back, is listed again only if its text changed.
+  Fragments are read the way `promote` reads them (line endings normalised,
+  outer whitespace dropped). A release finished by a merge commit (a release
+  branch that merges `dev` and removes the fragments there) counts as promoting
+  them, shown with the wording last committed before the merge; one the merge
+  itself reworded, one that was withdrawn, or one whose line only that merge
+  added and a later commit then edited, matches no `CHANGELOG.md` line and
+  is named on a `!` line instead. A fragment file over 1 MiB is not read.
+  A file added under `changelog.d/` whose name is not a fragment name (or that
+  is in a subdirectory), a fragment name that is a submodule, and a fragment
+  file over the size limit are each named on a `!` line (at most 20 names, then
+  a count) and are not listed. Only the top-level `changelog.d/README.md` and
+  `changelog.d/.gitkeep` are exempt. Releases rewrite `CHANGELOG.md` by hand
+  too, so a bullet that never had a fragment does not appear; fragments began on
+  2026-07-04, so a base before that cannot show entries written straight into
+  `CHANGELOG.md`. A `!` line anywhere in the report means that part could not be
+  read or compared; it is never "no change".
+
+"Your last pull" is read from the reflog of the branch you are on: the newest
+`git pull` that names no source or names that branch's upstream (or, when the
+branch has no upstream, the branch itself; `dev:dev` counts as `dev`, `:x` does
+not), or `git merge <upstream>` after a fetch (`git merge -s ours` and
+`git pull -s ours` take none of the upstream and are not counted), and the
+commit the branch was on before it. The `Via` line prints the reflog entry used. A pull on another branch is in that branch's reflog, and
+`checkout`, a local `merge`, `reset`, `git pull <other branch>` and a merge of a
+different branch (`origin/dev-hotfix` is not `origin/dev`) are not counted, so
+none of them can move the base later. A pull the script does not recognise, such
+as one that stopped on a conflict and was finished by hand, only makes the range
+start earlier, at the pull before it: the range may then include changes you
+already read. A fresh clone, a new branch, a detached `HEAD` or an expired
+reflog has no pull to read, so pass `--since`. A `git pull` that finds nothing
+new writes no reflog entry, so the range then still starts at the earlier pull
+that did (the `Base` and `Via` lines show which). After `git pull --rebase` the
+range starts at the common ancestor, so your own local commits, replayed by the
+rebase, and any fragments they add are in it too.
+
+`--since` with a date picks the first commit git finds that was made at or before that
+moment, by commit date (history with skewed commit dates can make that an older or newer commit than
+you meant), in local time. A bare `YYYY-MM-DD` means 00:00 that day;
+`YYYY-MM-DD HH:MM[:SS]` (or with a `T`) is that moment; an absolute date must fall from 3 January
+1970 to 31 December 2099 (git can read a moment on 1 January 1970 as "now" east of UTC, so earlier dates are refused);
+`yesterday` and `N <unit> ago` count back from now (a day is 24 hours). `N` is one to four digits, the unit is lowercase
+(`second`, `minute`, `hour`, `day`, `week`, `month`, `year`, singular or plural)
+and a month or year is a calendar month or year. Anything else is refused,
+because git would read a typo as "now".
+
+The script only reads (in a partial clone, git itself may fetch objects the range
+needs). Text from fragments and commit messages is printed with control characters
+(newline and tab aside) and invisible format characters (zero-width joiners and non-joiners, variation
+selectors, bidi marks) replaced by `?`, so an emoji sequence can show a `?`;
+a fragment's continuation lines are indented. Changes that skipped a fragment (rule 3) do not
+appear in the entries; `git log --first-parent --oneline <base>..HEAD` lists
+every merged PR, with `<base>` the commit the `Base` line prints.
+
 ## For AI coding agents
 
 If you are an agent (Claude Code, etc.) preparing a change in this repo: when

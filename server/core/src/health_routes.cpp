@@ -47,6 +47,7 @@
 #include "product_pack_store.hpp"
 #include "product_registry_store.hpp"
 #include "software_collection_settings_store.hpp"
+#include "software_lifecycle_store.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
@@ -809,6 +810,8 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             {"software_collection_settings_store",
              deps.software_collection_settings_store &&
                  deps.software_collection_settings_store->is_open()},
+            {"software_lifecycle_store",
+             deps.software_lifecycle_store && deps.software_lifecycle_store->is_open()},
             // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing
             // post-#802. UP-2 from the W7.4 Gate 4 risk register: a store
             // that fails to open AND `--allow-unsigned-packs` set produces
