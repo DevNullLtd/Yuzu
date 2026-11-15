@@ -907,12 +907,14 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
         CHECK(rest.remediation == it->rest_remediation);
         CHECK(mcp.remediation == it->mcp_remediation);
     }
-    // the sentinel and an out-of-range value is a refusal that audits nothing and retries nothing
+    // the sentinel and an out-of-range value is a refusal with no domain audit row, an empty audit
+    // detail and no retry (the MCP handler's generic `denied` row is not this function's)
     for (const auto v : {hcp::ReadError::kCount, static_cast<hcp::ReadError>(99)}) {
         const auto bogus = hcp::describe_read_error(v, hcp::Surface::kRest);
         CHECK_FALSE(bogus.unavailable);
         CHECK_FALSE(bogus.domain_audit_row);
         CHECK(bogus.message == "invalid request");
+        CHECK(bogus.audit_detail.empty());
     }
 }
 

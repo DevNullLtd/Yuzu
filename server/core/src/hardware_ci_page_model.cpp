@@ -259,7 +259,8 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         break;
     }
     // Unreachable for a named enumerator (the switch above has no default, so a new one is a
-    // -Wswitch warning). An out-of-range value is answered as a refusal with no audit row.
+    // -Wswitch warning). An out-of-range value is answered as a refusal with no domain audit row
+    // and an empty audit detail; the MCP handler still writes its generic `denied` row for it.
     f.audit_outcome = "denied";
     return f;
 }

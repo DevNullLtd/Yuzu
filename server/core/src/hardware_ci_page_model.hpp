@@ -153,7 +153,8 @@ struct Page {
 ///    and the request alone, before any read, and its text carries no count.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
-///    like any out-of-range value. Add a new error BEFORE it.
+///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
+///    every-enumerator test and the table's `static_assert` count up to `kCount`.
 enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScopeTooWide, kCount };
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the

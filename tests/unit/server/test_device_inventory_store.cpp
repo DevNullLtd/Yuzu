@@ -3422,25 +3422,55 @@ TEST_CASE("a v3 database upgrades to v4 behind a lock held longer than the pool'
     PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 1000}};
     REQUIRE(short_lock_pool.valid());
 
+    // No Catch macro runs off the main thread: the holder records a failure into an atomic flag and
+    // a message, ALWAYS counts the latch down (also on failure, so the main thread never hangs on
+    // it) and swallows every exception (so nothing reaches std::terminate). The jthread joins when
+    // this scope unwinds, so a REQUIRE that throws on the main thread cannot leave it joinable.
     std::latch holding{1};
-    std::thread holder([&] {
-        auto lease = pool.acquire();
-        REQUIRE(lease);
-        REQUIRE(yuzu::server::pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
-                PGRES_COMMAND_OK);
-        REQUIRE(yuzu::server::pg::exec_params(
-                    lease.get(), "LOCK TABLE device_inventory_store.device_ci IN ROW EXCLUSIVE MODE",
-                    std::vector<std::string>{})
-                    .status() == PGRES_COMMAND_OK);
-        holding.count_down();
-        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
-        (void)yuzu::server::pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{});
+    std::atomic<bool> holder_failed{false};
+    std::string holder_error; // written by the holder before it exits, read after the join
+    const auto exec_holder = [&](PGconn* conn, const char* sql) {
+        auto r = yuzu::server::pg::exec_params(conn, sql, std::vector<std::string>{});
+        if (r.status() != PGRES_COMMAND_OK) {
+            holder_failed.store(true);
+            holder_error += std::string(sql) + ": " + PQerrorMessage(conn) + "; ";
+            return false;
+        }
+        return true;
+    };
+    std::jthread holder([&] {
+        try {
+            auto lease = pool.acquire();
+            if (!lease) {
+                holder_failed.store(true);
+                holder_error += "acquire failed; ";
+                holding.count_down();
+                return;
+            }
+            const bool locked =
+                exec_holder(lease.get(), "BEGIN") &&
+                exec_holder(lease.get(), "LOCK TABLE device_inventory_store.device_ci IN ROW EXCLUSIVE MODE");
+            holding.count_down();
+            if (!locked) {
+                (void)yuzu::server::pg::exec_params(lease.get(), "ROLLBACK", std::vector<std::string>{});
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+            (void)exec_holder(lease.get(), "COMMIT");
+        } catch (...) {
+            holder_failed.store(true);
+            holder_error += "exception; ";
+            if (!holding.try_wait()) // only this thread counts down, so this cannot race
+                holding.count_down();
+        }
     });
     holding.wait();
     const auto t0 = std::chrono::steady_clock::now();
     DeviceInventoryStore store{short_lock_pool}; // runs v4 over the existing rows, waiting for the lock
     const auto waited = std::chrono::steady_clock::now() - t0;
     holder.join();
+    INFO("holder: " << holder_error);
+    REQUIRE_FALSE(holder_failed.load());
 
     REQUIRE(store.is_open());
     CHECK(waited > std::chrono::milliseconds(1500)); // it really did wait past the pool's 1 s
@@ -3505,6 +3535,36 @@ TEST_CASE("opening the store warns when the C-collated index is missing, invalid
                         "(agent_id)");
         open_and_capture(warn);
         CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    // The index NAME contains "agent_id", so a check that looks for that word in the definition
+    // text accepts all three of these; the check compares the printed key list whole.
+    SECTION("a same-named multi-column index starting with the right expression") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\", hostname)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index with an INCLUDE column") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "((agent_id COLLATE \"C\")) INCLUDE (hostname)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a same-named index on lower(agent_id) in C collation") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "((lower(agent_id) COLLATE \"C\"))");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("the plain collated column is the same index and stays silent") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "(agent_id COLLATE \"C\")");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_idx") == std::string::npos);
     }
     SECTION("a partial index of the right expression") {
         exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");

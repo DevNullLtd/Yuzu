@@ -228,17 +228,33 @@ constexpr const char* kMigrationV3Sql =
 // CaStore v5 and CommandOutboxStore v3 migrations, SET LOCAL (it ends with the migration's
 // transaction, so nothing leaks onto the pooled connection) lifts the statement timeout for the
 // build and allows a lock wait of 30 s (ca_store's value) behind a long ingest transaction.
-constexpr const char* kMigrationV4Sql =
-    "SET LOCAL lock_timeout = '30s'; "
-    "SET LOCAL statement_timeout = 0; "
-    "CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_ci ((agent_id COLLATE \"C\"));";
+// The btree key list of the index, exactly as `pg_get_indexdef` prints it after `USING btree`
+// (verified on PostgreSQL 18.4, where the parenthesised expression and a plain collated column
+// print the same). ONE spelling for the migration DDL, the operator's DDL in the WARN and the
+// runtime check, so the three cannot drift: the check compares the printed key list to this text
+// and nothing else, so a same-named index with another column, more columns, INCLUDE, a different
+// expression or an opclass does not pass.
+constexpr std::string_view kAgentIdCIndexKey = "(agent_id COLLATE \"C\")";
+constexpr const char* kAgentIdCIndexName = "device_ci_agent_id_c_idx";
+
+std::string agent_id_c_index_ddl(std::string_view table) {
+    std::string ddl = "CREATE INDEX IF NOT EXISTS ";
+    ddl += kAgentIdCIndexName;
+    ddl += " ON ";
+    ddl += table;
+    ddl += " (";
+    ddl += kAgentIdCIndexKey;
+    ddl += ")";
+    return ddl;
+}
+
+const std::string kMigrationV4Sql = "SET LOCAL lock_timeout = '30s'; "
+                                    "SET LOCAL statement_timeout = 0; " +
+                                    agent_id_c_index_ddl("device_ci") + ";";
 
 // The index as the runtime check (and an operator by hand) creates it: schema-qualified, because
 // no search_path is set outside the migration runner.
-constexpr const char* kAgentIdCIndexName = "device_ci_agent_id_c_idx";
-constexpr const char* kAgentIdCIndexCreateSql =
-    "CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
-    "((agent_id COLLATE \"C\"))";
+const std::string kAgentIdCIndexCreateSql = agent_id_c_index_ddl("device_inventory_store.device_ci");
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -344,8 +360,9 @@ int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
 /// `schema_meta` saying v4 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
 /// another definition that `IF NOT EXISTS` accepted). The read stays CORRECT without it (its
 /// `COLLATE "C"` spelling carries correctness), so a miss or a failed check is a WARN and the
-/// store still opens, but every page becomes a scan plus a sort, which a loaded server feels as a
-/// wedged pool, so the line says how to fix it. Never throws; a failed check logs and moves on.
+/// store still opens, but every page becomes a scan plus a sort, which a loaded server feels as an
+/// exhausted pool, so the line says how to fix it. It logs and returns and does not change
+/// `open_`; a failed check logs and moves on.
 void warn_if_agent_id_c_index_unusable(PGconn* conn) {
     pg::PgResult res = pg::exec_params(
         conn,
@@ -369,9 +386,17 @@ void warn_if_agent_id_c_index_unusable(PGconn* conn) {
         const std::string ready = PQgetvalue(res.get(), 0, 1);
         const std::string partial = PQgetvalue(res.get(), 0, 2);
         const std::string def = PQgetvalue(res.get(), 0, 3);
-        const bool by_c_bytes = def.find("COLLATE \"C\"") != std::string::npos &&
-                                def.find("agent_id") != std::string::npos &&
-                                def.find("USING btree") != std::string::npos;
+        // The definition is judged by the key list `pg_get_indexdef` prints after "USING btree",
+        // compared whole to the migration's own spelling (the index NAME also contains
+        // "agent_id", so a substring test would accept a same-named index on another column).
+        // The parenthesised-expression print is accepted too: it is the same index to the planner.
+        constexpr std::string_view kUsing = " USING btree ";
+        const auto using_at = def.find(kUsing);
+        const std::string_view key =
+            using_at == std::string::npos ? std::string_view{}
+                                          : std::string_view{def}.substr(using_at + kUsing.size());
+        const std::string wrapped = "(" + std::string(kAgentIdCIndexKey) + ")";
+        const bool by_c_bytes = key == kAgentIdCIndexKey || key == wrapped;
         if (valid != "t" || ready != "t")
             problem = "is invalid (an interrupted build)";
         else if (partial == "t" || !by_c_bytes)
