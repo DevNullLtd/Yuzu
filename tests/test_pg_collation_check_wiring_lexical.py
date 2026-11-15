@@ -62,6 +62,8 @@ Invariants:
      `audit_store_->stop_cleanup();` and `offload_target_store_->flush_all();` in stop(): the join
      can wait out a check stuck against a frozen backend, and a kill during that wait must not skip
      the lease release or the flushes (it is the last step before the pool is reset).
+     Those three steps belong to other subsystems: if one is renamed or removed the gate says
+     "stale anchor" and names the step, rather than reporting a collation-wiring defect.
 
   14. The recheck `start()` is wrapped in try/catch(const std::exception&) that resets the unstarted
      recheck: a refused thread creation (a task or thread limit) must degrade a report-only feature,
@@ -141,6 +143,10 @@ MSG_REQ_AFTER_JOIN = ("the early request_stop is after the join `pg_collation_re
 MSG_REQ_AFTER_WEB = "the early request_stop is after `web_server_->stop();` (then it is not early)"
 BEFORE_JOIN = ("leader_elector_->resign();", "audit_store_->stop_cleanup();",
                "offload_target_store_->flush_all();")
+MSG_STALE_ANCHOR = ("`{}` is not found in stop() (stale anchor): it names ANOTHER subsystem's step, "
+                    "which was renamed or removed. This is not a collation-wiring defect; update "
+                    "BEFORE_JOIN in this test to the step's new spelling and re-check that the "
+                    "join still comes after it")
 MSG_JOIN_LATE = ("the PgCollationRecheck join must come after the leader resign, the audit cleanup "
                  "and the offload flush in stop(): a join that waits on a wedged check must not be "
                  "able to skip them")
@@ -353,7 +359,9 @@ def recheck_problems(t, report_pos):
     if len(stops) == 1 and stop[0] < stops[0] < stop[1]:
         for step in BEFORE_JOIN:
             at = t.find(step, stop[0], stop[1])
-            if at < 0 or at > stops[0]:
+            if at < 0:
+                out.append(MSG_STALE_ANCHOR.format(step))
+            elif at > stops[0]:
                 out.append(MSG_JOIN_LATE)
                 break
     pool = t.find(POOL_DECL)
@@ -566,6 +574,13 @@ class PgCollationCheckWiring(unittest.TestCase):
         m = rest[:k] + STOP + "\n            " + rest[k:]
         self.assertNotEqual(m, self.src)
         self.assertEqual(problems(m), [MSG_JOIN_LATE])
+
+    def test_a_renamed_borrowed_step_reports_a_stale_anchor_not_a_wiring_defect(self):
+        for step in BEFORE_JOIN:
+            with self.subTest(step=step):
+                m = self.src.replace(step, step.replace("_", "X", 1), 1)
+                self.assertNotEqual(m, self.src)
+                self.assertEqual(problems(m), [MSG_STALE_ANCHOR.format(step)])
 
     def test_start_not_guarded_against_a_refused_thread(self):
         m, n = re.subn(r"try \{\s*pg_collation_recheck_->start\(\);\s*\} catch \(const std::exception& e\) \{.*?pg_collation_recheck_\.reset\(\);\s*\}",

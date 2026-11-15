@@ -25,7 +25,10 @@
 
 #include <initializer_list>
 #include <chrono>
+#include <functional>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -83,7 +86,8 @@ TEST_CASE("collation verdict: every combination of the three facts", "[pg_collat
           CollationVerdict::NotApplicable);
     CHECK(decide_collation_verdict(facts(false, "2.36", "2.39")) ==
           CollationVerdict::NotApplicable);
-    // column present, recorded NULL (C/POSIX/builtin): no version to drift
+    // column present, recorded NULL (a libc C/POSIX database; a builtin-provider database records
+    // a version and is checked, measured on PostgreSQL 18.4): no version to drift
     CHECK(decide_collation_verdict(facts(true, std::nullopt, std::nullopt)) ==
           CollationVerdict::NotApplicable);
     CHECK(decide_collation_verdict(facts(true, std::nullopt, "2.39")) ==
@@ -535,9 +539,8 @@ TEST_CASE("collation check against a real database: Ok, then Mismatch once the r
                     << " database=" << first.database << " recorded=" << first.recorded
                     << " actual=" << first.actual);
     if (first.verdict == CollationVerdict::NotApplicable)
-        SKIP("this PostgreSQL has no recorded collation version for the test database (C/POSIX "
-             "locale "
-             "or a server before 15)");
+        SKIP("this PostgreSQL has no recorded collation version for the test database (libc "
+             "C/POSIX locale or a server before 15)");
     // A cluster whose template database was created under an older library carries a recorded
     // version that already differs, so a database cloned from it starts as a Mismatch. That is the
     // condition under test, not a failure of this test.
@@ -570,4 +573,103 @@ TEST_CASE("collation check against a real database: Ok, then Mismatch once the r
     CHECK(second.recorded == "0.0.bogus");
     CHECK(second.actual == first.actual);
     CHECK(second.database == db.db_name());
+}
+
+namespace {
+
+/// `dsn` re-pointed at another database: every key except dbname is kept. Empty on a parse failure.
+std::string dsn_for_database(const std::string& dsn, const std::string& dbname) {
+    char* errmsg = nullptr;
+    const std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> opts{
+        PQconninfoParse(dsn.c_str(), &errmsg), &PQconninfoFree};
+    const std::unique_ptr<char, decltype(&PQfreemem)> err_owner{errmsg, &PQfreemem};
+    if (opts == nullptr)
+        return {};
+    const auto quoted = [](const char* v) {
+        std::string out = "'";
+        for (const char* p = v; *p != '\0'; ++p) {
+            if (*p == '\\' || *p == '\'')
+                out += '\\';
+            out += *p;
+        }
+        return out + "'";
+    };
+    std::string out;
+    for (const PQconninfoOption* o = opts.get(); o->keyword != nullptr; ++o) {
+        const std::string_view key = o->keyword;
+        if (o->val == nullptr || key == "dbname")
+            continue;
+        out += std::string(key) + "=" + quoted(o->val) + " ";
+    }
+    return out + "dbname=" + quoted(dbname.c_str());
+}
+
+} // namespace
+
+// The state the runbook spends the most words on: a recorded version is set but the operating
+// system reports none. Built on a libc C-locale database (recorded and actual both NULL) with a
+// superuser catalog UPDATE that sets a recorded value, which gives the same two facts as a base
+// image change. Kills: a decision that reads this as Ok or NotApplicable (the check would go
+// quiet on a database that may have stale indexes), and a runbook claim that REFRESH can repair it.
+TEST_CASE("collation check against a real database: a recorded version with none reported by the "
+          "operating system is Unreadable and REFRESH cannot repair it",
+          "[pg][pg_collation]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool admin{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(admin.valid());
+    const auto admin_sql = [&](const std::string& text, std::string* error) {
+        auto lease = admin.acquire();
+        REQUIRE(lease);
+        auto res = exec_params(lease.get(), text.c_str(), std::vector<std::string>{});
+        if (error != nullptr)
+            *error = PQerrorMessage(lease.get());
+        return res.status() == PGRES_COMMAND_OK;
+    };
+
+    // Named after the throwaway database (itself unique), kept under the 63-byte limit.
+    const std::string base = db.db_name();
+    const std::string name = "cn_" + base.substr(base.size() > 50 ? base.size() - 50 : 0);
+    const std::string quoted_name = quote_identifier(name);
+    std::string error;
+    if (!admin_sql("CREATE DATABASE " + quoted_name +
+                       " TEMPLATE template0 LOCALE_PROVIDER libc LOCALE 'C' ENCODING 'UTF8'",
+                   &error))
+        SKIP("cannot create a C-locale database here (needs CREATEDB): " << error);
+    struct DropGuard {
+        std::function<void()> drop;
+        ~DropGuard() {
+            try {
+                drop();
+            } catch (...) {}
+        }
+    } guard{
+        [&] { admin_sql("DROP DATABASE IF EXISTS " + quoted_name + " WITH (FORCE)", nullptr); }};
+
+    const std::string dsn = dsn_for_database(db.dsn(), name);
+    REQUIRE_FALSE(dsn.empty());
+    PgPool pool{{.conninfo = dsn, .size = 2}};
+    REQUIRE(pool.valid());
+
+    const CollationReport before = check_collation_version(pool);
+    INFO("verdict=" << to_string(before.verdict) << " failure=" << before.failure);
+    if (before.verdict != CollationVerdict::NotApplicable)
+        SKIP("a libc C-locale database records a version on this PostgreSQL; the state under test "
+             "cannot be built from it");
+
+    if (!admin_sql("UPDATE pg_database SET datcollversion = '2.39' WHERE datname = '" + name + "'",
+                   &error))
+        SKIP("the test role cannot update pg_database (not a superuser): " << error);
+
+    const CollationReport broken = check_collation_version(pool);
+    INFO("failure=" << broken.failure);
+    CHECK(broken.verdict == CollationVerdict::Unreadable);
+    CHECK(broken.recorded == "2.39");
+    CHECK(broken.actual.empty());
+    CHECK(broken.failure.find("the operating system reported no collation version") !=
+          std::string::npos);
+
+    // The documented way out does not apply: REFRESH fails and changes nothing.
+    CHECK_FALSE(admin_sql("ALTER DATABASE " + quoted_name + " REFRESH COLLATION VERSION", &error));
+    CHECK(error.find("invalid collation version change") != std::string::npos);
+    CHECK(check_collation_version(pool).verdict == CollationVerdict::Unreadable);
 }
