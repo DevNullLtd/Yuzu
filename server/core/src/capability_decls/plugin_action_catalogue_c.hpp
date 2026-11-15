@@ -41,7 +41,7 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 35> kPluginActionCatalogueC{{
+inline constexpr std::array<CommandCapability, 39> kPluginActionCatalogueC{{
     // ── network_config (agents/plugins/network_config/src/network_config_plugin.cpp) ──
     // All seven actions only report existing adapter/DNS/proxy/route configuration —
     // no local or remote state is ever changed.
@@ -359,9 +359,10 @@ inline constexpr std::array<CommandCapability, 35> kPluginActionCatalogueC{{
     },
 
     // ── firewall (agents/plugins/firewall/src/firewall_plugin.cpp) ──
-    // Status/rule-listing only — this plugin exposes NO rule-mutation
-    // action today (`actions()` is exactly {"state", "rules"}), despite the
-    // "firewall" name; classified by what the code does, not the name.
+    // `state` and `rules` are status/rule-listing only. The four containment
+    // actions further down (`quarantine`, `release`, `quarantine_status`,
+    // `quarantine_allow`) are the mutating surface (PRQ.1); each is classified
+    // by what the code does, not the name.
     {
         .plugin = "firewall",
         .action = "state",
@@ -381,6 +382,67 @@ inline constexpr std::array<CommandCapability, 35> kPluginActionCatalogueC{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .execute_gate = ExecuteGate::None,
+    },
+
+    {
+        .plugin = "firewall",
+        .action = "quarantine",
+        // Contains the host: Windows Firewall rule group + per-profile
+        // default-block (every other enabled rule disabled for the duration),
+        // an own nftables table (iptables fallback) on Linux, a pf sub-anchor
+        // on macOS. Destructive for the dispatch gate (explicit targets, no
+        // broadcast), but Reversible, unlike the legacy `quarantine.quarantine`
+        // row: `firewall.release` undoes the RULES and the ENABLE STATE on
+        // every leg -- it restores the captured Windows policy and re-enables
+        // the rules it disabled, deletes the nft table / iptables chain, and
+        // empties the pf anchor and releases its enable token. It does NOT
+        // restore connections: the macOS apply flushes the whole pf state
+        // table once (and again on each allow-set update), which no release
+        // can undo -- that part is one-way. Containment is also not in force
+        // between boot and the agent's start, on any leg. The row is new, so
+        // nothing moves.
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Reversible,
+        .securable = "Security",
+        .operation = authz::Operation::Execute,
+        .risk_tier = authz::RiskTier::Critical,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "firewall",
+        .action = "release",
+        // Lifts the containment `firewall.quarantine` applied; the inverse of
+        // that action.
+        .dispatch_class = DispatchClass::Mutating,
+        .mutability = Mutability::Reversible,
+        .securable = "Security",
+        .operation = authz::Operation::Execute,
+        .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "firewall",
+        .action = "quarantine_status",
+        // Reads local containment state and the live OS ruleset; never takes
+        // the mutation gate and never writes.
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "firewall",
+        .action = "quarantine_allow",
+        // Adds or removes operator exceptions on an active containment; add
+        // and remove are each other's inverse, so Reversible.
+        .dispatch_class = DispatchClass::Mutating,
+        .mutability = Mutability::Reversible,
+        .securable = "Security",
+        .operation = authz::Operation::Execute,
+        .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── quarantine (agents/plugins/quarantine/src/quarantine_plugin.cpp) ──

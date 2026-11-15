@@ -2299,7 +2299,7 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `plugin_not_found`, `kill_switched_os` and `os_gate_unreadable` are never produced for a
-> protective action (the quarantine plugin's four actions and `__guard__.push_rules`); see
+> protective action (the quarantine plugin's four actions, the firewall plugin's four containment actions and `__guard__.push_rules`); see
 > [Upgrading](upgrading.md#behaviour-change-protective-actions-exempt-from-plugin-enablement).
 >
 > `reason` is a top-level key on the error object, not part of the A4
@@ -11334,7 +11334,8 @@ narrow the all-OS layer but never widen it, and within the OS layer an `action@o
 }
 ```
 
-For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`
+For a **protective action** (the quarantine plugin's `quarantine`/`unquarantine`/`status`/`whitelist`,
+the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
 and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
 while dispatch still goes ahead (see
 [Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
@@ -11354,8 +11355,9 @@ change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit
 `enabled` (boolean) is required. `true` allows the plugin or action, which is also the state when no
 row exists. `false` kills it. `reason` is optional, at most 512 bytes; it is stored unredacted in the audit log, which every `AuditLog:Read` holder can read for the retention period, so do not put secrets or personal data in it. Every dispatch gate that checks
 this switch fails closed on a store error, so switching it off is a reliable emergency stop.
-**Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
-Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian
+**Exception:** a row for a protective action is stored and returned but has no effect on dispatch
+(a plugin-level `firewall` row still gates `firewall.state` and `firewall.rules`).
+Its audit detail is marked `protective_exempt=true` (`protective_exempt=partial` for a plugin-level `firewall` row, which still gates `firewall.state` and `firewall.rules`) and the server logs a warning. To stop Guardian
 rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
 not the effective state, in the same shape as the `GET` above.
 
@@ -13293,7 +13295,7 @@ marked cancelled), `agents_reached: 0` and the withheld counts in the `error` ob
 | 7 | `kill_switched_os` | `403` | `null` | Every target runs an OS for which the action is switched off. |
 | 8 | `no_agents_reached` | `503` | `5000` | Every target was unreachable. |
 
-A protective action (the quarantine control actions and `__guard__.push_rules`) never yields
+A protective action (the quarantine and firewall control actions and `__guard__.push_rules`) never yields
 `os_gate_unreadable`, `plugin_not_found` or `kill_switched_os`. Refusals in the targeting family
 increment `yuzu_server_dispatch_target_rejected_total{route="command_v1"}`.
 
