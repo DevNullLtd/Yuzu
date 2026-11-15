@@ -11508,10 +11508,28 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
     CHECK(payload["policy"]["fault"].is_null());
     CHECK(payload["policy"]["tiers"].contains("poor"));
     CHECK(payload["apps"][0]["profile"] == "default");
+    // #7504, #7519: the confidence level, the resolved tier name and the live observer split.
+    CHECK(payload["policy"]["interval_confidence"].get<double>() == Catch::Approx(0.95));
+    CHECK(payload["apps"][0]["score"].contains("tier"));
+    REQUIRE(payload.contains("observer_state")); // null here: no observer source in this harness
+    CHECK(payload["observer_state"].is_null());
     // Fleet aggregate — only the generic tool-call audit, never a domain verb.
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.app.view") == std::string::npos);
+
+    // The served payload validates against the output schema the tool declares. The schema is
+    // fetched from tools/list and must be an object, so the check can never pass vacuously.
+    {
+        auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7504})");
+        REQUIRE(listed);
+        nlohmann::json schema;
+        for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"])
+            if (t["name"] == "list_dex_apps")
+                schema = t["outputSchema"];
+        REQUIRE(schema.is_object());
+        CHECK(yuzu::test::schema_violation(schema, payload) == "");
+    }
 
     // Rule 1: the MCP payload's key sets equal the shared serializer's.
     yuzu::server::DexAppsModel one;
@@ -11558,9 +11576,38 @@ TEST_CASE("MCP DEX: list_dex_apps reports a degraded read as an error, never an 
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["code"] == kInternalError);
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == mcp::kMcpStoreFaultShortRetryMs);
+    // The message ends with the cause token (#7520): a dropped table is a query error.
+    CHECK(body["error"]["message"].get<std::string>().ends_with("(query_error)"));
     CHECK(ts.audit_log.back() == "mcp.list_dex_apps|failure");
     for (const auto& a : ts.audit_log)
         CHECK(a != "mcp.list_dex_apps|success");
+}
+
+TEST_CASE("MCP DEX: list_dex_apps declares the new payload fields and the coverage wording",
+          "[mcp][integration][dex][a5]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7519})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "list_dex_apps")
+            tool = &t;
+    REQUIRE(tool != nullptr);
+    const auto& props = (*tool)["outputSchema"]["properties"];
+    CHECK(props.contains("observer_state"));
+    CHECK(props["policy"]["properties"].contains("interval_confidence"));
+    CHECK(props["apps"]["items"]["properties"]["score"]["properties"].contains("tier"));
+    CHECK(props["apps"]["items"]["properties"]["versions"]["items"]["properties"]["score"]["properties"]
+              .contains("tier"));
+    const auto required = (*tool)["outputSchema"]["required"].dump();
+    CHECK(required.find("observer_state") != std::string::npos);
+    // The description says what crash_source_coverage is, and what observer_state is.
+    const auto d = (*tool)["description"].get<std::string>();
+    CHECK(d.find("shipped design") != std::string::npos);
+    CHECK(d.find("not live collector health") != std::string::npos);
+    CHECK(d.find("observer_state is the live count") != std::string::npos);
 }
 
 TEST_CASE("MCP DEX: list_dex_apps names an unreadable score policy in its error",
@@ -11761,11 +11808,13 @@ TEST_CASE("MCP DEX: list_dex_apps is listed with its output schema", "[mcp][dex]
         REQUIRE(t.contains("outputSchema"));
         const auto& out = t["outputSchema"];
         CHECK(out["required"] ==
-              nlohmann::json::array({"window", "apps", "policy", "population", "population_basis",
-                                     "crash_source_coverage", "apps_total", "apps_truncated"}));
+              nlohmann::json::array({"window", "apps", "policy", "observer_state", "population",
+                                     "population_basis", "crash_source_coverage", "apps_total",
+                                     "apps_truncated"}));
         CHECK(out["properties"].contains("crash_source_coverage"));
         const auto& policy = out["properties"]["policy"];
-        CHECK(policy["required"] == nlohmann::json::array({"source", "revision", "fault", "tiers"}));
+        CHECK(policy["required"] ==
+              nlohmann::json::array({"source", "revision", "fault", "interval_confidence", "tiers"}));
         CHECK(policy["properties"]["source"]["enum"] == nlohmann::json::array({"default", "custom"}));
         CHECK(policy["properties"]["fault"]["type"] == nlohmann::json::array({"string", "null"}));
         // The tier block is typed, not a bare object: four tiers, each a numeric edge and a string name.
