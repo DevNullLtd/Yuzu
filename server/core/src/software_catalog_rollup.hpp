@@ -67,12 +67,20 @@ private:
     std::shared_ptr<const SoftwareFleetSnapshot> snapshot_;
 };
 
+/// The step the idle wait between recomputes sleeps in, re-checking the stop flag after each
+/// step: the longest a `stop()` waits on a parked thread. Production uses this value; the
+/// constructor takes another only so a test need not wait out a 5 s step per `stop()`.
+inline constexpr std::chrono::milliseconds kCatalogRollupStopPoll{5000};
+
 class SoftwareCatalogRollup {
 public:
     /// `store` is borrowed (must outlive this). `interval` is the completion-to-start
     /// spacing between recomputes. `metrics` is borrowed/optional (null = no emission).
+    /// `stop_poll` is the idle-wait step (`kCatalogRollupStopPoll`; non-positive falls back to
+    /// it). A test seam only: production passes none.
     SoftwareCatalogRollup(SoftwareInventoryStore& store, std::chrono::seconds interval,
-                          yuzu::MetricsRegistry* metrics = nullptr);
+                          yuzu::MetricsRegistry* metrics = nullptr,
+                          std::chrono::milliseconds stop_poll = kCatalogRollupStopPoll);
     ~SoftwareCatalogRollup();
 
     SoftwareCatalogRollup(const SoftwareCatalogRollup&) = delete;
@@ -100,6 +108,7 @@ private:
     std::chrono::seconds interval_;
     yuzu::MetricsRegistry* metrics_;
     SoftwareFleetSnapshotHolder* snapshot_{nullptr};
+    std::chrono::milliseconds stop_poll_;
     std::atomic<bool> stop_{false};
     std::thread thread_;
 };

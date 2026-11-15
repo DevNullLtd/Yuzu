@@ -24,6 +24,7 @@
 //     synthesized httplib::Request directly into the captured handler.
 //     No socket, no acceptor thread, nothing for TSan to fight with.
 
+#include "http_response_policy.hpp"
 #include "post_read_stage.hpp"
 #include "route_inventory.hpp"
 
@@ -76,7 +77,10 @@ enum class StageRequirement {
 /// Each handler is registered wrapped in the post-read stage installed for the wrapped server
 /// (`PostReadStageRegistry`, `post_read_stage.hpp`), so the stage runs after the body is read and
 /// before the handler, and a `Handled` answer short-circuits the handler. The stage is looked up
-/// once, at registration, which is why it must be installed before the first route.
+/// once, at registration, which is why it must be installed before the first route. The order for
+/// a staged registration is: post-read stage, then the HEAD refusal, then the handler, then
+/// brotli encoding of the body (`http_response_policy.hpp`); the stage always runs first and its
+/// `Handled` answer short-circuits everything after it.
 ///
 /// FAIL-CLOSED: the default `StageRequirement::Required` makes a registration on a server with NO
 /// stage installed throw `std::logic_error` BEFORE anything is recorded or registered, so a route
@@ -108,7 +112,8 @@ private:
                                        "cap and step-up chokepoint would not run for it");
             return h;
         }
-        return [stage, h = std::move(h)](const httplib::Request& req, httplib::Response& res) {
+        return [stage, h = with_response_policy(std::move(h))](const httplib::Request& req,
+                                                                httplib::Response& res) {
             if ((*stage)(req, res) == httplib::Server::HandlerResponse::Handled)
                 return;
             h(req, res);
