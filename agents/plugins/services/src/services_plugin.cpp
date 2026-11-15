@@ -47,9 +47,10 @@
 #endif
 
 #if defined(__linux__) || defined(__APPLE__)
+#include <unistd.h> // ::geteuid (the root-or-helper decision for set_start_mode)
+
 #include <chrono>
 #include <spdlog/spdlog.h>
-#include <sudo_argv.hpp> // yuzu::shared::sudo_wrap (Decision-8 canonical privileged argv, ADR-3002)
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (K-7/CDX-07, ADR-3002 rung 2)
 #endif
@@ -467,42 +468,41 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     }
 
     // services/set_start_mode_linux#1 (docs/agent-spawn-sink-manifest.md)
-    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp):
-    // these four call sites (enable/disable/mask/unmask) previously ran
-    // completely UNWRAPPED -- no sudo at all -- even though
-    // scripts/install-agent-user.sh installs exactly this grant for a
-    // privilege-dropped agent:
-    //   /usr/bin/systemctl enable *,  /usr/bin/systemctl disable *
-    //   /usr/bin/systemctl mask *,    /usr/bin/systemctl unmask *
-    //   (and the /bin/systemctl twin)
-    // A non-root agent's systemctl enable/disable/mask/unmask on a SYSTEM
-    // unit requires root, so the unwrapped call failed outright for every
-    // non-root agent -- the grant existed and was never used. sudo_wrap
-    // builds the exact `sudo -n -- <tool> <args>` argv shape that grant
-    // matches (a no-op when already root). The systemctl-side "--" keeps the
-    // original safety property: is_safe_service_name allows a LEADING '-' in
-    // `name` (needed for e.g. "-foo"-shaped unit names to reach the
-    // pipe-delimited protocol unmangled), so without "--" a crafted name
-    // could still be parsed as a systemctl flag even though there is no
-    // shell involved.
+    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp). A non-root agent
+    // does not run systemctl itself: scripts/install-agent-user.sh grants it exactly one program
+    // as root for this, the helper yuzu-svc-helper (no argument, no wildcard in sudoers), and
+    // systemctl_set_start_mode_argv (services_parsers.hpp) builds the argv that has the helper
+    // run `systemctl <verb> -- <name>` under `sudo -n --`. The helper checks the name against
+    // the same character class as is_safe_service_name and runs systemctl with an argument list
+    // it builds itself. A root agent has no grant to bound and runs systemctl directly, with the
+    // same `--`: is_safe_service_name allows a LEADING '-' in `name` (needed for e.g.
+    // "-foo"-shaped unit names to reach the pipe-delimited protocol unmangled), so without "--"
+    // a crafted name could still be parsed as a systemctl flag even though there is no shell
+    // involved. The choice is the euid alone, the static decision sudo_wrap makes; there is no
+    // probe for the helper and no fallback to the old form, so a host whose installer has not
+    // been re-run fails with sudo's own message (docs/user-manual/upgrading.md).
     //
     // Mode -> systemctl verb:
     //   automatic -> enable  (starts at boot)
     //   manual    -> disable (available but not started at boot)
     //   disabled  -> mask    (cannot be started at all)
+    const bool euid_is_root = ::geteuid() == 0;
     std::vector<std::string> argv;
     if (mode == "automatic") {
-        argv = yuzu::shared::sudo_wrap({systemctl_path, "enable", "--", std::string(name)});
+        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "enable", name,
+                                                             euid_is_root);
     } else if (mode == "manual") {
         // If the service was previously masked, unmask it first so disable
         // works. Best-effort, same as before: its result is intentionally
         // not inspected (a service that was never masked has nothing to
         // unmask, and the following disable is the actual mode change).
-        run_command(
-            yuzu::shared::sudo_wrap({systemctl_path, "unmask", "--", std::string(name)}));
-        argv = yuzu::shared::sudo_wrap({systemctl_path, "disable", "--", std::string(name)});
+        run_command(yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "unmask", name,
+                                                                  euid_is_root));
+        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "disable", name,
+                                                             euid_is_root);
     } else if (mode == "disabled") {
-        argv = yuzu::shared::sudo_wrap({systemctl_path, "mask", "--", std::string(name)});
+        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "mask", name,
+                                                             euid_is_root);
     } else {
         ctx.write_output(
             std::format("error|invalid mode '{}': must be automatic, manual, or disabled", mode));
@@ -556,27 +556,27 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
     }
 
     // services/set_start_mode_macos#1 (docs/agent-spawn-sink-manifest.md)
-    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp):
-    // these two call sites (enable/disable) previously ran completely
-    // UNWRAPPED -- no sudo at all -- even though
-    // scripts/install-agent-user.sh installs exactly this grant for a
-    // privilege-dropped agent: `/bin/launchctl enable system/*` and
-    // `/bin/launchctl disable system/*`. A non-root agent's launchctl
-    // enable/disable on the system domain requires root, so the unwrapped
-    // call failed outright for every non-root agent -- the grant existed and
-    // was never used. sudo_wrap builds the exact `sudo -n -- <tool> <args>`
-    // argv shape that grant matches (a no-op when already root). No
-    // systemctl-style "--" is needed here: "system/<name>" is never itself
-    // leading-hyphen (it always starts with the literal "system/" prefix),
-    // so launchctl can never mistake it for a flag regardless of what `name`
-    // contains.
+    // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp). A non-root agent
+    // does not run launchctl itself: scripts/install-agent-user.sh grants it exactly one program
+    // as root for this, the helper yuzu-svc-helper (no argument, no wildcard in sudoers), and
+    // launchctl_set_start_mode_argv (services_parsers.hpp) builds the argv that has the helper
+    // run `launchctl <verb> system/<name>` under `sudo -n --`. The helper checks the name against
+    // the same character class as is_safe_service_name and runs launchctl with an argument list
+    // it builds itself. A root agent has no grant to bound and runs launchctl directly. No
+    // systemctl-style "--" is needed: "system/<name>" is never itself leading-hyphen (it always
+    // starts with the literal "system/" prefix), so launchctl can never mistake it for a flag
+    // regardless of what `name` contains. The choice is the euid alone, the static decision
+    // sudo_wrap makes; there is no probe for the helper and no fallback to the old form, so a
+    // host whose installer has not been re-run fails with sudo's own message
+    // (docs/user-manual/upgrading.md). The plugin runs no launchctl bootstrap or bootout.
+    const bool euid_is_root = ::geteuid() == 0;
     std::vector<std::string> argv;
     if (mode == "automatic") {
-        argv = yuzu::shared::sudo_wrap(
-            {launchctl_path, "enable", std::format("system/{}", name)});
+        argv = yuzu::services::launchctl_set_start_mode_argv(launchctl_path, "enable", name,
+                                                             euid_is_root);
     } else if (mode == "disabled") {
-        argv = yuzu::shared::sudo_wrap(
-            {launchctl_path, "disable", std::format("system/{}", name)});
+        argv = yuzu::services::launchctl_set_start_mode_argv(launchctl_path, "disable", name,
+                                                             euid_is_root);
     } else if (mode == "manual") {
         ctx.write_output(
             "error|mode 'manual' is not supported on macOS: launchd has no manual/auto "
@@ -617,14 +617,16 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
 // linux: systemctl (list-units / enable|disable|mask|unmask) via
 // run_bounded_subprocess(argv, ...) -- shell-free, direct argv[0] exec, no
 // `/bin/sh -c` hop -- rung 2 (ADR-3002) for every action: the read-only
-// list-units enumeration and enable/disable/mask/unmask (the latter now
-// sudo_wrap'd, matching the installed sudoers grant) alike. Previously rung
-// 3 (governed shell) throughout -- this migration removed the shell hop
-// entirely, it did not merely add sudo.
+// list-units enumeration, and enable/disable/mask/unmask through the
+// root-owned yuzu-svc-helper under sudo (matching the installed sudoers
+// grant; a root agent runs systemctl itself). Previously rung 3 (governed
+// shell) throughout -- this migration removed the shell hop entirely, it did
+// not merely add sudo.
 // macos: launchctl (list, print-disabled, enable|disable) via the same
-// shell-free runner path -- rung 2, same as linux above; the macOS
-// startup_type leg specifically is the bulk `launchctl print-disabled
-// system` parse in services_macos_launchd.hpp.
+// shell-free runner path -- rung 2, same as linux above (enable|disable
+// through yuzu-svc-helper under sudo); the macOS startup_type leg
+// specifically is the bulk `launchctl print-disabled system` parse in
+// services_macos_launchd.hpp.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"list",
      /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'systemctl list-units'", nullptr},
@@ -636,10 +638,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
     {"set_start_mode",
      /* linux   = */
-     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- systemctl enable|disable|mask|unmask'",
-      nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 2,
+      "runner argv 'sudo -n -- yuzu-svc-helper systemctl enable|disable|mask|unmask'", nullptr},
      /* macos   = */
-     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- launchctl enable|disable'", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'sudo -n -- yuzu-svc-helper launchctl enable|disable'",
+      nullptr},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "win32_service_api", nullptr}},
 };
 

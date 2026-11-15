@@ -16,18 +16,23 @@
  * fixtures through fakes and drives every decision path, including a crash
  * between any two runner calls.
  *
- * THIS FILE IS THE PRIVILEGE BOUNDARY. The sudoers lines that let the agent
- * run pfctl narrow the argv SHAPE but cannot confine it (sudo globs match
- * concatenated args; `pfctl -a ... -f` executes agent-generated file content).
- * On Linux the agent is granted no iptables, ip6tables or file-taking nft
- * command: it may run only the root-owned helper (kFwHelperPath), whose
- * iptables grammar is iptables_helper_argv and whose `nft load <staged file>`
- * action checks every line of the staged file against the text nft_ruleset_text
- * emits and gives nft a ruleset it rebuilt itself; the helper enforces both
- * itself. (`nft delete table` and `nft list table` are fixed commands, granted
- * as they are.) An agent that runs as root has no grant to bound and runs the
- * tools directly (ToolAccess::direct). What actually confines the privileged call is
- * that every token reaching an argv or a ruleset line is built here from a
+ * THIS FILE IS THE PRIVILEGE BOUNDARY. On Linux the agent is granted no
+ * iptables, ip6tables or file-taking nft command: it may run only the
+ * root-owned helper (kFwHelperPath), whose iptables grammar is
+ * iptables_helper_argv and whose `nft load <staged file>` action checks every
+ * line of the staged file against the text nft_ruleset_text emits and gives nft
+ * a ruleset it rebuilt itself; the helper enforces both itself. (`nft delete
+ * table` and `nft list table` are fixed commands, granted as they are.) On
+ * macOS the agent is granted no file-taking pfctl command either: the anchor
+ * load goes through the same helper (kFwHelperPathMacos), whose `pf load
+ * <staged file>` action checks every line against the text pf_anchor_ruleset
+ * emits and gives pfctl a ruleset it rebuilt itself. The enable reference is
+ * released with `pfctl -X <token>`, which sudoers pins to 1 to 24 digits with one
+ * bracket class per digit; the other pfctl lines are fixed commands, granted as
+ * they are. An agent that runs as root has no grant to bound and runs the
+ * tools directly (ToolAccess::direct). What confines the privileged call is the
+ * helper's grammar and, before it, that every token reaching an argv or a
+ * ruleset line is built here from a
  * typed, validated value and then re-checked against a strict charset
  * (is_safe_token: no whitespace, `;`, quote, `$`, backtick, `|`, `&`, `#`, `\` or
  * newline; is_safe_ruleset_line adds only space, braces, `,`, the `;` between nft
@@ -2456,13 +2461,20 @@ struct IptablesListing {
 }
 
 /// The root-owned helper the sudoers file grants in place of iptables, ip6tables and a file-taking
-/// nft (#7634): `scripts/install-agent-user.sh` writes it (root:root 0755, Linux only) and names
-/// this path in sudoers with no argument and no wildcard. An agent that is not root never runs
-/// those tools itself.
+/// nft (#7634): `scripts/install-agent-user.sh` writes it (root:root 0755) and names this path in
+/// sudoers with no argument and no wildcard. An agent that is not root never runs those tools
+/// itself. This is the Linux path; kFwHelperPathMacos is the macOS one, for the pf anchor load.
 inline constexpr std::string_view kFwHelperPath = "/usr/local/sbin/yuzu-fw-helper";
 
-/// How a Linux leg reaches the privileged tool. `helper`: through kFwHelperPath, the one program
-/// the sudoers file lets a non-root agent run for them. `direct`: the agent is root, which
+/// The same helper as the installer writes it on macOS (root:wheel 0755, in the directory Apple
+/// keeps root-run helpers in), named in sudoers with no argument and no wildcard. It carries the
+/// pf anchor load (`pf load <staged file>`); a macOS agent that is not root never runs `pfctl -f`
+/// itself.
+inline constexpr std::string_view kFwHelperPathMacos = "/Library/PrivilegedHelperTools/yuzu-fw-helper";
+
+/// How a leg reaches the privileged tool. `helper`: through the root-owned helper (kFwHelperPath on
+/// Linux, kFwHelperPathMacos on macOS), the one program the sudoers file lets a non-root agent run
+/// for the work that takes a file name or a variable argument. `direct`: the agent is root, which
 /// sudo_wrap already treats as needing no sudo and which has no sudoers grant to bound, so the leg
 /// runs the tool itself and does not need the helper installed. A static decision on the euid,
 /// made by the shell (make_leg) and passed in; this header never reads the euid, and a leg is
@@ -2476,6 +2488,15 @@ enum class ToolAccess : std::uint8_t { direct, helper };
 /// Stage).
 [[nodiscard]] inline std::vector<std::string> nft_helper_load_argv(std::string_view path) {
     return {std::string{kFwHelperPath}, "nft", "load", std::string{path}};
+}
+
+/// The macOS twin: the argv that has the helper load a staged pf anchor ruleset
+/// (`<helper> pf load <staged file>`). The helper accepts only
+/// `.../firewall-staging/yuzu-fwq-<token>.pf` (the stem and suffix PfLeg::apply hands to its
+/// Stage) and then only the ruleset text pf_anchor_ruleset emits; it loads it into the one anchor
+/// kPfAnchor, which is its own literal.
+[[nodiscard]] inline std::vector<std::string> pf_helper_load_argv(std::string_view path) {
+    return {std::string{kFwHelperPathMacos}, "pf", "load", std::string{path}};
 }
 
 namespace detail {
@@ -2689,6 +2710,11 @@ inline constexpr std::string_view kPfctlPath = "/sbin/pfctl";
 ///    The reply direction stays `from any port 67` (inbound only, no exit).
 ///  - ICMPv6 neighbour discovery is 133-136; redirect (137) is not needed.
 ///  - `block drop quick all` is last so nothing later can override containment.
+/// This text is also the grammar of the root-owned helper's `pf load` action
+/// (scripts/install-agent-user.sh): it accepts exactly the line forms emitted here and rebuilds
+/// every line itself, so a change to a line form is a change to the helper, and the golden text in
+/// tests/unit/test_firewall_quarantine_parsers.cpp (kGoldenPfRuleset) is run through the helper's
+/// own text by tests/test_legacy_quarantine_plugin_removed_lexical.py.
 [[nodiscard]] inline std::string pf_anchor_ruleset(const AllowSet& set) {
     std::vector<std::string> lines;
     lines.emplace_back("no nat all");
@@ -3546,7 +3572,8 @@ private:
 ///      `anchor_not_referenced` (before anything is loaded or flushed).
 ///   4. `-a com.apple -s Anchors`: a sibling that sorts before ours makes the
 ///      result partial (`anchor_not_first`), never a clean success.
-///   5. `-a <anchor> -f <staged file>`: atomic per anchor.
+///   5. `-a <anchor> -f <staged file>`: atomic per anchor. A non-root agent has the helper
+///      do it (`<helper> pf load <staged file>`), which loads the same anchor.
 ///   6. `-F states`: pf passes a state-matched packet without evaluating any rule,
 ///      so pre-existing connections would survive the load. Retried once. A
 ///      failure on an INITIAL apply is a FAILED apply (`state_flush_failed`), never
@@ -3560,8 +3587,11 @@ private:
 /// removes the anchor (initial apply) or records the new generation.
 class PfLeg final : public Leg {
 public:
-    PfLeg(Runner run, Stage stage, BootTime boot)
-        : run_(std::move(run)), stage_(std::move(stage)), boot_(std::move(boot)) {}
+    /// `access` says how the anchor load reaches pfctl: through the helper (a non-root agent) or
+    /// as `pfctl -a <anchor> -f <staged file>` (a root agent). Every other pfctl call is the same
+    /// in both modes, including the release of the enable reference.
+    PfLeg(Runner run, Stage stage, BootTime boot, ToolAccess access)
+        : run_(std::move(run)), stage_(std::move(stage)), boot_(std::move(boot)), access_(access) {}
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::pf; }
 
@@ -3647,7 +3677,9 @@ public:
             ok.notes.emplace_back("anchor_not_first=1");
         }
 
-        const auto ld = ex.call_staged(pfctl_load_argv(staged->path), *staged);
+        const auto ld = ex.call_staged(access_ == ToolAccess::helper ? pf_helper_load_argv(staged->path)
+                                                                     : pfctl_load_argv(staged->path),
+                                       *staged);
         if (!ld)
             return give_back(StepResult::fail(ex.reason()));
         if (!ld->ok())
@@ -3776,6 +3808,7 @@ private:
     Runner run_;
     Stage stage_;
     BootTime boot_;
+    ToolAccess access_;
 };
 
 // ── Drivers ─────────────────────────────────────────────────────────────────

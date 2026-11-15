@@ -60,13 +60,13 @@
       "legs": {
         "linux": {
           "fallback": "",
-          "mechanism": "runner argv 'sudo -n -- systemctl enable|disable|mask|unmask'",
+          "mechanism": "runner argv 'sudo -n -- yuzu-svc-helper systemctl enable|disable|mask|unmask'",
           "rung": "2",
           "support": "supported"
         },
         "macos": {
           "fallback": "",
-          "mechanism": "runner argv 'sudo -n -- launchctl enable|disable'",
+          "mechanism": "runner argv 'sudo -n -- yuzu-svc-helper launchctl enable|disable'",
           "rung": "2",
           "support": "supported"
         },
@@ -185,7 +185,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "e724207e0989",
+  "leg_hash": "e117e4e5a791",
   "manifest_version": 1,
   "name": "services",
   "outputs": [
@@ -348,14 +348,14 @@
       "runs_as": "agent service account, LocalSystem today (#1442)"
     },
     {
-      "grant": "None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grants `/bin/launchctl enable system/*` and `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use).",
+      "grant": "None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grant for the root-owned helper `/Library/PrivilegedHelperTools/yuzu-svc-helper` (written by `scripts/install-agent-user.sh`, named in sudoers with no argument and no wildcard), which takes `launchctl enable|disable <label>` and runs `/bin/launchctl enable|disable system/<label>` for a label of 1 to 256 letters, digits and `- _ . @`; it runs nothing else. The installer must be re-run on every host provisioned with it (until it has, `set_start_mode` fails on a non-root agent with sudo's own message).",
       "if_refused": "`list`/`running`: a failed `launchctl list` or `launchctl print-disabled` sets a typed `UNAVAILABLE` or `CONSTRAINED` status through the shared runner seam. `set_start_mode`: a `sudo -n` denial is captured (stderr merged into the output) and appended to the `error|launchctl command failed for '<name>' (exit=<n>)` line.",
       "measured": "2026-09-07, bare-metal, captured as an unprivileged interactive user, not the root identity the daemon runs under",
       "os": "macOS",
       "runs_as": "agent daemon, root (the shipped LaunchDaemon has no `UserName` key)"
     },
     {
-      "grant": "`list`/`running`: none. `set_start_mode`: the sudoers grant `systemctl enable`, `disable`, `mask` and `unmask` (`/bin/systemctl` and `/usr/bin/systemctl`); the `sudo -n --` prefix is skipped when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting.",
+      "grant": "`list`/`running`: none. `set_start_mode`: the sudoers grant for the root-owned helper `/usr/local/sbin/yuzu-svc-helper` (written by `scripts/install-agent-user.sh`, named in sudoers with no argument and no wildcard), which takes `systemctl enable|disable|mask|unmask <unit>` and runs `systemctl <verb> -- <unit>` for a unit name of 1 to 256 letters, digits and `- _ . @`; it runs nothing else. The installer must be re-run on every host provisioned with it. The `sudo -n --` prefix is skipped when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting.",
       "if_refused": "`list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing grant surfaces as `error|systemctl command failed for '<name>' (exit=1): sudo: a password is required`.",
       "measured": "2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity",
       "os": "Linux",
@@ -464,7 +464,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "e724207e0989",
+        "leg_hash": "e117e4e5a791",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -532,7 +532,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "e724207e0989",
+        "leg_hash": "e117e4e5a791",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -600,7 +600,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "e724207e0989",
+        "leg_hash": "e117e4e5a791",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"

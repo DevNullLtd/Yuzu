@@ -1664,10 +1664,10 @@ private:
 
 /// The agent-private directory a ruleset is staged in: `<agent.data_dir>/
 /// firewall-staging`, mode 0700 and owned by the agent. The privileged load (the helper's
-/// `nft load` on Linux, `pfctl -f` on macOS) reads the file after it is written, so a
+/// `nft load` on Linux, `pf load` on macOS) reads the file after it is written, so a
 /// world-writable temp dir would let another local user swap the content in between. The
-/// directory name and the `yuzu-fwq-*.nft` file name NftLeg stages are the shape the Linux
-/// helper accepts (scripts/install-agent-user.sh; pinned by
+/// directory name and the `yuzu-fwq-*.nft` / `yuzu-fwq-*.pf` file names NftLeg and PfLeg stage
+/// are the shape the helper accepts (scripts/install-agent-user.sh; pinned by
 /// tests/test_legacy_quarantine_plugin_removed_lexical.py). An existing directory is trusted
 /// only when it is a real directory (not a link) owned by us with no group/other access. Empty
 /// when `agent.data_dir` is unset or the directory cannot be made safe: the apply is then refused,
@@ -2630,7 +2630,7 @@ private:
 
 #endif // _WIN32
 
-// ── macOS leg (rung 2, sudo pfctl over the pf sub-anchor) ───────────────────
+// ── macOS leg (rung 2, the helper's pf load and sudo pfctl over the pf sub-anchor) ──
 #if defined(__APPLE__)
 
 /// The current boot's identity, `kern.boottime` as "<sec>.<usec>", read in-process
@@ -2646,9 +2646,13 @@ private:
 }
 
 /// macOS has one backend (pf), so the hint and for_apply carry nothing: release
-/// and status use the same leg that applied.
+/// and status use the same leg that applied. The anchor load goes through the root-owned helper
+/// unless the agent is root: the static decision on the euid that sudo_wrap makes and the Linux
+/// make_leg passes on. Only the load switches on it; the enable reference is released with the
+/// same `pfctl -X <token>` argv in both modes.
 [[nodiscard]] std::unique_ptr<fq::Leg> make_leg(YuzuPluginContext* raw, fq::BackendKind, bool) {
-    return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time);
+    const auto access = ::geteuid() == 0 ? fq::ToolAccess::direct : fq::ToolAccess::helper;
+    return std::make_unique<fq::PfLeg>(sudo_runner(), temp_file_stage(raw), kern_boot_time, access);
 }
 
 #endif // __APPLE__
@@ -3025,7 +3029,8 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 // backend is reachable. `state` and `rules` never mutate firewall state. The
 // four containment actions below do: Windows over COM (rung 1), Linux over
 // the root-owned helper's nft load / iptables argv (rung 2, with the status read rung 1 -> 2),
-// macOS over `sudo pfctl` (rung 2): an own sub-anchor plus a pf enable reference.
+// macOS over the root-owned helper's pf load and `sudo pfctl` (rung 2): an own sub-anchor plus a pf
+// enable reference.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "state",
@@ -3066,8 +3071,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "agent only"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo pfctl: own sub-anchor com.apple/000.yuzu_quarantine loaded with -a -f (the main ruleset "
-         "is never loaded), a pf enable reference (-E), one global pf state flush (-F states)",
+         "sudo yuzu-fw-helper pf load of an own sub-anchor com.apple/000.yuzu_quarantine (the main "
+         "ruleset is never loaded), sudo pfctl: a pf enable reference (-E), one global pf state "
+         "flush (-F states)",
          "needs Apple's anchor com.apple/* in the main ruleset and no sibling anchor sorting before "
          "000.yuzu_quarantine, else the result is partial or degraded; the state flush cuts every pf "
          "connection once and release does not restore them; a ttl_seconds limit rides the host "
@@ -3135,7 +3141,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo pfctl: atomic reload of the own sub-anchor (-a -f), then a global pf state flush",
+         "sudo yuzu-fw-helper pf load: atomic reload of the own sub-anchor, then a global pf state "
+         "flush (sudo pfctl -F states)",
          "each update flushes every pf state once, so connections not covered by an allowance are "
          "cut and not restored"},
         /* .windows_leg = */

@@ -37,13 +37,17 @@
 #       that need raw sockets, ptrace, or ip-route management can do
 #       so without an extra sudo round-trip:
 #         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
-# 6.  (Linux only) Installs /usr/local/sbin/yuzu-fw-helper (root:root 0755), the
-#       one program the sudoers file lets the agent account run as root for
-#       iptables, ip6tables and loading the nftables ruleset. It is written
-#       from a quoted heredoc below, to a temporary file in the same
-#       directory and renamed into place, and it goes in BEFORE the sudoers
-#       file that names it. See the helper's own header for the argument
-#       shapes it accepts.
+# 6.  Installs two root-owned helper programs (root:root 0755 on Linux, root:wheel 0755 on
+#       macOS), the only programs the sudoers file lets the agent account run as root for
+#       the work that needs more than a fixed command:
+#         yuzu-fw-helper   firewall containment: iptables / ip6tables and the nftables
+#                          ruleset load on Linux, the pf anchor load on macOS
+#         yuzu-svc-helper  services.set_start_mode: systemctl enable|disable|mask|unmask on
+#                          Linux, launchctl enable|disable on macOS
+#       Linux: /usr/local/sbin.  macOS: /Library/PrivilegedHelperTools.
+#       Each is written from a quoted heredoc below, to a temporary file in the same
+#       directory and renamed into place, and each goes in BEFORE the sudoers file that
+#       names it. See the helper's own header for the argument shapes it accepts.
 # 7.  (Optional) On both platforms, prints a verifying summary that the
 #       operator can spot-check.
 #
@@ -70,18 +74,18 @@
 #
 # UPGRADES
 # ────────
-# A host provisioned by an earlier copy of this script has no helper and its
-# sudoers file still carries the earlier firewall lines. Re-run this script
-# (with the agent upgrade) on EVERY Linux host provisioned with it: it
-# installs the helper and replaces the sudoers file. Until it has run, the
-# containment actions fail on that host (the nftables load and the iptables
-# fallback both go through the helper), unless the agent runs as root.
+# A host provisioned by an earlier copy of this script has neither helper and its
+# sudoers file still carries the earlier lines. Re-run this script (with the agent
+# upgrade) on EVERY Linux and macOS host provisioned with it: it installs both helpers
+# and replaces the sudoers file. Until it has run, the containment actions (the
+# nftables load and the iptables fallback on Linux, the pf anchor load on macOS) and
+# services.set_start_mode fail on that host, unless the agent runs as root.
 #
 # UNINSTALL
 # ─────────
 # Pass --uninstall to reverse:
 #   - removes /etc/sudoers.d/yuzu-agent
-#   - removes /usr/local/sbin/yuzu-fw-helper (Linux)
+#   - removes the two helpers (yuzu-fw-helper, yuzu-svc-helper)
 #   - removes the agent's filesystem hierarchy (logs are preserved
 #     under /var/log/yuzu-agent.removed-<timestamp>/ for forensics)
 #   - deletes the user account
@@ -95,10 +99,10 @@
 #                    executing any of them. Use this first.
 #   --check          Verify the install is correct (user exists with
 #                    expected attributes, sudoers file present + valid,
-#                    the Linux firewall helper present with the expected
-#                    owner, mode and content, state dirs exist with
-#                    correct ownership). Exits non-zero on any drift.
-#   --uninstall      Remove the user, sudoers file, firewall helper, and
+#                    both helpers present with the expected owner, mode
+#                    and content, state dirs exist with correct
+#                    ownership). Exits non-zero on any drift.
+#   --uninstall      Remove the user, sudoers file, both helpers, and
 #                    state dirs.
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
@@ -106,12 +110,12 @@
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
 #                    On macOS this is a no-op (no setcap equivalent).
-#   --no-sudoers     Skip the sudoers file install and the Linux firewall
-#                    helper it names. Useful in test environments where
-#                    you don't want any privilege grants; the agent will
-#                    still run but the firewall containment actions and
-#                    other privileged plugins will fail at dispatch
-#                    time (which the test ladder catches).
+#   --no-sudoers     Skip the sudoers file install and the two helpers it
+#                    names. Useful in test environments where you don't
+#                    want any privilege grants; the agent will still run
+#                    but the firewall containment actions and other
+#                    privileged plugins will fail at dispatch time (which
+#                    the test ladder catches).
 #   --no-setcap      Skip the setcap step on Linux. Useful if you set
 #                    capabilities via a packaging tool (.deb postinst,
 #                    .rpm %post).
@@ -138,11 +142,6 @@ BINARY_PATH=""             # filled in based on platform if not specified
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
 
-# The root-owned helper the Linux sudoers file names for iptables / ip6tables. The same string is
-# kFwHelperPath in agents/plugins/firewall/src/firewall_quarantine_parsers.hpp;
-# tests/test_legacy_quarantine_plugin_removed_lexical.py checks the two against each other.
-FW_HELPER_PATH="/usr/local/sbin/yuzu-fw-helper"
-
 # ── platform detection ───────────────────────────────────────────────────────
 # We support exactly two platforms in this script: macOS and Linux. The
 # Windows path is install-agent-user.ps1; this script's --help refuses to
@@ -161,6 +160,15 @@ case "$OS" in
         CACHE_DIR="/Library/Caches/Yuzu"
         LOG_DIR="/Library/Logs/Yuzu"
         DEFAULT_BINARY_PATH="/Library/Application Support/Yuzu/yuzu-agent"
+        # The two root-owned helpers the sudoers file names, and the group root's files carry
+        # (macOS has no group named root). These strings are kFwHelperPathMacos in
+        # agents/plugins/firewall/src/firewall_quarantine_parsers.hpp and kSvcHelperPathMacos in
+        # agents/plugins/services/src/services_parsers.hpp; tests/test_legacy_quarantine_plugin_removed_lexical.py
+        # checks each against its header. /Library/PrivilegedHelperTools is root:wheel 0755 on a stock
+        # macOS and is where Apple keeps helpers a daemon runs as root.
+        ROOT_GROUP="wheel"
+        FW_HELPER_PATH="/Library/PrivilegedHelperTools/yuzu-fw-helper"
+        SVC_HELPER_PATH="/Library/PrivilegedHelperTools/yuzu-svc-helper"
         ;;
     Linux)
         PLATFORM="linux"
@@ -173,6 +181,13 @@ case "$OS" in
         CACHE_DIR="/var/cache/yuzu-agent"
         LOG_DIR="/var/log/yuzu-agent"
         DEFAULT_BINARY_PATH="/usr/local/bin/yuzu-agent"
+        # The two root-owned helpers the sudoers file names, and root's group. These strings are
+        # kFwHelperPath in agents/plugins/firewall/src/firewall_quarantine_parsers.hpp and
+        # kSvcHelperPathLinux in agents/plugins/services/src/services_parsers.hpp;
+        # tests/test_legacy_quarantine_plugin_removed_lexical.py checks each against its header.
+        ROOT_GROUP="root"
+        FW_HELPER_PATH="/usr/local/sbin/yuzu-fw-helper"
+        SVC_HELPER_PATH="/usr/local/sbin/yuzu-svc-helper"
         ;;
     *)
         echo "error: unsupported platform: $OS" >&2
@@ -476,16 +491,30 @@ EOF
 
     if [[ "$PLATFORM" == "macos" ]]; then
         cat <<EOF
-# firewall plugin — pf anchor containment (the narrowed argv the firewall containment actions
-# run). These lines NARROW the argv shape; they do not confine pfctl: sudo globs match
-# concatenated args, and the anchor file named by -f is agent-generated. The confinement is the
-# firewall plugin's token validation (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp).
-# There is no bare /sbin/pfctl grant. The anchor name sorts first among Apple's com.apple/*
-# sub-anchors, and the release flush is -F rules / -F nat on that anchor only (never -F all:
-# that is global).
+# firewall plugin — pf anchor containment. The agent account may run one program as root to load
+# the anchor: the helper the installer wrote to $FW_HELPER_PATH (root:wheel 0755). This line names
+# the helper with no argument and no wildcard. For the anchor it takes "pf load <staged file>",
+# checks every line of the file against the ruleset the plugin generates (the fixed lines, then
+# rule lines of the plugin's own forms with each address and port validated, then the closing
+# block line), and gives pfctl a ruleset it builds from its own literals plus the checked values on
+# standard input; the file is never handed to pfctl. It never passes the caller's arguments on, and
+# anything outside that shape exits non-zero having run nothing. There is no pfctl grant that takes
+# a file name. The enable reference is given back with "pfctl -X <token>": the token is 1 to 24
+# digits, and sudoers pins that with one bracket class per digit (24 lines, the n-th with n
+# classes), because a sudoers argument pattern cannot otherwise fix a length without a wildcard and
+# sudo regular expressions need sudo 1.9.10, which an older sudo does not read. There is no bare
+# pfctl grant. The anchor name sorts first among Apple's com.apple/* sub-anchors, and the release
+# flush is -F rules / -F nat on that anchor only (never -F all: that is global). A host provisioned
+# before the helper existed has none of this until the installer is re-run.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -X *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -f *
+EOF
+        local pf_digits="" pf_n
+        for ((pf_n = 1; pf_n <= 24; pf_n++)); do
+            pf_digits+="[0123456789]"
+            printf '%s ALL=(root) NOPASSWD: /sbin/pfctl -X %s\n' "$ACCOUNT_NAME" "$pf_digits"
+        done
+        cat <<EOF
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -F rules
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules
@@ -495,18 +524,20 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s info
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s rules
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -s References
 
-# services.set_start_mode — launchd system domain
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootstrap system *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl bootout system *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl enable system/*
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/launchctl disable system/*
+# services.set_start_mode — launchd system domain. The agent account may run one program as root
+# for it: the helper the installer wrote to $SVC_HELPER_PATH (root:wheel 0755). This line names the
+# helper with no argument and no wildcard. The helper takes "launchctl enable|disable <label>",
+# checks the label against the characters a launchd label may have here (letters, digits, - _ . @,
+# 1 to 256 of them), and runs /bin/launchctl enable|disable system/<label> with an argument list
+# it builds from its own literals plus that label. It never passes the caller's arguments on, and
+# any other subcommand or shape exits non-zero having run nothing. The plugin runs no launchctl
+# bootstrap or bootout, so there is no line for them. A host provisioned before the helper existed
+# has none of this until the installer is re-run.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: $SVC_HELPER_PATH
 
 # network_actions.flush_dns
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/dscacheutil -flushcache
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/killall -HUP mDNSResponder
-
-# certificates.delete (system keychain only — user keychain is non-privileged)
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *
 
 EOF
     else  # linux
@@ -535,11 +566,16 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet yuzu_quarantine
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine
 
-# services.set_start_mode — systemd unit lifecycle
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/systemctl enable *,  /bin/systemctl disable *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /bin/systemctl mask *,    /bin/systemctl unmask *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl enable *,  /usr/bin/systemctl disable *
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl mask *,    /usr/bin/systemctl unmask *
+# services.set_start_mode — systemd unit lifecycle. The agent account may run one program as root
+# for it: the helper the installer wrote to $SVC_HELPER_PATH (root:root 0755). This line names the
+# helper with no argument and no wildcard. The helper takes "systemctl enable|disable|mask|unmask
+# <unit>", checks the unit name against the characters a unit name may have here (letters, digits,
+# - _ . @, 1 to 256 of them), and runs systemctl <verb> -- <unit> with an argument list it builds
+# from its own literals plus that name. It never passes the caller's arguments on, and any other
+# subcommand or shape exits non-zero having run nothing. A sudo regular expression could pin the
+# name in this file instead, but it needs sudo 1.9.10 (see the firewall note above). A host
+# provisioned before the helper existed has none of this until the installer is re-run.
+$ACCOUNT_NAME ALL=(root) NOPASSWD: $SVC_HELPER_PATH
 
 # network_actions.flush_dns
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/systemd-resolve --flush-caches
@@ -588,15 +624,9 @@ install_sudoers() {
     # group named `root` on Darwin. Linux uses `root:root`. The sudoers
     # file must end up owner=root:wheel on macOS, owner=root:root on
     # Linux — without the right ownership sudo refuses to load it.
-    local root_group
-    if [[ "$PLATFORM" == "macos" ]]; then
-        root_group="wheel"
-    else
-        root_group="root"
-    fi
-
-    log "installing $tmp -> $target (mode 0440, root:$root_group)"
-    run install -m 0440 -o root -g "$root_group" "$tmp" "$target"
+    # ROOT_GROUP is set once, in the platform block.
+    log "installing $tmp -> $target (mode 0440, root:$ROOT_GROUP)"
+    run install -m 0440 -o root -g "$ROOT_GROUP" "$tmp" "$target"
 }
 
 remove_sudoers() {
@@ -607,17 +637,21 @@ remove_sudoers() {
     fi
 }
 
-# ── Linux firewall helper ───────────────────────────────────────────────────
+# ── Root-owned helpers ──────────────────────────────────────────────────────
 #
-# The sudoers file names ONE program for the Linux firewall work (iptables, ip6tables and the
-# nftables ruleset load): $FW_HELPER_PATH. It is a POSIX sh script, written from the quoted
-# heredoc below (nothing in it is expanded by this script). The installer is standalone and has
-# no build output to copy, so the text lives here, and --check compares the installed file with it
-# byte for byte.
+# Two helpers, each a POSIX sh script written from a quoted heredoc below (nothing in it is
+# expanded by this script), on both platforms (the paths are set in the platform block). The
+# installer is standalone and has no build output to copy, so the text lives here, and --check
+# compares each installed file with it byte for byte. The sudoers file names each helper with no
+# argument and no wildcard:
+#   - $FW_HELPER_PATH, firewall containment: iptables, ip6tables and the nftables ruleset load on
+#     Linux, the pf anchor load on macOS.
+#   - $SVC_HELPER_PATH, services.set_start_mode: systemctl on Linux, launchctl on macOS.
 #
-# Contract (the C++ twins are iptables_helper_argv and nft_ruleset_text in
-# agents/plugins/firewall/src/firewall_quarantine_parsers.hpp; the grammars move together and
-# tests/test_legacy_quarantine_plugin_removed_lexical.py runs this text against the same cases):
+# The firewall helper's contract (the C++ twins are iptables_helper_argv, nft_ruleset_text and
+# pf_anchor_ruleset in agents/plugins/firewall/src/firewall_quarantine_parsers.hpp; the grammars
+# move together and tests/test_legacy_quarantine_plugin_removed_lexical.py runs this text against
+# the same cases):
 #   - iptables / ip6tables: it matches the token count and every fixed token with `case`,
 #     validates every variable token, and then execs the tool with an argument list it builds from
 #     its own literals plus the validated values. No token ever reaches a shell parser: no eval,
@@ -627,20 +661,30 @@ remove_sudoers() {
 #     standard input. The file's bytes never reach nft: a shell `read` and nft do not split the same
 #     bytes the same way (NUL, CR, backslash-newline), so a copy that passed a shell check would not
 #     be proven to be what nft parses. There is no temporary file to leave behind or cut short.
+#   - pf load: the same, for the macOS anchor: the staged file is read ONCE, every line is checked
+#     against the ruleset the plugin generates, and pfctl is given a ruleset the helper builds from
+#     its own literals plus the checked tokens on standard input.
 #   - anything else exits 64 having run nothing.
-# Installed root:root 0755, written to a temporary file in the same directory and renamed into
-# place, and always BEFORE the sudoers file that names it. Linux only.
+# The helper is ONE text on both platforms. An action whose tool is not on the host (iptables or
+# nft on a Mac, pfctl on Linux) fails at exec, after the same validation, having changed nothing.
+# The services helper's contract is in its own header (the C++ twin is the builders in
+# agents/plugins/services/src/services_parsers.hpp). Each is installed root:<root group> 0755,
+# written to a temporary file in the same directory and renamed into place, and always BEFORE the
+# sudoers file that names it.
 
 generate_fw_helper_content() {
     cat <<'YUZU_FW_HELPER'
 #!/bin/sh
-# yuzu-fw-helper: the one program the Yuzu agent account may run as root to change iptables and
-# ip6tables and to load the nftables ruleset. Installed by scripts/install-agent-user.sh (Linux
-# only), root:root 0755, and named in /etc/sudoers.d/yuzu-agent with no argument and no wildcard.
-# Do not edit by hand: the installer's --check compares this file with its own text.
+# yuzu-fw-helper: the one program the Yuzu agent account may run as root for firewall containment:
+# iptables and ip6tables and the nftables ruleset load on Linux, the pf anchor load on macOS.
+# Installed by scripts/install-agent-user.sh on both platforms, root-owned 0755 (root:root on
+# Linux, root:wheel on macOS), and named in /etc/sudoers.d/yuzu-agent with no argument and no
+# wildcard. Do not edit by hand: the installer's --check compares this file with its own text. An
+# action whose tool is not on the host fails at exec, having changed nothing.
 #
 # Usage: yuzu-fw-helper iptables|ip6tables <tokens>
 #        yuzu-fw-helper nft load <path>
+#        yuzu-fw-helper pf load <path>
 # <tokens> are exactly those of one of these shapes (<ours> is a yuzu-fwq-<generation>[-f] chain,
 # the generation 1 to 10 digits and at most 2147483647):
 #   -S
@@ -666,21 +710,40 @@ generate_fw_helper_content() {
 # fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
 # own literals plus the validated values. Anything else exits 64, having run nothing.
 #
-# nft load <path>: <path> is absolute, at most 512 characters with no control character, in a
-# directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits, . _ ->.nft. The
-# file is read ONCE, at most 262145 bytes of it, and must hold exactly the ruleset the plugin
-# generates (nft_ruleset_text): thirteen fixed lines in order, rule lines only in the input and
-# output chains, at most 512 lines of at most 512 characters, nothing after the closing brace. A
-# rule line is `iif lo accept` (input), `oif lo accept` (output), the neighbour-discovery line, or
+# nft load <path> and pf load <path>: <path> is absolute, at most 512 characters with no control
+# character, in a directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits,
+# . _ ->.nft for nft and yuzu-fwq-<...>.pf for pf (the other suffix is refused). The file must be
+# neither a link nor a file that is not a regular one. It is read ONCE, at most 262145 bytes of it,
+# at most 512 lines of at most 512 characters, and the whole input is checked before anything runs.
+# A last line with no newline is refused. A NUL byte is dropped, or cuts its line short, as the
+# shell reads it and never reaches the tool; bytes past the cap are not read. Nothing read from the
+# file is printed. The link, file-type and path checks are not atomic with the open, so they are not
+# the boundary: the line grammar is. Then the tool is given a ruleset this script builds from its
+# own literals plus the checked tokens, on standard input, never the file.
+#
+# nft: the file must hold exactly the ruleset the plugin generates (nft_ruleset_text): thirteen
+# fixed lines in order, rule lines only in the input and output chains, nothing after the closing
+# brace. A rule line is `iif lo accept` (input), `oif lo accept` (output), the neighbour-discovery
+# line, or
 #   [ip|ip6 saddr|daddr <address>] (meta l4proto tcp|udp | [P sport <port>] [P dport <port>])
 #       [tcp flags & (syn|ack) != syn] accept
 # with one protocol P per line, the flags only with tcp, `ip` only with an IPv4 address and `ip6`
-# only with an IPv6 one. The whole file is checked before anything runs; then nft is given a
-# ruleset this script builds from its own literals plus the checked tokens, on standard input
-# (nft -f /dev/stdin). Nothing read from the file is printed. The link, file-type and path checks
-# are not atomic with the open, so they are not the boundary: the line grammar is. A last line with
-# no newline is refused. A NUL byte is dropped, or cuts its line short, as the shell reads it and
-# never reaches nft; bytes past the cap are not read.
+# only with an IPv6 one. nft is run as `nft -f /dev/stdin`.
+#
+# pf: the file must hold exactly the anchor ruleset the plugin generates (pf_anchor_ruleset). Lines
+# 1 to 3 are `no nat all`, `no rdr all` and `pass quick on lo0 all no state`; then rule lines; the
+# last line is `block drop quick all`, with nothing after it. A rule line is one of
+#   pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } no state
+#   pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 keep state
+#   pass in quick inet proto udp from any port 67 to any port 68 keep state
+#   pass out quick <fam> proto tcp from any to <address> port <port> no state
+#   pass in quick <fam> proto tcp from <address> port <port> to any no state
+#   pass out quick <fam> proto tcp|udp from any to <address> [port <port>] keep state
+#   pass in quick <fam> proto tcp|udp from <address> to any [port <port>] keep state
+# where <fam> is `inet` only with an IPv4 address and `inet6` only with an IPv6 one, and <address>
+# and <port> are as above. Every line is rebuilt from the literals plus the checked tokens and must
+# equal the input line character for character. pfctl is run as
+# `pfctl -a com.apple/000.yuzu_quarantine -f /dev/stdin`; the anchor name is this script's literal.
 
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -689,12 +752,17 @@ export PATH LC_ALL
 IPT=/usr/sbin/iptables
 IP6T=/usr/sbin/ip6tables
 NFT=/usr/sbin/nft
+PFCTL=/sbin/pfctl
+PF_ANCHOR=com.apple/000.yuzu_quarantine
 # No pathname expansion and a single-space field separator before any word split below.
 set -f
 IFS=' '
 nl='
 '
 ND_RULE='icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept'
+PF_ND='pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } no state'
+PF_DHCP_OUT='pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 keep state'
+PF_DHCP_IN='pass in quick inet proto udp from any port 67 to any port 68 keep state'
 
 refuse() {
     printf 'yuzu-fw-helper: refused\n' >&2
@@ -901,10 +969,10 @@ parse_rule() {
 }
 
 # want LITERAL: the current input line ($line) is exactly LITERAL. The literal, never the input's
-# own bytes, is the next line of the text nft is given.
+# own bytes, is the next line of the text the tool is given.
 want() {
     tok_is "$line" "$1" || refuse
-    nft_text=$nft_text$1$nl
+    out_text=$out_text$1$nl
 }
 
 # nft_rule CHAIN RULE: RULE (a line without its four-space indent) is a rule the plugin emits into
@@ -1030,7 +1098,7 @@ nft_rule_line() {
         *) refuse ;;
     esac
     nft_rule "$1" "${line#    }" || refuse
-    nft_text=$nft_text'    '$rule_out$nl
+    out_text=$out_text'    '$rule_out$nl
 }
 
 # nft_apply: reads ALL of standard input (the staged file, already capped by the caller) and checks
@@ -1038,7 +1106,7 @@ nft_rule_line() {
 # it give nft the text built by want / nft_rule_line, on standard input: never a stream of the
 # file. It always ends in exit, with nft's status or 64.
 nft_apply() {
-    nft_text=
+    out_text=
     nft_n=
     st=1
     line=
@@ -1080,13 +1148,165 @@ nft_apply() {
     # The loop body does not run for a last line with no newline, but read leaves its text in $line.
     [ -z "$line" ] || refuse
     [ "$st" = 14 ] || refuse
-    printf '%s' "$nft_text" | "$NFT" -f /dev/stdin
+    printf '%s' "$out_text" | "$NFT" -f /dev/stdin
     exit $?
 }
 
-# nft_load PATH: yuzu-fw-helper nft load PATH. Never returns.
-nft_load() {
+# pf_rule: the current input line ($line) is a rule line the plugin emits into the pf anchor. Sets
+# rule_out to the line rebuilt from the script's literals plus the validated address and port, and
+# succeeds only when that is $line character for character. The parse below is permissive on
+# purpose (it only has to find the tokens); the comparison at the end is the check.
+pf_rule() {
+    case $line in
+        "$PF_ND" | "$PF_DHCP_OUT" | "$PF_DHCP_IN")
+            rule_out=$line
+            return 0
+            ;;
+    esac
+    set -- $line
+    [ $# -ge 12 ] || return 1
+    tok_is "$1" pass || return 1
+    case $2 in
+        out) p_dir=out ;;
+        in) p_dir=in ;;
+        *) return 1 ;;
+    esac
+    tok_is "$3" quick || return 1
+    case $4 in
+        inet) p_fam=inet ;;
+        inet6) p_fam=inet6 ;;
+        *) return 1 ;;
+    esac
+    tok_is "$5" proto || return 1
+    case $6 in
+        tcp) p_proto=tcp ;;
+        udp) p_proto=udp ;;
+        *) return 1 ;;
+    esac
+    tok_is "$7" from || return 1
+    shift 7
+    p_port=
+    case $p_dir in
+        out)
+            [ $# -ge 5 ] || return 1
+            tok_is "$1" any || return 1
+            tok_is "$2" to || return 1
+            is_addr "$3" || return 1
+            p_addr=$3
+            shift 3
+            ;;
+        *)
+            [ $# -ge 5 ] || return 1
+            is_addr "$1" || return 1
+            p_addr=$1
+            shift 1
+            if tok_is "$1" port; then
+                is_port "$2" || return 1
+                p_port=$2
+                shift 2
+            fi
+            [ $# -ge 2 ] || return 1
+            tok_is "$1" to || return 1
+            tok_is "$2" any || return 1
+            shift 2
+            ;;
+    esac
+    # An optional port here: after the destination (out) or after `to any` (in, no port before it).
+    if [ -z "$p_port" ] && [ $# -ge 2 ] && tok_is "$1" port; then
+        is_port "$2" || return 1
+        p_port=$2
+        shift 2
+    fi
+    [ $# -eq 2 ] || return 1
+    tok_is "$2" state || return 1
+    case $1 in
+        keep) p_mode=keep ;;
+        no) p_mode=no ;;
+        *) return 1 ;;
+    esac
+    # `inet` goes with an IPv4 literal and `inet6` with an IPv6 one (is_addr admitted only those).
+    case $p_addr in
+        *:*)
+            tok_is "$p_fam" inet6 || return 1
+            ;;
+        *)
+            tok_is "$p_fam" inet || return 1
+            ;;
+    esac
+    # The stateless control-channel form is TCP with a port; nothing else is `no state`.
+    if tok_is "$p_mode" no; then
+        tok_is "$p_proto" tcp || return 1
+        [ -n "$p_port" ] || return 1
+    fi
+    rule_out="pass $p_dir quick $p_fam proto $p_proto from "
+    case $p_dir in
+        out)
+            rule_out="${rule_out}any to $p_addr"
+            [ -z "$p_port" ] || rule_out="$rule_out port $p_port"
+            ;;
+        *)
+            rule_out="${rule_out}$p_addr"
+            if tok_is "$p_mode" no; then
+                rule_out="$rule_out port $p_port to any"
+            else
+                rule_out="$rule_out to any"
+                [ -z "$p_port" ] || rule_out="$rule_out port $p_port"
+            fi
+            ;;
+    esac
+    case $p_mode in
+        no) rule_out="$rule_out no state" ;;
+        *) rule_out="$rule_out keep state" ;;
+    esac
+    tok_is "$rule_out" "$line"
+}
+
+# pf_apply: reads ALL of standard input (the staged file, already capped by the caller) and checks
+# it line by line against the anchor ruleset the plugin generates. Only when the whole input passed
+# does it give pfctl the text built by want / pf_rule, on standard input: never a stream of the
+# file. It always ends in exit, with pfctl's status or 64.
+pf_apply() {
+    out_text=
+    pf_n=
+    st=1
+    line=
+    while IFS= read -r line; do
+        pf_n=${pf_n}x
+        [ "${#pf_n}" -le 512 ] || refuse
+        [ "${#line}" -le 512 ] || refuse
+        case $st in
+            1) want 'no nat all'; st=2 ;;
+            2) want 'no rdr all'; st=3 ;;
+            3) want 'pass quick on lo0 all no state'; st=4 ;;
+            4)
+                if tok_is "$line" 'block drop quick all'; then
+                    want 'block drop quick all'
+                    st=5
+                else
+                    pf_rule || refuse
+                    out_text=$out_text$rule_out$nl
+                fi
+                ;;
+            *) refuse ;;
+        esac
+    done
+    # The loop body does not run for a last line with no newline, but read leaves its text in $line.
+    [ -z "$line" ] || refuse
+    [ "$st" = 5 ] || refuse
+    printf '%s' "$out_text" | "$PFCTL" -a "$PF_ANCHOR" -f /dev/stdin
+    exit $?
+}
+
+# staged_file PATH SUFFIX: PATH is the shape of a file the plugin staged (SUFFIX is `.nft` or
+# `.pf`) and is neither a link nor a file that is not a regular one; sets `path`. Refuses
+# otherwise. Never the boundary: a link or a non-regular file is refused here, but the file can
+# change between these tests and the open the caller makes. The boundary is the caller's apply
+# function, which reads the one opened file and gives the tool only text it built itself. A FIFO
+# present at the tests is refused; a FIFO or device node put there after them is opened with
+# whatever side effects opening it has, and a FIFO blocks the open until a writer appears.
+staged_file() {
     path=$1
+    sfx=$2
     case $path in
         /*) ;;
         *) refuse ;;
@@ -1102,25 +1322,32 @@ nft_load() {
         *) refuse ;;
     esac
     case $leaf in
-        yuzu-fwq-*.nft) ;;
+        yuzu-fwq-*"$sfx") ;;
         *) refuse ;;
     esac
     mid=${leaf#yuzu-fwq-}
-    mid=${mid%.nft}
+    mid=${mid%"$sfx"}
     case $mid in
         '' | *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*) refuse ;;
     esac
-    # Not the boundary: a link or a non-regular file is refused here, but the file can change
-    # between these tests and the open below. The boundary is nft_apply, which reads the one opened
-    # file and gives nft only text it built itself. A FIFO present at the tests is refused; a FIFO
-    # or device node put there after them is opened with whatever side effects opening it has, and
-    # a FIFO blocks the open until a writer appears.
     if [ -L "$path" ] || [ ! -f "$path" ]; then
         refuse
     fi
+}
+
+# nft_load PATH: yuzu-fw-helper nft load PATH. Never returns.
+nft_load() {
+    staged_file "$1" .nft
     # The cap, 512 x 512 + 1, bounds the read and is not a check: 512 full-length lines exceed it and
     # nft_apply refuses them. The largest ruleset the grammar accepts is 64512 bytes.
     head -c 262145 < "$path" | nft_apply
+    exit $?
+}
+
+# pf_load PATH: yuzu-fw-helper pf load PATH. Never returns. The same cap and the same single open.
+pf_load() {
+    staged_file "$1" .pf
+    head -c 262145 < "$path" | pf_apply
     exit $?
 }
 
@@ -1132,6 +1359,12 @@ case $1 in
         [ $# -eq 3 ] || refuse
         tok_is "$2" load || refuse
         nft_load "$3"
+        refuse
+        ;;
+    pf)
+        [ $# -eq 3 ] || refuse
+        tok_is "$2" load || refuse
+        pf_load "$3"
         refuse
         ;;
     *) refuse ;;
@@ -1218,8 +1451,111 @@ esac
 YUZU_FW_HELPER
 }
 
-# fw_dir_verdict UID OCTAL_MODE: pure, no I/O. For the directory that holds the helper, with the
-# owner uid and octal mode `stat -L -c '%u %a'` reports, prints ok, warn or refuse. refuse: the
+# ── The services helper ─────────────────────────────────────────────────────
+#
+# $SVC_HELPER_PATH, the one program the sudoers file lets the agent account run as root for
+# services.set_start_mode. A POSIX sh script (valid under bash 3.2 as /bin/sh, dash and ash), the
+# same prelude as the firewall helper, no eval and no shell on a token. Contract (the C++ twin is
+# the builders in agents/plugins/services/src/services_parsers.hpp, and is_safe_service_name there
+# is the character class below; tests/test_legacy_quarantine_plugin_removed_lexical.py runs this
+# text against the same cases):
+#   - exactly three arguments: a tool, a verb and a name. The name is 1 to 256 characters of
+#     letters, digits and - _ . @, checked FIRST, with an enumerated `case` class, so nothing else
+#     reaches an argument list.
+#   - systemctl enable|disable|mask|unmask <unit>: the tool is /usr/bin/systemctl when it is
+#     executable, else /bin/systemctl (the plugin's own order); each verb arm execs the tool with
+#     its own literal verb, then `--`, then the name.
+#   - launchctl enable|disable <label>: each arm execs /bin/launchctl with its own literal verb and
+#     system/<label>.
+#   - anything else exits 64 having run nothing. The caller's arguments are never passed on as a
+#     list.
+
+generate_svc_helper_content() {
+    cat <<'YUZU_SVC_HELPER'
+#!/bin/sh
+# yuzu-svc-helper: the one program the Yuzu agent account may run as root for
+# services.set_start_mode: systemctl enable|disable|mask|unmask on Linux, launchctl enable|disable
+# on macOS. Installed by scripts/install-agent-user.sh on both platforms, root-owned 0755 (root:root
+# on Linux, root:wheel on macOS), and named in /etc/sudoers.d/yuzu-agent with no argument and no
+# wildcard. Do not edit by hand: the installer's --check compares this file with its own text. An
+# action whose tool is not on the host fails at exec, having changed nothing.
+#
+# Usage: yuzu-svc-helper systemctl enable|disable|mask|unmask <unit>
+#        yuzu-svc-helper launchctl enable|disable <label>
+# Exactly three arguments. The third is 1 to 256 characters of letters, digits and - _ . @ (a
+# leading - is allowed, which is why systemctl is given -- before it), checked before anything
+# else. The caller's arguments are never passed on: each arm below execs the tool with an argument
+# list made of its own literals plus that name. Anything else exits 64, having run nothing.
+
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+export PATH LC_ALL
+# No pathname expansion and a single-space field separator before any word split below.
+set -f
+IFS=' '
+
+refuse() {
+    printf 'yuzu-svc-helper: refused\n' >&2
+    exit 64
+}
+
+[ $# -eq 3 ] || refuse
+case $3 in
+    '' | *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._@-]*) refuse ;;
+esac
+[ "${#3}" -le 256 ] || refuse
+
+case $1 in
+    systemctl)
+        if [ -x /usr/bin/systemctl ]; then
+            tool=/usr/bin/systemctl
+        else
+            tool=/bin/systemctl
+        fi
+        case $2 in
+            enable) exec "$tool" enable -- "$3" ;;
+            disable) exec "$tool" disable -- "$3" ;;
+            mask) exec "$tool" mask -- "$3" ;;
+            unmask) exec "$tool" unmask -- "$3" ;;
+            *) refuse ;;
+        esac
+        ;;
+    launchctl)
+        case $2 in
+            enable) exec /bin/launchctl enable "system/$3" ;;
+            disable) exec /bin/launchctl disable "system/$3" ;;
+            *) refuse ;;
+        esac
+        ;;
+    *) refuse ;;
+esac
+refuse
+YUZU_SVC_HELPER
+}
+
+# dir_info DIR: `<uid> <octal mode> <group>` of the directory itself (links followed). The stat form
+# is chosen by platform, never by trying one and falling back to the other: on GNU stat, `-f` means
+# file-system status and would answer, wrongly, with text.
+dir_info() {
+    if [[ "$PLATFORM" == "macos" ]]; then
+        stat -L -f '%u %Lp %Sg' "$1"
+    else
+        stat -L -c '%u %a %G' "$1"
+    fi
+}
+
+# file_owner_mode FILE: `<owner>:<group> <octal mode>` of the file itself, by the same rule.
+file_owner_mode() {
+    if [[ "$PLATFORM" == "macos" ]]; then
+        stat -f '%Su:%Sg %Lp' "$1"
+    else
+        stat -c '%U:%G %a' "$1"
+    fi
+}
+
+# fw_dir_verdict UID OCTAL_MODE: pure, no I/O. For the directory that holds a helper, with the
+# owner uid and octal mode dir_info reports, prints ok, warn or refuse. refuse: the
 # owner is not uid 0 or the mode has the other-write bit (anyone could replace the helper). warn: the
 # mode has the group-write bit (Debian policy ships /usr/local directories root:staff 2775, so a
 # flat refusal would stop the installer there). Anything that is not a uid and an octal mode refuses.
@@ -1229,11 +1565,11 @@ fw_dir_verdict() {
     if (( 8#$2 & 0002 )); then echo refuse; elif (( 8#$2 & 0020 )); then echo warn; else echo ok; fi
 }
 
-# check_fw_dir DIR: applies fw_dir_verdict to DIR as it is now. Prints the warning on warn and
+# check_helper_dir DIR: applies fw_dir_verdict to DIR as it is now. Prints the warning on warn and
 # carries on (returns 0); returns non-zero on refuse or when the owner and mode cannot be read.
-check_fw_dir() {
+check_helper_dir() {
     local dir="$1" info uid mode grp
-    info=$(stat -L -c '%u %a %G' "$dir" 2>/dev/null) || {
+    info=$(dir_info "$dir" 2>/dev/null) || {
         warn "cannot read the owner and mode of $dir"
         return 1
     }
@@ -1241,77 +1577,98 @@ check_fw_dir() {
     case "$(fw_dir_verdict "$uid" "$mode")" in
         ok) return 0 ;;
         warn)
-            warn "$dir is writable by group $grp (mode $mode): its members can replace the files in it, including the firewall helper"
+            warn "$dir is writable by group $grp (mode $mode): its members can replace the files in it, including the root-owned helpers"
             return 0
             ;;
         *)
-            warn "$dir is owned by uid $uid with mode $mode: the firewall helper must live in a directory owned by root that other users cannot write to"
+            warn "$dir is owned by uid $uid with mode $mode: the root-owned helpers must live in a directory owned by root that other users cannot write to"
             return 1
             ;;
     esac
 }
 
-install_fw_helper() {
-    if [[ "$PLATFORM" != "linux" || "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
+# install_helper PATH GENERATOR: writes the helper GENERATOR prints to PATH, root:$ROOT_GROUP 0755.
+install_helper() {
+    local path="$1" generator="$2"
+    if [[ "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
 
     local dir tmp
-    dir=$(dirname "$FW_HELPER_PATH")
+    dir=$(dirname "$path")
     if [[ "$DRY_RUN" -eq 1 ]]; then
-        echo "[dry-run] would write the following to $FW_HELPER_PATH (root:root 0755):"
-        generate_fw_helper_content | sed 's/^/[dry-run]   /'
+        echo "[dry-run] would write the following to $path (root:$ROOT_GROUP 0755):"
+        "$generator" | sed 's/^/[dry-run]   /'
         return 0
     fi
 
-    log "installing the firewall helper $FW_HELPER_PATH (root:root 0755)"
+    log "installing the helper $path (root:$ROOT_GROUP 0755)"
     # Create the directory only when missing: never reset a site-customised owner or mode.
-    [[ -d "$dir" ]] || run install -d -m 0755 -o root -g root "$dir"
+    [[ -d "$dir" ]] || run install -d -m 0755 -o root -g "$ROOT_GROUP" "$dir"
     # Stop before writing when anyone but root could replace the helper.
-    check_fw_dir "$dir" || return 1
+    check_helper_dir "$dir" || return 1
     # No sweep of earlier temp files: a killed run can leave one, a root-owned dotfile that nothing
     # runs (sudoers names only the exact helper path), and a concurrent run's live file has the same
     # name shape.
     # A temporary file in the SAME directory, so the final rename is atomic: sudo never sees a
     # half-written helper, and a failed write leaves the previous helper in place.
-    tmp=$(mktemp "$dir/.yuzu-fw-helper.XXXXXX") || { warn "cannot create a temp file in $dir"; return 1; }
-    if ! generate_fw_helper_content > "$tmp" \
-        || ! chown root:root "$tmp" \
+    tmp=$(mktemp "$dir/.$(basename "$path").XXXXXX") || { warn "cannot create a temp file in $dir"; return 1; }
+    if ! "$generator" > "$tmp" \
+        || ! chown "root:$ROOT_GROUP" "$tmp" \
         || ! chmod 0755 "$tmp" \
         || ! sh -n "$tmp" \
-        || ! mv -f "$tmp" "$FW_HELPER_PATH"; then
+        || ! mv -f "$tmp" "$path"; then
         rm -f "$tmp"
-        warn "could not install $FW_HELPER_PATH"
+        warn "could not install $path"
         return 1
     fi
 }
 
-remove_fw_helper() {
-    if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
-    if [[ -e "$FW_HELPER_PATH" ]]; then
-        log "removing $FW_HELPER_PATH"
-        run rm -f "$FW_HELPER_PATH"
-    fi
+# install_helpers: both helpers, before the sudoers file that names them. A failure of one does not
+# stop the other; the return is non-zero when either failed.
+install_helpers() {
+    local rc=0
+    install_helper "$FW_HELPER_PATH" generate_fw_helper_content || rc=1
+    install_helper "$SVC_HELPER_PATH" generate_svc_helper_content || rc=1
+    return "$rc"
 }
 
-# check_fw_helper — Linux only: the helper is present, root:root 0755 and byte-identical to this
-# script's text. Returns non-zero on any drift.
-check_fw_helper() {
-    if [[ ! -f "$FW_HELPER_PATH" ]]; then
-        warn "$FW_HELPER_PATH is missing (re-run this installer)"
+remove_helpers() {
+    local path
+    for path in "$FW_HELPER_PATH" "$SVC_HELPER_PATH"; do
+        if [[ -e "$path" ]]; then
+            log "removing $path"
+            run rm -f "$path"
+        fi
+    done
+}
+
+# check_helper PATH GENERATOR: the helper is present, root:$ROOT_GROUP 0755 and byte-identical to
+# the text GENERATOR prints. Returns non-zero on any drift.
+check_helper() {
+    local path="$1" generator="$2"
+    if [[ ! -f "$path" ]]; then
+        warn "$path is missing (re-run this installer)"
         return 1
     fi
-    check_fw_dir "$(dirname "$FW_HELPER_PATH")" || return 1
+    check_helper_dir "$(dirname "$path")" || return 1
     local owner_mode
-    owner_mode=$(stat -c '%U:%G %a' "$FW_HELPER_PATH" 2>/dev/null || true)
-    if [[ "$owner_mode" != "root:root 755" ]]; then
-        warn "$FW_HELPER_PATH is ${owner_mode:-unreadable}, expected root:root 755"
+    owner_mode=$(file_owner_mode "$path" 2>/dev/null || true)
+    if [[ "$owner_mode" != "root:$ROOT_GROUP 755" ]]; then
+        warn "$path is ${owner_mode:-unreadable}, expected root:$ROOT_GROUP 755"
         return 1
     fi
-    if ! generate_fw_helper_content | cmp -s - "$FW_HELPER_PATH"; then
-        warn "$FW_HELPER_PATH differs from this installer's text (re-run this installer)"
+    if ! "$generator" | cmp -s - "$path"; then
+        warn "$path differs from this installer's text (re-run this installer)"
         return 1
     fi
-    log "$FW_HELPER_PATH present, root:root 0755, content current"
+    log "$path present, root:$ROOT_GROUP 0755, content current"
     return 0
+}
+
+check_helpers() {
+    local rc=0
+    check_helper "$FW_HELPER_PATH" generate_fw_helper_content || rc=1
+    check_helper "$SVC_HELPER_PATH" generate_svc_helper_content || rc=1
+    return "$rc"
 }
 
 # ── linux capabilities ──────────────────────────────────────────────────────
@@ -1401,9 +1758,9 @@ check_install() {
         fi
     fi
 
-    # 4. the firewall helper the Linux sudoers file names: owner, mode and content
-    if [[ "$PLATFORM" == "linux" && "$SKIP_SUDOERS" -eq 0 ]]; then
-        check_fw_helper || ((errs++))
+    # 4. the two helpers the sudoers file names: owner, mode and content
+    if [[ "$SKIP_SUDOERS" -eq 0 ]]; then
+        check_helpers || ((errs++))
     fi
 
     # 5. capabilities (Linux only)
@@ -1448,15 +1805,15 @@ case "$ACTION" in
             fi
         fi
         create_state_dirs
-        # The helper goes in BEFORE the sudoers file that names it. A failed helper does not hold
-        # the sudoers file back (replacing it is what drops the earlier iptables lines); it fails
-        # the run at the end instead.
-        fw_helper_rc=0
-        install_fw_helper || fw_helper_rc=1
+        # The helpers go in BEFORE the sudoers file that names them. A failed helper does not hold
+        # the sudoers file back (replacing it is what drops the earlier lines); it fails the run at
+        # the end instead.
+        helper_rc=0
+        install_helpers || helper_rc=1
         install_sudoers
         apply_setcap
-        if [[ "$fw_helper_rc" -ne 0 ]]; then
-            fail "the firewall helper was not installed; firewall containment will fail on this host until it is"
+        if [[ "$helper_rc" -ne 0 ]]; then
+            fail "a root-owned helper was not installed; firewall containment and services.set_start_mode will fail on this host until it is"
         fi
         log "install complete. Verify with: $0 --check"
         ;;
@@ -1469,7 +1826,7 @@ case "$ACTION" in
         require_root
         log "uninstalling Yuzu agent user on $PLATFORM (account: $ACCOUNT_NAME)"
         remove_sudoers
-        remove_fw_helper
+        remove_helpers
         remove_state_dirs
         if [[ "$PLATFORM" == "macos" ]]; then
             macos_delete_user

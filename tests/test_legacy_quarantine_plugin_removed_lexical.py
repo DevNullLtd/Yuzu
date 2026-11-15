@@ -210,7 +210,9 @@ class LegacyQuarantinePluginRemoved(unittest.TestCase):
 
 
 HELPER_RE = re.compile(r"cat <<'YUZU_FW_HELPER'\n(.*?)\nYUZU_FW_HELPER\n", re.S)
+SVC_HELPER_RE = re.compile(r"cat <<'YUZU_SVC_HELPER'\n(.*?)\nYUZU_SVC_HELPER\n", re.S)
 HEADER = "agents/plugins/firewall/src/firewall_quarantine_parsers.hpp"
+SVC_HEADER = "agents/plugins/services/src/services_parsers.hpp"
 INSTALLER = "scripts/install-agent-user.sh"
 
 
@@ -224,9 +226,36 @@ def helper_text():
     return m.group(1) + "\n"
 
 
+def svc_helper_text():
+    """The services helper exactly as the installer writes it."""
+    text = read_text(INSTALLER)
+    m = SVC_HELPER_RE.search(text or "")
+    if not m:
+        raise AssertionError("the installer no longer carries the services helper heredoc")
+    return m.group(1) + "\n"
+
+
+def code_lines(text):
+    """The lines of a script that are not comments."""
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+
+
+def installer_platform_values():
+    """The per-platform values the installer's platform block sets: {platform: {NAME: value}}."""
+    text = read_text(INSTALLER) or ""
+    m = re.search(r'case "\$OS" in\n(.*?)\n    \*\)\n', text, re.S)
+    if not m:
+        raise AssertionError("the installer's platform block is gone")
+    arms = m.group(1)
+    mac, _, lin = arms.partition("    Linux)")
+    out = {}
+    for platform, block in (("macos", mac), ("linux", lin)):
+        out[platform] = dict(re.findall(r'^\s+(ROOT_GROUP|FW_HELPER_PATH|SVC_HELPER_PATH)="([^"]+)"$', block, re.M))
+    return out
+
+
 def installer_helper_path():
-    m = re.search(r'^FW_HELPER_PATH="([^"]+)"$', read_text(INSTALLER) or "", re.M)
-    return m.group(1) if m else None
+    return installer_platform_values()["linux"].get("FW_HELPER_PATH")
 
 
 def header_helper_path():
@@ -234,25 +263,74 @@ def header_helper_path():
     return m.group(1) if m else None
 
 
+def header_constant(rel, name):
+    m = re.search(r"\b%s\s*=\s*\n?\s*\"([^\"]+)\"" % re.escape(name), read_text(rel) or "")
+    return m.group(1) if m else None
+
+
+def render_installer(platform, *extra):
+    """`install-agent-user.sh --dry-run` with a `uname` that says `platform` ("linux" or "macos"): a
+    dry run only prints, so this is the helpers and the sudoers text the installer would write."""
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_") as d:
+        shim = os.path.join(d, "uname")
+        os_name = "Linux" if platform == "linux" else "Darwin"
+        with open(shim, "w") as f:
+            f.write('#!/bin/sh\ncase "$1" in -s) echo %s ;; *) /usr/bin/uname "$@" ;; esac\n' % os_name)
+        os.chmod(shim, 0o755)
+        env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
+        r = subprocess.run(["bash", os.path.join(REPO, INSTALLER), "--dry-run", *extra],
+                           capture_output=True, text=True, timeout=60, env=env)
+    if r.returncode != 0:
+        raise AssertionError(r.stderr)
+    return r.stdout
+
+
+def rendered_section(out, marker, end_marker=None):
+    """The text a dry run prints after `marker` (one `[dry-run]   `-prefixed line each), up to the
+    next dry-run `would write` line or the end of the prefixed block."""
+    start = out.index(marker) + len(marker) + 1
+    lines = []
+    for l in out[start:].splitlines():
+        if not l.startswith("[dry-run]   "):
+            break
+        lines.append(l[len("[dry-run]   "):])
+    return "\n".join(lines) + "\n"
+
+
+def rendered_sudoers(platform):
+    out = render_installer(platform)
+    return rendered_section(out, "[dry-run] would write the following to /etc/sudoers.d/yuzu-agent:")
+
+
+def rendered_grants(platform):
+    """Every non-comment NOPASSWD line of the sudoers text the installer renders for `platform`."""
+    return [l.strip() for l in rendered_sudoers(platform).splitlines()
+            if "NOPASSWD:" in l and not l.lstrip().startswith("#")]
+
+
 class IptablesHelperGrant(unittest.TestCase):
     """The agent account has no iptables grant at all: one root-owned helper, named with no
     argument and no wildcard, takes the iptables / ip6tables work (#7634) and the nftables ruleset
     load. The only nft lines left are the two fixed ones that delete and list the table. The C++
     twins of the helper's grammar are iptables_helper_argv and nft_ruleset_text in the parsers
-    header."""
+    header. (This class reads the installer's text, so it runs on every host; RenderedSudoers
+    below reads what the installer renders for each platform.)"""
 
     def grant_lines(self):
         text = read_text(INSTALLER)
         self.assertIsNotNone(text)
-        return [l.strip() for l in text.splitlines() if "NOPASSWD:" in l and not l.lstrip().startswith("#")]
+        # the macOS pfctl -X lines come from a printf loop; RenderedSudoers checks all 24 of them
+        return [l.strip() for l in text.splitlines()
+                if "NOPASSWD:" in l and not l.lstrip().startswith(("#", "printf"))]
 
     def test_the_sudoers_text_grants_no_iptables_binary_of_any_kind(self):
         bad = [g for g in self.grant_lines() if re.search(r"ip6?tables", g)]
         self.assertEqual(bad, [], "no grant may name iptables, ip6tables, -save or -restore; the helper is the grant")
 
     def test_the_helper_line_has_no_argument_and_no_wildcard(self):
+        # one line in the macOS block and one in the Linux block, each the same
         lines = [g for g in self.grant_lines() if "FW_HELPER_PATH" in g]
-        self.assertEqual(lines, ["$ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH"])
+        self.assertEqual(lines, ["$ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH"] * 2)
         self.assertNotIn("*", lines[0])
 
     def test_no_nft_line_has_a_wildcard_there_is_no_bare_nft_and_the_two_fixed_lines_remain(self):
@@ -265,43 +343,65 @@ class IptablesHelperGrant(unittest.TestCase):
             "$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine",
         ])
 
-    def test_the_helper_accepts_the_staging_name_the_plugin_creates(self):
+    def test_the_helper_accepts_the_staging_names_the_plugin_creates(self):
         header = read_text(HEADER)
         plugin = read_text("agents/plugins/firewall/src/firewall_plugin.cpp")
         self.assertIn('stage_("yuzu-fwq-", ".nft", text)', header)
+        self.assertIn('stage_("yuzu-fwq-", ".pf", text)', header)
         self.assertIn('data_dir + "/firewall-staging"', plugin)
         text = helper_text()
         self.assertIn("*/firewall-staging)", text)
-        self.assertIn("yuzu-fwq-*.nft)", text)
+        # one shape check for both, which takes the suffix
+        self.assertEqual(text.count('staged_file "$1" .nft'), 1)
+        self.assertEqual(text.count('staged_file "$1" .pf'), 1)
+        self.assertIn('yuzu-fwq-*"$sfx")', text)
 
-    def test_the_helper_path_is_the_same_string_in_the_installer_and_the_header(self):
-        path = installer_helper_path()
-        self.assertEqual(path, "/usr/local/sbin/yuzu-fw-helper")
-        self.assertEqual(header_helper_path(), path)
+    def test_the_helper_paths_are_the_same_strings_in_the_installer_and_the_headers(self):
+        values = installer_platform_values()
+        self.assertEqual(values["linux"], {"ROOT_GROUP": "root", "FW_HELPER_PATH": "/usr/local/sbin/yuzu-fw-helper",
+                                           "SVC_HELPER_PATH": "/usr/local/sbin/yuzu-svc-helper"})
+        self.assertEqual(values["macos"], {"ROOT_GROUP": "wheel",
+                                           "FW_HELPER_PATH": "/Library/PrivilegedHelperTools/yuzu-fw-helper",
+                                           "SVC_HELPER_PATH": "/Library/PrivilegedHelperTools/yuzu-svc-helper"})
+        self.assertEqual(header_constant(HEADER, "kFwHelperPath"), values["linux"]["FW_HELPER_PATH"])
+        self.assertEqual(header_constant(HEADER, "kFwHelperPathMacos"), values["macos"]["FW_HELPER_PATH"])
+        self.assertEqual(header_constant(SVC_HEADER, "kSvcHelperPathLinux"), values["linux"]["SVC_HELPER_PATH"])
+        self.assertEqual(header_constant(SVC_HEADER, "kSvcHelperPathMacos"), values["macos"]["SVC_HELPER_PATH"])
+        self.assertEqual(installer_helper_path(), header_helper_path())
 
-    def test_no_sudoers_line_other_than_the_helper_follows_the_helper_path_with_text(self):
+    def test_no_sudoers_line_other_than_the_helpers_follows_a_helper_path_with_text(self):
         for g in self.grant_lines():
-            self.assertNotRegex(g, r"yuzu-fw-helper\S*\s+\S", g)
+            self.assertNotRegex(g, r"yuzu-(?:fw|svc)-helper\S*\s+\S", g)
+            self.assertNotRegex(g, r"HELPER_PATH\s+\S", g)
 
-    def test_the_helper_is_installed_before_the_sudoers_file_and_removed_and_checked(self):
+    def test_the_helpers_are_installed_before_the_sudoers_file_and_removed_and_checked(self):
         text = read_text(INSTALLER)
         dispatch = text[text.index('case "$ACTION" in'):]
-        self.assertLess(dispatch.index("install_fw_helper ||"), dispatch.index("install_sudoers"))
-        self.assertIn("remove_fw_helper", dispatch)
+        self.assertLess(dispatch.index("install_helpers ||"), dispatch.index("install_sudoers"))
+        self.assertIn("remove_helpers", dispatch)
         check = text[text.index("check_install() {"):text.index("# ── action dispatch")]
-        self.assertIn("check_fw_helper ||", check)
-        body = text[text.index("install_fw_helper() {"):text.index("remove_fw_helper() {")]
+        self.assertIn("check_helpers ||", check)
+        body = text[text.index("install_helper() {"):text.index("install_helpers() {")]
         self.assertIn("SKIP_SUDOERS", body)               # --no-sudoers skips it
-        self.assertIn('"$PLATFORM" != "linux"', body)      # Linux only
-        for step in ("mktemp", "chown root:root", "chmod 0755", "sh -n", "mv -f"):
+        self.assertNotIn('"$PLATFORM"', body)              # both platforms
+        for step in ("mktemp", 'chown "root:$ROOT_GROUP"', "chmod 0755", "sh -n", "mv -f"):
             self.assertIn(step, body)                      # temp file beside it, rename into place
+        both = text[text.index("install_helpers() {"):text.index("remove_helpers() {")]
+        self.assertIn('install_helper "$FW_HELPER_PATH" generate_fw_helper_content', both)
+        self.assertIn('install_helper "$SVC_HELPER_PATH" generate_svc_helper_content', both)
+        checks = text[text.index("check_helpers() {"):text.index("# ── linux capabilities")]
+        self.assertIn('check_helper "$FW_HELPER_PATH" generate_fw_helper_content', checks)
+        self.assertIn('check_helper "$SVC_HELPER_PATH" generate_svc_helper_content', checks)
 
-    def test_the_helper_text_has_no_eval_no_shell_no_command_substitution(self):
-        code = "\n".join(l for l in helper_text().splitlines() if not l.lstrip().startswith("#"))
-        for needle in ("eval", "sh -c", "bash -c", "$(", "`", "$((", "source ", ". /"):
-            self.assertNotIn(needle, code)
-        self.assertTrue(helper_text().startswith("#!/bin/sh\n"))
-        self.assertIn("\nset -u\n", helper_text())
+    def test_the_helper_texts_have_no_eval_no_shell_no_command_substitution(self):
+        for name, text in (("yuzu-fw-helper", helper_text()), ("yuzu-svc-helper", svc_helper_text())):
+            code = code_lines(text)
+            for needle in ("eval", "sh -c", "bash -c", "$(", "`", "$((", "source ", ". /"):
+                self.assertNotIn(needle, code, name)
+            self.assertTrue(text.startswith("#!/bin/sh\n"), name)
+            self.assertIn("\nset -u\n", text, name)
+            for prelude in ("\nPATH=/usr/sbin:/usr/bin:/sbin:/bin\n", "\nLC_ALL=C\n", "\nset -f\n", "\nIFS=' '\n"):
+                self.assertIn(prelude, text, name)
 
 
 def available_shells():
@@ -548,33 +648,56 @@ def golden_ruleset():
     return m.group(1)
 
 
-@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
-class NftLoadRuns(unittest.TestCase):
-    """`yuzu-fw-helper nft load <path>`, run with nft replaced by a stub that prints its arguments
-    and its standard input. The plugin's golden text comes out of the stub byte for byte on
-    `-f /dev/stdin`; a file that is anything else, or a path that is not the staged shape, runs
-    nothing. Run under each POSIX shell found (sh, dash, bash)."""
+GOLDEN_PF_RE = re.compile(r'kGoldenPfRuleset = R"PFGOLDEN\((.*?)\)PFGOLDEN";', re.S)
+
+
+def golden_pf_ruleset():
+    """The anchor ruleset the C++ unit test pins as pf_anchor_ruleset's output for a set that uses
+    every rule form, read out of that test so the helper is run against the plugin's own text."""
+    m = GOLDEN_PF_RE.search(read_text(PARSERS_TEST) or "")
+    if not m:
+        raise AssertionError("the golden pf ruleset is gone from " + PARSERS_TEST)
+    return m.group(1)
+
+
+class StagedLoadCase:
+    """Shared harness (a mixin: the concrete cases below are the TestCases) for the helper's two
+    file-taking actions, `nft load <path>` and `pf load <path>`, run with the tool replaced by a stub
+    that prints its arguments and its standard input. The plugin's golden text comes out of the stub
+    byte for byte; a file that is anything else, or a path that is not the staged shape, runs
+    nothing. Run under each POSIX shell found (sh, dash, bash). The subclasses name the action, the
+    suffix and the tool."""
+
+    ACTION = None       # "nft" | "pf"
+    SUFFIX = None       # ".nft" | ".pf"
+    TOOL = None         # the exec target the helper names exactly once, replaced by a stub
+    STUB_STEM = None    # "stub-nft" | "stub-pfctl"
+    TOOL_ARGV = ()      # what the helper hands the tool, before its standard input
+
+    @classmethod
+    def golden_text(cls):
+        raise NotImplementedError
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_")
         d = cls.tmp.name
         text = helper_text()
-        assert text.count("/usr/sbin/nft") == 1, "the helper must name /usr/sbin/nft exactly once"
+        assert text.count(cls.TOOL) == 1, "the helper must name %s exactly once" % cls.TOOL
         cls.helpers = {}
         for name, code in (("ok", 0), ("fail", 3)):
-            stub = os.path.join(d, "stub-nft-" + name)
+            stub = os.path.join(d, "%s-%s" % (cls.STUB_STEM, name))
             with open(stub, "w") as f:
                 f.write("#!/bin/sh\nprintf 'RAN %s\\n' \"${0##*/}\"\nfor a; do printf '%s\\n' \"$a\"; done\n"
                         "cat\nexit " + str(code) + "\n")
             os.chmod(stub, 0o755)
             path = os.path.join(d, "yuzu-fw-helper-" + name)
             with open(path, "w") as f:
-                f.write(text.replace("/usr/sbin/nft", stub))
+                f.write(text.replace(cls.TOOL, stub))
             cls.helpers[name] = path
         cls.stage = os.path.join(d, "var", "lib", "yuzu-agent", "firewall-staging")
         os.makedirs(cls.stage)
-        cls.golden = golden_ruleset()
+        cls.golden = cls.golden_text()
         cls.n = 0
 
     @classmethod
@@ -585,16 +708,17 @@ class NftLoadRuns(unittest.TestCase):
     def staged(cls, content):
         """A staged file holding `content` (str or bytes); its path."""
         cls.n += 1
-        path = os.path.join(cls.stage, "yuzu-fwq-t%d.nft" % cls.n)
+        path = os.path.join(cls.stage, "yuzu-fwq-t%d%s" % (cls.n, cls.SUFFIX))
         with open(path, "wb") as f:
             f.write(content if isinstance(content, bytes) else content.encode())
         return path
 
-    def want(self, ruleset=None):
-        return ("RAN stub-nft-ok\n-f\n/dev/stdin\n" + (self.golden if ruleset is None else ruleset)).encode()
+    def want(self, ruleset=None, helper="ok"):
+        head = "RAN %s-%s\n" % (self.STUB_STEM, helper) + "".join(a + "\n" for a in self.TOOL_ARGV)
+        return (head + (self.golden if ruleset is None else ruleset)).encode()
 
     def run_load(self, shell, path, helper="ok", extra=(), env=None):
-        return subprocess.run([shell, self.helpers[helper], "nft", "load", path, *extra], capture_output=True,
+        return subprocess.run([shell, self.helpers[helper], self.ACTION, "load", path, *extra], capture_output=True,
                               timeout=30, env=env)
 
     def run_each(self, jobs):
@@ -608,24 +732,24 @@ class NftLoadRuns(unittest.TestCase):
     def refused(self, content, label):
         """The helper runs nothing for `content` under every shell, and says only the fixed line."""
         path = self.staged(content)
-        results = self.run_each([(sh, ["nft", "load", path]) for sh in available_shells()])
+        results = self.run_each([(sh, [self.ACTION, "load", path]) for sh in available_shells()])
         for sh, r in zip(available_shells(), results):
             self.assertNotEqual(r.returncode, 0, (sh, label))
-            self.assertEqual(r.stdout, b"", (sh, label, "nft ran"))
+            self.assertEqual(r.stdout, b"", (sh, label, "the tool ran"))
             self.assertEqual(r.stderr, b"yuzu-fw-helper: refused\n", (sh, label))
 
-    def test_the_golden_text_reaches_nft_byte_for_byte_on_stdin_under_every_shell(self):
-        self.assertTrue(self.golden.startswith("table inet yuzu_quarantine {}\n") and self.golden.endswith("\n}\n"))
+    def test_the_golden_text_reaches_the_tool_byte_for_byte_on_stdin_under_every_shell(self):
+        self.assertTrue(self.golden.endswith("\n"))
         path = self.staged(self.golden)
         for sh in available_shells():
             r = self.run_load(sh, path)
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, self.want(), b""), sh)
 
-    def test_the_helper_exits_with_nfts_status(self):
+    def test_the_helper_exits_with_the_tools_status(self):
         path = self.staged(self.golden)
         for sh in available_shells():
             r = self.run_load(sh, path, helper="fail")
-            self.assertEqual((r.returncode, r.stdout), (3, self.want().replace(b"stub-nft-ok", b"stub-nft-fail")), sh)
+            self.assertEqual((r.returncode, r.stdout), (3, self.want(helper="fail")), sh)
 
     def test_the_environment_cannot_change_what_runs(self):
         env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent")
@@ -634,7 +758,7 @@ class NftLoadRuns(unittest.TestCase):
             r = self.run_load(sh, path, env=env)
             self.assertEqual((r.returncode, r.stdout), (0, self.want()), sh)
 
-    def test_a_nul_byte_in_the_file_never_reaches_nft(self):
+    def test_a_nul_byte_in_the_file_never_reaches_the_tool(self):
         lines = self.golden.split("\n")
         for at in (0, 5, 6, 7, 20):
             lines2 = list(lines)
@@ -643,7 +767,7 @@ class NftLoadRuns(unittest.TestCase):
             for sh in available_shells():
                 r = self.run_load(sh, path)
                 self.assertNotIn(b"\0", r.stdout, (sh, at))
-                # either refused having run nothing, or nft got the plugin's own text
+                # either refused having run nothing, or the tool got the plugin's own text
                 self.assertIn((r.returncode, r.stdout), ((64, b""), (0, self.want())), (sh, at))
         # a tail of NUL bytes and no newline: the shell drops it or reads it as an empty line
         path = self.staged(self.golden.encode() + b"\0" * 8)
@@ -651,6 +775,106 @@ class NftLoadRuns(unittest.TestCase):
             r = self.run_load(sh, path)
             self.assertNotIn(b"\0", r.stdout, (sh, "nul tail"))
             self.assertIn((r.returncode, r.stdout), ((64, b""), (0, self.want())), (sh, "nul tail"))
+
+    def test_a_link_a_fifo_a_directory_and_a_missing_file_run_nothing(self):
+        good = self.staged(self.golden)
+        link = os.path.join(self.stage, "yuzu-fwq-link" + self.SUFFIX)
+        os.symlink(good, link)
+        fifo = os.path.join(self.stage, "yuzu-fwq-fifo" + self.SUFFIX)
+        os.mkfifo(fifo)
+        directory = os.path.join(self.stage, "yuzu-fwq-dir" + self.SUFFIX)
+        os.mkdir(directory)
+        missing = os.path.join(self.stage, "yuzu-fwq-missing" + self.SUFFIX)
+        for label, path in (("symlink", link), ("fifo", fifo), ("directory", directory), ("missing", missing)):
+            for sh in available_shells():
+                r = self.run_load(sh, path)   # a FIFO that was opened would block until the 30 s timeout
+                self.assertNotEqual(r.returncode, 0, (sh, label))
+                self.assertEqual(r.stdout, b"", (sh, label))
+                self.assertEqual(r.stderr, b"yuzu-fw-helper: refused\n", (sh, label))
+
+    def test_the_action_takes_exactly_three_arguments(self):
+        good = self.staged(self.golden)
+        a = self.ACTION
+        calls = [[a], [a, "load"], [a, good], [a, "load", good, "extra"], [a, "load", good, ""],
+                 [a, "-f", good], [a, "list", "table", "inet", "yuzu_quarantine"], [a, "delete", "table"],
+                 [a, "LOAD", good], [a, "load ", good], [a, "", good], [a.upper(), "load", good],
+                 [a, "save", good], [a, "load", "-f", good]]
+        jobs = [(sh, c) for sh in available_shells() for c in calls]
+        for (sh, c), r in zip(jobs, self.run_each(jobs)):
+            self.assertNotEqual(r.returncode, 0, (sh, c))
+            self.assertEqual(r.stdout, b"", (sh, c))
+
+    def test_the_other_actions_staged_file_is_refused(self):
+        """A file staged for the other tool, whatever it holds, is not this action's: the suffix is
+        the action's own."""
+        other = ".pf" if self.SUFFIX == ".nft" else ".nft"
+        path = os.path.join(self.stage, "yuzu-fwq-other-%d%s" % (self.n + 1000, other))
+        with open(path, "w") as f:
+            f.write(self.golden)
+        for sh in available_shells():
+            r = self.run_load(sh, path)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (64, b"", b"yuzu-fw-helper: refused\n"), sh)
+
+    def test_a_path_outside_the_staged_shape_runs_nothing(self):
+        good = self.staged(self.golden)
+        name = os.path.basename(good)
+        other_sfx = ".pf" if self.SUFFIX == ".nft" else ".nft"
+        other = os.path.join(self.tmp.name, "other")
+        os.makedirs(other)
+        elsewhere = os.path.join(other, name)
+        with open(good, "rb") as f, open(elsewhere, "wb") as g:
+            g.write(f.read())
+        bad = [
+            ("relative", os.path.relpath(good)),
+            ("relative from the staging dir", "firewall-staging/" + name),
+            ("a directory not named firewall-staging", elsewhere),
+            ("the staging name only as a prefix", os.path.join(self.tmp.name, "x-firewall-staging", name)),
+            ("the staging name one level up", os.path.join(self.stage, "sub", name)),
+            ("a leaf without the stem", os.path.join(self.stage, "t1" + self.SUFFIX)),
+            ("a leaf with another suffix", os.path.join(self.stage, "yuzu-fwq-t1.txt")),
+            ("a leaf with the other tool's suffix", os.path.join(self.stage, "yuzu-fwq-t1" + other_sfx)),
+            ("a leaf with a cut-short suffix", os.path.join(self.stage, "yuzu-fwq-t1" + other_sfx + self.SUFFIX[:-1])),
+            ("a leaf with nothing between", os.path.join(self.stage, "yuzu-fwq-" + self.SUFFIX)),
+            ("a leaf with a space", os.path.join(self.stage, "yuzu-fwq-a b" + self.SUFFIX)),
+            ("a leaf with a semicolon", os.path.join(self.stage, "yuzu-fwq-a;b" + self.SUFFIX)),
+            ("a leaf with a glob", os.path.join(self.stage, "yuzu-fwq-*" + self.SUFFIX)),
+            ("a leaf with a dollar", os.path.join(self.stage, "yuzu-fwq-$x" + self.SUFFIX)),
+            ("a leaf with a newline", os.path.join(self.stage, "yuzu-fwq-a\nb" + self.SUFFIX)),
+            ("a newline in the directory", os.path.join(self.tmp.name, "a\nb", "firewall-staging", name)),
+            ("a control character", os.path.join(self.stage, "yuzu-fwq-a\x01b" + self.SUFFIX)),
+            ("a DEL", os.path.join(self.stage, "yuzu-fwq-a\x7fb" + self.SUFFIX)),
+            ("past 512 characters", "/" + "a" * 300 + "/firewall-staging/yuzu-fwq-" + "b" * 200 + self.SUFFIX),
+            ("the root", "/"),
+            ("an empty path", ""),
+            ("a bare dash", "-"),
+            ("an option", "-f"),
+            ("a trailing slash", self.stage + "/"),
+        ]
+        for label, path in bad:
+            for sh in available_shells():
+                r = self.run_load(sh, path)
+                self.assertNotEqual(r.returncode, 0, (sh, label))
+                self.assertEqual(r.stdout, b"", (sh, label))
+
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
+class NftLoadRuns(StagedLoadCase, unittest.TestCase):
+    """`yuzu-fw-helper nft load <path>`, run with nft replaced by a stub. The plugin's golden
+    ruleset comes out of the stub byte for byte on `-f /dev/stdin`."""
+
+    ACTION = "nft"
+    SUFFIX = ".nft"
+    TOOL = "/usr/sbin/nft"
+    STUB_STEM = "stub-nft"
+    TOOL_ARGV = ("-f", "/dev/stdin")
+
+    @classmethod
+    def golden_text(cls):
+        return golden_ruleset()
+
+    def test_the_golden_text_is_the_plugins_ruleset(self):
+        self.assertTrue(self.golden.startswith("table inet yuzu_quarantine {}\n") and self.golden.endswith("\n}\n"))
 
     def test_a_file_that_is_not_the_plugins_ruleset_runs_nothing(self):
         g = self.golden
@@ -773,71 +997,6 @@ class NftLoadRuns(unittest.TestCase):
         self.refused(self.golden.replace("    iif lo accept\n", "    " + "a" * 507 + "\n", 1), "a 512-character line")
         self.refused("x" * 300000, "a file past the byte cap, one line")
 
-    def test_a_link_a_fifo_a_directory_and_a_missing_file_run_nothing(self):
-        good = self.staged(self.golden)
-        link = os.path.join(self.stage, "yuzu-fwq-link.nft")
-        os.symlink(good, link)
-        fifo = os.path.join(self.stage, "yuzu-fwq-fifo.nft")
-        os.mkfifo(fifo)
-        directory = os.path.join(self.stage, "yuzu-fwq-dir.nft")
-        os.mkdir(directory)
-        missing = os.path.join(self.stage, "yuzu-fwq-missing.nft")
-        for label, path in (("symlink", link), ("fifo", fifo), ("directory", directory), ("missing", missing)):
-            for sh in available_shells():
-                r = self.run_load(sh, path)   # a FIFO that was opened would block until the 30 s timeout
-                self.assertNotEqual(r.returncode, 0, (sh, label))
-                self.assertEqual(r.stdout, b"", (sh, label))
-                self.assertEqual(r.stderr, b"yuzu-fw-helper: refused\n", (sh, label))
-
-    def test_a_path_outside_the_staged_shape_runs_nothing(self):
-        good = self.staged(self.golden)
-        name = os.path.basename(good)
-        other = os.path.join(self.tmp.name, "other")
-        os.makedirs(other)
-        elsewhere = os.path.join(other, name)
-        with open(good, "rb") as f, open(elsewhere, "wb") as g:
-            g.write(f.read())
-        bad = [
-            ("relative", os.path.relpath(good)),
-            ("relative from the staging dir", "firewall-staging/" + name),
-            ("a directory not named firewall-staging", elsewhere),
-            ("the staging name only as a prefix", os.path.join(self.tmp.name, "x-firewall-staging", name)),
-            ("the staging name one level up", os.path.join(self.stage, "sub", name)),
-            ("a leaf without the stem", os.path.join(self.stage, "t1.nft")),
-            ("a leaf with another suffix", os.path.join(self.stage, "yuzu-fwq-t1.txt")),
-            ("a leaf with nothing between", os.path.join(self.stage, "yuzu-fwq-.nft")),
-            ("a leaf with a space", os.path.join(self.stage, "yuzu-fwq-a b.nft")),
-            ("a leaf with a semicolon", os.path.join(self.stage, "yuzu-fwq-a;b.nft")),
-            ("a leaf with a glob", os.path.join(self.stage, "yuzu-fwq-*.nft")),
-            ("a leaf with a dollar", os.path.join(self.stage, "yuzu-fwq-$x.nft")),
-            ("a leaf with a newline", os.path.join(self.stage, "yuzu-fwq-a\nb.nft")),
-            ("a newline in the directory", os.path.join(self.tmp.name, "a\nb", "firewall-staging", name)),
-            ("a control character", os.path.join(self.stage, "yuzu-fwq-a\x01b.nft")),
-            ("a DEL", os.path.join(self.stage, "yuzu-fwq-a\x7fb.nft")),
-            ("past 512 characters", "/" + "a" * 300 + "/firewall-staging/yuzu-fwq-" + "b" * 200 + ".nft"),
-            ("the root", "/"),
-            ("an empty path", ""),
-            ("a bare dash", "-"),
-            ("an option", "-f"),
-            ("a trailing slash", self.stage + "/"),
-        ]
-        for label, path in bad:
-            for sh in available_shells():
-                r = self.run_load(sh, path)
-                self.assertNotEqual(r.returncode, 0, (sh, label))
-                self.assertEqual(r.stdout, b"", (sh, label))
-
-    def test_the_action_takes_exactly_three_arguments(self):
-        good = self.staged(self.golden)
-        calls = [["nft"], ["nft", "load"], ["nft", good], ["nft", "load", good, "extra"], ["nft", "load", good, ""],
-                 ["nft", "-f", good], ["nft", "list", "table", "inet", "yuzu_quarantine"], ["nft", "delete", "table"],
-                 ["nft", "LOAD", good], ["nft", "load ", good], ["nft", "", good], ["NFT", "load", good],
-                 ["nft", "save", good], ["nft", "load", "-f", good]]
-        jobs = [(sh, c) for sh in available_shells() for c in calls]
-        for (sh, c), r in zip(jobs, self.run_each(jobs)):
-            self.assertNotEqual(r.returncode, 0, (sh, c))
-            self.assertEqual(r.stdout, b"", (sh, c))
-
     def test_every_rule_form_is_accepted_in_the_chain_the_plugin_emits_it_in(self):
         g = self.golden.split("\n")[:-1]
         at = g.index("    type filter hook input priority -100; policy drop;") + 1
@@ -858,6 +1017,401 @@ class NftLoadRuns(unittest.TestCase):
             for sh in available_shells():
                 r = self.run_load(sh, path)
                 self.assertEqual((r.returncode, r.stdout), (0, self.want(text)), (sh, form))
+
+
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
+class PfLoadRuns(StagedLoadCase, unittest.TestCase):
+    """`yuzu-fw-helper pf load <path>` (macOS), run with pfctl replaced by a stub. The plugin's
+    golden anchor ruleset comes out of the stub byte for byte after `-a
+    com.apple/000.yuzu_quarantine -f /dev/stdin`; a file that is anything else, or a path that is
+    not the staged shape, runs nothing."""
+
+    ACTION = "pf"
+    SUFFIX = ".pf"
+    TOOL = "/sbin/pfctl"
+    STUB_STEM = "stub-pfctl"
+    TOOL_ARGV = ("-a", "com.apple/000.yuzu_quarantine", "-f", "/dev/stdin")
+
+    @classmethod
+    def golden_text(cls):
+        return golden_pf_ruleset()
+
+    CLOSING = "block drop quick all\n"
+
+    def with_rule(self, rule):
+        """The golden text with one more line in front of the closing line."""
+        self.assertTrue(self.golden.endswith(self.CLOSING))
+        return self.golden[:-len(self.CLOSING)] + rule + "\n" + self.CLOSING
+
+    def mod(self, old, new):
+        """The golden text with the first `old` replaced by `new` (which must change it)."""
+        self.assertIn(old, self.golden)
+        out = self.golden.replace(old, new, 1)
+        self.assertNotEqual(out, self.golden)
+        return out
+
+    def test_the_golden_text_is_the_plugins_anchor_ruleset(self):
+        self.assertTrue(self.golden.startswith("no nat all\nno rdr all\npass quick on lo0 all no state\n"))
+        self.assertTrue(self.golden.endswith(self.CLOSING))
+        self.assertEqual(self.golden.count(self.CLOSING), 1)
+
+    def test_a_file_that_is_not_the_plugins_anchor_ruleset_runs_nothing(self):
+        g = self.golden
+        lines = g.split("\n")[:-1]
+        RULE = "pass out quick inet proto udp from any to 203.0.113.53 port 53 keep state"
+        CTRL_OUT = "pass out quick inet proto tcp from any to 198.51.100.7 port 50051 no state"
+        CTRL_IN = "pass in quick inet proto tcp from 198.51.100.7 port 50051 to any no state"
+        EX_IN = "pass in quick inet proto tcp from 10.0.0.5 to any port 22 keep state"
+        cases = {
+            "empty": "",
+            "only the first line": lines[0] + "\n",
+            "cut before the closing line": "\n".join(lines[:-1]) + "\n",
+            "no final newline": g[:-1],
+            "the closing line missing, a rule last": "\n".join(lines[:-1] + [RULE]) + "\n",
+            "the closing line twice": g + self.CLOSING,
+            "text after the closing line": g + "pass all\n",
+            "an unterminated tail after the closing line": g + "pass all",
+            "a blank line after the closing line": g + "\n",
+            "a blank line inside": self.mod("no rdr all\n", "no rdr all\n\n"),
+            "include at the top": 'include "/etc/passwd"\n' + g,
+            "include as a rule": self.with_rule('include "/etc/x"'),
+            "load anchor": self.with_rule('load anchor "x" from "/etc/pf.conf"'),
+            "anchor": self.with_rule('anchor "x"'),
+            "anchor with a rule": self.with_rule('anchor "x" all'),
+            "a table": self.with_rule("table <t> { 10.0.0.1 }"),
+            "a macro": self.with_rule('x = "1"'),
+            "set skip": self.with_rule("set skip on lo0"),
+            "set limit": self.with_rule("set limit states 10"),
+            "a nat rule": self.with_rule("nat on en0 inet from any to any -> 10.0.0.1"),
+            "an rdr rule": self.with_rule("rdr pass on lo0 proto tcp from any to any port 80 -> 127.0.0.1 port 8080"),
+            "a scoped no nat": self.mod("no nat all\n", "no nat on en0 all\n"),
+            "no nat repeated": self.mod("no nat all\n", "no nat all\nno nat all\n"),
+            "no rdr before no nat": self.mod("no nat all\nno rdr all\n", "no rdr all\nno nat all\n"),
+            "pass all": self.with_rule("pass all"),
+            "pass quick all": self.with_rule("pass quick all"),
+            "block all": self.with_rule("block all"),
+            "a log pass": self.with_rule("pass log quick inet proto tcp from any to 10.0.0.1 port 22 keep state"),
+            "another interface for the loopback line": self.mod("pass quick on lo0 all no state",
+                                                                "pass quick on en0 all no state"),
+            "a stateful loopback line": self.mod("pass quick on lo0 all no state", "pass quick on lo0 all keep state"),
+            "the loopback line moved down": self.mod("pass quick on lo0 all no state\n", "")
+                                            .replace(self.CLOSING, "pass quick on lo0 all no state\n" + self.CLOSING),
+            "a host name": self.mod("to 203.0.113.53 port 53 keep state", "to example.com port 53 keep state"),
+            "a list as the address": self.mod("to 203.0.113.53 port 53 keep state",
+                                              "to { 10.0.0.1, 10.0.0.2 } port 53 keep state"),
+            "a table as the address": self.mod("to 203.0.113.53 port 53 keep state", "to <t> port 53 keep state"),
+            "any as the destination": self.mod("to 203.0.113.53 port 53 keep state", "to any port 53 keep state"),
+            "a negated address": self.mod("to 203.0.113.53 port 53 keep state", "to ! 203.0.113.53 port 53 keep state"),
+            "an interface as the address": self.mod("to 203.0.113.53 port 53 keep state", "to (en0) port 53 keep state"),
+            "inet with an IPv6 address": self.mod("inet6 proto udp from any to 2001:4860:4860::8888",
+                                                  "inet proto udp from any to 2001:4860:4860::8888"),
+            "inet6 with an IPv4 address": self.mod("inet proto udp from any to 203.0.113.53",
+                                                   "inet6 proto udp from any to 203.0.113.53"),
+            "no family": self.mod("pass out quick inet proto udp from any to 203.0.113.53",
+                                  "pass out quick proto udp from any to 203.0.113.53"),
+            "proto icmp": self.mod("inet proto udp from any to 203.0.113.53", "inet proto icmp from any to 203.0.113.53"),
+            "proto all": self.mod("inet proto udp from any to 203.0.113.53", "inet from any to 203.0.113.53"),
+            "a numeric proto": self.mod("inet proto udp from any to 203.0.113.53", "inet proto 17 from any to 203.0.113.53"),
+            "port 0": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port 0 keep state"),
+            "port 65536": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port 65536 keep state"),
+            "a leading-zero port": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port 053 keep state"),
+            "a port range": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port 53:80 keep state"),
+            "a named port": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port domain keep state"),
+            "a port list": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port { 53, 80 } keep state"),
+            "a port operator": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.53 port > 53 keep state"),
+            "an octet past 255": self.mod("to 203.0.113.53 port 53 keep state", "to 999.1.1.1 port 53 keep state"),
+            "a zero-padded octet": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.113.053 port 53 keep state"),
+            "a short quad": self.mod("to 203.0.113.53 port 53 keep state", "to 203.0.53 port 53 keep state"),
+            "a prefix past 32": self.mod("to 10.1.0.0/16 port 53", "to 10.1.0.0/33 port 53"),
+            "a leading-zero prefix": self.mod("to 10.1.0.0/16 port 53", "to 10.1.0.0/016 port 53"),
+            "an upper-case IPv6": self.mod("to 2001:4860:4860::8888", "to 2001:4860:4860::888A"),
+            "an IPv6 prefix past 128": self.mod("from 2001:db8::/32 to any", "from 2001:db8::/129 to any"),
+            "an interface-scoped address": self.mod("to 2001:db8::9 keep", "to fe80::1%en0 keep"),
+            "a comment line": self.with_rule("# note"),
+            "a trailing comment": self.mod(RULE, RULE + " # note"),
+            "a tab": self.mod(RULE, RULE.replace("udp from", "udp\tfrom")),
+            "a doubled space": self.mod(RULE, RULE.replace("udp from", "udp  from")),
+            "a trailing space": self.mod(RULE, RULE + " "),
+            "a leading space": self.mod(RULE, " " + RULE),
+            "CRLF line ends": g.replace("\n", "\r\n"),
+            "one CR": self.mod(RULE + "\n", RULE + "\r\n"),
+            "a backslash continuation": self.mod(RULE + "\n", RULE.replace("udp from", "udp \\\nfrom") + "\n"),
+            "modulate state": self.mod(RULE, RULE.replace("keep state", "modulate state")),
+            "synproxy state": self.mod(CTRL_OUT, CTRL_OUT.replace("no state", "synproxy state")),
+            "flags": self.mod(RULE, RULE.replace("keep state", "flags S/SA keep state")),
+            "a label": self.mod(RULE, RULE + " label x"),
+            "a tag": self.mod(RULE, RULE + " tag x"),
+            "a user": self.mod(RULE, RULE.replace("keep state", "user root keep state")),
+            "a queue": self.mod(RULE, RULE + " queue q"),
+            "an extra word": self.mod(RULE, RULE + " all"),
+            "keep state spelled with one word": self.mod(RULE, RULE.replace("keep state", "keepstate")),
+            "no state on a udp rule": self.mod(RULE, RULE.replace("keep state", "no state")),
+            "no state without a port": self.mod(CTRL_OUT, CTRL_OUT.replace(" port 50051", "")),
+            "the in control line with the exception layout":
+                self.mod(CTRL_IN, "pass in quick inet proto tcp from 198.51.100.7 to any port 50051 no state"),
+            "the in exception line with the control layout":
+                self.mod(EX_IN, "pass in quick inet proto tcp from 10.0.0.5 port 22 to any keep state"),
+            "an out line with the in layout": self.mod(RULE, "pass out quick inet proto udp from 203.0.113.53 to any "
+                                                             "port 53 keep state"),
+            "an in line with the out layout": self.mod(EX_IN, "pass in quick inet proto tcp from any to 10.0.0.5 "
+                                                              "port 22 keep state"),
+            "a direction other than in and out": self.mod(RULE, RULE.replace("pass out", "pass on")),
+            "no direction": self.mod(RULE, RULE.replace("pass out ", "pass ")),
+            "not quick": self.mod(RULE, RULE.replace(" quick", "")),
+            "block instead of pass": self.mod(RULE, RULE.replace("pass out", "block out")),
+            "a source port on an out line": self.mod(RULE, RULE.replace("from any to", "from any port 1024 to")),
+            "the nd line with a sixth type": self.mod("{ 133, 134, 135, 136 }", "{ 133, 134, 135, 136, 137 }"),
+            "the nd line with a missing type": self.mod("{ 133, 134, 135, 136 }", "{ 133, 134, 135 }"),
+            "the nd line for inet": self.mod("pass quick inet6 proto icmp6", "pass quick inet proto icmp6"),
+            "the dhcp line toward any": self.mod("to 255.255.255.255 port 67", "to any port 67"),
+            "the dhcp reply from another port": self.mod("from any port 67 to any port 68", "from any port 68 to any port 68"),
+            "the closing line with a log": self.mod(self.CLOSING, "block drop quick all log\n"),
+            "block drop all as the closing line": self.mod(self.CLOSING, "block drop all\n"),
+            "block return as the closing line": self.mod(self.CLOSING, "block return quick all\n"),
+            "an indented closing line": self.mod(self.CLOSING, " block drop quick all\n"),
+            "text after the closing line on its own line": g + "anchor \"x\"\n",
+            "an unterminated flush after the closing brace": g + "flush",
+            "the whole ruleset twice": g + g,
+            "an unterminated tail past the byte cap": g + "x" * 300000,
+            "a root-only line marker": self.with_rule("ROOT-ONLY-SECRET-LINE"),
+        }
+        for label, content in cases.items():
+            with self.subTest(label):
+                self.refused(content, label)
+
+    def test_nothing_from_a_refused_file_is_printed(self):
+        path = self.staged(self.with_rule("ROOT-ONLY-SECRET-LINE"))
+        for sh in available_shells():
+            r = self.run_load(sh, path)
+            self.assertNotIn(b"SECRET", r.stdout + r.stderr, sh)
+
+    def test_the_line_caps_are_512_lines_of_512_characters(self):
+        g = self.golden.split("\n")[:-1]
+        rule = "pass out quick inet proto tcp from any to 10.0.0.1 port 22 keep state"
+        def padded(n):
+            return "\n".join(g[:-1] + [rule] * n + g[-1:]) + "\n"
+        edge = 512 - len(g)
+        # 512 lines is accepted, 513 is not (every line in both is otherwise valid)
+        text512 = padded(edge)
+        self.assertEqual(text512.count("\n"), 512)
+        path = self.staged(text512)
+        for sh in available_shells():
+            r = self.run_load(sh, path)
+            self.assertEqual((r.returncode, r.stdout), (0, self.want(text512)), sh)
+        self.refused(padded(edge + 1), "513 lines")
+        # a 513-character line, and a 512-character one that is not a rule (a valid line is far shorter)
+        line = self.golden.split("\n")[3]
+        self.refused(self.mod(line, line + " " * (513 - len(line))), "a 513-character line")
+        self.refused(self.mod(line, line + " " * (512 - len(line))), "a 512-character line that is not a rule")
+        self.refused(self.with_rule("a" * 512), "a 512-character junk line")
+        self.refused("x" * 300000, "a file past the byte cap, one line")
+
+    def test_every_rule_form_is_accepted_wherever_the_plugin_puts_it(self):
+        forms = [
+            "pass out quick inet proto tcp from any to 255.255.255.255 port 65535 keep state",
+            "pass out quick inet proto udp from any to 0.0.0.0/0 keep state",
+            "pass in quick inet6 proto tcp from ::/0 to any port 1 keep state",
+            "pass out quick inet6 proto udp from any to ::1 port 53 keep state",
+            "pass out quick inet proto tcp from any to 10.0.0.0/32 port 1 no state",
+            "pass in quick inet6 proto tcp from 2001:db8::1 port 443 to any no state",
+            "pass in quick inet proto udp from 10.1.0.0/16 to any keep state",
+            "pass in quick inet proto udp from 10.1.0.0/16 to any port 65535 keep state",
+            "pass out quick inet6 proto tcp from any to 2001:db8::/128 port 8443 no state",
+        ]
+        for form in forms:
+            text = self.with_rule(form)
+            path = self.staged(text)
+            for sh in available_shells():
+                r = self.run_load(sh, path)
+                self.assertEqual((r.returncode, r.stdout), (0, self.want(text)), (sh, form))
+
+    def test_a_staging_directory_with_a_space_works(self):
+        """The packaged macOS data directory contains a space (/Library/Application Support/Yuzu):
+        the staged path travels as one argument and the shape check does not split it."""
+        spaced = os.path.join(self.tmp.name, "Library", "Application Support", "Yuzu", "firewall-staging")
+        os.makedirs(spaced)
+        path = os.path.join(spaced, "yuzu-fwq-AbC123.pf")
+        with open(path, "w") as f:
+            f.write(self.golden)
+        for sh in available_shells():
+            r = self.run_load(sh, path)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, self.want(), b""), sh)
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/sbin/pfctl"),
+                         "parses the text with the real pfctl, which only a Mac has")
+    def test_the_golden_text_and_every_accepted_form_parse_under_the_real_pfctl(self):
+        """`pfctl -n` parses and loads nothing. The helper hands pfctl a ruleset it rebuilt itself,
+        and what it rebuilt is what the plugin generates, so the plugin's own text must be text the
+        real tool accepts."""
+        texts = [("the golden text", self.golden)]
+        for form in ("pass out quick inet proto tcp from any to 10.0.0.0/32 port 1 no state",
+                     "pass in quick inet6 proto tcp from 2001:db8::1 port 443 to any no state",
+                     "pass in quick inet proto udp from 10.1.0.0/16 to any keep state"):
+            texts.append((form, self.with_rule(form)))
+        for label, text in texts:
+            r = subprocess.run(["/sbin/pfctl", "-n", "-a", "com.apple/000.yuzu_quarantine", "-f", "/dev/stdin"],
+                               input=text.encode(), capture_output=True, timeout=30)
+            self.assertEqual(r.returncode, 0, (label, r.stdout, r.stderr))
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
+class SvcHelperRuns(unittest.TestCase):
+    """`yuzu-svc-helper`, run with systemctl and launchctl replaced by stubs that print their
+    arguments. Every accepted shape reproduces its exact argument list; everything else exits
+    non-zero having run nothing. Run under each POSIX shell found (sh, dash, bash): the helper must
+    not depend on a bash extension."""
+
+    VERBS = ("enable", "disable", "mask", "unmask")
+    NAMES = ("cron.service", "getty@tty1.service", "-foo", "a", "a" * 256, "A.b_c-d@e", "0", "--now",
+             "com.apple.something", "-")
+    REFUSED_LINE = b"yuzu-svc-helper: refused\n"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_svchelper_")
+        d = cls.tmp.name
+        text = svc_helper_text()
+        code = code_lines(text)
+        assert code.count("/usr/bin/systemctl") == 2 and code.count("/bin/launchctl") == 2, \
+            "the helper names each tool path only as its exec target"
+
+        def stub(name):
+            path = os.path.join(d, name)
+            with open(path, "w") as f:
+                f.write("#!/bin/sh\nprintf 'RAN %s\\n' \"${0##*/}\"\nfor a; do printf '%s\\n' \"$a\"; done\n")
+            os.chmod(path, 0o755)
+            return path
+
+        primary, fallback, launchctl = stub("stub-systemctl-usr"), stub("stub-systemctl-bin"), stub("stub-launchctl")
+        missing = os.path.join(d, "no-such-systemctl")
+
+        def build(name, usr_bin, bin_):
+            # /usr/bin/systemctl first: /bin/systemctl is a substring of it
+            t = text.replace("/usr/bin/systemctl", usr_bin).replace("/bin/systemctl", bin_)
+            t = t.replace("/bin/launchctl", launchctl)
+            path = os.path.join(d, name)
+            with open(path, "w") as f:
+                f.write(t)
+            return path
+
+        cls.path = build("yuzu-svc-helper", primary, fallback)
+        cls.path_no_primary = build("yuzu-svc-helper-fallback", missing, fallback)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def run_helper(self, shell, args, path=None, env=None):
+        return subprocess.run([shell, path or self.path, *args], capture_output=True, timeout=30, env=env)
+
+    def run_each(self, jobs, path=None):
+        def one(job):
+            return self.run_helper(job[0], job[1], path)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return list(pool.map(one, jobs))
+
+    def test_the_helper_passes_a_syntax_check_under_every_shell(self):
+        for shell in available_shells():
+            r = subprocess.run([shell, "-n", self.path], capture_output=True, text=True, timeout=30)
+            self.assertEqual((r.returncode, r.stderr), (0, ""), shell)
+
+    def test_systemctl_runs_with_the_verb_then_double_dash_then_the_name(self):
+        jobs = [(sh, ["systemctl", v, n]) for sh in available_shells() for v in self.VERBS for n in self.NAMES]
+        for (sh, args), r in zip(jobs, self.run_each(jobs)):
+            want = ("RAN stub-systemctl-usr\n%s\n--\n%s\n" % (args[1], args[2])).encode()
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, b""), (sh, args))
+
+    def test_systemctl_falls_back_to_the_other_path_only_when_the_first_is_not_executable(self):
+        jobs = [(sh, ["systemctl", v, "cron.service"]) for sh in available_shells() for v in self.VERBS]
+        for (sh, args), r in zip(jobs, self.run_each(jobs, self.path_no_primary)):
+            want = ("RAN stub-systemctl-bin\n%s\n--\ncron.service\n" % args[1]).encode()
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, b""), (sh, args))
+
+    def test_launchctl_runs_with_the_verb_and_the_system_target(self):
+        jobs = [(sh, ["launchctl", v, n]) for sh in available_shells() for v in ("enable", "disable")
+                for n in self.NAMES]
+        for (sh, args), r in zip(jobs, self.run_each(jobs)):
+            want = ("RAN stub-launchctl\n%s\nsystem/%s\n" % (args[1], args[2])).encode()
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, b""), (sh, args))
+
+    def test_a_name_that_is_option_shaped_is_one_argument_after_the_double_dash(self):
+        for sh in available_shells():
+            r = self.run_helper(sh, ["systemctl", "enable", "--now"])
+            self.assertEqual(r.stdout, b"RAN stub-systemctl-usr\nenable\n--\n--now\n", sh)
+
+    def refused(self, args, label=None, path=None):
+        jobs = [(sh, list(args)) for sh in available_shells()]
+        for (sh, a), r in zip(jobs, self.run_each(jobs, path)):
+            self.assertNotEqual(r.returncode, 0, (sh, label or a))
+            self.assertEqual(r.stdout, b"", (sh, label or a, "a tool ran"))
+            self.assertEqual(r.stderr, self.REFUSED_LINE, (sh, label or a))
+
+    def test_a_name_outside_the_class_or_the_length_runs_nothing(self):
+        bad = ["a" * 257, "a" * 300, "", "/", "a/b", "system/foo", "a b", " a", "a ", "--root=/x", "a=b", "a;b",
+               "a|b", "a&b", "a$b", "$x", "`x`", "$(x)", "a\nb", "\nfoo", "foo\n", "a\tb", "a*", "*", "?", "[a]", "{a}",
+               "a\\b", "a'b", 'a"b', "a,b", "a:b", "é", "!", "~", "#", "%", "+",
+               "/Library/LaunchDaemons/x.plist", "../x", "x/../y", "a\r"]
+        for tool, verb in (("systemctl", "enable"), ("systemctl", "mask"), ("launchctl", "enable"),
+                           ("launchctl", "disable")):
+            for name in bad:
+                self.refused([tool, verb, name], (tool, verb, name))
+
+    def test_a_verb_outside_the_granted_ones_runs_nothing(self):
+        for verb in ("start", "stop", "restart", "reload", "edit", "link", "daemon-reload", "set-default", "kill",
+                     "preset", "revoke", "is-enabled", "status", "cat", "show", "list-units", "poweroff", "reboot",
+                     "isolate", "import-environment", "ENABLE", "Enable", "enable ", " enable", "--help", "-h", "",
+                     "--root=/x", "--now", "--system", "-t", "enable;", "disable|", "mask\n"):
+            self.refused(["systemctl", verb, "cron.service"], ("systemctl", verb))
+        for verb in ("bootstrap", "bootout", "kickstart", "kill", "load", "unload", "print", "print-disabled",
+                     "list", "submit", "remove", "start", "stop", "blame", "reboot", "ENABLE", "mask", "unmask",
+                     "enable ", "", "--help"):
+            self.refused(["launchctl", verb, "com.example.agent"], ("launchctl", verb))
+
+    def test_a_verb_of_the_other_family_runs_nothing(self):
+        # mask and unmask are systemctl's; launchd has no such state
+        self.refused(["launchctl", "mask", "com.example.agent"])
+        self.refused(["launchctl", "unmask", "com.example.agent"])
+
+    def test_the_argument_count_is_exactly_three(self):
+        calls = [[], ["systemctl"], ["systemctl", "enable"], ["launchctl", "enable"],
+                 ["systemctl", "enable", "cron.service", "extra"], ["systemctl", "enable", "cron.service", "--now"],
+                 ["systemctl", "enable", "--now", "cron.service"], ["systemctl", "--now", "enable", "cron.service"],
+                 ["systemctl", "enable", "cron.service", ""], ["launchctl", "enable", "x", "y"],
+                 ["launchctl", "enable", "x", "system/y"], ["systemctl", "enable", "-- ", "cron.service"],
+                 ["systemctl", "enable", "a", "b", "c", "d"], ["", "", ""], ["systemctl", "", ""]]
+        for c in calls:
+            self.refused(c)
+
+    def test_another_tool_family_runs_nothing(self):
+        for family in ("service", "sc", "rc-service", "init", "sudo", "sh", "bash", "rm", "systemctl ", " systemctl",
+                       "SYSTEMCTL", "Systemctl", "launchctl ", "/usr/bin/systemctl", "/bin/launchctl", "systemd",
+                       "journalctl", "loginctl", "iptables", "nft", "pfctl", ""):
+            self.refused([family, "enable", "cron.service"], family)
+
+    def test_the_environment_cannot_change_what_runs(self):
+        env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent",
+                   LC_ALL="en_US.UTF-8")
+        for sh in available_shells():
+            r = self.run_helper(sh, ["systemctl", "disable", "cron.service"], env=env)
+            self.assertEqual((r.returncode, r.stdout), (0, b"RAN stub-systemctl-usr\ndisable\n--\ncron.service\n"), sh)
+            r = self.run_helper(sh, ["launchctl", "disable", "com.example.agent"], env=env)
+            self.assertEqual((r.returncode, r.stdout), (0, b"RAN stub-launchctl\ndisable\nsystem/com.example.agent\n"), sh)
+
+    def test_a_glob_in_the_working_directory_is_never_expanded(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_svchelper_") as d:
+            for n in ("a", "b"):
+                open(os.path.join(d, n), "w").close()
+            for sh in available_shells():
+                r = subprocess.run([sh, self.path, "systemctl", "enable", "*"], capture_output=True, timeout=30, cwd=d)
+                self.assertNotEqual(r.returncode, 0, sh)
+                self.assertEqual(r.stdout, b"", sh)
+
+    def test_the_name_is_checked_before_the_tool_or_the_verb(self):
+        """A bad name is refused whatever the other arguments are: nothing about the tool is read first."""
+        for args in (["systemctl", "start", "a b"], ["launchctl", "bootout", "a/b"], ["nonsense", "x", "a;b"]):
+            self.refused(args)
 
 
 @unittest.skipIf(sys.platform == "win32", "runs the installer's function under bash")
@@ -900,48 +1454,173 @@ class HelperDirectoryVerdict(unittest.TestCase):
 
     def test_the_installer_and_the_check_apply_it(self):
         text = read_text(INSTALLER)
-        install = text[text.index("install_fw_helper() {"):text.index("remove_fw_helper() {")]
-        self.assertLess(install.index("check_fw_dir"), install.index("mktemp"))      # stop before writing
-        check = text[text.index("check_fw_helper() {"):text.index("# ── linux capabilities")]
-        self.assertIn("check_fw_dir", check)
+        install = text[text.index("install_helper() {"):text.index("install_helpers() {")]
+        self.assertLess(install.index("check_helper_dir"), install.index("mktemp"))      # stop before writing
+        check = text[text.index("check_helper() {"):text.index("check_helpers() {")]
+        self.assertIn("check_helper_dir", check)
+
+    def test_the_stat_form_is_chosen_by_platform_never_by_trying_one_after_the_other(self):
+        """On GNU stat `-f` means file-system status, so a `stat -f ... || stat -c ...` chain would
+        take the first answer on Linux and it would be the wrong one."""
+        text = read_text(INSTALLER)
+        for fn in ("dir_info() {", "file_owner_mode() {"):
+            body = text[text.index(fn):]
+            body = body[:body.index("\n}\n")]
+            self.assertIn('[[ "$PLATFORM" == "macos" ]]', body, fn)
+            self.assertNotRegex(body, r"stat[^\n]*\|\|", fn)
+        self.assertIn("stat -L -f '%u %Lp %Sg'", text)
         self.assertIn("stat -L -c '%u %a %G'", text)
+        self.assertIn("stat -f '%Su:%Sg %Lp'", text)
+        self.assertIn("stat -c '%U:%G %a'", text)
 
 
 @unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
-class InstallerDryRunOnLinux(unittest.TestCase):
-    """The installer's Linux branch, under `--dry-run` with a `uname` that says Linux (a dry run
-    only prints): the helper is written BEFORE the sudoers file, is the text the heredoc holds,
-    and `--no-sudoers` skips both."""
+class RenderedSudoers(unittest.TestCase):
+    """The sudoers text the installer renders for each platform (`--dry-run` with a `uname` that says
+    so). No grant line takes a wildcard: a helper named with no argument, or a fixed command, or on
+    macOS the 24 `pfctl -X` lines that pin the release token's length one bracket class per digit."""
 
-    def dry_run(self, *extra):
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_") as d:
-            shim = os.path.join(d, "uname")
-            with open(shim, "w") as f:
-                f.write('#!/bin/sh\ncase "$1" in -s) echo Linux ;; *) /usr/bin/uname "$@" ;; esac\n')
-            os.chmod(shim, 0o755)
-            env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
-            r = subprocess.run(["bash", os.path.join(REPO, INSTALLER), "--dry-run", *extra],
-                               capture_output=True, text=True, timeout=60, env=env)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        return r.stdout
+    HELPERS = {
+        "linux": ("/usr/local/sbin/yuzu-fw-helper", "/usr/local/sbin/yuzu-svc-helper", "yuzu"),
+        "macos": ("/Library/PrivilegedHelperTools/yuzu-fw-helper", "/Library/PrivilegedHelperTools/yuzu-svc-helper",
+                  "_yuzu"),
+    }
 
-    def test_the_helper_is_printed_before_the_sudoers_file_and_is_the_heredoc_text(self):
-        out = self.dry_run()
-        helper_marker = "[dry-run] would write the following to /usr/local/sbin/yuzu-fw-helper (root:root 0755):"
-        sudoers_marker = "[dry-run] would write the following to /etc/sudoers.d/yuzu-agent:"
-        self.assertIn(helper_marker, out)
-        self.assertIn(sudoers_marker, out)
-        self.assertLess(out.index(helper_marker), out.index(sudoers_marker))
-        printed = out[out.index(helper_marker) + len(helper_marker) + 1:out.index(sudoers_marker)]
-        lines = [l[len("[dry-run]   "):] for l in printed.splitlines() if l.startswith("[dry-run]   ")]
-        self.assertEqual("\n".join(lines) + "\n", helper_text())
-        self.assertIn("[dry-run]   yuzu ALL=(root) NOPASSWD: /usr/local/sbin/yuzu-fw-helper\n", out)
-        self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables")
+    @classmethod
+    def setUpClass(cls):
+        cls.grants = {p: rendered_grants(p) for p in cls.HELPERS}
+        cls.text = {p: rendered_sudoers(p) for p in cls.HELPERS}
 
-    def test_no_sudoers_skips_the_helper_too(self):
-        out = self.dry_run("--no-sudoers")
-        self.assertNotIn("yuzu-fw-helper", out)
-        self.assertNotIn("/etc/sudoers.d/yuzu-agent:", out)
+    def test_the_helper_lines_are_exactly_the_helper_with_no_argument_and_no_wildcard(self):
+        for platform, (fw, svc, acct) in self.HELPERS.items():
+            lines = self.grants[platform]
+            self.assertEqual([l for l in lines if "yuzu-fw-helper" in l],
+                             ["%s ALL=(root) NOPASSWD: %s" % (acct, fw)], platform)
+            self.assertEqual([l for l in lines if "yuzu-svc-helper" in l],
+                             ["%s ALL=(root) NOPASSWD: %s" % (acct, svc)], platform)
+
+    def test_no_grant_line_has_a_star_or_a_question_mark(self):
+        for platform, lines in self.grants.items():
+            self.assertGreater(len(lines), 5, platform)
+            for g in lines:
+                self.assertNotIn("*", g, (platform, g))
+                self.assertNotIn("?", g, (platform, g))
+
+    def test_no_grant_line_names_systemctl_launchctl_or_security(self):
+        for platform, lines in self.grants.items():
+            for g in lines:
+                self.assertNotRegex(g, r"\b(?:systemctl|launchctl|security)\b", (platform, g))
+            # the sudoers text does not grant them in a comment either
+            for l in self.text[platform].splitlines():
+                if not l.lstrip().startswith("#"):
+                    self.assertNotRegex(l, r"\b(?:systemctl|launchctl|security)\b", (platform, l))
+
+    def test_a_bracket_class_appears_only_on_the_pfctl_release_lines_and_there_are_24(self):
+        self.assertEqual([g for g in self.grants["linux"] if "[" in g], [])
+        mac = self.grants["macos"]
+        self.assertEqual([g for g in mac if "[" in g and "/sbin/pfctl -X " not in g], [])
+        cls = "[0123456789]"
+        want = ["_yuzu ALL=(root) NOPASSWD: /sbin/pfctl -X " + cls * n for n in range(1, 25)]
+        self.assertEqual([g for g in mac if "/sbin/pfctl -X" in g], want)
+        # the n-th line ends after its n classes, and no line has a character class of anything else
+        for g in mac:
+            if "[" in g:
+                self.assertRegex(g, r"^_yuzu ALL=\(root\) NOPASSWD: /sbin/pfctl -X (?:\[0123456789\]){1,24}$")
+
+    def test_no_pfctl_line_has_a_wildcard_and_there_is_no_bare_pfctl(self):
+        for g in self.grants["macos"]:
+            if "pfctl" in g:
+                self.assertNotIn("*", g)
+                self.assertNotIn("?", g)
+        self.assertEqual([g for g in self.grants["macos"] if re.search(r"NOPASSWD:\s*/sbin/pfctl\s*$", g)], [])
+        self.assertEqual([g for g in self.grants["macos"] if re.search(r"pfctl.* -f\b", g)], [],
+                         "no pfctl grant takes a file name; the helper loads the anchor")
+        self.assertEqual([g for g in self.grants["linux"] if "pfctl" in g], [])
+
+    def test_the_whole_grant_list_per_platform(self):
+        cls = "[0123456789]"
+        lin = ["yuzu ALL=(root) NOPASSWD: /usr/local/sbin/yuzu-fw-helper",
+               "yuzu ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet yuzu_quarantine",
+               "yuzu ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine",
+               "yuzu ALL=(root) NOPASSWD: /usr/local/sbin/yuzu-svc-helper",
+               "yuzu ALL=(root) NOPASSWD: /usr/bin/systemd-resolve --flush-caches",
+               "yuzu ALL=(root) NOPASSWD: /usr/bin/resolvectl flush-caches"]
+        self.assertEqual(self.grants["linux"], lin)
+        p = "_yuzu ALL=(root) NOPASSWD: "
+        mac = ([p + "/Library/PrivilegedHelperTools/yuzu-fw-helper", p + "/sbin/pfctl -E"]
+               + [p + "/sbin/pfctl -X " + cls * n for n in range(1, 25)]
+               + [p + "/sbin/pfctl -a com.apple/000.yuzu_quarantine -F rules",
+                  p + "/sbin/pfctl -a com.apple/000.yuzu_quarantine -F nat",
+                  p + "/sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules",
+                  p + "/sbin/pfctl -a com.apple -s Anchors",
+                  p + "/sbin/pfctl -F states",
+                  p + "/sbin/pfctl -s info",
+                  p + "/sbin/pfctl -s rules",
+                  p + "/sbin/pfctl -s References",
+                  p + "/Library/PrivilegedHelperTools/yuzu-svc-helper",
+                  p + "/usr/bin/dscacheutil -flushcache",
+                  p + "/usr/bin/killall -HUP mDNSResponder"])
+        self.assertEqual(self.grants["macos"], mac)
+
+    @unittest.skipUnless(shutil.which("visudo"), "visudo is not installed")
+    def test_visudo_accepts_the_rendered_text_of_each_platform(self):
+        for platform, text in self.text.items():
+            with tempfile.TemporaryDirectory(prefix="yuzu_test_sudoers_") as d:
+                path = os.path.join(d, "yuzu-agent")
+                with open(path, "w") as f:
+                    f.write(text)
+                r = subprocess.run(["visudo", "-cf", path], capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 0, (platform, r.stdout, r.stderr))
+
+    def test_the_comments_say_what_the_grants_are_and_that_the_installer_is_rerun(self):
+        for platform, text in self.text.items():
+            self.assertIn("installer is re-run", text, platform)
+            self.assertNotRegex(text, r"(?i)exploit|root-equivalent|vulnerab", platform)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
+class InstallerDryRun(unittest.TestCase):
+    """The installer under `--dry-run` with a `uname` that says each platform (a dry run only
+    prints): both helpers are written BEFORE the sudoers file, each is the text its heredoc holds,
+    and `--no-sudoers` skips all three."""
+
+    PLATFORMS = {
+        "linux": ("root", "/usr/local/sbin/yuzu-fw-helper", "/usr/local/sbin/yuzu-svc-helper"),
+        "macos": ("wheel", "/Library/PrivilegedHelperTools/yuzu-fw-helper",
+                  "/Library/PrivilegedHelperTools/yuzu-svc-helper"),
+    }
+
+    def markers(self, platform):
+        group, fw, svc = self.PLATFORMS[platform]
+        return ("[dry-run] would write the following to %s (root:%s 0755):" % (fw, group),
+                "[dry-run] would write the following to %s (root:%s 0755):" % (svc, group),
+                "[dry-run] would write the following to /etc/sudoers.d/yuzu-agent:")
+
+    def test_both_helpers_are_printed_before_the_sudoers_file_and_are_the_heredoc_texts(self):
+        for platform in self.PLATFORMS:
+            out = render_installer(platform)
+            fw_marker, svc_marker, sudoers_marker = self.markers(platform)
+            for m in (fw_marker, svc_marker, sudoers_marker):
+                self.assertEqual(out.count(m), 1, (platform, m))
+            self.assertLess(out.index(fw_marker), out.index(sudoers_marker), platform)
+            self.assertLess(out.index(svc_marker), out.index(sudoers_marker), platform)
+            self.assertEqual(rendered_section(out, fw_marker), helper_text(), platform)
+            self.assertEqual(rendered_section(out, svc_marker), svc_helper_text(), platform)
+
+    def test_no_sudoers_skips_both_helpers_and_the_sudoers_file(self):
+        for platform in self.PLATFORMS:
+            out = render_installer(platform, "--no-sudoers")
+            self.assertNotIn("yuzu-fw-helper", out, platform)
+            self.assertNotIn("yuzu-svc-helper", out, platform)
+            self.assertNotIn("/etc/sudoers.d/yuzu-agent:", out, platform)
+
+    def test_the_sudoers_file_names_the_helpers_it_was_rendered_with(self):
+        for platform, (group, fw, svc) in self.PLATFORMS.items():
+            out = render_installer(platform)
+            acct = "yuzu" if platform == "linux" else "_yuzu"
+            self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, fw), out, platform)
+            self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, svc), out, platform)
+            self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables", platform)
 
 
 class PatternSelfTest(unittest.TestCase):

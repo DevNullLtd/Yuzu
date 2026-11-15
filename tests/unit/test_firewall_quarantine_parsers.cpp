@@ -1961,6 +1961,134 @@ TEST_CASE("pf anchor ruleset: no nat/rdr, lo0, stateless control channel, block 
           v6text.npos);
 }
 
+namespace {
+
+// The anchor ruleset pf_anchor_ruleset emits for a set that uses every rule form. tests/
+// test_legacy_quarantine_plugin_removed_lexical.py reads this literal out of this file and runs it
+// through the helper's `pf load` with a stub for pfctl: the helper must hand the stub exactly this
+// text, byte for byte, so the two grammars cannot drift apart.
+constexpr std::string_view kGoldenPfRuleset = R"PFGOLDEN(no nat all
+no rdr all
+pass quick on lo0 all no state
+pass out quick inet proto tcp from any to 198.51.100.7 port 50051 no state
+pass in quick inet proto tcp from 198.51.100.7 port 50051 to any no state
+pass out quick inet6 proto tcp from any to 2001:db8::7 port 50051 no state
+pass in quick inet6 proto tcp from 2001:db8::7 port 50051 to any no state
+pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 keep state
+pass in quick inet proto udp from any port 67 to any port 68 keep state
+pass out quick inet proto udp from any to 203.0.113.53 port 53 keep state
+pass out quick inet proto tcp from any to 203.0.113.53 port 53 keep state
+pass out quick inet6 proto udp from any to 2001:4860:4860::8888 port 53 keep state
+pass out quick inet6 proto tcp from any to 2001:4860:4860::8888 port 53 keep state
+pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } no state
+pass in quick inet proto tcp from 10.0.0.5 to any port 22 keep state
+pass out quick inet proto tcp from any to 10.0.0.6 port 443 keep state
+pass out quick inet proto udp from any to 10.0.0.7 keep state
+pass in quick inet proto tcp from 10.0.0.8 to any keep state
+pass out quick inet proto udp from any to 10.1.0.0/16 port 53 keep state
+pass in quick inet6 proto tcp from 2001:db8::/32 to any port 443 keep state
+pass out quick inet6 proto udp from any to 2001:db8::7 port 8443 keep state
+pass out quick inet6 proto tcp from any to 2001:db8::9 keep state
+pass in quick inet proto udp from 10.0.0.11 to any port 5353 keep state
+pass in quick inet6 proto udp from 2001:db8::b to any keep state
+pass in quick inet proto tcp from 0.0.0.0/0 to any port 65535 keep state
+block drop quick all
+)PFGOLDEN";
+
+AllowSet pf_golden_set() {
+    auto b = build_allow_set("198.51.100.7,2001:db8::7", "198.51.100.7:50051",
+                             {"203.0.113.53", "2001:4860:4860::8888"},
+                             {ex("10.0.0.5:22/tcp/in"), ex("10.0.0.6:443/tcp/out"), ex("10.0.0.7/udp"),
+                              ex("10.0.0.8/tcp/in"), ex("10.1.0.0/16:53/udp/out"),
+                              ex("[2001:db8::]/32:443/tcp/in"), ex("[2001:db8::7]:8443/udp/out"),
+                              ex("[2001:db8::9]/tcp"), ex("10.0.0.11:5353/udp/in"),
+                              ex("[2001:db8::b]/udp/in"), ex("0.0.0.0/0:65535/tcp/in")});
+    REQUIRE(b.has_value());
+    return *b;
+}
+
+} // namespace
+
+TEST_CASE("pf_anchor_ruleset: the golden text covers every rule form the helper must accept",
+          "[agent][firewall_quarantine][sudoers]") {
+    const auto text = pf_anchor_ruleset(pf_golden_set());
+    CHECK(text == kGoldenPfRuleset);
+    // the forms, so a change to the set cannot quietly drop one from the golden
+    for (const char* form : {
+             "no nat all\nno rdr all\npass quick on lo0 all no state\n",
+             "pass out quick inet proto tcp from any to 198.51.100.7 port 50051 no state\n",
+             "pass in quick inet proto tcp from 198.51.100.7 port 50051 to any no state\n",
+             "pass out quick inet6 proto tcp from any to 2001:db8::7 port 50051 no state\n",
+             "pass in quick inet6 proto tcp from 2001:db8::7 port 50051 to any no state\n",
+             "pass out quick inet proto udp from any port 68 to 255.255.255.255 port 67 keep state\n",
+             "pass in quick inet proto udp from any port 67 to any port 68 keep state\n",
+             "pass quick inet6 proto icmp6 icmp6-type { 133, 134, 135, 136 } no state\n",
+             "pass out quick inet proto udp from any to 203.0.113.53 port 53 keep state\n",
+             "pass out quick inet6 proto tcp from any to 2001:4860:4860::8888 port 53 keep state\n",
+             "pass out quick inet proto udp from any to 10.0.0.7 keep state\n",
+             "pass in quick inet proto tcp from 10.0.0.8 to any keep state\n",
+             "pass in quick inet proto tcp from 10.0.0.5 to any port 22 keep state\n",
+             "pass out quick inet proto udp from any to 10.1.0.0/16 port 53 keep state\n",
+             "pass in quick inet6 proto tcp from 2001:db8::/32 to any port 443 keep state\n",
+             "pass in quick inet6 proto udp from 2001:db8::b to any keep state\n",
+             "pass in quick inet proto tcp from 0.0.0.0/0 to any port 65535 keep state\n"})
+        CHECK(text.find(form) != text.npos);
+    CHECK(text.ends_with("block drop quick all\n"));
+}
+
+TEST_CASE("the helper's pf load: the argv, and the largest allow set inside its line caps",
+          "[agent][firewall_quarantine][sudoers]") {
+    const std::string path = "/Library/Application Support/Yuzu/firewall-staging/yuzu-fwq-AbC123.pf";
+    const auto argv = pf_helper_load_argv(path);
+    CHECK(argv == Argv{"/Library/PrivilegedHelperTools/yuzu-fw-helper", "pf", "load", path});
+    CHECK(argv.front() == kFwHelperPathMacos);
+    CHECK(kFwHelperPathMacos != kFwHelperPath);
+    // a staged path is the one token outside the strict charset, and it must be the last
+    {
+        int ran = 0;
+        const Runner run = [&](const Argv&, std::chrono::milliseconds) {
+            ++ran;
+            return done(0);
+        };
+        Deadline dl;
+        detail::Exec ex(run, dl);
+        const StagedFile staged{path, nullptr, "/Library/Application Support/Yuzu/firewall-staging"};
+        CHECK(ex.call_staged(argv, staged));
+        CHECK(ran == 1);
+        const StagedFile elsewhere{path, nullptr, "/tmp"};
+        CHECK_FALSE(ex.call_staged(argv, elsewhere));
+        CHECK(ran == 1);
+    }
+
+    // The helper reads at most 512 lines of at most 512 characters, 262145 bytes in all. The
+    // largest set build_allow_set admits (32 control endpoints, 8 resolvers, 64 two-protocol
+    // exceptions, all IPv6) stays well inside.
+    std::string csv;
+    for (int i = 1; i <= 32; ++i)
+        csv += std::format("{}2001:db8:{:x}:1:2:3:4:5", i > 1 ? "," : "", i);
+    std::vector<std::string> resolvers;
+    for (int i = 1; i <= 8; ++i)
+        resolvers.push_back(std::format("2001:4860:{:x}:1:2:3:4:5", i));
+    std::vector<Endpoint> many;
+    for (int i = 0; i < 64; ++i)
+        many.push_back(ex(std::format("[2001:db8:ffff:{:x}:2:3:4:5]/128:{}/{}", i + 1, 40000 + i,
+                                      i % 2 ? "in" : "out")));
+    const auto big = build_allow_set(csv, "server.example.com:50051", resolvers, many);
+    REQUIRE(big);
+    CHECK(big->control.size() == kMaxControlIps);
+    CHECK(big->resolvers.size() == kMaxResolvers);
+    CHECK(big->exceptions.size() == kMaxExceptions);
+    const auto text = pf_anchor_ruleset(*big);
+    CHECK(text.size() <= 512u * 512u);
+    const auto parts = detail::split(text, '\n'); // the last part is the empty tail after the final newline
+    REQUIRE(parts.size() >= 2);
+    CHECK(parts.back().empty());
+    CHECK(parts.size() - 1 <= 512);
+    for (const auto line : parts)
+        CHECK(line.size() <= 512);
+    CHECK(text.ends_with("block drop quick all\n"));
+}
+
 TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, nothing global",
           "[agent][firewall_quarantine]") {
     // pf evaluates com.apple/* sub-anchors in name order; 200.AirDrop and
@@ -1971,6 +2099,8 @@ TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, no
     CHECK(is_safe_token(kPfAnchor));
 
     CHECK(join(pfctl_load_argv("/tmp/x.pf")) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -f /tmp/x.pf");
+    CHECK(join(pf_helper_load_argv("/tmp/x.pf")) ==
+          "/Library/PrivilegedHelperTools/yuzu-fw-helper pf load /tmp/x.pf");
     CHECK(join(pfctl_flush_states_argv()) == "/sbin/pfctl -F states");
     CHECK(join(pfctl_references_argv()) == "/sbin/pfctl -s References");
     CHECK(join(pfctl_release_argv("123456")) == "/sbin/pfctl -X 123456");
@@ -1982,7 +2112,8 @@ TEST_CASE("pfctl argv: the anchor sorts first, flush is scoped to our anchor, no
     CHECK(join(pfctl_rules_argv()) == "/sbin/pfctl -s rules");
     CHECK(join(pfctl_anchor_rules_argv()) == "/sbin/pfctl -a com.apple/000.yuzu_quarantine -s rules");
     CHECK(join(pfctl_siblings_argv()) == "/sbin/pfctl -a com.apple -s Anchors");
-    for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pfctl_flush_states_argv(), pfctl_references_argv(),
+    for (const auto& a : {pfctl_load_argv("/tmp/x.pf"), pf_helper_load_argv("/tmp/x.pf"),
+                          pfctl_flush_states_argv(), pfctl_references_argv(),
                           pfctl_release_argv("123456"), pfctl_enable_argv(),
                           pfctl_flush_anchor_rules_argv(), pfctl_flush_anchor_nat_argv(), pfctl_info_argv(),
                           pfctl_rules_argv(), pfctl_anchor_rules_argv(), pfctl_siblings_argv()})
@@ -3828,7 +3959,8 @@ struct PfWorld {
     std::string stage_dir = "/tmp";      // the private staging directory the Stage reports
     std::string record_at_enable, record_at_load, record_at_flush;
     Crash crash;
-    std::vector<Argv> log;
+    std::vector<Argv> log;  // the pfctl command each call stands for
+    std::vector<Argv> sent; // what the leg really sent
 
     void external_disable() { // someone ran `pfctl -d`
         pf_on = false;
@@ -3936,15 +4068,26 @@ struct PfWorld {
         return done(1, "unexpected argv: " + cmd);
     }
 
+    /// An anchor load reaches the runner as the root-owned helper's argv (`<helper> pf load
+    /// <file>`, a non-root agent) or as `pfctl -a <anchor> -f <file>` (a root agent). The runner
+    /// takes both, checks the helper form is exactly pf_helper_load_argv, and hands the world the
+    /// pfctl command it stands for, so `log` and every assertion on the order of the calls read
+    /// the same in either mode. `sent` keeps what the leg really sent.
     Runner runner() {
         return [this](const Argv& a, std::chrono::milliseconds) {
             ++crash.calls;
-            log.push_back(a);
+            sent.push_back(a);
+            Argv plan = a;
+            if (a[0] == kFwHelperPathMacos) {
+                REQUIRE(a == pf_helper_load_argv(a.back()));
+                plan = pfctl_load_argv(a.back());
+            }
+            log.push_back(plan);
             if (clock)
                 clock->advance(per_call);
             if (crash.calls == crash.crash_at && !crash.after_effect)
                 throw CrashSim{};
-            auto r = effect(a);
+            auto r = effect(plan);
             if (crash.calls == crash.crash_at && crash.after_effect)
                 throw CrashSim{};
             return r;
@@ -3980,13 +4123,14 @@ struct PfRig {
     std::int64_t now = 1'700'000'000;
     Env env;
 
-    PfRig()
+    explicit PfRig(ToolAccess access = ToolAccess::direct)
         : leg(world.runner(), world.stage(),
               [this]() -> std::optional<std::string> {
                   if (!boot_readable)
                       return std::nullopt;
                   return world.boot;
-              }),
+              },
+              access),
           env{leg, store, probe.fn(), [this] { return now; }} {
         world.clock = &clock;
         world.record = [this] { return store.raw; };
@@ -4004,6 +4148,52 @@ struct PfRig {
 };
 
 } // namespace
+
+TEST_CASE("the pf leg: a non-root agent loads through the helper, a root agent runs pfctl itself",
+          "[agent][firewall_quarantine][sudoers]") {
+    for (const auto access : {ToolAccess::helper, ToolAccess::direct}) {
+        PfRig rig(access);
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(kProbeTarget, 120), dl);
+        REQUIRE(o.status == "active");
+        // the staged file is the pattern the helper accepts: stem and suffix
+        const std::string path = "/tmp/yuzu-fwq-pf-1.pf";
+        std::size_t loads = 0;
+        for (const auto& a : rig.world.sent) {
+            const bool is_load = a.size() == 4 ? a[0] == kFwHelperPathMacos : (a.size() == 5 && a[3] == "-f");
+            if (!is_load)
+                continue;
+            ++loads;
+            if (access == ToolAccess::helper)
+                CHECK(a == Argv{"/Library/PrivilegedHelperTools/yuzu-fw-helper", "pf", "load", path});
+            else
+                CHECK(a == Argv{"/sbin/pfctl", "-a", "com.apple/000.yuzu_quarantine", "-f", path});
+        }
+        CHECK(loads == 1);
+        CHECK(rig.world.anchor_text == pf_anchor_ruleset(make_set()));
+        // nothing else changes with the mode: the load is the only call that goes through the helper
+        REQUIRE(rig.world.sent.size() == rig.world.log.size());
+        std::size_t via_helper = 0;
+        for (const auto& a : rig.world.sent)
+            if (a.front() == kFwHelperPathMacos)
+                ++via_helper;
+        CHECK(via_helper == (access == ToolAccess::helper ? 1u : 0u));
+        // the enable reference is given back with the same `pfctl -X <token>` in both modes
+        const auto token = rig.token();
+        REQUIRE_FALSE(token.empty());
+        const auto rm = release(rig.env, ReleaseRequest{}, dl);
+        CHECK(rm.status == "inactive");
+        std::size_t releases = 0;
+        for (const auto& a : rig.world.sent)
+            if (a.size() == 3 && a[1] == "-X") {
+                ++releases;
+                CHECK(a == pfctl_release_argv(token));
+                CHECK(a == Argv{"/sbin/pfctl", "-X", token});
+            }
+        CHECK(releases == 1);
+        CHECK(rig.world.tokens.empty());
+    }
+}
 
 TEST_CASE("pf: apply order -- reference, siblings, load, then the state flush; token recorded first",
           "[agent][firewall_quarantine]") {
@@ -4932,6 +5122,23 @@ TEST_CASE("pf: a staging directory with a space applies; an unusable staged path
             }
         CHECK(loaded); // the spaced path travelled as ONE argv element
     }
+    SECTION("the same directory through the helper: the spaced path is still ONE argv element") {
+        PfRig rig(ToolAccess::helper);
+        rig.world.stage_dir = "/Library/Application Support/Yuzu/firewall-staging";
+        auto dl = rig.dl();
+        const auto o = apply_and_verify(rig.env, rig.request(), dl);
+        CHECK(o.status == "active");
+        CHECK(rig.world.anchor_exists);
+        bool loaded = false;
+        for (const auto& a : rig.world.sent)
+            if (a.size() == 4 && a[0] == kFwHelperPathMacos) {
+                loaded = true;
+                CHECK(a[1] == "pf");
+                CHECK(a[2] == "load");
+                CHECK(a[3].starts_with("/Library/Application Support/Yuzu/firewall-staging/"));
+            }
+        CHECK(loaded);
+    }
     SECTION("a staged path outside its directory is refused before pfctl -E takes a reference") {
         PfWorld w;
         FakeStore store;
@@ -4940,7 +5147,8 @@ TEST_CASE("pf: a staging directory with a space applies; an unusable staged path
                              std::string_view) -> std::optional<StagedFile> {
             return StagedFile{"/etc/passwd", nullptr, "/tmp"};
         };
-        PfLeg leg(w.runner(), bad, [&]() -> std::optional<std::string> { return w.boot; });
+        PfLeg leg(w.runner(), bad, [&]() -> std::optional<std::string> { return w.boot; },
+                  ToolAccess::direct);
         Deadline dl;
         OsPayload os;
         const auto r = leg.apply(make_set(), 1, 0, os, dl, [](const OsPayload&) { return true; });

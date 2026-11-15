@@ -1182,7 +1182,8 @@ TEST_CASE("live (macOS pf): a failed update keeps the previous generation in for
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     FlakyLoadRunner runner;
-    fq::PfLeg leg(runner.fn(), real_stage(), live_boot_time);
+    // The live run needs root (LIVE_OR_SKIP), and a root agent runs pfctl itself: no helper.
+    fq::PfLeg leg(runner.fn(), real_stage(), live_boot_time, fq::ToolAccess::direct);
     MemStore store;
     fq::Env fenv{leg, store,
                  [](const std::string& ip, int port, std::chrono::milliseconds t) {

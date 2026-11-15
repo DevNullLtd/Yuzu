@@ -94,7 +94,7 @@ This shows why the two families of legs fail differently: Windows has no way to 
 |---|---|---|---|
 | `list` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
 | `running` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
-| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- launchctl enable\|disable' | ✅ supported · rung 2 · runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' |
+| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' | ✅ supported · rung 2 · runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' |
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -102,10 +102,10 @@ This shows why the two families of legs fail differently: Windows has no way to 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account, LocalSystem today (#1442) | `list`/`running`: none beyond the default account. `set_start_mode`: the plugin asks the Service Control Manager for `SC_MANAGER_CONNECT` and the target service for `SERVICE_CHANGE_CONFIG`, so the right is decided by that service's access-control list. The plugin enables or checks no privilege itself; the `SeAssignPrimaryTokenPrivilege` entry in `docs/agent-privilege-model.md` is not exercised by this code. | 2026-09-07, bare-metal, captured as `SYSTEM`; `list` and `running` only, `set_start_mode` stopped at parameter validation | `list`/`running`: a failed `OpenSCManagerW` or `EnumServicesStatusExW` returns an **empty** list with no error and no result status, so a refusal reads like "zero services". A single service whose configuration cannot be opened reports `startup_type` `unknown`. `set_start_mode`: failures are explicit `error\|...` rows (`access denied changing service '<name>'`, `service '<name>' not found`, or the Win32 error code). |
-| macOS | agent daemon, root (the shipped LaunchDaemon has no `UserName` key) | None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grants `/bin/launchctl enable system/*` and `/bin/launchctl disable system/*` (the installed grant also covers `bootstrap`/`bootout`, which this plugin does not use). | 2026-09-07, bare-metal, captured as an unprivileged interactive user, not the root identity the daemon runs under | `list`/`running`: a failed `launchctl list` or `launchctl print-disabled` sets a typed `UNAVAILABLE` or `CONSTRAINED` status through the shared runner seam. `set_start_mode`: a `sudo -n` denial is captured (stderr merged into the output) and appended to the `error\|launchctl command failed for '<name>' (exit=<n>)` line. |
-| Linux | agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`) | `list`/`running`: none. `set_start_mode`: the sudoers grant `systemctl enable`, `disable`, `mask` and `unmask` (`/bin/systemctl` and `/usr/bin/systemctl`); the `sudo -n --` prefix is skipped when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting. | 2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity | `list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing grant surfaces as `error\|systemctl command failed for '<name>' (exit=1): sudo: a password is required`. |
+| macOS | agent daemon, root (the shipped LaunchDaemon has no `UserName` key) | None as root: the `sudo -n --` prefix is skipped when the agent's effective uid is 0. A non-root agent needs the sudoers grant for the root-owned helper `/Library/PrivilegedHelperTools/yuzu-svc-helper` (written by `scripts/install-agent-user.sh`, named in sudoers with no argument and no wildcard), which takes `launchctl enable\|disable <label>` and runs `/bin/launchctl enable\|disable system/<label>` for a label of 1 to 256 letters, digits and `- _ . @`; it runs nothing else. The installer must be re-run on every host provisioned with it (until it has, `set_start_mode` fails on a non-root agent with sudo's own message). | 2026-09-07, bare-metal, captured as an unprivileged interactive user, not the root identity the daemon runs under | `list`/`running`: a failed `launchctl list` or `launchctl print-disabled` sets a typed `UNAVAILABLE` or `CONSTRAINED` status through the shared runner seam. `set_start_mode`: a `sudo -n` denial is captured (stderr merged into the output) and appended to the `error\|launchctl command failed for '<name>' (exit=<n>)` line. |
+| Linux | agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`) | `list`/`running`: none. `set_start_mode`: the sudoers grant for the root-owned helper `/usr/local/sbin/yuzu-svc-helper` (written by `scripts/install-agent-user.sh`, named in sudoers with no argument and no wildcard), which takes `systemctl enable\|disable\|mask\|unmask <unit>` and runs `systemctl <verb> -- <unit>` for a unit name of 1 to 256 letters, digits and `- _ . @`; it runs nothing else. The installer must be re-run on every host provisioned with it. The `sudo -n --` prefix is skipped when the agent is root. Under the packaged unit's `NoNewPrivileges=true`, `sudo` cannot escalate, so this grant takes effect only on a unit without that setting. | 2026-09-06, container, captured as root (`euid 0`), not the deployed unprivileged identity | `list`/`running`: a typed `UNAVAILABLE` or `CONSTRAINED` status; the captured sample shows `subprocess_runner:spawn_error` on both because `systemctl` could not be resolved in the capture container, not because of a permission denial. `set_start_mode`: a missing grant surfaces as `error\|systemctl command failed for '<name>' (exit=1): sudo: a password is required`. |
 
-Binaries and network: Linux runs `systemctl` (`list-units` for reads; `enable`, `disable`, `mask`, `unmask` under `sudo -n --` for the mutation). macOS runs `launchctl` (`list` and `print-disabled` for reads; `enable`, `disable` under `sudo -n --` for the mutation). Both go through the bounded, shell-free runner with a 20 second deadline. Windows uses the Service Control Manager API only, with no subprocess. No network access on any OS.
+Binaries and network: Linux runs `systemctl` (`list-units` for reads; `enable`, `disable`, `mask`, `unmask` through `sudo -n -- /usr/local/sbin/yuzu-svc-helper systemctl` for the mutation, or directly as root). macOS runs `launchctl` (`list` and `print-disabled` for reads; `enable`, `disable` through `sudo -n -- /Library/PrivilegedHelperTools/yuzu-svc-helper launchctl` for the mutation, or directly as root). Both go through the bounded, shell-free runner with a 20 second deadline. Windows uses the Service Control Manager API only, with no subprocess. No network access on any OS.
 
 ## Data contract
 
@@ -173,7 +173,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e724207e0989
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash e117e4e5a791
 
 ```
 == action=list
@@ -214,7 +214,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e724207e0989
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e117e4e5a791
 
 ```
 == action=list
@@ -255,7 +255,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e724207e0989
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e117e4e5a791
 
 ```
 == action=list
