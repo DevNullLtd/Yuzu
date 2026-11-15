@@ -190,6 +190,8 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **New REST route with its MCP twin pending (SAM-17).** `GET /api/v1/inventory/software/components` (components found inside applications: instances, devices, last poll, status) is a REST v1 capability whose MCP twin is built by SAM-21. The ledger keys no row on it: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (it is in `paths`). The pending twin is recorded here so it is not silent, and in the same 2026-11-09 ADR-1005 exception entry (revisit by 2026-12-31).
 
+**New REST routes with their MCP twins pending.** `GET /api/v1/inventory/software/hosts`, `GET /api/v1/inventory/software/hosts/{agent_id}`, `GET /api/v1/inventory/software/changes`, `GET /api/v1/inventory/software/summary` and `GET /api/v1/inventory/software/plugin-health` (per-host collection health, the install-change feed, the fleet summary and per-collector health) are REST v1 capabilities with no MCP tool yet. The ledger keys no row on them: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (each is in `paths`). The pending twins are tracked by issue #7765, which rides with #7396, and are recorded here so they are not silent.
+
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
 **Known asymmetry on the dashboard API-token pair.** `POST /api/settings/api-tokens` and `DELETE /api/settings/api-tokens/{id}` apply the same permission, MFA step-up, store-availability, tier/TTL and ownership rules as `POST /api/v1/tokens` and `DELETE /api/v1/tokens/{id}`. They differ in being narrower or in shape: the form has no `scope_service` (no service-scoped minting) and takes `ttl_hours` where the REST route takes `expires_at`; its audit rows are written through `AuditStore::log` and carry no user-agent, principal-class or session-id stamp; and MCP `create_api_token` has no step-up, by design (an MCP-tier token is required, with approval at the supervised tier). The rows stay `twinned`. The Settings page cannot yet prompt for the step-up code, so an MFA-enrolled operator whose proof has expired is refused, sees only the error toast "MFA step-up required" (no prompt) and must re-authenticate.
@@ -237,7 +239,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | other | 82 | 34 | 48 |
 | **Total** | **351** | **156** | **195** |
 
-Registered `/api/vN/*` routes: 296. OpenAPI `paths` entries: 295. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 229.
+Registered `/api/vN/*` routes: 301. OpenAPI `paths` entries: 300. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 229.
 
 Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 195. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 69.
 

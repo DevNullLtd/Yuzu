@@ -3,7 +3,11 @@
 # tests" step for every CI tier (ADR-0006 decision 8, #1318). The shipped
 # substrate is PostgreSQL 18 (deploy/docker/Dockerfile.postgres); the server
 # SQL is version-agnostic (13+), so a runner-native cluster on an older major
-# still exercises the suites correctly.
+# still exercises the suites correctly. Exception: ci.yml's Linux test step
+# runs its pg half with YUZU_TEST_PG_CLONE_STRATEGY=file_copy, whose
+# CREATE DATABASE ... STRATEGY clause needs PostgreSQL 15+. It is only faster
+# with durability off (the docker cluster below); on an fsync-on cluster
+# FILE_COPY clones measured about 9x slower than the default.
 #
 # Exports YUZU_TEST_POSTGRES_DSN via $GITHUB_ENV (or prints it when run
 # outside Actions, e.g. by the /test skill or a dev shell). Resolution
