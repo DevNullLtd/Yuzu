@@ -223,8 +223,9 @@ constexpr std::size_t kVerifyLaneCap = 4;
 /// failure and a verification that never returns are not results (a hung one
 /// leaves the watch unverified and is not covered). A directory that stays
 /// unverifiable but openable re-faults about every (this many intervals + the
-/// ordinary retry), and that retry doubles from 30 s to its 300 s cap across consecutive
-/// losses with no decided (Same) verify between them (DirWatch::lost_flaps).
+/// ordinary retry), and that retry doubles from 30 s to its 300 s cap across repeated
+/// losses with no decided (Same) verify between them and no failed re-establishment or
+/// shelter commit in between (DirWatch::lost_flaps; the exact scope is in the banner).
 /// "In a row" means no DECIDED result (Same) and no re-establishment in between; it is
 /// NOT time-bounded: results separated by refused launches or by a long quiet stretch
 /// still add up. Every open error other than not-found counts, including resource
@@ -683,11 +684,23 @@ struct DirWatch {
     Clock::time_point verified_at{};     ///< AGE: stamped at commit and at a harvested Same only (never
                                          ///< at Unverifiable or a restamp); orders the admission queue
     Clock::time_point verify_wait_since{}; ///< first pass this watch was due and not launched; {} = idle
-    bool verify_starved{false};          ///< that wait passed kVerifyStarvedIntervals (counted + warned once)
+    /// That wait passed kVerifyStarvedIntervals (counted + warned once per episode). The flag is
+    /// cleared only at a decided Same or at a commit: an episode that ends Unverifiable does not
+    /// re-arm the warn or the count until the next Same or commit. The warn is per WATCH (a
+    /// pinned lane or a post-resume queue can emit one per queued watch in a single pass) and
+    /// the count is a debug counter, not exported (stated residual, no standing gauge).
+    bool verify_starved{false};
     /// Path-loss damping (#5719 item 5). A loss is a FLAP when this watch was just
     /// re-established from a path-loss fault and no verify has decided Same since that commit.
-    unsigned lost_flaps{0};              ///< consecutive flaps (capped); seeds backend_attempts at the loss
-    bool after_loss_commit{false};       ///< the last commit re-established a path-lost watch
+    /// The run is lost_flaps = 0 at the first loss, 1 at the second: it counts REPEATS, and it
+    /// is restarted (the next loss is a first loss, 30 s) by the routes listed in the banner.
+    unsigned lost_flaps{0};              ///< repeat flaps (capped); seeds backend_attempts at the loss
+    /// The last commit re-established a path-lost watch. Read at commit_probe_locked from the
+    /// fault_reason stamped at detection: a re-establishment that failed first
+    /// (fail_backend_locked overwrites fault_reason) or a retry that committed Ancestor shelter
+    /// mode (health cleared there) leaves this false at the eventual commit, which restarts the
+    /// damping run. Under-damps only.
+    bool after_loss_commit{false};
     bool verified_since_commit{false};   ///< a verify decided Same since the last commit
     /// Verification found the path no longer names this watch's directory. The
     /// watch is already faulted (desired + reported) and its read has been
@@ -1772,14 +1785,28 @@ private:
     // backend_attempts at the loss, so the drain's retry doubles 30 s, 60, 120,
     // 240, then the 300 s cap. It adds no fault edge and changes no verdict; the
     // watch is already Faulted in the same episode. It is NOT reset at commit (that
-    // reset is what made every cycle 30 s). Not covered: a completion_hook throw
-    // during the drain takes unwind_pass_locked's failed-completion route
-    // (defer_admission_locked, a 50 ms seed), which skips the seeded retry.
+    // reset is what made every cycle 30 s).
+    //
+    // Exact damping scope: it covers the loop loss -> drain -> re-establishment commit
+    // -> loss with no decided Same between. The run is restarted (the next loss is
+    // treated as a first loss, 30 s) when (i) the re-establishment itself fails first
+    // (fail_backend_locked overwrites fault_reason before the eventual commit, so
+    // after_loss_commit reads false); (ii) the retry finds the target absent and commits
+    // Ancestor shelter mode (health is cleared there, so the later reappearance commit
+    // sees health clear); or (iii) an unwind recovery of the drain runs (a
+    // completion_hook throw or an allocation failure, on EITHER the failed-completion
+    // arm or the OK-completion arm's failed reissue): both use defer_admission_locked's
+    // 50 ms seed and skip the seeded retry. All three only under-damp. A replace loop
+    // faster than the verify interval is blind up to 300 s per cycle by design: the
+    // Faulted state stays reported and the resync Fired on re-establishment covers the
+    // net state (a change made and reverted inside that window is missed).
     //
     // Admission: a due verification is launched only into a free lane slot, the
     // least-recently-verified (verified_at) first. A watch that stays due and
     // unlaunched for kVerifyStarvedIntervals is counted (verify_starved) and
-    // warned once; verify_refused stays 0 in steady state (it is a tripwire).
+    // warned once per episode (the flag clears at a decided Same or a commit; the warn is
+    // per watch, the count a debug counter, not exported); verify_refused stays 0 in
+    // steady state (it is a tripwire).
     // LRU turns starvation into lag, it does not remove it; a hung verify of a
     // watch is not flagged.
 
@@ -2281,7 +2308,7 @@ private:
         w.verified_at = w.last_verify_at;  // age of a fresh establishment
         w.verify_wait_since = {};
         w.verify_starved = false;
-        w.verified_since_commit = false;   // lost_flaps is deliberately NOT reset here (UP-3)
+        w.verified_since_commit = false;   // lost_flaps (the damping seed) is deliberately NOT reset here
         const bool was_reappearance = w.probe_is_reappearance;
         bool committed = false;
         try {
@@ -2337,7 +2364,11 @@ private:
             }
         }
         // fault_reason is still the reason stamped at detection here (static literals, so a
-        // pointer compare); read BEFORE the clear below overwrites it.
+        // pointer compare); read BEFORE the clear below overwrites it. Damping scope: a failed
+        // re-establishment (fail_backend_locked replaced the reason) or an Ancestor shelter
+        // commit (health cleared here, so the later reappearance commit finds it clear) makes
+        // the NEXT commit read false and restarts the run; that only under-damps (see the
+        // banner at the verification section).
         w.after_loss_commit = w.health_desired_faulted && (w.fault_reason == kReasonPathLost ||
                                                            w.fault_reason == kReasonUnverifiable);
         if (w.health_desired_faulted) {
@@ -2630,7 +2661,7 @@ private:
             w.grace_counted = true;
             try {
                 spdlog::info("spark_file: '{}' stale read drained after path loss ({}); "
-                             "re-establishment retry scheduled (consecutive losses without a "
+                             "re-establishment retry scheduled (repeat losses without a "
                              "decided check: {})",
                              ::yuzu::log_key_token(fs::path(w.dir).string()), w.fault_reason,
                              w.lost_flaps);
@@ -2803,7 +2834,7 @@ private:
             }
         }
         sweep_passes_.fetch_add(1, std::memory_order_relaxed);
-        // Verification admission (UP-6): only as many launches as the lane has free slots,
+        // Fair admission of verifications: only as many launches as the lane has free slots,
         // chosen least-recently-verified first; nothing in this pass erases dirs_ entries,
         // so the pointers stay valid under mu_. Offered below, staged after the loop.
         std::array<DirWatch*, kVerifyLaneCap> picks{};
