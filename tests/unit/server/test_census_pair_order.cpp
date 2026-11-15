@@ -2300,3 +2300,22 @@ TEST_CASE("census pair order, B3 fix: the batch decides each row by the mode its
     CHECK(order_text(db.dsn(), "a") == "5|10|-|0|0|0|1|0|0|0");
     CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_straggler");
 }
+
+TEST_CASE("census pair order, B3 fix: DECIDE returns the retired epoch AFTER its update, so an "
+          "old-epoch pending event is retired by the re-base that retired its epoch",
+          PAIR_TAGS) {
+    // (5,11) fails its census write and stays pending. The clock ages and an epoch-3 event
+    // re-bases: DECIDE sets the fence to 5 and must hand the census write that new fence, so the
+    // clear retires the pending epoch-5 event (it carries the retired epoch). With the fence read
+    // from the row before the update the event outranks the epoch-3 verdict by pair and stays
+    // pending forever. Expected rows are the plan model's.
+    PAIR_FIXTURE();
+    run_schedule(store, db.dsn(), metrics,
+                 {
+                     deliver(1000, "r1", 'C', 1000, 5, 10, "C - 5/10", 0),
+                     deliver_failing(1010, "r1", 'D', 1010, 5, 11, "C - 5/10", 1),
+                     age_clock(),
+                     deliver(1020, "r1", 'E', 1020, 3, 1, "E F 3/1", 0),
+                 },
+                 "3|1|5|0|0|0|0|1|0|0", "applied_pair,-,rebase");
+}
