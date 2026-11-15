@@ -326,7 +326,7 @@ def collect(args, rows):
         targets = sorted({t for row in rows for t in row['build_targets']})
         if targets:
             result = bounded(['meson', 'compile', '-C', str(build), '-j', str(args.jobs), *targets],
-                             ROOT, env, out/'build.log', 1800)
+                             ROOT, env, out/'build.log', args.build_timeout)
             manifest['steps'].append(result)
             if result['exit_code']:
                 raise ValueError('Native build failed; no contract verdict issued')
@@ -439,6 +439,16 @@ def bundle(directory, destination):
     return 0
 
 
+def positive_seconds(value):
+    try:
+        seconds = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'build timeout must be whole seconds, got {value!r}')
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError(f'build timeout must be positive, got {seconds}')
+    return seconds
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -456,6 +466,10 @@ def main():
     run.add_argument('--only', action='append')
     run.add_argument('--jobs', type=int, default=4)
     run.add_argument('--history-db')
+    run.add_argument('--build-timeout', type=positive_seconds,
+                     default=os.environ.get('YUZU_CONTRACT_BUILD_TIMEOUT_S', '1800'),
+                     help='seconds allowed for the native build step '
+                          '(default: $YUZU_CONTRACT_BUILD_TIMEOUT_S, else 1800)')
     args = parser.parse_args()
     try:
         if args.command == 'bundle':

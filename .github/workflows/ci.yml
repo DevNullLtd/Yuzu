@@ -1991,6 +1991,10 @@ jobs:
           YUZU_TEST_SLOT_DIR: /tmp/yuzu-bigtam-test-slots
           YUZU_TEST_SLOT_NAME: yuzu-bigtam-heavy
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
+          # The contract build dir is separate from the standard one, so a runner
+          # that has not built it yet compiles yuzu_server_tests cold; that took
+          # over 30 min at -j2 (run 43722258525). The job's 90 min limit still applies.
+          YUZU_CONTRACT_BUILD_TIMEOUT_S: "3600"
         run: |
           # Keep opt-in options out of the branch-shared standard build (#4851).
           # Gateway registration is asserted, not required by a project option

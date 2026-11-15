@@ -32,7 +32,9 @@ Linux-only under [ADR-0035](../adr/0035-server-is-linux-only-windows-is-agent-on
 `build_tests=true`, `build_agent=true`, `server=enabled` and the gateway toolchain
 are required. Missing registration is an error, not a smaller successful plan.
 `--only ID` (repeatable) selects a declared subset; the manifest records it.
-`--jobs N` defaults to four.
+`--jobs N` defaults to four. `--build-timeout SECONDS` bounds the native build step; it defaults
+to `YUZU_CONTRACT_BUILD_TIMEOUT_S`, else 1800 (CI sets 3600, because a runner's first build of
+the contract build directory is cold).
 
 On macOS or Windows (MSYS2 bash), select the four plugin/gateway contracts
 explicitly and leave the server disabled:

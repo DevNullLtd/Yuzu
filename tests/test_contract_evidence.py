@@ -17,7 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 import xml.etree.ElementTree as ET
 import zipfile
@@ -225,7 +225,7 @@ class CollectorTests(unittest.TestCase):
         self.history_calls = []
         self.out = self.root / "evidence"
         self.args = argparse.Namespace(only=None, build_dir=str(self.build), output=str(self.out),
-                                       jobs=1, history_db=None)
+                                       jobs=1, history_db=None, build_timeout=4321)
 
     def introspect(self, command, **kwargs):
         if "--tests" in command:
@@ -255,6 +255,8 @@ class CollectorTests(unittest.TestCase):
 
     def native_step(self, command, cwd, env, log, timeout, cancel_grace=0):
         self.native_steps.append(command)
+        if command[1] == "compile":
+            self.assertEqual(timeout, 4321)
         log.write_text("controlled Meson transcript\n")
         if command[1] == "test":
             self.assertEqual(cancel_grace, 5)
@@ -483,6 +485,40 @@ class CollectorTests(unittest.TestCase):
         child.assert_not_called()
         self.assertEqual(previous.read_bytes(), b"immutable earlier attempt\n")
         self.assertEqual(list(self.out.iterdir()), [previous])
+
+
+class BuildTimeoutOptionTests(unittest.TestCase):
+    def parse(self, *extra, env=None):
+        argv = ["contract-evidence.py", "run", "--build-dir", "b", "--output", "o", *extra]
+        captured = {}
+        def fake_collect(args, rows):
+            captured["timeout"] = args.build_timeout
+            return 0
+        with (
+            patch.dict(os.environ, env or {}, clear=False),
+            patch.object(sys, "argv", argv),
+            patch.object(evidence, "load_registry", return_value=[]),
+            patch.object(evidence, "collect", side_effect=fake_collect),
+        ):
+            if env is None:
+                os.environ.pop("YUZU_CONTRACT_BUILD_TIMEOUT_S", None)
+            evidence.main()
+        return captured["timeout"]
+
+    def test_default_is_1800(self):
+        self.assertEqual(self.parse(), 1800)
+
+    def test_environment_sets_it(self):
+        self.assertEqual(self.parse(env={"YUZU_CONTRACT_BUILD_TIMEOUT_S": "3600"}), 3600)
+
+    def test_flag_beats_environment(self):
+        self.assertEqual(self.parse("--build-timeout", "90",
+                                    env={"YUZU_CONTRACT_BUILD_TIMEOUT_S": "3600"}), 90)
+
+    def test_non_positive_or_non_integer_is_refused(self):
+        for bad in ("0", "-5", "1.5", "soon"):
+            with self.subTest(bad=bad), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.parse(env={"YUZU_CONTRACT_BUILD_TIMEOUT_S": bad})
 
 
 class MesonReportPrivacyTests(unittest.TestCase):
