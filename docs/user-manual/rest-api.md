@@ -3306,8 +3306,8 @@ never an uncaught exception), `principal_type` other than `"user"`, a
 malformed `principal_id`, `{name}` is not one of the 7 assignable roles
 (`ITServiceOwner` and a genuinely unknown/custom role name return the
 identical client-facing message — no role-catalog oracle; the specific
-reason is audited server-side only; use `POST
-/api/v1/management-groups/{id}/roles` for `ITServiceOwner` instead), or the
+reason is audited server-side only; `ITServiceOwner` cannot be assigned at
+any scope), or the
 store rejects the grant for a genuine client-validation reason (a malformed
 or reserved-namespace `principal_id`) — this branch is defensive and not
 reachable via this route today, since `principal_type` is hardcoded `"user"`
