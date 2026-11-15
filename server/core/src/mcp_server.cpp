@@ -2794,6 +2794,9 @@ static const ToolDef kTools[] = {
      "query_responses by execution_id, or list_executions if you never learned one). NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "SCOPE: a caller whose Execution:Read is limited to a management group receives no "
+     "progress notifications and a final result without agents_success/agents_failure; poll "
+     "get_execution_status for the counts it may see. "
      "FALLBACK when not streaming: poll query_responses with the "
      "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
      "and retry a few times (or call get_execution_status to confirm a terminal state), or "
@@ -22070,8 +22073,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     fleet_read_fn_(req, scratch, "Execution", "Read");
                                 if (fleet_gate.admitted)
                                     bridge_fleet_scope = std::move(fleet_gate.scope);
+                            } else {
+                                spdlog::error("execute_instruction: fleet_read_fn_ unwired; "
+                                              "progress bridge uses its most restricted view");
                             }
                         } catch (...) {
+                            spdlog::error("execute_instruction: Execution:Read scope derivation "
+                                          "threw; progress bridge uses its most restricted view");
                             bridge_fleet_scope = yuzu::server::authz::deny_all();
                         }
                         auto rr = bridge->reserve(bridge_sid, binding, id,
@@ -22632,8 +22640,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #2712: structuredContent is baked into `result` HERE, before it
                 // is handed to bridge->arm() below as result_base - a streamed or
                 // parked final's build_real_final() parse-merges result_base and
-                // only ADDS top-level status/agents_success/agents_failure keys
-                // (mcp_stream_bridge.cpp), so structuredContent survives into every
+                // only ADDS top-level status keys, plus agents_success/agents_failure
+                // when the terminal payload carries them (it does not for a
+                // scope-confined dispatcher) (mcp_stream_bridge.cpp), so structuredContent survives into every
                 // final shape unchanged. This is a deliberate, pinned decision, not
                 // an accident of construction order - see the bridge byte-pin test
                 // added alongside this change.
@@ -22642,7 +22651,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the latched progress snapshot to the projector, which publishes
                 // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
-                // result object with status/agents_* added as top-level keys.
+                // result object with status (and agents_success/agents_failure when the
+                // terminal payload carries them) added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).

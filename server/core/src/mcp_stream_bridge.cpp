@@ -332,8 +332,9 @@ void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcep
 ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<BridgeRecord> rec,
                                                            std::shared_ptr<WakeCore> core) {
     return [rec = std::move(rec), core = std::move(core)](const ExecutionEvent& ev) noexcept {
-        // Hard constraint 7: strictly copy-only + notify, catch-and-count.
-        // Runs under Channel::mu; touches record mu + WakeCore::mu only.
+        // Hard constraint 7: copy and notify, catch-and-count (a confined terminal also
+        // sanitizes, see below). Runs under Channel::mu; touches record mu + WakeCore::mu
+        // only.
         try {
             if (core->listener_fault.exchange(false, std::memory_order_acq_rel)) {
                 throw std::bad_alloc{};  // inject_listener_fault_for_test
@@ -347,8 +348,11 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
             // dashboard consumers use, against the dispatching session's scope, which is
             // immutable on the record (set at reserve(), before any listener exists). An
             // unrestricted record classifies kPass here for both event types, so its
-            // behaviour is unchanged. Classified before `rec->mu` is taken: the verdict
-            // reads only the immutable scope, and the sanitize below allocates.
+            // behaviour is unchanged. The verdict is computed before `rec->mu` is taken
+            // because it reads only the immutable scope. The confined terminal's sanitize
+            // (one small JSON parse and dump, once per execution) runs below, under
+            // Channel::mu and `rec->mu`, inside the existing try/catch: a throw there leaves
+            // the slot untouched and is counted like any other listener failure.
             bool sanitize_terminal = false;
             switch (classify_execution_event_for_scope(ev, rec->fleet_read_scope)) {
             case ExecutionEventVerdict::kDrop:
@@ -461,7 +465,9 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     rec->created = now();
     rec->stream = std::move(stream);
     rec->progress_token = std::move(progress_token);
-    rec->fleet_read_scope = std::move(fleet_read_scope);  // immutable from here (banner)
+    // Only engaged-or-not is kept, never the agent ids: the listener and sweep() test
+    // engagement alone and agent-transition is never latched here (header banner).
+    rec->fleet_read_scope = fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt;
 
     const char* reject = nullptr;
     std::size_t active = 0;
@@ -2461,13 +2467,26 @@ void McpStreamBridge::sweep() {
                                 // Construct fully OUTSIDE the slot, then commit with
                                 // a noexcept move - a copy OOM leaves the slot and
                                 // terminal_accepted untouched (mirror the listener).
-                                // A confined record's terminal is the sanitized one even
-                                // here: this `ev` is the terminal-flagged execution-progress,
-                                // whose payload carries the counts. The sanitize reads only
-                                // `status`, and any throw is the copy-OOM defer below.
-                                MailboxEntry tmp{ev->id, oldest->fleet_read_scope.has_value()
-                                                             ? sanitize_execution_event_for_scope(*ev).data
-                                                             : ev->data};
+                                // A confined record's terminal is the sanitized one even here:
+                                // this `ev` is the terminal-flagged execution-progress, whose
+                                // payload carries the counts. The classifier is not reused
+                                // because it would drop an execution-progress-typed event;
+                                // sanitize parses the whole payload and reads `status`. A
+                                // payload with no string `status` latches "unknown", the
+                                // default build_real_final gives an unrestricted record, not
+                                // the sanitizer's fixed "completed". Any throw is the copy-OOM
+                                // defer below.
+                                std::string term_data = ev->data;
+                                if (oldest->fleet_read_scope.has_value()) {
+                                    const auto parsed = nlohmann::json::parse(ev->data, nullptr, false);
+                                    const bool has_status = parsed.is_object() &&
+                                                            parsed.contains("status") &&
+                                                            parsed["status"].is_string();
+                                    term_data = has_status
+                                                    ? sanitize_execution_event_for_scope(*ev).data
+                                                    : std::string(R"({"status":"unknown"})");
+                                }
+                                MailboxEntry tmp{ev->id, std::move(term_data)};
                                 oldest->terminal_slot = std::move(tmp);
                                 oldest->terminal_accepted = true;
                             } catch (...) {  // NOLINT(bugprone-empty-catch) - deliberate

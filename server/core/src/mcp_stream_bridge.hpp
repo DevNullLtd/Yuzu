@@ -178,8 +178,9 @@
 // stored on the record, immutable from then on (like the listener it feeds):
 //
 //   nullopt  - unrestricted. The listener's behaviour is unchanged by this rule.
-//   engaged  - confined (an engaged EMPTY set is deny-all, and is what a caller that
-//              could not resolve the scope passes, never nullopt). The listener drops
+//   engaged  - confined (reserve() keeps only that fact, as `deny_all()`: the record never
+//              retains the caller's agent ids; a caller that could not resolve the scope passes
+//              `deny_all()` too, never nullopt). The listener drops
 //              `execution-progress` (never latched into `progress_slot`, so no progress
 //              notification is ever emitted for the record) and latches
 //              `execution-completed` as `sanitize_execution_event_for_scope(ev)`, whose
@@ -193,7 +194,8 @@
 // `agent-transition` is never latched or projected by this bridge in either mode
 // (the listener returns before it), so the classifier's per-agent verdict has
 // nothing to decide here; a future change that projects it must route it through
-// `classify_execution_event_for_scope` first. The listener takes no new lock and
+// `classify_execution_event_for_scope` first and retain the real set on the record
+// (it keeps only engaged-or-not today). The listener takes no new lock and
 // never calls the bus, so the hierarchy below is unchanged. The tripwire
 // `tests/test_execution_owner_key_tripwire.py` CHECK 9 pins both classifier names
 // in mcp_stream_bridge.cpp.
@@ -572,7 +574,8 @@ public:
     /// by the listener's own unconditional wake); nothing strands.
     /// `result_base` = the serialized JSON-RPC *result object* exactly as today's
     /// plain path builds it (B5); the parked real final re-emits it with
-    /// status/agents_success/agents_failure added as TOP-LEVEL result keys.
+    /// status (and agents_success/agents_failure when the terminal payload carries them, which a
+    /// confined record's does not) added as TOP-LEVEL result keys.
     /// Empty ⇒ the bus-payload-only shape (tests; 3b always passes the real base).
     ArmOutcome arm(const std::string& session_id, const nlohmann::json& jsonrpc_id, ArmMode mode,
                    std::string result_base = {});
@@ -990,9 +993,11 @@ private:
         std::chrono::steady_clock::time_point created;  ///< set at reserve; the kArming reaper's age base
         std::shared_ptr<McpStreamState> stream;  ///< taken at reserve via stream_for
         std::optional<nlohmann::json> progress_token;
-        /// The dispatching session's fleet-read scope, set at reserve() before the record
-        /// is reachable and never again (the listener reads it lock-free, like `key`).
-        /// nullopt = unrestricted; engaged (incl. empty) = confined, see the banner.
+        /// Whether the dispatching session's fleet-read scope was confined, set at reserve()
+        /// before the record is reachable and never again (the listener reads it lock-free,
+        /// like `key`). Normalised there: nullopt = unrestricted, `deny_all()` = confined.
+        /// The agent ids are NOT retained. Nothing here consults them, because agent-transition
+        /// is never latched; a change that projects it must keep the real set. See the banner.
         authz::VisibleSet fleet_read_scope;
         /// Set by subscribe(), before any listener exists, and never again: subscribe()
         /// ENFORCES that with a state gate (!subscribed && !torn_down && kArming), so
