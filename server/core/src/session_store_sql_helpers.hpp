@@ -2,12 +2,13 @@
 
 /// @file session_store_sql_helpers.hpp
 /// Internal OWN-SCHEMA libpq helpers shared by `SessionStore` (session_store.cpp)
-/// and the ADR-0012 §3 query owner `CredentialChangeOwner`
-/// (credential_change_owner.cpp, #5342), mirroring rbac_store_sql_helpers.hpp's
-/// role for `RbacStore`/`RbacAdminAuthorityOwner`: ONE definition of each
-/// statement, never a second copy. Not a public API. Every function runs on the
-/// CALLER's already-open transaction (`PGconn*` from `with_txn_for`) and issues
-/// only `session_store`-schema SQL; cross-schema SQL never belongs here.
+/// and the ADR-0012 §3 query owners `CredentialChangeOwner`
+/// (credential_change_owner.cpp, #5342) and `RbacAdminAuthorityOwner`
+/// (`deactivate_account` calls `bump_generation_in_txn` only), mirroring
+/// rbac_store_sql_helpers.hpp's role for `RbacStore`/`RbacAdminAuthorityOwner`: ONE definition of
+/// each statement, never a second copy. Not a public API. Every function runs on the CALLER's
+/// already-open transaction (`PGconn*` from `with_txn_for`) and issues only `session_store`-schema
+/// SQL; cross-schema SQL never belongs here.
 ///
 /// Lock note for callers: `bump_generation_in_txn` takes the row lock on the
 /// single `session_store.session_meta` `write_generation` row and holds it to
@@ -20,7 +21,9 @@
 /// `audit_store.audit_events` (INSERT) → this row → COMMIT (#5342 Gate 8 T1′:
 /// with the bump before the audit INSERT, a lock held on `audit_events` stalled
 /// every unrelated session create/revoke). No session writer takes any other
-/// schema's lock, which keeps that order acyclic.
+/// schema's lock, which keeps that order acyclic. `RbacAdminAuthorityOwner::deactivate_account`
+/// takes it last too (`rbac_enabled` → grant rows → one `auth.users` row → this row →
+/// COMMIT).
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
