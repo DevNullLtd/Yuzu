@@ -100,9 +100,11 @@ It prints, in this order:
   listed; added back with identical text, it is not. A fragment you had, moved
   out of `changelog.d/` and back, is listed again only if its text changed.
   Fragments are read the way `promote` reads them (line endings normalised,
-  outer whitespace dropped), and a release finished by a merge commit (a
-  release branch that merges `dev` and removes the fragments there) counts as
-  promoting them. A fragment file over 1 MiB is not read.
+  outer whitespace dropped). A release finished by a merge commit (a release
+  branch that merges `dev` and removes the fragments there) counts as promoting
+  them, shown with the wording last committed before the merge; one the merge
+  itself reworded, or one that was withdrawn, matches no `CHANGELOG.md` line and
+  is named on a `!` line instead. A fragment file over 1 MiB is not read.
   A file added under `changelog.d/` whose name is not a fragment name (or that
   is in a subdirectory), a fragment name that is a submodule, and a fragment
   file over the size limit are each named on a `!` line (at most 20 names, then

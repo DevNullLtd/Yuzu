@@ -671,6 +671,8 @@ class Fragments(dict):
     def __init__(self) -> None:
         super().__init__()
         self.promoted: set[str] = set()
+        # Fragments a merge-commit release removed whose text matched no line the range added to CHANGELOG.md.
+        self.unmatched: list[str] = []
 
 
 def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
@@ -696,15 +698,22 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
     # -m so adds made inside merge commits are seen too. A fragment that already existed at `old`
     # can show up here (a merge diffs against its side parent), so each is checked against both ends.
     ever: set[str] = set()
-    # path -> the newest ordinary commit (one parent) of the range that added it. A merge "adds" whatever the
-    # parent it is diffed against lacks, and a root commit (a shallow clone's boundary) adds the whole tree.
+    # path -> the newest ordinary commit (one parent) of the range that added it / that added or changed it. A merge
+    # "adds" whatever the parent it is diffed against lacks, and a root commit (a shallow clone's boundary) adds the
+    # whole tree, so neither counts.
     added_by: dict[str, str] = {}
-    for sha, parents, toks in _records(repo.git("log", "--full-history", "-m", "-z", "--no-renames", "--diff-filter=AT", "--name-only",
+    touched_by: dict[str, str] = {}
+    for sha, parents, toks in _records(repo.git("log", "--full-history", "-m", "-z", "--no-renames", "--diff-filter=AMT", "--name-status",
                                                 "--format=%x01%H %P", f"{old}..{new}", "--", pathspec)):
-        for p in toks:
-            if p and _fragment_path_ok(p):
+        for i in range(0, len(toks) - 1, 2):
+            status, p = toks[i][:1], toks[i + 1]
+            if not _fragment_path_ok(p):
+                continue
+            if status in "AT":
                 ever.add(p)
-                if len(parents) == 1:
+            if len(parents) == 1:
+                touched_by.setdefault(p, sha)
+                if status in "AT":
                     added_by.setdefault(p, sha)
     changed = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=MT", "--name-only", old, new, "--", pathspec)
                if _fragment_path_ok(p) and p in ever]
@@ -724,8 +733,9 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
     renames, rename_sources = _rename_pairs(repo, old, new)
     renamed_away = {src for _, src in rename_sources}
     # Added in the range, gone at its end, and no commit deleted it: a merge commit removed it (a release
-    # branch that merges `dev`, promotes and drops the fragments in the merge). Its text is read where it was added.
-    orphans = {p: sha for p, sha in added_by.items()
+    # branch that merges `dev`, promotes and drops the fragments in the merge). Its text is read from the newest ordinary
+    # commit that changed it, which is the wording a release promoted unless the merge itself reworded it.
+    orphans = {p: touched_by[p] for p in added_by
                if p not in net and p not in tree_old and p not in deleters and p not in renamed_away}
 
     def old_root(path: str) -> str | None:
@@ -817,6 +827,8 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
             key = path if path not in found else f"{path}#{sha[:10]}"
             found[key] = body
             found.promoted.add(key)
+        elif orphans.get(path) == sha:
+            found.unmatched.append(path)
     return found
 
 
@@ -905,6 +917,7 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
     odd = unrecognised_names(repo, old, head)
     not_regular = sorted(set(repo.not_regular))
     too_big = sorted(set(repo.too_big))
+    unmatched = sorted(set(getattr(frags, "unmatched", [])))
     if lines:
         out.append(f"Changelog entries added ({total})")
         out.append("")
@@ -912,11 +925,14 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
         if getattr(frags, "promoted", None):
             out.append("Note: entries a release inside this range moved into CHANGELOG.md show the fragment's wording as it was")
             out.append("promoted; CHANGELOG.md has the release text, which may differ.")
-    elif empty or odd or not_regular or too_big:
+    elif empty or odd or not_regular or too_big or unmatched:
         out.append("No changelog entries could be listed for this range (see the ! lines below).")
     else:
         out.append("No changelog fragments were added in this range (refactors, CI and test-only changes may skip them;")
         out.append(f"`git log --first-parent --oneline {old[:10]}..HEAD` lists every merged PR).")
+    if unmatched:
+        out.append(f"! {plural(len(unmatched), 'fragment')} removed by a merge commit matched no line added to CHANGELOG.md "
+                   f"(withdrawn, or reworded in the merge), not listed: {name_list(unmatched)}; read CHANGELOG.md for the release text")
     if empty:
         out.append(f"! {plural(len(empty), 'fragment')} with no '- ' bullet, not summarised: {name_list(empty)}")
     if odd:
