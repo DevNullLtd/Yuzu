@@ -765,7 +765,7 @@ TEST_CASE("kGuardianBackendOpDeadlineMirror: pinned against the REAL, live-const
 // inspection in this session - not exercised by a source-grepping test or
 // a new test seam on the exported Agent interface, deliberately, per the
 // same "don't test the mechanism, test the property" spirit as the rest of
-// this file) and is NEVER read through spark_engine_/spark_boot_done_.
+// this file) and is NEVER read through spark_engine_/lifecycle_boot_done_.
 //
 // PR-A has no real mechanism yet to reproduce agent.cpp's exact
 // SparkEngine→mechanism→lane ownership chain (that is PR-B's job) - this

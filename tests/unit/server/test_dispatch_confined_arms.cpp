@@ -723,6 +723,25 @@ TEST_CASE("resolve_scope_targets: an Unresolvable registry evaluation aborts as 
     CHECK(*result.abort_reason == ScopeAbortReason::Unresolvable);
 }
 
+TEST_CASE("resolve_scope_targets: a ResultSetUnusable registry evaluation aborts as "
+          "result_set_unusable and matched is absent",
+          "[server][dispatch][scope]") {
+    std::string aborted_reason;
+    ScopeLadderAudit audit;
+    audit.evaluation_aborted = [&](const std::string& reason) { aborted_reason = reason; };
+    const auto result = resolve_scope_targets(
+        "ostype == \"Windows\"", "alice", nullptr,
+        [](const yuzu::scope::Expression&) -> std::expected<std::vector<std::string>, ScopeEvalError> {
+            return std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs_x"});
+        },
+        audit);
+    CHECK_FALSE(result.matched.has_value());
+    CHECK(aborted_reason == "result_set_unusable");
+    REQUIRE(result.abort_reason.has_value());
+    CHECK(*result.abort_reason == ScopeAbortReason::ResultSetUnusable);
+    CHECK(result.abort_detail == "rs_x"); // the registry's detail is carried for this reason
+}
+
 TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwise",
           "[server][dispatch][scope]") {
     // #4981 PR-1: scope_eval_error.hpp's to_string(ScopeEvalError::Kind) and
@@ -742,6 +761,19 @@ TEST_CASE("scope_eval_error/scope_abort_reason string vocabularies agree pairwis
           to_string(to_abort_reason(Kind::OwnerCheckFailed)));
     CHECK(std::string(to_string(Kind::PresenceDegraded)) ==
           to_string(to_abort_reason(Kind::PresenceDegraded)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusable)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusable)) == "result_set_unusable");
+    // A pending set may fill, so a retry can succeed: transient, not permanent.
+    CHECK_FALSE(scope_abort_is_permanent(Kind::ResultSetUnusable));
+    // A failed set, or an incomplete one where a missing member would match (for example under
+    // NOT, LEN or STARTSWITH), does not change by retrying: permanent, with the same wire reason.
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) ==
+          to_string(to_abort_reason(Kind::ResultSetUnusablePermanent)));
+    CHECK(std::string(to_string(Kind::ResultSetUnusablePermanent)) == "result_set_unusable");
+    CHECK(to_abort_reason(Kind::ResultSetUnusablePermanent) ==
+          ScopeAbortReason::ResultSetUnusablePermanent);
+    CHECK(scope_abort_is_permanent(Kind::ResultSetUnusablePermanent));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

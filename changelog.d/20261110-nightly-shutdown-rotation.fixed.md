@@ -1,2 +1,4 @@
 - **Drain gRPC workers before OpenSSL cleanup.** Release each secure worker's OpenSSL thread state before publishing retirement, and keep the server test runtime alive until its suite finishes so sanitizer runs exercise normal shutdown safely.
 - **Reject competing engine-credential rotations during cache publication.** Check the committed rotation initiator before the raw-secret cache is populated; this denial does not authorize secret re-serving or extend the grace window.
+- **Stop safely during agent startup.** Publish Guardian, DEX and Spark workers after initialization, and drain the DEX observer under a shutdown deadline when startup unwinds.
+- **Isolate gateway stream-status integration fixtures.** Use server-minted sessions for disconnect tests and settle deliberately refused notifications so retry traffic cannot contaminate later assertions.

@@ -37,8 +37,11 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::server;
@@ -157,6 +160,30 @@ TEST_CASE("preview_scope_targets: evaluate_scope_fn aborting surfaces kEvaluatio
         REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kEvaluationAborted);
         CHECK(outcome.detail == "presence_degraded");
         CHECK(outcome.failing_refs.empty());
+    }
+    SECTION("ResultSetUnusable is a transient abort with its own reason") {
+        auto outcome = preview_scope_targets(
+            R"(ostype == "linux")", "alice", std::nullopt, nullptr,
+            stub_fn(std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusable, "rs_x"})));
+        REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kEvaluationAborted);
+        CHECK(outcome.detail == "result_set_unusable");
+        CHECK(outcome.failing_refs.empty());
+        REQUIRE(outcome.abort_kind.has_value());
+        CHECK(*outcome.abort_kind == ScopeEvalError::Kind::ResultSetUnusable);
+        CHECK_FALSE(scope_abort_is_permanent(*outcome.abort_kind));
+        CHECK(outcome.abort_detail == "rs_x");
+    }
+    SECTION("ResultSetUnusablePermanent is a permanent abort with the same reason") {
+        auto outcome = preview_scope_targets(
+            R"(ostype == "linux")", "alice", std::nullopt, nullptr,
+            stub_fn(std::unexpected(ScopeEvalError{ScopeEvalError::Kind::ResultSetUnusablePermanent,
+                                                   "cause=failed result_set=rs_x"})));
+        REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kEvaluationAborted);
+        CHECK(outcome.detail == "result_set_unusable");
+        REQUIRE(outcome.abort_kind.has_value());
+        CHECK(*outcome.abort_kind == ScopeEvalError::Kind::ResultSetUnusablePermanent);
+        CHECK(scope_abort_is_permanent(*outcome.abort_kind));
+        CHECK(outcome.abort_detail == "cause=failed result_set=rs_x");
     }
     SECTION("OwnerCheckFailed carries the failing ref for the caller's own audit row") {
         auto outcome = preview_scope_targets(
@@ -537,4 +564,53 @@ TEST_CASE("preview_scope_targets: tag:<key> falls back to a locally-connected ag
     REQUIRE(outcome.kind == ScopePreviewOutcome::Kind::kOk);
     CHECK(outcome.payload["matched_count"] == 1);
     CHECK(outcome.payload["matched_agents"][0] == "agent-live");
+}
+
+TEST_CASE("scope preview: abort advice covers every Kind and no Kind",
+          "[scope][preview][abort_advice]") {
+    // The REST and MCP preview handlers both answer an abort from this one table: a transient
+    // abort carries the caller's retry hint, a permanent one carries none (null on the wire).
+    using K = ScopeEvalError::Kind;
+    constexpr std::int64_t kHint = 5000;
+    struct Row {
+        std::optional<K> kind;
+        std::string_view remediation;
+        std::optional<std::int64_t> retry_after_ms;
+    };
+    const std::string_view escalate =
+        "this is a permanent condition and will NOT clear on retry; escalate to an operator";
+    const std::string_view ready = "retry once the server reports ready";
+    const Row rows[] = {
+        {K::Unresolvable, escalate, std::nullopt},
+        {K::PrincipalUnresolved, escalate, std::nullopt},
+        {K::OwnerCheckFailed, escalate, std::nullopt},
+        {K::StoreDegraded, ready, kHint},
+        {K::PresenceDegraded, ready, kHint},
+        {K::ResultSetUnusable, "wait until the set is materialized, then retry", kHint},
+        {K::ResultSetUnusablePermanent,
+         "re-run the producer that created the set, then use the new set", std::nullopt},
+        {std::nullopt, ready, kHint},
+    };
+    for (const auto& row : rows) {
+        const auto advice = scope_abort_advice(row.kind, kHint);
+        INFO("kind " << (row.kind ? to_string(*row.kind) : "none"));
+        CHECK(advice.remediation == row.remediation);
+        CHECK(advice.retry_after_ms == row.retry_after_ms);
+    }
+}
+
+TEST_CASE("result sets: a not-ready parent's advice depends on its status",
+          "[scope][preview][abort_advice]") {
+    ResultSet parent;
+    parent.status = ResultSetStatus::Pending;
+    const auto pending = parent_not_ready_advice(parent);
+    CHECK(pending.remediation == "wait until the set is materialized");
+    CHECK(pending.retry_after_ms == std::optional<std::int64_t>{5000});
+    CHECK(parent_not_ready_message(parent) == kParentPendingMessage);
+
+    parent.status = ResultSetStatus::Failed;
+    const auto failed = parent_not_ready_advice(parent);
+    CHECK(failed.remediation == "re-create the parent result set");
+    CHECK_FALSE(failed.retry_after_ms.has_value());
+    CHECK(parent_not_ready_message(parent) == kParentFailedMessage);
 }

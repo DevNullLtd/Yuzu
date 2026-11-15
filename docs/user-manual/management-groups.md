@@ -357,7 +357,7 @@ curl -s -b cookies.txt \
 
 ### Add a Role Assignment
 
-Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+Only `Operator` and `Viewer` roles can be delegated via this endpoint. Assigning other roles (e.g., `ITServiceOwner`) returns `403 Forbidden`. The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A service-scoped API token is refused outright, and the `ITServiceOwner` arm is also refused for any MCP-tier session and for an engine-classed session (those two need the global `ManagementGroup:Write` permission); the same refusals apply to listing and removing role assignments.
 
 ```bash
 curl -s -b cookies.txt -X POST \
@@ -405,7 +405,7 @@ Returns `200 OK`:
 }
 ```
 
-The caller must be a global Administrator or hold `ITServiceOwner` on the target group.
+The caller must be a global Administrator or hold `ITServiceOwner` on the target group. A caller admitted only as `ITServiceOwner` of the group can remove only `Operator` and `Viewer` assignments (`403` otherwise); removing an `ITServiceOwner` assignment needs the global `ManagementGroup:Write` permission.
 
 ## Service Groups
 
@@ -501,7 +501,7 @@ Two gauges are exposed on the `/metrics` endpoint, refreshed on every scrape:
 | `DELETE` | `/api/v1/management-groups/{id}/members/{agent_id}` | Remove an agent from a group |
 | `GET` | `/api/v1/management-groups/{id}/roles` | List role assignments for a group |
 | `POST` | `/api/v1/management-groups/{id}/roles` | Add a role assignment to a group |
-| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group |
+| `DELETE` | `/api/v1/management-groups/{id}/roles` | Remove a role assignment from a group (a caller who is only the group's `ITServiceOwner` can remove only `Operator` and `Viewer`) |
 
 ## Constraints
 
