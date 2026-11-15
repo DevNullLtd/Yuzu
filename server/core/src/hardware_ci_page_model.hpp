@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file hardware_ci_page_model.hpp
-/// The ONE pure model behind the bulk device-CI read: `GET /api/v1/hardware/ci` and its MCP twin.
+/// The ONE pure model behind the bulk device-CI read: `GET /api/v1/hardware-ci` and its MCP twin.
 /// One keyset page of the stored `device_ci` rows (scalar fields only, no sections), ordered by
 /// the BYTE value of `agent_id` (the store reads `agent_id COLLATE "C"`, so the walk does not depend
 /// on the database collation), with the caller's scope pushed into SQL. Parameter parsing, the cursor codec, the

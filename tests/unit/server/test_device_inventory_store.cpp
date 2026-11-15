@@ -2899,7 +2899,7 @@ TEST_CASE("the read-degrade counter tells a failed record read from a failed sec
     }
 }
 
-// ── list_device_ci_after: the keyset read behind GET /api/v1/hardware/ci ──────────────────────
+// ── list_device_ci_after: the keyset read behind GET /api/v1/hardware-ci ──────────────────────
 
 TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in SQL",
           "[pg][device_ci][keyset]") {

@@ -1,7 +1,7 @@
 # Bulk device-CI read: database collation drift, evidence and residual
 
 **Date:** 2026-11-15
-**Change:** `GET /api/v1/hardware/ci` and the MCP tool `list_hardware_ci_records` (a keyset walk over
+**Change:** `GET /api/v1/hardware-ci` and the MCP tool `list_hardware_ci_records` (a keyset walk over
 `device_inventory_store.device_ci`, built for a daily pull into an external CMDB), with migration
 `device_inventory_store` v4. Code commits under test: `390104150e` (the byte-ordered keyset), `e40adb34a9` (the byte-ordered
 named read, the robust migration and the index check at open) and `fd490b9d31` (the exact index-shape

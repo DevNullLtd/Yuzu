@@ -1,6 +1,6 @@
 // Registry-resident hardware CI tools (see mcp_tool_registry.hpp): the MCP twins of
 // GET /api/v1/hardware (list_hardware_ci), GET /api/v1/hardware/{id} (get_hardware_ci) and
-// GET /api/v1/hardware/ci (list_hardware_ci_records, the bulk keyset page of stored CI rows).
+// GET /api/v1/hardware-ci (list_hardware_ci_records, the bulk keyset page of stored CI rows).
 //
 // All three are CONFINED READS gated by fleet_read_fn alone (ADR-0017 admit-then-filter,
 // Inventory:Read): the gate already covers the MCP tier ladder and RBAC, so neither
@@ -407,7 +407,7 @@ constexpr ToolRecord kToolRecords[] = {
      "values) plus the stored content_hash and blob_version. For agentic workers: every row is "
      "personal data that lands in your context, so pass limit up to 20 (the default here is 20) "
      "or an agent_id. A scheduled pull into an external CMDB belongs on the REST route GET "
-     "/api/v1/hardware/ci instead, which serves the same pages and cursor with limit up to 1000 "
+     "/api/v1/hardware-ci instead, which serves the same pages and cursor with limit up to 1000 "
      "(default 100). To walk the records: call with no arguments, pass next_cursor back as cursor "
      "until next_cursor is empty, and compare content_hash with your copy (equal means the stored "
      "record is unchanged apart from first_seen and last_seen, which move without a hash change, "

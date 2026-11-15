@@ -20617,7 +20617,7 @@ private:
             }
             return detail;
         };
-        // The keyset read of the stored CI rows behind GET /api/v1/hardware/ci and the MCP
+        // The keyset read of the stored CI rows behind GET /api/v1/hardware-ci and the MCP
         // list_hardware_ci_records twin: ONE closure for both, so they page the same table the same
         // way. An unwired store reads as a degrade (nullopt), never an empty page.
         auto hw_ci_page_reader =

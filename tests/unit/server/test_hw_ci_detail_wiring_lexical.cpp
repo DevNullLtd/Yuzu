@@ -239,7 +239,7 @@ TEST_CASE("hw_ci_detail_fn wiring (LEXICAL pin, not behaviour): the integrity me
           0); // one home for the name
 }
 
-// The bulk CI read (GET /api/v1/hardware/ci and the MCP list_hardware_ci_records) takes its store
+// The bulk CI read (GET /api/v1/hardware-ci and the MCP list_hardware_ci_records) takes its store
 // read from ONE closure in server.cpp. The route and MCP tests use a fake reader, and ServerImpl
 // is not unit-constructible, so nothing else notices if the closure is dropped from one transport
 // (that transport would answer "unavailable" for every call), duplicated with a different body, or

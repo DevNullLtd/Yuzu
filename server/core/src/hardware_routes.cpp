@@ -1,7 +1,7 @@
 /// @file hardware_routes.cpp
 /// /hardware route registration — the page shells + the read-only HTMX fragments +
 /// the REST v1 twins (`GET /api/v1/hardware`, `GET /api/v1/hardware/{id}`, and the bulk
-/// `GET /api/v1/hardware/ci` keyset page of stored CI rows), all
+/// `GET /api/v1/hardware-ci` keyset page of stored CI rows), all
 /// self-registered on the shared `HttpRouteSink` (the preflight_routes.cpp pattern)
 /// so this module owns its own REST surface without growing rest_api_v1.cpp's
 /// register_routes argument list. Renderers live in hardware_ui.cpp; query/sort/
@@ -724,11 +724,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         res.set_content(out.dump(), "application/json");
     });
 
-    // -- REST v1: GET /api/v1/hardware/ci: the bulk CI read, one keyset page per call --
-    // Registered BEFORE `GET /api/v1/hardware/{id}`: that pattern matches any single segment, so
-    // registered first it would take `/ci` as a device id. The router takes the first registered
-    // match; the cost is that a device whose agent_id is literally `ci` is only reachable here
-    // (as `?agent_id=ci`), not through the per-id route.
+    // -- REST v1: GET /api/v1/hardware-ci: the bulk CI read, one keyset page per call --
+    // A sibling segment, not a child of `/api/v1/hardware`: `GET /api/v1/hardware/{id}` matches any
+    // single segment, so the bulk read keeps its own prefix and a device whose agent_id is literally
+    // `ci` stays reachable through the per-id route.
     //
     // Reads the stored `device_ci` rows directly (NOT the 30-day roster `GET /api/v1/hardware`
     // rebuilds on every request), ordered by agent_id, with the caller's scope pushed into SQL
@@ -738,7 +737,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // Serial / system UUID / MAC / chassis and board serials are behavioural PII, so each served
     // page is ONE `inventory.devices.ci` audit row written AFTER the read (it carries the row
     // count) and FAIL-CLOSED: a row that does not persist withholds the page.
-    sink.Get("/api/v1/hardware/ci", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/api/v1/hardware-ci", [this](const httplib::Request& req, httplib::Response& res) {
         detail::ensure_correlation_id(res);
         if (!deps_.fleet_read_fn) {
             res.status = 503;

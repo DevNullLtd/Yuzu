@@ -140,7 +140,7 @@ struct Twin {
     std::vector<CiRead> ci_reads; // the `CiRead` argument of every ci_detail_fn call
     yuzu::MetricsRegistry metrics; // the integrity counter the fake ci_detail_fn below feeds
     std::vector<std::string> dex_calls_for;
-    // The keyset store behind GET /api/v1/hardware/ci and list_hardware_ci_records.
+    // The keyset store behind GET /api/v1/hardware-ci and list_hardware_ci_records.
     yuzu::server::test::FakeCiKeysetStore ci_store;
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
@@ -893,13 +893,12 @@ TEST_CASE("mcp hardware twins: get_hardware_ci is the REST data object byte for 
     no_sw.agent_version.reset();
     no_sw.software_last_seen.reset();
     t.ci_by_id["nosw"] = no_sw;
-    HardwareCiDetail ci_only = full_detail("ci-only");
+    HardwareCiDetail ci_only = full_detail("ci");
     ci_only.identity.reset(); // not in the roster, but a CI blob exists
-    t.ci_by_id["ci-only"] = ci_only;
+    t.ci_by_id["ci"] = ci_only;
     t.ci_by_id["degraded"] = HardwareCiDetail{};
 
-    // (Not "ci": GET /api/v1/hardware/ci is the bulk CI page, registered ahead of the per-id route.)
-    for (const char* id : {"full", "nosw", "ci-only", "degraded"}) {
+    for (const char* id : {"full", "nosw", "ci", "degraded"}) {
         INFO("device " << id);
         const json rest = t.rest_data(std::string("/api/v1/hardware/") + id);
         const json mcp = t.call("get_hardware_ci", {{"agent_id", id}});
@@ -1638,7 +1637,7 @@ TEST_CASE("mcp hardware twins: an out-of-scope read does not fetch the record or
 }
 
 // ───────────────────── list_hardware_ci_records: the bulk keyset twin ─────────────────────
-// The MCP twin of GET /api/v1/hardware/ci. It is a separate tool, not a mode of
+// The MCP twin of GET /api/v1/hardware-ci. It is a separate tool, not a mode of
 // list_hardware_ci: that tool is roster-driven with offset paging and one output schema, and
 // the bulk page reads the CI table with cursor paging and a different row.
 
@@ -1689,7 +1688,7 @@ TEST_CASE("mcp list_hardware_ci_records: served as a confined Inventory:Read rea
     // the decision-grade facts a worker needs before it calls
     for (const char* needle : {"more than 10000 devices", "-32602", "scope_basis", "daily-sync snapshot",
                                "from list_hardware_ci", "indistinguishable", "limit up to 20",
-                               "GET /api/v1/hardware/ci", "byte order", "not a snapshot",
+                               "GET /api/v1/hardware-ci", "byte order", "not a snapshot",
                                "confirm a device with agent_id before you retire it",
                                "empty devices array without agent_id"})
         CHECK(desc.find(needle) != std::string::npos);
@@ -1719,7 +1718,7 @@ TEST_CASE("mcp list_hardware_ci_records: the page is the REST data object byte f
     std::string cursor;
     for (int pages = 0; pages < 10; ++pages) {
         json args = {{"limit", 2}};
-        std::string url = "/api/v1/hardware/ci?limit=2";
+        std::string url = "/api/v1/hardware-ci?limit=2";
         if (!cursor.empty()) {
             args["cursor"] = cursor;
             url += "&cursor=" + cursor;
@@ -2018,7 +2017,7 @@ TEST_CASE("mcp list_hardware_ci_records: the default page is 20 rows, REST's sta
     CHECK(t.ci_store.queries[0].limit == 21);
 
     t.ci_store.queries.clear();
-    const json rest = t.rest_data("/api/v1/hardware/ci");
+    const json rest = t.rest_data("/api/v1/hardware-ci");
     CHECK(record_ids(rest).size() == 100);
     REQUIRE(t.ci_store.queries.size() == 1);
     CHECK(t.ci_store.queries[0].limit == 101);
@@ -2035,7 +2034,7 @@ TEST_CASE("route and mcp agree: a present-but-empty agent_id is refused with the
     seed(t, {"a", "b"});
     t.clear_audit();
     const int reads = t.ci_store.reads;
-    auto rest = t.sink.Get("/api/v1/hardware/ci?agent_id=");
+    auto rest = t.sink.Get("/api/v1/hardware-ci?agent_id=");
     REQUIRE(rest);
     CHECK(rest->status == 400);
     const json mcp_r = t.call("list_hardware_ci_records", {{"agent_id", ""}});
@@ -2062,7 +2061,7 @@ TEST_CASE("route and mcp agree for a confined caller: same ids, same order, same
     std::string cursor;
     for (int pages = 0; pages < 20; ++pages) {
         json args = {{"limit", 2}};
-        std::string url = "/api/v1/hardware/ci?limit=2";
+        std::string url = "/api/v1/hardware-ci?limit=2";
         if (!cursor.empty()) {
             args["cursor"] = cursor;
             url += "&cursor=" + cursor;

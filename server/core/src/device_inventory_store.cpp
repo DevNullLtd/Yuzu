@@ -404,7 +404,7 @@ void warn_if_agent_id_c_index_unusable(PGconn* conn) {
     }
     if (problem.empty())
         return;
-    spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware/ci and list_hardware_ci_"
+    spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware-ci and list_hardware_ci_"
                  "records stay correct but every page becomes a scan plus a sort of device_ci "
                  "(about 317 ms a page at 1M devices), which can exhaust the database pool under "
                  "load. Create it as the table owner, in a session that first ran SET lock_timeout = '30s' "

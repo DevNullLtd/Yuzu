@@ -1,5 +1,5 @@
 /// @file test_bulk_ci_page_model.cpp
-/// The pure model behind GET /api/v1/hardware/ci and the MCP list_hardware_ci_records tool:
+/// The pure model behind GET /api/v1/hardware-ci and the MCP list_hardware_ci_records tool:
 /// parameter parsing (REST clamps, MCP refuses), the cursor codec (tamper, filter binding), the
 /// keyset walk under every scope shape (TOP, engaged-empty, pushed-down, over the ceiling) with
 /// the EXACT returned set asserted against an in-memory fake store, and the JSON row shape.
