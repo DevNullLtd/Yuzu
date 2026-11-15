@@ -117,7 +117,7 @@ struct AsyncHarness {
     /// Recorded audit events (verb, result, detail) — the unwired-gate refusal
     /// must leave durable evidence, not just a status code.
     struct AuditCall {
-        std::string action, result, detail;
+        std::string action, result, detail, target_id;
     };
     std::vector<AuditCall> audits;
     /// AuditFn return value. false models a lost evidence row, which must
@@ -246,9 +246,9 @@ struct AsyncHarness {
             };
         }
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string&, const std::string&,
-                               const std::string& detail) -> bool {
-            audits.push_back({action, result, detail});
+                               const std::string& result, const std::string&,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audits.push_back({action, result, detail, target_id});
             return audit_ok;
         };
 
@@ -5647,6 +5647,7 @@ TEST_CASE("re-eval: each SQL refusal on a stored echo_query set writes one denie
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].detail == "reason=" + reason + " source_kind=echo_query");
     CHECK(rows[0].detail.find("xxxx") == std::string::npos);
+    CHECK(rows[0].target_id == id); // re-eval names the original set
     CHECK(h.calls.empty());
 }
 
@@ -5671,18 +5672,30 @@ TEST_CASE("instruction-result sets: a stale-source refusal writes one denied row
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     const auto iid = make_echo_sql_instruction(*h.instr, "SELECT 1 FROM $TCP_Live");
-    int status = 0;
-    SECTION("from-instruction-result") {
-        h.post("/api/v1/result-sets/from-instruction-result",
-               nlohmann::json{{"instruction_id", iid}}.dump(), status);
+    // Refused twice: with the row stored, and with it dropped (the same 400, flagged).
+    const auto refused = [&h](const std::string& path, const std::string& body,
+                              const std::string& target) {
+        for (const bool stored : {true, false}) {
+            INFO("audit row stored=" << stored);
+            h.audits.clear();
+            h.audit_ok = stored;
+            int status = 0;
+            h.post(path, body, status);
+            CHECK(status == 400);
+            CHECK(h.last_sec_audit_failed == (stored ? "" : "true"));
+            const auto rows = denied_rows(h);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0].detail == "reason=stale_source source_kind=instruction_result");
+            CHECK(rows[0].target_id == target);
+        }
+        CHECK(h.calls.empty());
+    };
+    SECTION("from-instruction-result: no set exists yet, so the row has no target") {
+        refused("/api/v1/result-sets/from-instruction-result",
+                nlohmann::json{{"instruction_id", iid}}.dump(), "");
     }
-    SECTION("re-eval of a stored instruction_result set") {
+    SECTION("re-eval of a stored instruction_result set names the original") {
         const auto id = seed_instruction_result(h, iid, nlohmann::json::object());
-        h.post("/api/v1/result-sets/" + id + "/re-eval", "", status);
+        refused("/api/v1/result-sets/" + id + "/re-eval", "", id);
     }
-    CHECK(status == 400);
-    const auto rows = denied_rows(h);
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].detail == "reason=stale_source source_kind=instruction_result");
-    CHECK(h.calls.empty());
 }

@@ -1626,13 +1626,14 @@ RegistryCursor read_cursor(EchoDatabase& db) {
 }
 
 // Fails every INSERT into the registry hourly tier from a second connection until released.
+// `table` names another table to fail instead (an upsert is an INSERT too).
 struct InsertTrap {
     sqlite3* h{nullptr};
-    explicit InsertTrap(const fs::path& p) {
+    explicit InsertTrap(const fs::path& p, const std::string& table = "registry_hourly_r") {
         REQUIRE(sqlite3_open(p.string().c_str(), &h) == SQLITE_OK);
         REQUIRE(sqlite3_exec(h,
-                             "CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON registry_hourly_r "
-                             "BEGIN SELECT RAISE(ABORT, 'trap'); END",
+                             ("CREATE TRIGGER yuzu_test_trap BEFORE INSERT ON " + table +
+                              " BEGIN SELECT RAISE(ABORT, 'trap'); END").c_str(),
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
     void release() {
@@ -5309,13 +5310,19 @@ TEST_CASE("registry source: a Winlogon DefaultPassword leaves no trace in any ro
 
 namespace {
 
-// The cursor text an earlier build wrote for a held DefaultPassword change: the encoder of this
-// build masks the candidate, so the legacy fields are written back over the encoded form.
+// The cursor text an earlier build wrote for a held DefaultPassword change, with state in every
+// field a rewrite has to carry over: the encoder of this build masks the candidate, so the legacy
+// fields are written back over the encoded form.
 std::string legacy_cursor_with_secret() {
     RegistryCursor cur;
     cur.present = true;
     cur.tick = 7;
+    cur.ccs = "ControlSet002";
+    cur.roots[kRoot] =
+        RegistryRootState{true, 100, 110, 120, "capped", false, {kRoot + "\\Denied"}, true};
+    cur.loss = {{30, 40}};
     cur.hku = {"S-1-5-21-1"};
+    cur.offline = {{"S-1-5-21-2", "C:\\Users\\yuzu_test_u"}};
     auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
     held.key = kWinlogon;
     cur.held = {held};
@@ -5324,6 +5331,19 @@ std::string legacy_cursor_with_secret() {
     j["held"][0]["s"] = utf16(kLogonSecret).size();
     j["held"][0]["pd"] = kLogonSecret;
     return j.dump();
+}
+
+// `rewritten` is `legacy` with only the held value's bytes masked: every other field of every
+// member (tick, ccs, roots, held, loss, hku, offline) is equal.
+void check_same_position(const std::string& legacy, const std::string& rewritten) {
+    auto want = nlohmann::json::parse(legacy);
+    // The fixture has state in every member, so a rewrite that drops one cannot pass.
+    for (const char* member : {"roots", "held", "loss", "hku", "offline"})
+        REQUIRE_FALSE(want.at(member).empty());
+    want["held"][0] =
+        registry_detail::candidate_to_json(registry_detail::candidate_from_json(want["held"][0]));
+    CHECK(want["held"][0]["d"] == kRegistryMaskedData);
+    CHECK(nlohmann::json::parse(rewritten) == want);
 }
 
 } // namespace
@@ -5336,13 +5356,7 @@ TEST_CASE("masked_registry_cursor: rewrites a legacy cursor at the same position
     const auto clean = masked_registry_cursor(legacy);
     REQUIRE(clean.has_value());
     CHECK_FALSE(carries_secret(*clean, kLogonSecret));
-    const auto back = decode_registry_cursor(*clean);
-    REQUIRE_FALSE(back.malformed);
-    CHECK(back.tick == 7);
-    CHECK(back.hku == std::vector<std::string>{"S-1-5-21-1"});
-    REQUIRE(back.held.size() == 1);
-    CHECK(back.held[0].window_lo == 10);
-    CHECK(back.held[0].data == kRegistryMaskedData);
+    check_same_position(legacy, *clean);
 
     CHECK_FALSE(masked_registry_cursor(*clean).has_value()); // its own output: nothing to rewrite
 
@@ -5368,10 +5382,11 @@ TEST_CASE("registry source: start() masks a legacy cursor with no tick, which a 
     src->start(t.db); // no collect: a disabled source never ticks, so start() is the only chance
     const std::string stored = *t.db.get_cursor("registry").value();
     CHECK_FALSE(carries_secret(stored, kLogonSecret));
-    const auto back = decode_registry_cursor(stored);
-    REQUIRE_FALSE(back.malformed);
-    CHECK(back.tick == 7);
-    CHECK(back.hku == std::vector<std::string>{"S-1-5-21-1"});
+    check_same_position(legacy, stored);
+    // Nothing is replayed or re-baselined: no event, no tier row, no baseline for the root.
+    CHECK(committed_rows().empty());
+    CHECK(count_rows(t.db) == 0);
+    CHECK_FALSE(t.db.try_get_state("registry:" + kRoot).value().has_value());
 
     // A second start finds nothing to rewrite: the row is byte-identical.
     Fake f2;
@@ -5386,6 +5401,25 @@ TEST_CASE("registry source: start() masks a legacy cursor with no tick, which a 
     auto src3 = make_registry_cursor_source(scope1(), f3.reader());
     src3->start(bad.db);
     CHECK(*bad.db.get_cursor("registry").value() == "{not json");
+}
+
+TEST_CASE("registry source: a failed cursor rewrite at start() changes nothing and is retried",
+          "[echo][registry][lifecycle]") {
+    const std::string legacy = legacy_cursor_with_secret();
+    auto t = make_db();
+    REQUIRE(t.db.insert_registry_events_and_cursor({}, legacy, {}).has_value());
+    Fake f;
+    {
+        InsertTrap trap(t.path, "echo_cursor"); // the cursor upsert fails; reads still work
+        auto src = make_registry_cursor_source(scope1(), f.reader());
+        REQUIRE_NOTHROW(src->start(t.db)); // logged, and the start goes on
+        CHECK(*t.db.get_cursor("registry").value() == legacy); // the disclosed residual: unchanged
+    }
+    auto src = make_registry_cursor_source(scope1(), f.reader()); // the next start
+    src->start(t.db);
+    const std::string stored = *t.db.get_cursor("registry").value();
+    CHECK_FALSE(carries_secret(stored, kLogonSecret));
+    check_same_position(legacy, stored);
 }
 
 

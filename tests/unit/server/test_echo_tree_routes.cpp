@@ -123,6 +123,9 @@ struct EchoHarness {
     /// Set = the dispatch chokepoint refuses every dispatch with this reason (sent 0, #7114).
     std::optional<yuzu::server::detail::DispatchDenialReason> dispatch_denied;
     bool dispatch_throws = false; ///< the dispatch itself throws
+    bool dispatch_throws_other = false; ///< the dispatch throws something that is no std::exception
+    bool caller_throws = false; ///< deriving the dispatch caller throws
+    int write_probes = 0; ///< scoped-gate calls for Write, which this stub always refuses
     /// "audit:<action>/<result>" and "dispatch", in call order: proves the `attempted` row
     /// precedes every dispatch it covers.
     std::vector<std::string> order;
@@ -197,10 +200,13 @@ struct EchoHarness {
             return authz::FleetReadGate{true, std::nullopt}; // TOP — unfiltered
         };
         // Scoped gate: Execute toggled by allow_execute, Read by allow_read; a non-empty
-        // scope_device denies any other device (mirrors a management-scope miss → 403).
+        // scope_device denies any other device (mirrors a management-scope miss → 403). Write is
+        // counted and refused: no route here may probe it (the dispatch chokepoint decides Write).
         auto scoped = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                              const std::string& op, const std::string& dev) {
-            bool ok = (op == "Execute") ? allow_execute : allow_read;
+            if (op == "Write")
+                ++write_probes;
+            bool ok = (op == "Execute") ? allow_execute : (op != "Write" && allow_read);
             if (ok && !scope_device.empty() && dev != scope_device)
                 ok = false;
             if (!ok)
@@ -235,6 +241,8 @@ struct EchoHarness {
             last_dispatch_params = params;
             if (dispatch_throws)
                 throw std::runtime_error("dispatch blew up");
+            if (dispatch_throws_other)
+                throw 42;
             if (dispatch_denied)
                 return {.command_id = "echo-denied",
                         .denied = yuzu::server::detail::DispatchDenial{
@@ -256,6 +264,8 @@ struct EchoHarness {
         // (empty session_user) fails closed with an empty principal, same
         // contract every production CallerFn documents.
         auto caller_fn = [this](const httplib::Request&) -> DispatchCaller {
+            if (caller_throws)
+                throw std::runtime_error("caller derivation blew up");
             if (session_user.empty())
                 return DispatchCaller{.exec_visible = authz::deny_all()};
             return DispatchCaller{.principal = session_user, .system = false};
@@ -2294,6 +2304,7 @@ TEST_CASE("capture-sources push: a device that no agent reached is reported as n
     CHECK(toast.at("message") == "0 of 1 change(s) pushed");
     CHECK(first_row(h, "no_agents") != nullptr);
     CHECK(h.metric(kSourcesPushMetric, "none_applied") == 1);
+    CHECK(h.write_probes == 0); // the cause is read from the dispatch outcome, never probed
 }
 
 TEST_CASE("capture-sources push: a chokepoint refusal is a dispatch_denied failure and stops the batch",
@@ -2343,6 +2354,57 @@ TEST_CASE("capture-sources push: a dispatch that throws leaves a failure row and
     CHECK(toast_of(*r).at("level") == "error");
     CHECK(h.metric(kSourcesPushMetric, "dispatch_exception") == 1);
     CHECK(h.metric(kSourcesPushMetric, "none_applied") == 0);
+}
+
+TEST_CASE("capture-sources push: a failure on the second of three sources reports what was sent",
+          "[echo][routes][capture-sources][audit]") {
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+    EchoHarness h;
+    // Armed when the first source's outcome row is written, so the fault meets the second source.
+    std::function<void()> arm;
+    h.audit_persists = [&arm](const EchoHarness::AuditRow& row) {
+        if (row.result == "dispatched")
+            arm();
+        return true;
+    };
+    int status = 500;
+    int dispatches = 2;
+    std::string token = "dispatch_exception";
+    std::string message = "The push failed part-way: 1 of 3 change(s) were sent and the rest may "
+                          "not have been. Reload the sources before pushing again.";
+    SECTION("the dispatch throws") { arm = [&h] { h.dispatch_throws = true; }; }
+    SECTION("the dispatch throws something that is not a std exception") {
+        arm = [&h] { h.dispatch_throws_other = true; };
+    }
+    SECTION("deriving the caller throws: that source is never dispatched") {
+        arm = [&h] { h.caller_throws = true; };
+        dispatches = 1;
+    }
+    SECTION("the chokepoint refuses") {
+        arm = [&h] { h.dispatch_denied = Reason::ApprovalRequired; };
+        status = 403;
+        token = "dispatch_denied reason=approval_required";
+        message =
+            "Not permitted: approval_required. 1 of 3 change(s) were sent, the rest were not.";
+    }
+    std::unique_ptr<httplib::Response> r;
+    CHECK_NOTHROW(r = push(h, "process%3Don,tcp%3Doff,service%3Don"));
+    REQUIRE(r);
+    CHECK(r->status == status);
+    CHECK(h.dispatch_calls == dispatches); // the third source is never tried
+    REQUIRE(h.audit_log.size() == 3);      // attempted, the first source's outcome, the failure
+    const auto& failure = h.audit_log.back();
+    CHECK(failure.result == "failure");
+    CHECK(failure.detail == token + " sent=1 tcp_enabled=false service_enabled=true");
+    CHECK(failure.principal == "alice");
+    const auto toast = toast_of(*r);
+    REQUIRE(toast.is_object());
+    CHECK(toast.at("level") == "error");
+    CHECK(toast.at("message").get<std::string>() == message);
+    const std::string counted = status == 403 ? "dispatch_denied" : "dispatch_exception";
+    for (const char* result : {"pushed", "none_applied", "audit_unavailable", "permission_revoked",
+                               "dispatch_denied", "dispatch_exception"})
+        CHECK(h.metric(kSourcesPushMetric, result) == (counted == result ? 1 : 0));
 }
 
 TEST_CASE("capture-sources push: every result series exists before the first push",

@@ -1524,7 +1524,8 @@ inline RegistryCandidate candidate_from_json(const nlohmann::json& j) {
 /// a disabled source never has. nullopt when there is nothing to rewrite, and for a cursor that
 /// does not decode: that one is collect()'s to report (gap:cursorlost) and re-baseline, never
 /// replaced here. The rewrite is the decoded cursor re-encoded, so the position (tick, roots,
-/// held windows, loss epochs, hku, offline) is unchanged and nothing is replayed.
+/// held windows, loss epochs, hku, offline) is unchanged and nothing is replayed. A field only a
+/// later build writes is dropped, as any committed tick of this build drops it (no downgrade).
 [[nodiscard]] inline std::optional<std::string> masked_registry_cursor(const std::string& stored) {
     const RegistryCursor cur = decode_registry_cursor(stored);
     if (cur.malformed ||

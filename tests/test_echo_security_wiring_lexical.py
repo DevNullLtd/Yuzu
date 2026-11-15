@@ -15,11 +15,12 @@ here, so they are pinned by text:
   3. server.cpp wires that writer: echo_tree_routes_->set_audit_as_session_fn(
      auth_routes_->audit_as_session_fn()).
 
-Lexical only: `//` comments are stripped and whitespace is collapsed before matching (`/* */`
-comments are deliberately NOT stripped), so it cannot see a relocation that keeps the tokens but
-changes control flow (review-enforced). The self-test applies in-memory mutations and requires
-problems() to be non-empty on each; a mutation whose pattern no longer matches the source fails
-loudly (stale pattern) rather than passing vacuously.
+Lexical only: comments (`//` and `/* */`) are stripped and whitespace is collapsed before matching,
+and a check that a token is PRESENT also ignores string and character literals, so a token kept
+only in a comment or a literal does not satisfy it. It cannot see a relocation that keeps the
+tokens but changes control flow (review-enforced). The self-test applies in-memory mutations and
+requires problems() to be non-empty on each; a mutation whose pattern no longer matches the source
+fails loudly (stale pattern) rather than passing vacuously.
 
 Usage: python3 -I tests/test_echo_security_wiring_lexical.py
 """
@@ -37,10 +38,19 @@ HINT = (" (this gate pins the #7075/#3864 wiring; if the code was legitimately r
         " update tests/test_echo_security_wiring_lexical.py)")
 
 
-def normalise(src):
-    """Strip // comments, join lines, collapse whitespace (/* */ deliberately not stripped)."""
-    lines = [re.sub(r"//.*$", "", ln) for ln in src.splitlines()]
-    return re.sub(r"\s+", " ", " ".join(lines))
+# Comments and literals are found in ONE pass, so a quote inside a comment, or a comment marker
+# inside a literal ("/api/*"), cannot hide code or pass a comment off as code.
+LEX = re.compile(r'//[^\n]*|/\*.*?\*/|R"([^\s()\\]{0,16})\(.*?\)\1"|"(?:\\.|[^"\\\n])*"'
+                 r"|'(?:\\.|[^'\\\n])'", re.S)
+
+
+def normalise(src, literals=True):
+    """Strip comments, collapse whitespace; literals=False also blanks string and char literals."""
+    def tok(m):
+        if m.group(0)[0] == "/":
+            return " "
+        return m.group(0) if literals else '""'
+    return re.sub(r"\s+", " ", LEX.sub(tok, src))
 
 
 def push_body(routes):
@@ -56,8 +66,9 @@ def push_body(routes):
 def problems(plugin_src, routes_src, server_src):
     out = []
     p = normalise(plugin_src)
+    p_code = normalise(plugin_src, literals=False)
     r = normalise(routes_src)
-    s = normalise(server_src)
+    s_code = normalise(server_src, literals=False)
 
     for tok in ("processes_to_json", "json_to_processes"):
         if tok in p:
@@ -71,9 +82,9 @@ def problems(plugin_src, routes_src, server_src):
     for arg in sites:
         if not (arg.startswith("yuzu::echo::encode_process_baseline(") or arg.startswith("state_json")):
             out.append(f"set_state(proc_key, {arg}...) is not the process baseline codec's output")
-    if "state_json = yuzu::echo::encode_process_baseline(" not in p:
+    if "state_json = yuzu::echo::encode_process_baseline(" not in p_code:
         out.append("the process poll's state_json is no longer built by encode_process_baseline")
-    if "scrub_process_baseline(*db_)" not in p:
+    if "scrub_process_baseline(*db_)" not in p_code:
         out.append("init no longer scrubs a legacy process baseline (scrub_process_baseline(*db_))")
 
     body = push_body(r)
@@ -83,10 +94,10 @@ def problems(plugin_src, routes_src, server_src):
         if re.search(r"\baudit_fn_\b", body):
             out.append("the push handler writes through audit_fn_, which re-resolves the principal "
                        "at write time (empty once the session is gone): use the session-bound writer")
-        if "audit_as_session_fn_" not in body:
+        if "audit_as_session_fn_" not in normalise(body, literals=False):
             out.append("the push handler no longer writes through audit_as_session_fn_")
 
-    if WIRING not in s:
+    if WIRING + ";" not in s_code:  # as a statement, outside comments and literals
         out.append("server.cpp no longer wires the push's session-bound audit writer")
     return out
 
@@ -126,6 +137,10 @@ class EchoSecurityWiringLexical(unittest.TestCase):
             "the push loses the session-bound writer": dict(r=mutate(
                 r, "if (audit_as_session_fn_)", "if (audit_fn_)")),
             "server.cpp stops wiring the writer": dict(s=mutate(s, WIRING + ";", "")),
+            "the wiring survives only in a block comment": dict(s=mutate(
+                s, WIRING + ";", "/* " + WIRING + "; */")),
+            "the wiring survives only in a string literal": dict(s=mutate(
+                s, WIRING + ";", 'spdlog::info("' + WIRING + ';");')),
         }
         for name, over in cases.items():
             with self.subTest(mutation=name):

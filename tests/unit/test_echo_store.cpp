@@ -5604,6 +5604,25 @@ TEST_CASE("execute_user_query: a deadline hit leaves the connection usable",
     CHECK(std::stoll(next->rows[0][0]) >= 200);
 }
 
+TEST_CASE("execute_user_query: a deadline that interrupts the prepare is the same error",
+          "[echo][store][sandbox][deadline]") {
+    auto t = make_test_db();
+    // The sandbox connection has run nothing yet, so its first prepare loads the schema; 500 more
+    // tables put that load over the 1000-step poll interval whatever the schema itself holds.
+    std::string pad = "BEGIN;";
+    for (int i = 0; i < 500; ++i)
+        pad += "CREATE TABLE yuzu_test_pad_" + std::to_string(i) + "(x);";
+    REQUIRE(t.db.execute_sql(pad + "COMMIT;"));
+    constexpr const char* kCheap = "SELECT COUNT(*) FROM echo_config"; // a handful of steps
+    auto r = t.db.execute_user_query(kCheap, 10000, std::chrono::milliseconds{0});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("statement deadline") != std::string::npos);
+    // With the schema loaded (the next prepare) the statement never reaches a poll, even at a
+    // zero deadline: it was the prepare that was interrupted above.
+    REQUIRE(t.db.execute_user_query(kCheap).has_value());
+    CHECK(t.db.execute_user_query(kCheap, 10000, std::chrono::milliseconds{0}).has_value());
+}
+
 TEST_CASE("execute_user_query: the row cap still truncates to a successful result",
           "[echo][store][sandbox][deadline]") {
     auto t = make_test_db();

@@ -1381,6 +1381,8 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
         // The `attempted` row, after every refusal above and before any dispatch.
         if (!(audit && detail::try_persist_audit(audit, req, "echo.sources.configure", "attempted",
                                                  "Agent", device, pairs))) {
+            if (!audit) // a wiring fault, not an audit-store outage: say which
+                spdlog::error("capture-sources push: no session-bound audit writer wired");
             res.status = 503;
             res.set_header("Sec-Audit-Failed", "true");
             push_toast(res, kPushAuditRefusal, "error");
