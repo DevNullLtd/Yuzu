@@ -34,8 +34,9 @@
  * To replay a failure: YUZU_TEST_POSTGRES_DSN=... YUZU_TEST_PAIR_HARNESS_ONLY=<seed> \
  *   yuzu_server_tests "census pair harness: seeds replayed through the store*"
  * On a mismatch the output names the seed, the campaign, the schedule (steps in readable form),
- * the first step whose state differs, and the expected and actual state side by side. The first
- * differing step is reported and the seed stops there: a later step would only repeat it.
+ * the first step whose state differs, and the expected and actual state side by side. The seed
+ * stops at its first differing STATE (a later step would only repeat it); a decision-label
+ * mismatch is reported once per seed and does not stop it.
  * YUZU_TEST_PAIR_HARNESS_DECISIONS=0 leaves the decision-label comparison out (the metric family
  * `yuzu_server_guardian_census_pair_decisions_total` arrives with the census SQL; before it, every
  * label would read as a mismatch and hide the verdict comparison).
@@ -45,8 +46,8 @@
  * old-boot deliveries. Two or three rules per agent (seed / 5 % 2). Time is simulated: a stored
  * database-clock column is shifted back by the elapsed seconds before each delivery, which is
  * exactly what the clock reads as later; there is no sleep. Where a clock comparison would sit
- * within 5 s of the one-hour window (the real clock keeps running while the model's does not),
- * every later receipt is moved 11 s later, in the model and the replay alike: a harness
+ * within 15 s of the one-hour window (the real clock keeps running while the model's does not),
+ * every later receipt is moved 31 s later, in the model and the replay alike: a harness
  * adaptation, applied after the digests above are taken.
  *
  * FAILURES. A failing census write is a trigger on the census table (a delivery always writes its
