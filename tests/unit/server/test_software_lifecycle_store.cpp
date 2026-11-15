@@ -157,6 +157,15 @@ TEST_CASE("SoftwareLifecycleStore: replace_rules is idempotent and replaces only
         CHECK_FALSE(store.replace_rules(LifecycleSource::declared, {}).has_value());
         CHECK(store.rules_for({kKey})->size() == 3);
     }
+    SECTION("the refusal names the rule by index and never repeats its key") {
+        const auto refused = store.replace_rules(
+            LifecycleSource::shipped,
+            {rule(LifecycleSource::shipped, "product:evil\x01" "key", "", LifecycleEvent::end_of_life,
+                  "2030-01-01")});
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find("rule 0") != std::string::npos);
+        CHECK(refused.error().find("evil") == std::string::npos);
+    }
 }
 
 TEST_CASE("SoftwareLifecycleStore: upsert_declared dedups to distinct facts and keeps the newest last_seen",
@@ -234,10 +243,12 @@ TEST_CASE("SoftwareLifecycleStore: reads are empty VALUES on no rows and nullopt
         CHECK_FALSE(store.evaluate_batch({{kKey, "16"}}, kToday, kNow).has_value());
         CHECK_FALSE(
             store.upsert_declared({fact("16", LifecycleEvent::end_of_life, "2027-01-01", 1)}));
+        // rules_for, declared_for, and evaluate_batch (its first read fails, so its second never
+        // runs).
         CHECK(metrics
                   .counter("yuzu_server_software_lifecycle_store_read_degrade_total",
                            {{"reason", "query_error"}})
-                  .value() >= 3.0);
+                  .value() == 3.0);
         CHECK(metrics
                   .counter("yuzu_server_software_lifecycle_store_write_degrade_total",
                            {{"reason", "query_error"}})
@@ -312,11 +323,11 @@ TEST_CASE("SoftwareLifecycleStore: a store whose schema drifted does not open an
     CHECK(metrics
               .counter("yuzu_server_software_lifecycle_store_read_degrade_total",
                        {{"reason", "store_not_open"}})
-              .value() >= 3.0);
+              .value() == 3.0);
     CHECK(metrics
               .counter("yuzu_server_software_lifecycle_store_write_degrade_total",
                        {{"reason", "store_not_open"}})
-              .value() >= 1.0);
+              .value() == 1.0);
 }
 
 TEST_CASE("SoftwareLifecycleStore: declared_for selects exact (key, version) pairs, never a cross product",
@@ -431,12 +442,61 @@ TEST_CASE("SoftwareLifecycleStore: replace_rules serialises on its advisory lock
                 .status() == PGRES_TUPLES_OK);
     const auto blocked = store.replace_rules(LifecycleSource::shipped, two);
     REQUIRE_FALSE(blocked.has_value());
+    CHECK(blocked.error().find("SQLSTATE 55P03") != std::string::npos); // lock_not_available
     CHECK(store.rules_for({kKey})->size() == 1); // unchanged; the pool's one connection is reusable
 
     // Released, the same call lands on the same connection.
     REQUIRE(PgResult{PQexec(holder.get(), "COMMIT")}.status() == PGRES_COMMAND_OK);
     REQUIRE(store.replace_rules(LifecycleSource::shipped, two).value() == 2);
     CHECK(store.rules_for({kKey})->size() == 2);
+}
+
+TEST_CASE("SoftwareLifecycleStore: every write and read enforces its own cap",
+          "[pg][store][lifecycle]") {
+    LIFECYCLE_STORE(store);
+    const auto count = [&](const char* table) {
+        return scalar(lifecycle_db_fx_.dsn(),
+                      std::string{"SELECT count(*) FROM software_lifecycle_store."} + table);
+    };
+
+    SECTION("replace_rules takes kLifecycleCsvMaxRows rules and refuses one more") {
+        std::vector<LifecycleRule> rules;
+        for (std::size_t i = 0; i < kLifecycleCsvMaxRows; ++i)
+            rules.push_back(rule(LifecycleSource::shipped, "product:k" + std::to_string(i), "",
+                                 LifecycleEvent::end_of_life, "2030-01-01"));
+        REQUIRE(store.replace_rules(LifecycleSource::shipped, rules).value() ==
+                kLifecycleCsvMaxRows);
+        rules.push_back(rule(LifecycleSource::shipped, "product:one-too-many", "",
+                             LifecycleEvent::end_of_life, "2030-01-01"));
+        CHECK_FALSE(store.replace_rules(LifecycleSource::shipped, rules).has_value());
+        CHECK(count("lifecycle_rule") == std::to_string(kLifecycleCsvMaxRows)); // nothing changed
+    }
+    SECTION("upsert_declared takes kLifecycleDeclaredBatchMax facts and refuses one more") {
+        std::vector<DeclaredFact> facts;
+        for (std::size_t i = 0; i < kLifecycleDeclaredBatchMax; ++i)
+            facts.push_back(fact("1", LifecycleEvent::end_of_life, "2030-01-01", 1,
+                                 "product:k" + std::to_string(i)));
+        REQUIRE(store.upsert_declared(facts));
+        CHECK(count("lifecycle_declared") == std::to_string(kLifecycleDeclaredBatchMax));
+        facts.push_back(fact("1", LifecycleEvent::end_of_life, "2030-01-01", 1,
+                             "product:one-too-many"));
+        CHECK_FALSE(store.upsert_declared(facts));
+        CHECK(count("lifecycle_declared") == std::to_string(kLifecycleDeclaredBatchMax));
+    }
+    SECTION("rules_for and declared_for take kLifecycleBatchMax keys and refuse one more") {
+        std::vector<std::string> keys;
+        std::vector<LifecycleLookup> lookups;
+        for (std::size_t i = 0; i < kLifecycleBatchMax; ++i) {
+            keys.push_back("product:k" + std::to_string(i));
+            lookups.push_back({keys.back(), "1"});
+        }
+        CHECK(store.rules_for(keys).has_value());
+        CHECK(store.declared_for(lookups).has_value());
+        keys.push_back("product:one-too-many");
+        lookups.push_back({keys.back(), "1"});
+        CHECK_FALSE(store.rules_for(keys).has_value());
+        CHECK_FALSE(store.declared_for(lookups).has_value());
+    }
 }
 
 TEST_CASE("SoftwareLifecycleStore: evaluate_batch refuses more than 500 lookups",
@@ -457,6 +517,7 @@ TEST_CASE("SoftwareLifecycleStore: evaluate_batch refuses more than 500 lookups"
         CHECK(store.evaluate_batch({{kKey, "1"}}, "2026-13-01", kNow).error().kind ==
               Kind::InvalidInput);
         CHECK(store.evaluate_batch({{"", "1"}}, kToday, kNow).error().kind == Kind::InvalidInput);
+        CHECK(store.evaluate_batch({{kKey, "1"}}, kToday, -1).error().kind == Kind::InvalidInput);
     }
     SECTION("an empty batch is an empty answer") {
         const auto none = store.evaluate_batch({}, kToday, kNow);

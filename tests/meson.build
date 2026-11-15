@@ -4877,6 +4877,13 @@ test('collection settings wiring lexical',
   suite: 'docs',
   timeout: 30,
 )
+# SAM-23: the lifecycle store's refuse-to-start arms, /readyz row, Deps wiring and stop() reset.
+test('software lifecycle wiring lexical',
+  _python3_test,
+  args: [files('test_software_lifecycle_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # SAM-17: the software lookup routes' hostname roster must be handed to RestApiV1 before
 # register_routes(); an unset function leaves every hostname null with no other signal.
 test('software lookup wiring lexical',

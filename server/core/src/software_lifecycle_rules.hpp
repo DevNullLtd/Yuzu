@@ -45,6 +45,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -163,7 +164,7 @@ struct DeclaredFact {
 namespace lifecycle_detail {
 
 /// Printable text: no control byte (NUL, tab, CR, DEL included), valid UTF-8, within the field cap.
-[[nodiscard]] inline bool text_ok(std::string_view s) noexcept {
+[[nodiscard]] inline bool text_ok(std::string_view s) {
     if (s.size() > kLifecycleFieldMaxBytes)
         return false;
     for (const char c : s)
@@ -274,8 +275,9 @@ parse_lifecycle_rules_csv(std::string_view text, LifecycleSource source) {
     return norm_key.empty() ? std::string{} : "product:" + std::string{norm_key};
 }
 
-/// The lifecycle key of an operating system: `os:<distro_id>` on Linux, `os:windows`,
-/// `os:macos`; "" when the family or Linux distro id is unknown.
+/// The lifecycle key of an operating system: `os:<distro_id>` on Linux, `os:windows`, `os:macos`
+/// (the family agents report is `darwin`; `macos` is accepted as an alias); "" when the family or
+/// Linux distro id is unknown.
 [[nodiscard]] inline std::string os_lifecycle_key(std::string_view os_family,
                                                   std::string_view distro_id) {
     const auto lower = [](std::string_view s) {
@@ -285,8 +287,10 @@ parse_lifecycle_rules_csv(std::string_view text, LifecycleSource source) {
         return o;
     };
     const std::string fam = lower(os_family);
-    if (fam == "windows" || fam == "macos")
-        return "os:" + fam;
+    if (fam == "windows")
+        return "os:windows";
+    if (fam == "darwin" || fam == "macos")
+        return "os:macos";
     if (fam == "linux" && !distro_id.empty())
         return "os:" + lower(distro_id);
     return {};
@@ -399,12 +403,16 @@ struct EventOutcome {
 } // namespace lifecycle_detail
 
 /// Resolve one (product_key, version) against the rules and declared facts the caller loaded.
-/// `today` MUST be a valid `YYYY-MM-DD` (`is_lifecycle_date`); `now_secs` is the evaluation
-/// instant and `stale_window_secs` the window a declared fact stays current after `last_seen`.
+/// `today` is a valid `YYYY-MM-DD` (`is_lifecycle_date`); `now_secs` is the evaluation instant and
+/// `stale_window_secs` the window a declared fact stays current after `last_seen`, both
+/// non-negative. An input outside those bounds yields the default evaluation (`unknown`), never a
+/// `supported` for a date that cannot be compared.
 [[nodiscard]] inline LifecycleEvaluation
 evaluate_lifecycle(std::string_view product_key, std::string_view version,
                    std::span<const LifecycleRule> rules, std::span<const DeclaredFact> declared,
                    std::string_view today, std::int64_t now_secs, std::int64_t stale_window_secs) {
+    if (!is_lifecycle_date(today) || now_secs < 0 || stale_window_secs < 0)
+        return {};
     auto eos = lifecycle_detail::resolve_event(LifecycleEvent::end_of_support, product_key, version,
                                                rules, declared, now_secs, stale_window_secs);
     auto eol = lifecycle_detail::resolve_event(LifecycleEvent::end_of_life, product_key, version,

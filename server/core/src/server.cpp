@@ -689,6 +689,15 @@ public:
                           "Software lifecycle store writes that failed, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error/txn_failed)",
                           "counter");
+        // Pre-seed every reason so the first degrade reads as an increase from 0.
+        for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                   "corrupt_row", "row_cap"})
+            metrics_.counter("yuzu_server_software_lifecycle_store_read_degrade_total",
+                             {{"reason", reason}});
+        for (const char* reason :
+             {"store_not_open", "pool_acquire_timeout", "query_error", "txn_failed"})
+            metrics_.counter("yuzu_server_software_lifecycle_store_write_degrade_total",
+                             {{"reason", reason}});
         metrics_.describe("yuzu_server_revocation_source_degrade_total",
                           "CRL source registrations refused for a retryable reason, by reason "
                           "(own_addresses_unavailable/dns_unavailable/dns_timeout/dns_busy/"
@@ -8607,6 +8616,11 @@ public:
                     spdlog::error("[PG] Refusing to start: embedded software lifecycle seed is "
                                   "invalid: {}",
                                   seed.error());
+                    startup_failed_ = true;
+                } else if (seed->empty()) {
+                    // A header-only seed parses cleanly and would delete every shipped rule.
+                    spdlog::error("[PG] Refusing to start: embedded software lifecycle seed has "
+                                  "no rules");
                     startup_failed_ = true;
                 } else if (auto loaded = software_lifecycle_store_->replace_rules(
                                LifecycleSource::shipped, *seed);

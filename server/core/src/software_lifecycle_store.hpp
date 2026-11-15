@@ -27,8 +27,9 @@
 ///     outage returns false (logged, counted on the `write_degrade` counter) and the next report
 ///     repeats the fact.
 ///
-/// Log levels (the counters are exact; the counted log lines are sampled: the first degrade and
-/// every 100th after it):
+/// Log levels (the counters are exact; the counted log lines are sampled per log level, `warn`
+/// and `error` each separately: the first degrade of that level and every 100th after it, so a
+/// storm at one level never hides the first line of the other):
 ///   - `warn`: the reads and `upsert_declared` degrades (closed store, pool timeout, query
 ///     error). The caller already gets an explicit nullopt / Unavailable / false, a retry can
 ///     succeed, and the next host report repeats the fact, so the line only records that it
@@ -42,8 +43,9 @@
 /// rows per product version). The evaluator decides which row wins; the store keeps both, each
 /// with its own `last_seen`. Retention ships with the first producer of declared facts.
 ///
-/// Time: `loaded_at` is the database clock, authored in-SQL. `last_seen` is the caller's receipt
-/// time of the report.
+/// Time: `loaded_at` is the database clock, authored in-SQL. Shipped rows are re-inserted at every
+/// start, so `loaded_at` (and `rule_id`) is when this server last loaded the rule, not when its
+/// date became known. `last_seen` is the caller's receipt time of the report.
 
 #include "software_lifecycle_rules.hpp"
 
@@ -82,7 +84,7 @@ public:
         enum class Kind {
             Unavailable, ///< store closed, no connection in time, or a read failed
             TooMany,     ///< more than kLifecycleBatchMax lookups; nothing ran
-            InvalidInput ///< a key, version or date cannot be stored or evaluated; nothing ran
+            InvalidInput ///< a key, version, date or negative `now_secs` is unusable; nothing ran
         };
         Kind kind{Kind::Unavailable};
         std::string message;

@@ -40,7 +40,7 @@ constexpr const char* kReasonTxnFailed = "txn_failed";
 constexpr int kDeclaredReadCap = 20000;
 /// Bound for the seed-load transaction (startup, one writer).
 constexpr std::chrono::milliseconds kWriteTimeout{5000};
-/// Log the first degrade of a kind and every 100th after it.
+/// Log the first degrade of a log class (see note_degrade) and every 100th after it.
 constexpr std::uint64_t kLogSample = 100;
 
 const std::vector<pg::PgMigration>& migrations() {
@@ -87,13 +87,16 @@ constexpr const char* kReadFamily = "yuzu_server_software_lifecycle_store_read_d
 constexpr const char* kWriteFamily = "yuzu_server_software_lifecycle_store_write_degrade_total";
 
 /// Count a degrade on `family` and report whether this occurrence should be logged: the first
-/// degrade and every 100th after it. The counters are exact per family and reason; only the log
-/// sampling shares one counter.
+/// degrade and every 100th after it, sampled separately for the two log classes in the header (the
+/// `error` reasons an operator acts on, and the retryable `warn` ones), so a storm of one class
+/// never suppresses the first line of the other. The counters are exact per family and reason.
 bool note_degrade(yuzu::MetricsRegistry* metrics, const char* family, const char* reason) {
-    static std::atomic<std::uint64_t> n{0};
+    static std::atomic<std::uint64_t> n[2]{};
     if (metrics)
         metrics->counter(family, {{"reason", reason}}).increment();
-    return (n.fetch_add(1, std::memory_order_relaxed) % kLogSample) == 0;
+    const std::string_view r{reason};
+    const bool error_class = r == kReasonCorruptRow || r == kReasonRowCap || r == kReasonTxnFailed;
+    return (n[error_class].fetch_add(1, std::memory_order_relaxed) % kLogSample) == 0;
 }
 
 std::string event_text(LifecycleEvent e) { return std::string{to_string(e)}; }
@@ -153,16 +156,19 @@ SoftwareLifecycleStore::replace_rules(LifecycleSource source,
         return std::unexpected("declared is not a rule source");
     if (rules.size() > kLifecycleCsvMaxRows)
         return std::unexpected("more than " + std::to_string(kLifecycleCsvMaxRows) + " rules");
+    // A rule is named by its index in the message, never by its key: the key may be the field that
+    // just failed validation, and the caller logs this text.
     std::set<std::tuple<std::string, std::string, LifecycleEvent>> seen;
-    for (const auto& r : rules) {
+    for (std::size_t i = 0; i < rules.size(); ++i) {
+        const auto& r = rules[i];
         if (r.source != source)
-            return std::unexpected("a rule carries a source other than " +
+            return std::unexpected("rule " + std::to_string(i) + " carries a source other than " +
                                    std::string{to_string(source)});
         if (const auto bad = validate_lifecycle_rule(r))
-            return std::unexpected("rule for " + r.product_key + ": " + *bad);
+            return std::unexpected("rule " + std::to_string(i) + ": " + *bad);
         if (!seen.emplace(r.product_key, r.version_prefix, r.event).second)
-            return std::unexpected("duplicate rule (product_key, version_prefix, event) for " +
-                                   r.product_key);
+            return std::unexpected("rule " + std::to_string(i) +
+                                   " repeats an earlier (product_key, version_prefix, event)");
     }
 
     std::vector<std::string> keys, prefixes, events, dates, refs;
@@ -411,8 +417,9 @@ SoftwareLifecycleStore::evaluate_batch(const std::vector<LifecycleLookup>& looku
         return std::unexpected(Error{Kind::TooMany, "more than " +
                                                         std::to_string(kLifecycleBatchMax) +
                                                         " lookups in one call"});
-    if (!is_lifecycle_date(today))
-        return std::unexpected(Error{Kind::InvalidInput, "today is not a calendar date"});
+    if (!is_lifecycle_date(today) || now_secs < 0)
+        return std::unexpected(
+            Error{Kind::InvalidInput, "today is not a calendar date or now_secs is negative"});
     std::set<std::string> distinct_keys;
     for (const auto& l : lookups) {
         if (const auto bad = validate_lifecycle_lookup(l.product_key, l.version))
@@ -422,9 +429,12 @@ SoftwareLifecycleStore::evaluate_batch(const std::vector<LifecycleLookup>& looku
     if (lookups.empty())
         return std::vector<LifecycleEvaluation>{};
 
+    // Both reads must answer or nothing does; a failed first read skips the second.
     const auto rules = rules_for(std::vector<std::string>(distinct_keys.begin(), distinct_keys.end()));
+    if (!rules)
+        return std::unexpected(Error{Kind::Unavailable, "lifecycle rows could not be read"});
     const auto declared = declared_for(lookups);
-    if (!rules || !declared)
+    if (!declared)
         return std::unexpected(Error{Kind::Unavailable, "lifecycle rows could not be read"});
 
     std::unordered_map<std::string, std::vector<LifecycleRule>> rules_by_key;

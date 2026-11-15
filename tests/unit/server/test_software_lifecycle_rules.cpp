@@ -10,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
 #include <set>
 #include <string>
 #include <vector>
@@ -77,6 +78,11 @@ TEST_CASE("lifecycle: dates decide the state", "[lifecycle][rules]") {
                                    rule(LifecycleSource::shipped, "16", kEol, "2026-01-01", "r2")});
         CHECK(e.state == LifecycleState::end_of_life);
         CHECK(e.source_ref == "r2");
+    }
+    SECTION("an end of life dated today has arrived") {
+        const auto e = eval("16", {rule(LifecycleSource::shipped, "16", kEol, kToday, "r1")});
+        CHECK(e.state == LifecycleState::end_of_life);
+        CHECK(e.source_ref == "r1");
     }
     SECTION("a future end of life alone is supported") {
         CHECK(eval("16", {rule(LifecycleSource::shipped, "16", kEol, "2030-01-01")}).state ==
@@ -213,6 +219,22 @@ TEST_CASE("lifecycle: only stale declared facts and no rule is unconfirmed", "[l
     }
 }
 
+TEST_CASE("lifecycle: an input that cannot be compared reads unknown, never supported",
+          "[lifecycle][rules]") {
+    const std::vector<LifecycleRule> expired{rule(LifecycleSource::shipped, "", kEol, "2020-01-01")};
+    CHECK(eval("16", expired).state == LifecycleState::end_of_life); // control: the same rule
+    for (const char* bad_today : {"", "garbage", "2026-02-30", "2026-11-1"})
+        CHECK(evaluate_lifecycle(kKey, "16", expired, {}, bad_today, kNow, kWindow).state ==
+              LifecycleState::unknown);
+    CHECK(evaluate_lifecycle(kKey, "16", expired, {}, kToday, -1, kWindow).state ==
+          LifecycleState::unknown);
+    CHECK(evaluate_lifecycle(kKey, "16", expired, {}, kToday, kNow, -1).state ==
+          LifecycleState::unknown);
+    // The cutoff subtraction cannot overflow: the guard refuses it before any rule is read.
+    CHECK(evaluate_lifecycle(kKey, "16", expired, {}, kToday, INT64_MIN, kWindow).state ==
+          LifecycleState::unknown);
+}
+
 TEST_CASE("lifecycle: dates are strict calendar dates", "[lifecycle][rules]") {
     CHECK(is_lifecycle_date("2024-02-29"));
     CHECK_FALSE(is_lifecycle_date("2023-02-29"));
@@ -231,6 +253,8 @@ TEST_CASE("lifecycle: keys", "[lifecycle][rules]") {
     CHECK(os_lifecycle_key("linux", "").empty());
     CHECK(os_lifecycle_key("Windows", "") == "os:windows");
     CHECK(os_lifecycle_key("macos", "ignored") == "os:macos");
+    CHECK(os_lifecycle_key("darwin", "ignored") == "os:macos"); // the family agents report
+    CHECK(os_lifecycle_key("Darwin", "") == "os:macos");
     CHECK(os_lifecycle_key("plan9", "x").empty());
 }
 
@@ -277,14 +301,30 @@ TEST_CASE("lifecycle csv: each defect refuses the whole file with a reason", "[l
                                         LifecycleSource::shipped)
                   .has_value());
     }
-    SECTION("oversize file") {
-        refused(csv(std::string(kLifecycleCsvMaxBytes, 'x')));
+    SECTION("file over the byte cap, one byte past an accepted file") {
+        // A valid file padded with a trailing comment line to an exact size.
+        const auto sized = [](std::size_t total) {
+            const std::string base = csv("a,,end_of_life,2026-02-01,r\n");
+            return base + "#" + std::string(total - base.size() - 1, 'x');
+        };
+        const auto at_cap = parse_lifecycle_rules_csv(sized(kLifecycleCsvMaxBytes),
+                                                      LifecycleSource::shipped);
+        REQUIRE(at_cap.has_value());
+        CHECK(at_cap->size() == 1);
+        CHECK(refused(sized(kLifecycleCsvMaxBytes + 1)).find("exceeds") != std::string::npos);
     }
-    SECTION("too many rows") {
-        std::string rows;
-        for (std::size_t i = 0; i <= kLifecycleCsvMaxRows; ++i)
-            rows += "k" + std::to_string(i) + ",,end_of_life,2026-02-01,r\n";
-        CHECK(refused(csv(rows)).find("rows") != std::string::npos);
+    SECTION("rows: the cap is accepted, one more is refused") {
+        const auto rows_of = [](std::size_t n) {
+            std::string rows;
+            for (std::size_t i = 0; i < n; ++i)
+                rows += "k" + std::to_string(i) + ",,end_of_life,2026-02-01,r\n";
+            return csv(rows);
+        };
+        const auto at_cap = parse_lifecycle_rules_csv(rows_of(kLifecycleCsvMaxRows),
+                                                      LifecycleSource::shipped);
+        REQUIRE(at_cap.has_value());
+        CHECK(at_cap->size() == kLifecycleCsvMaxRows);
+        CHECK(refused(rows_of(kLifecycleCsvMaxRows + 1)).find("rows") != std::string::npos);
     }
     SECTION("control byte") {
         refused(csv("a,,end_of_life,2026-02-01,r\x01x\n"));
@@ -292,8 +332,14 @@ TEST_CASE("lifecycle csv: each defect refuses the whole file with a reason", "[l
         refused(csv(std::string("a,,end_of_life,2026-02-01,r") + '\0' + "x\n"));
     }
     SECTION("invalid UTF-8") { refused(csv("a,,end_of_life,2026-02-01,r\xc3\x28\n")); }
-    SECTION("field over 256 bytes") {
-        refused(csv("a,,end_of_life,2026-02-01," + std::string(257, 'r') + "\n"));
+    SECTION("field over 256 bytes, one byte past an accepted field") {
+        CHECK(parse_lifecycle_rules_csv(
+                  csv("a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes, 'r') +
+                      "\n"),
+                  LifecycleSource::shipped)
+                  .has_value());
+        refused(csv("a,,end_of_life,2026-02-01," + std::string(kLifecycleFieldMaxBytes + 1, 'r') +
+                    "\n"));
     }
     SECTION("wrong column count") {
         refused(csv("a,end_of_life,2026-02-01,r\n"));
