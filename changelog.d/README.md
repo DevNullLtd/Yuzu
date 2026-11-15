@@ -63,7 +63,24 @@ python3 scripts/whats-new.py                          # since your last pull
 python3 scripts/whats-new.py --since v0.15.0          # since a tag, branch or commit
 python3 scripts/whats-new.py --since "2 weeks ago"    # or YYYY-MM-DD
 python3 scripts/whats-new.py --full                   # whole bullets, every dependency bump
+python3 scripts/whats-new.py --versions               # version bumps, rebuild notes, Docker image bumps (see below)
 ```
+
+On Windows, where `python3` is often not on `PATH`, use the launcher:
+`py -3 scripts\whats-new.py`. The script uses only the standard library
+(Python 3.9 or later, for `str.removeprefix`) and needs `git` on `PATH`.
+
+The header counts the entries that start `**Breaking` (a `Breaking` line,
+shown only when there are some), so you see them before reading further.
+`--versions` prints that header, the version bumps, the rebuild / redeploy
+notes and the Docker image bumps. It leaves out the changelog entries, and
+shows the other dependency bumps only as a count (`--full` lists them under
+their own heading). It is a quick look at what may need a rebuild, not a
+proof that nothing does: the rebuild notes watch `vcpkg`, `proto/`,
+`gateway/`, `sdk/` and the deploy files, and say nothing about `server/`,
+`agents/` or `common/` source changes, which only the file counts in the
+header show. Fragments the script could not read or list still get their
+`!` line in `--versions` mode, because the `Breaking` count leaves them out.
 
 It prints, in this order:
 
@@ -76,8 +93,23 @@ It prints, in this order:
   Dockerfile and compose bumps are listed; the rest (workflows, pip, npm) are
   counted, and `--full` lists them.
 - **Changelog entries:** the fragments this range adds, grouped security,
-  removed, deprecated, changed, added, fixed. Each shows its first line, cut at
-  200 characters. Security, removed and deprecated entries, and entries starting
+  removed, deprecated, changed, added, fixed. The heading counts them, and
+  says how many are already released and how many are breaking. An entry a
+  release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
+  when its first line sits under one `## [X.Y.Z]` heading at `HEAD` (each bullet
+  of a multi-bullet fragment is judged by its own first line, so a bullet the
+  release editor cut, or reworded in the release commit itself, gets no marker:
+  the two cannot be told apart), and
+  `[released]` when the version cannot be told: the release editorial pass
+  reworded the line (the usual cause), the line is under two versions, under
+  a column-0 `#` or `##` heading that is not `## [X]`, or before any heading,
+  or `CHANGELOG.md` is gone. A line only under `[Unreleased]` has no marker,
+  and neither has an entry no release in the range moved (the usual case for
+  a pull of `dev`). A heading is a column-0 `## [X]` line, as
+  `scripts/assemble-changelog.py` reads it, so a sample heading inside a code
+  fence counts as one. The marker is a reading aid, not release evidence.
+  Each shows its first line, cut at
+  200 characters (a marker follows the cut). Security, removed and deprecated entries, and entries starting
   `**Breaking` (in any case), are shown whole, continuation lines included;
   other entries show their continuation lines only with `--full`. A fragment
   replaced, reworded or withdrawn inside the range is shown once in its final
@@ -89,7 +121,8 @@ It prints, in this order:
   old one. A fragment added after your base and since promoted by a release is
   shown, under its last path and section, when its first line is a line a commit
   in the range added to `CHANGELOG.md`, even if the line was edited by hand after
-  the release; a name a release promoted twice in the range is shown each time
+  the release (unless a merge commit was the only commit that added the line, see
+  below); a name a release promoted twice in the range is shown each time
   (once, if the two texts are identical). A promoted entry shows the fragment's
   wording as it was promoted, not a later hand edit of the release text, so a
   note says so and `CHANGELOG.md` has the final text. A release that deletes a
@@ -103,7 +136,8 @@ It prints, in this order:
   outer whitespace dropped). A release finished by a merge commit (a release
   branch that merges `dev` and removes the fragments there) counts as promoting
   them, shown with the wording last committed before the merge; one the merge
-  itself reworded, or one that was withdrawn, matches no `CHANGELOG.md` line and
+  itself reworded, one that was withdrawn, or one whose line only that merge
+  added and a later commit then edited, matches no `CHANGELOG.md` line and
   is named on a `!` line instead. A fragment file over 1 MiB is not read.
   A file added under `changelog.d/` whose name is not a fragment name (or that
   is in a subdirectory), a fragment name that is a submodule, and a fragment
