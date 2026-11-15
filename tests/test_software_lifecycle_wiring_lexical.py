@@ -5,14 +5,17 @@ Nothing exercises ServerImpl's boot block in a unit test (docs/testing/unit-test
 no unit test boots ServerImpl for any fail-closed store), and a dropped or inverted line fails
 silently:
 
-  * each refusal arm (store open, seed parse, empty seed, seed load) must set startup_failed_, and
-    the empty-seed arm must refuse an EMPTY seed, or the server boots with no lifecycle rules and
-    every lookup reads unknown (R1-R4, R6);
+  * each refusal arm (store open, seed parse, empty seed, seed load) must set startup_failed_ as an
+    uncommented statement, and the open, parse and load arms must be entered on the right
+    condition (each joined to its own log line, since a bare `if (!seed) {` also guards the product
+    registry); the empty-seed arm must refuse an EMPTY seed. Otherwise the server boots with no
+    lifecycle rules and every lookup reads unknown (R1-R4, R6);
   * HealthRoutes must be handed the store and /readyz must report its real open state, not a
     constant (R5, R8);
   * stop() must drop the store ahead of the pool (R7);
-  * both degrade families must be pre-seeded at boot with every reason the store can count, so the
-    first degrade reads as an increase from 0 (R9, R10).
+  * each degrade family must be pre-seeded at boot with every reason the store counts under THAT
+    family (taken from its note_degrade call sites), so the first degrade reads as an increase
+    from 0 (R9, R10).
 
 problems() is a pure function over the source text. The mutation table below applies each defect
 in memory and requires problems() to name the matching requirement; a mutation whose pattern no
@@ -29,13 +32,19 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parent.parent / "server" / "core" / "src"
 
 # R1..R4: every refusal arm logs, then sets startup_failed_ within the same statement block.
+# (condition that enters the arm, log line). The condition is matched joined to its own log line
+# on whitespace-flattened text. The empty-seed arm has none: a comment sits between its condition
+# and its log line, and R6 pins that condition instead.
+ARM_LOG = 'spdlog::error("[PG] '
 ARMS = (
-    "Refusing to start: software lifecycle store migration/open",
-    "Refusing to start: embedded software lifecycle seed is",
-    "Refusing to start: embedded software lifecycle seed has",
-    "Refusing to start: software lifecycle seed load failed",
+    ("if (!software_lifecycle_store_->is_open()) {", "Refusing to start: software lifecycle store migration/open"),
+    ("if (!seed) {", "Refusing to start: embedded software lifecycle seed is"),
+    (None, "Refusing to start: embedded software lifecycle seed has"),
+    ("!loaded) {", "Refusing to start: software lifecycle seed load failed"),
 )
 FLAG = "startup_failed_ = true"
+# A statement at the start of a line: a `//`-commented flag does not count.
+FLAG_STMT = re.compile(r"^[ \t]*" + re.escape(FLAG) + ";", re.M)
 FLAG_WINDOW = 400
 
 DEPS_WIRING = ".software_lifecycle_store = software_lifecycle_store_.get()"
@@ -49,7 +58,9 @@ FAMILIES = (
     "yuzu_server_software_lifecycle_store_read_degrade_total",
     "yuzu_server_software_lifecycle_store_write_degrade_total",
 )
-STORE_REASON = re.compile(r'constexpr const char\* kReason\w+ = "([^"]+)";')
+STORE_CONST = re.compile(r'constexpr const char\* (k\w+) = "([^"]+)";')
+# The (family, reason) pairs the store really counts: note_degrade(metrics_, kXFamily, kReasonY).
+STORE_DEGRADE = re.compile(r"note_degrade\(\s*metrics_,\s*(k\w+Family),\s*(kReason\w+)\s*\)")
 
 
 def preseed_loops(server: str, family: str):
@@ -63,12 +74,16 @@ def preseed_loops(server: str, family: str):
 def problems(server: str, health: str, store: str) -> list:
     """One message per violated requirement; [] when clean."""
     out = []
-    for n, arm in enumerate(ARMS, 1):
+    flat_server = re.sub(r"\s+", " ", server)
+    for n, (cond, arm) in enumerate(ARMS, 1):
         at = server.find(arm)
         if at < 0:
             out.append(f"R{n}: server.cpp lacks the refusal '{arm}'")
-        elif FLAG not in server[at : at + FLAG_WINDOW]:
+            continue
+        if not FLAG_STMT.search(server, at, at + FLAG_WINDOW):
             out.append(f"R{n}: the refusal '{arm}' does not set startup_failed_")
+        if cond and f"{cond} {ARM_LOG}{arm}" not in flat_server:
+            out.append(f"R{n}: the refusal '{arm}' is not entered on '{cond}'")
     if DEPS_WIRING not in server:
         out.append(f"R5: server.cpp lacks '{DEPS_WIRING}' (HealthRoutes Deps wiring)")
     if EMPTY_SEED_ARM not in server:
@@ -86,30 +101,71 @@ def problems(server: str, health: str, store: str) -> list:
     if READYZ_EXPR not in flat:
         out.append(f"R8: the /readyz row is not '{READYZ_EXPR}'")
 
-    reasons = STORE_REASON.findall(store)
+    consts = dict(STORE_CONST.findall(store))
+    reasons = [v for k, v in consts.items() if k.startswith("kReason")]
     if not reasons:
         out.append("R10: software_lifecycle_store.cpp declares no kReason* literal to pin")
-    seeded = set()
+    pairs = set()
+    for fam, reason in STORE_DEGRADE.findall(store):
+        if fam in consts and reason in consts:
+            pairs.add((consts[fam], consts[reason]))
+        else:
+            out.append(f"R10: note_degrade({fam}, {reason}) names a constant the store does not declare")
+    if not pairs:
+        out.append("R10: software_lifecycle_store.cpp has no note_degrade call site to pin")
+    seeded = {}
     for fam in FAMILIES:
         loops = preseed_loops(server, fam)
         if not loops:
             out.append(f"R9: server.cpp does not pre-seed {fam} reason by reason")
-        for loop in loops:
-            seeded.update(loop)
-    for reason in sorted(set(reasons) - seeded):
+        seeded[fam] = {reason for loop in loops for reason in loop}
+    for reason in sorted(set(reasons).difference(*seeded.values())):
         out.append(f"R10: reason '{reason}' of the store is not pre-seeded in server.cpp")
+    for fam, reason in sorted(pairs):
+        if reason not in seeded.get(fam, ()):
+            out.append(f"R10: reason '{reason}' of {fam} is not in that family's pre-seed loop in server.cpp")
     return out
 
 
-def drop_flag(arm: str):
+def edit_flag(arm: str, edit):
+    """Apply `edit` to the startup_failed_ assignment that follows `arm`."""
+
     def mutate(server: str) -> str:
         at = server.find(arm)
         j = server.find(FLAG, at) if at >= 0 else -1
         if j < 0 or j - at >= FLAG_WINDOW:
             return server
-        return server[:j] + "(void)0" + server[j + len(FLAG) :]
+        return server[:j] + edit(FLAG) + server[j + len(FLAG) :]
 
     return mutate
+
+
+def invert_condition(cond: str, arm: str):
+    """Drop the `!` of `cond`, the nearest occurrence of it before `arm`'s log line."""
+
+    def mutate(server: str) -> str:
+        at = server.find(arm)
+        j = server.rfind(cond, 0, at) if at >= 0 else -1
+        if j < 0:
+            return server
+        return server[:j] + cond.replace("!", "", 1) + server[j + len(cond) :]
+
+    return mutate
+
+
+def drop_reason(family: str, reason: str):
+    """Remove `reason` from `family`'s pre-seed loop only."""
+    pat = (
+        r"(for \(const char\* reason :\s*\{)([^}]*)(\}\)\s*metrics_\.counter\(\s*\""
+        + re.escape(family)
+        + r"\")"
+    )
+    return lambda server: re.sub(
+        pat,
+        lambda m: m.group(1) + re.sub(rf'"{reason}",?\s*', "", m.group(2), count=1) + m.group(3),
+        server,
+        count=1,
+    )
 
 
 def reset_after_pool(server: str) -> str:
@@ -131,8 +187,17 @@ def remove_preseed(family: str):
 # (label, target file, mutation, requirement id that must be reported)
 MUTATIONS = [
     *(
-        (f"arm {n} no longer sets startup_failed_", "server", drop_flag(arm), f"R{n}")
-        for n, arm in enumerate(ARMS, 1)
+        (f"arm {n} no longer sets startup_failed_", "server", edit_flag(arm, lambda f: "(void)0"), f"R{n}")
+        for n, (_, arm) in enumerate(ARMS, 1)
+    ),
+    *(
+        (f"arm {n} sets startup_failed_ only in a comment", "server", edit_flag(arm, lambda f: "// " + f), f"R{n}")
+        for n, (_, arm) in enumerate(ARMS, 1)
+    ),
+    *(
+        (f"arm {n} entered on the inverted condition", "server", invert_condition(cond, arm), f"R{n}")
+        for n, (cond, arm) in enumerate(ARMS, 1)
+        if cond
     ),
     ("Deps wiring dropped", "server", lambda t: t.replace(DEPS_WIRING, ".x = nullptr", 1), "R5"),
     (
@@ -147,6 +212,9 @@ MUTATIONS = [
     ("readyz row hardcoded true", "health", lambda t: t.replace(READYZ_EXPR, "true", 1), "R8"),
     ("read pre-seed loop removed", "server", remove_preseed(FAMILIES[0]), "R9"),
     ("write pre-seed loop removed", "server", remove_preseed(FAMILIES[1]), "R9"),
+    # A reason both families count, dropped from one family's loop while the other still seeds it.
+    ("read pre-seed loop lacks a shared reason", "server", drop_reason(FAMILIES[0], "pool_acquire_timeout"), "R10"),
+    ("write pre-seed loop lacks a shared reason", "server", drop_reason(FAMILIES[1], "pool_acquire_timeout"), "R10"),
     (
         "a reason added to the store with no seed",
         "store",
