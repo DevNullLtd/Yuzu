@@ -28,8 +28,10 @@ confirmation. Run it on a local box with a keyboard and a screen.
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
 3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
 
---agent-id is required with --apply-containment (it never contains "the first agent listed"); a probe-only
-run picks the agent itself only when exactly one is registered. A login that does not yield an authenticated
+--agent-id is required with --apply-containment (it never contains "the first agent listed") and must be
+registered under this machine's hostname (first DNS label); a probe-only run picks the agent itself only
+when exactly one is registered. A passing apply also needs its own `release` command to succeed: an
+`inactive` read after a refused release, or after the time limit, exits 1 ("release unproven"), not 0. A login that does not yield an authenticated
 session exits 2.
 
 The ceremony dispatches `quarantine`, `release` and `quarantine_status` only. `quarantine_allow` (the
@@ -189,19 +191,45 @@ def _signals(handler, sigs):
             signal.signal(sig, prev)
 
 
-def release_and_confirm(client: Client, agent_id: str) -> bool:
+def release_succeeded(answer: dict, agent_id: str) -> bool:
+    """True iff this agent's `release` command ended in a SUCCESS (status 1) row. A FAILURE, TIMEOUT or
+    REJECTED row (a `busy` refusal while an apply was still in flight), a RUNNING row or no row is not."""
+    return any(isinstance(r, dict) and r.get("agent_id") == agent_id and type(r.get("status")) is int
+               and r["status"] == STATUS_SUCCESS
+               for r in (answer.get("responses") if isinstance(answer, dict) else None) or [])
+
+
+def release_and_confirm(client: Client, agent_id: str) -> tuple[bool, bool]:
     """Dispatch `firewall.release` and require an explicit `inactive` answer, re-reading the status a few
-    times (a slow apply can still be finishing). Any error, or no answer, is NOT a confirmation (exit 3)."""
+    times (a slow apply can still be finishing). Returns (confirmed, proven): `confirmed` is the host
+    reading `inactive`; `proven` is that this release command itself succeeded, so an `inactive` that a
+    dead-man limit or a refused (`busy`) release left behind is not taken for a release the ceremony did.
+    Any error, or no answer, is NOT a confirmation (exit 3)."""
     try:
-        dispatch(client, agent_id, "release", {})
+        proven = release_succeeded(dispatch(client, agent_id, "release", {}), agent_id)
         for _ in range(RELEASE_READS):
             time.sleep(2)
             if status_token(client, agent_id) == "inactive":
-                return True
-        return False
+                return True, proven
+        return False, proven
     except Exception as e:  # noqa: BLE001 - an unconfirmed release is exit 3, whatever stopped it
         print(f"release call failed: {e}", file=sys.stderr)
-        return False
+        return False, False
+
+
+def short_host(name: str) -> str:
+    """First DNS label, lower-cased: `Box.local`, `box.corp.example` and `BOX` are the same host."""
+    return (name or "").strip().lower().split(".")[0]
+
+
+def agent_is_this_host(agents, agent_id: str, node: str) -> bool:
+    """True iff the dashboard's registry entry for `agent_id` reports this machine's hostname. The
+    ceremony cuts the named agent off the network, so it must be the box in front of the operator."""
+    for a in agents or []:
+        if isinstance(a, dict) and (a.get("agent_id") or a.get("id")) == agent_id:
+            host = short_host(str(a.get("hostname") or ""))
+            return bool(host) and host == short_host(node)
+    return False
 
 
 def dashboard_is_local(dashboard: str) -> bool:
@@ -224,7 +252,7 @@ def parse_args(argv):
     p.add_argument("--agent-id", default="")
     p.add_argument("--exceptions", default="127.0.0.1", help="allow-set entries for the containment step")
     p.add_argument("--probe-target", default="", help="ip:port the plugin probes before/after the apply; without it the status reads active_unproven")
-    p.add_argument("--ttl-seconds", type=int, default=300, help="dead-man time limit on the containment (0 = none; the plugin's minimum is 60)")
+    p.add_argument("--ttl-seconds", type=int, default=300, help="dead-man time limit on the containment: 0 (none) or at least 300; a negative value is refused")
     p.add_argument("--apply-containment", action="store_true", help="really contain and release (guarded)")
     p.add_argument("--i-have-console-access", action="store_true", help="allow --apply-containment from an SSH session")
     return p.parse_args(argv)
@@ -236,9 +264,10 @@ def main(argv=None) -> int:
     if why:
         print(f"refused: {why}", file=sys.stderr)
         return EXIT_PRECONDITION
-    if args.apply_containment and 0 < args.ttl_seconds < MIN_TTL_S:
-        print(f"refused: --ttl-seconds below {MIN_TTL_S} could end the containment before the release "
-              "confirmation finishes (use 0 for none)", file=sys.stderr)
+    if args.apply_containment and (args.ttl_seconds < 0 or 0 < args.ttl_seconds < MIN_TTL_S):
+        print(f"refused: --ttl-seconds must be 0 (none) or at least {MIN_TTL_S}: a shorter limit could end the "
+              "containment before the release confirmation finishes, and a negative one would silently drop it",
+              file=sys.stderr)
         return EXIT_PRECONDITION
     if args.apply_containment and not args.agent_id:
         print("refused: --agent-id is required with --apply-containment (the ceremony contains exactly the "
@@ -257,9 +286,14 @@ def main(argv=None) -> int:
     try:
         client.login(args.user, args.password)
         agent_id = args.agent_id
+        agents = client.get_json("/api/agents")
+        agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
+        if args.apply_containment and not agent_is_this_host(agents, agent_id, platform.node()):
+            print(f"refused: agent {agent_id!r} is not registered under this host's name "
+                  f"({short_host(platform.node())!r}); the ceremony only contains the box you are sitting at",
+                  file=sys.stderr)
+            return EXIT_PRECONDITION
         if not agent_id:
-            agents = client.get_json("/api/agents")
-            agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
             if len(agents or []) != 1:
                 print(f"precondition failed: {len(agents or [])} agents registered; pass --agent-id "
                       "(the probe picks one only when exactly one is registered)", file=sys.stderr)
@@ -301,11 +335,15 @@ def main(argv=None) -> int:
             except BaseException as e:  # noqa: BLE001 - the release below must run for ANY failure
                 err = e
             # ALWAYS release, then re-raise whatever stopped the containment step.
-            released = release_and_confirm(client, agent_id)
+            released, proven = release_and_confirm(client, agent_id)
         print(f"released: {released}")
         if not released:
             print("RELEASE NOT CONFIRMED: clear the firewall by hand", file=sys.stderr)
             return EXIT_RELEASE_FAILED
+        if not proven:
+            print("release unproven: the host reads inactive, but this run's release command did not succeed "
+                  "(a refused or failed release, or the time limit ended the containment first)", file=sys.stderr)
+            return EXIT_FAIL
         if got:
             print(f"interrupted by signal {got[0]}; containment released", file=sys.stderr)
             return EXIT_FAIL

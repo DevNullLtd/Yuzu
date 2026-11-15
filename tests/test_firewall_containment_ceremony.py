@@ -80,6 +80,8 @@ def running():
 
 
 EMPTY = {"responses": [], "count": 0}
+REL = {"responses": [{"agent_id": "a", "status": 1, "output": "status|inactive"}], "count": 1}  # a release that worked
+BUSY = {"responses": [{"agent_id": "a", "status": 2, "output": "", "error_detail": "busy"}], "count": 1}
 
 
 class Status(unittest.TestCase):
@@ -202,6 +204,9 @@ class Flow(unittest.TestCase):
     def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None):
         calls = []
         self.params = {}
+        if client is None:
+            client = mock.MagicMock()
+            client.get_json.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local"}]}
 
         def fake(_client, _agent, action, params):
             calls.append(action)
@@ -215,7 +220,8 @@ class Flow(unittest.TestCase):
                (["--apply-containment"] if apply else []) + list(extra)
         with mock.patch.object(fc, "refusal", return_value=None), \
                 mock.patch.object(fc, "install_check", return_value=(0, "")), \
-                mock.patch.object(fc, "Client", return_value=client or mock.MagicMock()), \
+                mock.patch.object(fc, "Client", return_value=client), \
+                mock.patch.object(fc.platform, "node", return_value="box"), \
                 mock.patch.object(fc.time, "sleep"), \
                 mock.patch.object(fc, "dispatch", side_effect=fake):
             return fc.main(argv), calls
@@ -232,20 +238,20 @@ class Flow(unittest.TestCase):
 
     def test_success_contains_then_releases_and_confirms(self):
         rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                                   "quarantine": [{}], "release": [{}]})
+                                   "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(calls, ["quarantine_status", "quarantine", "quarantine_status", "release",
                                  "quarantine_status"])
 
     def test_inactive_after_the_apply_is_not_contained_but_still_releases(self):
         rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive"), row("inactive")],
-                                   "quarantine": [{}], "release": [{}]})
+                                   "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_FAIL)
         self.assertIn("release", calls)
 
     def test_a_missing_release_answer_exits_3(self):
         rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [EMPTY] * fc.RELEASE_READS,
-                               "quarantine": [{}], "release": [{}]})
+                               "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
 
     def test_a_release_that_raises_exits_3(self):
@@ -255,13 +261,13 @@ class Flow(unittest.TestCase):
 
     def test_a_still_active_status_after_the_release_exits_3(self):
         rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS,
-                               "quarantine": [{}], "release": [{}]})
+                               "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
 
     def test_a_slow_release_is_confirmed_by_a_later_read(self):
         rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("partial"),
                                                          row("inactive")],
-                                   "quarantine": [{}], "release": [{}]})
+                                   "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(calls, ["quarantine_status", "quarantine", "quarantine_status", "release",
                                  "quarantine_status", "quarantine_status"])
@@ -269,30 +275,30 @@ class Flow(unittest.TestCase):
     def test_a_spoofed_inactive_in_an_error_string_is_not_a_confirmed_release(self):
         spoof = {"error": "x status|inactive", "responses": []}
         rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [spoof] * fc.RELEASE_READS,
-                               "quarantine": [{}], "release": [{}]})
+                               "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)
 
     def test_a_failure_while_containing_still_releases(self):
         for boom in (RuntimeError("x"), KeyboardInterrupt()):
             with self.subTest(boom=type(boom).__name__):
                 rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive")],
-                                           "quarantine": [boom], "release": [{}]})
+                                           "quarantine": [boom], "release": [REL]})
                 self.assertEqual(rc, fc.EXIT_FAIL)
                 self.assertIn("release", calls)
 
     def test_the_apply_carries_the_dead_man_limit_and_the_probe_target(self):
         rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                               "quarantine": [{}], "release": [{}]}, extra=["--probe-target", "198.18.0.9:443"])
+                               "quarantine": [{}], "release": [REL]}, extra=["--probe-target", "198.18.0.9:443"])
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(self.params["quarantine"],
                          {"exceptions": "127.0.0.1", "ttl_seconds": 300, "probe_target": "198.18.0.9:443"})
         self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                       "quarantine": [{}], "release": [{}]}, extra=["--ttl-seconds", "0"])
+                       "quarantine": [{}], "release": [REL]}, extra=["--ttl-seconds", "0"])
         self.assertEqual(self.params["quarantine"], {"exceptions": "127.0.0.1"})
 
     def test_an_unproven_containment_passes_only_without_a_probe_target(self):
         script = lambda: {"quarantine_status": [row("inactive"), row("active_unproven"), row("inactive")],
-                          "quarantine": [{}], "release": [{}]}
+                          "quarantine": [{}], "release": [REL]}
         rc, calls = self.run_main(script())
         self.assertEqual(rc, fc.EXIT_OK)
         rc, calls = self.run_main(script(), extra=["--probe-target", "198.18.0.9:443"])
@@ -304,7 +310,7 @@ class Flow(unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
         rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                               "quarantine": [{}], "release": [{}]}, extra=["--ttl-seconds", str(fc.MIN_TTL_S)])
+                               "quarantine": [{}], "release": [REL]}, extra=["--ttl-seconds", str(fc.MIN_TTL_S)])
         self.assertEqual(rc, fc.EXIT_OK)
 
     def test_the_limit_floor_covers_the_polling_budget(self):
@@ -348,6 +354,32 @@ class Flow(unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(calls, ["quarantine_status"])
 
+    def test_a_negative_limit_is_refused_not_silently_dropped(self):
+        rc, calls = self.run_main({}, extra=["--ttl-seconds", "-1"])
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
+        self.assertEqual(calls, [])
+
+    def test_the_apply_is_bound_to_this_host(self):
+        for agents in ([{"agent_id": "a", "hostname": "other-box"}], [{"agent_id": "z", "hostname": "box"}],
+                       [{"agent_id": "a", "hostname": ""}], []):
+            with self.subTest(agents=agents):
+                client = mock.MagicMock()
+                client.get_json.return_value = {"agents": agents}
+                rc, calls = self.run_main({}, client=client)
+                self.assertEqual(rc, fc.EXIT_PRECONDITION)
+                self.assertEqual(calls, [])
+        self.assertTrue(fc.agent_is_this_host([{"agent_id": "a", "hostname": "BOX.corp.example"}], "a", "box.local"))
+
+    def test_a_refused_release_followed_by_inactive_is_not_a_pass(self):
+        # the apply is still in flight, the release is refused `busy`, yet a later status read says inactive
+        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                                   "quarantine": [{}], "release": [BUSY]})
+        self.assertEqual(rc, fc.EXIT_FAIL)
+        self.assertEqual(calls[-2:], ["release", "quarantine_status"])
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS,
+                               "quarantine": [{}], "release": [BUSY]})
+        self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)  # an unconfirmed release is still exit 3
+
     def test_the_apply_names_its_agent(self):
         rc, calls = self.run_main({}, agent=False)
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
@@ -373,7 +405,7 @@ class Flow(unittest.TestCase):
                 before = tuple(signal.getsignal(x) for x in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT))
                 rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
                                            "quarantine": [lambda _c, sig=sig: signal.raise_signal(sig)],
-                                           "release": [{}]})
+                                           "release": [REL]})
                 self.assertEqual(rc, fc.EXIT_FAIL)  # interrupted, but released and confirmed
                 self.assertEqual(calls[-2:], ["release", "quarantine_status"])
                 after = tuple(signal.getsignal(x) for x in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT))
@@ -382,7 +414,7 @@ class Flow(unittest.TestCase):
     def test_a_signal_during_the_release_does_not_skip_the_confirmation(self):
         rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
                                    "quarantine": [{}],
-                                   "release": [lambda _c: signal.raise_signal(signal.SIGTERM)]})
+                                   "release": [lambda _c: signal.raise_signal(signal.SIGTERM) or REL]})
         self.assertEqual(rc, fc.EXIT_FAIL)
         self.assertEqual(calls[-2:], ["release", "quarantine_status"])
 
