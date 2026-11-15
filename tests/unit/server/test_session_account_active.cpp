@@ -481,7 +481,13 @@ TEST_CASE("account gate: an active account is unaffected warm, cold and across a
         CHECK(poll_and_validate(*m, token).has_value());
 
     // The MFA proof and the idle window are untouched by the gate.
-    REQUIRE(a.mark_session_mfa_verified(token));
+    // (Stamped through the proof-carrying call: the account's real factor generation and a
+    // database instant, as /login/mfa/stepup writes them, #6079.)
+    const auto mfa_status = f.db->mfa_status("alice");
+    REQUIRE(mfa_status.has_value());
+    REQUIRE(a.mark_session_mfa_verified(
+        token, yuzu::server::LocalMfaProof{.factor_gen = mfa_status->factor_gen,
+                                           .verified_ms = mfa_status->db_now_ms}));
     auto& d = f.add();
     const auto seen = d.validate_session(token);
     REQUIRE(seen.has_value());
