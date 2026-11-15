@@ -45,6 +45,7 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -1909,10 +1910,12 @@ TEST_CASE("census pair order, UP-5: currently unordered is ONE SQL predicate, re
     put("clock_later", "101", "100");
     put("unpaired_later", "100", "101");
     put("future_clock", now_ns + " + 600000000000", "1"); // recorded 600 s ahead: beyond the slack
-    put("future_no_unpaired", now_ns + " + 600000000000", "NULL"); // needs an unpaired event too
+    put("future_no_unpaired", now_ns + " + 600000000000",
+        "NULL");                                         // a paired-only agent: still true
     put("inside_slack", now_ns + " + 60000000000", "1"); // 60 s ahead: a lock wait, not a step
 
-    const std::set<std::string> expected{"never_paired", "unpaired_later", "future_clock"};
+    const std::set<std::string> expected{"never_paired", "unpaired_later", "future_clock",
+                                         "future_no_unpaired"};
     for (const char* agent : {"blank", "never_paired", "equal", "clock_later", "unpaired_later",
                               "future_clock", "future_no_unpaired", "inside_slack"}) {
         INFO(agent);
@@ -1924,10 +1927,56 @@ TEST_CASE("census pair order, UP-5: currently unordered is ONE SQL predicate, re
     const auto list = store.unordered_agents(std::nullopt);
     REQUIRE(list.has_value());
     CHECK(std::set<std::string>(list->ids.begin(), list->ids.end()) == expected);
-    CHECK(list->count == 3);
+    CHECK(list->count == 4);
     const auto count = store.unordered_agent_count();
     REQUIRE(count.has_value());
-    CHECK(*count == 3);
+    CHECK(*count == 4);
+}
+
+TEST_CASE("census pair order, UP-5: a paired-only agent whose pair clock is stepped beyond the "
+          "slack is unordered in all three readers, inside the slack it is not",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    // A real paired first delivery: the order row has a clock and NO unpaired event.
+    REQUIRE(store
+                .insert_event_classified(
+                    with_pair(stamped("p1", "r1", "paired", kCompliant, 1000), 5, 10))
+                .outcome == EventInsertOutcome::Inserted);
+    const auto reads = [&](const char* agent) {
+        const auto row = store.agent_order_for_agent(agent);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        const auto list = store.unordered_agents(std::nullopt);
+        REQUIRE(list.has_value());
+        const auto count = store.unordered_agent_count();
+        REQUIRE(count.has_value());
+        const bool in_list =
+            std::find(list->ids.begin(), list->ids.end(), agent) != list->ids.end();
+        CHECK((*row)->currently_unordered == in_list); // the three readers agree on this agent
+        CHECK(*count == list->count);
+        return in_list;
+    };
+    const auto step_clock = [&](const char* agent, const std::string& ahead_ns) {
+        exec_sql(db.dsn(),
+                 std::string("UPDATE ") + kSchema +
+                     ".guardian_agent_order SET epoch_recv_ns = "
+                     "(floor(extract(epoch FROM clock_timestamp()) * 1000000000))::bigint + " +
+                     ahead_ns + " WHERE agent_id = '" + agent + "'");
+    };
+    REQUIRE(order_text(db.dsn(), "paired") == "5|10|-|0|0|0|0|0|0|0");
+    CHECK_FALSE(reads("paired")); // a normal paired agent is ordered
+
+    step_clock("paired", "60000000000"); // 60 s ahead: inside the slack
+    CHECK_FALSE(reads("paired"));
+    step_clock("paired", "600000000000"); // 600 s ahead: beyond it, the hold treats it as stale
+    CHECK(reads("paired"));
+    step_clock("paired", "0"); // back to now: ordered again, with no event in between
+    CHECK_FALSE(reads("paired"));
+
+    // A blank row (every column NULL) is never unordered, whatever the clock reads.
+    exec_sql(db.dsn(), std::string("INSERT INTO ") + kSchema +
+                           ".guardian_agent_order (agent_id) VALUES ('blank')");
+    CHECK_FALSE(reads("blank"));
 }
 
 TEST_CASE("census pair order: a Repair whose agent-row lock wait times out is Failed with its "

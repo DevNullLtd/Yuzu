@@ -2016,17 +2016,19 @@ constexpr const char* kRepairStoredPair =
     "WHERE event_id = $1";
 
 // "Currently unordered" (UP-5): the ONE definition, in SQL, against the order table aliased `o`.
-// The latest accepted unpaired census-bearing event is later than the pair clock (a NULL clock
-// reads as 0, so a never-paired agent qualifies), OR the clock itself is recorded further than the
-// slack in the database's future (a stepped-back replica clock: the same reading `fresh` gives it,
-// where the hold treats such a clock as stale, so the read side must agree). It never reads NULL: a
-// blank row (every column NULL) is not unordered. The value depends on the database clock, so it
-// can flip with no event, the moment a clock recorded in the future falls inside the slack. Every
-// reader (the per-device row, the fleet count and the id list) uses this text; no C++ copy exists.
+// Two independent alternatives. (1) The latest accepted unpaired census-bearing event is later than
+// the pair clock (a NULL clock reads as 0, so a never-paired agent qualifies). (2) The clock itself
+// is recorded further than the slack in the database's future (a stepped-back replica clock: the
+// same reading `fresh` gives it, where the hold treats such a clock as stale, so the read side must
+// agree); this holds for a paired-only agent too, with no unpaired event at all. It never reads
+// NULL: a blank row (every column NULL) is not unordered. The value depends on the database clock,
+// so it can flip with no event, the moment a clock recorded in the future falls inside the slack.
+// Every reader (the per-device row, the fleet count and the id list) uses this text; no C++ copy
+// exists.
 #define YUZU_AGENT_ORDER_UNORDERED_                                                                \
-    "(o.unpaired_recv_ns IS NOT NULL AND (o.unpaired_recv_ns > COALESCE(o.epoch_recv_ns, 0) "      \
+    "((o.unpaired_recv_ns IS NOT NULL AND o.unpaired_recv_ns > COALESCE(o.epoch_recv_ns, 0)) "     \
     "OR COALESCE(o.epoch_recv_ns > " YUZU_CENSUS_DB_NOW_NS_ " + " YUZU_CENSUS_FUTURE_SLACK_NS_     \
-    ", false)))"
+    ", false))"
 
 // Expanded here, while the clock and slack macros are still defined, for the read side below.
 constexpr const char* kAgentOrderUnorderedSql = YUZU_AGENT_ORDER_UNORDERED_;
