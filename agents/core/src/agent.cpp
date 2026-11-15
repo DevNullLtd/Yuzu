@@ -136,18 +136,19 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // stay under that - 20s leaves only a 10s margin, not a comfortable one (matching
 // service_win.cpp's own wording on the same relationship, not "well under").
 //
-// TWO watchdogs on the external-trigger path, and their budgets are independent, not
-// shared: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),
+// THREE watchdogs on the external-trigger path, with independent budgets rather than a
+// shared deadline: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),
 // unconditionally, even when AgentImpl::stop() already called it — and GuardianEngine::
 // stop() has no early-out (verified above), so a second call blocks on its own mtx_ then
 // RE-EXECUTES. In the worst case this composes SEQUENTIALLY in wall-clock time: stop()'s
 // own watchdog (W1) bounds its guardian_->stop() call to <20s without firing, then run()'s
 // thread notices stop_requested_ and the ScopeExit's watchdog (W2) separately bounds ITS
-// OWN guardian_->stop() re-run to <20s without firing — up to ~40s total elapsed before
-// either individually reaches its own floor, exceeding the 30s SCM hint with NEITHER
-// watchdog firing (external review, PR #3737, verified against this exact call graph).
+// OWN guardian_->stop() re-run to <20s without firing. The early DEX scope guard then
+// arms W3 for its serialized observer drain, also <20s without firing. These are
+// independent deadlines, not a shared total process-shutdown bound. The repeated DEX
+// drain can already be quiescent, so counting guards does not establish elapsed time.
 // Accepted, not fixed here: in this specific composed-but-neither-fires case the process
-// is NOT stuck — both phases genuinely complete, just slowly, and the agent reaches a
+// is NOT stuck — all phases genuinely complete, just slowly, and the agent reaches a
 // normal SERVICE_STOPPED/NO_ERROR report. Per SERVICE_FAILURE_ACTIONS_FLAG's documented
 // semantics (verified directly, not re-derived from this file), --install-service's
 // recovery actions (below) fire ONLY on a process that terminates without reporting
@@ -156,15 +157,15 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // wrongly claimed one always does — corrected against Microsoft's own documented flag
 // semantics). The actual consequence is milder than a restart: the service simply
 // reports STOPPED later than the SCM's hint anticipated, no automatic action either way.
-// If either watchdog instead genuinely FIRES (hard_exit(4)), the separate auto-restart
+// If any watchdog instead genuinely FIRES (hard_exit(4)), the separate auto-restart
 // claim below is unaffected — a TerminateProcess exit never reports SERVICE_STOPPED,
 // which IS the recovery-actions trigger condition.
 //
-// This two-watchdog analysis does NOT cover every hang: the reconnect loop's own inline
+// This watchdog-composition analysis does NOT cover every hang: the reconnect loop's own inline
 // final-teardown block (trigger_engine_.stop() + the per-plugin shutdown() loop, see that
 // code) runs on run()'s own thread BETWEEN stop_requested_ being noticed and the ScopeExit
 // even arming its watchdog (W2) — if a plugin's shutdown() hangs there, run() never
-// returns, W2 never arms, and NEITHER watchdog catches it (external review, PR #3737).
+// returns, W2 and W3 never arm, and no watchdog catches it (external review, PR #3737).
 // Pre-existing, not introduced by this PR; tracked as #3756 item 5 (item 3 on that same
 // issue is the separate composition-aware-budget design work above), not fixed here.
 //
@@ -175,7 +176,7 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // Same outcome bucket as the composition case (an extra restart, not a hang) but a
 // different trigger worth naming.
 //
-// Making the two watchdogs composition-aware (deriving W2's budget from
+// Making these watchdogs composition-aware (deriving cleanup budgets from
 // elapsed-time-since-stop()-began) is deliberately deferred — it needs a design and its
 // own review, not a quick patch to an externally-reviewed primitive — grouped with the
 // other open #2233 watchdog-tuning items as #3756.
@@ -982,6 +983,16 @@ public:
         // guard events pre-sink; durable buffering is A3).
         // --dex-disable / YUZU_AGENT_DEX_DISABLE is a deploy-time opt-out: when set,
         // the observer never arms and NO DEX signal telemetry is collected.
+        // An external stop cannot read this slot before boot publication. Keep its
+        // run-thread drain armed even if start() or later plugin loading throws. DEX
+        // callbacks borrow only agent members, so this guard may run after plugin and
+        // engine cleanup. Serialize with stop(): observer stop is not concurrent-safe.
+        ScopeExit stop_dex{[this]() {
+            yuzu::agent::ShutdownDeadlineGuard watchdog{kShutdownDeadlineGrace};
+            std::lock_guard<std::mutex> stop_lk(stop_mu_);
+            if (dex_observer_)
+                dex_observer_->stop();
+        }};
         dex_observer_ = make_dex_observer();
         // Runtime health flag — the single source of truth for the heartbeat arm tag.
         // A shared_ptr<atomic> (NOT `this`) so the observer's error callback, which fires
@@ -1429,10 +1440,10 @@ public:
                          backend);
             break;
         case GuardianEngine::SparkAvailability::Unwired:
-            // Reachable, and NOT an error: wire_spark_engine() bails leaving Unwired when
-            // a stop() already ran (a SIGTERM / service-stop during boot). Log at info -
-            // the agent is shutting down; legacy was never displaced.
-            spdlog::info("Guardian: spark path left Unwired (stop requested during boot); "
+            // Defensive fallback for an unwired Spark path; legacy was never displaced.
+            // External stop is gated until boot publication, so this state alone does
+            // not establish that a shutdown request interrupted initialization.
+            spdlog::info("Guardian: spark path left Unwired; "
                          "detection backend = {}",
                          backend);
             break;
@@ -1446,21 +1457,13 @@ public:
                          r.error());
         }
 
-        // Publish "the spark slot is final" to cross-thread readers — REQUIRED, not
-        // advisory. Handlers are installed and g_agent is published BEFORE run() (so a
-        // wedged make_agent can still be interrupted), which means Agent::stop() on the
-        // shutdown-watcher / SCM / console thread is concurrent with THIS boot block —
-        // and the catch paths above FREE the engine via reset(). A bare `if
-        // (spark_engine_)` in stop() during that window is a load racing a store/free:
-        // TSan caught it for real (randomized-SIGTERM fuzz, 101 ms delay — read at
-        // stop()'s spark gate vs the make_unique store above). stop() therefore gates
-        // its spark access on this latch and SKIPS spark before it flips: that is safe,
-        // not a leak, because this thread's OWN ScopeExit (armed above) stops the
-        // engine on every run() exit — same thread, no race. After the latch flips the
-        // slot is never written again until ~AgentImpl, which runs after the watcher
-        // join / g_agent_mu barrier. (Governance Gate-3 cpp-safety SAFE-1; the same
-        // boot-window shape updater_ already handles with updater_mu_.)
-        spark_boot_done_.store(true, std::memory_order_release);
+        // Publish all lifecycle workers only after their construction, configuration,
+        // and start/degrade paths finish. stop() can run from the moment g_agent is
+        // published, before run(), and must not race any of these unique_ptr writes.
+        // A stop before publication skips the slots; this thread's cleanup guards drain
+        // them without the latch, each under its own deadline. No slot changes after publication
+        // until destruction, after the watcher join / g_agent_mu lifetime barrier.
+        lifecycle_boot_done_.store(true, std::memory_order_release);
 
         // Wire trigger dispatch + start the engine. Plugins registered their
         // triggers during init() (above); the engine has been holding them
@@ -4071,25 +4074,21 @@ public:
         // Cancel under ctx_mu_ — see the member's note. The context is a STACK object owned
         // by run()'s reconnect frame, and this runs on the watcher / SCM thread.
         cancel_ctx(subscribe_ctx_);
-        if (guardian_)
-            guardian_->stop();
-        if (dex_observer_)
-            dex_observer_->stop();
-        // Gate on the boot latch BEFORE touching the pointer. This runs on the watcher /
-        // SCM / console thread; run()'s boot block stores AND (on the degrade path) FREES
-        // spark_engine_ until the latch flips — a bare `if (spark_engine_)` here raced
-        // that window (TSan-confirmed via the randomized-SIGTERM fuzz at 101 ms).
-        // Skipping spark pre-latch is safe: run()'s ScopeExit stops the engine on every
-        // run() exit, on run()'s own thread, with NO boot-latch gate of its own (adversarial
-        // review Kimi K1: an earlier revision of this PR gave the ScopeExit's call the same
-        // gate via a shared once-only-flag method, which broke this exact safety net - a
-        // stop() that raced the boot window would set the flag without ever having called
-        // spark_engine_->stop(), permanently skipping the ScopeExit's retry too. Reverted -
-        // each caller keeps its own, deliberately different, gating). Acquire pairs with the
-        // release store at the end of the boot block, so a post-latch read sees the final
-        // pointer value.
-        if (spark_boot_done_.load(std::memory_order_acquire) && spark_engine_)
-            spark_engine_->stop(); // idempotent; completion-barriered by lifecycle_mu_
+        // Startup constructs Guardian and DEX before Spark and may reset Spark on
+        // degradation. Read none of these slots until all startup mutations finish.
+        // The acquire pairs with run()'s release publication; after it, the slots stay
+        // immutable until destruction after the watcher/SCM lifetime barrier.
+        // A pre-publication stop still requests cancellation above. run()'s own cleanup
+        // guards drain all three under their deadlines, without this latch or stop_completed_,
+        // so an early stop cannot permanently skip teardown.
+        if (lifecycle_boot_done_.load(std::memory_order_acquire)) {
+            if (guardian_)
+                guardian_->stop();
+            if (dex_observer_)
+                dex_observer_->stop();
+            if (spark_engine_)
+                spark_engine_->stop();
+        }
         // LOCAL COPY. This runs on the watcher / SCM thread while run() may be publishing a
         // fresh Updater on reconnect; the copy keeps this one alive for the whole stop().
         if (auto u = updater())
@@ -4117,7 +4116,7 @@ public:
         // Route A (corrected), #2012/#3840 plan: additive sum of Guardian's
         // own bounded-I/O workers and every Spark mechanism's detached probe
         // workers (spark_detached_workers_, see its own doc comment on why
-        // this NEVER dereferences spark_engine_/spark_boot_done_ - that is
+        // this NEVER dereferences spark_engine_/lifecycle_boot_done_ - that is
         // the whole point of Route A, which fixed a real gap Route B (an
         // earlier design summing only through guardian_'s wired pointer)
         // had: a window where a mechanism's detached worker could exist
@@ -4684,7 +4683,7 @@ private:
     // Makes Agent::stop()'s own "Thread-safe" doc comment (agent.hpp) actually true.
     std::mutex stop_mu_;
     // A plain bool guarded by stop_mu_, not std::atomic<bool> like stop_requested_/
-    // spark_boot_done_ above - deliberate, not a drift from that idiom: every read and write
+    // lifecycle_boot_done_ above - deliberate, not a drift from that idiom: every read and write
     // of this flag already falls inside the same stop_mu_ critical section (it gates
     // whole-method mutual exclusion, not just a single flag check), so a bare atomic would
     // add nothing and would invite a future edit to check it outside the lock.
@@ -4854,7 +4853,7 @@ private:
     // covering every window the F3 sum must be correct in (pre-boot, mid-
     // boot, post-exception-reset, post-sticky-stop-skip-wiring - Astra's
     // round-3 finding, "F3 orphan-exit accounting - Route A (corrected)").
-    // Never read through spark_engine_ or spark_boot_done_ (that IS the
+    // Never read through spark_engine_ or lifecycle_boot_done_ (that IS the
     // point of Route A - see guardian_active_io_workers() below); its own
     // shared_ptr semantics keep the underlying atomic alive independent of
     // AgentImpl's member-destruction order, since any worker still holding a
@@ -4905,18 +4904,11 @@ private:
     // declaration-order position does not itself require reordering any
     // constructor-body statement.
     std::unique_ptr<GuardianEngine> guardian_;
-    /// TRUE once run()'s spark boot block has finished mutating spark_engine_ (set on
-    /// every path: instantiated, --spark-disable, or degrade-to-no-spark). Agent::stop()
-    /// — which runs on the watcher/SCM/console thread and is reachable from the moment
-    /// g_agent is published, BEFORE run() — must acquire-load this latch before reading
-    /// spark_engine_: the boot block both stores and (on the catch paths) FREES the
-    /// pointer, and TSan caught the bare read racing that window for real (randomized-
-    /// SIGTERM fuzz, 101 ms delay). Pre-latch, stop() skips spark; run()'s own ScopeExit
-    /// covers teardown on that same thread. Post-latch, the slot is never written again
-    /// until ~AgentImpl (after the watcher join / g_agent_mu barrier). The heartbeat
-    /// thread needs no latch — it is spawned by run() AFTER the boot block, so its reads
-    /// are sequenced by thread creation. (Gate-3 cpp-safety SAFE-1.)
-    std::atomic<bool> spark_boot_done_{false};
+    /// Publishes guardian_, dex_observer_ and spark_engine_ to external stop callers.
+    /// Startup owns their mutation until the release store. A pre-publication stop
+    /// leaves their bounded teardown to run()'s own cleanup. Post-publication pointers
+    /// remain immutable until destruction after the watcher/SCM lifetime barrier.
+    std::atomic<bool> lifecycle_boot_done_{false};
     /// SHARED_PTR BEHIND A MUTEX, not a unique_ptr — and not a std::atomic<shared_ptr> either.
     ///
     /// WHY IT IS SHARED. run() REASSIGNS this on every reconnect (a fresh Updater per

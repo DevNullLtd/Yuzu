@@ -144,10 +144,10 @@ find_psql() {
     PSQL="psql"
     return 0
   fi
-  # Wee Tam runner services don't put the PG bin dir on PATH; take the
-  # newest installed major (MSYS2 view of C:\Program Files\PostgreSQL).
+  # Runner services don't put the PG bin dir on PATH. Support both the
+  # installer layout and Wee Tam's per-agent binary copies on its CI drive.
   local candidate
-  candidate=$(find "/c/Program Files/PostgreSQL" -maxdepth 3 -path '*/bin/psql.exe' 2>/dev/null | sort -V | tail -1 || true)
+  candidate=$(find "/c/Program Files/PostgreSQL" /d/ci/pgbin -maxdepth 3 -path '*/bin/psql.exe' -type f 2>/dev/null | sort -V | tail -1 || true)
   if [[ -n "$candidate" ]]; then
     PSQL="$candidate"
     return 0

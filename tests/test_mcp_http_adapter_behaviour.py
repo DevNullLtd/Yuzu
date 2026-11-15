@@ -218,6 +218,8 @@ def run_adapter_staged(node, url, chunks, gap, extra=None, timeout=30):
             p.stdin.write(chunk.encode("utf-8"))
             p.stdin.flush()
         p.stdin.close()
+        # EOF has already been sent; communicate() must not flush the closed pipe.
+        p.stdin = None
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         p.kill()

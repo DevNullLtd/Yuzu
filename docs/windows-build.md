@@ -144,10 +144,12 @@ with `-ExecutionPolicy Bypass`, but not command text.
 
 ## Server tests are Linux-only
 
-The server is not built on Windows (ADR-0035), so there is no server test
-suite here: `meson test -C build-windows --suite server` runs only the five
-Node-script tests that also carry the `server` label (they need no server
-binary and skip without node), which is not server coverage. Run the agent tests
+The server is not built on Windows (ADR-0035), so there is no server-daemon
+test suite here. The `server` label also selects shared checks, including the
+gRPC runtime-lifetime regression and Node-script tests that need no server
+binary (the Node tests skip without node). Running
+`meson test -C build-windows --suite server` therefore does not provide native
+server-daemon coverage. Run the agent tests
 with `meson test -C build-windows --suite agent --print-errorlogs`, and the
 server tests on Linux. The old libpq.dll-on-PATH setup is no longer needed.
 

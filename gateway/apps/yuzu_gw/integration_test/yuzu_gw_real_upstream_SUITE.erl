@@ -290,44 +290,54 @@ heartbeat_batching(_Config) ->
             "Heartbeat buffer process should still be alive after batching"),
     ct:pal("Heartbeat batching to real server completed successfully").
 
-%% @doc Start an agent, disconnect it, verify the upstream disconnect
-%% notification is sent to the real server without crashing.
+%% @doc Register a real session, disconnect its stream, and verify that the
+%% server accepts both notices and forgets the session. A fabricated session
+%% causes refused-notice retries that leak into later cases' global metrics.
 agent_disconnect_notification(_Config) ->
     ct:pal("--- agent_disconnect_notification ---"),
 
-    StreamHandler = spawn(fun() -> stream_handler_loop(self()) end),
     AgentId = <<"real-disconnect-agent">>,
-    AgentArgs = #{
-        agent_id   => AgentId,
-        session_id => <<"real-disc-sess">>,
-        agent_info => #{plugins => [#{name => <<"system">>, version => <<"1.0">>}]},
-        stream_pid => StreamHandler,
-        peer_addr  => <<"127.0.0.1:0">>
-    },
+    {ok, #{session_id := SessionId}} =
+        yuzu_gw_upstream:proxy_register(make_register_req(AgentId)),
+    Labels = ["op=\"notify_stream_status\"", "outcome=\"unknown_session\""],
+    Before = server_metric("yuzu_server_gateway_route_desync_total", Labels),
+    Tap = attach_rpc_events(),
+    TestPid = self(),
+    StreamHandler = spawn(fun() -> stream_handler_loop(TestPid) end),
+    try
+        {ok, AgentPid} = yuzu_gw_agent:start_link(#{
+            agent_id   => AgentId,
+            session_id => SessionId,
+            agent_info => #{plugins => [#{name => <<"system">>, version => <<"1.0">>}]},
+            stream_pid => StreamHandler,
+            peer_addr  => <<"127.0.0.1:0">>
+        }),
+        unlink(AgentPid),
+        try
+            ?assertMatch({rpc_latency, _}, await_rpc(<<"notify_stream">>, 10000)),
+            ?assertEqual(0, metric_delta(Before, server_metric(
+                "yuzu_server_gateway_route_desync_total", Labels))),
+            ?assertEqual(known, server_session_state(SessionId)),
+            ?assertEqual({ok, {AgentPid, SessionId}},
+                         yuzu_gw_registry:lookup_local_session(AgentId)),
 
-    {ok, _AgentPid} = yuzu_gw_agent:start_link(AgentArgs),
-    timer:sleep(200),
-
-    CountBefore = yuzu_gw_registry:agent_count(),
-    ct:pal("Registry count before disconnect: ~B", [CountBefore]),
-    ?assert(CountBefore >= 1),
-
-    %% Kill the stream handler — agent detects DOWN and disconnects.
-    %% This fires NotifyStreamStatus to the real server.
-    exit(StreamHandler, kill),
-
-    %% Wait for cleanup.
-    ok = wait_until(fun() ->
-        yuzu_gw_registry:lookup(AgentId) =:= error
-    end, 5000),
-
-    CountAfter = yuzu_gw_registry:agent_count(),
-    ct:pal("Registry count after disconnect: ~B (was ~B)", [CountAfter, CountBefore]),
-    ?assert(CountAfter < CountBefore),
-
-    %% Verify upstream module didn't crash from the notification.
-    ?assert(is_pid(whereis(yuzu_gw_upstream)),
-            "Upstream process should survive disconnect notification").
+            %% DOWN drives the owner's real DISCONNECTED notification.
+            exit(StreamHandler, kill),
+            ?assertMatch({rpc_latency, _}, await_rpc(<<"notify_stream">>, 10000)),
+            ok = wait_until(fun() ->
+                yuzu_gw_registry:lookup(AgentId) =:= error
+            end, 5000),
+            ?assertEqual(unknown, server_session_state(SessionId)),
+            ?assertEqual(0, metric_delta(Before, server_metric(
+                "yuzu_server_gateway_route_desync_total", Labels)))
+        after
+            %% The owner is normally gone already; also clean it on assertion failure.
+            catch gen_statem:stop(AgentPid, shutdown, 5000)
+        end
+    after
+        exit(StreamHandler, kill),
+        telemetry:detach(Tap)
+    end.
 
 %%% -- #5652: every upstream call site paired with the real client ---------
 
@@ -402,31 +412,55 @@ rpc_proxy_inventory(_Config) ->
     ?assertMatch({ok, #{received := false}}, yuzu_gw_upstream:proxy_inventory(Report(Forged))).
 
 %% @doc NotifyStreamStatus through yuzu_gw_upstream:notify_stream_status/5. The
-%% call site is a cast, so the proof is on the server: a CONNECTED for a
-%% registered session is acknowledged (no desync is counted), one for a session
-%% the server does not hold is counted exactly once as an unknown_session
-%% desync, which only happens when agent_id and session_id arrive intact.
+%% call site is a cast, so the proof is on the server: a registered session
+%% adds no unknown-session desync, while an unminted one adds at least one.
+%% Refused notices may legitimately be retried; settle each key so those
+%% retries cannot pollute the next case's metrics or RPC telemetry.
 rpc_notify_stream_status(_Config) ->
     AgentId = <<"rpc-notify-agent">>,
     {ok, #{session_id := S}} = yuzu_gw_upstream:proxy_register(make_register_req(AgentId)),
+    Home = home_id(),
+    Forged = forged_session_id(),
+    ForgedHome = home_id(),
     Labels = ["op=\"notify_stream_status\"", "outcome=\"unknown_session\""],
     Tap = attach_rpc_events(),
     try
         Before = server_metric("yuzu_server_gateway_route_desync_total", Labels),
-        yuzu_gw_upstream:notify_stream_status(AgentId, S, connected, <<"127.0.0.1:1">>, home_id()),
+        yuzu_gw_upstream:notify_stream_status(AgentId, S, connected, <<"127.0.0.1:1">>, Home),
+        ok = await_notify_settled(AgentId, S, Home),
         ?assertMatch({rpc_latency, _}, await_rpc(<<"notify_stream">>, 10000)),
         ?assertEqual(0, metric_delta(Before, server_metric(
             "yuzu_server_gateway_route_desync_total", Labels))),
 
-        yuzu_gw_upstream:notify_stream_status(AgentId, forged_session_id(), connected,
-                                              <<"127.0.0.1:1">>, home_id()),
+        yuzu_gw_upstream:notify_stream_status(AgentId, Forged, connected,
+                                              <<"127.0.0.1:1">>, ForgedHome),
+        ok = await_notify_settled(AgentId, Forged, ForgedHome),
         ?assertMatch({rpc_latency, _}, await_rpc(<<"notify_stream">>, 10000)),
-        ok = wait_until(fun() ->
-            metric_delta(Before, server_metric("yuzu_server_gateway_route_desync_total",
-                                               Labels)) =:= 1
-        end, 10000)
+        ?assert(metric_delta(Before, server_metric(
+            "yuzu_server_gateway_route_desync_total", Labels)) >= 1)
     after
-        telemetry:detach(Tap)
+        try
+            ok = await_notify_settled(AgentId, S, Home),
+            ok = await_notify_settled(AgentId, Forged, ForgedHome)
+        after
+            telemetry:detach(Tap)
+        end
+    end.
+
+%% Called by the sender immediately after its cast: per-sender mailbox order
+%% puts the barrier behind that notice. Settlement cancels any refused retry;
+%% the separate rpc_latency assertion still proves a real successful RPC.
+await_notify_settled(AgentId, SessionId, Home) ->
+    Ack = alias([reply]),
+    try
+        ok = yuzu_gw_upstream:notify_settled(AgentId, SessionId, Home, Ack),
+        receive
+            {Ack, notify_settled} -> ok
+        after 10000 ->
+            ct:fail(notify_did_not_settle)
+        end
+    after
+        unalias(Ack)
     end.
 
 %% @doc ForwardGuardianMessage through yuzu_gw_upstream:forward_guardian_message/2.

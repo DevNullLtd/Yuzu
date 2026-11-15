@@ -1,123 +1,30 @@
-// Custom Catch2 entry point for yuzu_agent_tests AND yuzu_server_tests —
-// deliberately NOT Catch2WithMain (see tests/meson.build: both exes link
-// catch2_nomain_dep).
+// Shared Catch2 entry point for yuzu_agent_tests, yuzu_server_tests and the
+// gRPC lifetime regression. These targets link Catch2 without Catch2Main.
 //
-// #1648: the Windows debug test binaries have, on rare CI runs, printed a
-// clean Catch2 summary (e.g. "1 failed") and then had the OS report an
-// unrelated process exit code (42), which defeats scripts/ci/flake-retry.py's
-// classification (catch2_failed_cases() treats an abnormal exit as
-// unclassifiable and hard-blocks the job instead of retrying a known flake).
-// Printing Session::run()'s return value here, immediately before main()
-// returns, bisects the bug on its next occurrence:
-//   - this line prints (e.g. "returned 1") but the OS still reports 42 ->
-//     the corruption happens strictly AFTER main() returns (global/static
-//     destructors, DLL unload) — Catch2 and the test bodies are exonerated.
-//   - this line never prints on a 42-exit run -> main() never reached the
-//     fprintf, so the corruption happened DURING session.run() itself (e.g.
-//     a RegistryGuard watch thread crashing mid-suite), which also explains
-//     why catch2_failed_cases()'s junit re-run comes back empty/unparseable.
+// The server entry point keeps the default gRPC EventEngine alive across its suite,
+// then destroys the Catch session and drains gRPC before process/OpenSSL cleanup. The
+// dependency overlay also releases each secure worker's OpenSSL thread state
+// before publishing retirement: pinning alone does not join detached TLS
+// destructors. This runner owns the default engine, not arbitrary engines or
+// caller-owned threads created by tests; those fixtures must join their work.
+// The agent entry point does not pin a pool: its fork-without-exec death tests
+// require a thread-quiescent process. Agent fixtures own their gRPC lifetimes.
 //
-// #3507 AC1: printing the diagnostic was never enough to stop the strand -
-// once a teardown-thread crash happens AFTER a green (or honestly red)
-// summary, nothing in this file's control can stop the OS from reporting a
-// corrupted exit code, because the corruption happens in code this file does
-// not own (global/static destructors, DLL unload, a still-running detached
-// worker). The fix is to never reach that code on Windows: leave immediately
-// after Session::run() returns, via the same hard_exit() primitive
-// main.cpp/service_win.cpp already use for the identical class of hazard
-// (agents/core/src/hard_exit.hpp, ADR-0021 rung 7.6 / the F3 orphan-exit
-// obligation). This is REUSE of that primitive, not a new copy — both test
-// binaries already carry agents/core/src on their include path (see the
-// CONSTRAINT comment on yuzu_server_tests's target in tests/meson.build), so
-// server/core/src/main.cpp's "hoist to common/ on a third call site" rule is
-// not triggered by this include.
-//
-// hard_exit.hpp documents that its `code` "should be nonzero for every
-// F3/orphan-triggered call ... must never look like EXIT_SUCCESS" — that
-// sentence is scoped to the F3/orphan-drain use it was written for. THIS
-// call site is a different, deliberately reviewed use: a passing test run
-// (result == 0) is exactly the case #3507 exists to protect, since the
-// crash this bug describes happens strictly after a GREEN summary. Calling
-// hard_exit(0) here on Windows is intentional, not an oversight — do not
-// "fix" it to skip hard_exit on a zero result.
-//
-// Windows AND macOS (#ifdef, not a runtime check): nightly's coverage
-// (-Db_coverage) and the ASan/UBSan/TSan legs need a normal process exit
-// for their atexit dumps (gcov's .gcda write, LSan's leak report) —
-// hard_exit() skips atexit entirely by design. Those legs are Linux and
-// Windows only (nightly.yml, sanitizer-tests.yml declare no macOS job), so
-// extending to __APPLE__ breaks no instrumentation that exists today; the
-// sanitizer exclusion below is still written to cover macOS, so a future
-// macOS ASan leg is correct by construction rather than by omission.
-//
-// macOS added 2026-09-29 (#3507 follow-up). The hazard was described as "a
-// Windows-debug-CI phenomenon (#1648)" when AC1 shipped, and that was true
-// of the evidence then available. It is not true now: BigMags reproduced
-// the identical signature — flake-retry.py reporting "suite failed but
-// enumeration re-run reproduced no failing case" against `exit status 42`
-// — on three of four attempts on PR #5101 and again on PR #5107 the same
-// afternoon, while Linux stayed green and the macOS-failing PR changed no
-// C++ at all. The teardown race this guard exists to prevent is not
-// OS-specific; only the original evidence was. See #3507 for the run table.
-//
-// NOT claimed: that this closes #3507. Windows #5107 failed with "not a
-// classifiable Catch2 run — crash/non-Catch2", i.e. death DURING
-// session.run(), which is the second bisect arm this file's own header
-// describes and which a hard_exit AFTER run() cannot reach.
-//
-// ALSO excluded from hard_exit on Windows (governance Gate 2/3, 2026-08-28):
-// nightly.yml's windows-asan leg, which DOES build and run this exact binary
-// (tests/yuzu_agent_tests, -Db_sanitize=address) — an unconditional #ifdef
-// _WIN32 guard would fire there too, TerminateProcess-ing before any
-// static/global destructor runs and removing ASan's one window to catch a
-// UAF-class race between a still-running detached worker (the exact F3
-// scenario this hard_exit call exists to guard test-harness exit against)
-// and normal teardown — precisely the "whole UAF class this batch targets"
-// windows-asan's own job comment describes. Verified this exclusion is safe
-// to make, not merely convenient: windows-asan runs `meson test` directly,
-// never through flake-retry.py, so the #1648 exit-42 misclassification this
-// hard_exit call exists to prevent cannot occur on that leg — excluding it
-// costs this file's own stated purpose nothing. __SANITIZE_ADDRESS__ is a
-// real macro GCC and MSVC both define directly under their ASan flag, but
-// Clang answers __has_feature(address_sanitizer) instead. That distinction
-// USED to be irrelevant here ("Windows never uses Clang",
-// docs/windows-build.md's standing rule, and windows-asan's toolchain is
-// confirmed cl.exe) — extending this guard to macOS, which is Apple Clang,
-// makes it load-bearing: a bare !defined(__SANITIZE_ADDRESS__) would NOT
-// exclude a macOS ASan build, and the guard would then hard_exit (::_exit on
-// POSIX, not TerminateProcess - see hard_exit.hpp) before any static/global
-// destructor ran, reintroducing on macOS exactly the hole the windows-asan
-// carve-out above exists to prevent. The durable loss there is the
-// teardown-UAF WINDOW, not primarily the leak report. Hence YUZU_TEST_ASAN
-// below, which ORs both conventions.
-//
-// TSan is excluded on the same reasoning and by the same shape: the sanitizer
-// built to SEE a detached-worker-vs-teardown race is exactly the one that must
-// be allowed to reach teardown. (Apple's TSan runtime interposes _exit, so its
-// report and exit status survive hard_exit - the window does not, which is the
-// part that matters.) UBSan needs no exclusion: it reports inline and runs no
-// finalizer. The YUZU_TEST_TSAN macro this guard reads is the pre-existing one
-// defined below for the libpq suppressions hook. This is not a new, untested pattern: the identical
-// cross-toolchain sanitizer-detect need already lives in this exact
-// codebase at tests/unit/test_helpers.hpp's kSpinScale and
-// agents/core/include/yuzu/agent/guardian_engine.hpp's
-// YUZU_WORKER_MUTEX_GUARD (both OR in the __has_feature branch too, since
-// they also compile on Linux/macOS Clang — and as of the macOS extension
-// this call site does too, via YUZU_TEST_ASAN).
-//
-// Session's own destructor (and any Catch2/system atexit handler) never
-// runs on this path. Verified empirically (2026-08-27, scratch experiment
-// against the vendored Catch2 3.13.0) that this is safe for what
-// flake-retry.py needs: a `--reporter junit --out` file is fully written
-// and well-formed, WITH the correct process exit code preserved, when the
-// process calls _exit()/TerminateProcess() immediately after
-// Session::run() returns — junit finalization and the PG cleanup listener's
-// testRunEnded both fire INSIDE run(), not in Session's destructor.
-#include "hard_exit.hpp"
+// Preserve the existing #3507 unsanitized Windows/macOS hard_exit policy, but
+// only AFTER explicit suite/gRPC teardown. Sanitizers and coverage must retain
+// normal process exit so cleanup races, leaks and coverage output remain visible.
+// The historical exit-42 diagnosis was too broad: Catch2 itself returns 42 for
+// assertion failures. Only a mismatch with the logged Session return value is
+// evidence of an exit-status problem; 42 alone is not evidence of corruption.
+#include <cstdio>
 
 #include <catch2/catch_session.hpp>
+#ifdef YUZU_TEST_GRPC_RUNTIME
+#include <grpc/event_engine/event_engine.h>
+#include <grpc/grpc.h>
+#endif
 
-#include <cstdio>
+#include "hard_exit.hpp"
 
 // #1611: TSan suppression for libpq's two connect-time process globals.
 //
@@ -178,14 +85,43 @@
 #endif
 
 #ifdef YUZU_TEST_TSAN
-extern "C" __attribute__((visibility("default"), used)) const char*
-__tsan_default_suppressions() {
+extern "C" __attribute__((visibility("default"), used)) const char* __tsan_default_suppressions() {
     return "race:^static_std_strings$\n"
            "race:^static_client_encoding$\n";
 }
 #endif
 
-int main(int argc, char* argv[]) {
+namespace {
+
+#ifdef YUZU_TEST_GRPC_RUNTIME
+class SuiteGrpcRuntime {
+public:
+    SuiteGrpcRuntime() {
+        // Transfer the sole long-lived reference into gRPC's default-engine
+        // slot. Keeping a second shared_ptr here would deadlock shutdown's
+        // wait for the last owner. Creation can throw before the transfer;
+        // grpc_init is a non-throwing C API after successful installation.
+        grpc_event_engine::experimental::SetDefaultEventEngine(
+            grpc_event_engine::experimental::CreateEventEngine());
+        grpc_init();
+    }
+
+    ~SuiteGrpcRuntime() {
+        grpc_shutdown_blocking();
+        grpc_event_engine::experimental::ShutdownDefaultEventEngine();
+    }
+
+    SuiteGrpcRuntime(const SuiteGrpcRuntime&) = delete;
+    SuiteGrpcRuntime& operator=(const SuiteGrpcRuntime&) = delete;
+};
+#endif
+
+int run_suite(int argc, char* argv[]) {
+#ifdef YUZU_TEST_GRPC_RUNTIME
+    // Reverse destruction order is load-bearing: Session and its listeners
+    // release their resources before gRPC drains, including on a CLI error.
+    SuiteGrpcRuntime grpc_runtime;
+#endif
     Catch::Session session;
 
     int rc = session.applyCommandLine(argc, argv);
@@ -193,14 +129,20 @@ int main(int argc, char* argv[]) {
         return rc;
     }
 
-    int result = session.run();
+    return session.run();
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    const int result = run_suite(argc, argv);
     std::fprintf(stderr, "[DIAG] Catch2 Session::run() returned %d (main about to return)\n",
                  result);
     std::fflush(stderr);
     std::fflush(stdout);
-#if (defined(_WIN32) || defined(__APPLE__)) && !defined(YUZU_TEST_ASAN) && \
-    !defined(YUZU_TEST_TSAN)
-    yuzu::agent::hard_exit(result); // see the #3507 AC1 comment above
+#if (defined(_WIN32) || defined(__APPLE__)) && !defined(YUZU_TEST_ASAN) &&                         \
+    !defined(YUZU_TEST_TSAN) && !defined(YUZU_TEST_COVERAGE)
+    yuzu::agent::hard_exit(result); // existing #3507 policy, after explicit teardown
 #endif
     return result;
 }

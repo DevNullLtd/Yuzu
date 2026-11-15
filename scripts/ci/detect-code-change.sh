@@ -15,7 +15,8 @@
 #   detect-code-change.sh --class ci-infrastructure --git-diff BASE [HEAD]
 #
 #     The workflow canary gate. Establishes the diff itself, then reports true
-#     iff it includes .github/workflows/, .github/actions/, or scripts/ci/.
+#     iff it includes CI code or the canary's vcpkg inputs (manifests,
+#     triplets/x64-linux.cmake, ports/).
 #     A diff error reports true: an uncertain change set must run the canary.
 #
 # The default class remains `code` for backward compatibility.
@@ -179,7 +180,7 @@ for f in "${files[@]}"; do
   fi
   if [[ "$path_class" == "ci-infrastructure" ]]; then
     case "$f" in
-      .github/workflows/*|.github/actions/*|scripts/ci/*)
+      .github/workflows/*|.github/actions/*|scripts/ci/*|vcpkg.json|vcpkg-configuration.json|triplets/x64-linux.cmake|ports/*)
         echo "detect-code-change: CI infrastructure path matched: $f" >&2
         emit true
         ;;

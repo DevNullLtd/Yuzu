@@ -1,0 +1,52 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -3136,6 +3136,10 @@
+ )
+ 
+ target_compile_features(grpc PUBLIC cxx_std_17)
++# Only the secure target links OpenSSL. Keep grpc_unsecure and standalone
++# EventEngine targets independent of libcrypto.
++target_compile_definitions(grpc PRIVATE YUZU_GRPC_OPENSSL_WORKER_CLEANUP=1)
++
+ 
+ set_target_properties(grpc PROPERTIES
+   VERSION ${gRPC_CORE_VERSION}
+--- a/src/core/lib/event_engine/thread_pool/work_stealing_thread_pool.cc
++++ b/src/core/lib/event_engine/thread_pool/work_stealing_thread_pool.cc
+@@ -20,6 +20,12 @@
+ #include <grpc/support/port_platform.h>
+ #include <grpc/support/thd_id.h>
+ #include <inttypes.h>
++
++// Enabled only for the secure grpc target by the Yuzu dependency patch.
++// grpc_unsecure and standalone EventEngine targets do not link libcrypto.
++#if defined(YUZU_GRPC_OPENSSL_WORKER_CLEANUP)
++#include <openssl/crypto.h>
++#endif
+ 
+ #include <atomic>
+ #include <chrono>
+@@ -255,9 +261,21 @@
+   grpc_core::Thread(
+       "event_engine",
+       [](void* arg) {
+-        ThreadState* worker = static_cast<ThreadState*>(arg);
++        // The callback takes ownership of the context allocated below.
++        std::unique_ptr<ThreadState> worker(static_cast<ThreadState*>(arg));
++#if defined(YUZU_GRPC_OPENSSL_WORKER_CLEANUP) && \
++    !defined(OPENSSL_IS_BORINGSSL) && !defined(LIBRESSL_VERSION_NUMBER) && \
++    OPENSSL_VERSION_NUMBER >= 0x10100000L
++        // Declared after worker: crypto cleanup precedes ThreadState retirement.
++        // Quiesce observes that retirement, not detached pthread/FLS teardown.
++        struct ScopedOpenSslThreadState {
++          ScopedOpenSslThreadState() = default;
++          ScopedOpenSslThreadState(const ScopedOpenSslThreadState&) = delete;
++          ScopedOpenSslThreadState& operator=(const ScopedOpenSslThreadState&) = delete;
++          ~ScopedOpenSslThreadState() { OPENSSL_thread_stop(); }
++        } crypto_state;
++#endif
+         worker->ThreadBody();
+-        delete worker;
+       },
+       new ThreadState(shared_from_this()), nullptr,
+       grpc_core::Thread::Options().set_tracked(false).set_joinable(false))

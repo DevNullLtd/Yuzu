@@ -978,6 +978,26 @@ Check 'Windows nightly requires the host manifest without an optional guard' {
     $disabledFixture -match '(?im)^\s*if\s*:' -and
     $suppressedFixture -match '(?im)^\s*continue-on-error\s*:|\|\|\s*true\b'
 }
+# Historical evidence and the overlay's source attribution are not live pins.
+# Updating their SHA without refreshing the copied source would falsify provenance.
+function Get-ActiveBaselineReferences([string[]]$References) {
+  @($References | Where-Object {
+    $_ -notlike 'docs/reviews/*' -and $_ -notlike 'governance.d/*' -and
+    $_ -notin @('NOTICE', 'ports/grpc/README.txt')
+  })
+}
+
+Check 'baseline inventory preserves immutable evidence and overlay provenance' {
+  $historical = @('docs/reviews/probe.md', 'governance.d/probe.md',
+                  'NOTICE', 'ports/grpc/README.txt')
+  @(Get-ActiveBaselineReferences $historical).Count -eq 0
+}
+Check 'baseline inventory retains unlisted live pins and other overlay files' {
+  $active = @('vcpkg.json', 'deploy/windows/toolchain-contract.json',
+              'scripts/new-baseline-consumer.sh', 'ports/grpc/portfile.cmake')
+  $retained = @(Get-ActiveBaselineReferences $active)
+  ($retained -join '|') -ceq ($active -join '|')
+}
 Check 'the baseline updater covers every active tracked SHA reference' {
   $workflow = Get-Content -LiteralPath $BaselineWorkflowPath -Raw
   $filesMatch = [regex]::Match($workflow, '(?ms)^\s+files=\(\r?\n(?<body>.*?)^\s+\)')
@@ -987,7 +1007,7 @@ Check 'the baseline updater covers every active tracked SHA reference' {
   $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
   $references = @(& git -C $repoRoot grep -l -- ([string]$contract.job_pins.vcpkg_baseline))
   if($LASTEXITCODE -ne 0){ return $false }
-  $activeReferences = @($references | Where-Object { $_ -notlike 'docs/reviews/*' })
+  $activeReferences = @(Get-ActiveBaselineReferences $references)
   $missing = @($activeReferences | Where-Object { $listed -notcontains $_ })
   $missing.Count -eq 0 -and $listed -contains 'deploy/windows/toolchain-contract.json'
 }

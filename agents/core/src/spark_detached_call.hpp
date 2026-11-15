@@ -41,7 +41,7 @@
  * SparkDetachedLane is constructed with a shared `f3_counter` (agent-
  * lifetime-scoped, NOT lane- or SparkEngine-scoped - see agent.cpp's
  * spark_detached_workers_ member and its own doc comment for why it must
- * never be read through spark_engine_/spark_boot_done_). The counter is
+ * never be read through spark_engine_/lifecycle_boot_done_). The counter is
  * incremented at admission and decremented ONLY when the worker's own
  * closure (Payload<T, DFn>, below) is fully destroyed - which, by
  * construction (see "Ticketing" below), is strictly after every piece of

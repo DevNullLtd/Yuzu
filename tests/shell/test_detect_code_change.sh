@@ -130,6 +130,19 @@ expect_diff true  "quoted path runs canary fail-closed"          "$rename_commit
 expect_diff false "git diff no-change: canary may skip"          HEAD HEAD
 expect_diff true  "git diff failure: canary runs fail-closed"    missing-base HEAD
 
+# Dependency-only pushes must warm the same cache inputs the canary hashes.
+previous="$quoted_commit"
+for path in vcpkg.json vcpkg-configuration.json triplets/x64-linux.cmake ports/grpc/worker.patch; do
+  mkdir -p "$tmp_repo/$(dirname "$path")"
+  printf '%s\n' 'dependency fixture' > "$tmp_repo/$path"
+  git_fixture add -- "$path"
+  git_fixture -c user.name=Yuzu -c user.email=yuzu@example.invalid \
+    -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -qm dependency-change
+  current=$(git_fixture rev-parse HEAD)
+  expect_diff true "dependency input $path selects canary" "$previous" "$current"
+  previous="$current"
+done
+
 # --- merge-base mode: the PULL REQUEST diff ---------------------------------
 # Two-dot against a LIVE base tip reports the base branch's own commits as if
 # the PR contained them, so a PR that has merely fallen behind a base which
@@ -236,6 +249,8 @@ expect_caller() {
 }
 
 if [ -f "$workflow" ]; then
+  expect_caller true "canary vcpkg key includes overlay-port contents" \
+    'key: vcpkg-canary-x64-linux-.{0,80}hashFiles\([^)]*ports/\*\*'
   expect_caller true  "ci.yml passes a resolved head, not the checked-out ref" \
     '--class ci-infrastructure "\$diff_mode" "\$base_sha" "\$diff_head"'
   expect_caller false "ci.yml does not pass a literal HEAD to the classifier" \

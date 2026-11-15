@@ -30,24 +30,33 @@ set -euo pipefail
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
 cd "$ROOT"
 
-# Matches scripts/setup.sh's own host-triplet detection on every host this
-# repo runs on (macOS, Linux, and Windows git-bash) -- including its own
-# gap: native ARM64 Linux is not auto-detected there either, only an
-# explicit --cross-file selects arm64-linux/arm-linux, so this
-# intentionally does not do more than setup.sh does. The two scripts'
-# catch-all `case` arm differs (setup.sh defaults to Linux, this defaults
-# to Windows) but that arm is unreachable on any host either script
-# actually targets.
-case "$(uname -s)" in
-  Darwin) TRIPLET="$([ "$(uname -m)" = "arm64" ] && echo arm64-osx || echo x64-osx)" ;;
-  Linux)  TRIPLET="x64-linux" ;;
-  *)      TRIPLET="x64-windows" ;;
-esac
+# Meson supplies the same dependency paths and sanitizer mode as the parent
+# build. A sanitizer tree may contain only code-generation tools in the normal
+# host triplet; choosing that directory loses dependencies such as CLI11.
+if [ "$#" -gt 0 ]; then
+  setup_args=("$@")
+else
+  # Matches scripts/setup.sh's own host-triplet detection on every host this
+  # repo runs on (macOS, Linux, and Windows git-bash) -- including its own
+  # gap: native ARM64 Linux is not auto-detected there either, only an
+  # explicit --cross-file selects arm64-linux/arm-linux, so this
+  # intentionally does not do more than setup.sh does. The two scripts'
+  # catch-all `case` arm differs (setup.sh defaults to Linux, this defaults
+  # to Windows) but that arm is unreachable on any host either script
+  # actually targets.
+  case "$(uname -s)" in
+    Darwin) TRIPLET="$([ "$(uname -m)" = "arm64" ] && echo arm64-osx || echo x64-osx)" ;;
+    Linux)  TRIPLET="x64-linux" ;;
+    *)      TRIPLET="x64-windows" ;;
+  esac
 
-VCPKG_INSTALLED="$ROOT/vcpkg_installed/$TRIPLET"
-if [ ! -d "$VCPKG_INSTALLED" ]; then
-  echo "test_build_examples_gating: SKIP — no populated vcpkg_installed/$TRIPLET (run scripts/setup.sh first)"
-  exit 0
+  VCPKG_INSTALLED="$ROOT/vcpkg_installed/$TRIPLET"
+  if [ ! -d "$VCPKG_INSTALLED" ]; then
+    echo "test_build_examples_gating: SKIP — no populated vcpkg_installed/$TRIPLET (run scripts/setup.sh first)"
+    exit 0
+  fi
+  setup_args=("-Dcmake_prefix_path=$VCPKG_INSTALLED"
+              "-Dpkg_config_path=$VCPKG_INSTALLED/lib/pkgconfig")
 fi
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_build_examples_gating.XXXXXX")"
@@ -55,8 +64,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 if ! meson setup "$tmp/build" \
     -Dbuild_examples=false -Dbuild_tests=true \
-    -Dcmake_prefix_path="$VCPKG_INSTALLED" \
-    -Dpkg_config_path="$VCPKG_INSTALLED/lib/pkgconfig" \
+    "${setup_args[@]}" \
     > "$tmp/setup.log" 2>&1; then
   echo "::error::meson setup -Dbuild_examples=false -Dbuild_tests=true failed to configure — #4262 regression?" >&2
   cat "$tmp/setup.log" >&2

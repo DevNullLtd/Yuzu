@@ -24,9 +24,10 @@ ca(Name) ->
 %% @doc The same, with the key type: `ec' (P-384), `rsa' (2048), `ed25519' or `ed448'.
 -spec ca(string(), ec | rsa | ed25519 | ed448) -> #{cert := binary(), key := term()}.
 ca(Name, ec) ->
-    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, secp384r1}}]);
+    %% OTP's SHA-1 default is rejected by modern host crypto policies.
+    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, secp384r1}}, {digest, sha256}]);
 ca(Name, rsa) ->
-    public_key:pkix_test_root_cert(Name, [{key, {rsa, 2048, 65537}}]);
+    public_key:pkix_test_root_cert(Name, [{key, {rsa, 2048, 65537}}, {digest, sha256}]);
 ca(Name, ed25519) ->
     public_key:pkix_test_root_cert(Name, [{key, {namedCurve, ed25519}}]);
 ca(Name, ed448) ->
@@ -41,7 +42,8 @@ leaf(#{key := CaKey} = Ca) ->
                   #'ECPrivateKey'{parameters = {namedCurve, ?'id-Ed448'}} -> {namedCurve, ed448};
                   _ -> {namedCurve, secp256r1}
               end,
-    Config = public_key:pkix_test_data(#{root => Ca, peer => [{key, PeerKey}]}),
+    %% EdDSA keeps its intrinsic digest; OTP ignores this option for Ed keys.
+    Config = public_key:pkix_test_data(#{root => Ca, peer => [{key, PeerKey}, {digest, sha256}]}),
     proplists:get_value(cert, Config).
 
 -spec serial(binary()) -> non_neg_integer().

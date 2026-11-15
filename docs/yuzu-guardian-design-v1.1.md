@@ -2711,7 +2711,7 @@ Guardian ladder must check these.
   `GuardianEngine::active_io_workers()` (above) with a separate
   `spark_detached_workers_` counter — constructed via a default member
   initializer before any `SparkEngine`/mechanism exists, and never read
-  through `spark_engine_`/`spark_boot_done_` — fed by `agents/core/src/
+  through `spark_engine_`/`lifecycle_boot_done_` — fed by `agents/core/src/
   spark_detached_call.hpp`'s `SparkDetachedLane`/`DetachedCall<T>` primitive,
   so it stays correct across a boot-time exception that resets
   `spark_engine_`. `main.cpp`/`service_win.cpp` poll the SUM at this
