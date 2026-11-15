@@ -2253,6 +2253,25 @@ class MarkerAmbiguity(GitCase):
                 self.assertIn("- **Shipped thing.**  [released]\n", out)
                 self.assertNotIn("[released 0.9.0]", out)
 
+    def test_a_comment_line_is_not_a_heading(self):
+        """An indented or fenced `# comment` (a shell snippet in the notes) must not end the section above it."""
+        for n, body in enumerate(("  # restart the agent\n", "```\n# restart the agent\n```\n", "~~~sh\n## x\n~~~\n")):
+            with self.subTest(body=body):
+                repo, old = self.base(f"repo{n}")
+                log = f"# Changelog\n\n## [Unreleased]\n\n{body}\n- **Pending thing.**\n"
+                self.release_into(repo, log, old, first_line="- **Pending thing.**")
+                out = self.ok(repo, "--since", old)
+                self.assertIn("- **Pending thing.**\n", out)
+                self.assertNotIn("[released", out)
+
+    def test_a_bare_heading_in_a_crlf_changelog_names_no_version(self):
+        repo, old = self.base()
+        log = "# Changelog\r\n\r\n## [0.9.0] - 2026-08-01\r\n\r\n- **Other.**\r\n\r\n##\r\n\r\n- **Shipped thing.**\r\n"
+        self.release_into(repo, log, old)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**  [released]\n", out)
+        self.assertNotIn("[released 0.9.0]", out)
+
     def test_a_sub_heading_does_not_end_the_section(self):
         repo, old = self.base()
         log = "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n### Added\n\n- **Shipped thing.**\n"

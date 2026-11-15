@@ -26,7 +26,7 @@ collated before a release.
   python3 scripts/whats-new.py --since v0.15.0 # since a tag, branch or commit
   python3 scripts/whats-new.py --since "2 weeks ago"   # ISO date or "N <unit> ago"
   python3 scripts/whats-new.py --full          # whole bullets; every non-image dep bump
-  python3 scripts/whats-new.py --versions      # only version bumps, redeploy notes and Docker image bumps
+  python3 scripts/whats-new.py --versions      # only version bumps, rebuild notes and Docker image bumps
 
 "Your last pull" is read from the reflog of the branch you are on: the newest `pull`
 entry that names no source or names this branch's upstream, or a `merge <upstream>`
@@ -689,13 +689,16 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
     """{line: version} for the lines of a CHANGELOG.md, the version being that of the `## [X]` heading above it.
 
     None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
-    be told: the line sits under a `#` or `##` heading that is not `## [X]` (indented, tab-separated, a title),
-    before any heading, or under more than one version (a generic bullet repeated across releases), so naming
+    be told: the line sits under a `#` or `##` heading that is not `## [X]` (tab-separated, a title, indented
+    before a bracket), before any heading, or under more than one version (a generic bullet repeated across releases), so naming
     one version could name the wrong one."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
+    fenced = False
     for line in lines_of((changelog or "").removeprefix("\ufeff")):
-        if re.match(r" {0,3}#{1,2}(?:[ \t]|$)", line):
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced and re.match(r"(?:#{1,2}(?:[ \t\r]|$)| {1,3}##[ \t]*\[)", line):
             m = re.match(r"## \[([^\]\n]*)\]", line)
             name = m.group(1).strip() if m else ""
             version = None if name.lower() == "unreleased" else name
