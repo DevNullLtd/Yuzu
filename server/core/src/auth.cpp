@@ -2654,7 +2654,7 @@ bool AuthManager::reactivate_user(const std::string& username) {
     // proof, whose first factor was verified before the deactivation, can still mint after the
     // reactivation (reactivation keeps the password), because the post-mint recheck compares
     // the role, the credential hash and the active state, and all three match. A login that
-    // carries a bound proof is denied instead: the deactivation changed the account's factor
+    // carries a bound proof earned before the deactivation is denied instead: the deactivation changed the account's factor
     // generation and the recheck compares it. Local erase, then the durable wipe; if the wipe
     // does not persist the account stays inactive and the caller retries (invalidate_user is
     // idempotent).

@@ -922,8 +922,9 @@ TEST_CASE("reactivation of an ENROLLED account: a bound MFA proof does not survi
 
     // Reactivation removes the row, and the account comes back UN-enrolled at a NEW factor
     // generation: a deactivation clears the factor, and the generation trigger redraws on every
-    // change of the enrolment, so a proof bound to the old generation could never be honoured
-    // even if a row had survived.
+    // change of the enrolment. (That a bound proof surviving on a row would be refused by
+    // generation equality is pinned by the step-up gate cases, not by this one: the wipe
+    // deletes the row first.)
     REQUIRE(a.reactivate_user("alice"));
     CHECK(f.durable_sessions_of("alice") == 0);
     const auto after = f.db->mfa_status("alice");

@@ -753,8 +753,9 @@ configure the connector to retry a `500`, as for a deprovision. A sign-in after
 the reactivation is a new sign-in, with one residual: a login that carries no
 bound MFA proof, whose first factor was verified before the deactivation, can
 still complete after the reactivation, because the post-mint recheck compares
-the role, credential hash and active state, and for a login that carries a bound
-MFA proof also the factor generation, which a deactivation changes;
+the role, credential hash and active state, and for a login whose bound
+MFA proof was earned before the deactivation also the factor generation, which a
+deactivation changes;
 deactivation clears the TOTP secret and recovery codes, so a pending MFA
 login cannot complete unless the user enrols again inside the pending window.
 

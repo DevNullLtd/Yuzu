@@ -2787,9 +2787,9 @@ the same audit behavior described below, not a silent no-op:
   new sign-in, with one residual: a login that carries no bound MFA proof,
   whose first factor was verified before the deactivation, can still mint after
   the reactivation, because the post-mint recheck compares the role, the
-  credential hash and the active state, and for a login that carries a bound
-  MFA proof also the factor generation (a deactivation changes it, so such a
-  login is denied).
+  credential hash and the active state, and for a login whose bound MFA proof was earned
+  before the deactivation also the factor generation (a deactivation changes
+  it, so such a login is denied).
   Deactivation clears the TOTP secret and recovery codes, so a pending MFA
   login cannot complete unless the user re-enrols inside the pending window
   (`--mfa-login-pending-secs`, default 120).
