@@ -1,7 +1,7 @@
 #include "mcp_stream_bridge.hpp"
 
 #include "background_jobs.hpp"
-
+#include "execution_event_scope.hpp" // classify/sanitize: the bus-consumer confined projection
 #include "mcp_jsonrpc.hpp"
 #include "mcp_session.hpp"
 #include "mcp_stream.hpp"
@@ -343,6 +343,22 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
             if (!is_terminal && !is_progress) {
                 return;  // agent-transition et al: not projected (documented)
             }
+            // Confined-projection rule (header banner): the SAME classifier the REST and
+            // dashboard consumers use, against the dispatching session's scope, which is
+            // immutable on the record (set at reserve(), before any listener exists). An
+            // unrestricted record classifies kPass here for both event types, so its
+            // behaviour is unchanged. Classified before `rec->mu` is taken: the verdict
+            // reads only the immutable scope, and the sanitize below allocates.
+            bool sanitize_terminal = false;
+            switch (classify_execution_event_for_scope(ev, rec->fleet_read_scope)) {
+            case ExecutionEventVerdict::kDrop:
+                return;  // confined progress: never latched, so never projected
+            case ExecutionEventVerdict::kSanitize:
+                sanitize_terminal = true;
+                break;
+            case ExecutionEventVerdict::kPass:
+                break;
+            }
             {
                 std::lock_guard<std::mutex> lk(rec->mu);
                 if (rec->terminal_accepted) {
@@ -356,7 +372,9 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
                     // Construct fully OUTSIDE the slot, then commit with a
                     // noexcept move: a payload-copy throw leaves the slot
                     // untouched and terminal_accepted unset.
-                    MailboxEntry tmp{ev.id, ev.data};
+                    MailboxEntry tmp{ev.id, sanitize_terminal
+                                                ? sanitize_execution_event_for_scope(ev).data
+                                                : ev.data};
                     rec->terminal_slot = std::move(tmp);
                     rec->terminal_accepted = true;  // sticky from here on
                 } else {
@@ -401,7 +419,8 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
                                                         McpSessionBinding binding,
                                                         const nlohmann::json& jsonrpc_id,
                                                         std::optional<nlohmann::json> progress_token,
-                                                        bool streamed_intent) {
+                                                        bool streamed_intent,
+                                                        authz::VisibleSet fleet_read_scope) {
     if (bus_ == nullptr) {
         count_reject("disabled");
         return {false, "disabled"};
@@ -442,6 +461,7 @@ McpStreamBridge::ReserveResult McpStreamBridge::reserve(const std::string& sessi
     rec->created = now();
     rec->stream = std::move(stream);
     rec->progress_token = std::move(progress_token);
+    rec->fleet_read_scope = std::move(fleet_read_scope);  // immutable from here (banner)
 
     const char* reject = nullptr;
     std::size_t active = 0;
@@ -2441,7 +2461,13 @@ void McpStreamBridge::sweep() {
                                 // Construct fully OUTSIDE the slot, then commit with
                                 // a noexcept move - a copy OOM leaves the slot and
                                 // terminal_accepted untouched (mirror the listener).
-                                MailboxEntry tmp{ev->id, ev->data};
+                                // A confined record's terminal is the sanitized one even
+                                // here: this `ev` is the terminal-flagged execution-progress,
+                                // whose payload carries the counts. The sanitize reads only
+                                // `status`, and any throw is the copy-OOM defer below.
+                                MailboxEntry tmp{ev->id, oldest->fleet_read_scope.has_value()
+                                                             ? sanitize_execution_event_for_scope(*ev).data
+                                                             : ev->data};
                                 oldest->terminal_slot = std::move(tmp);
                                 oldest->terminal_accepted = true;
                             } catch (...) {  // NOLINT(bugprone-empty-catch) - deliberate

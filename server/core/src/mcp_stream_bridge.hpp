@@ -169,6 +169,35 @@
 // that session 410s. Reached only on a double publish-failure (allocation death);
 // counted, and the durable execution_id fetch remains the recovery path.
 //
+// ── Confined-projection rule (the executions-history ladder's bus-consumer rule) ──
+//
+// This bridge is an ExecutionEventBus consumer reachable by a confinable principal,
+// so it applies the same projection as the REST /api/v1/events route and the
+// dashboard SSE route, from the same classifier (`execution_event_scope.hpp`). The
+// scope is the DISPATCHING session's fleet-read scope, handed to reserve() and
+// stored on the record, immutable from then on (like the listener it feeds):
+//
+//   nullopt  - unrestricted. The listener's behaviour is unchanged by this rule.
+//   engaged  - confined (an engaged EMPTY set is deny-all, and is what a caller that
+//              could not resolve the scope passes, never nullopt). The listener drops
+//              `execution-progress` (never latched into `progress_slot`, so no progress
+//              notification is ever emitted for the record) and latches
+//              `execution-completed` as `sanitize_execution_event_for_scope(ev)`, whose
+//              payload is `{"status":...}` only. build_real_final adds
+//              `agents_success`/`agents_failure` only when the latched payload has them,
+//              so a confined record's final carries the real `status` and no counts.
+//              The pressure visitor's kTerminalBuffered arm latches a terminal-flagged
+//              `execution-progress` payload (which carries the counts); it sanitizes
+//              that too for a confined record.
+//
+// `agent-transition` is never latched or projected by this bridge in either mode
+// (the listener returns before it), so the classifier's per-agent verdict has
+// nothing to decide here; a future change that projects it must route it through
+// `classify_execution_event_for_scope` first. The listener takes no new lock and
+// never calls the bus, so the hierarchy below is unchanged. The tripwire
+// `tests/test_execution_owner_key_tripwire.py` CHECK 9 pins both classifier names
+// in mcp_stream_bridge.cpp.
+//
 // ── LOCK HIERARCHY (acquire strictly left→right; releasing before acquiring a
 //    lower tier is always allowed) ────────────────────────────────────────────
 //
@@ -209,6 +238,7 @@
 //   order). The streamed-charge decrement it would owe is deferred to the
 //   post-visit teardown_claimed (under bridge_mu_), preserving exactly-once.
 
+#include "authz_model.hpp" // authz::VisibleSet: the dispatching session's fleet-read scope
 #include "execution_event_bus.hpp"
 #include "mcp_session.hpp" // McpSessionBinding: the BridgeRecord stores one by value
 
@@ -516,9 +546,17 @@ public:
     /// #2740 they are no longer permanent: an at-cap admission RECLAIMS one
     /// rather than refusing (see `select_displaceable_pin_locked`). A transient
     /// over-count still rejects fail-closed (A5/C3).
+    ///
+    /// `fleet_read_scope` is the dispatching session's fleet-read scope (see the
+    /// confined-projection rule in the banner): nullopt = unrestricted, an engaged
+    /// set = confined. Defaulted only so the existing bridge unit-test call sites stay
+    /// unchanged; the production caller (execute_instruction) always passes it, and
+    /// the tripwire's CHECK 9 pins that. A caller that cannot resolve the scope MUST
+    /// pass `authz::deny_all()`, never nullopt.
     ReserveResult reserve(const std::string& session_id, McpSessionBinding binding,
                           const nlohmann::json& jsonrpc_id,
-                          std::optional<nlohmann::json> progress_token, bool streamed_intent);
+                          std::optional<nlohmann::json> progress_token, bool streamed_intent,
+                          authz::VisibleSet fleet_read_scope = std::nullopt);
 
     /// S3: bus subscribe_and_replay(execution_id, 0) onto the reserved record.
     /// Runs UNDER bridge_mu_ (A3): installation and the sub-token store are
@@ -952,6 +990,10 @@ private:
         std::chrono::steady_clock::time_point created;  ///< set at reserve; the kArming reaper's age base
         std::shared_ptr<McpStreamState> stream;  ///< taken at reserve via stream_for
         std::optional<nlohmann::json> progress_token;
+        /// The dispatching session's fleet-read scope, set at reserve() before the record
+        /// is reachable and never again (the listener reads it lock-free, like `key`).
+        /// nullopt = unrestricted; engaged (incl. empty) = confined, see the banner.
+        authz::VisibleSet fleet_read_scope;
         /// Set by subscribe(), before any listener exists, and never again: subscribe()
         /// ENFORCES that with a state gate (!subscribed && !torn_down && kArming), so
         /// teardown_claimed can borrow this rather than copy it. Not merely a comment -

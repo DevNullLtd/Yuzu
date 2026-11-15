@@ -22042,9 +22042,33 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
+                        // #7817: the bridge relays this execution's counts to the
+                        // dispatcher, so it applies the same confined projection as
+                        // GET /api/v1/events, from the dispatcher's Execution:Read scope.
+                        // Derived through the one gate every Execution read uses here
+                        // (fleet_read_fn_, as get_execution_status does), on a scratch
+                        // response because a refusal here must not answer THIS request.
+                        // FAIL CLOSED: not admitted, unwired or a throw resolves to
+                        // deny-all (progress dropped, terminal sanitized), never to
+                        // nullopt (unrestricted). Only an admitted, unfiltered gate yields
+                        // nullopt, which keeps that caller's frames unchanged.
+                        yuzu::server::authz::VisibleSet bridge_fleet_scope =
+                            yuzu::server::authz::deny_all();
+                        try {
+                            if (fleet_read_fn_) {
+                                httplib::Response scratch;
+                                auto fleet_gate =
+                                    fleet_read_fn_(req, scratch, "Execution", "Read");
+                                if (fleet_gate.admitted)
+                                    bridge_fleet_scope = std::move(fleet_gate.scope);
+                            }
+                        } catch (...) {
+                            bridge_fleet_scope = yuzu::server::authz::deny_all();
+                        }
                         auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
-                                                  /*streamed_intent=*/streamed_mode);
+                                                  /*streamed_intent=*/streamed_mode,
+                                                  std::move(bridge_fleet_scope));
                         if (rr.ok) {
                             bridge_active = true;
                             streamed_active = streamed_mode;
