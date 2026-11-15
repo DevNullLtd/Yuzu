@@ -285,6 +285,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "ota_upload",
     "json_to_csv_export",
     "result_sets",
+    "workflow_execute",
     "nvd_match",
     "ca_import_chain",
     "ca_issue_code_signing",
@@ -479,7 +480,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
     // software_collection_settings(1: the collection settings subtree) + default(1).
     // + result_sets(1: POST /api/v1/result-sets, the 200000-value budget of device_ids).
-    CHECK(std::size(kBodyCapTable) == 43);
+    // + workflow_execute(1: POST under /api/workflows/, the execute subtree, 4 MiB and 30000 values).
+    CHECK(std::size(kBodyCapTable) == 44);
 }
 
 // The dex_score_policy_form row is derived from the document's own limits (body_cap_policy.hpp),
@@ -1418,6 +1420,12 @@ TEST_CASE("resolve_body_cap: the JSON value budgets of the named classes",
     CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_body_bytes == 16u * 1024 * 1024);
     CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_json_values == 1'000'000);
     CHECK(resolve_body_cap("POST", "/api/workflows").max_json_values == kJsonValuesOff);
+    // The create stays on its own unscanned row; the execute subtree has its own scanned one.
+    CHECK(resolve_body_cap("POST", "/api/workflows").path_class == "workflow_yaml");
+    CHECK(resolve_body_cap("POST", "/api/workflows/wf_abc/execute").path_class == "workflow_execute");
+    CHECK(resolve_body_cap("POST", "/api/workflows/wf_abc/execute").max_json_values == 30'000);
+    CHECK(resolve_body_cap("POST", "/api/workflows/wf_abc/execute").max_body_bytes ==
+          4u * 1024 * 1024);
     CHECK(resolve_body_cap("POST", "/api/no/such/route").max_json_values == kJsonValuesDefault);
 }
 

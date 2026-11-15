@@ -470,6 +470,13 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (workflow_routes.cpp:1023). Same "no aggregate contract yet" shape as
     // guardian rule authoring above — deliberate, generous, explicit.
     {"POST", "/api/workflows", 16u * 1024 * 1024, false, "workflow_yaml", kJsonValuesOff},
+    // POST /api/workflows/{id}/execute — the workflow EXECUTE subtree. The row above matches by
+    // prefix, so without this one every POST under `/api/workflows/` inherited the 16 MiB, unscanned
+    // YAML-authoring class (a JSON body of `[],[],...` built a 258 to 429 MiB tree; #2146). The
+    // execute body is `agent_ids` (at most 10000), a scope and 32 parameters, the same worst case as
+    // `commands` (about 3.3 MiB), so the same 4 MiB cap and 30000-value budget. The trailing slash
+    // keeps the exact `POST /api/workflows` create on the row above (the longer prefix wins).
+    {"POST", "/api/workflows/", 4u * 1024 * 1024, false, "workflow_execute", 30'000},
 
     // POST /api/product-packs — product-pack installation from a YAML
     // bundle (workflow_routes.cpp:1746). A pack holds MULTIPLE YAML
