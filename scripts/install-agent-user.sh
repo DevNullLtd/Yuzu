@@ -131,8 +131,9 @@
 #   1  - install/check/uninstall failed; details on stderr (an install that could not
 #        install a helper also exits 1, after removing the sudoers file)
 #   2  - argument or precondition error (not run as root, unsupported OS)
-#   3  - sudoers file failed visudo validation or could not be installed; the
-#        installer removed any earlier file, so no old grant stays
+#   3  - sudoers file failed visudo validation; it was not installed and the
+#        installer removed any earlier file, so no old grant stays (another
+#        install failure of that file exits with that command's own status)
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -1838,6 +1839,9 @@ case "$ACTION" in
         if [[ "$sudoers_rc" -ne 0 ]]; then
             warn "$SUDOERS_FILE was not installed (status $sudoers_rc); removing any earlier file so no old grant stays"
             remove_sudoers
+            if [[ -e "$SUDOERS_FILE" ]]; then
+                warn "$SUDOERS_FILE could not be removed: remove it by hand"
+            fi
             exit "$sudoers_rc"
         fi
         log "install complete. Verify with: $0 --check"
