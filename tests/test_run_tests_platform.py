@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -174,6 +175,30 @@ exec bash "$fixture_root/scripts/run-tests.sh" "$2"
         for suite in ("e2e", "integration", "metrics_e2e", "prometheus"):
             self.assertTrue(any(f"<--suite=yuzu_gw_{suite}_SUITE>" in call for call in calls), calls)
         self.assertIn("Passed:  4", result.stdout)
+
+    def store_stub_python3(self):
+        # The Windows Store `python3` exists on PATH but only prints a hint and
+        # fails; the runner must probe by execution and move on to `python`.
+        self.executable("bin/python3", 'echo "Python was not found" >&2\nexit 9009\n')
+
+    def test_store_stub_python3_falls_back_to_python(self):
+        self.store_stub_python3()
+        self.executable("bin/python", 'exec "$YUZU_TEST_REAL_PYTHON" "$@"\n')
+        result, calls = self.run_tier("MINGW64_NT-10.0", "erlang-ct",
+                                      YUZU_TEST_CT_OUTPUT="All 2 tests passed.",
+                                      YUZU_TEST_REAL_PYTHON=sys.executable)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(calls), 4)
+        self.assertIn("Passed:  4", result.stdout)
+
+    def test_no_working_python_fails_loudly(self):
+        self.store_stub_python3()
+        self.executable("bin/python", 'exit 127\n')
+        result, _ = self.run_tier("MINGW64_NT-10.0", "erlang-ct",
+                                  YUZU_TEST_CT_OUTPUT="All 2 tests passed.")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Failed:  4", result.stdout)
+        self.assertIn("no working Python 3 interpreter", result.stderr)
 
     def test_performance_tier_rejects_empty_execution(self):
         result, _ = self.run_tier("Darwin", "erlang-perf", YUZU_TEST_CT_OUTPUT="All 0 tests passed.")

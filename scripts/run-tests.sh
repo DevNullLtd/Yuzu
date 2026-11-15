@@ -45,11 +45,30 @@ skip()   { SKIP=$((SKIP + 1)); echo "  ⊘ $1 (skipped)"; }
 # Native server targets are available only on Linux (ADR-0035).
 server_supported() { [[ "$(uname -s)" == "Linux" ]]; }
 
+# Resolve a working Python 3 once, on first use, into $YUZU_RUN_PYTHON: try
+# `python3`, then `python`, and keep the first that actually runs. A Windows
+# runner has no `python3`, or only the Store stub, which exists but fails to
+# run, so a lookup by name alone is not enough. Returns 1 with a loud error
+# when neither works; the calling tier then fails rather than skipping.
+YUZU_RUN_PYTHON=""
+resolve_python() {
+    [[ -n "$YUZU_RUN_PYTHON" ]] && return 0
+    local candidate
+    for candidate in python3 python; do
+        if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            YUZU_RUN_PYTHON="$candidate"
+            return 0
+        fi
+    done
+    echo "  ERROR: no working Python 3 interpreter (tried python3, python)" >&2
+    return 1
+}
+
 # ── Tier 1: C++ Unit Tests ──────────────────────────────────────────
 run_checks() {
     banner "STATIC CHECKS"
     echo "  Validating hookify guardrail rules..."
-    if python3 "$PROJECT_ROOT/scripts/check-hookify-rules.py"; then
+    if resolve_python && "$YUZU_RUN_PYTHON" "$PROJECT_ROOT/scripts/check-hookify-rules.py"; then
         pass "hookify rules valid"
     else
         fail "hookify rules invalid"
@@ -175,7 +194,7 @@ run_ct_suite() {
         rc=$?
     fi
     tail -10 "$capture"
-    if python3 "$SCRIPT_DIR/gateway_test_summary.py" strict "$suite" "$rc" "$capture"; then
+    if resolve_python && "$YUZU_RUN_PYTHON" "$SCRIPT_DIR/gateway_test_summary.py" strict "$suite" "$rc" "$capture"; then
         rm -f "$capture"
         pass "$label"
     else
