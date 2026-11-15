@@ -487,7 +487,8 @@ TEST_CASE("facet_health: status counts incl. enabled=false as disabled, percenti
           "[pg][software_inventory][reads_v3]") {
     READS_SHARED(store, pool);
     const std::string apps = "installed_apps.list_inventory";
-    // Measured rows: durations 100, 200, 300, 400, 5000 (p50 = 300, p95 = max = 5000).
+    // Measured rows: durations 100, 200, 300, 400, 5000 and the two zeros below (p50 = 200,
+    // p95 = max = 5000).
     add_facet(pool, "d-1", apps, "full", 100, 10);
     add_facet(pool, "d-2", apps, "full", 200, 20);
     add_facet(pool, "d-3", apps, "full", 300, 30);

@@ -586,6 +586,36 @@ TEST_CASE("changes: an agent_id outside the scope is an empty page and a denied 
     CHECK(h.audits("inventory.software.changes", "denied") == 1);
 }
 
+TEST_CASE("changes: the audit target is one line, and a hostile agent_id cannot add fields to it",
+          "[software][routes][software_read_routes]") {
+    Harness h;
+    h.changes = {change_row(1, "b", 10)};
+    const auto targets = [&](const std::string& result) {
+        std::vector<std::string> out;
+        for (const auto& a : h.audit_log)
+            if (a.action == "inventory.software.changes" && a.result == result)
+                out.push_back(a.target_id);
+        return out;
+    };
+    const std::string one{"changes:agent=x_kind_remove"}; // log_token folds the LF and '='
+    const std::string hostile = "/api/v1/inventory/software/changes?agent_id=x%0Akind%3Dremove";
+    auto res = h.sink.Get(hostile); // served (unfiltered caller)
+    REQUIRE(res);
+    CHECK(targets("success") == std::vector<std::string>{one});
+    h.audit_log.clear();
+    h.scope = scope_of({"b"}); // denied: the same single-line target on both rows
+    res = h.sink.Get(hostile);
+    REQUIRE(res);
+    CHECK(targets("denied") == std::vector<std::string>{one});
+    CHECK(targets("success") == std::vector<std::string>{one});
+    h.audit_log.clear(); // the grammar: fleet, then ;kind and ;since only when set
+    h.scope.reset();
+    REQUIRE(h.sink.Get("/api/v1/inventory/software/changes"));
+    REQUIRE(h.sink.Get("/api/v1/inventory/software/changes?agent_id=b&kind=install&since=5"));
+    CHECK(targets("success") ==
+          std::vector<std::string>{"changes:fleet", "changes:agent=b;kind=install;since=5"});
+}
+
 TEST_CASE("a blank roster hostname reads as unknown on the change feed and plugin-health slowest[]",
           "[software][routes][software_read_routes]") {
     Harness h;

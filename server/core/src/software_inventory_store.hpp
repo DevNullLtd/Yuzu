@@ -308,7 +308,7 @@ struct ComponentRollupMeta {
 };
 
 /// One `software_facet_state` row as `query_hosts` returns it (the raw stored status; the wire
-/// `status` for the facet is derived by the route).
+/// `status` is that stored value as is, and the route derives only `row_status` from it).
 struct SoftwareHostFacet {
     std::string facet;
     std::string status;

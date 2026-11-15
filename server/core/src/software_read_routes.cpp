@@ -13,6 +13,8 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <yuzu/log_token.hpp>
+
 #include <string_view>
 #include <utility>
 
@@ -225,10 +227,15 @@ const char* mode_name(AggregateMode m) {
     return "omitted";
 }
 
+// `;`-delimited like the sibling reads. agent_id is caller text, so it goes through log_token.
 std::string changes_target(const SoftwareChangesQuery& q) {
-    return "changes agent_id=" + (q.agent_id.empty() ? std::string("*") : q.agent_id) +
-           " kind=" + (q.kind.empty() ? std::string("*") : q.kind) +
-           " since=" + std::to_string(q.since);
+    std::string out = q.agent_id.empty() ? std::string("changes:fleet")
+                                         : "changes:agent=" + ::yuzu::log_token(q.agent_id);
+    if (!q.kind.empty())
+        out += ";kind=" + q.kind;
+    if (q.since > 0)
+        out += ";since=" + std::to_string(q.since);
+    return out;
 }
 
 } // namespace

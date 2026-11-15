@@ -9066,6 +9066,8 @@ The install-change feed: one row per install, removal or upgrade of a package th
 
 **Lateness contract.** The 60-second window is the contract and there is no watermark. A row that commits more than 60 seconds after its own `observed_at` (a slow writer, or a clock behind the others) can land behind a cursor that has already passed its position, and a consumer walking forward on that cursor will not see it. To recover, re-read from an earlier `since` and de-duplicate on `change_id`: `change_id` is unique, so a row seen twice is the same row. A consumer that must not miss a change re-reads a trailing overlap of at least the lateness it is willing to tolerate on every poll. Nothing counts late rows today; that is tracked by #7766.
 
+**Retention.** Changes older than 400 days are pruned, and decommissioning a device deletes its change history.
+
 **Errors:** `400` (malformed `since`, `limit` or `cursor`, a cursor that passes over more than 100,000 rows, invalid `kind`), `401`, `403`, `503` with `retry_after_ms`, never an empty 200.
 
 #### `GET /api/v1/inventory/software/summary`
@@ -9118,7 +9120,7 @@ Collection health per facet across the fleet: how many devices are in each statu
        "devices": {"full": 900, "delta": 120, "constrained": 3, "timeout": 61, "oversize": 0,
                    "not_collected": 40, "disabled": 5},
        "collecting": 1084, "timeout_share": 0.0563, "failing_share": 0.059,
-       "disabled_share": 0.0043, "not_collected_share": 0.0343,
+       "disabled_share": 0.0044, "not_collected_share": 0.0354,
        "duration_ms": {"p50": 380, "p95": 2900, "max": 30000},
        "bytes_read": {"p50": 9100, "p95": 52000, "max": 410000},
        "slowest": [{"agent_id": "agent-017", "hostname": "db-02", "duration_ms": 30000}]}

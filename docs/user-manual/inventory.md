@@ -487,8 +487,10 @@ section hash (an out-of-band change to the table) set the starting point and pro
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
-and its components with it. Nothing in
-the dashboard or the API shows the change history or the components yet. The agent of this build
+and its components with it. The change
+history is read through `GET /api/v1/inventory/software/changes` and the components through
+`GET /api/v1/inventory/software/components` (see the REST API reference); the dashboard shows
+neither yet. The agent of this build
 sends v3 (and no longer has a v2 writer). Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
 `need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
