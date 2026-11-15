@@ -126,6 +126,11 @@ used as-is — they aren't renames, so they create no split-brain.
      state); it drives the server-side compliance census (`guardian_agent_rule_status`):
      `guard.compliant` and `drift.remediated` set compliant, `drift.detected` sets
      drifted, and `remediation.failed`, `guard.unhealthy` and `guard.errored` set errored.
+     Which of two events becomes a census row's verdict is decided by the server's census
+     ordering, not by arrival: the agent's `(boot_epoch, emit_seq)` pair between two events
+     that both carry one, the agent stamp (limited to receipt plus 300 s) and then ingest
+     order between two that do not; see `docs/yuzu-guardian-design-v1.1.md` section 7.1 and
+     the Guaranteed State guide.
    - The agent reports **observation-only** fields (`rule_id`/guard id, `event_type`,
      `guard_type`, `guard_category`, `detected_value`, `expected_value`,
      `detection_latency_us`, agent-stamped `timestamp`; + `remediation_*` on remediate

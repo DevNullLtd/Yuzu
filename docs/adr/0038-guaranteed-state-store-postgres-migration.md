@@ -356,6 +356,61 @@ runs no order step, so the event is never counted in the agent's order clock or 
 fleet count of unordered agents can undercount for an agent whose first deliveries all failed the
 step, until its next first delivery. That gap must be closed before the comparison ships.
 
+## Update (2026-11-15) - the census decides by the agent's emit-order pair (UP-14, #5690)
+
+The Update (2026-11-03) above gave the census row one ordering rule, the key and `ingest_seq`. Schema v5
+stores the agent's `(boot_epoch, emit_seq)` pair and the per-agent order row, and this Update records that
+the census now DECIDES by the pair. It is a change of behaviour in the census statements and the order
+step, not of the schema: no column or table is added beyond the v5 text, and the lock order of every census
+writer is unchanged (agent order row, pending events in `ingest_seq` order, census row, rule row; never a rule
+row first).
+
+- The order step gives every census-bearing first delivery or batch row a mode from the agent's pair clock
+  (`unpaired`, `unpaired_held`, `current`, `current_straggler`, `current_rebase`, `refused_regression`,
+  `refused_retired`, plus `implausible_held`, set by the store from the ingest boundary and never returned by
+  the SQL), and the census statements decide the row by it. A mode label the code does not know, or a NULL,
+  is a failure of the step, never a default. Two unpaired events keep the key rule. A decision that is not a
+  clean in-order pair apply flags the row. The decision label of each census write is a metric and a log
+  line, never an input to a row decision.
+- The pair clock is fresh for one hour (`YUZU_CENSUS_STALE_NS_`, reused) of DATABASE time and not when it is
+  recorded more than five minutes (`YUZU_CENSUS_FUTURE_SLACK_NS_`) in the database's future. Only a `current`
+  event or a re-base refreshes it; a refused, straggler or unpaired event never does. A re-base to a lower
+  epoch retires the former epoch (`retired_epoch`), after which its events are refused.
+- A Repair (a redelivery of an event stored with pending evidence) runs no order step and never writes the
+  pair clock or a counter. It runs the idempotent Ensure, takes the agent's order row `FOR SHARE` as its
+  first lock and reads the mode without writing it, inside its `census_upsert` savepoint under the step's 1 s
+  lock bound (restored before the census statements); a stale clock gives `current_straggler` or
+  `refused_regression` where a first delivery would re-base. Everything it did to the order table is undone
+  by every exit that projects nothing, so a blank order row survives only a Repair that touched the census
+  row. A blank row is never "currently unordered". The consequence recorded in the 2026-11-12 Update stands:
+  an event whose first delivery failed the order step is never counted in the agent's clock or counters, so
+  the unordered count can undercount for an agent whose first deliveries all failed it. That Update says the
+  gap must be closed before the comparison ships; this change does not close it, and it stays an open item
+  for the owner, not a withdrawn one.
+- An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
+  more than ten years past receipt, is `implausible` and is HELD at first delivery whatever the clock says:
+  stored with pending evidence, the census untouched, counted as an unpaired event for the agent. The flag is
+  decided once, at first delivery, and is not stored, so a Repair judges the event as an unpaired one: the
+  hold is not durable. A batch cannot hold an event and rolls back instead.
+- "Currently unordered" has one definition, in SQL (UP-5): the latest accepted unpaired event is later than
+  the pair clock, or the pair clock is recorded more than five minutes in the database's future. The database
+  decides it on every read, so it can change with no event; no C++ copy exists.
+- The per-agent order read keeps its `503` on a degraded read (UP-12): a null `ordering` would read as "never
+  accepted". No code changed for it.
+
+Known residuals, stated rather than fixed. (1) A paired event whose Repair is decided `refused_regression`
+against an unpaired census row is acknowledged, flags the row and counts a decision, but is never retired and
+stays pending until a paired apply on that (agent, rule) or the agent is decommissioned: a member of the
+#7147 stranded-evidence class, pinned by a test. (2) The batch path does not sort its rows by agent, so two
+concurrent batches over the same agents can deadlock (no production caller; unchanged from v4). (3) Repairs of
+one agent contend with its first deliveries on the order row: measured on one development host, on a debug
+build with fsync off and not a guarantee, 8 concurrent repairs on one agent with 10,000 pending events on one
+pair delayed a first delivery by up to about 600 ms (p95 between 341 and 552 ms); more concurrent repairs could
+push a first delivery past the 1 s bound into a step failure that stores it pending. (4) A pair clock pinned
+by a value inside the plausibility bound heals when the hold expires, one hour after the last accepted event.
+No new background loop, reaper or job is added, so the leader fence and the retention rules are not
+touched.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

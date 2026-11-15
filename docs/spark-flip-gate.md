@@ -2961,19 +2961,21 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   conditions in the Guardian guide's section 'When a verdict is flagged or does not move'
   holds), and the hold cannot touch it (server side). The agent now also
   stamps a `(boot_epoch, emit_seq)` pair at the point queue order is decided (legacy executor
-  admission; the Spark outbox stamp). A server that compares the pair orders a retained
-  verdict against a newer one by it, and that order depends on neither the wall clock nor
-  arrival order; a server that does not compare it ignores the pair and keeps ordering by its
-  census ordering key (the merge gate below says which stage the server is at). Entries that
+  admission; the Spark outbox stamp). The server orders a retained verdict against a newer
+  one by it between two events that both carry a pair, and that order depends on neither the
+  wall clock nor arrival order outside the flagged recoveries (the merge gate below says which
+  stage the server is at; a server on an earlier stage ignores the pair and keeps ordering by
+  its census ordering key). Entries that
   carry no pair (journal-paged replays, DEX observations, and an agent whose boot epoch could
   not be claimed) are sent with the pair unset (0/0): two such events order by the census
-  ordering key, and against a paired verdict the server change will hold them (item 1). Note on
+  ordering key, and against a paired verdict the server holds them (item 1). Note on
   #5690's acceptance options (factual, not a ruling): a tie policy closes UP-13 but not UP-14
   (the server now flags a tied or mis-ordered pair rather than keeping it silently); a policy
   that ordered by receipt sequence alone would close UP-14 but worsen UP-13; only terminal
-  precedence closes both. The server change below is none of these three: once PR B ships it
-  will order by the pair, fall back to the census ordering key between two unpaired events,
-  and use arrival order only in the flagged recoveries it will define. The test
+  precedence closes both. The server change below is none of these three: from PR B it
+  orders by the pair, falls back to the census ordering key between two unpaired events, and
+  uses arrival order only in the flagged recoveries (a re-base of a stale pair clock, and the
+  transition of an unpaired event over a paired verdict once the hold has expired). The test
   `#3972 chaos: a third sender holding the stream write mutex ...`
   (hidden `[.chaos]`) characterises UP-13 and deliberately asserts no order.
 - UP-14: the five conditions the SERVER change must meet. Actual order of delivery: the census
@@ -2982,9 +2984,13 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   ignored the pair between #7303 and PR A. PR A stores the pair, counts unpaired and rejected
   pairs and exposes the counts, but does not compare the pair: between PR A and PR B the
   verdict decision is the census ordering key alone. PR B adds the comparison, the hold and
-  the recovery. Tracking unit: #5690. The one checkbox per item goes in the server pull
-  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. Until PR B merges, items 1
-  to 4 are not met and the UP-14 residual stands as described above. The conditions:
+  the recovery: from PR B the verdict of a census row is decided by the pair rules in the
+  Guardian guide's section 'Boot epoch and event ordering' (operator reading: 'Running the
+  pair regime'). Tracking unit: #5690. The one checkbox per item goes in the server pull
+  requests' descriptions: item 5 on PR A, items 1 to 4 on PR B. PR B is the change that meets
+  items 1 to 4: until it merges they are not met and the UP-14 residual stands as described
+  above, and whether each is met is decided by the evidence in its description, not by this
+  paragraph. The conditions:
   1. The comparator orders per (agent_id, rule_id) and compares the pair when both sides
      carry one. An unpaired event against a paired verdict is held (refused, flagged, counted)
      while the agent's pair clock is fresh, and applied by arrival, flagged, once the clock is
