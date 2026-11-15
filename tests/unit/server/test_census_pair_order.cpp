@@ -2355,3 +2355,25 @@ TEST_CASE("census pair order, B3 fix: a decision whose savepoint is rolled back 
     CHECK(order_text(db.dsn(), "a") == "5|3|-|0|0|0|2|0|0|0"); // two stragglers, no duplicate
     CHECK(decision_delta(counts, decision_counts(metrics)) == "-");
 }
+
+TEST_CASE("census pair order, A1: a refused-regression Repair never retires its own pending "
+          "event (documented stranded-evidence behaviour, pinned)",
+          PAIR_TAGS) {
+    // Pins documented behaviour, not a design goal (the #7147 stranded-evidence class). r1 holds a
+    // paired verdict (5,10), r2 an unpaired one. A (4,3) event on r2 fails its first delivery and
+    // is stored pending: every redelivery is decided refused_regression (a Repair never re-bases,
+    // so ageing the clock changes nothing), flags the row, counts a decision, is acked Redelivered
+    // and stays pending, because the clear never retires a paired event against an unpaired row.
+    // It leaves only on a paired apply on that (agent, rule). Expected rows: the plan model's.
+    PAIR_FIXTURE();
+    ScheduleRun run(store, db.dsn(), metrics,
+                    "applied_pair,applied_key,-,refused_regression,refused_regression");
+    run.run(deliver(1000, "r1", 'C', 1000, 5, 10, "C - 5/10", 0));
+    run.run(deliver(1010, "r2", 'C', 1010, 0, 0, "C F -/-", 0));
+    run.run(deliver_failing(1020, "r2", 'D', 1020, 4, 3, "C F -/-", 1));
+    run.run(redeliver(1030, 3, "C F -/-", 1));
+    run.run(age_clock());
+    run.run(redeliver(8300, 3, "C F -/-", 1));
+    run.expect_order("5|10|-|1|1|1|0|0|0|0");
+    CHECK(verdict(db.dsn(), "a", "r1") == "C - 5/10");
+}
