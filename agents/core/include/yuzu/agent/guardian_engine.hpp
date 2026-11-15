@@ -351,6 +351,21 @@ public:
     /// GuardianEngine getters (policy_generation(), journal_stats(), ...) DO take mtx_, so the
     /// tick as a whole can still wait behind apply_rules; only this read cannot.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
+    /// #5605: the number of Spark baseline-on-arm captures CURRENTLY staged on this agent and not
+    /// yet written to its local KV baseline record (the persister's pending_captures(), the
+    /// runtime's staging-map size mirrored). A CURRENT value that falls as captures are written,
+    /// not a cumulative count: unlike baseline_persist_failures() it reads the open backlog even
+    /// when every pass throws before its first write. std::nullopt (tag omitted, the arm_stats()
+    /// dormancy pattern) when no persister is published: prefer_spark_ is false (every released
+    /// agent), wire_spark_engine has not run or ran after stop(), --spark-disable, a null engine,
+    /// or a wiring that failed before the persister was published, or failed after it and was
+    /// rolled back (rollback_spark_wiring_locked unpublishes it). A present 0 means "no capture
+    /// waiting at this persister", NOT "Spark is healthy". After stop() the persister stays
+    /// published, so a heartbeat tick before the thread joins reads the residual the Stop pass
+    /// could not write (captures this process will lose). A capture that could not even be staged
+    /// is not counted here (see baseline_persist_failures()), and a legacy FileGuard persist
+    /// failure is counted nowhere. Lock-free (never mtx_), like baseline_persist_failures().
+    [[nodiscard]] std::optional<std::uint64_t> baseline_unpersisted() const;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
     /// because a same-target record already existed (first capture wins). Not a failure and not
     /// part of baseline_persist_failures(). DIAGNOSTIC accessor with no production consumer and
@@ -1453,11 +1468,15 @@ private:
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
     /// #4045: the persister, published for lock-free readers (baseline_persist_failures /
-    /// baseline_persist_refusals). Stored with release by wire_spark_engine (under mtx_) right
-    /// after the persister is constructed, never cleared or replaced (wire is once-only and
-    /// rollback_spark_wiring_locked leaves the persister alone), and the object lives until
-    /// this engine's destructor, so an acquire load that sees non-null may dereference it for
-    /// as long as the engine is alive. Every other member read still needs mtx_.
+    /// baseline_persist_refusals / baseline_unpersisted). Stored with release by
+    /// wire_spark_engine (under mtx_) right after the persister is constructed and never
+    /// replaced (wire is once-only). #5605: rollback_spark_wiring_locked UNPUBLISHES it (stores
+    /// nullptr here) so a wiring that failed after this point reads as "no persister" (the
+    /// Spark path is SparkFailed and nothing can stage), not as a live zero; it leaves the
+    /// persister OBJECT (baseline_persister_) alone, which lives until this engine's destructor,
+    /// so a reader that loaded the pointer before the clear still dereferences a live object,
+    /// and an acquire load that sees non-null may dereference it for as long as the engine is
+    /// alive. Every other member read still needs mtx_.
     std::atomic<GuardianBaselinePersister*> baseline_persister_published_{nullptr};
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.

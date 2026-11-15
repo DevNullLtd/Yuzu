@@ -2089,6 +2089,19 @@ std::uint64_t GuardianEngine::baseline_persist_failures() const {
     return p ? p->failure_signals() : 0;
 }
 
+std::optional<std::uint64_t> GuardianEngine::baseline_unpersisted() const {
+    // Lock-free by design (never mtx_), like baseline_persist_failures(): prefer_spark_ is a
+    // const bool and the published pointer is atomic, so no lock is needed for the dormancy
+    // gate. nullopt (not 0) when dormant, so the heartbeat omits the tag rather than reporting
+    // a fabricated "live, nothing pending" (the arm_stats() false-present trap).
+    if (!prefer_spark_)
+        return std::nullopt;
+    const auto* p = baseline_persister_published_.load(std::memory_order_acquire);
+    if (!p)
+        return std::nullopt;
+    return p->pending_captures();
+}
+
 std::uint64_t GuardianEngine::baseline_persist_refusals() const {
     const auto* p = baseline_persister_published_.load(std::memory_order_acquire);
     return p ? p->persist_refusals() : 0;
@@ -4051,8 +4064,10 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
                       "anything but a real KvStore (see kv_store.hpp's IJournalStore doc)");
         lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
         baseline_persister_ = std::make_shared<GuardianBaselinePersister>(
-            kv_, spark_runtime_->staged_baseline_drops_source()); // #4045
-        // Published for the lock-free heartbeat getters; never cleared (see the member's doc).
+            kv_, spark_runtime_->staged_baseline_drops_source(),
+            spark_runtime_->staged_baseline_count_source()); // #4045, #5605
+        // Published for the lock-free heartbeat getters; only rollback_spark_wiring_locked ever
+        // unpublishes it (see the member's doc).
         baseline_persister_published_.store(baseline_persister_.get(), std::memory_order_release);
 
         auto id = engine->register_consumer("guardian-spark",
@@ -4159,6 +4174,11 @@ void GuardianEngine::rollback_spark_wiring_locked(SparkEngine* engine, bool regi
     spark_runtime_.reset();
     spark_backend_.reset();
     spark_reader_.reset();
+    // #5605: unpublish the persister (the object, baseline_persister_, stays alive until the
+    // destructor). A wiring that failed AFTER the publish leaves this agent SparkFailed, where
+    // nothing can ever stage: the lock-free heartbeat getters must read "no persister", not a
+    // live 0 that baseline_unpersisted() would report as "Spark path live, nothing pending".
+    baseline_persister_published_.store(nullptr, std::memory_order_release);
     if (registered)
         engine->unregister_consumer(consumer_id);
     spark_engine_ = nullptr;
