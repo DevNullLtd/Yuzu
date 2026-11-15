@@ -2281,13 +2281,17 @@ class MarkerAmbiguity(GitCase):
 
     def test_an_unclosed_or_mismatched_fence_never_names_a_version(self):
         for name, body in (("unclosed", "```\n- fenced\n"),
-                           ("inline span", "```code``` text\n- fenced\n"),
                            ("mixed", "```\n~~~\n- fenced\n")):
             with self.subTest(name):
                 sections = WN.release_sections(
                     f"## [Unreleased]\n- u\n\n## [2.0]\n{body}\n## [1.0]\n- old\n\n## [Unreleased]\n- later\n")
                 self.assertEqual(sections["- old"], "")
                 self.assertEqual(sections["- later"], "")
+
+    def test_an_inline_code_span_at_the_start_of_a_line_is_not_a_fence(self):
+        sections = WN.release_sections("## [2.0]\n```code``` text\n- fenced\n## [1.0]\n- old\n")
+        self.assertEqual(sections["- fenced"], "2.0")
+        self.assertEqual(sections["- old"], "1.0")
 
     def test_a_fence_showing_headings_names_no_version_after_it(self):
         log = ("## [1.0]\n```\n## [9.9]\n## [Unreleased]\n```\n- real1\n\n"
@@ -2307,6 +2311,31 @@ class MarkerAmbiguity(GitCase):
         sections = WN.release_sections(log)
         self.assertEqual(sections["- e2"], "")
         self.assertEqual(sections["- e3"], "")
+
+    def test_a_fence_follows_commonmark_for_openers_and_closers(self):
+        cases = (
+            ("closer with an info string stays inside", "## [2.0]\n```\n```js\n## [9.9]\n```\n- b\n", ""),
+            ("closer indented four spaces stays inside", "## [2.0]\n```\n    ```\n## [9.9]\n```\n- b\n", ""),
+            ("tilde closer with text stays inside", "## [2.0]\n~~~\n~~~ x\n## [9.9]\n~~~\n- b\n", ""),
+            ("backtick in the info string is not an opener", "## [2.0]\n```a`b\n- b\n", "2.0"),
+            ("opener indented four spaces is not a fence", "## [2.0]\n    ```\n- b\n## [1.0]\n- c\n", "2.0"),
+            ("a longer closing run closes", "## [2.0]\n```\n````\n## [3.0]\n- b\n", "3.0"),
+            ("a two-character run is not a fence", "## [1.0]\n``\n## [2.0]\n- b\n", "2.0"),
+            ("a tilde fence closes on a tilde run", "## [1.0]\n~~~\n~~~\n## [2.0]\n- b\n", "2.0"),
+        )
+        for name, log, want in cases:
+            with self.subTest(name):
+                self.assertEqual(WN.release_sections(log)["- b"], want)
+
+    def test_any_bracketed_heading_inside_a_fence_leaves_the_version_unknown(self):
+        for heading in ("## [3.0]", "##\t[3.0]", "  ## [3.0]", "# [3.0]"):
+            with self.subTest(heading=heading):
+                log = f"## [2.0]\n```\n{heading}\n- b\n"
+                self.assertEqual(WN.release_sections(log)["- b"], "")
+
+    def test_a_shell_comment_in_a_fence_changes_nothing(self):
+        log = "## [2.0]\n```sh\n# restart the agent\nrun\n```\n- b\n"
+        self.assertEqual(WN.release_sections(log)["- b"], "2.0")
 
     def test_a_tilde_line_does_not_close_a_backtick_fence(self):
         sections = WN.release_sections("## [1.0]\n```\n~~~\n# not a heading\n```\n- after\n")

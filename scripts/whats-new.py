@@ -691,22 +691,25 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
     None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
     be told: the line sits under a `#` or `##` heading that is not `## [X]` (tab-separated, a title, indented
     by one to three spaces before a bracket), before any heading, or under more than one version (a generic
-    bullet repeated across releases), so naming one version could name the wrong one. Headings inside a code
-    fence are not read as headings; a `## [X]` line inside one leaves the version unknown until the next
-    heading outside a fence, because a fence that never closes cannot be told from a sample."""
+    bullet repeated across releases), so naming one version could name the wrong one. Fences follow CommonMark
+    (up to three spaces of indent, a closer of the same character at least as long and followed by nothing, no
+    backtick in a backtick fence's info string). Headings inside one are not read as headings; a bracketed
+    heading line inside one leaves the version unknown until the next heading outside a fence, because a fence
+    that never closes cannot be told from a sample."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
     fence, flen = "", 0  # the character and length of the code fence open at this line
     for line in lines_of((changelog or "").removeprefix("\ufeff")):
-        text = line.lstrip()
-        run = len(text) - len(text.lstrip(text[:1])) if text[:1] in ("`", "~") else 0
+        indent = len(line) - len(line.lstrip(" "))
+        text = line[indent:]
+        run = len(text) - len(text.lstrip(text[:1])) if indent <= 3 and text[:1] in ("`", "~") else 0
         if fence:
-            if run >= flen and text[0] == fence:
+            if run >= flen and text[0] == fence and not text[run:].strip():
                 fence = ""
-            elif line.startswith("## ["):
+            elif re.match(r"(?:#{1,2}[ \t]*\[| {1,3}##[ \t]*\[)", line):
                 # A heading, or sample text in a fence that may never close: either way name no version.
                 version = ""
-        elif run >= 3:
+        elif run >= 3 and not (text[0] == "`" and "`" in text[run:]):
             fence, flen = text[0], run
         elif re.match(r"(?:#{1,2}(?:[ \t\r]|$)| {1,3}##[ \t]*\[)", line):
             m = re.match(r"## \[([^\]\n]*)\]", line)
