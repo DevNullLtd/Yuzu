@@ -7,7 +7,7 @@ what the agent's order row and its counters read, and which decision label each 
 
 It is the oracle for `tests/unit/server/test_census_pair_harness.cpp`, which ports it to C++, replays
 the same schedules through the real `GuaranteedStateStore`, and compares after every delivery. It is
-not a dependency of the build and no meson target runs it; it is here so the digest table in the
+not a dependency of the build and neither a meson target nor a CI job runs it; it is here so the digest table in the
 harness can be regenerated and a model change reviewed in the open.
 
 Files:
