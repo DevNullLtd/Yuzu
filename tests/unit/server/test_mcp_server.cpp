@@ -53895,11 +53895,11 @@ TEST_CASE("MCP list_executions: a service-scoped session admitted without a scop
 
 // ── #7817 - execute_instruction hands the dispatcher's Execution:Read scope to the bridge ──
 //
-// Global Execution:Execute with only SCOPED Execution:Read is modelled at the handler's
-// two seams: the fixture's perm_fn admits Execute globally, and `fleet_read_fn_for_test`
-// stands in for require_fleet_read (a real RbacStore needs PostgreSQL role rows; the gate's
-// own scope derivation is covered where it lives). This pins what the handler does with the
-// gate's answer, not the gate.
+// This case FAKES the gate (`fleet_read_fn_for_test`) so it can drive each arm of the handler's
+// derivation: scoped, refused, unwired, throwing, and admitted-unfiltered. It pins what the
+// handler does with the gate's answer, not the gate. The REAL gate (a real RbacStore, a global
+// Execution:Execute with a management-group-scoped Execution:Read) is driven by the owner-rig
+// case "a REAL RbacStore mixed grant is projected" below.
 TEST_CASE("MCP execute_instruction bridge: a scope-confined dispatcher gets no progress and a count-free final (#7817)",
           "[pg][mcp][integration][execute][bridge][7817]") {
     namespace smcp = yuzu::server::mcp;

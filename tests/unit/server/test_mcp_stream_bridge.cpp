@@ -5880,10 +5880,15 @@ TEST_CASE("bridge unrestricted dispatcher (#7817) - frames are byte-identical wi
           R"("id":3})");
 }
 
-TEST_CASE("bridge confined dispatcher (#7817) - a buffered terminal with no status latches \"unknown\", not \"completed\"",
+TEST_CASE("bridge confined dispatcher (#7817) - a buffered terminal with no usable status latches \"unknown\", not \"completed\"",
           "[mcp][bridge][7817][2409]") {
     // Parity with an unrestricted record, whose build_real_final defaults a missing status
-    // to "unknown": the pressure visitor's sanitize must not invent "completed".
+    // to "unknown": the pressure visitor's sanitize must not invent "completed". Three payloads:
+    // valid JSON with counts and no status, text that is not JSON, and JSON that is not an object.
+    const std::string payload = GENERATE(
+        std::string(R"({"agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})"),
+        std::string("this is not json"), std::string("[1,2,3]"));
+    CAPTURE(payload);
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, bound("alice"), json(1), json("t"), true,
@@ -5892,9 +5897,7 @@ TEST_CASE("bridge confined dispatcher (#7817) - a buffered terminal with no stat
     REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-7817u"));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
-    fx.bus.publish("exec-7817u", "execution-progress",
-                   R"({"agents_responded":3,"agents_targeted":3,"agents_success":3,"agents_failure":0})",
-                   /*is_terminal=*/true);
+    fx.bus.publish("exec-7817u", "execution-progress", payload, /*is_terminal=*/true);
     REQUIRE(poll_until([&] {
         fx.bridge->sweep();
         return fx.bridge->record_count() == 0;
@@ -5905,9 +5908,12 @@ TEST_CASE("bridge confined dispatcher (#7817) - a buffered terminal with no stat
     REQUIRE(result.has_value());
     CHECK((*result)["status"] == "unknown");
     check_no_count_keys(*result);
+    // build_fallback_final also says "unknown" but carries a `detail`; the arm-built final does
+    // not, so this cannot pass through the fallback final.
+    CHECK_FALSE(result->contains("detail"));
 }
 
-TEST_CASE("bridge confined dispatcher (#7817) - a listener fault on the terminal latches nothing; the retry delivers it sanitized",
+TEST_CASE("bridge confined dispatcher (#7817) - a listener fault on the terminal latches nothing; a later terminal latches sanitized",
           "[mcp][bridge][7817]") {
     Fx fx;
     auto s = fx.make_session();
@@ -5919,6 +5925,9 @@ TEST_CASE("bridge confined dispatcher (#7817) - a listener fault on the terminal
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(4)));
 
+    // The injected fault throws at the top of the listener, so it models any throw inside the
+    // listener's try block, including one from the confined terminal's sanitize allocation: the
+    // same catch arm counts it and leaves the slot untouched.
     fx.bridge->inject_listener_fault_for_test();
     fx.bus.publish("exec-7817f", "execution-completed", kCompleted, /*is_terminal=*/true);
     // The fault is counted (the projector flushes it) and nothing was latched or published.

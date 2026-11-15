@@ -60,6 +60,14 @@ def must_fail(what, check, mutated, prefix):
     expect(fires(check, mutated, prefix), f"{what}: {prefix} must fail")
 
 
+def must_fail_with(what, check, mutated, prefix, reason):
+    """The mutation must fail with an error that starts with `prefix` AND contains `reason`, so it
+    cannot start failing for a different reason of the same check without this noticing."""
+    errs = [e for e in check(mutated) if e.startswith(prefix)]
+    expect(any(reason in e for e in errs),
+           f"{what}: {prefix} must fail with `{reason}`; got {[e[:110] for e in errs]}")
+
+
 def main() -> int:
     files = t.read_tree(t.REPO_ROOT, "server")
 
@@ -432,87 +440,126 @@ def main() -> int:
                      "        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);"), "CHECK 8")
 
     # ---- CHECK 9: the MCP stream bridge is a projected bus consumer (#7817) ------------------
+    c9 = t.check_bridge_projection
+
+    def m9(what, mutated, reason):
+        must_fail_with(what, c9, mutated, "CHECK 9", reason)
+
+    B = "mcp_stream_bridge.cpp"
+    M = "mcp_server.cpp"
     classify_call = "classify_execution_event_for_scope(ev, rec->fleet_read_scope)"
-    must_fail("the bridge classifier call deleted", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", classify_call, "ExecutionEventVerdict::kPass"), "CHECK 9")
-    must_fail("the bridge classifier call only commented out", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", "switch (" + classify_call + ")",
-                     "// switch (" + classify_call + ")\n            switch (ExecutionEventVerdict::kPass)"),
-              "CHECK 9")
-    must_fail("the bridge classifier handed a different scope", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", classify_call,
-                     "classify_execution_event_for_scope(ev, authz::VisibleSet{})"), "CHECK 9")
-    must_fail("the bridge classifier called a second time", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
-                     "bool sanitize_terminal = false;\n            (void)" + classify_call + ";"), "CHECK 9")
-    must_fail("the listener no longer returns on kDrop", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", "case ExecutionEventVerdict::kDrop:\n                return;",
-                     "case ExecutionEventVerdict::kDrop:\n                break;"), "CHECK 9")
-    must_fail("a sanitize call removed from the bridge", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", "? sanitize_execution_event_for_scope(ev).data",
-                     "? ev.data"), "CHECK 9")
-    must_fail("the pressure visitor sanitize removed", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", "? sanitize_execution_event_for_scope(*ev).data",
-                     "? ev->data"), "CHECK 9")
-    must_fail("a classifier name only in a comment", t.check_bridge_projection,
-              {**files, S + "mcp_stream_bridge.cpp": "".join(
-                  l for l in files[S + "mcp_stream_bridge.cpp"].splitlines(True)
-                  if "execution_event_scope.hpp" not in l and "classify_execution_event_for_scope(ev" not in l
-                  and "sanitize_execution_event_for_scope" not in l) +
-                  "// classify_execution_event_for_scope( sanitize_execution_event_for_scope(\n"}, "CHECK 9")
-    must_fail("the production reserve() dropped the scope", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp", "std::move(bridge_fleet_scope));", ");", count=1), "CHECK 9")
-    must_fail("the production reserve() passes a different scope", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp", "std::move(bridge_fleet_scope));",
-                     "std::nullopt);"), "CHECK 9")
-    must_fail("the dispatcher scope starts unrestricted, not deny-all", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp", "bridge_fleet_scope =\n                            yuzu::server::authz::deny_all();",
-                     "bridge_fleet_scope = std::nullopt;"), "CHECK 9")
+    m9("the bridge classifier call deleted",
+       mutate(files, B, classify_call, "ExecutionEventVerdict::kPass"), "exactly once (the listener)")
+    m9("the bridge classifier call only commented out",
+       mutate(files, B, "switch (" + classify_call + ")",
+              "// switch (" + classify_call + ")\n            switch (ExecutionEventVerdict::kPass)"),
+       "exactly once (the listener)")
+    m9("the bridge classifier handed a different scope",
+       mutate(files, B, classify_call, "classify_execution_event_for_scope(ev, authz::VisibleSet{})"),
+       "must be called with (ev, rec->fleet_read_scope)")
+    m9("the bridge classifier called a second time",
+       mutate(files, B, "bool sanitize_terminal = false;",
+              "bool sanitize_terminal = false;\n            (void)" + classify_call + ";"),
+       "exactly once (the listener)")
+    m9("the listener no longer returns on kDrop",
+       mutate(files, B, "case ExecutionEventVerdict::kDrop:\n                return;",
+              "case ExecutionEventVerdict::kDrop:\n                break;"), "must `return` on kDrop")
+    m9("a sanitize call removed from the bridge",
+       mutate(files, B, "? sanitize_execution_event_for_scope(ev).data", "? ev.data"), "exactly twice")
+    m9("the pressure visitor sanitize removed",
+       mutate(files, B, "? sanitize_execution_event_for_scope(*ev).data", "? ev->data"), "exactly twice")
+    m9("a classifier name only in a comment",
+       {**files, S + B: "".join(
+           l for l in files[S + B].splitlines(True)
+           if "execution_event_scope.hpp" not in l and "classify_execution_event_for_scope(ev" not in l
+           and "sanitize_execution_event_for_scope" not in l) +
+           "// classify_execution_event_for_scope( sanitize_execution_event_for_scope(\n"},
+       "exactly once (the listener)")
+    m9("the production reserve() dropped the scope",
+       mutate(files, M, "std::move(bridge_fleet_scope));", ");", count=1), "sixth argument")
+    m9("the production reserve() passes a different scope",
+       mutate(files, M, "std::move(bridge_fleet_scope));", "std::nullopt);"), "sixth argument")
+    m9("the dispatcher scope starts unrestricted, not deny-all",
+       mutate(files, M, "bridge_fleet_scope =\n                            yuzu::server::authz::deny_all();",
+              "bridge_fleet_scope = std::nullopt;"), "declared exactly once")
     store = "rec->fleet_read_scope = fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt;"
-    must_fail("the reserve() scope store deleted", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", store, ""), "CHECK 9")
-    must_fail("the reserve() store only commented out", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", store, "// " + store), "CHECK 9")
-    must_fail("the reserve() stores nullopt unconditionally", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", store, "rec->fleet_read_scope = std::nullopt;"), "CHECK 9")
-    must_fail("the reserve() retains the caller's agent ids again", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", store, "rec->fleet_read_scope = std::move(fleet_read_scope);"),
-              "CHECK 9")
-    must_fail("a second fleet_read_scope store", t.check_bridge_projection,
-              mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
-                     "bool sanitize_terminal = false;\n            rec->fleet_read_scope = std::nullopt;"),
-              "CHECK 9")
-    must_fail("the handler catch assigns nullopt", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp",
-                     "scope derivation \"\n                                          \"threw; progress bridge uses its most restricted view\");\n"
-                     "                            bridge_fleet_scope = yuzu::server::authz::deny_all();",
-                     "scope derivation \"\n                                          \"threw; progress bridge uses its most restricted view\");\n"
-                     "                            bridge_fleet_scope = std::nullopt;"), "CHECK 9")
-    must_fail("the admitted guard removed (unconditional move)", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp", "if (fleet_gate.admitted)\n                                    bridge_fleet_scope",
-                     "bridge_fleet_scope"), "CHECK 9")
-    must_fail("a third bridge_fleet_scope assignment", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp", "                        auto rr = bridge->reserve(",
-                     "                        bridge_fleet_scope = std::nullopt;\n                        auto rr = bridge->reserve("),
-              "CHECK 9")
-    must_fail("the scope read with a different pair", t.check_bridge_projection,
-              mutate(files, "mcp_server.cpp", 'fleet_read_fn_(req, scratch, "Execution", "Read")',
-                     'fleet_read_fn_(req, scratch, "Execution", "Execute")'), "CHECK 9")
-    must_fail("a second reserve() on a bridge-named receiver in another file", t.check_bridge_projection,
-              mutate(files, "server.cpp", "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);",
-                     "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);\n"
-                     "        (void)mcp_bridge_->reserve(a, b, c, d, false);"), "CHECK 9")
-    must_fail("a new file holding the bridge", t.check_bridge_projection,
-              {**files, S + "new_holder.cpp": "yuzu::server::mcp::McpStreamBridge* b = nullptr;\n"}, "CHECK 9")
-    expect(t.check_bridge_projection({**files, S + "commented_holder.cpp":
-           "// McpStreamBridge held here; bridge_->reserve(a);\n"}) == [],
+    m9("the reserve() scope store deleted", mutate(files, B, store, ""), "must assign fleet_read_scope exactly once")
+    m9("the reserve() store only commented out", mutate(files, B, store, "// " + store),
+       "must assign fleet_read_scope exactly once")
+    m9("the reserve() stores nullopt unconditionally",
+       mutate(files, B, store, "rec->fleet_read_scope = std::nullopt;"), "store in McpStreamBridge::reserve must be `")
+    m9("the reserve() retains the caller's agent ids again",
+       mutate(files, B, store, "rec->fleet_read_scope = std::move(fleet_read_scope);"),
+       "store in McpStreamBridge::reserve must be `")
+    m9("the reserve() store has a && wrapper in its condition",
+       mutate(files, B, store, "rec->fleet_read_scope = fleet_read_scope.has_value() && false ? "
+                               "authz::deny_all() : std::nullopt;"),
+       "store in McpStreamBridge::reserve must be `")
+    m9("the reserve() store behind an if",
+       mutate(files, B, store, "if (fleet_read_scope.has_value() && false) " + store), "top-level statement")
+    m9("the reserve() store behind an if with a block",
+       mutate(files, B, store, "if (bus_ == nullptr && false) {\n        " + store + "\n    }"),
+       "top-level statement")
+    m9("the reserve() store behind an else",
+       mutate(files, B, store, "if (fleet_read_scope.has_value()) { } else " + store), "top-level statement")
+    m9("a statement inserted between the progress_token move and the store",
+       mutate(files, B, store, "rec->streamed_intent = streamed_intent;\n    " + store), "top-level statement")
+    m9("a second fleet_read_scope store",
+       mutate(files, B, "bool sanitize_terminal = false;",
+              "bool sanitize_terminal = false;\n            rec->fleet_read_scope = std::nullopt;"),
+       "must assign fleet_read_scope exactly once")
+    catch_text = ("scope derivation \"\n                                          \"threw; progress bridge uses its most restricted view\");\n"
+                  "                            bridge_fleet_scope = yuzu::server::authz::deny_all();")
+    m9("the handler catch assigns nullopt",
+       mutate(files, M, catch_text, catch_text.replace("yuzu::server::authz::deny_all();", "std::nullopt;")),
+       "must be assigned exactly twice")
+    m9("the admitted guard removed (unconditional move)",
+       mutate(files, M, "if (fleet_gate.admitted)\n                                    bridge_fleet_scope",
+              "bridge_fleet_scope"), "must be assigned exactly twice")
+    anchor = "                        auto rr = bridge->reserve("
+    m9("a third bridge_fleet_scope assignment",
+       mutate(files, M, anchor, "                        bridge_fleet_scope = std::nullopt;\n" + anchor),
+       "is mentioned 3 time(s)")
+    m9("bridge_fleet_scope reset before the reserve call",
+       mutate(files, M, anchor, "                        bridge_fleet_scope.reset();\n" + anchor), "is mentioned 3 time(s)")
+    m9("bridge_fleet_scope swapped before the reserve call",
+       mutate(files, M, anchor, "                        bridge_fleet_scope.swap(other_scope);\n" + anchor),
+       "is mentioned 3 time(s)")
+    m9("bridge_fleet_scope exchanged before the reserve call",
+       mutate(files, M, anchor,
+              "                        (void)std::exchange(bridge_fleet_scope, std::nullopt);\n" + anchor),
+       "is mentioned 3 time(s)")
+    m9("bridge_fleet_scope assigned an empty braced value",
+       mutate(files, M, anchor, "                        bridge_fleet_scope = {};\n" + anchor), "is mentioned 3 time(s)")
+    m9("the scope read with a different pair",
+       mutate(files, M, 'fleet_read_fn_(req, scratch, "Execution", "Read")',
+              'fleet_read_fn_(req, scratch, "Execution", "Execute")'), "must be read with Execution:Read")
+    seed = "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);"
+    for what, call in (
+            ("a second reserve() on a bridge-named receiver", "(void)mcp_bridge_->reserve(a, b, c, d, false);"),
+            ("a second reserve() on a receiver with no bridge in its name", "(void)br_->reserve(a, b, c, d, false);"),
+            ("a second reserve() through an alias", "auto& sb = *p; (void)sb.reserve(a, b, c, d, false, e);"),
+            ("a second reserve() on a dereferenced expression", "(void)(*mcp_x_).reserve(a, b, c, d, false);")):
+        m9(what, mutate(files, "server.cpp", seed, seed + "\n        " + call), "a member reserve( call with")
+    m9("a second reserve() in mcp_server.cpp itself",
+       mutate(files, M, anchor, "                        (void)br_->reserve(a, b, c, d, false);\n" + anchor),
+       "a member reserve( call with")
+    m9("the bridge's reserve named through a pointer to member",
+       mutate(files, "server.cpp", seed, seed + "\n        auto pm = &mcp::McpStreamBridge::reserve;"),
+       "names McpStreamBridge::reserve")
+    m9("a new file holding the bridge",
+       {**files, S + "new_holder.cpp": "yuzu::server::mcp::McpStreamBridge* b = nullptr;\n"},
+       "the files naming McpStreamBridge changed")
+    expect(c9({**files, S + "commented_holder.cpp": "// McpStreamBridge held here; bridge_->reserve(a, b, c, d, e);\n"}) == [],
            "a comment naming the bridge and a reserve() must NOT trip CHECK 9")
-    expect(t.check_bridge_projection(files) == [], "the real tree must pass CHECK 9")
+    expect(c9(mutate(files, "server.cpp", seed, seed + "\n        std::vector<int> v; v.reserve(10);")) == [],
+           "a one-argument container reserve() must NOT trip CHECK 9")
+    expect(c9(files) == [], "the real tree must pass CHECK 9")
     # A comment or string holding the same text must NOT satisfy or trip the check.
-    commented = mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
+    commented = mutate(files, B, "bool sanitize_terminal = false;",
                        "// classify_execution_event_for_scope(ev, rec->fleet_read_scope)\n"
                        "            bool sanitize_terminal = false;")
-    expect(t.check_bridge_projection(commented) == [], "a comment repeating the classifier call must NOT trip CHECK 9")
+    expect(c9(commented) == [], "a comment repeating the classifier call must NOT trip CHECK 9")
 
     # ---- the frozen lists are load-bearing: a stale entry fails ------------------------------
     for name, table, key, value in (

@@ -67,15 +67,22 @@ CHECK 9 (the MCP stream bridge is a projected bus consumer, #7817). On comment- 
   once, inside `McpStreamBridge::make_listener`, with `(ev, rec->fleet_read_scope)`, and its switch
   returns on kDrop; `sanitize_execution_event_for_scope(` appears exactly twice in the file (the
   listener's terminal and the pressure visitor's buffered terminal, which this check does not tell
-  apart); `McpStreamBridge::reserve` stores `rec->fleet_read_scope` exactly once, as
+  apart); `McpStreamBridge::reserve` stores `rec->fleet_read_scope` exactly once, as the top-level
+  statement straight after the `rec->progress_token` move (not conditional), and as
   `fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt` (the record keeps only
   engaged-or-not). In mcp_server.cpp, `bridge_fleet_scope` is declared once, initialised from
-  `deny_all()`, assigned only from `fleet_gate.scope` under `if (fleet_gate.admitted)` and from
-  `deny_all()` in the `catch (...)`, and is the sixth argument of the one `bridge->reserve(`. Under
-  server/ (outside the bridge's own two files) the only call of `reserve(` on a receiver whose name
-  contains `bridge` is that one, and the exact set of files naming `McpStreamBridge` is frozen, so a
-  second holder of the bridge under another variable name is a reviewed act. The
-  docs/executions-history-ladder.md rule that a NEW bus consumer needs its own tripwire is met here.
+  `deny_all()`, mentioned exactly twice before the reserve call (assigned only from
+  `fleet_gate.scope` under `if (fleet_gate.admitted)` and from `deny_all()` in the `catch (...)`, so no
+  reset, swap, exchange or reassignment), read with Execution:Read from one `fleet_read_fn_` call,
+  and is the sixth argument of the one `bridge->reserve(`. Under server/ (outside the bridge's own
+  two files) no member call of `reserve(` takes more than one argument except that reviewed call,
+  whatever the receiver is named (a container's reserve takes one, the bridge's five or six), and
+  nothing outside them names `McpStreamBridge::reserve`; the exact set of files naming
+  `McpStreamBridge` in code is also frozen. RESIDUAL: a call that does not use member syntax with
+  arguments in the call itself (a pointer to member, `std::invoke`, a lambda that forwards a
+  parameter pack) is only caught if it names `McpStreamBridge::reserve` or a new file holds the
+  bridge. The docs/executions-history-ladder.md rule that a NEW bus consumer needs its own
+  tripwire is met here.
 
 Every frozen entry must still match something (a stale entry fails), so the lists cannot rot.
 
@@ -1365,6 +1372,16 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
         else:
             m = in_reserve[0]
             lhs_start = sc.masked.rfind("rec->", 0, m.start() + 1)
+            # A top-level statement of reserve() (brace depth 1), straight after the
+            # `rec->progress_token` move: not behind an `if`/`else`/loop, not in a nested block.
+            depth = sc.masked.count("{", rspan[0], lhs_start) - sc.masked.count("}", rspan[0], lhs_start)
+            before = sc.masked[:lhs_start].rstrip()
+            prev_stmt = _norm(sc.code[before.rfind(";", 0, len(before) - 1) + 1:len(before)])
+            if depth != 1 or prev_stmt != "rec->progress_token = std::move(progress_token);":
+                errs.append(f"CHECK 9: the fleet_read_scope store in McpStreamBridge::reserve must be a "
+                            f"top-level statement straight after `rec->progress_token = "
+                            f"std::move(progress_token);` (not conditional); found depth {depth}, "
+                            f"preceded by `{prev_stmt}`")
             text = _norm(sc.code[lhs_start:m.end()])
             if _norm(text.replace(" ;", ";")) != _norm(_RESERVE_NORMALISED.replace(" ;", ";")):
                 errs.append(f"CHECK 9: the fleet_read_scope store in McpStreamBridge::reserve must be "
@@ -1392,6 +1409,12 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
                     f"initialised from deny_all() (fail closed), found {len(decls)}")
     elif reserves:
         seg = ms.masked[decls[0].end():reserves[0]]
+        mentions = re.findall(r"\bbridge_fleet_scope\b", seg)
+        if len(mentions) != 2:
+            errs.append(f"CHECK 9: bridge_fleet_scope is mentioned {len(mentions)} time(s) between its "
+                        f"declaration and bridge->reserve( in {MCP_SERVER_CPP}; only the two "
+                        f"sanctioned assignments may touch it (no reset, swap, exchange, emplace or "
+                        f"reassignment)")
         assigns = re.findall(r"\bbridge_fleet_scope\s*=(?!=)", seg)
         admit = re.findall(r"\bif\s*\(\s*fleet_gate\.admitted\s*\)\s*bridge_fleet_scope\s*=\s*"
                            r"std::move\(\s*fleet_gate\.scope\s*\)\s*;", seg)
@@ -1413,7 +1436,9 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
             errs.append(f"CHECK 9: the dispatcher scope must be read with Execution:Read in "
                         f"{MCP_SERVER_CPP}")
 
-    # No other production reserve() on something named like the bridge, and a frozen holder set.
+    # No other production call of a MEMBER reserve() that takes more than one argument, whatever the
+    # receiver is called (a container's reserve takes one; the bridge's takes five or six), and no
+    # other spelling that names the bridge's reserve. The one reviewed call is in mcp_server.cpp.
     other = []
     holders = set()
     for rel, sc2 in _each(files, "McpStreamBridge", "reserve"):
@@ -1421,12 +1446,17 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
             continue
         if "McpStreamBridge" in sc2.masked:
             holders.add(rel)
-        for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:->|\.)\s*reserve\s*\(", sc2.masked):
-            if "bridge" in m.group(1).lower() and not (rel == MCP_SERVER_CPP and m.group(1) == "bridge"):
-                other.append(f"{rel}: {m.group(1)}.reserve(")
+        for m in re.finditer(r"(?:->|\.)\s*reserve\s*\(", sc2.masked):
+            o = m.end() - 1
+            nargs = len(_split_args(sc2.masked, sc2.code, o, _balanced(sc2.masked, o)))
+            if nargs != 1 and not (rel == MCP_SERVER_CPP and o in reserves):
+                other.append(f"{rel}: a member reserve( call with {nargs} arguments")
+        if "McpStreamBridge::reserve" in sc2.masked:
+            other.append(f"{rel}: names McpStreamBridge::reserve")
     if other:
-        errs.append("CHECK 9: a reserve() on a bridge-named receiver outside the one reviewed caller "
-                    f"(its scope argument is unpinned): {sorted(other)}")
+        errs.append("CHECK 9: a member reserve( call that is not a one-argument container reserve, or a "
+                    "reference to McpStreamBridge::reserve, outside the one reviewed bridge->reserve( "
+                    f"in {MCP_SERVER_CPP} (its scope argument is unpinned): {sorted(other)}")
     if holders != BRIDGE_HOLDERS:
         errs.append(f"CHECK 9: the files naming McpStreamBridge changed: new {sorted(holders - BRIDGE_HOLDERS)}, "
                     f"gone {sorted(BRIDGE_HOLDERS - holders)}; a new holder must be reviewed for a "
