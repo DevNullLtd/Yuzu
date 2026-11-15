@@ -7079,6 +7079,7 @@ TEST_CASE("REST gs.status: unordered_agents and unordered_agent_ids report the a
     const auto note = d["note"].get<std::string>();
     CHECK(note.find("unordered_agents counts agents") != std::string::npos);
     CHECK(note.find("orders a census verdict by the emit-order pair") != std::string::npos);
+    CHECK(note.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 }
 
 TEST_CASE("REST gs.status: the unordered ids are capped at 50 and the count is exact",

@@ -2432,6 +2432,7 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         const std::string sdesc = sget.value("description", "");
         CHECK(sdesc.find("unordered_agents") != std::string::npos);
         CHECK(sdesc.find("orders a census verdict by the emit-order pair") != std::string::npos);
+        CHECK(sdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 
         // Per-device all-guards read.
         const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
@@ -2473,6 +2474,7 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         const std::string gdesc = gget.value("description", "");
         CHECK(gdesc.find("ordering") != std::string::npos);
         CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
+        CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
         CHECK(p["pair_duplicates"].value("description", "").find("Equal pairs refused") !=
               std::string::npos);
         const std::string g200 = gget.at("responses").at("200").value("description", "");

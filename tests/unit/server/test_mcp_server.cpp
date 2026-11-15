@@ -53582,6 +53582,7 @@ TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, require
     CHECK(sdesc.size() < 4096);
     CHECK(sdesc.find("unordered_agents") != std::string::npos);
     CHECK(sdesc.find("orders a census verdict by the emit-order pair") != std::string::npos);
+    CHECK(sdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 
     const auto guards = tool("get_guardian_device_guards");
     const auto& gs = guards["outputSchema"];
@@ -53606,4 +53607,5 @@ TEST_CASE("MCP Guardian: the output schemas declare the ordering fields, require
     CHECK(gdesc.find("ordering") != std::string::npos);
     CHECK(gdesc.find("pair_duplicates") != std::string::npos);
     CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
+    CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 }

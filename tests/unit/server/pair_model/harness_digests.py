@@ -10,6 +10,9 @@ CAMPS = [dict(p_fail=0.2, p_lost=0.03, p_step=0.05, p_claim_fail=0.05, p_lower_e
          dict(p_fail=0.2, p_lost=0.03, p_eqwipe=0.4),
          dict(p_fail=0.2, p_claim_fail=0.05, p_lower_epoch=0.15, p_eqwipe=0.1, p_late=0.2)]
 f = lambda x: "" if x is None else str(x)
+# An FNV-style 64-bit hash with a NON-standard offset basis (1469598103934665603; real FNV-1a is
+# 14695981039346656037). Identical to fnv1a() in test_census_pair_harness.cpp; changing it requires
+# regenerating the digest table.
 def fnv(s):
     h = 1469598103934665603
     for c in s.encode():

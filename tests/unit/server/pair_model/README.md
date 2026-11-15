@@ -16,12 +16,13 @@ Files:
 - `ext.py` is the schedule generator `gen2` (clock steps, losses, late and lower-epoch deliveries).
 - `pend.py` is the pending-evidence extension: `Store("plan", REC2)` is the model the tests use and
   `gen_actions` turns a seed into a schedule (first deliveries, failed census writes, redeliveries).
-- `harness_digests.py` prints one line per seed, `<seed> <schedule digest> <trace digest>`, FNV-1a
-  digests of the canonical schedule and model-trace text that `schedule_text` and `snap_text` in the
-  harness reproduce.
+- `harness_digests.py` prints one line per seed, `<seed> <schedule digest> <trace digest>`, FNV-style
+  64-bit digests (non-standard offset basis, identical in the C++ and the Python; changing it
+  requires regenerating the digest table) of the canonical schedule and model-trace text that
+  `schedule_text` and `snap_text` in the harness reproduce.
 
-To regenerate the digest table (Python 3.14.4 was used; any Python 3 gives the same output, the
-generator only uses `random.Random(<int>)`):
+To regenerate the digest table (verified byte-identical on Python 3.12 and 3.14; it relies only on
+the int-seeded `random()`/`randint()`/`randrange()`/`choice()` stream, stable across 3.x since 3.2):
 
     python3 -I tests/unit/server/pair_model/harness_digests.py 64
 

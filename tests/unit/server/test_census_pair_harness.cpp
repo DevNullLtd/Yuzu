@@ -35,10 +35,10 @@
  * README.md; it is NOT a dependency of this file or of the build). Both are ported here,
  * with a port of CPython's Mersenne Twister so that `random.Random(seed)` and this file draw the
  * same numbers. The port is held faithful by the case "census pair harness: the C++ port agrees
- * with the Python model": it needs no database, and compares an FNV-1a digest of the first 64
- * seeds' schedules and model traces with digests produced by the Python model (the table
- * `kPythonDigests`, from the canonical forms `schedule_text` and `snap_text` below, produced by
- * tests/unit/server/pair_model/harness_digests.py). A model change is a change to the table:
+ * with the Python model": it needs no database, and compares an FNV-style digest (see `fnv1a`) of
+ * the first 64 seeds' schedules and model traces with digests produced by the Python model (the
+ * table `kPythonDigests`, from the canonical forms `schedule_text` and `snap_text` below, produced
+ * by tests/unit/server/pair_model/harness_digests.py). A model change is a change to the table:
  * regenerate it with that script, never edit a digest by hand.
  *
  * SEEDS AND REPLAY. A seed is the Python seed, so seed 17 here is `random.Random(17)` there.
@@ -93,10 +93,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -843,6 +845,10 @@ std::string trace_text(const Seed& s) {
     return out;
 }
 
+// An FNV-style 64-bit hash, NOT standard FNV-1a: the offset basis below is 1469598103934665603, not
+// the real FNV-1a basis 14695981039346656037 (a digit was lost when it was first typed). The
+// same constant is in harness_digests.py, so the two agree; changing it on one side, or "fixing"
+// it, requires regenerating the digest table `kPythonDigests`.
 std::uint64_t fnv1a(const std::string& s) {
     std::uint64_t h = 1469598103934665603ULL;
     for (unsigned char c : s) {
@@ -1416,11 +1422,32 @@ private:
     bool label_reported_{false};
 };
 
+// A checked non-negative integer from an environment variable: the whole text must be a decimal
+// number that fits an int. A malformed value throws (the running test case fails with the message)
+// instead of silently running seed 0 or the default range, which would pass for the wrong reason.
+int checked_env_int(const char* name, const char* text) {
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' || errno != 0 || text[0] == '-' || text[0] == '+' ||
+        v > static_cast<unsigned long long>(std::numeric_limits<int>::max()))
+        throw std::runtime_error(std::string(name) + "='" + text +
+                                 "' is not a non-negative decimal integer that fits an int");
+    return static_cast<int>(v);
+}
+
 std::pair<int, int> seed_range() {
-    if (const char* only = std::getenv("YUZU_TEST_PAIR_HARNESS_ONLY"); only && *only)
-        return {std::atoi(only), std::atoi(only) + 1};
-    const char* n = std::getenv("YUZU_TEST_PAIR_HARNESS_SEEDS");
-    return {0, n && std::atoi(n) > 0 ? std::atoi(n) : 64};
+    if (const char* only = std::getenv("YUZU_TEST_PAIR_HARNESS_ONLY"); only && *only) {
+        const int seed = checked_env_int("YUZU_TEST_PAIR_HARNESS_ONLY", only);
+        return {seed, seed + 1};
+    }
+    if (const char* n = std::getenv("YUZU_TEST_PAIR_HARNESS_SEEDS"); n && *n) {
+        const int count = checked_env_int("YUZU_TEST_PAIR_HARNESS_SEEDS", n);
+        if (count == 0)
+            throw std::runtime_error("YUZU_TEST_PAIR_HARNESS_SEEDS=0 would run no seeds");
+        return {0, count};
+    }
+    return {0, 64};
 }
 
 bool labels_enabled() {
