@@ -444,8 +444,8 @@ database.
   formulae and casks carry one; the other ecosystems have no registered Package-URL type, so
   their `purl` is empty, and so is the Homebrew presence row. The server stores it only from the
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
-  value is indexed, and the store can look up the devices carrying exactly one `purl`; the
-  dashboard and the API do not return it yet.
+  value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
+  installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -487,8 +487,10 @@ section hash (an out-of-band change to the table) set the starting point and pro
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
-and its components with it. Nothing in
-the dashboard or the API shows the change history or the components yet. The agent of this build
+and its components with it. The change
+history is read through `GET /api/v1/inventory/software/changes` and the components through
+`GET /api/v1/inventory/software/components` (see the REST API reference); the dashboard shows
+neither yet. The agent of this build
 sends v3 (and no longer has a v2 writer). Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
 `need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
@@ -798,6 +800,15 @@ curl -H "Authorization: Bearer $TOKEN" \
 # The same for a component bundled inside applications (empty until agents report components):
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software/components?name=log4j-core&version_min=2.0&version_max=2.14.1"
+# The same range as a vers: string (percent-encoded: >= is %3E%3D, | is %7C, < is %3C), which can
+# also express several intervals and exclusions. Rows come back identical to version_min/version_max:
+curl -H "Authorization: Bearer $TOKEN" \
+  "$SERVER/api/v1/inventory/software?name=OpenSSL&vers=vers:generic/%3E%3D3.0.0%7C%3C%3D3.0.6"
+# Who runs exactly this package? Search by Package URL (the canonical form, qualifiers and all,
+# matched exactly). The purl holds `?` and `&`, so let curl URL-encode it:
+curl -G -H "Authorization: Bearer $TOKEN" \
+  --data-urlencode 'purl=pkg:deb/debian/openssl@3.0.11-1?arch=amd64&distro=debian-12' \
+  "$SERVER/api/v1/inventory/software"
 # Hand the device list over as a file (up to 10,000 rows per call; follow X-Next-Cursor for more):
 curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   "$SERVER/api/v1/inventory/software?name=OpenSSL&version_min=3.0.0&version_max=3.0.6&format=csv"
@@ -806,20 +817,36 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
 - Query params: `name` (exact), `agent_id` (exact), `version` (exact; present-empty
   selects the empty-version rows), `q` (case-insensitive literal substring), `kind`,
   `ecosystem`, `source` (exact), `match` (`exact`, `prefix` or `contains` for `name`),
-  `version_min` / `version_max` (inclusive version range), `status`, `limit` (max 1000; 10000
+  `version_min` / `version_max` (inclusive version range), `vers` (the same range as a
+  `vers:<scheme>/...` string), `purl` (exact Package URL), `status`, `limit` (max 1000; 10000
   with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
   `agent_id` for a fleet-wide scan. The full parameter and error tables are in
   [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
   `cursor` is REST-only (the MCP tool takes only those).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
-  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 22 fields: the 14
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
   release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
   ecosystem does not store them (see the availability matrix above); `source` is the
   `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
-  `last_confirmed_at`, `install_type`, `install_scope`, `install_location` and
-  `instance_key`. The MCP tool's rows keep the 14 package fields until its twin catches up.
+  `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
+  `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
+  tool's rows keep the 14 package fields until its twin catches up.
+- **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
+  purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
+  so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
+  turns `totals` off (`totals_omitted: "filters"`). `vers=` is the
+  same range as `version_min` / `version_max`, written `vers:<scheme>/<constraint>|...` with
+  comparators `=` `!=` `<` `<=` `>` `>=` (`*` alone matches every version that has one); a row
+  with an empty version is outside every range, `*` and a `!=`-only range included, and is
+  selected with a present-empty `version=`. It needs `name` with
+  `match=exact` and is not combined with `version`, `version_min` or `version_max`. The
+  schemes `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are accepted and are **all
+  compared with the one catalogue comparator**, so a scheme's own edge ordering (Maven
+  qualifiers, PyPI post and dev releases, written epochs) can differ from the scheme's rules;
+  `deb` and `rpm` are refused by name and any other scheme is a `400`. The components route
+  takes `vers` too; it has no `purl`.
 - **Lookup totals.** For an exact `name`, an unfiltered (global) caller also gets `totals`
   (install rows and distinct devices); a management-group-confined caller gets its rows and
   `totals: null` with `totals_omitted: "scope"`: **null means not shown, never zero**. The
@@ -884,6 +911,54 @@ the fleet view (pass `agent_id` for an in-scope device) and service-scoped token
 denied. A degraded read is `503`, never an empty `200`; the fleet export and the unfiltered
 versions read are also `503` until the first catalogue refresh has landed. Parameters,
 responses and audit behaviour: [REST API](rest-api.md#get-apiv1inventorysoftwarecatalogue).
+
+### Collection health, hosts and the change feed
+
+Three REST reads show how installed-software collection is going. Parameters and responses:
+[REST API](rest-api.md#get-apiv1inventorysoftwarehosts).
+
+- **`GET /api/v1/inventory/software/plugin-health`** is the fleet view: one entry per facet (collector) with the number of devices in each status, the share timing out or failing, collection time and bytes read (p50, p95, max) and the ten slowest devices. Start here.
+- **`GET /api/v1/inventory/software/hosts`** and **`/hosts/{agent_id}`** are the per-device view: each device's last report time and, per facet, the status, the short `token` explaining it, when it was last confirmed, and what the last collection cost. Use `q` to find a device by hostname or agent id among the devices the roster holds (seen in the last 30 days, the newest 100,000: a search that finds nothing proves nothing while `roster_truncated` is `true`, and a device quiet for over 30 days is listed but not matched; tracked by #7790), and `last_synced_before` to list devices that have gone quiet.
+- **`GET /api/v1/inventory/software/summary`** gives devices reporting and stale (no report for 48 hours), install, removal and upgrade counts for the last 24 hours and 7 days, and the catalogue size.
+
+**Reading collection health.**
+
+- "Collecting" means a facet reported `full`, `delta`, `constrained`, `timeout` or `oversize`. `not_collected` (the OS has nothing to collect, or the plugin is not loaded) and `disabled` (switched off on purpose) are not failures and are left out of the timeout and failing shares.
+- `timeout_share` is the timeouts over collecting devices; `failing_share` adds `constrained` and `oversize`. A share of `null` means no device is collecting that facet.
+- The fleet figures are a snapshot recomputed about hourly; `as_of` says when. A caller confined to some management groups sees figures for only those devices, computed on the request. A block that cannot be given is `null` with `omitted` of `scope` or `building`; it is never shown as zero.
+- A `constrained` or `timeout` facet keeps the device's last confirmed rows, shown as unconfirmed, so a failing collector never makes software disappear.
+
+**Following changes.** `GET /api/v1/inventory/software/changes` lists installs, removals and upgrades in `(observed_at, change_id)` order. Page with `next_cursor` until it is `null`; a page that is not full has none, so a caught-up feed ends on `null` and there is no cursor to poll with. Start the next poll from `since` set to the `stable_before` of the previous response (earlier by whatever overlap you want), and de-duplicate on `change_id`. Rows appear after a 60-second settle window. A row that commits more than 60 seconds after its own `observed_at` can be missed by a cursor that already passed it; to recover, re-read from an earlier `since` and de-duplicate on `change_id`. A consumer that cannot tolerate a miss should re-read a trailing overlap on every poll. For a caller confined to more than 10,000 devices the cursor carries a count of passed-over rows: a page can be empty with a non-null `next_cursor`, a row deleted inside that span between two pages can make the next page skip a row, and a cursor passing over more than 100,000 rows is a `400` (restart from a later `since`; tracked by #7789).
+
+#### Software facet timeout share
+
+Alert `YuzuSoftwareFacetTimeoutShareHigh` (warning).
+
+**What fired.** For the facet in the `facet` label, more than 5% of the devices collecting it reported `timeout` (the collector ran past its deadline), with at least 20 collecting devices, for 24 hours. A device reports about once a day, so the share has held through a full reporting cycle.
+
+**Check first.**
+
+1. Open `GET /api/v1/inventory/software/plugin-health` and find the facet. Is only this facet over the line, or are several from the same plugin or all of them? One facet points at that collector; all of them point at load on the devices or the agent.
+2. Compare `duration_ms` p95 and max with the facet's deadline (60 seconds, or 120 for `installed_apps`, `windows_optional_features` and `hardware`). A p95 near the deadline means the collector is slow; a max at the deadline with a low p95 means a few devices.
+3. Take the ten `slowest` devices and read each one's collector state with `GET /api/v1/inventory/software/hosts/{agent_id}`; that response carries the section statuses and tokens, not the OS, the agent version or the management groups. Read the OS and the agent version from `GET /api/v1/devices/{id}`, and the members of a management group from `GET /api/v1/management-groups/{id}`. Are the slow devices one OS, one agent version, or one management group?
+4. Read the `token` column. `busy` means a worker of the same plugin was still running from an earlier day, so every facet of that plugin times out together: look at the plugin's other facets and at what the long-running action is. A `timeout` token is a plain deadline miss, and `rejected` is a worker that could not start.
+5. If the slow devices share an agent version, check whether the share began when that version was rolled out.
+
+#### Software facet failing share
+
+Alert `YuzuSoftwareFacetFailingShareHigh` (warning).
+
+**What fired.** For the facet in the `facet` label, more than 20% of the devices collecting it reported `constrained`, `timeout` or `oversize`, with at least 20 collecting devices, for 24 hours.
+
+**Check first.**
+
+1. Open `GET /api/v1/inventory/software/plugin-health` and read the per-status split (`devices`) for the facet. Which of the three dominates? If it is `timeout`, follow the timeout runbook above.
+2. Is it this facet only or all facets of one plugin? All facets of a plugin failing together suggests the plugin, not one collector.
+3. Is it one OS or all? A facet that cannot run on an OS reports `not_collected`, not `constrained`; a `constrained` share concentrated on one OS usually means a tool the collector needs is missing or returning errors there.
+4. Check the agent version of the failing devices through `GET /api/v1/devices/{id}` (the software host response does not carry it) and whether the share began with a rollout.
+5. Read the `token` column on the failing devices: `rc=<n>` is a non-zero exit, `truncated` is cut-off output, `no_rows` is a read that returned no applications, which the collector treats as a fault and reports as `constrained`, never as an empty estate, `unavailable` is a tool that did not answer, `rejected` is a worker that could not start. For `oversize` the token carries `rows=<n>` or `bytes=<n>`; a facet over 20,000 rows or one report cannot carry sends no rows at all, so consider whether that device is expected to hold that much.
+
+While a facet fails, the server keeps each device's last confirmed rows, so the software list stays complete but is marked unconfirmed until a later `full` section.
 
 ### Dashboard (`/inventory` → `/hardware` / `/software`)
 
@@ -1622,6 +1697,19 @@ The server turns every distinct installed-software title into a stable identity 
 - **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no vendor (a `via:` label: `git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
 - **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
 - **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
+
+### Software lifecycle (server store)
+
+The server keeps the dates after which a software title or an operating system version is past support, so a later software view can say whether an installed version is supported. Only the store and the evaluator exist so far: nothing reads it yet (no REST route, MCP tool, page or background job), and no host reports lifecycle dates yet.
+
+- **Two tables, no stored state.** Rules (`lifecycle_rule`) carry a product key, a version prefix, an event (`end_of_support` or `end_of_life`), a date and the public page the date came from. Host-declared facts (`lifecycle_declared`) carry a product key, one exact version, an event, a date and when a host last repeated it. A fact is global: one row per distinct date, never one per host. The state of a version is computed on every read from those two tables, so changing a rule or correcting a date never leaves an old answer behind.
+- **Keys.** A software title is `product:` plus its registry key (for example `product:postgresql:postgresql`). An operating system is `os:<distro id>` on Linux (the version is the distro version), or `os:windows` / `os:macos` with the OS version.
+- **States.** `end_of_life` once the end-of-life date has arrived, else `end_of_support` once the end-of-support date has, else `supported` when at least one date is known and it is still ahead, else `unknown`. A version with no rule and no fact is always `unknown`, never `supported`. Every answer names the date and source of each event it resolved; an answer from a rule also names the public page its date was read from, and a host-declared date has no page.
+- **Which date wins.** Per event: a host-declared date that a host repeated in the last 48 hours first; then `external`, then `imported`, then `shipped` rules; then, only when nothing else exists, a declared date no host has repeated lately, reported as `unconfirmed`. If current declared dates differ, the earliest wins and the answer is flagged as a conflict. A rule tier that disagrees with the winner also raises the conflict flag and is listed. Inside one tier the longest dot-component version prefix wins (`3.8` covers `3.8.10`, not `3.80`; an empty prefix covers every version).
+- **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
+- **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
+- **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
+- **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)
 

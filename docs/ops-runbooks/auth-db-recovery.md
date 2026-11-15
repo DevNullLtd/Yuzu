@@ -397,7 +397,11 @@ then clear this replica's cache. If the response body reports
 `db_error=true`), only this replica's cache was cleared. The rows survive, and
 any replica that misses its cache, including this one after a restart, will
 rebuild those sessions from them. Retry the revoke once the database is
-healthy.
+healthy. A session whose local account is inactive or deleted is refused at
+validation regardless, so a surviving row of a deactivated account does not
+serve once each replica's generation poll has run (about one second on a healthy
+poll, at most about 30 seconds while a replica's poll fails; see
+`docs/auth-architecture.md`, "Account state at session validation").
 
 API tokens are a separate credential class. The admin `?username=` call does
 **not** revoke them, and neither does a restart. `/sessions/me` ("Sign out
@@ -648,12 +652,16 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
      FROM audit_store.audit_events
     WHERE action IN ('scim.user.deactivated', 'scim.user.deleted', 'scim.user.provisioned', 'user.delete')
       AND ((result = 'partial' AND (detail LIKE '%sessions_db_error=true%' OR detail LIKE '%api_tokens_db_error=true%'))
-           OR detail LIKE '%durable session wipe failed%')
+           OR detail LIKE '%durable session wipe failed%'
+           OR detail LIKE 'account_state=unknown%'
+           OR detail LIKE 'store_failure%')
       AND timestamp >= extract(epoch FROM now() - interval '7 days')
     ORDER BY timestamp DESC;"
 ```
 
-`target_id` is the username for `user.delete` and the SCIM id for the three SCIM actions; the username is in `scim_store.scim_resources` (`SELECT username FROM scim_store.scim_resources WHERE scim_id = '<target_id>';`). A `scim.user.provisioned` row is a `POST /Users` with `active:false`: the account already exists and the IdP's retry meets `409`, so deactivate it by a `PATCH` with `active:false` (or from the dashboard) once the store has recovered. A `scim.user.provisioned` `success` row with `session_leg_backstopped=true` is not a failure: the account removal's own session wipe covered the delete. A `failure` row with `account deactivated; durable session wipe failed` means the account is down but a session may survive; end it with `DELETE /api/v1/sessions?username=<name>`. That call writes to the same session store, so it works only once PostgreSQL is healthy; it needs `UserManagement:Write` and asks for an MFA step-up only when the caller is a session whose account has an enrolled factor (see "Ending the sessions by hand" below).
+`target_id` is the username for `user.delete` and the SCIM id for the three SCIM actions; the username is in `scim_store.scim_resources` (`SELECT username FROM scim_store.scim_resources WHERE scim_id = '<target_id>';`). A `scim.user.provisioned` row is a `POST /Users` with `active:false`: the account already exists and the IdP's retry meets `409`, so deactivate it by a `PATCH` with `active:false` (or from the dashboard) once the store has recovered. A `scim.user.provisioned` `success` row with `session_leg_backstopped=true` is not a failure: the account removal's own session wipe covered the delete. A `failure` row with `account deactivated; durable session wipe failed` means the account is down and its session row may survive; the row is not served once each replica's generation poll has run (a session whose local account is inactive is rejected at validation: about one second after the deactivation commits on a healthy poll, at most about 30 seconds while a replica's poll fails), and you can remove it with `DELETE /api/v1/sessions?username=<name>`. `yuzu_auth_session_account_inactive_total` counts those refusals; it is not evidence of a failed wipe, because a healthy deactivation can increment it too. That call writes to the same session store, so it works only once PostgreSQL is healthy; it needs `UserManagement:Write` and asks for an MFA step-up only when the caller is a session whose account has an enrolled factor (see "Ending the sessions by hand" below).
+
+A `failure` row whose detail starts `account_state=unknown` (SCIM, `503`) or `store_failure` (dashboard `user.delete`, `503`) means the guarded deactivation did not complete and the account may still be active; the response does not tell you why. Besides a lock wait on the `rbac_enabled`, grant or account rows, the cause can be the deactivation's own write of the session write-generation: the transaction takes the fleet-shared `session_store.session_meta` row last, and it aborts (the account stays active) when that row cannot be locked within the 2000 ms lifecycle lock timeout (a stuck or slow-committing session writer holds it) or when the session store cannot be reached from the owner's pool. That cause cannot be told apart from a lock timeout in the response. Retry once the store is healthy. While it persists, deactivations keep failing; a session writer's transaction sets no timeout of its own and runs under the pool's default lock timeout (10 seconds unless the DSN sets its own) and statement timeout (30 seconds).
 
 **Confirming it converged.** After the retry succeeds, the matching `scim.user.deactivated`, `scim.user.deleted` or `user.delete` row has result `success`, and no session row is left for the account:
 
@@ -663,6 +671,20 @@ psql -q "$YUZU_POSTGRES_DSN" -c \
 ```
 
 The count must be 0. For a person who signs in through OIDC or SAML, also check the linked principal names (`oidc:...`, `saml:...`; they are listed in the success row's `revoked_principals=` detail). If the count is not 0, end the sessions with `DELETE /api/v1/sessions?username=<name>` and run the check again.
+
+### Sessions of deactivated accounts
+
+A durable session row of a deactivated local account can linger (a failed wipe, or a deactivation by SQL). This query lists them by username:
+
+```bash
+psql -q "$YUZU_POSTGRES_DSN" -c \
+  "SELECT s.username, count(*) FROM session_store.sessions s
+     JOIN auth.users u USING (username)
+    WHERE NOT u.is_active AND s.auth_source = 'local'
+    GROUP BY 1;"
+```
+
+For a deactivation made through the product, these rows are refused at validation once each replica's generation poll has run (about one second on a healthy poll, at most about 30 seconds while a replica's poll fails; see `docs/auth-architecture.md`, "Account state at session validation"). A deactivation made by direct SQL bumps no generation, so a replica with a warm cache keeps serving the session until the next generation change, and only a cold read refuses it: end those users' sessions with `DELETE /api/v1/sessions?username=<name>` or restart the replicas. The reaper removes these rows at expiry, and you can remove them at once with the same `DELETE`. The query matches local sessions of accounts that still have an `auth.users` row; a hard-deleted account has none. Returning to an earlier build is not supported, and an earlier build does not refuse these rows; if it happens regardless, run the query and end those sessions first (see `docs/user-manual/upgrading.md`, "Rollback").
 
 ## Emergency MFA disable (break-glass)
 
