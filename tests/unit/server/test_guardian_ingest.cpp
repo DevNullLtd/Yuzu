@@ -1087,6 +1087,16 @@ TEST_CASE("guardian ingest: pair_from_wire with a receipt applies the absolute p
     CHECK(pair_from_wire(static_cast<std::uint64_t>(kEpochSkewSeconds), 1, -5).paired);
     // The structural form is structural only: it does not apply the bound.
     CHECK(pair_from_wire_structural(7, kEmitSeqCeiling).paired);
+
+    // A receipt at the top of the signed range must not overflow the epoch ceiling (a signed
+    // overflow is undefined behaviour): the ceiling is far above any epoch, so a pair inside
+    // the range is plausible, and only the sequence bound can refuse it.
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    CHECK(pair_from_wire(7, 11, kMax).paired);
+    CHECK(pair_from_wire((std::uint64_t{1} << 62) - 1, 11, kMax).paired);
+    CHECK(pair_from_wire(7, kEmitSeqCeiling, kMax).reject == PairReject::Implausible);
+    CHECK(pair_from_wire(7, 11, kMax - kEpochSkewSeconds).paired);
+    CHECK(pair_from_wire(7, 11, std::numeric_limits<std::int64_t>::min()).paired);
 }
 
 TEST_CASE("guardian ingest: apply_wire_pair with a receipt withholds an implausible pair and "
