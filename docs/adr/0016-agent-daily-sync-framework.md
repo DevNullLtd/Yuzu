@@ -1384,9 +1384,11 @@ the fallback.
 | `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
 | `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle with an openable `Contents` and no `release` file under `Contents/Home`, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
 
-The rpm `list_inventory` query format has ten columns, `%{VENDOR}` the last; the pinned argv
-literal in `docs/agent-spawn-sink-manifest.md` carries the same format, and `parse_rpm_inv_line`
-takes ten tokens. The `list` action has its own columns.
+The rpm `list_inventory` query format (`kRpmInvQueryFormat`) has ten columns, the two free-text
+tags last: `%{VENDOR}` then `%{PACKAGER}`. The pinned argv literal in
+`docs/agent-spawn-sink-manifest.md` carries the same format. `parse_rpm_inv_line` takes at least
+nine tokens: the publisher is `VENDOR` when set, else `PACKAGER`, each read as the text before any
+tab it contains. The `list` action has its own columns.
 
 **The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
 `kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
@@ -1767,6 +1769,43 @@ Two recorded limits of the writer: component records are still normalised inside
 (idempotent, and unreachable until a producer exists; the component change plans them pre-normalised and
 drops that call), and the agent tests' server oracle is a test-local copy of the server recipe (the agent
 tests cannot link the store), so the server's golden vectors stay the cross-pin and both change together.
+
+### 2026-11-14 — the lookup read surface: purl, and `vers:` ranges (SAM-43)
+
+**Decision.** The REST lookup reads return and filter by the row's Package URL, and both lookup
+routes accept a `vers:` range. No schema change: the `purl` column and its partial index
+`installed_software_purl_idx` landed in schema v10 with the v3 apply path.
+
+- **purl on the installs route.** Rows carry `purl` (`null` when the stored value is empty: the
+  device has not yet sent a v3 report, or its ecosystem has no registered purl type) and the CSV
+  export gains a 23rd column, `purl`. `purl=` is a byte-equality filter on the stored canonical value (no prefix, no
+  case folding; it must start `pkg:`), emitted as `purl = $n AND purl <> ''` so the partial index
+  qualifies for every plan; the `agent_ids` scope push-down still applies, so a confined caller
+  gets complete pages. A purl filter makes `totals_omitted` read `filters`. The components table
+  has no purl column, so the components route takes `vers` only.
+- **One range evaluator.** `vers_range.hpp` (pure) parses `vers:<scheme>/<constraints>`, sorts the
+  constraints under the comparator, refuses a duplicate version or two lower or two upper bounds
+  in a row, and applies the VERS containment algorithm. `version_min` / `version_max` are read as
+  `vers:generic/>=min|<=max` when min is not above max (a min above max matches nothing), so
+  every range reaches the live distinct-version read through the same `resolve_version_range`,
+  with the kCatalogRowCap refusal and the empty-version rule unchanged (a row with an empty
+  version is outside every range, `*` and a `!=`-only range included). `vers` needs `name` with `match=exact` and cannot be combined with `version`,
+  `version_min` or `version_max`.
+- **Schemes.** `generic`, `semver`, `maven`, `npm`, `pypi` and `nuget` are evaluated, all under
+  the one catalogue comparator (`catalog_version_compare`), which is a recorded approximation:
+  a scheme's own ordering at the edges (Maven qualifiers, PyPI post and dev releases, written
+  epochs) can differ. `deb` and `rpm` are refused by name as not supported yet, any other scheme
+  is unknown; both are a `400`, never an unbounded match. The text is bounded (1024 bytes, 32
+  constraints), carries no control byte or space, and an error never echoes the input.
+- **The CVE matcher shares only the interval core.** `nvd_version_in_range`'s bounded branch calls
+  `vers::in_interval` once for the inclusive pair and once for the exclusive pair under
+  `nvd_version_compare`; results are identical (pinned by `test_nvd.cpp`). The matcher's
+  comparator, its epoch stripping and its CPE `exact` rule are untouched.
+- **Parity.** REST ships before the MCP tool; the gap is recorded in `docs/api-parity-ledger.md`
+  and tracked by #7749, which rides with #7396.
+- **Export width.** The maximum-width installs export is now 23 columns with a `purl` of up to
+  2048 bytes, about 245 MB per request by the same cap arithmetic as above (22 x 1024 + 2048
+  bytes, 10,000 rows).
 
 ## Routed-concern invariants
 

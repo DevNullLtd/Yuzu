@@ -975,7 +975,12 @@ TEST_CASE("worst-case cursors stay within kCursorMaxBytes", "[server][software_c
     const auto valid = encode_devices_cursor(
         {SoftwareCursor{std::string(1024, 'n'), agent, INT64_MAX}, INT64_MAX}, kHeadFp);
     CHECK(valid.size() == tok.size());
-    CHECK(decode_devices_cursor(valid, kHeadFp));
+    // a widest-text token at the largest skip the decode accepts
+    CHECK(decode_devices_cursor(
+        encode_devices_cursor({SoftwareCursor{std::string(1024, 'n'), agent, INT64_MAX},
+                               kWideScopeMaxSkip},
+                              kHeadFp),
+        kHeadFp));
 }
 
 TEST_CASE("catalogue cursor decoder refusals", "[server][software_catalogue_model]") {
@@ -1038,6 +1043,66 @@ std::string d2_payload(std::initializer_list<std::string_view> fields) {
     return out;
 }
 } // namespace
+
+// The wide path mints a skip that grows by kWideScopeMaxReads x limit per request while every row
+// is out of scope, and the next request hands it to the store as an OFFSET. The decode refuses a
+// skip past kWideScopeMaxSkip, so no request's OFFSET exceeds it. Every count is derived from the
+// constants, never a literal.
+TEST_CASE("read_devices_page: the wide-scope skip has a product ceiling",
+          "[server][software_catalogue_model]") {
+    constexpr std::int64_t kPerRequest = kWideScopeMaxReads * kCataloguePageMax;
+    constexpr std::int64_t kAccepted = kWideScopeMaxSkip / kPerRequest;
+    static_assert(kAccepted >= 1);
+
+    // A synthetic store: every row is one device outside the caller's scope, and a read answers
+    // `limit` rows after the keyset position plus the skip, so nothing is stored.
+    int reads = 0;
+    std::vector<std::int64_t> read_skips; // each read's OFFSET
+    const DevicesReader reader =
+        [&](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
+        ++reads;
+        read_skips.push_back(q.skip);
+        const std::int64_t base = (q.after ? q.after->install_id : 0) + q.skip;
+        std::vector<SoftwareFleetRow> out;
+        for (int i = 1; i <= q.limit; ++i)
+            out.push_back(fleet_row("hub", "z", base + i));
+        return out;
+    };
+    const auto rq = [](std::string cursor) {
+        return dreq(static_cast<int>(kCataloguePageMax), std::move(cursor));
+    };
+    const VisibleSet scope = wide_scope("m");
+
+    std::string cursor;
+    std::int64_t minted = 0; // the skip the previous request minted
+    for (std::int64_t k = 1; k <= kAccepted + 1; ++k) {
+        INFO("request " << k);
+        const auto first_read = read_skips.size();
+        auto page = read_devices_page(reader, rq(cursor), scope);
+        REQUIRE(page);
+        CHECK(page->rows.empty());
+        REQUIRE_FALSE(page->next_cursor.empty());
+        REQUIRE(read_skips.size() == first_read + static_cast<std::size_t>(kWideScopeMaxReads));
+        CHECK(read_skips[first_read] == minted); // the OFFSET is the previous minted skip
+        CHECK(read_skips[first_read] <= kWideScopeMaxSkip);
+        minted += kPerRequest;
+        // The cursor minted is the head anchor plus the counted skip (the last one is past the
+        // ceiling, so it is compared as a token rather than decoded).
+        CHECK(page->next_cursor ==
+              encode_devices_cursor({SoftwareCursor{}, minted}, devices_fingerprint(rq({}).query)));
+        cursor = page->next_cursor;
+    }
+    // The last request above decoded a skip == the ceiling (accepted) and minted past it.
+    CHECK(minted == kWideScopeMaxSkip + kPerRequest);
+
+    // The next request is the first refused, before any store read.
+    const int reads_before = reads;
+    auto refused = read_devices_page(reader, rq(cursor), scope);
+    REQUIRE_FALSE(refused);
+    REQUIRE(refused.error());
+    CHECK(*refused.error() == CursorError::kScanLimit);
+    CHECK(reads == reads_before);
+}
 
 TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue_model]") {
     const std::string fp = devices_fingerprint({});
@@ -1105,6 +1170,20 @@ TEST_CASE("devices cursor round trip and refusals", "[server][software_catalogue
     }
     // hand-made head: name "", agent "", id 0, skip 0 - ACCEPTED (opaque, not authenticated)
     CHECK(decode_devices_cursor(d2({"", "", "0", "0"}), fp));
+
+    // The wide-scope skip has a product ceiling: a skip AT the ceiling decodes, one past it is
+    // refused with its own code, after the filter check (malformed -> filter mismatch -> scan limit).
+    CHECK(decode_devices_cursor(d2({"n", "a", "1", std::to_string(kWideScopeMaxSkip)}), fp));
+    refuses(d2({"n", "a", "1", std::to_string(kWideScopeMaxSkip + 1)}), fp, CursorError::kScanLimit);
+    refuses(d2({"n", "a", "1", std::to_string(kWideScopeMaxSkip + 1)}), "ffffffffffffffff",
+            CursorError::kFilterMismatch);
+    refuses(d2({"n", "a", "x", std::to_string(kWideScopeMaxSkip + 1)}), fp, CursorError::kMalformed);
+    // Its operator text is its own, never one of the other refusals'.
+    const auto scan = cursor_error_message(CursorError::kScanLimit);
+    CHECK_FALSE(scan.empty());
+    for (const auto other :
+         {CursorError::kMalformed, CursorError::kFilterMismatch, CursorError::kStale})
+        CHECK(scan != cursor_error_message(other));
 
     // Known answer: the rest-api.md example token, so the documented example cannot drift from
     // what the codec mints.

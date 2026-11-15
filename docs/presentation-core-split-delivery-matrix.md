@@ -285,7 +285,7 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   scan covers `path: .` incl. `vcpkg_installed`, per this PR's changelog fragment — so SBOM pickup is
   NOT a WS-B2 deferral.)
   **Superseded by ADR-0035 ladder step 1 (2026-11-10):** the Windows and macOS legs of `ci.yml`
-  configure with `-Dbuild_server=false`, so the Drogon canary now builds on Linux only and the
+  are agent-only (`-Dbuild_server=false` at step 1, the `server` option's `auto` since step 3), so the Drogon canary now builds on Linux only and the
   Windows dynamic-DLL LOAD assertion above no longer runs in CI. The #4296 "the canary must not
   silently stop running" tripwire is moot for Windows: the server, and every Drogon-linked binary,
   is Linux-only under ADR-0035 (Decision 6 amends ADR-0031 Gate G10 accordingly).

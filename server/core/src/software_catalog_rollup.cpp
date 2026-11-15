@@ -11,16 +11,19 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <exception>
 
 namespace yuzu::server {
 
 SoftwareCatalogRollup::SoftwareCatalogRollup(SoftwareInventoryStore& store,
                                              std::chrono::seconds interval,
-                                             yuzu::MetricsRegistry* metrics)
+                                             yuzu::MetricsRegistry* metrics,
+                                             std::chrono::milliseconds stop_poll)
     : store_(store),
       interval_(interval <= std::chrono::seconds{0} ? std::chrono::seconds{3600} : interval),
-      metrics_(metrics) {}
+      metrics_(metrics),
+      stop_poll_(stop_poll <= std::chrono::milliseconds{0} ? kCatalogRollupStopPoll : stop_poll) {}
 
 SoftwareCatalogRollup::~SoftwareCatalogRollup() {
     stop();
@@ -64,12 +67,15 @@ void SoftwareCatalogRollup::run() {
     bool first = true;
     while (!stop_.load(std::memory_order_acquire)) {
         if (!first) {
-            // Sleep the interval in 5s steps so shutdown stays responsive. Spacing is
-            // measured from the END of the previous recompute (completion-spaced), so a
-            // recompute slower than the interval can never overlap the next.
-            const long steps = (interval_.count() + 4) / 5;
-            for (long i = 0; i < steps && !stop_.load(std::memory_order_acquire); ++i)
-                std::this_thread::sleep_for(std::chrono::seconds{5});
+            // Sleep the interval in stop_poll_ steps (5 s in production) so shutdown stays
+            // responsive. Spacing is measured from the END of the previous recompute
+            // (completion-spaced), so a recompute slower than the interval can never overlap
+            // the next. The step count rounds up, as the former (interval + 4) / 5 did.
+            const auto steps = (std::chrono::milliseconds{interval_} + stop_poll_ -
+                                std::chrono::milliseconds{1}) /
+                               stop_poll_;
+            for (std::int64_t i = 0; i < steps && !stop_.load(std::memory_order_acquire); ++i)
+                std::this_thread::sleep_for(stop_poll_);
             if (stop_.load(std::memory_order_acquire))
                 break;
         }

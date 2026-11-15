@@ -11,7 +11,7 @@ map, and gateway command forwarding.
 > compose / UAT-script change. The Cedar & Vale sales demo has its own full
 > runbook at `docs/demo-environment.md`.
 
-A cross-platform UAT script at `scripts/start-UAT.sh` (Linux + macOS) stands up the full stack, verifies connectivity, and runs command round-trip tests. The historical `scripts/linux-start-UAT.sh` name is kept as a thin shim that execs the canonical script. Usage:
+A UAT script at `scripts/start-UAT.sh` (Linux; macOS builds no native server since ADR-0035 step 3, so the native stack is unavailable there) stands up the full stack, verifies connectivity, and runs command round-trip tests. The historical `scripts/linux-start-UAT.sh` name is kept as a thin shim that execs the canonical script. Usage:
 
 ```bash
 bash scripts/start-UAT.sh          # start + verify (6 automated tests)

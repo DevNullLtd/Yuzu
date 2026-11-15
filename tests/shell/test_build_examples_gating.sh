@@ -89,10 +89,10 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 2
 fi
 
-"$PYTHON_BIN" - "$targets" "$ROOT" <<'PYEOF'
+"$PYTHON_BIN" - "$targets" "$ROOT" "$(uname -s)" <<'PYEOF'
 import json, os, sys
 
-targets_path, root = sys.argv[1], sys.argv[2]
+targets_path, root, uname_s = sys.argv[1], sys.argv[2], sys.argv[3]
 
 with open(targets_path) as f:
     names = {t["name"] for t in json.load(f)}
@@ -126,6 +126,13 @@ if present_demos:
     errors.append(f"demo plugin target(s) unexpectedly present under build_examples=false: {sorted(present_demos)}")
 if missing_required:
     errors.append(f"required target(s) missing under build_examples=false: {sorted(missing_required)}")
+
+# ADR-0035 ladder step 3: the server is Linux-only and the `server` feature
+# option is `auto`, so this configure passes no server switch and must come
+# out agent-only off Linux (the ADR said to pass an off-switch here; this
+# asserts the auto behaviour instead, which is the stronger check).
+if uname_s != "Linux" and "yuzu-server" in names:
+    errors.append("a yuzu-server target exists on a non-Linux host: the `server` feature option must be off there (ADR-0035)")
 
 if errors:
     for e in errors:
