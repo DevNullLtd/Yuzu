@@ -32,6 +32,9 @@ Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing c
 run picks the agent itself only when exactly one is registered. A login that does not yield an authenticated
 session exits 2.
 
+The ceremony dispatches `quarantine`, `release` and `quarantine_status` only. `quarantine_allow` (the
+fourth containment action) is not exercised here: it has no ceremony coverage, only its unit tests.
+
 The status is read from the exact `status|<token>` row of the agent's reply, taken only from a SUCCESS
 (status 1) row once no row is still RUNNING (status 0); FAILURE, TIMEOUT and REJECTED rows are no answer. The flow is covered
 against a recording fake (tests/test_firewall_containment_ceremony.py); the live apply/release round
@@ -64,9 +67,11 @@ SSH_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 POLL_S = 20
 POLL_APPLY_S = 90
 RELEASE_READS = 4
-# The limit must outlast the longest the ceremony can hold the containment: the status read after the apply
+# The limit must outlast the ceremony's own polling budget while contained: the status read after the apply
 # (2 s + 20 s), the release dispatch (90 s), then RELEASE_READS re-reads (4 x (2 s + 20 s)) = 200 s, plus
 # the apply's own wait (up to 90 s, which can run past the point the plugin starts the clock) = 290 s.
+# Each poll deadline is checked between reads, so a degraded dashboard can add up to one 30 s read per
+# poll: the dead-man limit is the backstop for that tail, not a promise it cannot occur.
 MIN_TTL_S = 300
 # CommandResponse.status (proto/yuzu/agent/v1/agent.proto): only SUCCESS is an answer; RUNNING is an
 # interim row to poll past; FAILURE, TIMEOUT and REJECTED carry no usable status.

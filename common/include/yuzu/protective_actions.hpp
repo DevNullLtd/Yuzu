@@ -144,4 +144,12 @@ namespace detail {
            iequals(plugin, "__guard__");
 }
 
+/// True iff `plugin` owns protective actions AND declares ordinary ones beside them (today only
+/// `firewall`: `state`, `rules`), so a plugin-level kill-switch row for it exempts the protective
+/// actions yet still gates the rest. `quarantine` and `__guard__` declare only protective actions.
+/// Kept beside `plugin_owns_protective_actions` so the plugin names are spelled in this header only.
+[[nodiscard]] inline bool plugin_mixes_protective_and_ordinary_actions(std::string_view plugin) {
+    return detail::iequals(plugin, "firewall");
+}
+
 } // namespace yuzu::protective

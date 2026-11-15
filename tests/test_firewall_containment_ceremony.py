@@ -137,8 +137,14 @@ class Poll(unittest.TestCase):
             return client.poll_response("cid", timeout_s=timeout_s), seq
 
     def test_it_polls_past_running_to_the_terminal_row(self):
-        got, _ = self.poll([EMPTY, running(), running(), row("inactive")])
+        client = fc.Client("http://127.0.0.1:9")
+        reads = []
+        replies = [EMPTY, running(), running(), row("inactive")]
+        with mock.patch.object(client, "get_json", side_effect=lambda _p: reads.append(1) or replies[len(reads) - 1]), \
+                mock.patch.object(fc.time, "sleep"):
+            got = client.poll_response("cid", timeout_s=20)
         self.assertEqual(got, row("inactive"))
+        self.assertEqual(len(reads), 4)  # an early return on the first row (empty or RUNNING) reads fewer
 
     def test_a_row_that_never_leaves_running_is_returned_at_the_deadline_and_is_no_answer(self):
         with mock.patch.object(fc.time, "monotonic", side_effect=[0, 1, 2, 3, 100, 100]):
@@ -300,6 +306,23 @@ class Flow(unittest.TestCase):
         rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
                                "quarantine": [{}], "release": [{}]}, extra=["--ttl-seconds", str(fc.MIN_TTL_S)])
         self.assertEqual(rc, fc.EXIT_OK)
+
+    def test_the_limit_floor_covers_the_polling_budget(self):
+        # 22 s status read + 90 s release + 4 x 22 s re-reads + 90 s apply = 290 s must fit inside the floor
+        self.assertGreaterEqual(fc.MIN_TTL_S, 290)
+        self.assertEqual(fc.MIN_TTL_S, 300)
+        rc, calls = self.run_main({}, extra=["--ttl-seconds", str(fc.MIN_TTL_S - 1)])
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
+        self.assertEqual(calls, [])
+
+    def test_only_the_apply_and_release_get_the_long_poll(self):
+        client = mock.MagicMock()
+        client.post_json.return_value = {"command_id": "c"}
+        for action, want in (("quarantine", fc.POLL_APPLY_S), ("release", fc.POLL_APPLY_S),
+                             ("quarantine_status", fc.POLL_S)):
+            with self.subTest(action=action):
+                fc.dispatch(client, "a", action, {})
+                self.assertEqual(client.poll_response.call_args.kwargs["timeout_s"], want)
 
     def test_a_non_loopback_dashboard_is_refused_for_the_apply_only(self):
         rc, calls = self.run_main({}, dashboard="http://192.0.2.7:8080")

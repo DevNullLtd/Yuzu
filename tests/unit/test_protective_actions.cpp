@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 using yuzu::protective::is_protective_action;
+using yuzu::protective::plugin_mixes_protective_and_ordinary_actions;
 using yuzu::protective::plugin_owns_protective_actions;
 using yuzu::protective::is_quarantine_control_plugin;
 using yuzu::protective::is_firewall_control_plugin;
@@ -98,4 +99,19 @@ TEST_CASE("plugin_owns_protective_actions: true exactly for plugins with a prote
             any = any || is_protective_action(plugin, action);
         CHECK(plugin_owns_protective_actions(plugin) == any);
     }
+}
+
+TEST_CASE("plugin_mixes_protective_and_ordinary_actions: only firewall, and only an owner",
+          "[protective][security]") {
+    for (const auto plugin :
+         {"quarantine", "Quarantine", "__guard__", "echo", "firewall", "Firewall", "firewalls", ""}) {
+        const bool mixes = plugin_mixes_protective_and_ordinary_actions(plugin);
+        // A plugin cannot mix without owning a protective action ...
+        if (mixes)
+            CHECK(plugin_owns_protective_actions(plugin));
+        // ... and the mixed plugin really has an ordinary action beside its protective ones.
+        CHECK(mixes == (std::string_view{plugin} == "firewall" || std::string_view{plugin} == "Firewall"));
+    }
+    CHECK_FALSE(is_protective_action("firewall", "state"));
+    CHECK_FALSE(is_protective_action("firewall", "rules"));
 }

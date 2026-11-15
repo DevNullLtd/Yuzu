@@ -277,8 +277,8 @@ inline constexpr std::size_t kListRowCap = 5000;
         // `state`, `rules`) exempts the protective ones yet still gates the rest: `partial`, so a
         // post-mortem cannot read it as a complete exemption. `quarantine` and `__guard__` declare
         // only protective actions, and an action-level row is exact: both stay `true`.
-        const bool partial =
-            scope.action.empty() && yuzu::protective::detail::iequals(scope.plugin, "firewall");
+        const bool partial = scope.action.empty() &&
+                             yuzu::protective::plugin_mixes_protective_and_ordinary_actions(scope.plugin);
         detail += partial ? ", protective_exempt=partial" : ", protective_exempt=true";
     }
     if (!reason.empty()) {
