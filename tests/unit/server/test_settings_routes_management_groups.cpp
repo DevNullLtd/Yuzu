@@ -458,7 +458,7 @@ TEST_CASE("Settings group create: a duplicate name writes attempted then failure
     CHECK(rows[0].detail == kMarkupName); // the raw name, the existing contract
     CHECK(rows[1].result == "failure");
     CHECK(rows[1].target_id.empty());
-    CHECK(rows[1].detail == "name_conflict");
+    CHECK(rows[1].detail == std::string("name_conflict ") + kMarkupName);
 }
 
 TEST_CASE("Settings group create: success writes attempted then success with the new id",
@@ -548,7 +548,7 @@ TEST_CASE("Settings group create: a store fault answers fixed text, writes failu
     CHECK(rows[0].result == "attempted");
     CHECK(rows[1].result == "failure");
     CHECK(rows[1].target_id.empty());
-    CHECK(rows[1].detail == "store_error");
+    CHECK(rows[1].detail == "store_error Store Down");
 }
 
 TEST_CASE("Settings group create: a session or grant gone after the attempted row creates "
@@ -567,7 +567,7 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         CHECK(rows[0].result == "attempted");
         CHECK(rows[1].result == "failure");
         CHECK(rows[1].target_id.empty());
-        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].detail == "session_revoked Session Gone");
     }
     SECTION("permission revoked") {
         h.perm_revoked_after_attempt = true;
@@ -579,7 +579,7 @@ TEST_CASE("Settings group create: a session or grant gone after the attempted ro
         CHECK(rows[0].result == "attempted");
         CHECK(rows[1].result == "failure");
         CHECK(rows[1].target_id.empty());
-        CHECK(rows[1].detail == "permission_revoked");
+        CHECK(rows[1].detail == "permission_revoked Grant Gone");
         CHECK(rows[1].bound);
     }
     CHECK(h.group_names().empty());
@@ -730,7 +730,7 @@ TEST_CASE("Settings group create: a parent deleted between the check and the ins
     CHECK(rows[0].result == "attempted");
     CHECK(rows[1].result == "failure");
     CHECK(rows[1].target_id.empty());
-    CHECK(rows[1].detail == "validation_refused");
+    CHECK(rows[1].detail == "validation_refused Orphaned Child");
     CHECK(h.group_names().empty());
 }
 
@@ -747,7 +747,7 @@ TEST_CASE("Settings group create: the session_revoked and permission_revoked fai
         const auto rows = h.create_rows();
         REQUIRE(rows.size() == 2);
         CHECK(rows[0].principal == "admin");
-        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].detail == "session_revoked Revoked Session");
         CHECK(rows[1].bound); // a re-resolved row would name nobody here
         CHECK(rows[1].principal == "admin");
         CHECK(rows[1].principal == rows[0].principal);
@@ -759,7 +759,7 @@ TEST_CASE("Settings group create: the session_revoked and permission_revoked fai
         REQUIRE(res);
         const auto rows = h.create_rows();
         REQUIRE(rows.size() == 2);
-        CHECK(rows[1].detail == "permission_revoked");
+        CHECK(rows[1].detail == "permission_revoked Revoked Perm");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
         CHECK(rows[1].principal == "admin");
@@ -804,4 +804,37 @@ TEST_CASE("Settings group create: the success and failure outcome rows are sessi
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
     }
+}
+
+// A create's target_id is empty on both rows, so the group name is what pairs a failure row with
+// its attempted row: detail is "<token> <name>", the name being the bounded clean-text value the
+// attempted row carries.
+TEST_CASE("Settings group create: a failure row's detail is the token, a space and the group name "
+          "the attempted row carries",
+          "[pg][settings][management-groups][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    for (const char* n : {"Pair A", "Pair B"}) {
+        ManagementGroup first;
+        first.name = n;
+        first.membership_type = "static";
+        REQUIRE(h.mgmt_group_store.create_group(first).has_value());
+    }
+
+    std::vector<std::string> details;
+    for (const std::string name : {std::string("Pair A"), std::string("Pair B")}) {
+        h.calls.clear();
+        auto res = h.create(name);
+        REQUIRE(res);
+        const auto rows = h.create_rows();
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[1].detail == "name_conflict " + name);
+        CHECK(rows[1].detail == "name_conflict " + rows[0].detail);
+        for (const unsigned char c : rows[1].detail) {
+            CHECK(c > 0x1F);
+            CHECK(c != 0x7F);
+        }
+        details.push_back(rows[1].detail);
+    }
+    CHECK(details[0] != details[1]);
 }

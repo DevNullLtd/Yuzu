@@ -25,6 +25,7 @@
 /// a named constant) is not seen by the scan.
 
 #include <array>
+#include <string>
 #include <string_view>
 
 namespace yuzu::server {
@@ -75,6 +76,25 @@ inline constexpr std::string_view kMgmtGroupTokenValidationRefused = "validation
     if (mgmt_group_error_is_store_fault(err))
         return kMgmtGroupTokenStoreError;
     return kMgmtGroupTokenValidationRefused;
+}
+
+/// The `detail` of a FAILURE row of a management-group write (create, add member, remove member),
+/// on every surface: `<token> <key>`. The token is one of the fixed tokens (it holds no space) and
+/// the key is the bounded clean-text value the `attempted` row already carries in its `detail`:
+/// the group NAME for create, the AGENT ID for add and remove. A failure row can then be paired
+/// with its `attempted` row (a create's `target_id` is empty on both). A reader takes the first
+/// space-delimited word as the token. The key is checked (`mgmt_group_name_ok`,
+/// `mgmt_group_agent_id_length_ok` and `mgmt_text_ok`: at most 256 bytes, no control byte) before
+/// any row is written, so it holds none; store text is never part of it. An empty key leaves the
+/// bare token. Extend this, never concatenate the two at a call site.
+[[nodiscard]] inline std::string mgmt_group_failure_detail(std::string_view token,
+                                                           std::string_view key) {
+    std::string d(token);
+    if (!key.empty()) {
+        d += ' ';
+        d.append(key);
+    }
+    return d;
 }
 
 } // namespace yuzu::server

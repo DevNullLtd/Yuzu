@@ -394,7 +394,7 @@ TEST_CASE("POST /management-groups: a duplicate name writes attempted then a nam
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id.empty());
-    CHECK(h.audits[1].detail == "name_conflict");
+    CHECK(h.audits[1].detail == "name_conflict dup-name");
 }
 
 TEST_CASE("POST /management-groups: success writes attempted then success with the new id",
@@ -470,7 +470,7 @@ TEST_CASE("POST /management-groups: a store fault on create answers 503 with a f
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id.empty());
-    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audits[1].detail == "store_error store-fault");
     CHECK(h.audit_count(kCreate, "success") == 0);
 }
 
@@ -491,7 +491,7 @@ TEST_CASE("POST /management-groups: a session gone after the attempted row creat
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
-    CHECK(h.audits[1].detail == "session_revoked");
+    CHECK(h.audits[1].detail == "session_revoked session-gone");
 }
 
 TEST_CASE("POST /management-groups: a permission revoked after the attempted row creates nothing "
@@ -511,7 +511,7 @@ TEST_CASE("POST /management-groups: a permission revoked after the attempted row
     CHECK(h.audits[0].result == "attempted");
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
-    CHECK(h.audits[1].detail == "permission_revoked");
+    CHECK(h.audits[1].detail == "permission_revoked perm-gone");
     CHECK(h.audits[1].bound);
 }
 
@@ -660,7 +660,7 @@ TEST_CASE("POST /management-groups/{id}/members: a store fault on the insert ans
     CHECK(h.audits[1].action == kAdd);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id == gid);
-    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audits[1].detail == "store_error agent-1");
     CHECK(h.audit_count(kAdd, "success") == 0);
 }
 
@@ -680,7 +680,7 @@ TEST_CASE("POST /management-groups/{id}/members: a session or grant gone after t
         CHECK(h.audits[1].action == kAdd);
         CHECK(h.audits[1].result == "failure");
         CHECK(h.audits[1].target_id == gid);
-        CHECK(h.audits[1].detail == "session_revoked");
+        CHECK(h.audits[1].detail == "session_revoked agent-1");
     }
     SECTION("permission revoked") {
         h.perm_revoked_after_attempted = true;
@@ -691,7 +691,7 @@ TEST_CASE("POST /management-groups/{id}/members: a session or grant gone after t
         CHECK(h.audits[0].result == "attempted");
         CHECK(h.audits[1].action == kAdd);
         CHECK(h.audits[1].result == "failure");
-        CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].detail == "permission_revoked agent-1");
         CHECK(h.audits[1].bound);
     }
     CHECK(h.member_count(gid) == 0);
@@ -720,7 +720,7 @@ TEST_CASE("POST /management-groups/{id}/members: a group deleted between the che
         CHECK(h.audits[1].action == kAdd);
         CHECK(h.audits[1].result == "failure");
         CHECK(h.audits[1].target_id == gid);
-        CHECK(h.audits[1].detail == "group_not_found"); // a fixed token, never the store's text
+        CHECK(h.audits[1].detail == "group_not_found agent-1"); // a fixed token and the agent id, never the store text
     }
     SECTION("a lost outcome row keeps the 404 and marks the response Sec-Audit-Failed") {
         h.fail_audit.insert(std::string(kAdd) + "|failure");
@@ -851,7 +851,7 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a store fault answers
     CHECK(h.audits[1].action == kRemove);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id == gid);
-    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audits[1].detail == "store_error agent-1");
     CHECK(h.audit_count(kRemove, "success") == 0);
 }
 
@@ -872,7 +872,7 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a session or grant go
         CHECK(h.audits[1].action == kRemove);
         CHECK(h.audits[1].result == "failure");
         CHECK(h.audits[1].target_id == gid);
-        CHECK(h.audits[1].detail == "session_revoked");
+        CHECK(h.audits[1].detail == "session_revoked agent-1");
     }
     SECTION("permission revoked") {
         h.perm_revoked_after_attempted = true;
@@ -883,7 +883,7 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a session or grant go
         CHECK(h.audits[0].result == "attempted");
         CHECK(h.audits[1].action == kRemove);
         CHECK(h.audits[1].result == "failure");
-        CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].detail == "permission_revoked agent-1");
         CHECK(h.audits[1].bound);
     }
     CHECK(h.member_count(gid) == 1);
@@ -1340,7 +1340,7 @@ TEST_CASE("POST /management-groups: a parent deleted between the check and the i
     CHECK(h.audits[1].action == kCreate);
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id.empty());
-    CHECK(h.audits[1].detail == "validation_refused");
+    CHECK(h.audits[1].detail == "validation_refused orphaned-child");
     CHECK_FALSE(h.group_exists("orphaned-child"));
     CHECK(h.group_count() == groups_before - 1); // only the parent's deletion changed the count
 }
@@ -1360,7 +1360,7 @@ TEST_CASE("POST /management-groups: the session_revoked and permission_revoked f
         CHECK(h.audits[0].result == "attempted");
         CHECK(h.audits[0].principal == "tester");
         CHECK(h.audits[1].result == "failure");
-        CHECK(h.audits[1].detail == "session_revoked");
+        CHECK(h.audits[1].detail == "session_revoked revoked-session");
         CHECK(h.audits[1].bound); // not re-resolved: a re-resolved row would name nobody here
         CHECK(h.audits[1].principal == "tester");
         CHECK(h.audits[1].principal == h.audits[0].principal);
@@ -1371,7 +1371,7 @@ TEST_CASE("POST /management-groups: the session_revoked and permission_revoked f
         auto res = h.create(R"({"name":"revoked-perm"})");
         REQUIRE(res);
         REQUIRE(h.audits.size() == 2);
-        CHECK(h.audits[1].detail == "permission_revoked");
+        CHECK(h.audits[1].detail == "permission_revoked revoked-perm");
         CHECK(h.audits[1].bound);
         CHECK(h.audits[1].principal == "tester");
         CHECK(h.audits[1].principal == h.audits[0].principal);
@@ -1393,7 +1393,7 @@ TEST_CASE("POST and DELETE members: the session_revoked failure row names the pr
         REQUIRE(res);
         const auto rows = h.rows_of(kAdd);
         REQUIRE(rows.size() == 2);
-        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].detail == "session_revoked agent-2");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == "tester");
         CHECK(rows[1].principal == rows[0].principal);
@@ -1405,7 +1405,7 @@ TEST_CASE("POST and DELETE members: the session_revoked failure row names the pr
         REQUIRE(res);
         const auto rows = h.rows_of(kRemove);
         REQUIRE(rows.size() == 2);
-        CHECK(rows[1].detail == "session_revoked");
+        CHECK(rows[1].detail == "session_revoked agent-1");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == "tester");
         CHECK(rows[1].principal == rows[0].principal);
@@ -1485,7 +1485,7 @@ TEST_CASE("POST /management-groups/{id}/members: the success and group_not_found
         CHECK(res->status == 404);
         const auto rows = h.rows_of(kAdd);
         REQUIRE(rows.size() == 2);
-        CHECK(rows[1].detail == "group_not_found");
+        CHECK(rows[1].detail == "group_not_found agent-b2");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
     }
@@ -1515,8 +1515,84 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: the success and store
         REQUIRE(res);
         const auto rows = h.rows_of(kRemove);
         REQUIRE(rows.size() == 2);
-        CHECK(rows[1].detail == "store_error");
+        CHECK(rows[1].detail == "store_error agent-b3");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
     }
+}
+
+// ── Every failure row pairs with its attempted row: detail is "<token> <key>" ───────────────────
+// A create's target_id is empty on both rows, and the add/remove rows name the group but not the
+// agent, so the key (the group name for create, the agent id for add and remove) is what a reader
+// pairs on. The key is already bounded and clean before any row, so it holds no control byte.
+
+namespace {
+
+bool detail_is_clean_text(const std::string& d) {
+    for (const unsigned char c : d)
+        if (c <= 0x1F || c == 0x7F)
+            return false;
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("POST /management-groups: a failure row's detail is the token, a space and the group "
+          "name the attempted row carries",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    make_group(h, "pair-a");
+    make_group(h, "pair-b");
+    const std::string longest(256, 'n'); // the bound: accepted, and carried whole
+    make_group(h, longest);
+
+    std::set<std::string> details;
+    for (const std::string name : {std::string("pair-a"), std::string("pair-b"), longest}) {
+        h.audits.clear();
+        auto res = h.create(nlohmann::json{{"name", name}}.dump());
+        REQUIRE(res);
+        REQUIRE(h.audits.size() == 2);
+        CHECK(h.audits[0].result == "attempted");
+        CHECK(h.audits[1].result == "failure");
+        CHECK(h.audits[1].detail == "name_conflict " + name);
+        CHECK(h.audits[1].detail == "name_conflict " + h.audits[0].detail);
+        CHECK(detail_is_clean_text(h.audits[1].detail));
+        details.insert(h.audits[1].detail);
+    }
+    CHECK(details.size() == 3); // three keys, three different details
+}
+
+TEST_CASE("POST and DELETE members: a failure row's detail is the token, a space and the agent id "
+          "the attempted row carries",
+          "[pg][rest][mgmt_group][mgmt-audit-first]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "pair-members");
+    drop_mgmt_table(h, "management_group_store.management_group_members");
+
+    std::set<std::string> add_details;
+    std::set<std::string> remove_details;
+    for (const std::string agent : {std::string("agent-a"), std::string("agent-b")}) {
+        h.audits.clear();
+        auto added = h.add_member(gid, nlohmann::json{{"agent_id", agent}}.dump());
+        REQUIRE(added);
+        auto add_rows = h.rows_of(kAdd);
+        REQUIRE(add_rows.size() == 2);
+        CHECK(add_rows[1].detail == "store_error " + agent);
+        CHECK(add_rows[1].detail == "store_error " + add_rows[0].detail);
+        CHECK(add_rows[1].target_id == gid);
+        CHECK(detail_is_clean_text(add_rows[1].detail));
+        add_details.insert(add_rows[1].detail);
+
+        h.audits.clear();
+        auto removed = h.remove_member(gid, agent);
+        REQUIRE(removed);
+        auto remove_rows = h.rows_of(kRemove);
+        REQUIRE(remove_rows.size() == 2);
+        CHECK(remove_rows[1].detail == "store_error " + agent);
+        CHECK(remove_rows[1].detail == "store_error " + remove_rows[0].detail);
+        CHECK(detail_is_clean_text(remove_rows[1].detail));
+        remove_details.insert(remove_rows[1].detail);
+    }
+    CHECK(add_details.size() == 2); // two keys, two different details
+    CHECK(remove_details.size() == 2);
 }

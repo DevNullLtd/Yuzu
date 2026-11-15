@@ -7002,7 +7002,8 @@ void SettingsRoutes::register_routes(
     // are POST /api/v1/management-groups and the MCP create_management_group tool. Every refusal
     // that needs no write to decide (permission, empty name, `validate_new_group`) answers first
     // and burns no row. The `attempted` row can wait on the audit pool, so the session and the
-    // permission are decided again after it. Failure rows carry FIXED detail tokens only, and
+    // permission are decided again after it. Failure rows carry a FIXED token and the group name the `attempted` row carries
+    // (`mgmt_group_failure_detail`), never store text, and
     // no store text reaches the page: a store fault answers a fixed message, a validation
     // refusal echoes its own closed text, HTML-escaped. The form swaps the response body into
     // #mgmt-groups-section (htmx drops a 4xx/5xx body), so a refusal that must be seen carries
@@ -7099,7 +7100,7 @@ void SettingsRoutes::register_routes(
         if (!fresh_session) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
-                                                "session_revoked");
+                                                mgmt_group_failure_detail("session_revoked", g.name));
             if (res.status < 400) { // auth_fn_ writes its own 401; cover one that did not
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "authentication required"),
@@ -7110,7 +7111,8 @@ void SettingsRoutes::register_routes(
         if (!perm_fn_(req, res, "ManagementGroup", "Write")) { // writes its own 403
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
-                                                "permission_revoked");
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          g.name));
             return;
         }
         g.created_by = fresh_session->username;
@@ -7123,7 +7125,7 @@ void SettingsRoutes::register_routes(
             const bool fault = token == kMgmtGroupTokenStoreError;
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
-                                                std::string(token));
+                                                mgmt_group_failure_detail(token, g.name));
             if (fault) {
                 // The cause is logged (sanitised), never shown on the page or audited.
                 spdlog::error("management_group.create store fault: {}",

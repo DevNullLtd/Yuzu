@@ -29286,7 +29286,7 @@ TEST_CASE("MCP create_management_group: a duplicate name writes attempted then f
     CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                          "management_group.create|failure"});
     CHECK(mg_create_row_field(ts, ts.audit_details, 0) == "Taken Name");
-    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "name_conflict");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "name_conflict Taken Name");
     CHECK(mg_create_row_field(ts, ts.audit_target_ids, 0).empty());
     CHECK(mg_create_row_field(ts, ts.audit_target_ids, 1).empty());
     CHECK(store.list_groups().size() == 1);
@@ -29394,7 +29394,7 @@ TEST_CASE("MCP create_management_group: a store fault on create answers a fixed 
 
     CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                          "management_group.create|failure"});
-    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "store_error");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "store_error doomed");
 }
 
 TEST_CASE("MCP create_management_group: authority is decided again after the attempted row",
@@ -29419,7 +29419,7 @@ TEST_CASE("MCP create_management_group: authority is decided again after the att
         CHECK(res->status == 403); // perm_fn writes its own refusal
         CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                              "management_group.create|failure"});
-        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "permission_revoked");
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "permission_revoked revoked");
         CHECK(store.list_groups().empty());
     }
 
@@ -29435,7 +29435,7 @@ TEST_CASE("MCP create_management_group: authority is decided again after the att
         CHECK(res->status == 401);
         CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                              "management_group.create|failure"});
-        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked");
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked revoked");
         CHECK(store.list_groups().empty());
     }
 }
@@ -29543,7 +29543,7 @@ TEST_CASE("MCP create_management_group: a changed principal after the attempted 
     CHECK(res->body.find("\"unauthorized\"") == std::string::npos);
     CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                          "management_group.create|failure"});
-    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked swapped");
     CHECK(store.list_groups().empty());
 }
 
@@ -29587,7 +29587,7 @@ TEST_CASE("MCP create_management_group: a parent deleted between the check and t
     CHECK(body["error"]["data"]["retry_after_ms"].is_null());
     CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                          "management_group.create|failure"});
-    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "validation_refused");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "validation_refused orphaned-child");
     CHECK(mg_create_row_field(ts, ts.audit_target_ids, 1).empty());
     CHECK(store.list_groups().empty()); // the parent was deleted, the child never created
 }
@@ -29636,7 +29636,7 @@ TEST_CASE("MCP create_management_group: the session_revoked and permission_revok
         auto res = ts.call(mg_create_body({{"name", "revoked"}}));
         REQUIRE(res);
         REQUIRE(mg_create_rows(ts).size() == 2);
-        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked");
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked revoked");
         const auto first = mg_create_row_field(ts, ts.audit_principals, 0);
         CHECK(first == "test-user");
         CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == first); // bound, not re-resolved
@@ -29650,7 +29650,7 @@ TEST_CASE("MCP create_management_group: the session_revoked and permission_revok
         auto res = ts.call(mg_create_body({{"name", "revoked"}}));
         REQUIRE(res);
         REQUIRE(mg_create_rows(ts).size() == 2);
-        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "permission_revoked");
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "permission_revoked revoked");
         CHECK(mg_create_row_field(ts, ts.audit_principals, 1) ==
               mg_create_row_field(ts, ts.audit_principals, 0));
         CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == "test-user");
@@ -29688,7 +29688,7 @@ TEST_CASE("MCP create_management_group: with no session-bound writer wired the s
     CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                          "management_group.create|failure"});
     CHECK(mg_create_row_field(ts, ts.audit_details, 0) == "revoked");
-    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked");
+    CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "session_revoked revoked");
     CHECK(mg_create_row_field(ts, ts.audit_target_ids, 1).empty());
     CHECK(mg_create_row_field(ts, ts.audit_principals, 0) == "test-user");
     CHECK(mg_create_row_field(ts, ts.audit_principals, 1).empty()); // re-resolved after revocation
@@ -30323,7 +30323,7 @@ TEST_CASE("MCP add_management_group_member: a store fault on the insert answers 
 
     CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
                                                       "management_group.add_member|failure"});
-    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "store_error");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "store_error agent-1");
     CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
 }
 
@@ -30563,7 +30563,7 @@ TEST_CASE("MCP add_management_group_member: a group deleted between the check an
         CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // no retry hint, as before
         CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
                                                           "management_group.add_member|failure"});
-        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "group_not_found");
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "group_not_found agent-1");
         CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
         CHECK(mg_add_row_field(ts, ts.audit_target_types, 1) == "ManagementGroup");
     }
@@ -30645,7 +30645,7 @@ TEST_CASE("MCP add_management_group_member: a changed principal after the attemp
     CHECK(body["error"]["code"] == kPermissionDenied);
     CHECK(body["error"]["message"] == "authentication required");
     CHECK(res->body.find("\"unauthorized\"") == std::string::npos);
-    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked agent-1");
     CHECK(f.store.get_members(f.gid).empty());
 }
 
@@ -30695,7 +30695,7 @@ TEST_CASE("MCP add_management_group_member: the session_revoked failure row name
     auto res = ts.call(mg_add_body(f.gid, "agent-1"));
     REQUIRE(res);
     REQUIRE(mg_add_rows(ts).size() == 2);
-    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked");
+    CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked agent-1");
     CHECK(mg_add_row_field(ts, ts.audit_principals, 0) == "test-user");
     CHECK(mg_add_row_field(ts, ts.audit_principals, 1) == "test-user");
     CHECK(f.store.get_members(f.gid).empty());
@@ -30720,7 +30720,7 @@ TEST_CASE("MCP add_management_group_member: authority is decided again after the
         CHECK(res->status == 403); // perm_fn writes its own refusal
         CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
                                                           "management_group.add_member|failure"});
-        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "permission_revoked");
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "permission_revoked agent-1");
         CHECK(f.store.get_members(f.gid).empty());
     }
 
@@ -30736,7 +30736,7 @@ TEST_CASE("MCP add_management_group_member: authority is decided again after the
         CHECK(res->status == 401);
         CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
                                                           "management_group.add_member|failure"});
-        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked");
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "session_revoked agent-1");
         CHECK(f.store.get_members(f.gid).empty());
     }
 }
@@ -30838,9 +30838,87 @@ TEST_CASE("MCP add_management_group_member: the success and failure outcome rows
         REQUIRE(deleted);
         REQUIRE(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
                                                             "management_group.add_member|failure"});
-        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "group_not_found");
+        CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "group_not_found agent-b2");
         CHECK(mg_add_row_field(ts, ts.audit_principals, 1) == "test-user");
     }
+}
+
+// A failure row pairs with its attempted row by its key: detail is "<token> <key>", the key being
+// the group name (create) or the agent id (add), the bounded clean-text value the attempted row
+// carries.
+TEST_CASE("MCP create_management_group: a failure row's detail is the token, a space and the "
+          "group name the attempted row carries",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* n : {"pair-a", "pair-b"}) {
+        yuzu::server::ManagementGroup first;
+        first.name = n;
+        first.membership_type = "static";
+        REQUIRE(store.create_group(first).has_value());
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    std::vector<std::string> details;
+    std::size_t row = 0;
+    for (const std::string name : {std::string("pair-a"), std::string("pair-b")}) {
+        auto res = ts.call(mg_create_body({{"name", name}}));
+        REQUIRE(res);
+        REQUIRE(mg_create_rows(ts).size() == (row + 1) * 2);
+        const auto attempted = mg_create_row_field(ts, ts.audit_details, row * 2);
+        const auto failure = mg_create_row_field(ts, ts.audit_details, row * 2 + 1);
+        CHECK(failure == "name_conflict " + name);
+        CHECK(failure == "name_conflict " + attempted);
+        for (const unsigned char c : failure) {
+            CHECK(c > 0x1F);
+            CHECK(c != 0x7F);
+        }
+        details.push_back(failure);
+        ++row;
+    }
+    CHECK(details[0] != details[1]);
+}
+
+TEST_CASE("MCP add_management_group_member: a failure row's detail is the token, a space and the "
+          "agent id the attempted row carries",
+          "[mcp][pg][management_group][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    {
+        auto lease = f.pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(), "DROP TABLE management_group_store.management_group_members CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+    std::vector<std::string> details;
+    std::size_t row = 0;
+    for (const std::string agent : {std::string("agent-a"), std::string("agent-b")}) {
+        auto res = ts.call(mg_add_body(f.gid, agent));
+        REQUIRE(res);
+        REQUIRE(mg_add_rows(ts).size() == (row + 1) * 2);
+        const auto attempted = mg_add_row_field(ts, ts.audit_details, row * 2);
+        const auto failure = mg_add_row_field(ts, ts.audit_details, row * 2 + 1);
+        CHECK(failure == "store_error " + agent);
+        CHECK(failure == "store_error " + attempted);
+        for (const unsigned char c : failure) {
+            CHECK(c > 0x1F);
+            CHECK(c != 0x7F);
+        }
+        details.push_back(failure);
+        ++row;
+    }
+    CHECK(details[0] != details[1]);
 }
 
 TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallback admits "
@@ -54598,7 +54676,7 @@ TEST_CASE("MCP management-group member and role tools: a store fault on an exist
         CHECK(wf_rows_since(ts, before, "management_group.add_member|success").empty());
         const auto failure = wf_rows_since(ts, before, "management_group.add_member|failure");
         REQUIRE(failure.size() == 1);
-        CHECK(failure.front() == "store_error");
+        CHECK(failure.front() == "store_error agent-1");
         const auto mcp_failure = wf_rows_since(ts, before, "mcp.add_management_group_member|failure");
         REQUIRE(mcp_failure.size() == 1);
         CHECK(mcp_failure.front() == "store_error");

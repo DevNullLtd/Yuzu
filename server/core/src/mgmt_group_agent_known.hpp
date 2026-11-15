@@ -32,8 +32,8 @@
 /// detail is `<raw agent_id> agent_known=<1|0|unreadable>`. The raw id is caller text and may
 /// itself contain spaces or the text " agent_known=1", so the id is never parsed; the
 /// authoritative flag is the LAST space-delimited token, which an id cannot forge because the
-/// suffix is always appended after it. The `attempted` row keeps the bare raw id, and failure rows
-/// keep their fixed tokens.
+/// suffix is always appended after it. The `attempted` row keeps the bare raw id, and a failure
+/// row's detail is a fixed token, a space and the raw id (`mgmt_group_failure_detail`).
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>

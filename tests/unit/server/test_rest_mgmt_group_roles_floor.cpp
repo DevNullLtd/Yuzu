@@ -786,7 +786,7 @@ TEST_CASE("POST /management-groups/{id}/members: a store error answers 503 with 
     CHECK(h.audits[1].action == "management_group.add_member");
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id == gid);
-    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audits[1].detail == "store_error agent-1");
 }
 
 TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a control byte in the agent id is "
@@ -851,7 +851,7 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a store error answers
     CHECK(h.audits[1].action == "management_group.remove_member");
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id == gid);
-    CHECK(h.audits[1].detail == "store_error");
+    CHECK(h.audits[1].detail == "store_error agent-1");
 }
 
 TEST_CASE("DELETE /management-groups/{id}/roles: a control byte in a field is refused 400 with a "

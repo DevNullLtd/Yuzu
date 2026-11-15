@@ -13826,7 +13826,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto fresh = auth_fn(req, res);
                 if (!fresh || fresh->username != session->username) {
                     (void)mg_audit_bound("management_group.create", "failure", "",
-                                            "session_revoked");
+                                         mgmt_group_failure_detail("session_revoked", name));
                     if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                         res.status = 401;
                         res.set_content(a4_error(kPermissionDenied, "authentication required",
@@ -13837,7 +13837,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write")) {
                     (void)mg_audit_bound("management_group.create", "failure", "",
-                                            "permission_revoked");
+                                         mgmt_group_failure_detail("permission_revoked", name));
                     return;
                 }
 
@@ -13847,8 +13847,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto token = create_failure_token(result.error());
                     const bool conflict = token == kMgmtGroupTokenNameConflict;
                     const bool fault = token == kMgmtGroupTokenStoreError;
-                    const bool audit_ok = mg_audit_bound("management_group.create", "failure", "",
-                                                         std::string(token));
+                    const bool audit_ok =
+                        mg_audit_bound("management_group.create", "failure", "",
+                                       mgmt_group_failure_detail(token, name));
                     mcp_audit("failure", conflict ? std::string(kMgmtGroupTokenNameConflict)
                                                   : (fault ? std::string(kMgmtGroupTokenStoreError)
                                                            : result.error()));
@@ -14245,7 +14246,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto fresh = auth_fn(req, res);
                 if (!fresh || fresh->username != session->username) {
                     (void)mg_audit_bound("management_group.add_member", "failure", group_id,
-                                            "session_revoked");
+                                         mgmt_group_failure_detail("session_revoked", agent_id));
                     if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                         res.status = 401;
                         res.set_content(a4_error(kPermissionDenied, "authentication required",
@@ -14256,7 +14257,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write")) {
                     (void)mg_audit_bound("management_group.add_member", "failure", group_id,
-                                            "permission_revoked");
+                                         mgmt_group_failure_detail("permission_revoked", agent_id));
                     return;
                 }
                 auto result = mgmt_store->add_member(group_id, agent_id);
@@ -14268,15 +14269,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     // left without one.
                     if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
                         (void)mg_audit_bound("management_group.add_member", "failure", group_id,
-                                             "group_not_found");
+                                             mgmt_group_failure_detail("group_not_found", agent_id));
                         mcp_audit("denied", "group not found");
                         res.set_content(a4_error(kInvalidParams, "group not found"),
                                         "application/json");
                         return;
                     }
                     spdlog::warn("add_management_group_member store failure: {}", result.error());
-                    const bool audit_ok = mg_audit_bound("management_group.add_member", "failure",
-                                                         group_id, "store_error");
+                    const bool audit_ok = mg_audit_bound(
+                        "management_group.add_member", "failure", group_id,
+                        mgmt_group_failure_detail("store_error", agent_id));
                     res.set_content(
                         a4_error(info.code, "management group store unavailable", "retry shortly",
                                  /*retry_after_ms=*/info.retry_after_ms, {}, audit_ok),
