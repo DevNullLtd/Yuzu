@@ -3013,15 +3013,15 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      shows a duplicate replay does not reapply an obsolete census transition.
   4. The rule for gap repairs (they draw a fresh pair at admission today) and for accepted
      unordered (0/0) events is stated with correctness outcomes and tests: a failed-claim 0/0
-     event against an existing ordered verdict; rollback to a non-stamping binary; the
-     transition from unordered back to ordered; whether an accepted 0/0 clears or retains the
-     stored ordering metadata, and how that metadata stays associated with the verdict it
+     event against an existing ordered verdict, and one from an agent whose instance lock was
+     lost; the transition from unordered back to ordered; whether an accepted 0/0 clears or
+     retains the stored ordering metadata, and how that metadata stays associated with the verdict it
      actually describes; and the timeline of a previously undelivered older replay (an error at
      timestamp 100 replayed as 0/0 after a backward clock step, after a newer live compliant
      verdict at timestamp 90), in both arrival orders and with subsequent live events; and two
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
-     was refused the data-directory lock (`instance_lock_not_held`) or an older build sends
-     0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
+     was refused the data-directory lock (`instance_lock_not_held`) or whose epoch claim failed
+     sends 0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
      that is in turn ranked above it; met as: no apply reversal within a regime, and every
      transition between regimes is one-way, flagged and time-fenced), the outcome is stated,
      and a test covers it. Two
@@ -3030,8 +3030,12 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      are unrelated across instances, and the count below cannot see them because both send a
      pair: for that case too the outcome is stated and a test covers it. The server also
      counts accepted events that carry no pair, per agent, and exposes the count (a metric or
-     an API field), so an agent that runs unordered is visible fleet-wide; the agent's own
-     signal is one error-level log line.
+     an API field), so an agent that runs unordered is visible fleet-wide (an agent whose first
+     deliveries all fail the per-agent order step has no order row, so it is not counted
+     until its next successful first delivery; the compensating signals are
+     `yuzu_server_guardian_census_proj_failures_total` and
+     `yuzu_server_guardian_census_pending_events`); the agent's own signal is one error-level
+     log line.
      For every case above, tests show that stale state is not silently presented as the current
      verdict. When the available ordering information cannot establish freshness, the server
      exposes that uncertainty or obtains fresh state; census-ordering-key fallback, metadata retention,

@@ -127,7 +127,8 @@ used as-is — they aren't renames, so they create no split-brain.
      `guard.compliant` and `drift.remediated` set compliant, `drift.detected` sets
      drifted, and `remediation.failed`, `guard.unhealthy` and `guard.errored` set errored.
      Which of two events becomes a census row's verdict is decided by the server's census
-     ordering, not by arrival: the agent's `(boot_epoch, emit_seq)` pair between two events
+     ordering, not by arrival (the flagged recoveries apply by arrival: a re-base of a stale
+     pair clock, and an unpaired event once the clock is stale): the agent's `(boot_epoch, emit_seq)` pair between two events
      that both carry one, the agent stamp (limited to receipt plus 300 s) and then ingest
      order between two that do not; see `docs/yuzu-guardian-design-v1.1.md` section 7.1 and
      the Guaranteed State guide.

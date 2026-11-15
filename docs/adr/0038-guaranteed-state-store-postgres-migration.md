@@ -393,11 +393,12 @@ row first).
   so the fleet unordered count and the agent's per-agent counters do not include it, and it is not listed
   in `unordered_agent_ids`, until its next first delivery writes the clock and counters. Its failed events
   are stored with pending evidence, so they show on `yuzu_server_guardian_census_pending_events`. The
-  follow-up (issue to be filed) is a schema v6 change: a database-clock receipt column
+  follow-up (issue to be filed) is a fresh-database DDL change under the hard-cutover contract: a database-clock receipt column
   (`recv_ns`) on `guaranteed_state_events` written in the event INSERT, plus a partial index leading with
   `agent_id` on `projection_pending AND boot_epoch IS NULL` (the only pending index today is
-  `idx_gse_pending (rule_id, agent_id)`; the 2026-11-06 owner ruling declined an `agent_id`-leading pending
-  index, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
+  `idx_gse_pending (rule_id, agent_id)`; the owner declined an `agent_id`-leading pending index on
+  2026-11-06, a ruling recorded in the comment at `unrepresented_pending_for_agent` in
+  `guaranteed_state_store.cpp`, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
   holding such a pending unpaired event. It is not part of this change.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
   more than ten years past receipt, is `implausible`. The pair is dropped at the ingest boundary, exactly as an
@@ -424,13 +425,20 @@ row first).
 
 Known residuals, stated rather than fixed. (1) A paired event whose Repair is decided `refused_regression`
 against an unpaired census row is acknowledged, flags the row and counts a decision, but is never retired and
-stays pending until a paired apply on that (agent, rule) or the agent is decommissioned: a member of the
-#7147 stranded-evidence class, pinned by a test. (2) The batch path does not sort its rows by agent, so two
+stays pending until a paired apply on that (agent, rule), the rule is deleted, or the agent is decommissioned: a
+member of the #7147 stranded-evidence class, pinned by a test. (2) The batch path does not sort its rows by agent, so two
 concurrent batches over the same agents can deadlock (no production caller; unchanged from v4). (3) Repairs of
 one agent contend with its first deliveries on the order row: measured on one development host, on a debug
 build with fsync off and not a guarantee, 8 concurrent repairs on one agent with 10,000 pending events on one
-pair delayed a first delivery by up to about 600 ms (p95 between 341 and 552 ms); more concurrent repairs could
-push a first delivery past the 1 s bound into a step failure that stores it pending. (4) A pair clock pinned
+pair delayed a first delivery by up to about 600 ms (95th percentile of that delay between 341 and 552 ms over
+the runs), on a fresh events table whose pending rows were the newest in it. The performance review measured
+how long one repair held the order row `FOR SHARE` before the P-1 fix: 275 ms (10,000 newest pending events,
+1.3 million events), 540 ms (10,000 old pending events, the same table) and 22.5 s (old pending events, 5.3
+million events); after it the census upsert over 1.3 million events with 150 old pending events measured
+0.16 ms (it was 115 ms). The margin depends on the size of the events table relative to the age of the pending
+rows, not on the pending count alone, and all of these are single measurements, to be repeated on a release
+build with fsync on. More concurrent repairs could push a first delivery past the 1 s bound into a step
+failure that stores it pending. (4) A pair clock pinned
 by a value inside the plausibility bound heals when the hold expires, one hour after the last accepted event.
 No new background loop, reaper or job is added, so the leader fence and the retention rules are not
 touched.
