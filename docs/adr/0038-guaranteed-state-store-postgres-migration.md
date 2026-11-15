@@ -369,17 +369,30 @@ row first).
   (`unpaired`, `unpaired_held`, `current`, `current_straggler`, `current_rebase`, `refused_regression`,
   `refused_retired`), and the census statements decide the row by it. A mode label the code does not know, or a NULL,
   is a failure of the step, never a default. Two unpaired events keep the key rule. A decision that is not a
-  clean in-order pair apply flags the row. The decision label of each census write is a metric and a log
-  line, never an input to a row decision.
+  clean in-order pair apply flags the row. The decision label of each census write is a metric (it is not
+  logged), never an input to a row decision; the durable evidence is the `order_uncertain` flag and `ts_hwm`
+  on the census row. The metric resets on a server restart, and a refused event expires with the 30-day
+  reaper.
 - The pair clock is fresh for one hour (`YUZU_CENSUS_STALE_NS_`, reused) of DATABASE time and not when it is
   recorded more than five minutes (`YUZU_CENSUS_FUTURE_SLACK_NS_`) in the database's future. Only a `current`
   event or a re-base refreshes it; a refused, straggler or unpaired event never does. A re-base to a lower
   epoch retires the former epoch (`retired_epoch`), after which its events are refused.
+- The two transitions between the key regime and the pair regime run in opposite directions and are fenced
+  differently (decided by the census statement, `YUZU_CENSUS_PAIR_APPLY_` and `YUZU_CENSUS_KEY_TRANS_`). Pair to
+  key, an unpaired event over a paired verdict, is fenced by the hold while the pair clock is fresh, and
+  applies by arrival, flagged, once it is stale (and only when the event is later by arrival than the
+  verdict). Key to pair, a paired event over a census row that holds no pair, is not fenced by the clock or
+  by arrival: any event whose mode is `current`, `current_straggler` or `current_rebase` applies whenever
+  the row holds no pair, whatever the unpaired verdict's key or arrival, and the row is flagged; only
+  `refused_regression` and `refused_retired` are refused over it. A Repair of an older paired event is
+  decided from the same clock (never a re-base), so a late Repair of an older paired event of the live
+  epoch can replace a newer unpaired verdict. The prototype validated this rule and the code matches it; it
+  is stated here because the earlier text of this Update gave it only as a metric label.
 - A Repair (a redelivery of an event stored with pending evidence) runs no order step and never writes the
   pair clock or a counter. It runs the idempotent Ensure, takes the agent's order row `FOR SHARE` as its
   first lock and reads the mode without writing it, inside its `census_upsert` savepoint under the step's 1 s
-  lock bound (restored before the census statements) and under a 2 s `statement_timeout` for all of its
-  census statements (`kRepairStatementTimeoutMs`, set and restored the same way, P-1), a bound that counts
+  lock bound (restored before the census statements) and under a 2 s `statement_timeout` for EACH of its
+  census statements (`kRepairStatementTimeoutMs`, set and restored the same way, P-1), a per-statement bound that counts
   lock waits too: a statement over it fails with SQLSTATE 57014 and the Repair is Failed with its evidence
   kept; a stale clock gives `current_straggler` or
   `refused_regression` where a first delivery would re-base. Everything it did to the order table is undone
@@ -400,6 +413,25 @@ row first).
   2026-11-06, a ruling recorded in the comment at `unrepresented_pending_for_agent` in
   `guaranteed_state_store.cpp`, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
   holding such a pending unpaired event. It is not part of this change.
+- A Repair holds one pooled connection for the sum of its statements: the Ensure and the clock read, each
+  under the 1 s lock bound, then five census statements under 2 s each, about 12 s in the worst case. Those
+  are per-statement bounds, not a deadline for the whole Repair (a whole-Repair deadline is a follow-up, issue
+  to be filed). At most `kRepairMaxConcurrent` (4, a compile-time constant with no operator setting) Repairs
+  run at once in one server process, because the pool (16 connections by default) is shared with auth and
+  audit. A Repair that finds the cap full is shed at once: nothing is written, the transaction is rolled back,
+  the event stays pending, and the shed is counted as a failed Repair on
+  `census_projection_total{source="repair",outcome="failed"}` and `census_proj_failures_total`, with a
+  sampled WARN (`repair shed`; the first after a quiet minute, then every 100th). Ingest outcomes never reach
+  the agent in this tree (`ingest_guardian_response` returns void and the Guardian RPC is acknowledged
+  unconditionally), so backpressure cannot be expressed, and a shed Repair is stranded evidence of the #7147
+  class: the agent does not resend it, and a later applying verdict for the pair or an agent replaying its
+  journal clears it. Only Repairs are capped; a first delivery or a batch row never is. The first delivery's
+  order step also runs under `SET LOCAL statement_timeout` equal to its lock bound plus 500 ms
+  (`kAgentStepStatementMarginMs`), 1.5 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
+  wait and a `FOR SHARE` locker does not queue behind a waiting `FOR UPDATE`, so a rolling chain of Repair
+  share locks on one agent could otherwise keep a first delivery waiting past its 1 s bound. A statement that
+  reaches either bound takes the failed-step path (the event is stored pending). No alert rule ships for any
+  of these signals.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
   more than ten years past receipt, is `implausible`. The pair is dropped at the ingest boundary, exactly as an
   `out_of_range` one is, and the event is judged as an unpaired event at first delivery: its stored pair is
@@ -437,9 +469,20 @@ how long one repair held the order row `FOR SHARE` before the P-1 fix: 275 ms (1
 million events); after it the census upsert over 1.3 million events with 150 old pending events measured
 0.16 ms (it was 115 ms). The margin depends on the size of the events table relative to the age of the pending
 rows, not on the pending count alone, and all of these are single measurements, to be repeated on a release
-build with fsync on. More concurrent repairs could push a first delivery past the 1 s bound into a step
-failure that stores it pending. (4) A pair clock pinned
+build with fsync on. The Repair cap (above) bounds how many repairs contend at once, and the step's 1.5 s statement bound ends
+a wait that a chain of repair share locks would otherwise extend; a first delivery that reaches either bound
+is stored pending. (4) A pair clock pinned
 by a value inside the plausibility bound heals when the hold expires, one hour after the last accepted event.
+(5) The retired-epoch fence is permanent and holds ONE slot. It ignores the clock's freshness, so a sustained
+`refused_retired` rate can mean a live agent is fenced (an orphan process or a second sender still using the
+retired epoch, or an agent started from a restored data directory that carries it). The exits are an agent
+restart (its new epoch claim is above the retired one) or decommissioning the device; after a second re-base
+to a lower epoch the slot holds the epoch that re-base left, and the first retired epoch is no longer fenced.
+(6) The plausibility bound is read against the ingesting replica's wall clock, not the database clock (the
+rest of the pair regime uses the database clock), so a replica whose clock was set years back judges every
+honest paired event of every agent implausible, which is then decided as an unpaired event; a follow-up
+(issue to be filed) derives it from the database `now()`. (7) The pair is agent-asserted and not
+authenticated beyond the agent identity; it steers only that agent's own census rows.
 No new background loop, reaper or job is added, so the leader fence and the retention rules are not
 touched.
 

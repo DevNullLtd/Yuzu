@@ -3022,8 +3022,10 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
      live senders sharing one agent_id, a lock holder stamping a pair while a process that
      was refused the data-directory lock (`instance_lock_not_held`) or whose epoch claim failed
      sends 0/0: the mixture must not make the comparator non-transitive (a verdict ranked above one
-     that is in turn ranked above it; met as: no apply reversal within a regime, and every
-     transition between regimes is one-way, flagged and time-fenced), the outcome is stated,
+     that is in turn ranked above it; met as: no apply reversal within a regime, and the two
+     transitions between regimes, which run in opposite directions, are each flagged: pair to key
+     is fenced by the hold (a fresh pair clock) and applies by arrival once the clock is stale,
+     while key to pair is not fenced by the clock or by arrival), the outcome is stated,
      and a test covers it. Two
      stamping senders on separate data directories under one fixed agent id (independent
      epochs) still order totally, but their events rank against each other by epochs that

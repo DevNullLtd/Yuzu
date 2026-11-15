@@ -1006,8 +1006,15 @@ epoch, a same-epoch lower sequence, an equal pair and an unpaired event against 
 are refused and flag the row; once it is stale an event of a lower epoch, or of the live epoch
 with a sequence not above the highest seen, re-bases the clock and is applied by arrival, flagged
 (an equal pair is still refused as a duplicate), and a re-base to a lower epoch retires the former
-epoch so that its late events are refused. An unpaired event against a paired verdict, once the
-clock is stale, is applied by arrival, flagged, and does not move the clock. A pair far above any honest one (`emit_seq` of 2^40 or more, or a
+epoch so that its late events are refused (the fence is one slot and permanent: it ignores the
+clock's freshness, and a second re-base to a lower epoch replaces it). An unpaired event against a
+paired verdict, once the clock is stale, is applied by arrival, flagged, and does not move the
+clock. The two transitions between the regimes run in opposite directions and are fenced
+differently. Pair to key is fenced by the hold (fresh clock) and applies by arrival once the clock
+is stale. Key to pair is not fenced by the clock or by arrival: a paired event whose mode is a
+current-epoch one applies over a census row that holds no pair whatever the unpaired verdict's key
+or arrival, flagged (only a regression or a retired-epoch event is refused over it), so a late
+repair of an older paired event can replace a newer unpaired verdict. A pair far above any honest one (`emit_seq` of 2^40 or more, or a
 `boot_epoch` over ten years past receipt) is dropped at ingest like an out-of-range one and the
 event is judged as an unpaired event. The server owns the comparison and the recovery path for a pinned or lost epoch; the
 operator reading is in `docs/user-manual/guaranteed-state.md`, "Running the pair regime".
