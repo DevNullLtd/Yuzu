@@ -5147,7 +5147,7 @@ void RestApiV1::register_routes(
                   const auto exists = mgmt_store->get_group_checked(group_id);
                   if (!exists) {
                       spdlog::warn("management_group.add_member group read failure: {}",
-                                   exists.error());
+                                   ::yuzu::log_key_token(exists.error()));
                       mgmt_write_failed(res);
                       return;
                   }

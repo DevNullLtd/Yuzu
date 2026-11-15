@@ -30921,6 +30921,42 @@ TEST_CASE("MCP add_management_group_member: a failure row's detail is the token,
     CHECK(details[0] != details[1]);
 }
 
+TEST_CASE("MCP add_management_group_member: the group read failure log line holds the store "
+          "text on one physical line",
+          "[mcp][pg][management_group][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    {
+        auto lease = f.pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult drop = pg::exec_params(
+            lease.get(), "DROP TABLE management_group_store.management_groups CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    ts.start();
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    cap.stop();
+    REQUIRE(res);
+    const auto text = cap.text();
+    REQUIRE(text.find("add_management_group_member group read failure: query failed") !=
+            std::string::npos);
+    // PQerrorMessage text ends in a newline: an unsanitised argument leaves a stray line.
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto eol = text.find('\n', pos);
+        const auto line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        if (!line.empty())
+            CHECK(line.front() == '['); // every line begins with its own timestamp
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    CHECK(mg_add_rows(ts).empty()); // refused before any management_group row
+}
+
 TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallback admits "
           "without UserManagement:Read (compound gate)",
           "[mcp][pg][management_group]") {

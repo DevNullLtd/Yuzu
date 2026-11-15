@@ -14216,7 +14216,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto exists = mgmt_store->get_group_checked(group_id);
                 if (!exists) {
                     spdlog::warn("add_management_group_member group read failure: {}",
-                                 exists.error());
+                                 ::yuzu::log_key_token(exists.error()));
                     mcp_audit("failure", "store_error");
                     res.set_content(a4_error(kInternalError, "management group store unavailable",
                                              "retry shortly",

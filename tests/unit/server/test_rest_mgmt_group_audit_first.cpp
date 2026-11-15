@@ -1596,3 +1596,33 @@ TEST_CASE("POST and DELETE members: a failure row's detail is the token, a space
     CHECK(add_details.size() == 2); // two keys, two different details
     CHECK(remove_details.size() == 2);
 }
+
+// ── The group-read failure log line neutralises the store's text ────────────────────────────────
+
+TEST_CASE("POST /management-groups/{id}/members: the group read failure log line holds the store "
+          "text on one physical line",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "read-fails");
+    // PQerrorMessage text ends in a newline (and a failed statement adds a second line), so an
+    // unsanitised argument would leave stray lines in the log.
+    drop_mgmt_table(h, "management_group_store.management_groups");
+
+    yuzu::test::LogCapture cap;
+    auto res = h.add_member(gid, R"({"agent_id":"agent-1"})");
+    cap.stop();
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto text = cap.text();
+    const auto at = text.find("management_group.add_member group read failure: query failed");
+    REQUIRE(at != std::string::npos);
+    std::size_t pos = 0;
+    while (pos < text.size()) {
+        const auto eol = text.find('\n', pos);
+        const auto line = text.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+        if (!line.empty())
+            CHECK(line.front() == '['); // every line begins with its own timestamp
+        pos = eol == std::string::npos ? text.size() : eol + 1;
+    }
+    CHECK(h.audits.empty()); // refused before any row
+}
