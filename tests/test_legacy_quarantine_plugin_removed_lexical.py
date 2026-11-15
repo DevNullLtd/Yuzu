@@ -1631,7 +1631,8 @@ class InstallerFailedHelper(unittest.TestCase):
     setcap steps stubbed and every path pointed into a temporary directory: the sudoers file is
     written only when both helpers were installed in the run. When one was not, the file is removed
     (an earlier file's lines included), `install_sudoers` is never reached and the run exits 1; a
-    sudoers file that fails to install ends the run with its own status and no "install complete"."""
+    sudoers file that fails to install removes any earlier file too and ends the run with its own
+    status and no "install complete"."""
 
     BASH = "/bin/bash" if os.path.exists("/bin/bash") else "bash"   # macOS: 3.2, the oldest the installer meets
     ANCHOR = 'case "$ACTION" in\n    install)\n'
@@ -1733,7 +1734,7 @@ class InstallerFailedHelper(unittest.TestCase):
             rc, out, err, reached, _ = self.run_install(d, sudoers_rc=3)
             self.assertEqual(rc, 3, (out, err))
             self.assertTrue(reached)
-            self.assertTrue(os.path.exists(sudoers), "an earlier file is left in place")
+            self.assertFalse(os.path.exists(sudoers), "no earlier grant may stay after a failed install")
             self.assertIn("was not installed (status 3)", err)
             self.assertNotIn("install complete", out)
 

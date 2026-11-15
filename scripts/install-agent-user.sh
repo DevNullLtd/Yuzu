@@ -73,8 +73,8 @@
 # second pass. The sudoers file is overwritten each run (so you can
 # update the privilege list and re-run), but only after passing
 # `visudo -cf`, and only when both helpers were installed in that run. When a helper
-# cannot be installed (its directory is not owned by root, or other users can write to
-# it) the installer removes the sudoers file and exits 1, so no grant names a helper
+# cannot be installed (its directory is not owned by root, or is writable by all users;
+# a group-writable one is accepted with a warning) the installer removes the sudoers file and exits 1, so no grant names a helper
 # that is not there. Correct the directory and re-run to get the file back.
 #
 # UPGRADES
@@ -131,8 +131,8 @@
 #   1  - install/check/uninstall failed; details on stderr (an install that could not
 #        install a helper also exits 1, after removing the sudoers file)
 #   2  - argument or precondition error (not run as root, unsupported OS)
-#   3  - sudoers file failed visudo validation; it was not installed and an earlier
-#        one, if any, is left in place
+#   3  - sudoers file failed visudo validation or could not be installed; the
+#        installer removed any earlier file, so no old grant stays
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -1833,10 +1833,11 @@ case "$ACTION" in
             if [[ -e "$SUDOERS_FILE" ]]; then
                 fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
             fi
-            fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by other users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
+            fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
         fi
         if [[ "$sudoers_rc" -ne 0 ]]; then
-            warn "$SUDOERS_FILE was not installed (status $sudoers_rc); an earlier file, if any, is unchanged"
+            warn "$SUDOERS_FILE was not installed (status $sudoers_rc); removing any earlier file so no old grant stays"
+            remove_sudoers
             exit "$sudoers_rc"
         fi
         log "install complete. Verify with: $0 --check"
