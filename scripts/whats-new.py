@@ -690,15 +690,22 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
 
     None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
     be told: the line sits under a `#` or `##` heading that is not `## [X]` (tab-separated, a title, indented
-    by one to three spaces before a bracket), before any heading, or under more than one version (a generic bullet repeated across releases), so naming
-    one version could name the wrong one."""
+    by one to three spaces before a bracket), before any heading, or under more than one version (a generic
+    bullet repeated across releases), so naming one version could name the wrong one. Headings inside a code
+    fence are ignored; a fence left open ends at the next `## [X]` heading, so it costs at most one section."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
-    fenced = False
+    fenced = ""  # the character of the code fence open at this line, "" when none
     for line in lines_of((changelog or "").removeprefix("\ufeff")):
-        if line.lstrip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and re.match(r"(?:#{1,2}(?:[ \t\r]|$)| {1,3}##[ \t]*\[)", line):
+        if line.startswith("## ["):
+            fenced = ""  # a version heading cannot be inside a fence, so an unclosed one ends here
+        mark = line.lstrip()[:1]
+        if fenced:
+            if line.lstrip().startswith(fenced * 3):
+                fenced = ""
+        elif mark in ("`", "~") and line.lstrip().startswith(mark * 3):
+            fenced = mark
+        elif re.match(r"(?:#{1,2}(?:[ \t\r]|$)| {1,3}##[ \t]*\[)", line):
             m = re.match(r"## \[([^\]\n]*)\]", line)
             name = m.group(1).strip() if m else ""
             version = None if name.lower() == "unreleased" else name
