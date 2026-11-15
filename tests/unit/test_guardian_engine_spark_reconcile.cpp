@@ -11505,3 +11505,209 @@ TEST_CASE("#5605 T13b: baseline_unpersisted() never waits on mtx_",
     if (probe.joinable())
         probe.join();
 }
+
+// ── #5605: the boot re-arm "no persisted baseline" counter ────────────────────────────────────
+// baseline_rebaselined_at_boot() counts, once per rule per boot, a `file-hash-equals` rule with
+// no authored expected_hash whose boot seed lookup (start_local's walk) found NO record. These
+// pin which read outcomes count, that both backends count once, and that nothing after the
+// walk (apply_rules) does.
+namespace {
+
+/// One restartable incarnation over an existing KV file, with a File mechanism so a
+/// prefer_spark=true engine arms the rule through the real Spark backend. Construction does NOT
+/// wire or start: the test chooses the order.
+struct Boot5605 {
+    std::unique_ptr<KvStore> kv;
+    std::unique_ptr<SparkEngine> spark_engine;
+    FakeServiceMechanism* mechanism{nullptr};
+    std::unique_ptr<GuardianEngine> engine;
+
+    Boot5605(const fs::path& db_path, bool prefer_spark) {
+        auto opened = KvStore::open(db_path);
+        REQUIRE(opened.has_value());
+        kv = std::make_unique<KvStore>(std::move(*opened));
+        spark_engine = std::make_unique<SparkEngine>();
+        auto mech = std::make_unique<FakeServiceMechanism>();
+        mechanism = mech.get();
+        REQUIRE(spark_engine->register_mechanism(SparkType::File, std::move(mech)).has_value());
+        spark_engine->start();
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-test", prefer_spark);
+    }
+    Boot5605(const Boot5605&) = delete;
+    Boot5605& operator=(const Boot5605&) = delete;
+    ~Boot5605() {
+        if (mechanism)
+            mechanism->release_all_gates();
+        if (engine &&
+            !yuzu::test::spin_until([this] { return engine->active_io_workers() == 0; },
+                                    std::chrono::seconds{10})) {
+            std::fprintf(stderr, "Boot5605: workers still alive after the bounded wait\n");
+        }
+        engine.reset();
+        spark_engine->stop();
+    }
+    void wire() {
+        engine->wire_spark_engine(spark_engine.get(), /*spark_disabled_by_config=*/false,
+                                  [](const OutboxEntry&) { return SendResult::Sent; });
+        REQUIRE(engine->spark_availability() == GuardianEngine::SparkAvailability::Available);
+    }
+    void put_record(const std::string& rule_id, const std::string& payload) {
+        REQUIRE(kv->set(GuardianEngine::kv_namespace(), "baseline:" + rule_id, payload));
+    }
+    void push(const std::vector<gpb::GuaranteedStateRule>& rules, std::uint64_t generation) {
+        REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(
+                    *engine, push_bytes_5513(rules, generation))
+                    .exit_code == 0);
+    }
+};
+
+/// Phase 1: persist `rules` (full_sync, generation 1) in a throwaway legacy incarnation whose
+/// target is ABSENT, so no baseline is ever captured. Returns the KV path (owned by `rig`).
+fs::path seed_rules_5605(BootRig5513& rig, const std::vector<gpb::GuaranteedStateRule>& rules) {
+    rig.seed(/*prefer_spark=*/false, /*with_spark=*/false, rules, /*generation=*/1);
+    return rig.db_.path;
+}
+
+std::string baseline_json_5605(const std::string& fingerprint, const std::string& hash) {
+    nlohmann::json j;
+    j["schema"] = 1;
+    j["fingerprint"] = fingerprint;
+    j["hash"] = hash;
+    return j.dump();
+}
+
+} // namespace
+
+TEST_CASE("#5605 T14: an Absent record counts exactly once per rule, on the Spark backend and "
+          "on the legacy backend (whose arm seeds a second time)",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const fs::path target = t.file(); // never created: nothing can have been captured
+    const auto rule = make_file_hash_rule("r1", target.string());
+    for (const bool prefer_spark : {true, false}) {
+        CAPTURE(prefer_spark);
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {rule});
+        {
+            // The seed incarnation really left no record, so Absent is what the boot reads.
+            Boot5605 probe{db, false};
+            auto raw = probe.kv->get_entry(GuardianEngine::kv_namespace(), "baseline:r1");
+            REQUIRE(raw.has_value());
+            REQUIRE_FALSE(raw->has_value());
+        }
+        Boot5605 b{db, prefer_spark};
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+        if (prefer_spark)
+            b.wire(); // the production order: wire BEFORE start_local
+        REQUIRE(b.engine->start_local().has_value());
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1); // exactly 1, never 2
+    }
+}
+
+TEST_CASE("#5605 T15: a matching persisted record does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const fs::path target = t.file();
+    BootRig5513 rig;
+    const fs::path db = seed_rules_5605(rig, {make_file_hash_rule("r1", target.string())});
+    Boot5605 b{db, /*prefer_spark=*/true};
+    b.put_record("r1", baseline_json_5605(baseline_fingerprint_4045(target), kHash5605));
+    b.wire();
+    REQUIRE(b.engine->start_local().has_value());
+    CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+}
+
+TEST_CASE("#5605 T16: a record for a different target (a retarget) does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const fs::path target = t.file();
+    BootRig5513 rig;
+    const fs::path db = seed_rules_5605(rig, {make_file_hash_rule("r1", target.string())});
+    Boot5605 b{db, /*prefer_spark=*/true};
+    b.put_record("r1", baseline_json_5605(baseline_fingerprint_4045(t.file("other.txt")), kHash5605));
+    b.wire();
+    REQUIRE(b.engine->start_local().has_value());
+    CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+}
+
+TEST_CASE("#5605 T17: a malformed record (bad JSON, or a wrong schema) does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    // ReadError at boot has no clean seam here (start_local reads the rule list from the same
+    // store, so a dropped table removes the rules too); it is not counted by construction
+    // (only Absent is) and is listed as could-not-verify, not tested.
+    Spark4045Target t;
+    const fs::path target = t.file();
+    const std::string fp = baseline_fingerprint_4045(target);
+    nlohmann::json wrong_schema = nlohmann::json::parse(baseline_json_5605(fp, kHash5605));
+    wrong_schema["schema"] = 999;
+    for (const std::string& payload : {std::string{"{this is not json"}, wrong_schema.dump()}) {
+        CAPTURE(payload);
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {make_file_hash_rule("r1", target.string())});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        b.put_record("r1", payload);
+        b.wire();
+        REQUIRE(b.engine->start_local().has_value());
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+    }
+}
+
+TEST_CASE("#5605 T18: an apply_rules push after boot does not count",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const auto rule = make_file_hash_rule("r1", t.file().string());
+    BootRig5513 rig;
+    const fs::path db = seed_rules_5605(rig, {rule});
+    Boot5605 b{db, /*prefer_spark=*/true};
+    b.wire();
+    REQUIRE(b.engine->start_local().has_value());
+    REQUIRE(b.engine->baseline_rebaselined_at_boot() == 1);
+    // The same rule again, and a brand-new rule with no record: both read Absent in
+    // reconcile_rule_locked, but the boot walk is over, so neither counts.
+    b.push({rule, make_file_hash_rule("r2", t.file("second.txt").string())}, 2);
+    CHECK(b.engine->baseline_rebaselined_at_boot() == 1);
+}
+
+TEST_CASE("#5605 T19: the count survives an Unwired agent and a throw after the seed read, a "
+          "disabled rule is not counted, and the boot flag is cleared on every exit",
+          "[spark][guardian][baseline][boot][5605]") {
+    Spark4045Target t;
+    const auto rule = make_file_hash_rule("r1", t.file().string());
+
+    SECTION("reversed wiring order: start_local before wire_spark_engine still counts") {
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {rule});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        REQUIRE(b.engine->start_local().has_value()); // Unwired: the seed read precedes Inert
+        CHECK(b.engine->spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1);
+    }
+    SECTION("a disabled rule is never re-armed, so it is not counted") {
+        auto disabled = rule;
+        disabled.set_enabled(false);
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {disabled});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        b.wire();
+        REQUIRE(b.engine->start_local().has_value());
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 0);
+    }
+    SECTION("a throw AFTER the seed read keeps the count, and the flag is cleared") {
+        BootRig5513 rig;
+        const fs::path db = seed_rules_5605(rig, {rule});
+        Boot5605 b{db, /*prefer_spark=*/true};
+        b.wire();
+        std::atomic<int> thrown{0};
+        b.engine->set_seed_read_hook_for_test([&](const std::string& rule_id) {
+            if (rule_id == "r1" && thrown.fetch_add(1) == 0)
+                throw std::runtime_error("injected after the seed read"); // boot arm only
+        });
+        REQUIRE(b.engine->start_local().has_value()); // the walk degrades the rule, survives
+        REQUIRE(thrown.load() == 1);
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1); // counted before the throw
+        // A later push re-reads Absent records for a NEW rule: not counted (the flag is clear).
+        b.push({rule, make_file_hash_rule("r2", t.file("second.txt").string())}, 2);
+        CHECK(b.engine->baseline_rebaselined_at_boot() == 1);
+        b.engine->set_seed_read_hook_for_test(nullptr);
+    }
+}

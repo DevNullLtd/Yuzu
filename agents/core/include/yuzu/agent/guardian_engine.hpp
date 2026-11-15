@@ -366,6 +366,18 @@ public:
     /// is not counted here (see baseline_persist_failures()), and a legacy FileGuard persist
     /// failure is counted nowhere. Lock-free (never mtx_), like baseline_persist_failures().
     [[nodiscard]] std::optional<std::uint64_t> baseline_unpersisted() const;
+    /// #5605: the number of `file-hash-equals` rules with no authored expected_hash whose boot
+    /// re-arm seed lookup (start_local's walk over the cached rules) found NO persisted baseline
+    /// record, counted once per rule per boot, on BOTH detection backends (the lookup precedes
+    /// the backend choice). Each such rule re-captures the file's CURRENT content as its
+    /// baseline at that boot. It is NOT proof that a capture was lost: a rule never captured, a
+    /// prior failed arm, a platform whose file mechanism cannot arm (the seed read runs before
+    /// placement is decided) and a genuinely lost capture all read the same. A read error, a
+    /// malformed record, a fingerprint mismatch (a retarget), a disabled rule and any apply_rules
+    /// after boot are not counted. Written only under mtx_ during the one start_local walk (a
+    /// second start_local is a no-op), so it is a per-boot constant afterwards; read lock-free.
+    /// Live on every agent today (not gated on prefer_spark_).
+    [[nodiscard]] std::uint64_t baseline_rebaselined_at_boot() const noexcept;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
     /// because a same-target record already existed (first capture wins). Not a failure and not
     /// part of baseline_persist_failures(). DIAGNOSTIC accessor with no production consumer and
@@ -1478,6 +1490,14 @@ private:
     /// and an acquire load that sees non-null may dereference it for as long as the engine is
     /// alive. Every other member read still needs mtx_.
     std::atomic<GuardianBaselinePersister*> baseline_persister_published_{nullptr};
+    /// #5605: true only while start_local's boot re-arm walk runs. mtx_-guarded (both callers of
+    /// reconcile_rule_locked hold mtx_), set before the walk and cleared by a GuardianRollback
+    /// scope guard on every exit, so apply_rules never sees it set.
+    bool boot_rearm_walk_{false};
+    /// #5605: rules whose boot seed lookup found no persisted baseline (see
+    /// baseline_rebaselined_at_boot()). Incremented only at reconcile_rule_locked's shared seed
+    /// block with boot_rearm_walk_ set (mtx_ held); atomic so the heartbeat reads it lock-free.
+    std::atomic<std::uint64_t> boot_rebaselined_{0};
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
