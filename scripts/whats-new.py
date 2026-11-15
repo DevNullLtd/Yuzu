@@ -33,8 +33,8 @@ fresh clone has none, so pass --since.
 
 Read-only: it runs `git` queries and changes no ref, index or file (in a partial clone, git itself may
 fetch objects the range needs). All repository-sourced text is printed with control characters
-and invisible format characters (zero-width joiners, variation selectors, bidi marks) replaced
-by `?`, so an emoji sequence can show one. Stdlib only.
+(other than newline and tab) and invisible format characters (zero-width joiners, variation
+selectors, bidi marks) replaced by `?`, so an emoji sequence can show one. Stdlib only.
 """
 
 from __future__ import annotations
@@ -115,6 +115,8 @@ def lines_of(text: str) -> list[str]:
 class Repo:
     def __init__(self, root: Path):
         self.root = root
+        # Paths `blobs` found to be something other than a file (a submodule, a tree): never listed.
+        self.not_regular: list[str] = []
 
     def _run(self, *args: str, stdin: str | None = None, binary: bool = False) -> subprocess.CompletedProcess:
         # Bytes in, bytes out, decoded here: text mode would turn a lone CR into a newline before
@@ -123,7 +125,7 @@ class Repo:
             # Pinned so a user's git config cannot change what is parsed (colour codes, signature
             # lines in `log`, quoted paths) and git's messages are not translated (see show()).
             proc = subprocess.run(["git", "-c", "core.quotepath=off", "-c", "color.ui=false",
-                                   "-c", "log.showSignature=false", "-c", "i18n.logOutputEncoding=UTF-8", *args],
+                                   "-c", "log.showSignature=false", "-c", "log.mailmap=false", "-c", "i18n.logOutputEncoding=UTF-8", *args],
                                   cwd=self.root, capture_output=True, input=stdin.encode() if stdin is not None else None,
                                   env={**{k: v for k, v in os.environ.items() if k not in REPO_LOCATING_ENV},
                                        "LC_ALL": "C", "LANGUAGE": "C"})
@@ -161,7 +163,7 @@ class Repo:
         raise GitError(f"could not read {path} at {ref[:10]}: {proc.stderr.strip()}")
 
     def blobs(self, specs: list[str], required: bool = True) -> dict[str, str | None]:
-        """Contents of `<rev>:<path>` specs in one process.
+        """Contents of `<rev>:<path>` specs in one process; None for something that is not a file.
 
         Every caller names an object the history says exists, so a missing one (a damaged
         repository, a partial clone that may not fetch) raises: skipping it would print "nothing
@@ -183,11 +185,20 @@ class Repo:
                     raise GitError(f"could not read {spec.split(':', 1)[1]} at {spec.split(':', 1)[0][:10]}: object missing")
                 out[spec] = None
                 continue
+            fields = header.split(" ")
+            if len(fields) == 2 and fields[1] == "submodule":  # a gitlink: no content follows
+                self.not_regular.append(spec.split(":", 1)[1])
+                out[spec] = None
+                continue
             try:
-                size = int(header.rsplit(" ", 1)[1])
+                size = int(fields[-1])
             except ValueError as exc:
                 raise GitError(f"unexpected reply from git cat-file --batch: {header!r}") from exc
-            out[spec] = data[pos:pos + size].decode("utf-8", "replace")
+            if len(fields) == 3 and fields[1] != "blob":  # a tree or a commit where a file was expected
+                self.not_regular.append(spec.split(":", 1)[1])
+                out[spec] = None
+            else:
+                out[spec] = data[pos:pos + size].decode("utf-8", "replace")
             pos += size + 1
         return out
 
@@ -283,7 +294,7 @@ def _minus_months(moment: datetime, months: int) -> datetime:
     total = moment.year * 12 + (moment.month - 1) - months
     year, month = divmod(total, 12)
     if year < 1970:
-        raise GitError("--since: that date is before 1970, earlier than any commit")
+        raise GitError("--since: that date is before 3 January 1970, earlier than any commit")
     month += 1
     # Clamp the day (31 March minus one month is the last day of February).
     for day in (moment.day, 30, 29, 28):
@@ -300,7 +311,7 @@ def _back(now: datetime, delta: timedelta) -> datetime:
     try:
         return (now.astimezone() - delta).astimezone().replace(tzinfo=None)
     except (OSError, OverflowError, ValueError) as exc:  # before the epoch (Windows), or out of range
-        raise GitError("--since: that date is before 1970, earlier than any commit") from exc
+        raise GitError("--since: that date is before 3 January 1970, earlier than any commit") from exc
 
 
 def date_cutoff(since: str, now: datetime | None = None) -> str:
@@ -391,7 +402,7 @@ def plugin_abi(repo: Repo, ref: str) -> dict[str, str]:
 
 def released_version(repo: Repo, ref: str) -> dict[str, str]:
     text = repo.show(ref, "CHANGELOG.md") or ""
-    m = re.search(r"^## \[(\d[^\]]*)\]", text, re.M)
+    m = re.search(r"^## \[(\d[^\]\n]*)\]", text, re.M)
     return {"latest released CHANGELOG section": m.group(1)} if m else {}
 
 
@@ -478,6 +489,10 @@ def version_changes(repo: Repo, old: str, new: str) -> list[str]:
 
 # --- touched surfaces --------------------------------------------------------
 
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
 def surface_notes(files: list[str]) -> list[str]:
     def under(*prefixes: str) -> list[str]:
         return [f for f in files if f.startswith(prefixes)]
@@ -493,10 +508,10 @@ def surface_notes(files: list[str]) -> list[str]:
     ):
         n = len(under(prefix))
         if n:
-            notes.append(f"{text} ({n} files)")
+            notes.append(f"{text} ({plural(n, 'file')})")
     deploy = under("deploy/", "docker-compose")
     if deploy:
-        notes.append(f"deploy/compose files changed ({len(deploy)} files): re-read them before redeploying")
+        notes.append(f"deploy/compose files changed ({plural(len(deploy), 'file')}): re-read them before redeploying")
     return notes
 
 
@@ -567,19 +582,21 @@ def _records(out: str) -> list[tuple[str, list[str]]]:
     return recs
 
 
-def _rename_pairs(repo: Repo, old: str, new: str) -> tuple[dict[str, tuple[str, int]], set[tuple[str, str]]]:
-    """({destination: (source, similarity)}, {(commit, source)}) for every fragment rename a commit
-    in old..new made.
+def _rename_pairs(repo: Repo, old: str, new: str) -> tuple[dict[str, tuple[str, int]], dict[tuple[str, str], tuple[str, int]]]:
+    """({destination: (source, similarity)}, {(commit, source): (destination, similarity)}) for every
+    fragment rename a commit in old..new made.
 
     Read from the history, not the net diff: a net diff pairs a deletion in one commit with an
     unrelated addition in another when their bytes match, and then a genuinely new fragment would
-    read as a rename of the deleted one. The (commit, source) set says which deletions were the
+    read as a rename of the deleted one. The (commit, source) map says which deletions were the
     source half of a rename, so a path that is later reused is not mistaken for the renamed one.
+    A name that is not a fragment name on either side is not a fragment rename: the reader never
+    had a fragment under it.
     """
-    out = repo.git("log", "-m", "-z", "-M", "--diff-filter=R", "--name-status", "--format=%x01%H",
+    out = repo.git("log", "--full-history", "-m", "-z", "-M", "--diff-filter=R", "--name-status", "--format=%x01%H",
                    f"{old}..{new}", "--", FRAGMENT_DIR + "/")
     pairs: dict[str, tuple[str, int]] = {}
-    sources: set[tuple[str, str]] = set()
+    sources: dict[tuple[str, str], tuple[str, int]] = {}
     for sha, toks in _records(out):
         i = 0
         while i + 2 < len(toks):
@@ -588,18 +605,30 @@ def _rename_pairs(repo: Repo, old: str, new: str) -> tuple[dict[str, tuple[str, 
                 continue
             score = int(toks[i][1:]) if toks[i][1:].isdigit() else 0
             src, dst = toks[i + 1], toks[i + 2]
-            sources.add((sha, src))
+            i += 3
+            if not (_fragment_path_ok(src) and _fragment_path_ok(dst)):
+                continue
+            if (sha, src) not in sources or score > sources[(sha, src)][1]:
+                sources[(sha, src)] = (dst, score)
             if dst not in pairs or score > pairs[dst][1]:
                 pairs[dst] = (src, score)
-            i += 3
     return pairs, sources
 
 
 def unrecognised_names(repo: Repo, old: str, new: str) -> list[str]:
-    """Files this range adds under changelog.d/ that are not named like fragments (README.md aside)."""
+    """Files this range adds under changelog.d/ that are not named like fragments (README.md and
+    .gitkeep aside)."""
     pathspec = FRAGMENT_DIR + "/"
     return [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
-            if not _fragment_path_ok(p) and p != f"{FRAGMENT_DIR}/README.md"]
+            if not _fragment_path_ok(p) and p not in (f"{FRAGMENT_DIR}/README.md", f"{FRAGMENT_DIR}/.gitkeep")]
+
+
+class Fragments(dict):
+    """{key: body}; `promoted` holds the keys of entries a release moved into CHANGELOG.md."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.promoted: set[str] = set()
 
 
 def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
@@ -623,21 +652,21 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
            if _fragment_path_ok(p)]
     # -m so adds made inside merge commits are seen too. A fragment that already existed at `old`
     # can show up here (a merge diffs against its side parent), so each is checked against both ends.
-    ever = {p for p in repo.names("log", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only",
+    ever = {p for p in repo.names("log", "--full-history", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only",
                                   "--format=", f"{old}..{new}", "--", pathspec)
             if _fragment_path_ok(p)}
     changed = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=M", "--name-only", old, new, "--", pathspec)
                if _fragment_path_ok(p) and p in ever]
     # Every commit that deleted a fragment path, newest first.
     deleters: dict[str, list[str]] = {}
-    for sha, toks in _records(repo.git("log", "-z", "--no-renames", "--diff-filter=D", "--name-only", "--format=%x01%H",
+    for sha, toks in _records(repo.git("log", "--full-history", "-z", "--no-renames", "--diff-filter=D", "--name-only", "--format=%x01%H",
                                        f"{old}..{new}", "--", pathspec)):
         for p in toks:
             if p and _fragment_path_ok(p) and sha not in deleters.setdefault(p, []):
                 deleters[p].append(sha)
     if not (net or changed or deleters):
         return {}
-    tree_old = set(lines_of(repo.git("ls-tree", "-r", "--name-only", old, "--", pathspec)))
+    tree_old = set(repo.names("ls-tree", "-r", "-z", "--name-only", old, "--", pathspec))
     renames, rename_sources = _rename_pairs(repo, old, new)
 
     def old_root(path: str) -> str | None:
@@ -659,50 +688,69 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
         """The path whose text at `old` the reader already has for `path`, if there is one."""
         return path if path in tree_old else old_root(path)
 
-    found: dict[str, str] = {}
+    found = Fragments()
     net_refs = {p: r for p in net if (r := reference(p)) is not None}
     # What the reader already has under a renamed-from path is not new; a rename plus a reword is.
     old_bodies = repo.blobs([f"{old}:{r}" for r in set(net_refs.values())])
     for spec, body in repo.blobs([f"{new}:{p}" for p in net]).items():
         path = spec.split(":", 1)[1]
-        if not (path in net_refs and old_bodies[f"{old}:{net_refs[path]}"] == body):
+        if body is not None and not (path in net_refs and old_bodies[f"{old}:{net_refs[path]}"] == body):
             found[path] = body
 
     # A path that existed at `old`, was deleted in the range and is back with different text.
     readded = [p for p in changed if p in deleters and p not in found]
     for spec, body in repo.blobs([f"{new}:{p}" for p in readded]).items():
-        found[spec.split(":", 1)[1]] = body
+        if body is not None:
+            found[spec.split(":", 1)[1]] = body
 
     # Promoted: a life of a path ended by a deletion that was not the source half of a rename.
     # The first life of a path that existed at `old` is the reader's own entry, so its deletion is skipped.
+    # A deletion that git paired with an addition at less than 100% similarity is a rename only when
+    # the addition kept the first bullet: a release that deletes a fragment and adds a similar one
+    # in the same commit is a promotion (checked below), not a rename.
     ended: list[tuple[str, str]] = []
+    inexact: dict[tuple[str, str], str] = {}
     for p, shas in deleters.items():
         for sha in (shas[:-1] if p in tree_old else shas):
-            if (sha, p) not in rename_sources:
+            hit = rename_sources.get((sha, p))
+            if hit is None:
                 ended.append((p, sha))
-    if not ended:
+            elif hit[1] != 100:
+                inexact[(p, sha)] = hit[0]
+    if not (ended or inexact):
         return found
     # Lines a commit of the range added to CHANGELOG.md, so a line polished after its release still matches.
     changelog_added = {
         line[1:].rstrip() for line in lines_of(repo.git("diff", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", old, new, "--", "CHANGELOG.md"))
         if line.startswith("+") and not line.startswith("+++")
     }
-    for line in lines_of(repo.git("log", "-p", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", "--format=",
+    for line in lines_of(repo.git("log", "--full-history", "-p", "-U0", "--text", "--no-color", "--no-ext-diff", "--no-textconv", "--format=",
                                   f"{old}..{new}", "--", "CHANGELOG.md")):
         if line.startswith("+") and not line.startswith("+++"):
             changelog_added.add(line[1:].rstrip())
-    specs = {(p, sha): f"{sha}^:{p}" for p, sha in ended}
+    specs = {(p, sha): f"{sha}^:{p}" for p, sha in [*ended, *inexact]}
     bodies = repo.blobs(list(specs.values()))
+    kept = repo.blobs([f"{sha}:{dst}" for (_, sha), dst in inexact.items()], required=False)
+
+    def first_line(body: str | None) -> str:
+        first = bullets(body or "")[:1]
+        return first[0].split("\n")[0].rstrip() if first else ""
+
     refs = {p: r for p, _ in specs if (r := reference(p)) is not None}
     ref_bodies = repo.blobs([f"{old}:{r}" for r in set(refs.values())])
     for (path, sha), spec in specs.items():
         body = bodies[spec]
+        if body is None:
+            continue
         if path in refs and ref_bodies[f"{old}:{refs[path]}"] == body:
             continue  # the text the reader had at `old`
-        first = bullets(body)[:1]
-        line = first[0].split("\n")[0].rstrip() if first else ""
+        line = first_line(body)
+        if (path, sha) in inexact and line == first_line(kept.get(f"{sha}:{inexact[(path, sha)]}")):
+            continue  # renamed and edited, the first bullet kept: the same entry
         if line and line in changelog_added:
-            found[path if path not in found else f"{path}#{sha[:10]}"] = body
+            key = path if path not in found else f"{path}#{sha[:10]}"
+            found[key] = body
+            found.promoted.add(key)
     return found
 
 
@@ -748,7 +796,7 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
     count = repo.git("rev-list", "--count", f"{old}..{head}").strip()
     files = repo.names("diff", "-z", "--no-renames", "--name-only", old, head)
     out = [
-        f"Changes since {how}: {count} commits, {len(files)} files ({top_level_summary(files)})",
+        f"Changes since {how}: {plural(int(count), 'commit')}, {plural(len(files), 'file')} ({top_level_summary(files)})",
         f"Base {repo.git('log', '-1', '--format=%h %cs %s', old).strip()}",
         f"Head {repo.git('log', '-1', '--format=%h %cs %s', head).strip()}",
     ]
@@ -778,26 +826,36 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
             out.append(f"  + {len(other)} other bumps (workflows, pip, npm); --full lists them")
         out.append("")
 
-    lines, total, empty = render_fragments(added_fragments(repo, old, head), full)
+    frags = added_fragments(repo, old, head)
+    lines, total, empty = render_fragments(frags, full)
+    odd = unrecognised_names(repo, old, head)
+    not_regular = sorted(set(repo.not_regular))
     if lines:
         out.append(f"Changelog entries added ({total})")
         out.append("")
         out.extend(lines)
+        if getattr(frags, "promoted", None):
+            out.append("Note: entries a release inside this range moved into CHANGELOG.md show the fragment's wording as it was")
+            out.append("promoted; CHANGELOG.md has the release text, which may differ.")
+    elif empty or odd or not_regular:
+        out.append("No changelog entries could be listed for this range (see the ! lines below).")
     else:
         out.append("No changelog fragments were added in this range (refactors, CI and test-only changes may skip them;")
         out.append(f"`git log --first-parent --oneline {old[:10]}..HEAD` lists every merged PR).")
     if empty:
         out.append(f"! {len(empty)} fragment(s) had no '- ' bullet and are not summarised: {', '.join(empty)}")
-    odd = unrecognised_names(repo, old, head)
     if odd:
-        out.append(f"! {len(odd)} file(s) added under {FRAGMENT_DIR}/ are not named like fragments and are not listed: "
-                   + ", ".join(one(n) for n in odd))
+        out.append(f"! {len(odd)} file(s) added under {FRAGMENT_DIR}/ are not named like fragments (or are not directly in it) "
+                   "and are not listed: " + ", ".join(one(n) for n in odd))
+    if not_regular:
+        out.append(f"! {len(not_regular)} path(s) named like fragments are not regular files (a submodule or a directory) "
+                   "and are not listed: " + ", ".join(one(n) for n in not_regular))
     return out
 
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description="Summarise what changed in this checkout since the last pull.")
-    ap.add_argument("--since", help="ref, tag or commit, or a date (YYYY-MM-DD[ HH:MM], yesterday, \"N days ago\"); default: your last pull")
+    ap.add_argument("--since", help="ref, tag or commit, or a date (YYYY-MM-DD[ HH:MM[:SS]], yesterday, \"N days ago\"); default: your last pull")
     ap.add_argument("--full", action="store_true",
                     help="print whole bullets (not first lines) and list every non-image dependency bump")
     ap.add_argument("--repo", type=Path, default=None, help=argparse.SUPPRESS)

@@ -89,14 +89,23 @@ It prints, in this order:
   old one. A fragment added after your base and since promoted by a release is
   shown, under its last path and section, when its first line is a line a commit
   in the range added to `CHANGELOG.md`, even if the line was edited by hand after
-  the release; a name a release promoted twice in the range is shown each time.
+  the release; a name a release promoted twice in the range is shown each time
+  (once, if the two texts are identical). A promoted entry shows the fragment's
+  wording as it was promoted, not a later hand edit of the release text, so a
+  note says so and `CHANGELOG.md` has the final text. A release that deletes a
+  fragment and adds a similar one in the same commit still counts as promoting
+  the first unless the new file keeps its first bullet.
   A path you had and edited is not listed, nor is its promotion. A path you had,
   that a release promoted and that was added back with different text, is
   listed; added back with identical text, it is not. A fragment you had, moved
-  out of `changelog.d/` and back, is listed again. Fragments are read the way
+  out of `changelog.d/` and back, is listed again only if its text changed. Fragments are read the way
   `promote` reads them (line endings normalised, outer whitespace dropped).
-  A file added under `changelog.d/` whose name is not a fragment name is named
-  on a `!` line and is not listed. A `!` line anywhere in the report means that
+  A file added under `changelog.d/` whose name is not a fragment name (or that
+  is in a subdirectory), and a fragment name that is a submodule or a directory,
+  is named on a `!` line and is not listed (`README.md` and `.gitkeep` are
+  exempt). Releases rewrite `CHANGELOG.md` by hand too, so a bullet that never
+  had a fragment does not appear; fragments began on 2026-07-04, so a base
+  before that cannot show entries written straight into `CHANGELOG.md`. A `!` line anywhere in the report means that
   part could not be read or compared; it is never "no change".
 
 "Your last pull" is read from the reflog of the branch you are on: the newest
@@ -130,7 +139,7 @@ because git would read a typo as "now".
 
 The script only reads (in a partial clone, git itself may fetch objects the range
 needs). Text from fragments and commit messages is printed with control characters
-and invisible format characters (zero-width joiners and non-joiners, variation
+(newline and tab aside) and invisible format characters (zero-width joiners and non-joiners, variation
 selectors, bidi marks) replaced by `?`, so an emoji sequence can show a `?`;
 a fragment's continuation lines are indented. Changes that skipped a fragment (rule 3) do not
 appear in the entries; `git log --first-parent --oneline <base>..HEAD` lists
