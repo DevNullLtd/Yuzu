@@ -99,9 +99,10 @@ inline constexpr std::uint64_t kEmitSeqCeiling = std::uint64_t{1} << 40;
 inline constexpr std::int64_t kEpochSkewSeconds = 315'576'000;
 
 /// Why a wire emit-order pair was not taken as a pair (D5). `None` covers both a valid pair and
-/// the legitimate unpaired 0/0 of an older sender; neither is counted. `Implausible` (UP-9) is a
-/// structurally valid pair outside the absolute bound above; unlike the other two it is HELD, not
-/// judged as an unpaired event (see `GuaranteedStateEventRow::pair_implausible`).
+/// the legitimate unpaired 0/0 (a journal replay, or an agent whose epoch claim failed); neither is
+/// counted. `Implausible` (UP-9) is a structurally valid pair outside the absolute bound above;
+/// unlike the other two it is HELD, not judged as an unpaired event (see
+/// `GuaranteedStateEventRow::pair_implausible`).
 enum class PairReject { None, HalfSet, OutOfRange, Implausible };
 
 /// The wire `(boot_epoch, emit_seq)` pair as validated at the ingest boundary: `paired` is true
