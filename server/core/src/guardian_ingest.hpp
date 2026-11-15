@@ -149,8 +149,10 @@ void report_pair_reject(PairReject reject, const GuaranteedStateEventRow& row,
                         yuzu::MetricsRegistry* metrics);
 
 /// Gauge of agents "currently unordered": the latest accepted unpaired census-bearing event is
-/// later than the agent's pair clock (the sweep reads `GuaranteedStateStore::unordered_agent_count`,
-/// the count-only twin of `unordered_agents`). Fleet-wide, no
+/// later than the agent's pair clock, or the pair clock is recorded more than 300 s in the
+/// database's future (the sweep reads `GuaranteedStateStore::unordered_agent_count`, the count-only
+/// twin of `unordered_agents`, and both use the one SQL predicate). The value depends on the
+/// database clock, so it can change between two sweeps with no event. Fleet-wide, no
 /// labels (never by agent: the per-agent view is the `ordering` field of the per-device read).
 /// Described in server.cpp and deliberately NOT pre-seeded, like `..._census_pending_events`: a
 /// zero before the first answered read would read as "no unordered agents".

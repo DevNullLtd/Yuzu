@@ -179,17 +179,30 @@ struct GuardianAgentOrder {
     std::int64_t pair_duplicates{0};
     std::int64_t retired_events{0};
 
-    /// "Currently unordered": the latest accepted unpaired census-bearing event is later than the
-    /// pair clock (a NULL clock reads as 0). The store applies the same predicate in SQL for the
-    /// fleet count (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)`).
+    /// The database's own answer to "currently unordered" for this row (UP-5): the latest accepted
+    /// unpaired census-bearing event is later than the pair clock (a NULL clock reads as 0), or the
+    /// pair clock is recorded further than 300 s in the database's future. The store sets it from
+    /// the same SQL text the fleet count and the id list use, so the three cannot disagree. It
+    /// depends on the database clock, so it can change with no event. Unset only on a row built
+    /// without a store.
+    std::optional<bool> unordered_by_store;
+
+    /// "Currently unordered": the store's answer when it set one, which is every row it returns.
+    /// The fallback below is NOT a second definition of the predicate: it exists only so a row
+    /// built by hand (the unit tests of the JSON helper) still answers, it omits the future-clock
+    /// arm, and no production path reaches it. It is to be deleted together with those tests'
+    /// derivation cases (`test_guardian_api.cpp`, "currently_unordered is strict").
     [[nodiscard]] bool currently_unordered() const noexcept {
+        if (unordered_by_store)
+            return *unordered_by_store;
         return unpaired_recv_ns.has_value() && *unpaired_recv_ns > epoch_recv_ns.value_or(0);
     }
 };
 
-/// Agents "currently unordered" (`unpaired_recv_ns` set and later than `COALESCE(epoch_recv_ns, 0)`)
-/// inside the caller's scope: the exact `count`, and the first `kUnorderedAgentIdCap` agent ids in
-/// byte order. `count > ids.size()` means the list is truncated.
+/// Agents "currently unordered" (see `GuardianAgentOrder::unordered_by_store`: one SQL definition,
+/// including the future-clock arm) inside the caller's scope: the exact `count`, and the first
+/// `kUnorderedAgentIdCap` agent ids in byte order. `count > ids.size()` means the list is
+/// truncated.
 struct UnorderedAgentsSummary {
     std::int64_t count{0};
     std::vector<std::string> ids;

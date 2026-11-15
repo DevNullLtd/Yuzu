@@ -4435,15 +4435,19 @@ public:
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
                           "gauge");
-        metrics_.describe(detail::kGuardianCensusUnorderedAgentsMetric,
-                          "Agents whose latest accepted unpaired census-bearing event is later than "
-                          "the time their pair clock last advanced (an agent that never sent a "
-                          "pair counts; accepted means accepted for ordering). The pair is stored "
-                          "and counted, not yet compared: "
-                          "no verdict depends on it. Not updated while the store cannot answer, "
-                          "and absent until the first answered read. Per-agent detail is the "
-                          "ordering field of the per-device all-guards read.",
-                          "gauge");
+        metrics_.describe(
+            detail::kGuardianCensusUnorderedAgentsMetric,
+            "Agents whose latest accepted unpaired census-bearing event is later than "
+            "the time their pair clock last advanced, or whose pair clock is "
+            "recorded more than 300 s in the database's future (an agent that never "
+            "sent a pair counts; accepted means accepted for ordering). The value "
+            "is read against the database clock, so it can change between two "
+            "sweeps with no event. The pair is stored and counted, not yet "
+            "compared: no verdict depends on it. Not updated while the store "
+            "cannot answer, "
+            "and absent until the first answered read. Per-agent detail is the "
+            "ordering field of the per-device all-guards read.",
+            "gauge");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
                           "Cumulative DEX observation rows deleted by the retention reaper "
                           "(disposal evidence for the behavioral-PII projection, WS-E)", "counter");

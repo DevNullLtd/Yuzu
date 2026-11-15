@@ -576,8 +576,12 @@ public:
     std::expected<std::optional<GuardianAgentOrder>, std::string>
     agent_order_for_agent(std::string_view agent_id) const;
 
-    /// Agents currently unordered (`unpaired_recv_ns IS NOT NULL AND unpaired_recv_ns >
-    /// COALESCE(epoch_recv_ns, 0)`): the exact count and the first `kUnorderedAgentIdCap` ids in
+    /// Agents currently unordered (the latest accepted unpaired census-bearing event is later than
+    /// the pair clock, a NULL clock reading as 0, or the pair clock is recorded more than 300 s in
+    /// the database's future; one SQL definition shared with `agent_order_for_agent`'s
+    /// `currently_unordered` and `unordered_agent_count`, so the value can change with no event
+    /// when the database clock passes a recorded future clock): the exact count and the first
+    /// `kUnorderedAgentIdCap` ids in
     /// `agent_id COLLATE "C"` order. Same scope contract as `uncertain_rule_count`: `nullopt` = the
     /// whole fleet; engaged-empty = `{0, {}}` WITHOUT a query; a non-empty scope is applied IN SQL,
     /// so the count never includes a hidden agent. `std::unexpected`, never a silent zero, on any

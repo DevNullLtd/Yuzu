@@ -2008,6 +2008,23 @@ constexpr const char* kRepairStoredPair =
     "SELECT boot_epoch, emit_seq FROM guaranteed_state_store.guaranteed_state_events "
     "WHERE event_id = $1";
 
+// "Currently unordered" (UP-5): the ONE definition, in SQL, against the order table aliased `o`.
+// The latest accepted unpaired census-bearing event is later than the pair clock (a NULL clock
+// reads as 0, so a never-paired agent qualifies), OR the clock itself is recorded further than the
+// slack in the database's future (a stepped-back replica clock: the same reading `fresh` gives it,
+// where the hold treats such a clock as stale, so the read side must agree). It never reads NULL: a
+// blank row (every column NULL) is not unordered. The value depends on the database clock, so it
+// can flip with no event, the moment a clock recorded in the future falls inside the slack. Every
+// reader (the per-device row, the fleet count and the id list) uses this text; no C++ copy exists.
+#define YUZU_AGENT_ORDER_UNORDERED_                                                                \
+    "(o.unpaired_recv_ns IS NOT NULL AND (o.unpaired_recv_ns > COALESCE(o.epoch_recv_ns, 0) "      \
+    "OR COALESCE(o.epoch_recv_ns > " YUZU_CENSUS_DB_NOW_NS_ " + " YUZU_CENSUS_FUTURE_SLACK_NS_     \
+    ", false)))"
+
+// Expanded here, while the clock and slack macros are still defined, for the read side below.
+constexpr const char* kAgentOrderUnorderedSql = YUZU_AGENT_ORDER_UNORDERED_;
+
+#undef YUZU_AGENT_ORDER_UNORDERED_
 #undef YUZU_AGENT_ORDER_MODE_RO_
 #undef YUZU_AGENT_ORDER_MODE_
 #undef YUZU_AGENT_ORDER_FRESH_
@@ -4244,10 +4261,14 @@ GuaranteedStateStore::agent_order_for_agent(std::string_view agent_id) const {
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "SELECT agent_id, epoch, emit_seq_hwm, epoch_recv_ns, retired_epoch, unpaired_recv_ns, "
-        "unpaired_events, unpaired_held, pair_regressions, pair_stragglers, pair_recoveries, "
-        "pair_duplicates, retired_events "
-        "FROM guaranteed_state_store.guardian_agent_order WHERE agent_id = $1::text",
+        (std::string("SELECT o.agent_id, o.epoch, o.emit_seq_hwm, o.epoch_recv_ns, "
+                     "o.retired_epoch, o.unpaired_recv_ns, o.unpaired_events, o.unpaired_held, "
+                     "o.pair_regressions, o.pair_stragglers, o.pair_recoveries, "
+                     "o.pair_duplicates, o.retired_events, ") +
+         kAgentOrderUnorderedSql +
+         " AS currently_unordered "
+         "FROM guaranteed_state_store.guardian_agent_order o WHERE o.agent_id = $1::text")
+            .c_str(),
         std::vector<std::string>{std::string(agent_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         if (const auto d =
@@ -4280,14 +4301,17 @@ GuaranteedStateStore::agent_order_for_agent(std::string_view agent_id) const {
     o.pair_recoveries = num(10);
     o.pair_duplicates = num(11);
     o.retired_events = num(12);
+    o.unordered_by_store = to_bool(PQgetvalue(r, 0, 13));
     return std::optional<GuardianAgentOrder>{std::move(o)};
 }
 
-// Agents "currently unordered": the latest accepted unpaired census-bearing event is later than the
-// pair clock (NULL clock reads as 0, so a never-paired agent qualifies). The scope contract is
-// uncertain_rule_count's: an engaged-empty scope is zero without a query (ADR-0017 INV-2), a
-// non-empty one is applied IN SQL before the count and the id list (INV-3). One statement, so the
-// count and the ids come from one snapshot; the window count is taken before the LIMIT.
+// Agents "currently unordered" (the predicate is `kAgentOrderUnorderedSql`, the only definition):
+// the latest accepted unpaired census-bearing event is later than the pair clock (NULL clock reads
+// as 0, so a never-paired agent qualifies), or the clock is recorded in the database's future. The
+// scope contract is uncertain_rule_count's: an engaged-empty scope is zero without a query
+// (ADR-0017 INV-2), a non-empty one is applied IN SQL before the count and the id list (INV-3). One
+// statement, so the count and the ids come from one snapshot; the window count is taken before the
+// LIMIT.
 std::expected<UnorderedAgentsSummary, std::string> GuaranteedStateStore::unordered_agents(
     const std::optional<std::vector<std::string>>& agent_scope) const {
     static DegradeSampler sampler;
@@ -4308,20 +4332,19 @@ std::expected<UnorderedAgentsSummary, std::string> GuaranteedStateStore::unorder
             spdlog::warn("GuaranteedStateStore::unordered_agents: pool acquire timed out");
         return std::unexpected("no database connection: " + pool_.last_error());
     }
-    std::string sql = "SELECT agent_id, count(*) OVER () FROM "
-                      "guaranteed_state_store.guardian_agent_order "
-                      "WHERE unpaired_recv_ns IS NOT NULL "
-                      "AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)";
+    std::string sql = "SELECT o.agent_id, count(*) OVER () FROM "
+                      "guaranteed_state_store.guardian_agent_order o WHERE " +
+                      std::string(kAgentOrderUnorderedSql);
     std::vector<std::string> params;
     if (agent_scope) {
         std::vector<std::string_view> views;
         views.reserve(agent_scope->size());
         for (const std::string& a : *agent_scope)
             views.emplace_back(a);
-        sql += " AND agent_id = ANY($1::text[])";
+        sql += " AND o.agent_id = ANY($1::text[])";
         params.push_back(pg::to_text_array(views));
     }
-    sql += " ORDER BY agent_id COLLATE \"C\" LIMIT " + std::to_string(kUnorderedAgentIdCap);
+    sql += " ORDER BY o.agent_id COLLATE \"C\" LIMIT " + std::to_string(kUnorderedAgentIdCap);
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
         if (const auto d =
@@ -4381,11 +4404,13 @@ std::expected<std::int64_t, std::string> GuaranteedStateStore::unordered_agent_c
         pg::exec_params(conn, "SET LOCAL statement_timeout = 1000", std::vector<std::string>{});
     pg::PgResult res =
         timeout.status() == PGRES_COMMAND_OK
-            ? pg::exec_params(conn,
-                              "SELECT count(*) FROM guaranteed_state_store.guardian_agent_order "
-                              "WHERE unpaired_recv_ns IS NOT NULL "
-                              "AND unpaired_recv_ns > COALESCE(epoch_recv_ns, 0)",
-                              std::vector<std::string>{})
+            ? pg::exec_params(
+                  conn,
+                  (std::string("SELECT count(*) FROM guaranteed_state_store.guardian_agent_order "
+                               "o WHERE ") +
+                   kAgentOrderUnorderedSql)
+                      .c_str(),
+                  std::vector<std::string>{})
             : std::move(timeout);
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
         if (const auto d =

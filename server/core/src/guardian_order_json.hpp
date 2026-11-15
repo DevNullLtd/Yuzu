@@ -4,7 +4,8 @@
 /// The one JSON rendering of a `GuardianAgentOrder` (the `ordering` object of the per-device
 /// all-guards read). REST (`GET /api/v1/guaranteed-state/agents/{agent_id}/rules`) and MCP
 /// (`get_guardian_device_guards`) both call this, so the two surfaces cannot drift on a key, a
-/// null or the `currently_unordered` derivation. Pure: no store, no I/O.
+/// null or the `currently_unordered` value, which is the one the store computed in SQL
+/// (`GuardianAgentOrder::unordered_by_store`). Pure: no store, no I/O.
 
 #include <cstdint>
 #include <format>
