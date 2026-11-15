@@ -11,7 +11,11 @@
  * armed spark of its type onto O(mechanism) OS resources — one IOCP + thread
  * for file changes, one TP_WAIT pool for registry changes, one sd-bus
  * connection + thread (Linux) or one alertable-wait thread + one SCM
- * connection (Windows) for service changes — never O(rules).
+ * connection (Windows) for service changes, never O(rules). That bound is on
+ * the resident watch resources: since #5719 item 5 the Windows File mechanism
+ * ALSO does O(watched directories) periodic work (one short-lived detached
+ * identity-verification thread per watched directory per path_verify_interval),
+ * so its steady-state CPU and thread-creation cost is not O(mechanism).
  *
  * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
  * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test
@@ -600,19 +604,27 @@ struct FileMechanismTestControls {
     std::chrono::milliseconds path_lost_stuck_deadline{0};
     /// Runs on the detached verification worker, with no lock, before the real
     /// check. Returns 0 to run the real check, or a Win32 error to fail the open
-    /// step with (ERROR_PATH_NOT_FOUND reads as lost, anything else as undecidable).
-    /// May park (a hung path); the test must release it before stopping. Throwing
-    /// reads as undecidable. Null clears it.
+    /// step with (ERROR_PATH_NOT_FOUND or ERROR_FILE_NOT_FOUND reads as lost,
+    /// anything else as undecidable). May park (a hung path); the test must
+    /// release it before stopping. Throwing reads as undecidable. The worker is
+    /// detached and never joined, and the hook is copied into it: capture shared
+    /// state by value, never a test local by reference. Null clears it.
     std::function<unsigned long(std::wstring_view dir)> verify_hook;
-    /// Runs on the worker for every dequeued completion of a real directory, under
-    /// the mechanism's lock (it must not call back into the mechanism), with the
-    /// completion's result and byte count. Returning true swallows the completion:
-    /// nothing processes it, as if the OS never delivered it (the read is not
-    /// outstanding any more, and not reissued). Hand swallowed completions back
-    /// with release_suppressed_completions. Null clears it (swallowed ones stay).
+    /// Runs on the owner worker for every dequeued completion of a watched
+    /// directory or of an ancestor shelter, under the mechanism's lock (it must not
+    /// call back into the mechanism), with the completion's result and byte count.
+    /// Returning true swallows the completion: nothing processes it, as if the OS
+    /// never delivered it (the read is not outstanding any more, and not reissued).
+    /// Hand swallowed completions back with release_suppressed_completions. Null
+    /// clears it (swallowed ones stay). It runs inside run() but outside run()'s
+    /// try, so it must NEVER throw (a throw ends the process): a test-only seam.
+    /// The stash of swallowed completions holds RAW DirWatch pointers: releasing
+    /// after the watch was unwatched or the mechanism stopped is a use-after-free,
+    /// so a test must release BEFORE it disarms.
     std::function<bool(std::wstring_view dir, bool ok, unsigned long bytes)> completion_suppress_hook;
     /// One-shot: re-post every completion the suppress hook swallowed so the worker
-    /// processes it with its original result and byte count.
+    /// processes it with its original result and byte count. Release before the
+    /// watch is disarmed (see completion_suppress_hook).
     bool release_suppressed_completions{false};
 };
 
@@ -643,12 +655,13 @@ struct FileMechanismDebugCounters {
     /// the path still names the directory the watch holds. `lost`: it names a
     /// different directory or nothing (the watch is faulted). `unverifiable`: the
     /// check could not decide (open refused, identity unavailable, worker threw);
-    /// never a fault.
+    /// a fault only when kVerifyUnverifiableFaultStreak of them come in a row.
     std::uint64_t verify_same{0};
     std::uint64_t verify_lost{0};
     std::uint64_t verify_unverifiable{0};
     std::uint64_t verify_refused{0};       ///< verify launches refused by a full lane (retried)
-    std::uint64_t verify_launch_failed{0}; ///< verify launches that failed to start a thread (retried)
+    std::uint64_t verify_launch_failed{0}; ///< verify launches attempted and failed to start a thread
+                                           ///< (retried); a launch never attempted is not counted
     std::uint64_t path_lost_stuck{0};      ///< lost paths whose drain outlasted the stuck deadline
     std::uint64_t path_lost_drained_ok{0}; ///< lost-path drains whose completion carried `ok`
 };

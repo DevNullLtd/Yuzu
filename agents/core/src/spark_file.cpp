@@ -224,6 +224,13 @@ constexpr std::size_t kVerifyLaneCap = 4;
 /// leaves the watch unverified and is not covered). A directory that stays
 /// unverifiable but openable re-faults about every (this many intervals + the
 /// ordinary retry): honest and bounded, not damped (a follow-up).
+/// "In a row" means no DECIDED result (Same) and no re-establishment in between; it is
+/// NOT time-bounded: results separated by refused launches or by a long quiet stretch
+/// still add up. Every open error other than not-found counts, including resource
+/// exhaustion (handle or memory pressure), so after this many such results a watch whose
+/// handle may still be working is cancelled and dropped and re-established on the ordinary
+/// retry (30 s, doubling to a 300 s cap on repeated failure); excluding resource errors
+/// from the streak is a follow-up.
 constexpr unsigned kVerifyUnverifiableFaultStreak = 3;
 /// How long a lost path may wait for its cancelled read's completion before the
 /// wait is counted and warned once (an observation, not an escalation: the sweep
@@ -342,7 +349,9 @@ struct FileProbeResult {
     const char* stage{""}; ///< which step failed, for the log / fault reason
     DirIdentity id;        ///< Target mode: identity of `handle`'s directory (valid=false when the
                            ///< filesystem gave none). A verification result: identity of whatever
-                           ///< the path named when it was re-opened.
+                           ///< the path named when it was re-opened. An `ok` Target result whose
+                           ///< identity is not valid carries the failed identity read in
+                           ///< `err`/`stage` (diagnostic only: `ok` still decides the commit).
 };
 static_assert(std::is_nothrow_move_constructible_v<FileProbeResult>);
 
@@ -438,6 +447,10 @@ struct FileProbeJob {
             if (open_dir(dir, h, err)) {
                 DWORD id_err = 0;
                 r.id = read_dir_identity(h.get(), id_err); // from the exact handle that is returned
+                if (!r.id.valid) { // diagnostic only (the attach logs it); `ok` still commits
+                    r.err = id_err;
+                    r.stage = "FileIdInfo(target)";
+                }
                 r.handle = std::move(h);
                 r.resolved_dir = dir;
                 r.mode = WatchMode::Target;
@@ -1788,8 +1801,10 @@ private:
     }
 
     /// Consume a finished verification, if any. Same resets the could-not-decide
-    /// streak; Unverifiable counts it (one warn on the first of a run, a fault at
-    /// kVerifyUnverifiableFaultStreak in a row); Lost faults the watch. Under mu_.
+    /// streak; Unverifiable counts it (one warn on the first of each RUN of undecided
+    /// results, re-armed whenever a Same or a re-establishment resets the streak; a
+    /// fault at kVerifyUnverifiableFaultStreak in a row); Lost faults the watch. Under
+    /// mu_.
     void harvest_verify_locked(DirWatch& w, FilePassWork& work) {
         if (!w.verify_call)
             return;
@@ -1803,8 +1818,14 @@ private:
         if (!verify_eligible(w) || w.path_lost)
             return;
         enum class Verdict { Same, Lost, Unverifiable } v = Verdict::Unverifiable;
+        // What the warn below reports for an undecided result; the worker-threw path has
+        // no result to read (`stage` is a string literal either way).
+        const char* undecided_stage = "verification worker threw or its result was lost";
+        DWORD undecided_err = 0;
         if (r->has_value()) {
             const FileProbeResult& res = **r;
+            undecided_stage = res.stage;
+            undecided_err = res.err;
             if (res.ok)
                 v = w.dir_id.same_as(res.id) ? Verdict::Same : Verdict::Lost;
             else if (std::string_view(res.stage) == kVerifyOpenStage &&
@@ -1818,12 +1839,13 @@ private:
             break;
         case Verdict::Unverifiable:
             verify_unverifiable_.fetch_add(1, std::memory_order_relaxed);
-            if (++w.unverifiable_streak == 1) { // the first of a run: one warn, never one per sample
+            if (++w.unverifiable_streak == 1) { // the first of a run: one warn per RUN, not per sample
                 try {
-                    spdlog::warn("spark_file: '{}' cannot be verified (the directory identity check "
-                                 "could not decide); reported faulted after {} in a row",
-                                 ::yuzu::log_key_token(fs::path(w.dir).string()),
-                                 kVerifyUnverifiableFaultStreak);
+                    spdlog::warn("spark_file: '{}' directory identity check undecided at {} "
+                                 "(err={}), streak 1/{}; the watch is not faulted unless it stays "
+                                 "undecided",
+                                 ::yuzu::log_key_token(fs::path(w.dir).string()), undecided_stage,
+                                 undecided_err, kVerifyUnverifiableFaultStreak);
                 } catch (...) {
                 }
             }
@@ -1993,8 +2015,8 @@ private:
         if (!w.dir_id.valid) {
             try {
                 spdlog::info("spark_file: '{}' path verification unavailable: no usable directory "
-                             "identity (a rename of this directory will not be detected)",
-                             ::yuzu::log_key_token(fs::path(w.dir).string()));
+                             "identity ({}, err={}); a rename of this directory will not be detected",
+                             ::yuzu::log_key_token(fs::path(w.dir).string()), res.stage, res.err);
             } catch (...) {
             }
         }
@@ -2528,11 +2550,18 @@ private:
         if (w.path_lost && !is_anc) {
             // The read mark_path_lost_locked() cancelled has now drained (run()
             // already cleared io_pending). Whatever it carries, `ok` or not, is
-            // evidence about the OLD directory under its OLD name: never fire it,
-            // never reissue it here (the failed-completion unwind route in
-            // unwind_pass_locked DOES reissue on this handle; it converges through the
-            // sweep's re-cancel). Only now is it safe to drop the handle and enter
-            // the ordinary retry; the fault was stamped and staged at detection.
+            // dropped: never fired and never reissued here (the OK-completion route
+            // in unwind_pass_locked DOES reissue on this handle; it converges
+            // through the sweep's re-cancel). Only now is it safe to drop the handle
+            // and enter the ordinary retry; the fault was stamped and staged at
+            // detection. Why dropping is safe depends on the reason:
+            //  - kReasonPathLost: the completion is evidence about the OLD
+            //    directory under its OLD name, so firing it would report a change
+            //    at the watched path that did not happen there.
+            //  - kReasonUnverifiable: the handle may be open on the RIGHT
+            //    directory, so an `ok` completion dropped here can be a real
+            //    change. It is recovered only by the resync fire (needs_resync,
+            //    set at detection) once the re-established watch commits.
             // The fault reason is the one detection stamped (nothing else writes
             // it in between). The retry is not a slow establishment: counting its
             // wait as one would bump slow_op_total and overwrite the reason on the
@@ -2763,8 +2792,8 @@ private:
                     // drain). Nothing else may run: a resync here would be retired
                     // before coverage resumed. Re-cancel in case the first cancel
                     // raced the read's own completion posting (idempotent). This
-                    // also converges the failed-completion unwind route that
-                    // reissued a read on the invalidated handle (unwind_pass_locked).
+                    // also converges the OK-completion unwind route that reissued
+                    // a read on the invalidated handle (unwind_pass_locked).
                     if (w.handle && w.io_pending)
                         ::CancelIoEx(w.handle.get(), &w.ov);
                     if (!w.path_lost_stuck_warned && now - w.path_lost_since >= path_lost_stuck_deadline()) {
@@ -2978,8 +3007,15 @@ private:
                 auto vit = dirs_.find(pl.dirkey);
                 DirWatch* vw = (vit != dirs_.end() && vit->second) ? vit->second.get() : nullptr;
                 if (pl.job || pl.status != DetachedLaunch::Launched || !pl.call) {
-                    (pl.status == DetachedLaunch::Rejected ? verify_refused_ : verify_launch_failed_)
-                        .fetch_add(1, std::memory_order_relaxed);
+                    // Count only an entry whose launch RETURNED: run_off_lock resets
+                    // `pl.job` once a launch returns, so an engaged job means no launch
+                    // outcome was recorded (the pass threw before or inside the launch
+                    // call) and `status` is only its LaunchFailed default; counting that
+                    // would overstate real launch failures.
+                    if (!pl.job)
+                        (pl.status == DetachedLaunch::Rejected ? verify_refused_
+                                                               : verify_launch_failed_)
+                            .fetch_add(1, std::memory_order_relaxed);
                     // Refused (lane full) or never launched: retry after the
                     // admission seed instead of a full interval. Watches attached
                     // together fall due together, and a full-interval retry would
@@ -3496,6 +3532,13 @@ private:
                             w.needs_resync = true;
                             w.resync_epoch = ++resync_epoch_;
                             defer_admission_locked(w, DetachedLaunch::LaunchFailed);
+                            // A lost path's retry wait is not a slow establishment: the
+                            // drain in process_completion_locked marks the grace spent
+                            // for the same reason (accepted_at is from the original
+                            // establishment, so the next sweep would count slow_op_total
+                            // and overwrite fault_reason). Scalar write, noexcept-safe.
+                            if (w.path_lost)
+                                w.grace_counted = true;
                         }
                     } else if (work.consumed_is_anc) {
                         // Ancestors carry no keys/resync — best effort is keeping it armed.
