@@ -42,7 +42,7 @@ fresh clone has none, so pass --since.
 Read-only: it runs `git` queries and changes no ref, index or file (in a partial clone, git itself may
 fetch objects the range needs). All repository-sourced text is printed with control characters
 (other than newline and tab) and invisible format characters (zero-width joiners, variation
-selectors, bidi marks) replaced by `?`, so an emoji sequence can show one. Stdlib only.
+selectors, bidi marks) replaced by `?`, so an emoji sequence can show one. Stdlib only, Python 3.9 or later.
 """
 
 from __future__ import annotations
@@ -689,12 +689,13 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
     """{line: version} for the lines of a CHANGELOG.md, the version being that of the `## [X]` heading above it.
 
     None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
-    be told: the line sits under a `##` heading that is not `## [X]`, before any heading, or under more than
-    one heading (a generic bullet repeated across releases), so naming one version could name the wrong one."""
+    be told: the line sits under a `#` or `##` heading that is not `## [X]` (indented, tab-separated, a title),
+    before any heading, or under more than one version (a generic bullet repeated across releases), so naming
+    one version could name the wrong one."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
     for line in lines_of((changelog or "").removeprefix("\ufeff")):
-        if line.startswith("## "):
+        if re.match(r" {0,3}#{1,2}(?:[ \t]|$)", line):
             m = re.match(r"## \[([^\]\n]*)\]", line)
             name = m.group(1).strip() if m else ""
             version = None if name.lower() == "unreleased" else name
@@ -1001,7 +1002,9 @@ def build_report(repo: Repo, since: str | None, full: bool, versions_only: bool 
         elif other:
             out.append(f"+ {plural(len(other), 'other dependency bump')} (workflows, pip, npm); --full lists them")
         if notices:
-            out.append("Not read or not listed, so not in the Breaking count above (run without --versions for the full report):")
+            if out and out[-1]:
+                out.append("")
+            out.append("Fragments the report could not use, which the Breaking count leaves out (run without --versions for the full report):")
             out.extend(notices)
         return out
     if images or other:
@@ -1040,7 +1043,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--full", action="store_true",
                     help="print whole bullets (not first lines) and list every non-image dependency bump")
     ap.add_argument("--versions", action="store_true",
-                    help="only the version bumps, rebuild/redeploy notes and Docker image bumps (the header still counts **Breaking entries)")
+                    help="only the version bumps, rebuild/redeploy notes and Docker image bumps (the header still counts **Breaking entries, and a `!` line names any fragment that could not be read or listed)")
     ap.add_argument("--repo", type=Path, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 

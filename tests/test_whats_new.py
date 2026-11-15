@@ -2243,6 +2243,32 @@ class MarkerAmbiguity(GitCase):
         self.assertNotIn("\x1b", out)
         self.assertNotIn("\u202e", out)
 
+    def test_a_heading_in_any_other_level_one_or_two_form_names_no_version(self):
+        for n, heading in enumerate(("##\t[1.0.0]", "  ## [1.0.0]", "# [1.0.0]", "##")):
+            with self.subTest(heading=heading):
+                repo, old = self.base(f"repo{n}")
+                log = f"# Changelog\n\n## [0.9.0] - 2026-08-01\n\n- **Other.**\n\n{heading}\n\n- **Shipped thing.**\n"
+                self.release_into(repo, log, old)
+                out = self.ok(repo, "--since", old)
+                self.assertIn("- **Shipped thing.**  [released]\n", out)
+                self.assertNotIn("[released 0.9.0]", out)
+
+    def test_a_sub_heading_does_not_end_the_section(self):
+        repo, old = self.base()
+        log = "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n### Added\n\n- **Shipped thing.**\n"
+        self.release_into(repo, log, old)
+        self.assertIn("- **Shipped thing.**  [released 1.0.0]\n", self.ok(repo, "--since", old))
+
+    def test_a_line_before_any_heading_names_no_version(self):
+        repo, old = self.base()
+        self.release_into(repo, "- **Shipped thing.**\n\n## [1.0.0] - 2026-09-01\n\n- **Other.**\n", old)
+        self.assertIn("- **Shipped thing.**  [released]\n", self.ok(repo, "--since", old))
+
+    def test_the_tag_cut_is_at_forty_characters(self):
+        self.assertEqual(WN.tag_for("x" * 40), "  [released " + "x" * 40 + "]")
+        self.assertEqual(WN.tag_for("x" * 41), "  [released " + "x" * 37 + "...]")
+        self.assertEqual(WN.tag_for(""), "  [released]")
+
     def test_every_mode_agrees_on_a_compound_changelog(self):
         repo, old = self.base()
         log = ("\ufeff# Changelog\n\n## [Unreleased]\n\n- **Dup.**\n\n## [1.1.0] - 2026-10-30\n\n- **Dup.**\n- **Plain.**\n\n"
@@ -2274,14 +2300,15 @@ class VersionsModeNotices(GitCase):
         self.put(repo, "changelog.d/2-b.changed.md", "- **Breaking: readable.**\n")
         return repo, old
 
-    def check(self, repo, old, needle):
-        self.commit(repo, "fragments")
+    def check(self, repo, old, needle, commit=True):
+        if commit:
+            self.commit(repo, "fragments")
         for flags in (("--versions",), ("--versions", "--full"), ()):
             with self.subTest(flags=flags):
                 out = self.ok(repo, "--since", old, *flags)
                 self.assertIn(needle, out)
                 if "--versions" in flags:
-                    self.assertIn("Not read or not listed, so not in the Breaking count above", out)
+                    self.assertIn("Fragments the report could not use, which the Breaking count leaves out", out)
                     self.assertIn("Breaking  1 changelog entry", out)
                     self.assertNotIn("Changelog entries added", out)
 
@@ -2300,11 +2327,53 @@ class VersionsModeNotices(GitCase):
         self.put(repo, "changelog.d/3-none.added.md", "no bullet here\n")
         self.check(repo, old, "with no '- ' bullet")
 
+    def test_a_gitlink_named_like_a_fragment(self):
+        repo, old = self.breaking_repo()
+        self.git(repo, "add", "-A")
+        self.git(repo, "update-index", "--add", "--cacheinfo", f"160000,{'a' * 40},changelog.d/9-sub.fixed.md")
+        self.git(repo, "commit", "-q", "-m", "fragments")
+        self.check(repo, old, "not regular files (a submodule)", commit=False)
+
+    def test_a_fragment_a_merge_commit_removed_and_reworded(self):
+        repo = self.init()
+        self.put(repo, "CHANGELOG.md", CHANGELOG)
+        self.put(repo, "changelog.d/README.md", "readme\n")
+        old = self.commit(repo, "base")
+        self.git(repo, "checkout", "-q", "-b", "rel")
+        self.put(repo, "x.txt", "x\n")
+        self.commit(repo, "rel work")
+        self.git(repo, "checkout", "-q", "-b", "next", old)
+        self.put(repo, "changelog.d/3-c.fixed.md", "- **Original text.**\n")
+        self.put(repo, "changelog.d/4-b.changed.md", "- **Breaking: readable.**\n")
+        self.commit(repo, "c")
+        self.git(repo, "checkout", "-q", "rel")
+        self.git(repo, "merge", "--no-commit", "--no-ff", "next")
+        self.put(repo, "CHANGELOG.md", (repo / "CHANGELOG.md").read_text().replace("### Fixed", "### Fixed\n- **Reworded in the merge.**", 1))
+        self.git(repo, "rm", "-qf", "changelog.d/3-c.fixed.md")
+        self.commit(repo, "merge and reword")
+        out = self.ok(repo, "--since", old, "--versions")
+        self.assertIn("! 1 fragment removed by a merge commit matched no line added to CHANGELOG.md", out)
+        self.assertIn("3-c.fixed.md", out)
+
+    def test_two_kinds_of_notice_keep_their_order_and_follow_a_blank_line(self):
+        repo, old = self.breaking_repo()
+        self.put(repo, "changelog.d/3-none.added.md", "no bullet here\n")
+        self.put(repo, "changelog.d/notes.txt", "x\n")
+        self.put(repo, "changelog.d/4-big.changed.md", "- **Breaking: big.** " + "x" * (2 * 1024 * 1024) + "\n")
+        self.commit(repo, "fragments")
+        self.put(repo, ".github/workflows/ci.yml", "a\n")
+        self.commit(repo, "build(deps): bump docker/login-action")
+        out = self.ok(repo, "--since", old, "--versions")
+        self.assertIn("+ 1 other dependency bump (workflows, pip, npm); --full lists them\n\nFragments the report", out)
+        self.assertLess(out.index("with no '- ' bullet"), out.index("not named like fragments"))
+        self.assertLess(out.index("not named like fragments"), out.index("over 1024 KiB"))
+        self.assertIn("\n\nFragments the report could not use", out)
+
     def test_no_notice_line_when_everything_was_read(self):
         repo, old = self.breaking_repo()
         self.commit(repo, "fragments")
         out = self.ok(repo, "--since", old, "--versions")
-        self.assertNotIn("Not read or not listed", out)
+        self.assertNotIn("Fragments the report could not use", out)
         self.assertNotIn("\n! ", out)
 
     def test_versions_full_names_the_other_dependency_bumps(self):

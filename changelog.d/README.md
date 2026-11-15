@@ -63,7 +63,7 @@ python3 scripts/whats-new.py                          # since your last pull
 python3 scripts/whats-new.py --since v0.15.0          # since a tag, branch or commit
 python3 scripts/whats-new.py --since "2 weeks ago"    # or YYYY-MM-DD
 python3 scripts/whats-new.py --full                   # whole bullets, every dependency bump
-python3 scripts/whats-new.py --versions               # only the version bumps (see below)
+python3 scripts/whats-new.py --versions               # version bumps, rebuild notes, Docker image bumps (see below)
 ```
 
 On Windows, where `python3` is often not on `PATH`, use the launcher:
@@ -96,16 +96,16 @@ It prints, in this order:
   removed, deprecated, changed, added, fixed. The heading counts them, and
   says how many are already released and how many are breaking. An entry a
   release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
-  when its first line sits under exactly one `## [X.Y.Z]` heading at `HEAD`. It
+  when its first line sits under one `## [X.Y.Z]` version at `HEAD`. It
   ends `[released]` when the version cannot be told: the release editorial pass
-  reworded the line (the usual cause), it appears under more than one heading
-  or under a `##` heading that is not `## [X]`, or `CHANGELOG.md` is gone;
+  reworded the line (the usual cause), it appears under more than one version
+  or under a `#` or `##` heading that is not `## [X]`, or `CHANGELOG.md` is gone;
   read `CHANGELOG.md` for the release. A line that is only under
   `[Unreleased]` has no marker. No marker means no release in the range moved
   the entry, which is the usual case for a pull of `dev`. The marker is read
   from `CHANGELOG.md` text, not from a tag, so it is a reading aid and not
   release evidence. Each shows its first line, cut at
-  200 characters. Security, removed and deprecated entries, and entries starting
+  200 characters (a marker follows the cut). Security, removed and deprecated entries, and entries starting
   `**Breaking` (in any case), are shown whole, continuation lines included;
   other entries show their continuation lines only with `--full`. A fragment
   replaced, reworded or withdrawn inside the range is shown once in its final
