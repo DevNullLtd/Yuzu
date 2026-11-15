@@ -1837,11 +1837,21 @@ flip, with a red-first test each:
     cost statement covers are a herd of N watches that go blind together for up to 300 s under handle or memory pressure
     (review id UP-G8-3), and an SMB blip longer than the streak whose cancelled read then does not drain (the
     never-draining case below). A directory that stays unverifiable but openable will re-fault about every (3 intervals
-    plus the retry). The retry is damped: it doubles 30 s, 60, 120, 240, then the 300 s cap across consecutive
-    losses with no decided (Same) check between them (counted in `path_lost_flaps`); a genuine rename after any Same,
-    or a first loss, restarts at 30 s. It adds no fault edge and changes no verdict. One route skips it: a throw while
-    the lost path drains recovers on the 50 ms admission backoff instead (above). A lost path whose cancelled read has
-    not drained after 30 s is counted (`path_lost_stuck`) and warned once; there is no escalation.
+    plus the retry). The retry is damped: it doubles 30 s, 60, 120, 240, then the 300 s cap across repeated
+    losses with no decided (Same) check between them and no failed re-establishment or shelter commit in between
+    (counted in `path_lost_flaps`; the counter is 0 at the first loss and 1 at the second, so it counts repeats); a
+    genuine rename after any Same, or a first loss, restarts at 30 s. It adds no fault edge and changes no verdict.
+    The damping covers the loop loss, drain, re-establishment commit, loss with no decided Same between. Three routes
+    restart the run (the next loss is treated as a first loss, 30 s), and all three only under-damp: (i) the
+    re-establishment itself fails first (the failure overwrites the fault reason before the eventual commit); (ii) the
+    retry finds the target absent and commits Ancestor shelter mode (health is cleared there, so the later
+    reappearance commit finds it clear); and (iii) an unwind recovery of the drain (a completion hook throw or an
+    allocation failure, on either the failed-completion arm or the OK-completion arm's failed reissue) recovers on the
+    50 ms admission backoff instead and skips the seeded retry (above). A replace loop faster than the verify interval
+    is blind for up to 300 s per cycle by design: the Faulted state stays reported and one resync `Fired` per key on
+    re-establishment covers the net state, but a change made and reverted inside the blind window is missed. A lost
+    path whose cancelled read has not drained after 30 s is counted (`path_lost_stuck`) and warned once; there is no
+    escalation.
     **Open residuals of the File fix** (none is claimed as covered): detection is sampled, so a watch can be deaf
     for up to one interval and then stays Faulted until the retry; a rename away and back between two samples is not
     noticed; an ancestor shelter whose own parent is renamed away is not verified, and whether a rename of an
@@ -1850,8 +1860,12 @@ flip, with a red-first test each:
     verified (author-reported: on a FAT32 volume no verification ran and the rename went undetected; ReFS, SMB,
     OneDrive and other filesystems were not tested); a verification that hangs pins one of 4 verification slots, that
     watch stays unverified, and 4 hung verifications disable verification for every other watch; a due watch waits
-    for a free slot and is admitted least-recently-verified first (a queue, not a refusal); a wait of more than 3
-    intervals is counted (`verify_starved`) and warned once per episode; `verify_refused` is expected to stay 0 (it is
+    for a free slot and is admitted least-recently-verified first (a queue, not a refusal); a wait of at least 3
+    intervals is counted (`verify_starved`) and warned once per episode, per watch (the warn is unthrottled and logged
+    under the pass lock, so a pinned lane or a post-resume queue can emit one warn per queued watch in a pass; the
+    episode flag clears only at a decided Same or a commit, so an episode that ends Unverifiable does not re-arm the
+    warn or the count until the next Same or commit; `verify_starved` is a debug counter that is not exported, tracked
+    with #7658 below, and there is no standing "starved now" gauge); `verify_refused` is expected to stay 0 (it is
     a tripwire that admission and the lane agree); least-recently-first turns starvation into lag, it does not remove
     it, and the hung verification of a watch is not itself flagged; a launch failure
     is retried after 50 ms (counted in `verify_launch_failed`, which counts only launches that were attempted); the
@@ -1866,7 +1880,8 @@ flip, with a red-first test each:
     open hangs (unmeasured), and a hung open pins a slot, is not a result, and shows only as `verify_starved` on the
     watches queued behind it; after a resume or network drop every watch falls due together, admission is capped at 4
     concurrent workers and served least-recently-verified first, a queue and not a thread burst (review id UP-8); a
-    cancelled read on a dead SMB handle that never drains is the UP-1 residual above; a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
+    cancelled read on a dead SMB handle that never drains is the never-draining-read residual above (review id UP-1);
+    a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
     (review id UP-9); renaming the parent of N watched directories gives N Faulted edges, N warns (one per Lost) and N
     infos (one per drain), and N probes that all retry at the same instant against the probe lane (review id UP-10); and every re-fault cycle
     delivers one resync `Fired` event per key when the watch is re-established.
@@ -1891,11 +1906,22 @@ flip, with a red-first test each:
     (4) Gate 5 flip-time chaos scenarios, none run here: a cancelled read that never completes (a blackholed SMB share
     or a filter driver), including `stop()` with it outstanding; a `CreateFileW` hung inside a verification at `stop()`
     or `unwatch()` while all 4 verification slots are pinned; a handle or memory-pressure herd of watches going blind
-    together; an in-place DENY ACL applied to a live watch's directory; and a pinned verification lane with N healthy
-    watches (expected: the starvation signal and no refusal churn). (5) Two test gaps: the DENY-ACL case has not been measured
+    together; an in-place DENY ACL applied to a live watch's directory; a pinned verification lane with N healthy
+    watches (expected: the starvation signal and no refusal churn); and, added in fix round 5 from the round 4 review
+    (words only, no label ids): a replace loop faster than the verify interval (the blind fraction approaches 300 s per
+    cycle, Faulted is reported, one resync `Fired` per recovery); a rename-away-then-recreate loop that is absent at the
+    30 s retry (not damped: the shelter route); a pinned lane with 1,000 and with 10,000 healthy watches (the warn
+    count, the time the pass lock is held, and `verify_refused` staying 0); a resume or clock-jump burst with all
+    watches due (no spin, a bounded `sweep_passes`); a completion hook throw during the drain combined with flapping
+    (the 50 ms route); a saturated lane plus a late genuine rename (it is classified as a flap); a recommit during a
+    hung verification; and the dead-share latency to the 3rd undecided result under queue lag (longer than 10 to
+    15 s). (5) Two test gaps: the DENY-ACL case has not been measured
     under LOCAL SYSTEM, the identity of the Windows CI runner (`deploy/windows/README.md`), so a red first CI run there
     would mean the case itself does not hold under that identity (a broken leg), not that the mechanism regressed; and
-    `verify_launch_failed` has no test (`verify_refused` is only asserted to stay 0 under a saturated lane).
+    `verify_launch_failed` has no test (`verify_refused` is only asserted to stay 0 under a saturated lane). (6) Shard B
+    timing: the five round 4 File cases add roughly 10 to 15 s to the Windows agent shard that holds them (an estimate
+    from the single-case run times, not a shard measurement); no post-change shard B timing exists, so measure it on
+    the first Windows CI run.
     **Runs.** Author-reported (pre-governance, logs not retained): the cancelled read's completion was consumed in
     the same millisecond as detection in the one run whose log was read; the identity read was stable across
     repeated opens on the NTFS temp volume (about 5300 verifications, none unverifiable) and the four File identity
@@ -1939,6 +1965,35 @@ flip, with a red-first test each:
     untouched (network case only) and streak 4 (the stays-undecidable case and the network case). The mutated sources
     were restored and the rig tree rebuilt from the unmutated source after each. The set of cases is not a proof that
     no other deaf path exists in any mechanism.
+    Fix round 5 (round 4 Gate 8 low items), rig bytes: commit `23b1d42fbb` (comments and one log format string in
+    `spark_file.cpp`, whole-repo tree `2627bceb120084a6f5e0bdcde919c8df8e78770d`) and commit `6b0365a74d` (two test
+    flake fixes and comments in `test_spark_mechanism.cpp`, whole-repo tree `c1087c75393cccfc6748167fb5e8fa09879e3749`;
+    `spark_mechanism.hpp` is unchanged since `aef43b21ac`). The rig tree was `git archive` of `6b0365a74d` (the docs
+    commit that follows changes no source), and the md5 of the three source files on the rig equalled the md5 of the
+    committed files (`spark_file.cpp` `258ebab4b6707ba0748203c80e9dab8e`, `spark_mechanism.hpp`
+    `81d44cb03545293a6e7f76db72a32099`, `test_spark_mechanism.cpp` `4652ff04bdae21ab559ae710d8b1a04e`); the tree hashes
+    name the whole repository and were not themselves checked on the rig. The production commit of this round changes
+    comments and one log format string ("repeat losses" for "consecutive losses" in the drain info line) and nothing
+    else (checked by listing every non-comment changed line of the diff), so the earlier full table of 22 mutations
+    was run on the round 4 production bytes and is not re-run in full; only the subset below was re-run on the new
+    bytes. Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green.
+    Windows (weecolin): `[mechanism]` 187 cases (5631 assertions), `[5719]` 62 (2053) and `[4415prA]` 105 (3544)
+    green (the assertion totals moved by one or two against round 4 because some cases count assertions per
+    iteration), the parked Registry case red when run by tag (1 case, 16 assertions, 2 failed) and still counted once
+    among the hidden cases. The four changed or flake-prone cases (network error, the two damping cases, the
+    saturated lane) each ran 20 of 20 green normally and 50 of 50 green with one busy-loop process per logical core;
+    in addition the saturated-lane case and the first damping case each ran 200 of 200 green normally, the window of
+    the two flakes fixed this round (the flakes are race windows, so a clean run is evidence of absence only up to
+    that count). Eleven mutations were re-run on the new test bytes (up to 3 runs of each of the 20 File cases,
+    stopping at a case's first red run): admission in map order, admission ignoring free slots, the starvation check
+    deleted and the lane wake clause dropped (each: the saturated-lane case only); no seed from `lost_flaps` into
+    `backend_attempts` and `lost_flaps` reset at commit (each: the first damping case only, which now uses an exact
+    count of three failing verifications); the flap rule without the decided-verify gate and a decided verify that
+    never sets the flag (each: the decided-verify case only); network errors that leave the streak untouched (network
+    case only); streak 4 (the stays-undecidable case and the network case); all ten caught as in round 4. M12 (the
+    guard on the unwind OK-completion arm's reissue-failure sub-branch) was again NOT caught (untested guard, no
+    seam). The mutated source was restored and the rig tree rebuilt after each (the restored md5 equalled the
+    committed one).
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
