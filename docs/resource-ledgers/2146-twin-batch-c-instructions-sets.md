@@ -112,7 +112,11 @@ throttle, and some value containers. The test-side resources are listed last.
   `PolicyStore::query_policies` per own fragment (`fragment_filter`, `limit` 4, one lease each), then
   one `referrers_fn` call per contained definition (three leases inside it). They run SEQUENTIALLY,
   each taking and releasing its own lease; no lease is held across the next read and NONE is held
-  across `uninstall()`, which takes its own.
+  across `uninstall()`, which takes its own. The uninstall callback (`make_item_delete_fn`, also the
+  install compensation callback) adds, only after a bare `false` from `PolicyStore::delete_fragment`
+  or `delete_policy`, up to two more sequential leased reads (`get_fragment` then `query_policies`
+  with `limit` 1, or `get_policy`), each taken and released inside its store method; its inner
+  `db_error` lambda captures the `item_id` reference parameter and runs inside that call.
 - **Release point:** scope exit; every refusal returns before `uninstall()` is reached, so a refused
   pack is untouched.
 - **Transfer:** the exclusion set is moved into `exclusions` and read by reference per call; blockers
@@ -189,7 +193,8 @@ throttle, and some value containers. The test-side resources are listed last.
   `store->import_definition_json`.
 - **Owner type:** a local `nlohmann::json` parse of the request body and one `std::string` produced
   by `dump(-1, ' ', false, error_handler_t::replace)`.
-- **Release point:** scope exit; the dumped string is a temporary passed to the store by value.
+- **Release point:** scope exit; the dumped string is a temporary bound to the store's `const
+  std::string&` parameter and lives to the end of that call.
 - **Transfer:** never; a body that is not depth-safe JSON, not parseable or not an object is
   returned unchanged.
 - **Failure cleanup:** parsing uses `allow_exceptions=false` and `json_exceeds_depth` runs first;
@@ -226,6 +231,12 @@ throttle, and some value containers. The test-side resources are listed last.
   `std::thread` or wait out a full lock timeout. `workers` is declared after `delete_txn`, so it is
   destroyed first. The worker records its result in a captured local; no Catch macro runs off the
   main thread. The two-writer race test uses the same `Workers` seam with an empty hook.
+- **Raw libpq connection (N4-3):** `test_workflow_routes.cpp` opens one `PQconnectdb` connection outside
+  the pool to insert a corrupt pack item row; it is adopted into `pg::PgConn` on the same statement
+  and closed at scope exit (it is destroyed before the pool and the database fixture).
+- **Fault helpers (N4-1, N4-2b, N4-5):** `yuzu::test::SqlFault` and `WriteFault` arm a trigger or a
+  table rename on a pooled connection and repair it in their destructor (a bounded acquire), after
+  an explicit `repair()` in each test; they are declared after the pool, so they are destroyed first.
 - **Perf test:** the `ticket_subject` scaling test reads `std::chrono::steady_clock` only; no thread
   or file.
 - **Source-tree read:** none added by this change.

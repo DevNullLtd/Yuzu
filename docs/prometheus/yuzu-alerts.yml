@@ -6497,7 +6497,7 @@ groups:
             confirmed orphan: delete it directly through that sibling store's
             own route (DELETE /api/instructions/{id}, /api/policies/{id} or
             /api/policy-fragments/{id}, /api/workflows/{id}); delete the
-            workflows and fragments that name an orphan definition first,
+            schedules, workflows and fragments that name an orphan definition first,
             because its DELETE answers 409 while they exist. If it instead
             says "outcome could not be confirmed" (no item named), do NOT
             delete anything by guessing ids from the submitted bundle — first
