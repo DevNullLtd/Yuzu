@@ -1670,7 +1670,8 @@ private:
 /// helper accepts (scripts/install-agent-user.sh; pinned by
 /// tests/test_legacy_quarantine_plugin_removed_lexical.py). An existing directory is trusted
 /// only when it is a real directory (not a link) owned by us with no group/other access. Empty
-/// when `agent.data_dir` is unset or the directory cannot be made safe: the apply is then refused, never staged in /tmp.
+/// when `agent.data_dir` is unset or the directory cannot be made safe: the apply is then refused,
+/// never staged in /tmp.
 [[maybe_unused]] std::string private_staging_dir(YuzuPluginContext* raw) {
     const auto data_dir = config_value(raw, "agent.data_dir");
     if (data_dir.empty())

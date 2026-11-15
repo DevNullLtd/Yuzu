@@ -1596,7 +1596,8 @@ TEST_CASE("iptables_helper_argv: anything outside the granted shapes is refused"
     // addresses: a name, an option, a prefix out of range, a malformed literal
     for (const char* addr : {"evil.example.com", "localhost", "-1.2.3.4", "--modprobe=/x", "10.0.0", "10.0.0.0.0",
                              "10..0.1", ".10.0.1", "10.0.0.", "10.0.0.1/33", "10.0.0.1/", "/24", "10.0.0.1/-1",
-                             "10.0.0.1/24/1", "10.0.0.1/0024", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
+                             "10.0.0.1/24/1", "10.0.0.1/0024", "10.0.0.1/08", "10.0.0.1/024", "10.0.0.1/000",
+                             "10.0.0.1/032", "2001:db8::/032", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
                              "fe80:1", "g::1", "10.0.0.1 ", "0x0a.0.0.1", "10.0.0.1,10.0.0.2",
                              "::ffff:1.2.3.4", "!10.0.0.1", "10.0.0.1/ 8", "",
                              // out-of-range or zero-padded quads: a name to the tool, not an address

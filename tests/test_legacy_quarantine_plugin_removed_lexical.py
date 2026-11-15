@@ -418,7 +418,8 @@ _ADV = [
     *[["-A", "yuzu-fwq-1", "-s", addr, "-p", "tcp", "-j", "ACCEPT"]
       for addr in ("evil.example.com", "localhost", "-1.2.3.4", "--modprobe=/x", "10.0.0", "10.0.0.0.0",
                    "10..0.1", ".10.0.1", "10.0.0.", "10.0.0.1/33", "10.0.0.1/", "/24", "10.0.0.1/-1",
-                   "10.0.0.1/24/1", "10.0.0.1/0024", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
+                   "10.0.0.1/24/1", "10.0.0.1/0024", "10.0.0.1/08", "10.0.0.1/024", "10.0.0.1/000",
+                   "10.0.0.1/032", "2001:db8::/032", "2001:db8::1/129", "2001:db8:::1", "2001:DB8::1",
                    "fe80:1", "g::1", "10.0.0.1 ", "0x0a.0.0.1", "10.0.0.1,10.0.0.2", "::ffff:1.2.3.4",
                    "!10.0.0.1", "10.0.0.1/ 8", "", "1" * 44,
                    # out of range or zero-padded quads (F8): a name to the tool, not an address
@@ -644,6 +645,12 @@ class NftLoadRuns(unittest.TestCase):
                 self.assertNotIn(b"\0", r.stdout, (sh, at))
                 # either refused having run nothing, or nft got the plugin's own text
                 self.assertIn((r.returncode, r.stdout), ((64, b""), (0, self.want())), (sh, at))
+        # a tail of NUL bytes and no newline: the shell drops it or reads it as an empty line
+        path = self.staged(self.golden.encode() + b"\0" * 8)
+        for sh in available_shells():
+            r = self.run_load(sh, path)
+            self.assertNotIn(b"\0", r.stdout, (sh, "nul tail"))
+            self.assertIn((r.returncode, r.stdout), ((64, b""), (0, self.want())), (sh, "nul tail"))
 
     def test_a_file_that_is_not_the_plugins_ruleset_runs_nothing(self):
         g = self.golden
@@ -710,6 +717,7 @@ class NftLoadRuns(unittest.TestCase):
             "ip with an IPv6 address": g.replace("ip saddr 10.0.0.5 tcp dport 22", "ip saddr 2001:db8::1 tcp dport 22", 1),
             "ip6 with an IPv4 address": g.replace("ip6 saddr 2001:db8::/32", "ip6 saddr 10.0.0.5", 1),
             "a prefix past 32": g.replace("ip saddr 10.1.0.0/16", "ip saddr 10.1.0.0/33", 1),
+            "a leading-zero prefix": g.replace("ip saddr 10.1.0.0/16", "ip saddr 10.1.0.0/016", 1),
             "an upper-case IPv6": g.replace("ip6 saddr 2001:db8::/32", "ip6 saddr 2001:DB8::/32", 1),
             "port 0": g.replace("tcp dport 22 accept", "tcp dport 0 accept", 1),
             "port 65536": g.replace("tcp dport 22 accept", "tcp dport 65536 accept", 1),
@@ -725,6 +733,8 @@ class NftLoadRuns(unittest.TestCase):
             "another interface": g.replace("    iif lo accept\n", "    iif eth0 accept\n", 1),
             "an ICMP type": g.replace("nd-neighbor-advert }", "nd-neighbor-advert, echo-request }", 1),
             "text after the closing brace": g + "flush ruleset\n",
+            "an unterminated flush ruleset after the closing brace": g + "flush ruleset",
+            "an unterminated tail past the byte cap": g + "x" * 300000,
             "a blank line after the closing brace": g + "\n",
             "the whole table twice": g + g,
             "a root-only line marker": g.replace("    iif lo accept\n", "    ROOT-ONLY-SECRET-LINE\n", 1),
@@ -888,11 +898,10 @@ class HelperDirectoryVerdict(unittest.TestCase):
                                         ("-1", "755"), ("0", "-755"), ("0", "7 5")]),
                          ["refuse"] * 8)
 
-    def test_the_installer_and_the_check_apply_it_and_clean_up_a_stale_temp(self):
+    def test_the_installer_and_the_check_apply_it(self):
         text = read_text(INSTALLER)
         install = text[text.index("install_fw_helper() {"):text.index("remove_fw_helper() {")]
         self.assertLess(install.index("check_fw_dir"), install.index("mktemp"))      # stop before writing
-        self.assertLess(install.index(".yuzu-fw-helper.??????"), install.index("mktemp"))
         check = text[text.index("check_fw_helper() {"):text.index("# ── linux capabilities")]
         self.assertIn("check_fw_dir", check)
         self.assertIn("stat -L -c '%u %a %G'", text)

@@ -659,7 +659,8 @@ generate_fw_helper_content() {
 #       [--tcp-flags ACK ACK|RST RST (tcp only)] -j ACCEPT
 # <address> is an IPv4 literal (four decimal parts of 0 to 255, no leading zero, exactly three
 # dots) or an IPv6 literal (lower-case hex and colons, two or more colons), at most 43 characters
-# with its prefix; <port> is 1 to 65535 in plain decimal.
+# with its prefix, which is 1 to 3 digits with no leading zero (0 alone is allowed) and at most 32
+# or 128; <port> is 1 to 65535 in plain decimal.
 #
 # The caller's arguments are never passed on. Each branch below matches the token count and the
 # fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
@@ -677,7 +678,9 @@ generate_fw_helper_content() {
 # only with an IPv6 one. The whole file is checked before anything runs; then nft is given a
 # ruleset this script builds from its own literals plus the checked tokens, on standard input
 # (nft -f /dev/stdin). Nothing read from the file is printed. The link, file-type and path checks
-# are not atomic with the open, so they are not the boundary: the line grammar is.
+# are not atomic with the open, so they are not the boundary: the line grammar is. A last line with
+# no newline is refused. A NUL byte is dropped, or cuts its line short, as the shell reads it and
+# never reaches nft; bytes past the cap are not read.
 
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -773,6 +776,7 @@ is_addr() {
             pre=${1#*/}
             all_digits "$pre" || return 1
             [ "${#pre}" -le 3 ] || return 1
+            case $pre in 0?*) return 1 ;; esac
             ;;
     esac
     case $addr_part in
@@ -1037,6 +1041,7 @@ nft_apply() {
     nft_text=
     nft_n=
     st=1
+    line=
     while IFS= read -r line; do
         nft_n=${nft_n}x
         [ "${#nft_n}" -le 512 ] || refuse
@@ -1072,6 +1077,8 @@ nft_apply() {
             *) refuse ;;
         esac
     done
+    # The loop body does not run for a last line with no newline, but read leaves its text in $line.
+    [ -z "$line" ] || refuse
     [ "$st" = 14 ] || refuse
     printf '%s' "$nft_text" | "$NFT" -f /dev/stdin
     exit $?
@@ -1105,10 +1112,13 @@ nft_load() {
     esac
     # Not the boundary: a link or a non-regular file is refused here, but the file can change
     # between these tests and the open below. The boundary is nft_apply, which reads the one opened
-    # file and gives nft only text it built itself. The tests keep a FIFO from blocking the open.
+    # file and gives nft only text it built itself. A FIFO present at the tests is refused; one put
+    # there after them blocks the open until a writer appears.
     if [ -L "$path" ] || [ ! -f "$path" ]; then
         refuse
     fi
+    # The cap, 512 x 512 + 1, bounds the read and is not a check: 512 full-length lines exceed it and
+    # nft_apply refuses them. The largest ruleset the grammar accepts is 64512 bytes.
     head -c 262145 < "$path" | nft_apply
     exit $?
 }
@@ -1213,16 +1223,9 @@ YUZU_FW_HELPER
 # mode has the group-write bit (Debian policy ships /usr/local directories root:staff 2775, so a
 # flat refusal would stop the installer there). Anything that is not a uid and an octal mode refuses.
 fw_dir_verdict() {
-    case $1 in '' | *[!0123456789]*) echo refuse; return ;; esac
     case $2 in '' | *[!01234567]*) echo refuse; return ;; esac
     [ "$1" = 0 ] || { echo refuse; return; }
-    local mode=$2 rest other group
-    other=${mode#"${mode%?}"}
-    rest=${mode%?}
-    group=${rest#"${rest%?}"}
-    case $other in 2 | 3 | 6 | 7) echo refuse; return ;; esac
-    case $group in 2 | 3 | 6 | 7) echo warn; return ;; esac
-    echo ok
+    if (( 8#$2 & 0002 )); then echo refuse; elif (( 8#$2 & 0020 )); then echo warn; else echo ok; fi
 }
 
 # check_fw_dir DIR: applies fw_dir_verdict to DIR as it is now. Prints the warning on warn and
@@ -1263,8 +1266,9 @@ install_fw_helper() {
     [[ -d "$dir" ]] || run install -d -m 0755 -o root -g root "$dir"
     # Stop before writing when anyone but root could replace the helper.
     check_fw_dir "$dir" || return 1
-    # A killed earlier run can leave its temporary file; none of them is ours to keep.
-    rm -f "$dir"/.yuzu-fw-helper.??????
+    # No sweep of earlier temp files: a killed run can leave one, a root-owned dotfile that nothing
+    # runs (sudoers names only the exact helper path), and a concurrent run's live file has the same
+    # name shape.
     # A temporary file in the SAME directory, so the final rename is atomic: sudo never sees a
     # half-written helper, and a failed write leaves the previous helper in place.
     tmp=$(mktemp "$dir/.yuzu-fw-helper.XXXXXX") || { warn "cannot create a temp file in $dir"; return 1; }

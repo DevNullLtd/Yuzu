@@ -2503,10 +2503,10 @@ namespace detail {
 
 /// An IPv4 literal (four decimal parts of 0 to 255, no leading zero: parse_ipv4) or an IPv6 literal
 /// (lower-case hex and colons, two or more colons, no `:::`), then an optional `/<1 to 3 digits>`
-/// not above 32 or 128; at most 43 characters in all. The IPv4 half is a full parse, so no host
-/// name and no out-of-range quad (`999.1.1.1`) can pass for an address; the IPv6 half stays a
-/// charset-and-shape check (a name has no two colons and no all-hex-and-colon form the tool would
-/// resolve).
+/// with no leading zero (`0` alone is allowed) and not above 32 or 128; at most 43 characters in
+/// all. The IPv4 half is a full parse, so no host name and no out-of-range quad (`999.1.1.1`) can
+/// pass for an address; the IPv6 half stays a charset-and-shape check (a name has no two colons
+/// and no all-hex-and-colon form the tool would resolve).
 [[nodiscard]] inline bool helper_addr(std::string_view t) {
     if (t.size() > 43)
         return false;
@@ -2517,7 +2517,7 @@ namespace detail {
         addr = t.substr(0, slash);
         prefix = t.substr(slash + 1);
         has_prefix = true;
-        if (!is_digits(prefix, 1, 3))
+        if (!is_digits(prefix, 1, 3) || (prefix.size() > 1 && prefix.front() == '0'))
             return false;
     }
     const auto colons = static_cast<std::size_t>(std::count(addr.begin(), addr.end(), ':'));
