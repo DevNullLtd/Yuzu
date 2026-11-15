@@ -9459,6 +9459,112 @@ tests:
         eval_time: 250m
         exp_samples: []
 
+  # SAM-33 plugin-health alerts. Series are the yuzu_software_facet_devices gauge: 30 collecting
+  # devices of which 3 time out (10%) and 0 are otherwise failing. Timeout share 10% > 5% but
+  # failing share 10% < 20%. The series are one sample per minute (the rule file's evaluation
+  # interval) because a sparser series goes stale after 5 minutes and would restart the 24h hold.
+  - interval: 1m
+    name: software facet timeout share - fires after 24h, not at 23h
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "27x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="timeout"}'
+        values: "3x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="not_collected"}'
+        values: "500x1550"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 23h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing", facet="installed_software.dpkg", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples: []
+
+  # Two replicas export the same fleet figure: the share is unchanged and exactly one alert fires
+  # (no duplicate per instance).
+  - interval: 1m
+    name: software facet failing share - fires after 24h, not at 23h, one alert for two replicas
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "20x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="constrained"}'
+        values: "5x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="oversize"}'
+        values: "5x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "20x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="constrained"}'
+        values: "5x1550"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="oversize"}'
+        values: "5x1550"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 23h
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSoftwareFacetFailingShareHigh", alertstate="firing", facet="installed_software.dpkg", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuSoftwareFacetTimeoutShareHigh", alertstate="firing"}'
+        eval_time: 25h
+        exp_samples: []
+
+  # Low volume: 19 collecting devices, 50% timing out -> neither rule fires.
+  - interval: 1m
+    name: software facet alerts - fewer than 20 collecting devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="full"}'
+        values: "9x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
+  # Two replicas each export 19 collecting devices, 10 of them timing out. A bare sum would read
+  # 38 devices at 52% and fire; judging each replica's own 20-device floor keeps it real.
+  - interval: 1m
+    name: software facet alerts - two replicas of 19 collecting devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "9x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "9x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "10x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
+  # Two replicas hold DIFFERENT snapshots of the same 19 devices: core-a saw all 19 collect fully,
+  # core-b saw all 19 time out. A per-status max across replicas would read 38 collecting devices,
+  # 50% timing out, and fire both rules; each replica's own snapshot is 19 devices, under the floor.
+  - interval: 1m
+    name: software facet alerts - replicas with different snapshots of 19 devices never fire
+    input_series:
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="full"}'
+        values: "19x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-a:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "0x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="full"}'
+        values: "0x1800"
+      - series: 'yuzu_software_facet_devices{job="yuzu",instance="core-b:9568",facet="installed_software.dpkg",status="timeout"}'
+        values: "19x1800"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuSoftwareFacet.*", alertstate="firing"}'
+        eval_time: 29h
+        exp_samples: []
+
   # ── yuzu-delivery: webhook and offload delivery backlog ─────────────────────────────────────
   #
   # Which case is meant to catch which change to which rule (reasoned, NOT mutation-run):
@@ -9577,3 +9683,483 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuDeliveryPoolBacklogHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning", store="webhook"}'
             value: 1
+
+  # ── yuzu-oidc-resolver: OIDC name lookup pool ───────────────────────────────────────────────
+  #
+  # Which case is meant to catch which change to which rule (each one mutation-run):
+  #   YuzuOidcResolverPoolHigh
+  #     * `> 0.75` weakened to `>= 0.75`                 -> OIDC case B (exactly 12 of 16 is quiet)
+  #     * `for: 5m` shortened to 4m or below             -> OIDC case A (not firing at 8m) and
+  #                                                         case G (not firing at 4m)
+  #     * `for: 5m` lengthened to 6m or above            -> OIDC case G (firing at 5m)
+  #     * `for: 5m` shortened to 3m or below             -> OIDC case B (a 3 minute peak stays quiet)
+  #     * the join narrowed with on()/ignoring()         -> OIDC case C (one replica's ratio must
+  #                                                         not be reported as the other's)
+  #     * the capacity gauge renamed or dropped          -> OIDC case A (nothing fires) and case D
+  #   YuzuOidcResolverLookupsRefused
+  #     * the `outcome="busy"` filter lost               -> OIDC case E (timeout-only growth is quiet)
+  #     * `for: 10m` shortened to 6m or below            -> OIDC case E (quiet at 8m)
+  #     * `for: 10m` changed to 9m or to 11m             -> OIDC case L (a refusal active for 10
+  #                                                         evaluations is quiet, 11 fires at 11m)
+  #     * `for: 10m` shortened to 5m or below            -> OIDC case J (a 3 minute burst is
+  #                                                         quiet at 8m); case H (a restart that
+  #                                                         stops refusing is quiet at 5m) catches
+  #                                                         4m or below
+  #     * the `[5m]` rate window widened to 10m or
+  #       narrowed to 3m                                 -> OIDC case L
+  #     * `rate` replaced by `delta`                     -> OIDC case H (a counter reset in the
+  #                                                         window must not silence a refusal that
+  #                                                         keeps going)
+  #     * `> 0` weakened to `>= 0`                       -> OIDC case F (a flat counter is quiet)
+  #     * `sum by (instance)` replaced by a fleet sum    -> OIDC case F (instance isolation)
+  #   Cases G, I, J and K document shapes and add no rule change of their own: a stalled tick (G),
+  #   a fleet with a replica that publishes no capacity (I), a short burst the hold does not cover
+  #   (J) and a lookup worker that could not be started, which refuses lookups while the pool holds
+  #   2 of 16 slots (K).
+
+  # OIDC CASE A -- a pool held at 14 of 16 slots from 4m (it starts at 4 slots) is pending until
+  # 9m and firing from there (`for: 5m`); the alert carries the instance label.
+  - interval: 1m
+    name: oidc resolver pool - above 75 percent for the hold fires
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "4x3 14x40"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s1"}'
+        values: "16x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="pending"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="pending", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # OIDC CASE B -- exactly 75% (12 of 16) held for the whole run never fires, and a pool that
+  # reaches 16 of 16 for only 3 minutes and then drains never satisfies the 5 minute hold.
+  - interval: 1m
+    name: oidc resolver pool - exactly 75 percent and a short peak are quiet
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "12x43"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s1"}'
+        values: "16x43"
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s2"}'
+        values: "0x2 16x3 0x40"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s2"}'
+        values: "16x45"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate=~"firing|pending"}'
+        eval_time: 4m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="pending", instance="s2", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate=~"firing|pending"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # OIDC CASE C -- two replicas: only the one whose own ratio is above 75% fires. The second
+  # replica (4 of 16) must stay quiet, and the first must not be reported under its instance.
+  - interval: 1m
+    name: oidc resolver pool - only the replica above 75 percent fires
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "14x43"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s1"}'
+        values: "16x43"
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s2"}'
+        values: "4x43"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s2"}'
+        values: "16x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # OIDC CASE D -- the capacity gauge absent (a replica that has not published it) means no ratio
+  # and so no alert, even with the in-flight gauge at 16. This documents the join, it does not
+  # endorse the silence: a missing capacity series is its own problem.
+  - interval: 1m
+    name: oidc resolver pool - no capacity series means no ratio and no alert
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "16x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate=~"firing|pending"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # OIDC CASE E -- a refused-lookup rate of one a minute is pending, then firing from about 11m
+  # (`for: 10m`). Growth of the timeout outcome alone never fires it, and neither does one burst
+  # of refusals that then stops.
+  - interval: 1m
+    name: oidc resolver lookups refused - a sustained busy rate fires, timeout-only and a burst do not
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="ok"}'
+        values: "0+3x40"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s2",outcome="timeout"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s2",outcome="busy"}'
+        values: "0x40"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s3",outcome="busy"}'
+        values: "0 0 5 5x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s3"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending", instance=~"s2|s3"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # OIDC CASE F -- the zero-seeded counters of a server that has never refused a lookup, and a
+  # counter that stopped moving (3 a long time ago), stay quiet; with two replicas refusing at
+  # different times only the one still refusing fires.
+  - interval: 1m
+    name: oidc resolver lookups refused - zero-seeded and flat counters are quiet, per instance
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "0x43"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s2",outcome="busy"}'
+        values: "3x43"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s3",outcome="busy"}'
+        values: "0+2x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending", instance=~"s1|s2"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s3", severity="warning"}'
+            value: 1
+
+  # OIDC CASE G -- a stalled maintenance tick. The in-flight gauge sits flat at 16 of 16 (the tick
+  # is not republishing it), so PoolHigh is quiet at 4m and firing from 5m. The busy counter does
+  # not move until 13m and then arrives as ONE +40 step: its 5 minute rate is positive for
+  # only 4 evaluations after the step, never the 10 minute hold, so Refused is pending and then
+  # gone, never firing.
+  - interval: 1m
+    name: oidc resolver - a stalled tick keeps the full gauge firing and a late counter step quiet
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "16x43"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s1"}'
+        values: "16x43"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "0x12 40x31"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # OIDC CASE H -- a counter reset. A replica that restarts and then stops refusing (3 4 5, then
+  # 0 for good) never satisfies the hold: its rate is positive for a few minutes around the reset
+  # and then zero. A replica that restarts and keeps refusing (5 6, then 0 and 1 more a minute)
+  # still fires, because rate() carries the increase across the reset.
+  - interval: 1m
+    name: oidc resolver lookups refused - a counter reset neither fires a stopped replica nor hides a live one
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "3 4 5 0x40"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s2",outcome="busy"}'
+        values: "5 6 0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s1"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s1"}'
+        eval_time: 14m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending", instance="s1"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s2"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s2", severity="warning"}'
+            value: 1
+
+  # OIDC CASE I -- a fleet with one replica on an earlier build, which publishes the in-flight
+  # gauge (here at 16) and no capacity series. The ratio has no match for it, so PoolHigh is silent
+  # for that replica while the other one (14 of 16) fires. This documents the join; it does not
+  # endorse the silence.
+  - interval: 1m
+    name: oidc resolver pool - a replica with no capacity series is silent beside one that fires
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "14x43"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s1"}'
+        values: "16x43"
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s2"}'
+        values: "16x43"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate=~"firing|pending"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # OIDC CASE J -- a 3 minute burst of refusals (5, 10, 15, 20, then flat). The 5 minute rate is
+  # positive for 6 evaluations (3m to 8m), so Refused is pending at 5m, not firing at 8m and gone
+  # by 20m.
+  - interval: 1m
+    name: oidc resolver lookups refused - a 3 minute burst is pending and never fires
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "0x2 5 10 15 20x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="pending", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 8m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate=~"firing|pending"}'
+        eval_time: 20m
+        exp_samples: []
+
+  # OIDC CASE K -- the shape of a lookup worker that could not be started: refusals every minute
+  # while the pool holds 2 of 16 slots. Refused fires, PoolHigh stays quiet. The two rules read
+  # different things, and the refusal rule is the one that sees this.
+  - interval: 1m
+    name: oidc resolver - refusals with a nearly empty pool fire Refused and not PoolHigh
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_in_flight{job="yuzu",instance="s1"}'
+        values: "2x43"
+      - series: 'yuzu_server_oidc_resolver_pool_capacity{job="yuzu",instance="s1"}'
+        values: "16x43"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "0+1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuOidcResolverPoolHigh", alertstate=~"firing|pending"}'
+        eval_time: 15m
+        exp_samples: []
+
+  # OIDC CASE L -- the hold, exactly. A counter that rises by one a minute for 7 minutes and then
+  # stops (s1) keeps the 5 minute rate positive for 10 evaluations, 9 minutes from the first to the
+  # last, so it is quiet at 10m; one that rises for 8 minutes (s2) is positive for 11 evaluations
+  # and fires at 11m. A hold of 9m fires s1 at 10m; a hold of 11m leaves s2 quiet at 11m.
+  - interval: 1m
+    name: oidc resolver lookups refused - 9 minutes of refusals stay quiet and 10 fire
+    input_series:
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s1",outcome="busy"}'
+        values: "0+1x7 7x40"
+      - series: 'yuzu_server_oidc_resolver_lookups_total{job="yuzu",instance="s2",outcome="busy"}'
+        values: "0+1x8 8x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOidcResolverLookupsRefused", alertstate="firing", instance="s2", severity="warning"}'
+            value: 1
+
+  # ── yuzu-crl-source: CRL source registration refused while name lookups are backing up ──────
+  #
+  # Which case is meant to catch which change to YuzuCrlSourceResolverBusy (each one mutation-run):
+  #   * the `reason="dns_busy"` filter lost                -> CRL case B (the other five reasons,
+  #                                                           however fast they rise, are quiet)
+  #   * the filter value changed to another reason         -> CRL case A (nothing fires)
+  #   * `> 0` weakened to `>= 0`                           -> CRL cases B and D (a flat series fires)
+  #   * `[15m]` shortened to 10m or below                  -> CRL case A (still firing at 14m)
+  #   * `[15m]` changed to 14m, 12m or 16m                 -> CRL case H (an event is firing 13
+  #                                                           minutes later and quiet at 14)
+  #   * `for: 0m` lengthened to 5m or more                 -> CRL case A (firing at 5m)
+  #   * `sum by (instance)` replaced by a fleet sum        -> CRL case D (the sample loses its
+  #                                                           instance label)
+  #   * the counter born at 1 contributes no increase      -> CRL case F (documented, not endorsed)
+  #   Cases E and G document shapes and add no rule change of their own: a stalled tick that
+  #   delivers 40 refusals in one step (E) and a 3 minute burst (G), both of which fire here and
+  #   neither of which fires OIDC YuzuOidcResolverLookupsRefused.
+
+  # CRL CASE A -- the dns_busy counter is seeded at 0 and rises once at 3m: the alert fires at
+  # 5m, is still firing at 14m, and has resolved by 30m once the window has passed.
+  - interval: 1m
+    name: crl source resolver busy - one refusal fires and then resolves
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0 0 0 1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 14m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CRL CASE B -- the other five reasons rise by one a minute and stay quiet, and a dns_busy
+  # series that was seeded at 0 and never moved stays quiet too.
+  - interval: 1m
+    name: crl source resolver busy - the other five reasons and a flat dns_busy are quiet
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="own_addresses_unavailable"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_unavailable"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_timeout"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_budget_exhausted"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="validation_busy"}'
+        values: "0+1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CRL CASE C -- no CRL source series at all (a server that has not published the counter) is
+  # quiet. This documents the silence, it does not endorse it: the server seeds every reason at
+  # boot, so an absent series is a server that is not running, which the up-based rules cover.
+  - interval: 1m
+    name: crl source resolver busy - an absent counter is quiet
+    input_series:
+      - series: 'up{job="yuzu",instance="s1"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 25m
+        exp_samples: []
+
+  # CRL CASE D -- two replicas: only the one that refused a request alerts, under its own
+  # instance label; the other (seeded at 0, never moved) is quiet.
+  - interval: 1m
+    name: crl source resolver busy - only the replica that refused alerts
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0 0 0 1 1x40"
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s2",reason="dns_busy"}'
+        values: "0x44"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CRL CASE E -- a stalled maintenance tick. The counter does not move until 13m and then
+  # arrives as ONE +40 step: the increase over 15 minutes is positive at once, so the alert is
+  # quiet at 11m and firing at 13m. (OIDC YuzuOidcResolverLookupsRefused stays quiet on this
+  # shape: OIDC case G.)
+  - interval: 1m
+    name: crl source resolver busy - a late counter step fires
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0x12 40x31"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 11m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 13m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CRL CASE F -- a series born at 1, with no seeded 0 before it, is quiet: a constant series has
+  # no increase, so the first event is lost. This documents the limit the group comment names as a
+  # known blind spot; it does not endorse it. The server seeds every reason at boot, which is why
+  # the series is expected to start at 0.
+  - interval: 1m
+    name: crl source resolver busy - a series born at 1 is quiet
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CRL CASE G -- a 3 minute burst (5, 10, 15, 20) fires at once, where OIDC
+  # YuzuOidcResolverLookupsRefused stays quiet for the same shape (OIDC case J).
+  - interval: 1m
+    name: crl source resolver busy - a 3 minute burst fires
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0x2 5 10 15 20x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+
+  # CRL CASE H -- the window, exactly. One refusal at 3m is still firing 12 and 13 minutes later
+  # (15m and 16m) and quiet at 17m. A `[14m]` window is quiet at 16m, a `[12m]` window is quiet at
+  # 15m, and a `[16m]` window is still firing at 17m.
+  - interval: 1m
+    name: crl source resolver busy - a refusal fires for 13 minutes after it and not at 14
+    input_series:
+      - series: 'yuzu_server_revocation_source_degrade_total{job="yuzu",instance="s1",reason="dns_busy"}'
+        values: "0 0 0 1 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing"}'
+        eval_time: 16m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate="firing", instance="s1", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
+        eval_time: 17m
+        exp_samples: []

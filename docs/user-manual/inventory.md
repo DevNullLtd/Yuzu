@@ -487,8 +487,10 @@ section hash (an out-of-band change to the table) set the starting point and pro
 the last case is logged as a warning and, by decision, no counter or alert counts it. Removed
 software is simply deleted from the device's list; the history entry is the record that it was
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
-and its components with it. Nothing in
-the dashboard or the API shows the change history or the components yet. The agent of this build
+and its components with it. The change
+history is read through `GET /api/v1/inventory/software/changes` and the components through
+`GET /api/v1/inventory/software/components` (see the REST API reference); the dashboard shows
+neither yet. The agent of this build
 sends v3 (and no longer has a v2 writer). Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
 `need_full`, `mismatch`, `rejected` or `error`, and `facet` is the collector source
@@ -910,6 +912,54 @@ denied. A degraded read is `503`, never an empty `200`; the fleet export and the
 versions read are also `503` until the first catalogue refresh has landed. Parameters,
 responses and audit behaviour: [REST API](rest-api.md#get-apiv1inventorysoftwarecatalogue).
 
+### Collection health, hosts and the change feed
+
+Three REST reads show how installed-software collection is going. Parameters and responses:
+[REST API](rest-api.md#get-apiv1inventorysoftwarehosts).
+
+- **`GET /api/v1/inventory/software/plugin-health`** is the fleet view: one entry per facet (collector) with the number of devices in each status, the share timing out or failing, collection time and bytes read (p50, p95, max) and the ten slowest devices. Start here.
+- **`GET /api/v1/inventory/software/hosts`** and **`/hosts/{agent_id}`** are the per-device view: each device's last report time and, per facet, the status, the short `token` explaining it, when it was last confirmed, and what the last collection cost. Use `q` to find a device by hostname or agent id among the devices the roster holds (seen in the last 30 days, the newest 100,000: a search that finds nothing proves nothing while `roster_truncated` is `true`, and a device quiet for over 30 days is listed but not matched; tracked by #7790), and `last_synced_before` to list devices that have gone quiet.
+- **`GET /api/v1/inventory/software/summary`** gives devices reporting and stale (no report for 48 hours), install, removal and upgrade counts for the last 24 hours and 7 days, and the catalogue size.
+
+**Reading collection health.**
+
+- "Collecting" means a facet reported `full`, `delta`, `constrained`, `timeout` or `oversize`. `not_collected` (the OS has nothing to collect, or the plugin is not loaded) and `disabled` (switched off on purpose) are not failures and are left out of the timeout and failing shares.
+- `timeout_share` is the timeouts over collecting devices; `failing_share` adds `constrained` and `oversize`. A share of `null` means no device is collecting that facet.
+- The fleet figures are a snapshot recomputed about hourly; `as_of` says when. A caller confined to some management groups sees figures for only those devices, computed on the request. A block that cannot be given is `null` with `omitted` of `scope` or `building`; it is never shown as zero.
+- A `constrained` or `timeout` facet keeps the device's last confirmed rows, shown as unconfirmed, so a failing collector never makes software disappear.
+
+**Following changes.** `GET /api/v1/inventory/software/changes` lists installs, removals and upgrades in `(observed_at, change_id)` order. Page with `next_cursor` until it is `null`; a page that is not full has none, so a caught-up feed ends on `null` and there is no cursor to poll with. Start the next poll from `since` set to the `stable_before` of the previous response (earlier by whatever overlap you want), and de-duplicate on `change_id`. Rows appear after a 60-second settle window. A row that commits more than 60 seconds after its own `observed_at` can be missed by a cursor that already passed it; to recover, re-read from an earlier `since` and de-duplicate on `change_id`. A consumer that cannot tolerate a miss should re-read a trailing overlap on every poll. For a caller confined to more than 10,000 devices the cursor carries a count of passed-over rows: a page can be empty with a non-null `next_cursor`, a row deleted inside that span between two pages can make the next page skip a row, and a cursor passing over more than 100,000 rows is a `400` (restart from a later `since`; tracked by #7789).
+
+#### Software facet timeout share
+
+Alert `YuzuSoftwareFacetTimeoutShareHigh` (warning).
+
+**What fired.** For the facet in the `facet` label, more than 5% of the devices collecting it reported `timeout` (the collector ran past its deadline), with at least 20 collecting devices, for 24 hours. A device reports about once a day, so the share has held through a full reporting cycle.
+
+**Check first.**
+
+1. Open `GET /api/v1/inventory/software/plugin-health` and find the facet. Is only this facet over the line, or are several from the same plugin or all of them? One facet points at that collector; all of them point at load on the devices or the agent.
+2. Compare `duration_ms` p95 and max with the facet's deadline (60 seconds, or 120 for `installed_apps`, `windows_optional_features` and `hardware`). A p95 near the deadline means the collector is slow; a max at the deadline with a low p95 means a few devices.
+3. Take the ten `slowest` devices and read each one's collector state with `GET /api/v1/inventory/software/hosts/{agent_id}`; that response carries the section statuses and tokens, not the OS, the agent version or the management groups. Read the OS and the agent version from `GET /api/v1/devices/{id}`, and the members of a management group from `GET /api/v1/management-groups/{id}`. Are the slow devices one OS, one agent version, or one management group?
+4. Read the `token` column. `busy` means a worker of the same plugin was still running from an earlier day, so every facet of that plugin times out together: look at the plugin's other facets and at what the long-running action is. A `timeout` token is a plain deadline miss, and `rejected` is a worker that could not start.
+5. If the slow devices share an agent version, check whether the share began when that version was rolled out.
+
+#### Software facet failing share
+
+Alert `YuzuSoftwareFacetFailingShareHigh` (warning).
+
+**What fired.** For the facet in the `facet` label, more than 20% of the devices collecting it reported `constrained`, `timeout` or `oversize`, with at least 20 collecting devices, for 24 hours.
+
+**Check first.**
+
+1. Open `GET /api/v1/inventory/software/plugin-health` and read the per-status split (`devices`) for the facet. Which of the three dominates? If it is `timeout`, follow the timeout runbook above.
+2. Is it this facet only or all facets of one plugin? All facets of a plugin failing together suggests the plugin, not one collector.
+3. Is it one OS or all? A facet that cannot run on an OS reports `not_collected`, not `constrained`; a `constrained` share concentrated on one OS usually means a tool the collector needs is missing or returning errors there.
+4. Check the agent version of the failing devices through `GET /api/v1/devices/{id}` (the software host response does not carry it) and whether the share began with a rollout.
+5. Read the `token` column on the failing devices: `rc=<n>` is a non-zero exit, `truncated` is cut-off output, `no_rows` is a read that returned no applications, which the collector treats as a fault and reports as `constrained`, never as an empty estate, `unavailable` is a tool that did not answer, `rejected` is a worker that could not start. For `oversize` the token carries `rows=<n>` or `bytes=<n>`; a facet over 20,000 rows or one report cannot carry sends no rows at all, so consider whether that device is expected to hold that much.
+
+While a facet fails, the server keeps each device's last confirmed rows, so the software list stays complete but is marked unconfirmed until a later `full` section.
+
 ### Dashboard (`/inventory` → `/hardware` / `/software`)
 
 The old three-tab **Inventory** dashboard is gone. `/inventory` itself still exists as a
@@ -946,7 +996,8 @@ place, **Hardware** and **Software**, each its own page:
   rows, and the KPI counts drawn from them, genuinely narrow to their scope, the same
   confinement class the REST/MCP software-query surfaces use (see above). The roster
   read is audited as `inventory.devices` (unchanged verb, still the behavioural-PII
-  tier). A store-wide CI or Tags read failure shows its own explicit **"CI columns
+  tier). A store-wide CI or Tags read failure (for CI that includes the read running out of its 20-second
+  budget) shows its own explicit **"CI columns
   unavailable"** / **"Tags unavailable"** banner (never silently "no CI"/"no tags") —
   distinct from a single device that simply hasn't synced yet, which still shows a plain
   `—` placeholder in just that cell.
@@ -1211,19 +1262,21 @@ device outside it shows its `agent_id` in place of the hostname.
 
 The KPI strip's other figures are derived from the same capped roster: the CI-coverage count,
 the manufacturer counts and "Showing a-b of N" are lower bounds too, while the median memory
-and the CI-coverage ratio describe only the listed devices. The notice says so, though only the
-four count tiles carry the `≥` mark.
+and the CI-coverage ratio describe only the listed devices. The notice says so for the median; the
+CI-coverage ratio likewise describes only the listed devices, and only the four count tiles carry the
+`≥` mark.
 
 ### Known limits above 100,000 devices
 
 The roster cap is a display and read cap, not a tested capacity. Above it:
 
-- The Hardware CI columns come from a separate read with its own 100,000-row cap (ordered by
-  hostname), so CI columns can be blank for devices that are listed (#7549).
 - Fleet topology answers `413` above the ceiling and cannot be raised past it (#7550).
 - The Software and Quarantine hostname column, and the host type-ahead and "of N hosts" count on
   the Software page, show only devices inside the capped roster (a host outside it appears as
   its `agent_id`, or not at all in the type-ahead).
+- Every render of the Hardware list reads the CI of the whole roster, up to 100,000 rows, on one
+  database connection, and the Home page's confined estate view reads it too for counts that never
+  use CI. A burst of concurrent renders on a large fleet can hold the shared database pool (#1783).
 - Search, filter and sort run over the capped set, and there is no way to page past the cap
   (#7567). A device seen within the window is always reachable by its id.
 
@@ -1393,7 +1446,7 @@ ingest is failing. Four further series sharpen the picture:
   hash_only majority doesn't bury the `full` and `v3` tail, the pool-pressure
   signal under a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
-  `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
+  `pool_acquire_timeout` / `query_error`, plus `sections_query_error` for `source="device_ci"` only: the hardware record read answered but its v2 sections did not, the case the REST record route answers `503` and the MCP tool with a retryable error, where `query_error` is the record read itself failing; plus `keyed_read_budget` for `source="device_ci"` only: the Hardware list's roster-keyed CI read ran out of its overall budget between chunks, so the list shows "CI columns unavailable" and never partial CI; plus `admission_full` for `source="installed_software"` and `source="ca_issued"` only: a `/crypto` read refused by its in-flight bound before any store call; source ∈ `installed_software` / `device_ci` /
   `software_licensing` / `product_registry` / `app_usage` / `generic`, and the `/crypto` sources `ca_issued` (Yuzu-issued certificate reads) and `crypto_layout` (dashboard layouts), see [metrics.md](metrics.md#crypto-dashboard-metrics)) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
@@ -1591,6 +1644,8 @@ rollout) are not counted, so a zero there does not rule out a skipping collector
 
 **The Hardware list shows "Hardware roster unavailable" (or `GET /api/v1/hardware` answers `503`).** The persisted device roster could not be read. Check `yuzu_server_agent_presence_store_failed_total{op="query_stale_within"}`: `reason="store_unavailable"` means no database connection could be obtained (the pool wait is 0.5-2 s, plus up to 10 s to connect to an unreachable database; see `/readyz` `pg_reachable` and the Postgres pool alerts: `YuzuPgPoolSaturated` with `pg_reachable` green points at pool saturation), `reason="db_error"` means the query itself failed (detail in the server's `query_stale_within failed` warn line). The audit row is `inventory.devices` with `result=failure` and detail `hardware roster read failed`; the REST `503` message `hardware roster unavailable` tells it apart from the audit-persist `503` (`audit subsystem unavailable`), which shares the same `retry_after_ms`. The CI-record symptoms ("Device roster unreadable", "Device identity unavailable", the record `503`) share the counter but audit as `inventory.device.ci` / `inventory.device.software`. The banner clears on the next successful read; no restart is needed. A fleet with more than 100,000 endpoints in the window is **not** this fault: it shows the "Partial list" notice with the table, and `yuzu_server_agent_presence_roster_truncated_total` counts each truncated read (a steady state on such a fleet, so it has no alert). The per-device record's identity lookup counts its own failures under `op="find_within"` of the same failure counter.
 
+**The Hardware list shows "CI columns unavailable".** The device-CI read failed or ran out of its 20-second budget, so a blank CI cell is a failed read, not "no CI". The list reads CI for the listed devices only, in chunks of 10,000 on one connection. Split `yuzu_inventory_read_degrade_total{source="device_ci"}` by `reason`: `keyed_read_budget` or `pool_acquire_timeout` points at pool saturation or a slow database (`yuzu_pg_pool_waiters`, `yuzu_pg_acquire_wait_seconds`, `yuzu_pg_acquire_timeout_total`, the `YuzuPgPoolSaturated` alert); `query_error` has its detail in the `DeviceInventoryStore` warning in the server log; `store_not_open` means the store failed at boot. The banner clears on the next successful render; no restart is needed.
+
 **`install_location` is `-` for many Windows applications and every Linux application.** `-` means the OS
 reported no location, not that collection failed. Windows reads each Uninstall key's `InstallLocation`, which many
 MSI-registered products, SDK and runtime component packages and some system components never populate (182 of
@@ -1664,8 +1719,16 @@ sync, defeating the hash-skip protocol.
 - **Observability.** Ingest shares
   `yuzu_inventory_ingest_total{source="device_ci"}` +
   `yuzu_inventory_ingest_duration_seconds{source="device_ci"}`; read degrades use
-  `yuzu_inventory_read_degrade_total{source="device_ci"}`. The store joins
-  `/readyz` + `/healthz`.
+  `yuzu_inventory_read_degrade_total{source="device_ci"}` (`reason` is `store_not_open`,
+  `pool_acquire_timeout`, `query_error`, `sections_query_error` or `keyed_read_budget`, the Hardware
+  list's CI join giving up between chunks; each series appears on its first occurrence). The Hardware
+  list reads CI only for the devices on its roster, in chunks of 10,000 on one connection, so a
+  listed device is never left without CI by a row cap. The 20-second budget is checked between
+  chunks, so it applies only to rosters over 10,000 devices, and one slow statement can still run
+  to the pool's 30-second statement bound: the worst case for one read is about 50 seconds of one
+  connection. A Postgres setting that logs statements (`log_statement=all`, a low
+  `log_min_duration_statement`) records each chunk's id list; set `log_parameter_max_length` to
+  limit how much of each id list is logged. The store joins `/readyz` + `/healthz`.
 - **VMs / serial-less hosts.** A device with no SMBIOS serial (many VMs) reports
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.

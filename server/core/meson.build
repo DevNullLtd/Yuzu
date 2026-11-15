@@ -871,6 +871,9 @@ yuzu_server_core_lib = static_library(
     'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
     'src/software_list_model.cpp',
+    'src/software_hosts_model.cpp',
+    'src/software_changes_model.cpp',
+    'src/software_plugin_health_model.cpp',
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
@@ -1052,6 +1055,7 @@ yuzu_server_routes_lib = static_library(
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
     'src/software_collection_settings_routes.cpp',
+    'src/software_read_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',
