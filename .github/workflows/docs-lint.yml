@@ -269,6 +269,11 @@ jobs:
       - name: Changelog promote --append
         run: python3 tests/test_assemble_changelog_append.py
 
+      # scripts/whats-new.py: collated "what changed since my last pull" view
+      # (version bumps + changelog.d fragments). Builds a throwaway git repo.
+      - name: What's-new script
+        run: python3 tests/test_whats_new.py
+
       # Windows agent installer trust-anchor lockdown (#5196). The .iss is
       # compiled only by release.yml, never on a PR; this lints its source
       # text (no /T on the icacls grant, a Constrained-Language-safe exact

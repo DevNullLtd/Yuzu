@@ -48,7 +48,7 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 53);
+    CHECK(kBackgroundJobs.size() == 54);
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
@@ -66,6 +66,11 @@ TEST_CASE("background-job table classifies every audited pass correctly",
         auto* probe = find("pg_reachability_probe.tick");
         REQUIRE(probe != nullptr);
         CHECK(probe->cls == BackgroundJobClass::ReplicaSafe);
+        // Each replica exports its own collation-mismatch gauge from its own recheck; a
+        // leader-gated recheck would leave every follower's gauge stale.
+        auto* collation = find("pg_collation_recheck.tick");
+        REQUIRE(collation != nullptr);
+        CHECK(collation->cls == BackgroundJobClass::ReplicaSafe);
         // SAM.4: the hourly title normalisation is a shared-PG single writer behind an
         // advisory try-lock, so every replica runs it and a loser skips.
         auto* norm = find("software_normalization_job.run_tick");

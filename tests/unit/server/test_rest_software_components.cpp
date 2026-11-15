@@ -536,6 +536,45 @@ TEST_CASE("REST components: a version range resolves and its totals are exact (a
     CHECK(body.dump().find("version_min") == std::string::npos);
 }
 
+TEST_CASE("REST components: vers resolves to the same rows and totals as version_min/version_max; bad vers is a 400",
+          "[pg][rest][inventory_components]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    SoftwareInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    seed_components(store, "dev-a", {comp("libfoo", "/a1", "1.9"), comp("libfoo", "/a2", "1.10")});
+    seed_components(store, "dev-b", {comp("libfoo", "/b", "1.10")});
+    seed_components(store, "dev-c", {comp("libfoo", "/c", "2.0")});
+
+    CompHarness h{&store};
+    // vers:generic/>=1.9|<=1.10, percent-encoded as a client sends it.
+    const auto by_vers = get_json(h, "?name=libfoo&vers=vers:generic/%3E%3D1.9%7C%3C%3D1.10");
+    const auto by_bounds = get_json(h, "?name=libfoo&version_min=1.9&version_max=1.10");
+    CHECK(row_keys(by_vers) == row_keys(by_bounds));
+    CHECK(row_keys(by_vers) == std::set<std::string>{"dev-a|/a1", "dev-a|/a2", "dev-b|/b"});
+    CHECK(by_vers.at("data").at("totals") == by_bounds.at("data").at("totals"));
+    // Several intervals: 1.9 and 2.0 only.
+    const auto two = get_json(h, "?name=libfoo&vers=vers:generic/%3C%3D1.9%7C%3E%3D2.0");
+    CHECK(row_keys(two) == std::set<std::string>{"dev-a|/a1", "dev-c|/c"});
+    // The audit target records the vers input (log_token folds '=' to '_'), not the resolved set.
+    REQUIRE_FALSE(h.audit_log.empty());
+    CHECK(h.audit_log.back().target_id == "components:name=libfoo;vers=vers:generic/<_1.9|>_2.0");
+
+    h.audit_log.clear();
+    for (const char* q : {"?vers=vers:generic/%3E%3D1.0",                    // no name
+                          "?name=libfoo&vers=vers:generic/%3E%3D1.0&version_min=1", // both spellings
+                          "?name=libfoo&vers=vers:deb/%3E%3D1.0",            // refused by name
+                          "?name=libfoo&vers=vers:nope/%3E%3D1.0",           // unknown scheme
+                          "?name=libfoo&vers=vers:generic/1.0%7C1.0"}) {     // duplicate version
+        CAPTURE(q);
+        auto res = h.sink.Get(std::string(kPath) + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    CHECK(h.audit_log.empty()); // a 400 writes nothing
+}
+
 TEST_CASE("REST components: a range sees a version first reported after the last refresh, and works before any refresh",
           "[pg][rest][inventory_components]") {
     YUZU_REQUIRE_PG_DB_TPL(db, swinv_tpl);

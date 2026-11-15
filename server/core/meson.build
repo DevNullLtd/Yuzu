@@ -749,6 +749,7 @@ yuzu_server_core_lib = static_library(
     'src/home_panels_render.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
+    'src/pg_collation_recheck.cpp', # hourly repeat of the collation version check (ReplicaSafe)
     'src/command_outbox_store.cpp',
     'src/command_delivery_finalization_owner.cpp', # #4982 round 5: ADR-0012 §3 cross-schema owner
     'src/command_outbox_delivery.cpp',
@@ -946,6 +947,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/pg_collation_check.cpp', # collation version check, at start and then repeated; logs and exports a gauge, never stops the server
     'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.

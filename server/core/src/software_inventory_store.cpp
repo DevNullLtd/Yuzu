@@ -2212,6 +2212,11 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     return out;
 }
 
+std::string SoftwareInventoryStore::query_software_purl_predicate_sql(int param) {
+    // `purl <> ''` is stated so the partial index qualifies for every plan, generic ones too.
+    return " AND i.purl = $" + std::to_string(param) + " AND i.purl <> ''";
+}
+
 std::string SoftwareInventoryStore::find_by_purl_sql() {
     // `purl <> ''` is stated so the partial index qualifies for every plan, generic ones too.
     return "SELECT agent_id, name, version, ecosystem, purl, install_id "
@@ -2298,7 +2303,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         "SELECT i.agent_id, i.name, i.version, i.publisher, i.install_date, i.kind, i.ecosystem, "
         "i.epoch, i.release, i.arch, i.signature_status, i.distro_id, i.distro_version, "
         "i.package_id, i.source, i.install_id, i.install_type, i.install_scope, "
-        "i.install_location, i.instance_key, fs.status, fs.enabled, fs.last_confirmed_at "
+        "i.install_location, i.instance_key, fs.status, fs.enabled, fs.last_confirmed_at, i.purl "
         "FROM software_inventory_store.installed_software i "
         "LEFT JOIN software_inventory_store.software_facet_state fs "
         "ON fs.agent_id = i.agent_id AND fs.facet = i.source WHERE 1=1";
@@ -2331,6 +2336,10 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
     if (!q.source.empty()) {
         sql += " AND i.source = $" + std::to_string(++p);
         params.push_back(q.source);
+    }
+    if (!q.purl.empty()) {
+        sql += query_software_purl_predicate_sql(++p);
+        params.push_back(q.purl);
     }
     if (q.version) {
         // Present (even "") is an exact bucket; nullopt = any version.
@@ -2397,6 +2406,7 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
             row.facet_enabled = PQgetisnull(res.get(), i, 21) ||
                                 std::string_view(PQgetvalue(res.get(), i, 21)) == "t";
             row.last_confirmed_at = PQgetisnull(res.get(), i, 22) ? 0 : result_i64(res, i, 22);
+            row.entry.purl = PQgetvalue(res.get(), i, 23);
             out.push_back(std::move(row));
         }
         return out;
@@ -2406,7 +2416,8 @@ SoftwareInventoryStore::query_software(const SoftwareFleetQuery& q) {
         // The shapes whose cost the name index does not bound (q, match=contains, match=prefix
         // under a locale collation, a status filter) run under the 5 s statement bound and
         // degrade to the audited 503, never to a pool lease held to the 30 s pool default. The
-        // reads below keep the bare lease: exact-name and agent_id/scope reads are index-driven;
+        // reads below keep the bare lease: exact-name and agent_id/scope reads are index-driven,
+        // and so is a purl filter (installed_software_purl_idx; it does not set scan_shaped);
         // a kind, ecosystem, source or exact version filter with no name is a filtered walk under
         // ORDER BY name, bounded only by the pool's 30 s statement_timeout (pre-existing shape,
         // unchanged by this change; version without a name is new but takes the same path).
