@@ -21,6 +21,7 @@
 #include <spdlog/common.h> // spdlog::sink_ptr, spdlog::level::level_enum -- lightweight, no logger/thread_pool machinery
 
 #include "agent.pb.h"
+#include "guardian_pair_mode.hpp" // the pair limits (detail::k*), the census decision set
 
 namespace yuzu {
 class MetricsRegistry;
@@ -84,19 +85,9 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
 inline constexpr char kGuardianEventsRejectedMetric[] =
     "yuzu_server_guardian_events_rejected_total";
 
-/// The limits on a wire pair, in ONE place (the store's `census_pair` and `pair_from_wire` both
-/// read them). Each half of a pair is in [1, `kPairValueLimit`): below 2^62 the BIGINT sign bit is
-/// unreachable. On top of that (UP-9) a pair must be PLAUSIBLE: `emit_seq` below `kEmitSeqCeiling`
-/// (2^40, about 1.1e12 events in one boot) and `boot_epoch` (Unix seconds) at most
-/// `kEpochSkewSeconds` (ten years of 365.25 days) past the server's receipt time. A pair that
-/// passes the range check and fails this one is `Implausible`: one such pair accepted would pin an
-/// agent's pair clock above every honest event for the life of the row, because only a higher pair
-/// advances the clock. The bound is absolute and stateless; a pair inside it is still judged by the
-/// pair clock (an agent whose clock was pinned by a value just inside it heals when the hold
-/// expires, one hour after the last accepted event).
-inline constexpr std::uint64_t kPairValueLimit = std::uint64_t{1} << 62;
-inline constexpr std::uint64_t kEmitSeqCeiling = std::uint64_t{1} << 40;
-inline constexpr std::int64_t kEpochSkewSeconds = 315'576'000;
+/// The limits on a wire pair (`kPairValueLimit`, `kEmitSeqCeiling`, `kEpochSkewSeconds`) are
+/// defined once in `guardian_pair_mode.hpp` (included above), with their rationale: the store reads
+/// them too and must not include this header for them.
 
 /// Why a wire emit-order pair was not taken as a pair (D5). `None` covers both a valid pair and
 /// the legitimate unpaired 0/0 (a journal replay, or an agent whose epoch claim failed); neither is
@@ -118,14 +109,17 @@ struct WirePair {
     std::int64_t emit_seq{0};
     PairReject reject{PairReject::None};
 };
-[[nodiscard]] WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept;
+/// STRUCTURE only (`_structural`): it does not apply the plausibility bound, so it is not for the
+/// ingest boundary. The name is the warning: the production caller is the receipt overload below,
+/// and a caller that reaches for this one has chosen, by name, to skip the bound (tests, and
+/// `pair_from_wire` itself).
+[[nodiscard]] WirePair pair_from_wire_structural(std::uint64_t boot_epoch,
+                                                 std::uint64_t emit_seq) noexcept;
 
 /// The production form (UP-9): the structural check above, then the absolute plausibility bound
 /// (`kEmitSeqCeiling`, `kEpochSkewSeconds`) against `receipt_unix_s`, the server's receipt time in
 /// whole Unix seconds. A pair that fails only the bound is `Implausible` (unpaired, `paired`
-/// false). The two-argument form checks structure only and exists for callers with no receipt; the
-/// ingest boundary never uses it (production ingest must use this overload, or the bound is not
-/// applied).
+/// false). The ingest boundary uses this form and never `pair_from_wire_structural`.
 [[nodiscard]] WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq,
                                       std::int64_t receipt_unix_s) noexcept;
 
@@ -141,14 +135,13 @@ inline constexpr char kGuardianPairRejectedMetric[] = "yuzu_server_guardian_pair
 inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of_range",
                                                              "implausible"};
 
-/// Counter of census decisions by `decision` (the closed `CensusDecision` set,
-/// `guardian_pair_mode.hpp`), one per census write whose upsert returned a labelled row and whose
-/// savepoint released: a first delivery, a Repair and a batch row. A key-mode event the key rule
-/// refuses has no label and counts nothing. Best-effort and counted
-/// before the transaction commits, as the projection counter is. Pre-seeded (server.cpp) from
-/// `kCensusDecisions` so each series reads 0, not absent. Never labelled by agent.
-inline constexpr char kGuardianCensusPairDecisionsMetric[] =
-    "yuzu_server_guardian_census_pair_decisions_total";
+// Counter of census decisions by `decision` (the closed `CensusDecision` set,
+// `guardian_pair_mode.hpp`), one per census write whose upsert returned a labelled row and whose
+// savepoint released: a first delivery, a Repair and a batch row. A key-mode event the key rule
+// refuses has no label and counts nothing. Best-effort and counted
+// before the transaction commits, as the projection counter is. Pre-seeded (server.cpp) from
+// `kCensusDecisions` so each series reads 0, not absent. Never labelled by agent.
+// The metric name, `kGuardianCensusPairDecisionsMetric`, lives in `guardian_pair_mode.hpp`.
 
 /// The ONE place a `PairReject` becomes its label, so the counter series, the pre-seed loop and the
 /// log line cannot drift from `kGuardianPairRejectReasons`. `None` has no reason (empty).
@@ -174,12 +167,13 @@ static_assert(std::string_view(pair_reject_reason(PairReject::HalfSet)) == "half
               "the reason labels are the documented series values");
 
 /// Validate the wire pair and, when it is a pair, set `row.boot_epoch`/`row.emit_seq`; otherwise
-/// leave both unset. Returns why the pair was withheld, or `nullopt` when it was taken or the sender
-/// is unpaired (0/0). Pure: it neither logs nor counts, because the caller must do that only once
-/// the store has accepted the event (`report_pair_reject`). Never refuses the event.
-[[nodiscard]] std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row,
-                                                        std::uint64_t boot_epoch,
-                                                        std::uint64_t emit_seq);
+/// leave both unset. Returns why the pair was withheld, or `nullopt` when it was taken or the
+/// sender is unpaired (0/0). Pure: it neither logs nor counts, because the caller must do that only
+/// once the store has accepted the event (`report_pair_reject`). Never refuses the event. STRUCTURE
+/// only, like `pair_from_wire_structural` (it applies no plausibility bound); test-only.
+[[nodiscard]] std::optional<PairReject> apply_wire_pair_structural(GuaranteedStateEventRow& row,
+                                                                   std::uint64_t boot_epoch,
+                                                                   std::uint64_t emit_seq);
 
 /// The production form (UP-9): as above with the plausibility bound applied against
 /// `receipt_unix_s`. An `Implausible` pair leaves `boot_epoch`/`emit_seq` unset and is returned as

@@ -2,8 +2,7 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 #include "guardian_generation_raise.hpp" // kMaxPolicyGenerationTarget
-#include "guardian_ingest.hpp"           // detail::kPairValueLimit, the one pair-range constant
-#include "guardian_pair_mode.hpp"
+#include "guardian_pair_mode.hpp" // detail::kPairValueLimit (the one pair-range constant), the census decision set
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -31,6 +30,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <utility>
@@ -2128,6 +2128,11 @@ constexpr const char* kCensusUpsert =
     "   OR COALESCE(" YUZU_CENSUS_SEEN_MAX_SEQ_ ", 0) > COALESCE(c.seq_hwm, c.ingest_seq, 0) "
     "RETURNING (c.ingest_seq = $6::bigint) AS applied, c.order_uncertain, " YUZU_CENSUS_DECISION_
     " AS decision";
+// MSVC refuses a string literal of 65 535 bytes after concatenation (C1091). This statement is
+// concatenated from the YUZU_CENSUS_* macros, so growing one of them can reach the limit with no
+// other warning; fail the build here, with headroom, on every compiler.
+static_assert(std::char_traits<char>::length(kCensusUpsert) < 60000,
+              "kCensusUpsert is approaching the MSVC string-literal limit (C1091, 65535 bytes)");
 
 // Retire ONLY the event itself and the rows the pair-lock statement returned, and only what the
 // final row dominates. A pending row that committed after the lock statement is never touched.
@@ -2503,6 +2508,23 @@ project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
         // savepoint rolls back (undoing this SET LOCAL) and the Repair is Failed, its evidence
         // kept. The success path restores the connection's own bound before the RELEASE, which
         // keeps a SET LOCAL, exactly as the lock_timeout below does.
+        //
+        // Why this cleanup is written out and not a scope guard (the SET LOCAL pair and the
+        // savepoint exits here, and the same in `agent_order_step`). The owner of the connection's
+        // state is `pg::PgTxn`: RAII, it issues ROLLBACK when destroyed uncommitted, and a ROLLBACK
+        // ends every SET LOCAL and savepoint with the transaction, so an exception unwinding out
+        // of this function is already cleaned up. Every other exit is control flow, and each one
+        // either ROLLBACKs TO the savepoint (undoing both SET LOCALs) or restores them by hand:
+        //   - `fail` / `fail_with`: ROLLBACK TO + RELEASE (reverts both SET LOCALs);
+        //   - `retired_exit`: ROLLBACK TO + RELEASE (reverts both);
+        //   - a failed control statement: Abandoned, the caller abandons the transaction (its
+        //     PgTxn rolls it back) and nothing further runs on the connection;
+        //   - the success path: `SET LOCAL lock_timeout TO DEFAULT` after the clock read,
+        //     `SET LOCAL statement_timeout TO DEFAULT` before the RELEASE (RELEASE keeps a SET
+        //     LOCAL).
+        // The restore's own success decides the outcome (a failed restore returns Abandoned, a
+        // failed ROLLBACK TO / RELEASE returns Abandoned), and a destructor cannot return a value
+        // or choose between Failed, Abandoned and PendingRetired.
         if (!control(("SET LOCAL statement_timeout = " +
                       std::to_string(repair_step.statement_timeout_ms))
                          .c_str()))
@@ -2722,6 +2744,12 @@ agent_order_step(PGconn* conn,
     };
     if (!control("SAVEPOINT agent_step"))
         return {AgentStepOutcome::Abandoned, {}};
+    // The cleanup below is written out, not a scope guard, for the reason stated at the Repair's
+    // statement bound in `project_rule_status`: `pg::PgTxn` owns the connection state (an exception
+    // unwinds to its ROLLBACK), and every other exit is control flow that must return Failed or
+    // Abandoned. The exits: a rows==1 success restores `lock_timeout TO DEFAULT` then RELEASEs; a
+    // failure ROLLBACKs TO the savepoint (undoing the SET LOCAL) then RELEASEs; a failed control
+    // statement returns Abandoned and the caller's PgTxn rolls the transaction back.
     // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
     if (!control(("SET LOCAL lock_timeout = " + std::to_string(lock_timeout_ms)).c_str()))
         return {AgentStepOutcome::Abandoned, {}};
@@ -4969,20 +4997,23 @@ GuaranteedStateStore::unrepresented_pending_for_agent(
     }
     // DISTINCT pairs of this device, minus any with a census row; the window count is taken before
     // the LIMIT, so the count is exact while the id list is capped. The order is BYTE order
-    // (COLLATE "C"), so which ids survive the cap is identical on every cluster whatever its locale.
+    // (COLLATE "C"), so which ids survive the cap is identical on every cluster whatever its
+    // locale.
     //
-    // NO index is built for this read, deliberately (owner ruling 2026-11-06). Nothing indexes agent_id
-    // WITHIN the pending partition: idx_gse_pending is (rule_id, agent_id) WHERE projection_pending,
-    // so agent_id is its second column, and idx_gse_agent_time reaches a device's rows but visits
-    // every event of it, pending or not. Measured envelope: on PG16/17/18 with ~125k pending of 530k
-    // events and with 1.2M pending, every plan took under 100 ms and read fewer than 2000 buffers;
-    // a PG18 scratch replica with 7M events and 2M pending read in ~190 ms unfiltered, per agent.
-    // RE-OPEN when the pending backlog grows past that envelope, which shows up as a 'statement
-    // timeout' log line from this function or a rising
+    // NO index is built for this read, deliberately (owner ruling 2026-11-06). Nothing indexes
+    // agent_id WITHIN the pending partition: idx_gse_pending is (rule_id, agent_id) WHERE
+    // projection_pending, so agent_id is its second column, and idx_gse_agent_time reaches a
+    // device's rows but visits every event of it, pending or not. Measured envelope: on PG16/17/18
+    // with ~125k pending of 530k events and with 1.2M pending, every plan took under 100 ms and
+    // read fewer than 2000 buffers; a PG18 scratch replica with 7M events and 2M pending read in
+    // ~190 ms unfiltered, per agent. RE-OPEN when the pending backlog grows past that envelope,
+    // which shows up as a 'statement timeout' log line from this function or a rising
     // yuzu_server_guardian_read_degrade_total{source="guardian_census_device",
-    // reason="statement_timeout"}. The fix is a partial (agent_id, rule_id) WHERE projection_pending
-    // index, carried into the UP-14 server PR's v5 migration or #7147; the boot index-shape check
-    // in the schema DO block (idx_gse_pending) must learn it in the same change.
+    // reason="statement_timeout"}. The owner declined an agent_id-leading pending index
+    // (2026-11-06) and no such index exists. A partial (agent_id, rule_id) WHERE projection_pending
+    // index, and the database-clock receipt column that closes the clock/counter gap, are a
+    // fresh-database DDL change tracked by a follow-up (issue to be filed); the boot index-shape
+    // check in the schema DO block (idx_gse_pending) must learn the index in the same change.
     std::vector<std::string> params{agent_id};
     std::string sql = "WITH q AS (SELECT DISTINCT e.rule_id "
                       "FROM guaranteed_state_store.guaranteed_state_events e "

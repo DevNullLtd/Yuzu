@@ -279,7 +279,7 @@ std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seco
     return seconds * kNsPerSec + nanos;
 }
 
-WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept {
+WirePair pair_from_wire_structural(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept {
     // Exclusive upper bound: below 2^62 the BIGINT sign bit is unreachable.
     if (boot_epoch == 0 && emit_seq == 0)
         return {};
@@ -294,14 +294,16 @@ WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexce
 
 WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq,
                         std::int64_t receipt_unix_s) noexcept {
-    const WirePair structural = pair_from_wire(boot_epoch, emit_seq);
+    const WirePair structural = pair_from_wire_structural(boot_epoch, emit_seq);
     if (!structural.paired)
         return structural;
-    // Both halves are below 2^62 here, so the signed comparisons are exact. A receipt before 1970
+    // Both halves are below 2^62 here, so the signed comparisons are exact. The epoch bound is
+    // written `boot_epoch - skew > max(receipt, 0)`, never `boot_epoch > receipt + skew`: the sum
+    // overflows (signed, undefined) for a receipt near INT64_MAX, and the difference cannot,
+    // because `boot_epoch` is at least 1 and the skew is a small constant. A receipt before 1970
     // (a broken server clock) leaves the epoch bound at its own skew, never below it.
-    const std::int64_t epoch_ceiling =
-        std::max<std::int64_t>(receipt_unix_s, 0) + kEpochSkewSeconds;
-    if (emit_seq >= kEmitSeqCeiling || structural.boot_epoch > epoch_ceiling)
+    if (emit_seq >= kEmitSeqCeiling ||
+        structural.boot_epoch - kEpochSkewSeconds > std::max<std::int64_t>(receipt_unix_s, 0))
         return {.reject = PairReject::Implausible};
     return structural;
 }
@@ -321,9 +323,10 @@ std::optional<PairReject> apply_validated_pair(GuaranteedStateEventRow& row, con
 }
 } // namespace
 
-std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,
-                                          std::uint64_t emit_seq) {
-    return apply_validated_pair(row, pair_from_wire(boot_epoch, emit_seq));
+std::optional<PairReject> apply_wire_pair_structural(GuaranteedStateEventRow& row,
+                                                     std::uint64_t boot_epoch,
+                                                     std::uint64_t emit_seq) {
+    return apply_validated_pair(row, pair_from_wire_structural(boot_epoch, emit_seq));
 }
 
 std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,

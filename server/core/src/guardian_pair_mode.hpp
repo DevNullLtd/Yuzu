@@ -9,12 +9,37 @@
 /// the code does not know must not read as `current`, which is the permissive one.
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace yuzu::server {
+
+namespace detail {
+/// The limits on a wire pair, in ONE place. They live here, in the pure header, because both the
+/// ingest boundary (`pair_from_wire`, `guardian_ingest.cpp`) and the store (`census_pair`,
+/// `guaranteed_state_store.cpp`) read them and the store must not pull in the ingest header
+/// (protobuf, spdlog) for three constants. Each half of a pair is in [1, `kPairValueLimit`): below
+/// 2^62 the BIGINT sign bit is unreachable. On top of that (UP-9) a pair must be PLAUSIBLE:
+/// `emit_seq` below `kEmitSeqCeiling` (2^40, about 1.1e12 events in one boot) and `boot_epoch`
+/// (Unix seconds) at most `kEpochSkewSeconds` (ten years of 365.25 days) past the server's receipt
+/// time. A pair that passes the range check and fails this one is `Implausible`: one such pair
+/// accepted would pin an agent's pair clock above every honest event for the life of the row,
+/// because only a higher pair advances the clock. The bound is absolute and stateless; a pair
+/// inside it is still judged by the pair clock (an agent whose clock was pinned by a value just
+/// inside it heals when the hold expires, one hour after the last accepted event).
+inline constexpr std::uint64_t kPairValueLimit = std::uint64_t{1} << 62;
+inline constexpr std::uint64_t kEmitSeqCeiling = std::uint64_t{1} << 40;
+inline constexpr std::int64_t kEpochSkewSeconds = 315'576'000;
+
+/// The census pair-decision counter's name (`census_decision_label` is its `decision` label). Here
+/// beside the label set for the same reason as the limits above: the store counts it, the ingest
+/// boundary and server.cpp pre-seed it.
+inline constexpr char kGuardianCensusPairDecisionsMetric[] =
+    "yuzu_server_guardian_census_pair_decisions_total";
+} // namespace detail
 
 enum class PairMode {
     Unpaired,          // no usable pair, and the pair clock is not fresh (or never set)
@@ -47,13 +72,32 @@ enum class PairMode {
     return "";
 }
 
+/// Every mode, in enumerator order. `parse_pair_mode` walks THIS list, so a mode missing from it
+/// could never be parsed from the step's answer (and would fail the step, silently). The asserts
+/// below tie it to the enum: it is contiguous from 0, every enumerator has a label, and the value
+/// one past the list has none (the switch above returns "" outside the enumerators, so an
+/// enumerator added after the last one fails here until this list is extended).
+inline constexpr std::array<PairMode, 7> kPairModes = {
+    PairMode::Unpaired,         PairMode::UnpairedHeld,     PairMode::RefusedRetired,
+    PairMode::Current,          PairMode::CurrentStraggler, PairMode::CurrentRebase,
+    PairMode::RefusedRegression};
+
+[[nodiscard]] constexpr bool pair_mode_table_is_complete() noexcept {
+    for (std::size_t i = 0; i < kPairModes.size(); ++i) {
+        if (static_cast<std::size_t>(kPairModes[i]) != i ||
+            std::string_view(pair_mode_label(kPairModes[i])).empty())
+            return false;
+    }
+    return std::string_view(pair_mode_label(static_cast<PairMode>(kPairModes.size()))).empty();
+}
+static_assert(pair_mode_table_is_complete(),
+              "kPairModes must list every PairMode in enumerator order, each with a label");
+
 /// Parse the text the step's SQL returned. `nullopt` for anything outside the SQL's closed set (an
 /// empty string, a differently cased label, a label from a later version): the caller fails the
 /// step, it never substitutes a mode.
 [[nodiscard]] constexpr std::optional<PairMode> parse_pair_mode(std::string_view s) noexcept {
-    for (const PairMode m :
-         {PairMode::Unpaired, PairMode::UnpairedHeld, PairMode::RefusedRetired, PairMode::Current,
-          PairMode::CurrentStraggler, PairMode::CurrentRebase, PairMode::RefusedRegression}) {
+    for (const PairMode m : kPairModes) {
         if (s == pair_mode_label(m))
             return m;
     }
@@ -134,6 +178,20 @@ inline constexpr std::array<CensusDecision, 10> kCensusDecisions = {
     }
     return "";
 }
+
+[[nodiscard]] constexpr bool census_decision_table_is_complete() noexcept {
+    for (std::size_t i = 0; i < kCensusDecisions.size(); ++i) {
+        if (static_cast<std::size_t>(kCensusDecisions[i]) != i ||
+            std::string_view(census_decision_label(kCensusDecisions[i])).empty())
+            return false;
+    }
+    return std::string_view(
+               census_decision_label(static_cast<CensusDecision>(kCensusDecisions.size())))
+        .empty();
+}
+static_assert(census_decision_table_is_complete(),
+              "kCensusDecisions must list every CensusDecision in enumerator order, each with a "
+              "label (it is the metric's pre-seed list and the parser's list)");
 
 /// Parse the label the census statement returned. `nullopt` for anything outside the closed set
 /// (an empty string, a differently cased label, a label from a later version).

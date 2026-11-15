@@ -817,42 +817,42 @@ std::int64_t pair_rejected_count(yuzu::MetricsRegistry& m, const char* reason) {
 
 TEST_CASE("guardian ingest: pair_from_wire validates the emit-order pair (UP-14 D5)",
           "[guardian][ingest][pair]") {
-    using yuzu::server::detail::pair_from_wire;
+    using yuzu::server::detail::pair_from_wire_structural;
     using yuzu::server::detail::PairReject;
     // Both set and in [1, 2^62): a pair, in the order (boot_epoch, emit_seq).
-    const auto ok = pair_from_wire(7, 11);
+    const auto ok = pair_from_wire_structural(7, 11);
     CHECK(ok.paired);
     CHECK(ok.boot_epoch == 7);
     CHECK(ok.emit_seq == 11);
     CHECK(ok.reject == PairReject::None);
     // 2^62 - 1 is the largest accepted value on either side; both extremes at once.
-    const auto top = pair_from_wire(k2p62 - 1, k2p62 - 1);
+    const auto top = pair_from_wire_structural(k2p62 - 1, k2p62 - 1);
     CHECK(top.paired);
     CHECK(top.boot_epoch == static_cast<std::int64_t>(k2p62 - 1));
     CHECK(top.emit_seq == static_cast<std::int64_t>(k2p62 - 1));
     CHECK(top.reject == PairReject::None);
-    CHECK(pair_from_wire(1, 1).paired); // the 1-based floor
+    CHECK(pair_from_wire_structural(1, 1).paired); // the 1-based floor
     // 0/0 is an unpaired sender, not a rejection.
-    const auto none = pair_from_wire(0, 0);
+    const auto none = pair_from_wire_structural(0, 0);
     CHECK_FALSE(none.paired);
     CHECK(none.reject == PairReject::None);
     // Exactly one set, in either direction, is half_set.
-    CHECK_FALSE(pair_from_wire(5, 0).paired);
-    CHECK(pair_from_wire(5, 0).reject == PairReject::HalfSet);
-    CHECK_FALSE(pair_from_wire(0, 5).paired);
-    CHECK(pair_from_wire(0, 5).reject == PairReject::HalfSet);
+    CHECK_FALSE(pair_from_wire_structural(5, 0).paired);
+    CHECK(pair_from_wire_structural(5, 0).reject == PairReject::HalfSet);
+    CHECK_FALSE(pair_from_wire_structural(0, 5).paired);
+    CHECK(pair_from_wire_structural(0, 5).reject == PairReject::HalfSet);
     // half_set is decided before the range check: a lone out-of-range value beside a zero is
     // still half_set.
-    CHECK(pair_from_wire(k2p62, 0).reject == PairReject::HalfSet);
-    CHECK(pair_from_wire(0, k2p62).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire_structural(k2p62, 0).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire_structural(0, k2p62).reject == PairReject::HalfSet);
     // Either value at or above 2^62 beside a set partner is out_of_range, including values with
     // the sign bit set (a wire uint64 cannot be negative; it would read as one as an int64).
     for (const std::uint64_t big : {k2p62, k2p62 + 1, std::uint64_t{1} << 63,
                                     std::numeric_limits<std::uint64_t>::max()}) {
-        CHECK_FALSE(pair_from_wire(big, 3).paired);
-        CHECK(pair_from_wire(big, 3).reject == PairReject::OutOfRange);
-        CHECK_FALSE(pair_from_wire(3, big).paired);
-        CHECK(pair_from_wire(3, big).reject == PairReject::OutOfRange);
+        CHECK_FALSE(pair_from_wire_structural(big, 3).paired);
+        CHECK(pair_from_wire_structural(big, 3).reject == PairReject::OutOfRange);
+        CHECK_FALSE(pair_from_wire_structural(3, big).paired);
+        CHECK(pair_from_wire_structural(3, big).reject == PairReject::OutOfRange);
     }
 }
 
@@ -860,7 +860,7 @@ TEST_CASE("guardian ingest: apply_wire_pair fills the row and returns why a pair
           "(UP-14 D5)",
           "[guardian][ingest][pair]") {
     using yuzu::server::GuaranteedStateEventRow;
-    using yuzu::server::detail::apply_wire_pair;
+    using yuzu::server::detail::apply_wire_pair_structural;
     using yuzu::server::detail::PairReject;
     GuaranteedStateEventRow row;
     row.event_id = "evt-pair";
@@ -876,36 +876,37 @@ TEST_CASE("guardian ingest: apply_wire_pair fills the row and returns why a pair
           "out_of_range");
 
     // Both set: the pair lands on the row, not swapped, and nothing is withheld.
-    CHECK_FALSE(apply_wire_pair(row, 7, 11).has_value());
+    CHECK_FALSE(apply_wire_pair_structural(row, 7, 11).has_value());
     REQUIRE(row.boot_epoch.has_value());
     REQUIRE(row.emit_seq.has_value());
     CHECK(*row.boot_epoch == 7);
     CHECK(*row.emit_seq == 11);
     // The largest accepted values.
-    CHECK_FALSE(apply_wire_pair(row, k2p62 - 1, k2p62 - 1).has_value());
+    CHECK_FALSE(apply_wire_pair_structural(row, k2p62 - 1, k2p62 - 1).has_value());
     CHECK(row.boot_epoch == static_cast<std::int64_t>(k2p62 - 1));
     CHECK(row.emit_seq == static_cast<std::int64_t>(k2p62 - 1));
     // Both zero: unset, and not a rejection.
-    CHECK_FALSE(apply_wire_pair(row, 0, 0).has_value());
+    CHECK_FALSE(apply_wire_pair_structural(row, 0, 0).has_value());
     CHECK_FALSE(row.boot_epoch.has_value());
     CHECK_FALSE(row.emit_seq.has_value());
 
     // Half set, each direction: unset, and the reason is returned.
-    CHECK(apply_wire_pair(row, 5, 0) == std::optional<PairReject>{PairReject::HalfSet});
+    CHECK(apply_wire_pair_structural(row, 5, 0) == std::optional<PairReject>{PairReject::HalfSet});
     CHECK_FALSE(row.boot_epoch.has_value());
     CHECK_FALSE(row.emit_seq.has_value());
-    CHECK(apply_wire_pair(row, 0, 5) == std::optional<PairReject>{PairReject::HalfSet});
+    CHECK(apply_wire_pair_structural(row, 0, 5) == std::optional<PairReject>{PairReject::HalfSet});
     CHECK_FALSE(row.boot_epoch.has_value());
     // 2^62 on either side: unset, out_of_range.
-    CHECK(apply_wire_pair(row, k2p62, 5) == std::optional<PairReject>{PairReject::OutOfRange});
+    CHECK(apply_wire_pair_structural(row, k2p62, 5) ==
+          std::optional<PairReject>{PairReject::OutOfRange});
     CHECK_FALSE(row.boot_epoch.has_value());
     CHECK_FALSE(row.emit_seq.has_value());
-    CHECK(apply_wire_pair(row, 5, std::numeric_limits<std::uint64_t>::max()) ==
+    CHECK(apply_wire_pair_structural(row, 5, std::numeric_limits<std::uint64_t>::max()) ==
           std::optional<PairReject>{PairReject::OutOfRange});
     CHECK_FALSE(row.emit_seq.has_value());
     // A pair is cleared by a later rejection on the same row, never left half-applied.
-    CHECK_FALSE(apply_wire_pair(row, 3, 4).has_value());
-    CHECK(apply_wire_pair(row, 3, 0).has_value());
+    CHECK_FALSE(apply_wire_pair_structural(row, 3, 4).has_value());
+    CHECK(apply_wire_pair_structural(row, 3, 0).has_value());
     CHECK_FALSE(row.boot_epoch.has_value());
     CHECK_FALSE(row.emit_seq.has_value());
 }
@@ -1058,6 +1059,7 @@ TEST_CASE("guardian ingest: pair_from_wire with a receipt applies the absolute p
     using yuzu::server::detail::kEmitSeqCeiling;
     using yuzu::server::detail::kEpochSkewSeconds;
     using yuzu::server::detail::pair_from_wire;
+    using yuzu::server::detail::pair_from_wire_structural;
     using yuzu::server::detail::PairReject;
     constexpr std::int64_t receipt = 1'800'000'000; // Unix seconds
     const auto epoch_at = [&](std::int64_t delta) {
@@ -1083,8 +1085,8 @@ TEST_CASE("guardian ingest: pair_from_wire with a receipt applies the absolute p
     CHECK(pair_from_wire(0, 0, receipt).reject == PairReject::None);
     // A receipt before 1970 never lowers the bound below the skew itself.
     CHECK(pair_from_wire(static_cast<std::uint64_t>(kEpochSkewSeconds), 1, -5).paired);
-    // The two-argument form is structural only: it does not apply the bound.
-    CHECK(pair_from_wire(7, kEmitSeqCeiling).paired);
+    // The structural form is structural only: it does not apply the bound.
+    CHECK(pair_from_wire_structural(7, kEmitSeqCeiling).paired);
 }
 
 TEST_CASE("guardian ingest: apply_wire_pair with a receipt withholds an implausible pair and "
@@ -1092,6 +1094,7 @@ TEST_CASE("guardian ingest: apply_wire_pair with a receipt withholds an implausi
           "[guardian][ingest][pair]") {
     using yuzu::server::GuaranteedStateEventRow;
     using yuzu::server::detail::apply_wire_pair;
+    using yuzu::server::detail::apply_wire_pair_structural;
     using yuzu::server::detail::kEmitSeqCeiling;
     using yuzu::server::detail::PairReject;
     constexpr std::int64_t receipt = 1'800'000'000;
@@ -1112,7 +1115,7 @@ TEST_CASE("guardian ingest: apply_wire_pair with a receipt withholds an implausi
           std::optional<PairReject>{PairReject::OutOfRange});
     CHECK_FALSE(row.boot_epoch.has_value());
     // The three-argument form is structural only: the implausible pair is taken.
-    CHECK_FALSE(apply_wire_pair(row, 7, kEmitSeqCeiling).has_value());
+    CHECK_FALSE(apply_wire_pair_structural(row, 7, kEmitSeqCeiling).has_value());
     CHECK(row.emit_seq == static_cast<std::int64_t>(kEmitSeqCeiling));
 }
 
