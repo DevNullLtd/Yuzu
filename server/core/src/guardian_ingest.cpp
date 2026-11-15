@@ -21,6 +21,7 @@
 
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
+#include "guardian_pair_mode.hpp" // kCensusDecisions, census_decision_label
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"
 
@@ -108,6 +109,12 @@ void warm_create_guardian_event_store_metric(yuzu::MetricsRegistry& metrics) {
           EventInsertOutcome::Conflict, EventInsertOutcome::Error})
         metrics.histogram(kGuardianEventStoreDurationMetric,
                           {{"status", std::string(event_insert_status_label(status))}}, buckets);
+}
+
+void preseed_census_pair_decision_metric(yuzu::MetricsRegistry& metrics) {
+    for (const CensusDecision decision : kCensusDecisions)
+        metrics.counter(kGuardianCensusPairDecisionsMetric,
+                        {{"decision", census_decision_label(decision)}});
 }
 
 void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,

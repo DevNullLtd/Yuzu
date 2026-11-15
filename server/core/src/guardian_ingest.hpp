@@ -139,6 +139,16 @@ inline constexpr char kGuardianPairRejectedMetric[] = "yuzu_server_guardian_pair
 inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of_range",
                                                              "implausible"};
 
+/// Counter of census decisions by `decision` (the closed `CensusDecision` set,
+/// `guardian_pair_mode.hpp`), one per census write whose upsert returned a labelled row and whose
+/// savepoint released: a first delivery, a Repair and a batch row. A key-mode event the key rule
+/// refuses has no label and counts nothing; an implausible held event never reaches the census, so
+/// it counts nothing here (it is on the projection counter as `held`). Best-effort and counted
+/// before the transaction commits, as the projection counter is. Pre-seeded (server.cpp) from
+/// `kCensusDecisions` so each series reads 0, not absent. Never labelled by agent.
+inline constexpr char kGuardianCensusPairDecisionsMetric[] =
+    "yuzu_server_guardian_census_pair_decisions_total";
+
 /// The ONE place a `PairReject` becomes its label, so the counter series, the pre-seed loop and the
 /// log line cannot drift from `kGuardianPairRejectReasons`. `None` has no reason (empty).
 [[nodiscard]] constexpr const char* pair_reject_reason(PairReject r) noexcept {
@@ -214,6 +224,11 @@ inline constexpr char kGuardianEventStoreDurationMetric[] =
 /// through the seconds tail (Postgres / lock contention). Boundaries are fixed at first series
 /// creation, so warm-create and any observe MUST agree; this is the single source.
 [[nodiscard]] std::vector<double> guardian_event_store_buckets();
+
+/// Birth every `decision` series of `kGuardianCensusPairDecisionsMetric` (the closed
+/// `kCensusDecisions` set) at 0, so each reads 0 rather than absent from boot. Call once at startup
+/// (server.cpp) and in tests that assert the family.
+void preseed_census_pair_decision_metric(yuzu::MetricsRegistry& metrics);
 
 /// Birth all four `status` series (inserted|redelivered|conflict|error) with the custom ladder
 /// so the boundaries are pinned before the first observe and the series appear on /metrics from

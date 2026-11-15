@@ -112,9 +112,10 @@ struct GuaranteedStateEventRow {
     // `boot_epoch`/`emit_seq` ONLY when both are set and each is in [1, 2^62): both set or both
     // unset, never one. Unset = unpaired (NULL columns). The store writes them to the event row
     // and to the census row (re-validated by `census_pair`, so a half pair is never stored). The
-    // agent order step reads them and counts how a comparator WOULD decide (the per-agent
-    // regression, straggler, recovery and retired-event counters); no verdict compares them yet.
-    // Like the key inputs above they stay OUT of the duplicate identity.
+    // agent order step decides a MODE from them and the agent's pair clock (counting it on the
+    // per-agent regression, straggler, recovery and retired-event counters), and the census
+    // statements order the verdict by that mode: a paired event over a paired row follows the
+    // pair, not the key. Like the key inputs above they stay OUT of the duplicate identity.
     std::optional<std::int64_t> boot_epoch;
     std::optional<std::int64_t> emit_seq;
     // UP-9: the ingest boundary withheld a structurally valid pair because it failed the absolute
@@ -316,7 +317,8 @@ struct GuardianDeviceGuardsReport {
     std::vector<std::string> unrepresented_pending_rule_ids;
     /// The device's `guardian_agent_order` row (the stored emit-order pair clock and its
     /// counters), or `nullopt` when the device never had a census-bearing event accepted (or was
-    /// decommissioned). Stored and counted, not yet compared: no verdict is held or refused on it.
+    /// decommissioned). The clock and counters the census ordering decides by: an unpaired event is
+    /// held, and a pair-mode event refused or re-based, from this row.
     std::optional<GuardianAgentOrder> ordering;
 };
 

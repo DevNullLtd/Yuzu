@@ -4420,6 +4420,26 @@ public:
                   "rejected", "failed", "abandoned"})
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
+        metrics_.describe(
+            detail::kGuardianCensusPairDecisionsMetric,
+            "Compliance-census decisions by decision label, one per census write that returned a "
+            "decision and was not rolled back: applied_pair (a pair-ordered event became the "
+            "verdict), applied_key (an unpaired event became the verdict by the key rule), "
+            "transition_to_pair (a pair-ordered event replaced an unpaired verdict), "
+            "transition_to_key (an unpaired event replaced a paired verdict after the hold "
+            "expired), rebase (a stale pair clock was re-based: applied by arrival and flagged), "
+            "held_unpaired (an unpaired event refused while the pair clock is fresh), "
+            "refused_regression (a lower epoch refused while the pair clock is fresh), "
+            "refused_retired (an event of the retired epoch refused), refused_duplicate (an equal "
+            "pair refused: two processes share one epoch) and refused_straggler (a same-epoch "
+            "lower sequence refused while the pair clock is fresh). A Repair of a stored event "
+            "counts its decision too. An unpaired event the key rule refuses has no label and "
+            "counts nothing; an implausible pair held at first delivery never reaches the census "
+            "(see the projection counter's held outcome). Counted when the projection returns, "
+            "before the transaction commits, so a rolled-back transaction still counts. Resets on "
+            "server restart.",
+            "counter");
+        detail::preseed_census_pair_decision_metric(metrics_);
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
         metrics_.describe(detail::kGuardianPairRejectedMetric,
                           "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
@@ -4452,8 +4472,7 @@ public:
             "recorded more than 300 s in the database's future (an agent that never "
             "sent a pair counts; accepted means accepted for ordering). The value "
             "is read against the database clock, so it can change between two "
-            "sweeps with no event. The pair is stored and counted, not yet "
-            "compared: no verdict depends on it. Not updated while the store "
+            "sweeps with no event. Not updated while the store "
             "cannot answer, "
             "and absent until the first answered read. Per-agent detail is the "
             "ordering field of the per-device all-guards read.",
