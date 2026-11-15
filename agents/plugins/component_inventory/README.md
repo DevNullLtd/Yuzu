@@ -1,6 +1,15 @@
 # component_inventory
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Installed software components found in application trees (Java archives) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.components.scan) |
+| **Platforms** | Windows 🟡 planned · macOS ✅ · Linux ✅ |
+| **Actions** | `scan` (definition `crossplatform.components.scan`) |
+| **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
+| **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -36,6 +45,15 @@ What a result proves. `supported` means the scan finished: no bound was reached 
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `scan` | 🟡 planned · rung 1 · bounded Program Files walk with the same archive reads | ✅ supported · rung 1 · bounded read-only walk of /Applications, /Library/Java, /usr/local and /opt/homebrew; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via getmntinfo_r_np | ✅ supported · rung 1 · bounded read-only walk of /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and /usr/share/maven; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via /proc/<pid>/mountinfo |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`scan` / Windows** — not read yet: one unsupported status row, windows:planned
+- **`scan` / macOS** — Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained
+- **`scan` / Linux** — Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,6 +71,7 @@ No external binaries, no subprocesses, no network use: the plugin lists director
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+The action takes no parameters.
 <!-- END GENERATED -->
 
 ### Outputs
@@ -60,6 +79,19 @@ No external binaries, no subprocesses, no network use: the plugin lists director
 Every row is pipe-delimited. The first row is always `status|scan|<level>|<tokens>` (`level` is `supported`, `constrained` or `unsupported`; `tokens` is comma-joined cause tokens, or `-`). Component rows follow as `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>`, one per archive and one per nested library; the first field is `row_kind` (`status` or `comp`) and is the first column below, and on a status row the next columns carry the action name, the level and the tokens. `version` is empty when `version_source` is `unreadable`. `supported` with zero component rows and no informational token means none was found at the roots; `constrained` means the list may be incomplete. Rows are written at both levels.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.components.scan` — `row_kind|kind|name|version|version_source|path|size|mtime|anchor_app`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `row_kind` | string | `status` `comp` | macOS, Linux | `comp` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), comp (one per archive or nested library found). |
+| `kind` | string | - | macOS, Linux | `java` | Component kind. Values: java. Status rows: the action name (scan). |
+| `name` | string | - | macOS, Linux | `log4j-core` | Artifact name taken from the file name, without the version and extension (log4j-core-2.17.1.jar reads log4j-core). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported). |
+| `version` | string | - | macOS, Linux | `2.17.1` | Version from the file name, corrected by the archive's pom.properties or MANIFEST.MF only when the file name carries that version; when the name gives none, from pom.properties, else MANIFEST.MF; empty when none gives one. Nested libraries take it from the entry name only. A pre-release or build qualifier (rc, beta, M1, snapshot, a build number) stays in it. Status rows: the comma-joined cause tokens, or -. |
+| `version_source` | string | `filename` `pom` `manifest` `unreadable` | macOS, Linux | `filename` | Where the version came from. Values: filename, pom, manifest, unreadable (no source gave a version; the row is still listed and the scan is not made incomplete by it). |
+| `path` | string | - | macOS, Linux | `/opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar` | Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?. |
+| `size` | int64 | - | macOS, Linux | `1789769` | Size in bytes: the archive file size, or the nested entry's uncompressed size. |
+| `mtime` | int64 | - | macOS, Linux | `1700000000` | Modification time of the archive file as Unix seconds; a nested library carries its archive's. |
+| `anchor_app` | string | - | macOS, Linux | `app` | First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -98,6 +130,28 @@ A `constrained` answer names one cause (the first recorded); the informational t
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-11-15 · euid 501 · leg-hash 2f84f2a4c6e7
+
+```
+== action=scan
+status|scan|constrained|macos:component_inventory:budget_entries
+comp|java|test||unreadable|/opt/homebrew/Library/Homebrew/test/support/fixtures/test.jar|397|1787153877|Library
+comp|java|concurrent_ruby||unreadable|/opt/homebrew/Library/Homebrew/vendor/bundle/ruby/4.0.0/gems/concurrent-ruby-1.3.8/lib/concurrent-ruby/concurrent/concurrent_ruby.jar|136802|1787153877|Library
+[result_status] CONSTRAINED / PARTIAL / macos:component_inventory:budget_entries
+```
+
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-15 · euid 0 · leg-hash 2f84f2a4c6e7
+
+```
+== action=scan
+status|scan|supported|linux:component_inventory:link_skipped,linux:component_inventory:version_unreadable
+comp|java|libintl|0.23.2|filename|/usr/share/java/libintl-0.23.2.jar|2594|1763054400|libintl-0.23.2.jar
+comp|java|gradle-wrapper|2.10|manifest|/opt/vcpkg/buildtrees/grpc/src/v1.76.0-c85157dbaa.clean/examples/android/helloworld/gradle/wrapper/gradle-wrapper.jar|53636|1760754624|vcpkg
+comp|java|gradle-wrapper||unreadable|/opt/vcpkg/buildtrees/grpc/src/v1.81.1-f067b41624.clean/examples/android/helloworld/gradle/wrapper/gradle-wrapper.jar|43764|1780610306|vcpkg
+comp|java|gradle-wrapper|2.10|manifest|/opt/vcpkg/buildtrees/grpc/src/v1.76.0-c85157dbaa.clean/src/android/test/interop/gradle/wrapper/gradle-wrapper.jar|53636|1760754624|vcpkg
+comp|java|gradle-wrapper||unreadable|/opt/vcpkg/buildtrees/grpc/src/v1.81.1-f067b41624.clean/src/android/test/interop/gradle/wrapper/gradle-wrapper.jar|43764|1780610306|vcpkg
+[result_status] OK / FULL
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -111,4 +165,9 @@ A `constrained` answer names one cause (the first recorded); the informational t
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/component_inventory/src/component_fs_posix.cpp` · `agents/plugins/component_inventory/src/component_inventory_plugin.cpp` · `agents/plugins/component_inventory/src/component_java_parsers.hpp` · `agents/plugins/component_inventory/src/component_legs.hpp` · `agents/plugins/component_inventory/src/component_scan.hpp` · `agents/plugins/component_inventory/src/component_walk.hpp` · `agents/plugins/component_inventory/src/zip_directory.hpp`
+- Definitions: `content/definitions/component_inventory.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_component_inventory.hpp`
+- Tests: `tests/test_component_inventory_definition.py` · `tests/unit/test_component_inventory_local_dispatcher.cpp`
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

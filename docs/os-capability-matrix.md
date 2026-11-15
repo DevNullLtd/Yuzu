@@ -291,6 +291,9 @@ implementation is.
 | chargen | chargen_stop | linux | supported | 1 | in-process | - |
 | chargen | chargen_stop | macos | supported | 1 | in-process | - |
 | chargen | chargen_stop | windows | supported | 1 | in-process | - |
+| component_inventory | scan | linux | supported | 1 | bounded read-only walk of /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and /usr/share/maven; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via /proc/<pid>/mountinfo | Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained |
+| component_inventory | scan | macos | supported | 1 | bounded read-only walk of /Applications, /Library/Java, /usr/local and /opt/homebrew; no link followed at any path component; archive central directory, pom.properties and MANIFEST.MF read in-process; network mounts skipped via getmntinfo_r_np | Java archives only; machine roots only (per-user installs are not read); any budget, unreadable directory or unenumerable archive answers constrained |
+| component_inventory | scan | windows | planned | 1 | bounded Program Files walk with the same archive reads | not read yet: one unsupported status row, windows:planned |
 | content_dist | stage | linux | supported | 1 | httplib_tls | - |
 | content_dist | stage | macos | supported | 1 | httplib_tls | - |
 | content_dist | stage | windows | constrained | 1 | httplib_tls | requires OpenSSL to be found at build time; HTTPS unavailable if absent |
