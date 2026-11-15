@@ -322,11 +322,19 @@ public:
         agent_step_enabled_.store(enabled, std::memory_order_relaxed);
     }
 
-    /// The agent order step's own `lock_timeout` and `statement_timeout`, in milliseconds. The lock
+    /// The agent order step's own `lock_timeout` and `statement_timeout` (this value plus
+    /// `kAgentStepStatementMarginMs`), in milliseconds. The lock
     /// bound is per lock wait, the statement bound is the whole of each statement (Ensure, DECIDE,
     /// and the one re-run after a concurrent delete), so a step can hold its pooled connection for
     /// the sum of its statements. See the Timeouts paragraph on `agent_order_step`.
     static constexpr int kAgentStepLockTimeoutMs = 1000;
+
+    /// The margin by which the step's `statement_timeout` exceeds its `lock_timeout`. The statement
+    /// bound must not fire first on an ordinary wait: a lock wait begins after its statement does,
+    /// so at equal values the statement timeout would always end it (57014) and the lock timeout
+    /// (55P03) could never be reached. With the margin a plain wait still ends on the lock bound,
+    /// and the statement bound is the ceiling for a wait the lock bound does not end.
+    static constexpr int kAgentStepStatementMarginMs = 500;
 
     /// Test seam: the `lock_timeout` the agent order step applies, in milliseconds (default
     /// `kAgentStepLockTimeoutMs`). A test that parks a delivery behind a held lock and expects the
