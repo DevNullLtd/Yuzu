@@ -1778,7 +1778,8 @@ flip, with a red-first test each:
     **Pre-flip requirements at a glance (File fix, #5719 item 5).** This list only points at the detail below; none of
     it is done. Before any `prefer_spark` flip:
     - #7836: the Registry parent-key rename deaf-watch gap (the parked case) is closed or explicitly accepted.
-    - #7874: resource-exhaustion errors no longer count toward the undecided-result streak.
+    - #7874: resource-exhaustion and network open errors (see #7874) no longer count toward the undecided-result
+      streak.
     - #7875: a lost path whose cancelled read never drains gets a deadline-driven recovery, or the owner re-accepts
       the residual (it is also in section 5).
     - #7876: a runtime off switch exists for the Spark File mechanism as a whole.
@@ -1791,7 +1792,8 @@ flip, with a red-first test each:
     Anything marked "governance-round" was produced on the same rig by the committed cases and the scripted loops and
     mutations named, on the source tree whose git tree hash is given with the figures; those run logs are
     author-reported too: held in the author's scratch area, not committed to the repository, and not reproducible from
-    it. No figure here is a macOS or CI result; the only sanitizer result is the MSVC AddressSanitizer one of fix round 8, on the Windows rig.
+    it. No figure here is a macOS or CI result; the only sanitizer result is the MSVC AddressSanitizer one of fix
+    round 8, on the Windows rig.
     The oracle is the literal one in (e): within a bound the mechanism calls `fault()`. A watch that only drops
     its coverage, or only stops delivering, is a red case, not a pass; delivery after the object is repaired is a
     secondary check. The File cases LATCH on the Collector's Faulted event (the delivery of that `fault()` call)
@@ -1931,8 +1933,9 @@ flip, with a red-first test each:
     access operation follows; unmeasured) on a directory that carries an auditing SACL, adds EDR noise and thread churn,
     has no cap on the number of directories, and its cost was
     measured only up to 200 directories (author-reported, below). A rule path on a network share (a UNC path) makes it
-    a periodic SMB session that authenticates as the machine account (an NTLM sign-in, by review; not measured), once per directory every 5 s, so audit
-    and EDR owners must expect that sign-in and share traffic as well as local handle requests. What is and is not known
+    a periodic SMB session that authenticates as the machine account (an NTLM sign-in, by review; not measured), once
+    per directory every 5 s, so audit and EDR owners must expect that sign-in and share traffic as well as local handle
+    requests. What is and is not known
     about the cost: the only measurement is a non-committed probe at a 1 s interval over 30 s at 200 watched directories
     (3864 verifications, about 129 per second, which is a throughput ceiling and not a budget); no committed document
     carries a "share of a core" figure and none should be quoted from a review; above roughly 600 directories at the
@@ -2138,6 +2141,50 @@ flip, with a red-first test each:
     (the file change is Windows-only; the header change is comments). Not run: the flip-time chaos scenarios named in item
     (4), any Linux sanitizer on the File mechanism (it is Windows-only), and a TSan run. No agent re-review covered this
     round; the confirmation is the rig runs, the ASan reproduction and the diff check.
+    Fix round 9 (a default-leg observer for the stash cure, a stricter replay lookup, tighter stash tests), rig bytes:
+    production commit `b2344dc3c8` (`spark_file.cpp` and `spark_mechanism.hpp`, whole-repo tree
+    `f0684df16195fec657e58f8ee077f5ba9fc6d66e`) and test commit `9ae268a80b` (`test_spark_mechanism.cpp`, whole-repo tree
+    `f11ddf4ffcd3c3e158d16551894f7f0d953bcf6a`); the documentation commit that follows changes no source. The rig tree
+    was a `git archive` of `b2344dc3c8` with the test file copied over (the same bytes as the commits), and the md5 of
+    the three source files on the rig equalled the md5 of the committed files (`spark_file.cpp`
+    `809af7a9e2e01387e80db677fd5f883b`, `spark_mechanism.hpp` `f74eeae461ece34dc0f3f99a0c95d035`,
+    `test_spark_mechanism.cpp` `9a68a170a1805af64909cb33c5e11723`); the tree hashes name the whole repository and were not
+    themselves checked on the rig. **What changed.** A new debug counter, `stash_dropped`, counts a handed-back stash
+    entry that `run()` drops instead of replaying. The replay lookup now returns a watch only when its id matches, it is
+    not being removed and it has no read outstanding (the state a swallowed completion leaves); anything else is dropped
+    and counted. **Which leg observes what.** The unwatch case asserts `stash_dropped == 1`, so every Windows leg sees the
+    drop arm run; a heap-use-after-free report for a dereference of the freed watch exists only on the windows-asan
+    nightly leg (main only). The stop case is a contract pin, not an observer: the premature-reap half of the old defect
+    (a reap that ended while another watch's read was pending) has no test observer, because a kernel write into freed
+    memory is invisible to ASan and no counter or stat shows that no watch is `io_pending` when the reap ends; its
+    closure rests on the cure (a release posts nothing) and on code reading. A fourth case (25 item-5 File cases now, 24 before) pins that a release after
+    `stop()` is harmless (no crash, no event, nothing dropped, nothing quarantined; that the stash was cleared is not
+    directly observable). The ninth-swallow case now states "replayed once" against a control, the unswallowed ninth
+    watch, because one change yields two Fired events per completion on the rig, not one; its post-release check on the
+    hook's call count was trivially true and was removed. Test-only wording and ordering fixes: the park guard is declared
+    after the engine, the new waits are scaled for the slow legs, the unwatch case takes its liveness baseline after a
+    settle, and the comment on the backup-privilege guard no longer claims the privileges are enabled in an elevated
+    token. **Runs.** Normal build (the weecolin debug-type build without debug info): `[mechanism]` 192 cases (5760
+    assertions), `[5719]` 67 (2184) and `[4415prA]` 105 (3544) green, the parked Registry case red by tag (1 case, 16
+    assertions, 2 failed), the `File spark (real mechanism): *` pattern 3 of 3 green (54 cases), each of the four stash
+    cases 20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16). MSVC AddressSanitizer
+    build of the same bytes (`/fsanitize=address /MD`, annotations disabled, `halt_on_error=1`): the four stash cases,
+    `[mechanism]` 192 cases (5762 assertions), `[5719]` 67 (2184), `[4415prA]` 105 (3544) green, the parked case red by
+    tag, the File pattern (54 cases) green 3 of 3, no AddressSanitizer report in any run. Linux debug: `[mechanism]` 62
+    cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green, unchanged. **Mutations** (each built
+    from the restored source and restored afterwards; the restored md5 equalled the committed one): removing the
+    `stash_dropped` increment turns the unwatch case red in the NORMAL build, on its first run, at the
+    `stash_dropped == 1` requirement, while the other stash cases and the two lost-path stash cases stayed green 3 of 3
+    (the default-leg observer is real). Reverting the lookup to id-only (dropping the removing and `io_pending`
+    predicates) turned NO case red (3 of 3 green on every stash and lost-path case): the two extra predicates have no
+    test observer, and the existing seams do not reach a stash entry whose watch is removing or re-armed, so they are
+    hardening by construction, not a tested guard. **The old bytes in a non-ASan build.** The previous production bytes
+    (`e850a0f387`) with the previous test file (`be187fea47`, whose unwatch case reproduced the heap-use-after-free under
+    ASan in fix round 8) in the NORMAL build: the unwatch, stop and ninth-swallow cases each passed 5 of 5. So without
+    the sanitizer the old defect is silent in these cases, which is why the counter assertion (on the old bytes there is
+    no drop to count: the entry's watch is dereferenced) and the windows-asan leg are the observers. Not run: the retired-watch and
+    re-armed-watch arms of the lookup (no existing seam reaches them), any TSan run, and the flip-time chaos scenarios. No
+    agent re-review covered this round.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
