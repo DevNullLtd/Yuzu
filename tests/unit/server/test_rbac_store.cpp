@@ -25,6 +25,7 @@
 #include "rbac_store.hpp"
 
 #include "test_auth_db_pg_helper.hpp" // RBAC_STORE_WITH_AUTH — the last-admin guard's auth.users JOIN
+#include "test_mgmt_group_pg_helper.hpp" // plant_group_role_row (test-only raw group-role insert)
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
@@ -2927,13 +2928,15 @@ TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]
     REQUIRE(group_id.has_value());
     mgmt.add_member(*group_id, "agent-crm-1");
 
-    // Assign ITServiceOwner to alice on this group
+    // Assign Operator (seeds Tag:Write and Execution:Execute) to alice on this group. The write
+    // is REQUIREd: an unchecked refusal would leave no row and the CHECKs below would fail for
+    // the wrong reason.
     GroupRoleAssignment a;
     a.group_id = *group_id;
     a.principal_type = "user";
     a.principal_id = "alice";
-    a.role_name = "ITServiceOwner";
-    mgmt.assign_role(a);
+    a.role_name = "Operator";
+    REQUIRE(mgmt.assign_role(a).has_value());
 
     // alice has NO global role, but should have scoped access
     CHECK(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
@@ -2946,20 +2949,22 @@ TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_stor
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ManagementGroupStore mgmt{pool};
 
-    // alice has ITServiceOwner on CRM group, but agent-other is not in it
+    // alice has Operator on CRM group, but agent-other is not in it
     ManagementGroup g;
     g.name = "Service: CRM";
     g.membership_type = "static";
     auto group_id = mgmt.create_group(g);
     REQUIRE(group_id.has_value());
-    mgmt.add_member(*group_id, "agent-crm-1");
+    REQUIRE(mgmt.add_member(*group_id, "agent-crm-1").has_value());
 
     GroupRoleAssignment a;
     a.group_id = *group_id;
     a.principal_type = "user";
     a.principal_id = "alice";
-    a.role_name = "ITServiceOwner";
-    mgmt.assign_role(a);
+    a.role_name = "Operator";
+    // REQUIREd: the denial below is only meaningful when the grant genuinely exists, so that it
+    // is the scope (not a missing row) that denies.
+    REQUIRE(mgmt.assign_role(a).has_value());
 
     // agent-other is NOT in the CRM group
     CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-other", &mgmt));
@@ -2996,7 +3001,7 @@ TEST_CASE("RbacStore: check_scoped_permission_checked separates a genuine deny f
     a.group_id = *group_id;
     a.principal_type = "user";
     a.principal_id = "alice";
-    a.role_name = "ITServiceOwner";
+    a.role_name = "Operator";
     REQUIRE(mgmt.assign_role(a).has_value());
 
     const auto checked = [&](const std::string& user, const std::string& agent,
@@ -3085,7 +3090,7 @@ TEST_CASE("RbacStore: check_scoped_permission_checked reports a member or ancest
     a.group_id = *pid;
     a.principal_type = "user";
     a.principal_id = "alice";
-    a.role_name = "ITServiceOwner";
+    a.role_name = "Operator";
     REQUIRE(mgmt.assign_role(a).has_value());
 
     // Healthy: the child's agent is reachable from the grant on its PARENT (ancestor-aware).
@@ -3141,19 +3146,24 @@ TEST_CASE("RbacStore: revoking one role's default does not create a scoped deny_
     mgmt.add_member(*group_id, "agent-crm-1");
 
     // alice holds BOTH roles scoped to the SAME group: ITServiceOwner
-    // (revoked default) and Operator (independent, unrevoked grant).
+    // (revoked default) and Operator (independent, unrevoked grant). The store refuses a
+    // group-scoped ITServiceOwner, so that row is planted by direct SQL (test-only seam): it
+    // stands in for a row an older build left behind, which the resolver still reads.
     GroupRoleAssignment a_ito;
     a_ito.group_id = *group_id;
     a_ito.principal_type = "user";
     a_ito.principal_id = "alice";
     a_ito.role_name = "ITServiceOwner";
-    mgmt.assign_role(a_ito);
+    yuzu::test::plant_group_role_row(db.dsn(), a_ito);
     GroupRoleAssignment a_op;
     a_op.group_id = *group_id;
     a_op.principal_type = "user";
     a_op.principal_id = "alice";
     a_op.role_name = "Operator";
-    mgmt.assign_role(a_op);
+    REQUIRE(mgmt.assign_role(a_op).has_value());
+    // Both rows must exist: Operator alone would also admit the check below, so without this the
+    // test could pass with the ITServiceOwner row missing, which is the case it exists for.
+    REQUIRE(mgmt.get_group_roles(*group_id).size() == 2);
 
     // If the revoked role's absence were (wrongly) treated as a deny_group,
     // this would come back false. It must not — the revoked role is

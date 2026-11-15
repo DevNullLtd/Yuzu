@@ -337,6 +337,15 @@ The hourly software title normalisation job (see [Inventory](inventory.md)) expo
 
 Two alerts read them: `YuzuSoftwareNormalizationStale` (last success older than 7200 s, warning) and `YuzuSoftwareNormalizationFailing` (`increase(yuzu_software_normalization_pass_total{outcome="error"}[3h]) >= 2` for 10 minutes, warning: two hourly ticks failed within three hours). A job that has never succeeded is the Failing rule's case, not the Stale rule's. Neither watches the job's input list: if the catalogue rollup that rebuilds it stops completing, the gauges freeze while ticks keep succeeding, and `YuzuInventoryCatalogRollupStale` or `YuzuInventoryCatalogRollupFailing` is the signal.
 
+## Software lifecycle store metrics
+
+The software lifecycle store (see [Inventory](inventory.md#software-lifecycle-server-store)) counts every read or write it could not complete. No label carries a product key, version or date.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_software_lifecycle_store_read_degrade_total{reason}` | counter | A rule or declared-fact read, or a lifecycle evaluation, that could not be answered and returned unavailable instead of an empty result. `reason` is `store_not_open` (the store did not open at boot), `pool_acquire_timeout` (no database connection within 2 s), `query_error`, `corrupt_row` (a stored row with an event or source outside the closed sets) or `row_cap` (more than 20,000 declared-fact rows for one batch). A request with more than 500 lookups is refused before any read and is not counted. Zero-seeded for every reason. |
+| `yuzu_server_software_lifecycle_store_write_degrade_total{reason}` | counter | A write that failed. `reason` is `store_not_open`, `pool_acquire_timeout`, `query_error` (recording declared facts), or `txn_failed` (the start-up replacement of the shipped rules, which also refuses the boot). A failed declared-fact write is not retried by the store; the next host report repeats the fact. Zero-seeded for every reason. |
+
 ## Executions event-outbox metrics (HA WS-2a)
 
 The durable `event_outbox` (ADR-2002 §5) shadows the execution-history SSE events and,
