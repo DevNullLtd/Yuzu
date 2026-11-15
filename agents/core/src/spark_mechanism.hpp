@@ -20,6 +20,9 @@
  * verification is deadline-driven, not notification-driven: each watched
  * directory is sampled on its own 5 s schedule (path_verify_interval), run by the
  * File mechanism itself and NOT coalesced onto the SparkEngine's timer wheel.
+ * The Windows Registry mechanism does the same per idle, healthy Target-mode watch
+ * (#7836): every 5 s it re-opens the key's path on its existing probe lane (one
+ * short-lived detached worker per watched key per interval).
  *
  * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
  * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test
@@ -739,6 +742,13 @@ struct RegistryMechanismTestControls {
     std::chrono::milliseconds backend_retry_base{0};
     std::chrono::milliseconds admission_backoff_seed{0};
     std::chrono::milliseconds sweep_cadence{0};
+    /// How often an idle, healthy Target-mode watch re-opens its registered path
+    /// and checks it still resolves to a key (#5719 item 5, #7836: a renamed
+    /// parent key is otherwise silent). Production default 5 s. Zero leaves the
+    /// current value unchanged; a shortened value takes effect at the next wake
+    /// (the control call nudges the sweeper), so a test can hold it long, change
+    /// the world, then shorten it.
+    std::chrono::milliseconds path_verify_interval{0};
 };
 
 /// Mechanism-internal counters the public SparkMechanismStats does not carry
@@ -763,6 +773,8 @@ struct RegistryMechanismDebugCounters {
     std::uint64_t emit_failed{0};    ///< emit() threw on submit (fire callback or sweeper)
     std::uint64_t resync_retries{0}; ///< restored resync debt re-staged by the sweeper
     std::uint64_t established_failed{0}; ///< established() threw when invoked
+    std::uint64_t verify_lost{0};        ///< periodic path verifications that found the path lost
+    std::uint64_t verify_undecided{0};   ///< periodic path verifications that could not decide
     std::size_t probe_workers_active{0};
     std::size_t drain_workers_active{0};
     std::size_t live_watches{0};

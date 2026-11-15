@@ -50,6 +50,24 @@
  *   - a joined `sweeper_` thread polls outstanding probes/drains, commits late
  *     results, retries on a schedule, and is the SINGLE producer of fault()
  *     edges and synthetic fires (dispatched with mu_ released).
+ *   - periodic path verification (#5719 item 5, #7836): a notify handle follows
+ *     its KEY, so a renamed PARENT key leaves the watch healthy and silent on
+ *     the renamed tree. Every kRegPathVerifyInterval the sweeper stages an idle,
+ *     armed, Target-mode watch as a Deferred probe (RegWatch::verify_probe) that
+ *     runs through the ordinary probe lane, F3-counted, with no new thread. A
+ *     result that resolves in Ancestor mode (the path no longer names a key)
+ *     faults the watch and re-opens the path on the ordinary backend retry; a
+ *     Target result or an undecided one (open refused, probe threw) leaves the
+ *     live handle in place. Residuals, none fixed here: a rename followed by a
+ *     re-creation of the path is not noticed (the fresh open succeeds and is not
+ *     compared with the held key); a rename away and back inside one interval is
+ *     not noticed; an Ancestor-mode watch whose shelter ancestor is renamed is
+ *     not verified; a persistent access-denied on the verification open leaves
+ *     the watch unverified with no fault (counted as undecided); HKCR is a merged
+ *     view, so a user-hive key appearing later changes what the path resolves to;
+ *     every watch starts its interval at the same commit time, so a large fleet
+ *     of watches launches its verifications together (probe lane cap, refusals
+ *     defer without demoting coverage).
  *
  * OWNERSHIP / DISPATCH PROTOCOL (plan amendment 5 - the same rules PR-B2/B3
  * apply to File/Service):
@@ -173,6 +191,15 @@ constexpr std::chrono::milliseconds kRegAdmissionBackoffCap{30'000};
 /// a 300 s cap, attempts reset on a successful establishment.
 constexpr std::chrono::milliseconds kRegBackendRetryBase{30'000};
 constexpr std::chrono::milliseconds kRegBackendRetryCap{300'000};
+/// How often an idle, healthy Target-mode watch re-opens its registered PATH and
+/// checks the path still resolves to a key (#5719 item 5, #7836). The notify handle
+/// follows its KEY, not its path: when a PARENT key is renamed away the handle keeps
+/// working on the renamed tree and nothing signals, so the watch reads healthy while
+/// the registered path no longer names it. SAMPLED, so a rename is noticed up to one
+/// interval (plus a sweep wake and the probe) late, and a rename away and back
+/// within one interval is not noticed at all. Not a measured value; the test control
+/// RegistryMechanismTestControls::path_verify_interval overrides it.
+constexpr std::chrono::milliseconds kRegPathVerifyInterval{5'000};
 
 constexpr std::size_t kProbeLaneCap = 16; ///< concurrent detached probe workers
 constexpr std::size_t kDrainLaneCap = 8;  ///< concurrent detached drain workers
@@ -490,6 +517,18 @@ struct RegWatch {
     bool grace_counted{false};
     bool needs_resync{false};
     std::uint64_t resync_epoch{0};
+    /// Periodic path verification (#7836), under mu_ like everything else here.
+    /// `last_verify_at` is stamped at every commit and at every verification
+    /// start (a due test is `now - last_verify_at >= interval`, never a
+    /// precomputed due time, so a shortened interval takes effect at once).
+    /// `verify_probe` marks the outstanding probe as a verification of an
+    /// ARMED watch rather than an establishment or a re-arm: its result is
+    /// judged, never committed. Set only with probe Deferred/Pending, cleared
+    /// only at resolution. A fire that consumes the notification while it is
+    /// outstanding leaves it set: resolve_probe_locked() then sees `armed` false
+    /// and commits the probe as the re-arm.
+    Clock::time_point last_verify_at{};
+    bool verify_probe{false};
     /// Establishment-signal state (rung 9c PR-6 item 1), all under mu_ like
     /// everything else in this struct. `incarnation` identifies WHICH watch a
     /// staged/dispatched report is about — forward-only rebind (never
@@ -1045,6 +1084,8 @@ public:
             admission_seed_ms_.store(c.admission_backoff_seed.count(), std::memory_order_relaxed);
         if (c.sweep_cadence.count() > 0)
             sweep_cadence_ms_.store(c.sweep_cadence.count(), std::memory_order_relaxed);
+        if (c.path_verify_interval.count() > 0)
+            path_verify_ms_.store(c.path_verify_interval.count(), std::memory_order_relaxed);
         nudge_locked();
     }
 
@@ -1072,6 +1113,8 @@ public:
         d.drains_untracked = drains_untracked_.load(std::memory_order_relaxed);
         d.fault_failed = fault_failed_.load(std::memory_order_relaxed);
         d.sweep_pass_failed = sweep_pass_failed_.load(std::memory_order_relaxed);
+        d.verify_lost = verify_lost_.load(std::memory_order_relaxed);
+        d.verify_undecided = verify_undecided_.load(std::memory_order_relaxed);
         return d;
     }
 
@@ -1144,6 +1187,15 @@ public:
                 // the coverage mark just staged above (the `if (job)` branch's
                 // own off-lock launch reaches its own nudge further down), so
                 // nudge explicitly here.
+                if (w.verify_probe) {
+                    // It is a path VERIFICATION of this watch (#7836) and `armed` was
+                    // just cleared above, so resolve_probe_locked() will commit it as
+                    // the re-arm. It was staged with grace_counted = true and an old
+                    // accepted_at; restart the ordinary re-arm grace from this fire.
+                    // Scalar writes only (this is a TP_WAIT callback).
+                    w.accepted_at = Clock::now();
+                    w.grace_counted = false;
+                }
                 nudge_locked();
             }
         }
@@ -1205,6 +1257,9 @@ private:
     }
     [[nodiscard]] std::chrono::milliseconds sweep_cadence() const {
         return std::chrono::milliseconds(sweep_cadence_ms_.load(std::memory_order_relaxed));
+    }
+    [[nodiscard]] std::chrono::milliseconds path_verify_interval() const {
+        return std::chrono::milliseconds(path_verify_ms_.load(std::memory_order_relaxed));
     }
     [[nodiscard]] std::chrono::milliseconds backend_retry_base() const {
         return std::chrono::milliseconds(backend_retry_base_ms_.load(std::memory_order_relaxed));
@@ -1280,8 +1335,11 @@ private:
         // No coverage established on this path, in every calling context
         // (watch_incarnation's admission-refused branch, on_fire's job-throw
         // catch and re-arm-launch-refused branch, reconcile_probe_launches_
-        // locked()'s noexcept recovery) - mark unconditionally.
-        mark_coverage_locked(w, SparkCoverage::None);
+        // locked()'s noexcept recovery) - mark unconditionally, EXCEPT for a
+        // refused VERIFICATION launch of a still-armed watch: its notify is
+        // live, so a lane cap or launch failure must not demote it (#7836).
+        if (!(w.verify_probe && w.armed))
+            mark_coverage_locked(w, SparkCoverage::None);
     }
 
     /// Genuine backend failure: retry on the 30 s doubling schedule, report the
@@ -1331,6 +1389,7 @@ private:
         w.backend_attempts = 0;
         w.admission_attempts = 0;
         w.grace_counted = false;
+        w.last_verify_at = Clock::now(); // the commit just opened the path: counts as verified
         // The one positive coverage site: Target mode has live OS-level
         // notification coverage, Ancestor mode does not (it watches the PARENT
         // for the target's appearance, not the target itself) - unconditional
@@ -1364,7 +1423,47 @@ private:
         // `res` (now holding only the pool lease) drops here - not the last ref.
     }
 
+    /// The verdict on a periodic path verification (#7836); `r` came from a probe
+    /// that was launched against an ARMED, Target-mode watch. The result is never
+    /// committed: the live handle and notify stay in place unless the path is
+    /// lost, and whatever the probe opened is discarded off-lock. Under mu_.
+    ///   - not ok (open or notify refused, hook or probe threw): undecided. The
+    ///     watch keeps its handle and is NOT faulted (an unreadable path is not
+    ///     proof of a rename), and the next verification is one interval away.
+    ///   - Ancestor mode: the target path no longer resolves (a parent was
+    ///     renamed away, or the key deleted before its notification was
+    ///     consumed). The live handle follows the renamed tree and is deaf to the
+    ///     path: fault, owe a synthetic fire, and re-open the path on the
+    ///     ordinary backend retry (which recovers through commit_locked).
+    ///   - Target mode: the path still resolves to a key. NOT compared with the
+    ///     key the watch holds: a rename that is followed by a re-creation of the
+    ///     path is not noticed (documented residual, docs/spark-flip-gate.md).
+    void resolve_verify_locked(RegWatch& w, DetachedResult<ProbeResult> r, SweepWork& work) {
+        w.call.reset();
+        if (r.has_value() && r->ok && r->mode == WatchMode::Ancestor) {
+            verify_lost_.fetch_add(1, std::memory_order_relaxed);
+            work.dead_results.push_back(std::move(*r)); // reserved per visit: nothrow
+            w.needs_resync = true;
+            w.resync_epoch = ++resync_epoch_;
+            fail_backend_locked(w, "registry watch key renamed or replaced");
+            return; // grace_counted stays true: this is not a missed obligation
+        }
+        if (!(r.has_value() && r->ok))
+            verify_undecided_.fetch_add(1, std::memory_order_relaxed);
+        if (r.has_value())
+            work.dead_results.push_back(std::move(*r));
+        w.probe = ProbeState::Idle;
+        w.grace_counted = false; // as after a commit
+    }
+
     void resolve_probe_locked(RegWatch& w, DetachedResult<ProbeResult> r, SweepWork& work) {
+        // `&& w.armed` is mandatory: a fire that landed while the verification was
+        // outstanding consumed the notification (armed=false), so this probe is the
+        // watch's RE-ARM and must commit; judging it would leave the watch deaf.
+        if (std::exchange(w.verify_probe, false) && w.armed) {
+            resolve_verify_locked(w, std::move(r), work);
+            return;
+        }
         if (r.has_value() && r->ok) {
             commit_locked(w, std::move(*r), work);
             return;
@@ -1402,6 +1501,7 @@ private:
         auto wake = now + std::chrono::hours(1);
         const auto cadence = sweep_cadence();
         const auto grace = health_grace();
+        const auto verify_interval = path_verify_interval();
         for (const auto& [k, w] : watches_) {
             // A marked-but-not-yet-staged coverage report must be
             // picked up on the very next pass, never left for an idle watch's
@@ -1420,6 +1520,10 @@ private:
             case ProbeState::Idle:
                 if (w->armed && w->needs_resync)
                     wake = std::min(wake, w->resync_retry_at); // restored debt, on its backoff
+                // Without this an idle sweeper sleeps to its 1 h ceiling and the
+                // periodic verification never runs.
+                if (w->armed && w->mode == WatchMode::Target && verify_interval.count() > 0)
+                    wake = std::min(wake, w->last_verify_at + verify_interval);
                 continue;
             }
             if (!w->grace_counted)
@@ -1558,6 +1662,21 @@ private:
                         {SweepWork::Action::Kind::Emit, w.spark_key, false, "", w.resync_epoch});
                     w.needs_resync = false;
                     resync_retries_.fetch_add(1, std::memory_order_relaxed);
+                }
+                // Periodic path verification (#7836): an idle, healthy Target-mode
+                // watch is due. Stage it as a Deferred probe due now, so the NEXT
+                // pass launches it through the ordinary launch/publish path (a plain
+                // Pending state would let grace_check_locked fault a healthy watch
+                // after the grace period: grace_counted = true pre-empts that).
+                // Scalar writes only, nothing here can throw.
+                if (w.armed && w.mode == WatchMode::Target && path_verify_interval().count() > 0 &&
+                    now - w.last_verify_at >= path_verify_interval()) {
+                    w.last_verify_at = now;
+                    w.verify_probe = true;
+                    w.probe = ProbeState::Deferred;
+                    w.next_retry_at = now;
+                    w.grace_counted = true;
+                    nudged_ = true;
                 }
                 break;
             }
@@ -2141,12 +2260,15 @@ private:
     std::atomic<std::uint64_t> established_failed_{0}; ///< an established() call threw
     std::atomic<std::uint64_t> fault_failed_{0};     ///< a fault() submit threw (sweeper path)
     std::atomic<std::uint64_t> sweep_pass_failed_{0}; ///< sweeper passes that threw (sg-7/sre6-1)
+    std::atomic<std::uint64_t> verify_lost_{0};      ///< path verifications that found the path lost
+    std::atomic<std::uint64_t> verify_undecided_{0}; ///< path verifications that could not decide
     std::atomic<std::size_t> retiring_cap_{kRetiringCap};
     std::atomic<std::int64_t> caller_wait_ms_{kRegCallerWaitBudget.count()};
     std::atomic<std::int64_t> health_grace_ms_{kRegHealthGrace.count()};
     std::atomic<std::int64_t> sweep_cadence_ms_{kRegSweepCadence.count()};
     std::atomic<std::int64_t> backend_retry_base_ms_{kRegBackendRetryBase.count()};
     std::atomic<std::int64_t> admission_seed_ms_{kRegAdmissionBackoffSeed.count()};
+    std::atomic<std::int64_t> path_verify_ms_{kRegPathVerifyInterval.count()};
 };
 
 void CALLBACK reg_on_wait_cb(PTP_CALLBACK_INSTANCE, PVOID ctx, PTP_WAIT, TP_WAIT_RESULT) {
