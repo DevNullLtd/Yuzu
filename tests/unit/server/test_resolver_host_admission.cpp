@@ -635,8 +635,8 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
           "[resolver_host_admission][wiring][lexical]") {
     const std::string flat = squeeze(comment_free_source("oidc_provider.cpp"));
 
-    // The production instance is chosen only when no test installed a lookup or a pool: a pin on
-    // the selection, because no test can drive the production lookup without DNS.
+    // The production instance is chosen only when no test installed a lookup or a pool: a
+    // source-text check of the selection, because no test can drive the production lookup without DNS.
     const std::string selection =
         "if(!admission&&!lookup&&!pool)admission=oidc_lookup_admission_ref();";
     CHECK(count_occurrences(flat, selection) == 1);
@@ -748,7 +748,7 @@ TEST_CASE("OIDC lookup admission limits (LEXICAL pin, not behaviour): the docume
         std::string out;
         bool space = false;
         for (const char c : text) {
-            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '#' || c == '"') {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '#' || c == '/' || c == '"') {
                 space = true;
                 continue;
             }

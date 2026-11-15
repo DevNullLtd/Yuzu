@@ -37,9 +37,7 @@
 ///
 /// The NAT64 prefix probe (`ipv4only.arpa`) is exempt from both: the adapter does not call this
 /// class for it, so it takes no lease, is never refused here and never feeds the memory; only the
-/// pool's cap applies to it. That cap is the probe's only bound: the probe is not single-flight, so
-/// stuck probe lookups are limited by the pool alone (open owner decision: its own small cap, or
-/// single-flight).
+/// pool's cap applies to it, and that cap is its only bound.
 ///
 /// The caller treats a refusal like any other refused lookup: the same `kBusy` status and the
 /// same reason text as a full pool, so no caller learns a new failure kind. Nothing here returns an

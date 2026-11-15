@@ -372,7 +372,7 @@ public:
         std::shared_ptr<net::HostLookupAdmission> admission = {});
     /// Test-only seam: the process-wide admission the POSIX adapter uses when no test has installed
     /// a lookup or a pool (null on Windows, whose lookup has none). A test reads its limits and
-    /// that it is one object; the adapter's choice of it is pinned in the source. Same
+    /// that it is one object; the adapter's choice of it is checked by a source-text test. Same
     /// source-scan pin.
     [[nodiscard]] static std::shared_ptr<net::HostLookupAdmission>
     production_lookup_admission_for_test();

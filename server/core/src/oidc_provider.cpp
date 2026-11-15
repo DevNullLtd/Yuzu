@@ -925,9 +925,9 @@ std::string_view truncate_utf8(std::string_view s, std::size_t max) {
 constexpr const char* kEgressRefusedReason = OidcProvider::kEgressRefused;
 constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleartextPublicRefused;
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
-// The lookup was refused because the pool was full, no worker could be created or the name was
-// refused or timed out within the last 3 s, or the name already had 8 lookups outstanding (POSIX
-// only).
+// The lookup was refused because the pool was full, no worker could be created, the name already
+// had 8 lookups outstanding, lookups for 64 names were already outstanding, the name was refused or
+// timed out within the last 3 s, or the admission check did not complete (POSIX only).
 // Nothing was learned about the name, so callers must not remember it as a failure.
 constexpr const char* kEgressLookupBusyReason = "the host name lookup was not started";
 
@@ -1131,11 +1131,9 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 #else
 // Whether a lookup goes through the admission (the per-name limit and the refusal memory). The
 // NAT64 probe is exempt: it takes no lease, is not refused by the admission and does not feed it, so
-// only the pool's cap applies to it, as before the admission existed. That cap is the probe's only
-// bound: it is not single-flight (callers that find the cache stale at the same moment each start
-// one), a probe that was started and failed arms the 1 minute negative window below, and a probe
-// the pool refused arms none. Open owner decision: give it its own small cap, or make it
-// single-flight.
+// only the pool's cap applies to it, as before the admission existed. Its only bound is the pool's
+// cap; a probe that started and failed arms the 1 minute negative window below, and one the pool
+// refused arms none.
 enum class LookupAdmission { kApply, kExempt };
 
 // The throttled warning for a lookup refused before the pool was asked: a name refused or timed out
@@ -2756,8 +2754,9 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
                           ::yuzu::log_key_token(config_.issuer),
                           ::yuzu::log_key_token(doc.error()));
             // A refusal because the lookup pool was full, no worker could be created, the name
-            // was refused or timed out moments ago or the name already had 8 lookups outstanding
-            // learned nothing about the issuer: retried next attempt, not remembered. Matched by equality
+            // already had 8 lookups outstanding, lookups for 64 names were already outstanding,
+            // the name was refused or timed out moments ago or the admission check did not
+            // complete learned nothing about the issuer: retried next attempt, not remembered. Matched by equality
             // with the one text http_get_bounded composes, so IdP-controlled text cannot match.
             const std::string busy_error =
                 std::string("request failed: ") + kEgressLookupBusyReason;

@@ -8198,7 +8198,7 @@ groups:
     # builds only: the capacity gauge reads 16 on every build, while the in-flight gauge and the
     # lookups counter stay at 0 on a Windows server. A lookup holds one of the pool's slots until
     # the resolver returns, so a pool at its capacity refuses the next lookup at once. A name that
-    # already has 8 lookups outstanding, a ninth name once 64 names have lookups outstanding, or a
+    # already has 8 lookups outstanding, a 65th name once 64 names have lookups outstanding, or a
     # name whose lookup was refused or timed out in the last 3 seconds, is also refused without
     # taking a slot and is counted as busy (so is a lookup whose admission check did not complete),
     # so busy can rise while the in-flight gauge is below the capacity. The
@@ -8208,9 +8208,9 @@ groups:
     # (ok | not_found | temporary | timeout | busy, all five zero-seeded at boot), mirrored from
     # the pool on the same tick.
     #
-    # YuzuOidcResolverPoolHigh is the early signal: more than 75% of 16 slots, so 13 or more held
+    # YuzuOidcResolverPoolHigh is the pool-wide signal: more than 75% of 16 slots, so 13 or more held
     # (12 of 16 is exactly 75% and stays quiet), for 5 minutes. It sees a pool-wide fill and not
-    # one stuck name: a single name holds at most 8 slots. It is a ratio and not a
+    # one stuck name: a single name holds at most 8 slots, except the NAT64 probe name, which only the pool's cap bounds. It is a ratio and not a
     # ">= capacity" rule because a sampled gauge sits at exactly its capacity only rarely.
     # YuzuOidcResolverLookupsRefused fires on refusals held for 10 minutes (the rate window is
     # 5 minutes, the hold is 10), so a single refused lookup never pages. It is the rule that sees
