@@ -268,7 +268,7 @@ def header_constant(rel, name):
     return m.group(1) if m else None
 
 
-def render_installer(platform, *extra):
+def render_installer(platform, *extra, visudo=None):
     """`install-agent-user.sh --dry-run` with a `uname` that says `platform` ("linux" or "macos"): a
     dry run only prints, so this is the helpers and the sudoers text the installer would write."""
     with tempfile.TemporaryDirectory(prefix="yuzu_test_fwhelper_") as d:
@@ -277,6 +277,10 @@ def render_installer(platform, *extra):
         with open(shim, "w") as f:
             f.write('#!/bin/sh\ncase "$1" in -s) echo %s ;; *) /usr/bin/uname "$@" ;; esac\n' % os_name)
         os.chmod(shim, 0o755)
+        if visudo is not None:   # a `visudo` that is a shell body: the sudoers writer asks it about `requiretty`
+            with open(os.path.join(d, "visudo"), "w") as f:
+                f.write("#!/bin/sh\n" + visudo + "\n")
+            os.chmod(os.path.join(d, "visudo"), 0o755)
         env = dict(os.environ, PATH=d + os.pathsep + os.environ.get("PATH", ""))
         r = subprocess.run(["bash", os.path.join(REPO, INSTALLER), "--dry-run", *extra],
                            capture_output=True, text=True, timeout=60, env=env)
@@ -1573,6 +1577,15 @@ class RenderedSudoers(unittest.TestCase):
                     f.write(text)
                 r = subprocess.run(["visudo", "-cf", path], capture_output=True, text=True, timeout=30)
                 self.assertEqual(r.returncode, 0, (platform, r.stdout, r.stderr))
+
+    def test_requiretty_is_written_only_when_this_hosts_visudo_accepts_it(self):
+        # sudo-rs rejects the whole file over `!requiretty`; sudo and the classic visudo accept it.
+        for platform in self.text:
+            accepted = render_installer(platform, visudo="exit 0")
+            refused = render_installer(platform, visudo='grep -q requiretty "$2" && exit 1; exit 0')
+            self.assertIn("!requiretty", accepted, platform)
+            self.assertNotIn("requiretty", refused, platform)
+            self.assertIn('env_keep += "YUZU_*"', refused, platform)
 
     def test_the_comments_say_what_the_grants_are_and_that_the_installer_is_rerun(self):
         for platform, text in self.text.items():

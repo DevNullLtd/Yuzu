@@ -593,11 +593,26 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/resolvectl flush-caches
 EOF
     fi
 
-    cat <<EOF
-# Pre-requisites for daemon-style invocation:
-Defaults:$ACCOUNT_NAME    !requiretty
-Defaults:$ACCOUNT_NAME    env_keep += "YUZU_*"
-EOF
+    echo "# Pre-requisites for daemon-style invocation:"
+    if sudo_knows_requiretty; then
+        echo "Defaults:$ACCOUNT_NAME    !requiretty"
+    fi
+    echo "Defaults:$ACCOUNT_NAME    env_keep += \"YUZU_*\""
+}
+
+# sudo_knows_requiretty: sudo-rs (the default sudo on newer Ubuntu) has no `requiretty` setting and
+# its visudo rejects the whole file over that one line, so the line is written only when this host's
+# visudo accepts it. No visudo, or no temporary file, keeps the line (install_sudoers needs visudo
+# and refuses the file without it).
+sudo_knows_requiretty() {
+    command -v visudo >/dev/null 2>&1 || return 0
+    local probe rc
+    probe=$(mktemp -t yuzu-requiretty.XXXXXX) || return 0
+    echo "Defaults !requiretty" >"$probe"
+    visudo -cf "$probe" >/dev/null 2>&1
+    rc=$?
+    rm -f "$probe"
+    return "$rc"
 }
 
 install_sudoers() {
