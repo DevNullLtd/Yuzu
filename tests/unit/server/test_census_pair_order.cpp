@@ -1504,7 +1504,7 @@ TEST_CASE("census pair order: a Repair of a brand-new agent's first event leaves
     }
 }
 
-// ── Cells of the model that no case above kills ──────────────────────────────────────────
+// Cells of the model that no case above kills
 // Every row below comes from the model (pend.py, all five variants); the two marked [sql] were also
 // run on the SQL text before it was transcribed into the store and agree. Red on the PR A tree: the
 // key rule decided each of them, so some verdict, flag, pending count, order row or decision
