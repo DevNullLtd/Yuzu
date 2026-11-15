@@ -120,6 +120,7 @@ struct Twin {
     // ── shared fakes ──
     std::vector<InventoryDeviceRow> roster_rows;
     bool roster_degraded = false;
+    bool roster_truncated = false; // #5712: the roster read was a typed partial
     bool ci_degraded = false;
     bool tags_degraded = false;
     std::map<std::string, HardwareCiDetail> ci_by_id; // an id not here reads as absent
@@ -186,6 +187,7 @@ struct Twin {
             InventoryDevicesResult out;
             out.rows = roster_rows;
             out.roster_degraded = roster_degraded;
+            out.roster_truncated = roster_truncated;
             out.ci_degraded = ci_degraded;
             out.tags_degraded = tags_degraded;
             return out;
@@ -531,6 +533,59 @@ TEST_CASE("mcp hardware twins: an unwired provider is an internal error with no 
             CHECK(out["retry"] == -1);
         }
         CHECK(rows.size() == 2);
+    }
+}
+
+// ───────────────────────── truncated roster (#5712) ────────────────────────────
+
+// A truncated roster is a SUCCESS carrying the typed bit, not a retryable error (#5371).
+// Kills: reusing the roster-unavailable arm for a partial; dropping the field from the shared
+// REST/MCP body; a MCP answer that disagrees with REST; a missing audit marker in either audit row;
+// the flag appearing on a complete roster; and a confined caller NOT seeing the bit (one bit, and
+// their own rows can be among the missing).
+TEST_CASE("mcp hardware twins: a truncated roster is served with roster_truncated, never an error",
+          "[mcp][hardware][roster_truncated]") {
+    SECTION("global read") {
+        Twin t;
+        t.roster_truncated = true;
+        t.roster_rows = {make_row("a", "host-a", "linux", true)};
+        const json r = t.call("list_hardware_ci");
+        REQUIRE_FALSE(r.contains("error"));
+        const auto& sc = r["result"]["structuredContent"];
+        CHECK(sc["roster_truncated"] == true);
+        CHECK(sc["roster_cap"] == 100000);
+        CHECK(sc["count"] == 1);
+        CHECK(sc["ci_degraded"] == false);
+        REQUIRE_FALSE(t.domain_details.empty());
+        CHECK(t.domain_details.back().find("roster_truncated=1") != std::string::npos);
+        REQUIRE_FALSE(t.generic_details.empty());
+        CHECK(t.generic_details.back().find("roster_truncated=1") != std::string::npos);
+        CHECK(has(t.generic_rows, "mcp.list_hardware_ci|success"));
+        // Same bytes as the REST twin: one shared builder.
+        const json rest = t.rest_data("/api/v1/hardware");
+        CHECK(sc["roster_truncated"] == rest["roster_truncated"]);
+        CHECK(sc["roster_cap"] == rest["roster_cap"]);
+    }
+    SECTION("confined read still reports the one-bit fact, never a count") {
+        Twin t;
+        t.roster_truncated = true;
+        t.roster_rows = {make_row("a", "host-a", "linux", true), make_row("b", "host-b", "linux", true)};
+        t.scope = std::unordered_set<std::string>{"a"};
+        const json r = t.call("list_hardware_ci");
+        REQUIRE_FALSE(r.contains("error"));
+        const auto& sc = r["result"]["structuredContent"];
+        CHECK(sc["roster_truncated"] == true);
+        CHECK(sc["scope_basis"] == "authority_scoped");
+        CHECK_FALSE(sc.contains("devices_omitted")); // no existence-oracle count
+    }
+    SECTION("complete roster") {
+        Twin t;
+        t.roster_rows = {make_row("a", "host-a", "linux", true)};
+        const json r = t.call("list_hardware_ci");
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(r["result"]["structuredContent"]["roster_truncated"] == false);
+        REQUIRE_FALSE(t.domain_details.empty());
+        CHECK(t.domain_details.back().find("roster_truncated") == std::string::npos);
     }
 }
 

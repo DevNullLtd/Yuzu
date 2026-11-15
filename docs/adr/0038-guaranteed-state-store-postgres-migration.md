@@ -286,6 +286,76 @@ census-bearing event (after a state change, an agent restart or a rule push; not
 evidence (the retained events are redelivered with no repair), so the agent is stopped first. The owner
 will revisit that later; it is tracked in #7532.
 
+## Update (2026-11-12) - a decommission also deletes the agent's order row, first (UP-14, H1)
+
+This is the Update the 2026-11-09 Update above calls for, in the one respect it widens. Schema v5
+adds the per-agent order table `guardian_agent_order` (one row per agent), whose row every
+census-bearing first delivery locks first, before the pair's pending events, the census row and the
+rule row. `GuaranteedStateStore::delete_agent` now deletes that agent's row as the FIRST statement of its
+existing single transaction, so the lock order of every census writer is the same: agent row, pending
+events in `ingest_seq` order, census rows, never a rule row. The delete is never a transaction of its
+own: a later statement's failure rolls it back with the rest. Without the delete a decommissioned
+agent would keep its order row; taking it after the pending events would invert the order against a
+first delivery.
+
+The 2026-11-09 sentence that `delete_agent` "adds no new lock" is therefore true of the pending-event and
+census steps and no longer of the method as a whole: it now takes the agent's order-row lock, first.
+Nothing else is added: no advisory lock, no rule-mutation hook, no policy-generation bump, no push, and no
+tenth cascade store (the order row is part of the `guaranteed_state` store, so the nine-store count
+and its pins are unchanged).
+
+Erasure of this store remains PARTIAL (owner ruling D1, unchanged): the event log and the DEX
+observations stay until retention expiry, and widening that is still tracked in #7531; the event
+log's `boot_epoch` and `emit_seq` columns stay with their events until they expire. The order row
+holds the agent's counters and pair clock only: it is device-level (keyed by `agent_id`), holds
+server receipt-time clock readings and counters, and holds no user content and no behavioural data.
+The `epoch` and `emit_seq_hwm` values are what the agent asserted (the server checks only their
+range and does not verify them otherwise), while the clock readings are server database time. The row
+is retained until the device is decommissioned, with no TTL and no prune. An agent that vanishes
+without a decommission can therefore stay counted in the unordered-agents figure (while its latest
+unpaired event is later than its pair clock) and can crowd the first-50 id list. A prune of this table would be a separate clock-guarded-retention decision, not a
+quiet addition.
+
+Known residual, accepted: a first delivery that inserts the agent's order row and has not committed is
+invisible to the DELETE, so a brand-new or just-decommissioned agent's first event can commit an order
+row after `delete_agent` returned. A running agent also re-creates its order row with its census
+row (tracker #7532), the same class as the pending-list race of #7147. The decommissioned agent then
+has an order row again. That is accepted: the row holds counters and the pair clock only, and a later
+decommission deletes it.
+
+Lock wait and pool bound of the agent step (owner decision, 2026-11-12). Every census-bearing first
+delivery of an agent queues on that agent's order row, so one transaction that holds the row
+(for example the census fold of another rule of the same agent, a stalled commit, or an operator
+session left idle in a transaction) makes the agent's other first deliveries wait. A waiter holds a
+connection lease for the whole wait, and the leases come from one shared `PgPool` (default 16
+connections, `--postgres-pool-size`) that serves every store, authentication and audit included,
+with a 500 ms acquire timeout for ingest. The step therefore bounds its own wait: it runs
+`SET LOCAL lock_timeout = 1000` after its savepoint and restores the connection's own value (its
+session reset value: the pool's startup option, 10 s by default, a DSN `options=` value, or the
+role, database or server setting) before the savepoint is released (`kAgentStepLockTimeoutMs`), so
+each lock wait in the step gives up after 1 s instead of the pool's default 10 s. The bound is
+absolute: a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the step. One step can wait
+more than once (Ensure, DECIDE and one re-run after a concurrent delete of the agent's row), so a
+pooled connection can be held for the sum of those waits. A waiter that gives up takes the existing
+failure path: the event is stored with pending census evidence, its census write is skipped, and it
+is counted as a failed census projection. Such an event is acked and nothing on the server redelivers it, and the
+reaper exempts pending rows (`NOT projection_pending`), so for a rule that never fires again on that
+agent it stays until a later verdict for that (agent, rule) retires it: the accepted pending-list
+class of #7147, now also reachable through an order-step wait of over 1 s. The census write and the
+fold keep the connection's own `lock_timeout`. The owner chose this trade on 2026-11-12, with the
+cost of faster pending growth stated in the option, over recording the pool bound alone: a waiter fails fast
+into pending instead of holding a pooled connection for 10 s, and the cost is faster pending growth
+for the waiting rules. Different agents do not wait on one another through this row, but they share
+the pool, so one agent holding its row for long can occupy leases until the shared pool saturates. Measured on one
+development host (Postgres 18.4, a pool of 8, default timeouts): the fold of one first delivery took
+about 155 ms with 10,000 pending events on one (agent, rule) pair and about 1.67 s with 100,000,
+and another rule of the same agent waited about 151 ms during the 10,000-pending fold (about 2 ms
+with the step off). The point at which the pool saturates was not measured, and neither was the
+gateway's in-flight occupancy. A redelivery repairs only the census row of such an event: a repair
+runs no order step, so the event is never counted in the agent's order clock or counters, and the
+fleet count of unordered agents can undercount for an agent whose first deliveries all failed the
+step, until its next first delivery. That gap must be closed before the comparison ships.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

@@ -15,6 +15,8 @@
 
 #include <functional>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "dex_api.hpp"
 #include "dex_score_policy_provider.hpp" // DexScorePolicyProvider::ReadFn - pure, no store type
@@ -31,6 +33,13 @@ class RuntimeConfigStore;
 /// DexRoutes / RestApiV1 / mcp_server already share (see server.cpp). Kept as
 /// a callback so this core-only header needs no AgentRegistry/health includes.
 using FleetFn = std::function<DexFleet()>;
+
+/// Supplies the live observer state of the given agent ids, ALIGNED by index (one entry per id,
+/// `NoneReported` for an id with nothing to say). Called by `apps()` with exactly the ids of the
+/// requested scope, once, after a successful read. Assembled in server.cpp over the agent health
+/// store, so this header needs no registry include. Empty = no observer source (the model's
+/// `observer_state` stays unset).
+using DexObserverFn = std::function<std::vector<DexObserverState>(const std::vector<std::string>& ids)>;
 
 /// Factory for the store-backed implementation (`LocalDexApi`, dex_api.cpp —
 /// kept out of the abstract header so that header stays free of store
@@ -59,9 +68,14 @@ using FleetFn = std::function<DexFleet()>;
 /// (`dex_default_score_policy()`, source "default"). A `policy_fn` that returns
 /// an error makes `apps()` degrade with `degraded_reason`
 /// "score_policy_unavailable"; see `DexScorePolicyFn` for the contract.
+///
+/// `observer_fn` may be empty (see `DexObserverFn`). When set it is borrowed like `fleet_fn`: its
+/// captures must outlive every holder of the returned API (server.cpp declares the health store
+/// before them; tests/test_guardian_backend_wiring_lexical.py pins that order).
 [[nodiscard]] std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store,
                                                          FleetFn fleet_fn,
-                                                         DexScorePolicyFn policy_fn = {});
+                                                         DexScorePolicyFn policy_fn = {},
+                                                         DexObserverFn observer_fn = {});
 
 /// The production `DexScorePolicyProvider::ReadFn`: reads the stored score policy
 /// document (`kDexScorePolicyKey`) from the runtime config store. A stored value is
