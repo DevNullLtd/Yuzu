@@ -62,13 +62,20 @@ CHECK 8 (gates). In `AuthRoutes::require_fleet_read` and `AuthRoutes::require_li
   `InvariantViolated` straight after its refusal, and the `require_list_read` wrapper refuses an admit
   that carries no session, un-admits the gate and drops its scope.
 
-CHECK 9 (the MCP stream bridge is a projected bus consumer, #7817). `McpStreamBridge::make_listener`
-  in mcp_stream_bridge.cpp calls `classify_execution_event_for_scope(ev, rec->fleet_read_scope)` and
-  `sanitize_execution_event_for_scope(` appears exactly twice in that file (the listener's terminal and
-  the pressure visitor's buffered terminal), each name exactly where expected; the production
-  `bridge->reserve(` in mcp_server.cpp passes a sixth argument, `std::move(bridge_fleet_scope)`, whose
-  local is initialised from `deny_all()` (an unresolved scope is the MOST confined, never nullopt).
-  The docs/executions-history-ladder.md rule that a NEW bus consumer needs its own tripwire is met here.
+CHECK 9 (the MCP stream bridge is a projected bus consumer, #7817). On comment- and string-blanked
+  source it pins: in mcp_stream_bridge.cpp, `classify_execution_event_for_scope(` is called exactly
+  once, inside `McpStreamBridge::make_listener`, with `(ev, rec->fleet_read_scope)`, and its switch
+  returns on kDrop; `sanitize_execution_event_for_scope(` appears exactly twice in the file (the
+  listener's terminal and the pressure visitor's buffered terminal, which this check does not tell
+  apart); `McpStreamBridge::reserve` stores `rec->fleet_read_scope` exactly once, as
+  `fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt` (the record keeps only
+  engaged-or-not). In mcp_server.cpp, `bridge_fleet_scope` is declared once, initialised from
+  `deny_all()`, assigned only from `fleet_gate.scope` under `if (fleet_gate.admitted)` and from
+  `deny_all()` in the `catch (...)`, and is the sixth argument of the one `bridge->reserve(`. Under
+  server/ (outside the bridge's own two files) the only call of `reserve(` on a receiver whose name
+  contains `bridge` is that one, and the exact set of files naming `McpStreamBridge` is frozen, so a
+  second holder of the bridge under another variable name is a reviewed act. The
+  docs/executions-history-ladder.md rule that a NEW bus consumer needs its own tripwire is met here.
 
 Every frozen entry must still match something (a stale entry fails), so the lists cannot rot.
 
@@ -1281,10 +1288,32 @@ def check_gates(files: dict[str, str]) -> list[str]:
 
 _CLASSIFY = "classify_execution_event_for_scope"
 _SANITIZE = "sanitize_execution_event_for_scope"
+BRIDGE_HPP = _SRC + "mcp_stream_bridge.hpp"
+# CHECK 9: the files under server/ (besides the bridge's own two) that name `McpStreamBridge` in code
+# (a comment is blanked first). Frozen
+# so a new holder of the bridge, which could reserve() through a variable whose name the receiver
+# scan below does not recognise, is a reviewed act.
+BRIDGE_HOLDERS = frozenset({
+    _SRC + "mcp_server.cpp", _SRC + "mcp_server.hpp", _SRC + "mcp_stream.cpp",
+    _SRC + "mcp_stream.hpp", _SRC + "server.cpp",
+})
+_RESERVE_NORMALISED = "rec->fleet_read_scope = fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt ;"
 
 
 def _call_idxs(masked: str, name: str) -> list[int]:
     return [m.start() for m in re.finditer(r"(?<![\w:])" + name + r"\s*\(", masked)]
+
+
+def _fn_body(masked: str, header_re: str):
+    """(open, close) of the brace body of the one function whose header matches `header_re`."""
+    hits = [m.end() for m in re.finditer(header_re, masked)]
+    if len(hits) != 1:
+        return None, len(hits)
+    close_paren = _balanced(masked, hits[0] - 1)
+    body_open = masked.find("{", close_paren)
+    if body_open < 0:
+        return None, 0
+    return (body_open, _balanced(masked, body_open, "{", "}")), 1
 
 
 def check_bridge_projection(files: dict[str, str]) -> list[str]:
@@ -1302,14 +1331,12 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
                     f"terminal and the pressure visitor's buffered terminal), found {len(sanitize)}")
 
     # The classifier call sits inside McpStreamBridge::make_listener and takes the record's scope.
-    defs = [m.end() for m in re.finditer(r"McpStreamBridge::make_listener\s*\(", sc.masked)]
-    if len(defs) != 1:
+    span, n = _fn_body(sc.masked, r"McpStreamBridge::make_listener\s*\(")
+    if span is None:
         errs.append(f"CHECK 9: McpStreamBridge::make_listener must be defined exactly once in "
-                    f"{BRIDGE_CPP}, found {len(defs)}")
+                    f"{BRIDGE_CPP}, found {n}")
     else:
-        close_paren = _balanced(sc.masked, defs[0] - 1)
-        body_open = sc.masked.find("{", close_paren)
-        body_close = _balanced(sc.masked, body_open, "{", "}") if body_open >= 0 else len(sc.masked)
+        body_open, body_close = span
         if not any(body_open < i < body_close for i in classify):
             errs.append(f"CHECK 9: the {_CLASSIFY}( call in {BRIDGE_CPP} must be inside "
                         f"McpStreamBridge::make_listener")
@@ -1321,11 +1348,30 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
                             f"(ev, rec->fleet_read_scope), found ({', '.join(args)})")
         # A kDrop verdict must return before anything is latched.
         lis = sc.masked[body_open:body_close]
-        m = re.search(r"case\s+ExecutionEventVerdict::kDrop\s*:\s*return\s*;", lis)
-        if not m:
+        if not re.search(r"case\s+ExecutionEventVerdict::kDrop\s*:\s*return\s*;", lis):
             errs.append(f"CHECK 9: the listener's {_CLASSIFY} switch must `return` on kDrop")
 
-    # The production reserve() call hands the dispatcher's scope to the record.
+    # reserve() stores the NORMALISED scope exactly once: the record keeps engaged-or-not only.
+    rspan, n = _fn_body(sc.masked, r"McpStreamBridge::reserve\s*\(")
+    if rspan is None:
+        errs.append(f"CHECK 9: McpStreamBridge::reserve must be defined exactly once in {BRIDGE_CPP}, "
+                    f"found {n}")
+    else:
+        stores = [m for m in re.finditer(r"\bfleet_read_scope\s*=(?!=)[^;]*;", sc.masked)]
+        in_reserve = [m for m in stores if rspan[0] < m.start() < rspan[1]]
+        if len(stores) != 1 or len(in_reserve) != 1:
+            errs.append(f"CHECK 9: {BRIDGE_CPP} must assign fleet_read_scope exactly once, inside "
+                        f"McpStreamBridge::reserve; found {len(stores)} ({len(in_reserve)} in reserve)")
+        else:
+            m = in_reserve[0]
+            lhs_start = sc.masked.rfind("rec->", 0, m.start() + 1)
+            text = _norm(sc.code[lhs_start:m.end()])
+            if _norm(text.replace(" ;", ";")) != _norm(_RESERVE_NORMALISED.replace(" ;", ";")):
+                errs.append(f"CHECK 9: the fleet_read_scope store in McpStreamBridge::reserve must be "
+                            f"`{_RESERVE_NORMALISED[:-2]};` (the record keeps only engaged-or-not); "
+                            f"found `{text}`")
+
+    # The handler: the dispatcher's scope derivation and its hand-off.
     if MCP_SERVER_CPP not in files:
         return errs + [f"CHECK 9: {MCP_SERVER_CPP} not found"]
     ms = scan(files[MCP_SERVER_CPP])
@@ -1339,11 +1385,52 @@ def check_bridge_projection(files: dict[str, str]) -> list[str]:
             errs.append(f"CHECK 9: bridge->reserve( in {MCP_SERVER_CPP} must pass the dispatcher's "
                         f"scope as its sixth argument, `std::move(bridge_fleet_scope)`; found "
                         f"{len(args)} argument(s)")
-    decls = re.findall(r"yuzu::server::authz::VisibleSet\s+bridge_fleet_scope\s*=\s*"
-                       r"yuzu::server::authz::deny_all\s*\(\s*\)\s*;", ms.masked)
+    decls = list(re.finditer(r"yuzu::server::authz::VisibleSet\s+bridge_fleet_scope\s*=\s*"
+                             r"yuzu::server::authz::deny_all\s*\(\s*\)\s*;", ms.masked))
     if len(decls) != 1:
         errs.append(f"CHECK 9: bridge_fleet_scope in {MCP_SERVER_CPP} must be declared exactly once, "
                     f"initialised from deny_all() (fail closed), found {len(decls)}")
+    elif reserves:
+        seg = ms.masked[decls[0].end():reserves[0]]
+        assigns = re.findall(r"\bbridge_fleet_scope\s*=(?!=)", seg)
+        admit = re.findall(r"\bif\s*\(\s*fleet_gate\.admitted\s*\)\s*bridge_fleet_scope\s*=\s*"
+                           r"std::move\(\s*fleet_gate\.scope\s*\)\s*;", seg)
+        catch = re.findall(r"\bcatch\s*\(\s*\.\.\.\s*\)\s*\{[^{}]*\bbridge_fleet_scope\s*=\s*"
+                           r"yuzu::server::authz::deny_all\s*\(\s*\)\s*;[^{}]*\}", seg)
+        gate_call = re.findall(r"fleet_read_fn_\s*\(\s*req\s*,\s*scratch\s*,", ms.code[decls[0].end():reserves[0]])
+        if len(assigns) != 2 or len(admit) != 1 or len(catch) != 1:
+            errs.append(f"CHECK 9: between its declaration and bridge->reserve( in {MCP_SERVER_CPP}, "
+                        f"bridge_fleet_scope must be assigned exactly twice: `if (fleet_gate.admitted) "
+                        f"bridge_fleet_scope = std::move(fleet_gate.scope);` and deny_all() in the "
+                        f"`catch (...)`; found {len(assigns)} assignment(s), {len(admit)} admitted, "
+                        f"{len(catch)} catch")
+        if len(gate_call) != 1:
+            errs.append(f"CHECK 9: the dispatcher scope must come from exactly one fleet_read_fn_(req, "
+                        f"scratch, ...) call before bridge->reserve( in {MCP_SERVER_CPP}; found "
+                        f"{len(gate_call)}")
+        if not re.search(r'fleet_read_fn_\s*\(\s*req\s*,\s*scratch\s*,\s*"Execution"\s*,\s*"Read"\s*\)',
+                         ms.code[decls[0].end():reserves[0]]):
+            errs.append(f"CHECK 9: the dispatcher scope must be read with Execution:Read in "
+                        f"{MCP_SERVER_CPP}")
+
+    # No other production reserve() on something named like the bridge, and a frozen holder set.
+    other = []
+    holders = set()
+    for rel, sc2 in _each(files, "McpStreamBridge", "reserve"):
+        if rel in (BRIDGE_CPP, BRIDGE_HPP):
+            continue
+        if "McpStreamBridge" in sc2.masked:
+            holders.add(rel)
+        for m in re.finditer(r"([A-Za-z_]\w*)\s*(?:->|\.)\s*reserve\s*\(", sc2.masked):
+            if "bridge" in m.group(1).lower() and not (rel == MCP_SERVER_CPP and m.group(1) == "bridge"):
+                other.append(f"{rel}: {m.group(1)}.reserve(")
+    if other:
+        errs.append("CHECK 9: a reserve() on a bridge-named receiver outside the one reviewed caller "
+                    f"(its scope argument is unpinned): {sorted(other)}")
+    if holders != BRIDGE_HOLDERS:
+        errs.append(f"CHECK 9: the files naming McpStreamBridge changed: new {sorted(holders - BRIDGE_HOLDERS)}, "
+                    f"gone {sorted(BRIDGE_HOLDERS - holders)}; a new holder must be reviewed for a "
+                    f"reserve() that drops the dispatcher's scope, then listed in BRIDGE_HOLDERS")
     return errs
 
 

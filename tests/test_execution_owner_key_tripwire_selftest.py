@@ -468,6 +468,45 @@ def main() -> int:
     must_fail("the dispatcher scope starts unrestricted, not deny-all", t.check_bridge_projection,
               mutate(files, "mcp_server.cpp", "bridge_fleet_scope =\n                            yuzu::server::authz::deny_all();",
                      "bridge_fleet_scope = std::nullopt;"), "CHECK 9")
+    store = "rec->fleet_read_scope = fleet_read_scope.has_value() ? authz::deny_all() : std::nullopt;"
+    must_fail("the reserve() scope store deleted", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", store, ""), "CHECK 9")
+    must_fail("the reserve() store only commented out", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", store, "// " + store), "CHECK 9")
+    must_fail("the reserve() stores nullopt unconditionally", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", store, "rec->fleet_read_scope = std::nullopt;"), "CHECK 9")
+    must_fail("the reserve() retains the caller's agent ids again", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", store, "rec->fleet_read_scope = std::move(fleet_read_scope);"),
+              "CHECK 9")
+    must_fail("a second fleet_read_scope store", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
+                     "bool sanitize_terminal = false;\n            rec->fleet_read_scope = std::nullopt;"),
+              "CHECK 9")
+    must_fail("the handler catch assigns nullopt", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp",
+                     "scope derivation \"\n                                          \"threw; progress bridge uses its most restricted view\");\n"
+                     "                            bridge_fleet_scope = yuzu::server::authz::deny_all();",
+                     "scope derivation \"\n                                          \"threw; progress bridge uses its most restricted view\");\n"
+                     "                            bridge_fleet_scope = std::nullopt;"), "CHECK 9")
+    must_fail("the admitted guard removed (unconditional move)", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp", "if (fleet_gate.admitted)\n                                    bridge_fleet_scope",
+                     "bridge_fleet_scope"), "CHECK 9")
+    must_fail("a third bridge_fleet_scope assignment", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp", "                        auto rr = bridge->reserve(",
+                     "                        bridge_fleet_scope = std::nullopt;\n                        auto rr = bridge->reserve("),
+              "CHECK 9")
+    must_fail("the scope read with a different pair", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp", 'fleet_read_fn_(req, scratch, "Execution", "Read")',
+                     'fleet_read_fn_(req, scratch, "Execution", "Execute")'), "CHECK 9")
+    must_fail("a second reserve() on a bridge-named receiver in another file", t.check_bridge_projection,
+              mutate(files, "server.cpp", "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);",
+                     "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);\n"
+                     "        (void)mcp_bridge_->reserve(a, b, c, d, false);"), "CHECK 9")
+    must_fail("a new file holding the bridge", t.check_bridge_projection,
+              {**files, S + "new_holder.cpp": "yuzu::server::mcp::McpStreamBridge* b = nullptr;\n"}, "CHECK 9")
+    expect(t.check_bridge_projection({**files, S + "commented_holder.cpp":
+           "// McpStreamBridge held here; bridge_->reserve(a);\n"}) == [],
+           "a comment naming the bridge and a reserve() must NOT trip CHECK 9")
     expect(t.check_bridge_projection(files) == [], "the real tree must pass CHECK 9")
     # A comment or string holding the same text must NOT satisfy or trip the check.
     commented = mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
