@@ -2289,12 +2289,24 @@ class MarkerAmbiguity(GitCase):
                 self.assertEqual(sections["- old"], "")
                 self.assertEqual(sections["- later"], "")
 
-    def test_a_balanced_fence_showing_headings_changes_nothing(self):
+    def test_a_fence_showing_headings_names_no_version_after_it(self):
         log = ("## [1.0]\n```\n## [9.9]\n## [Unreleased]\n```\n- real1\n\n"
-               "## [Unreleased]\n~~~md\n## [1.0]\n~~~\n- pending\n")
+               "## [0.9]\n```\nplain code\n```\n- real2\n")
         sections = WN.release_sections(log)
-        self.assertEqual(sections["- real1"], "1.0")
-        self.assertIsNone(sections["- pending"])
+        self.assertEqual(sections["- real1"], "")  # never 9.9, and never None
+        self.assertEqual(sections["- real2"], "0.9")  # a fence with no heading in it changes nothing
+
+    def test_a_long_fence_is_closed_only_by_a_run_as_long(self):
+        log = "## [2.0]\n````\n```\n## [9.9]\n```\n````\n- real\n"
+        self.assertEqual(WN.release_sections(log)["- real"], "")
+        log = "## [2.0]\n````\n```\n```\n````\n- real\n"
+        self.assertEqual(WN.release_sections(log)["- real"], "2.0")
+
+    def test_an_unclosed_fence_followed_by_a_sample_never_names_a_wrong_version(self):
+        log = "## [2.0]\n```\n- x\n## [1.0]\n- e2\n```\ncode\n```\n- e3\n"
+        sections = WN.release_sections(log)
+        self.assertEqual(sections["- e2"], "")
+        self.assertEqual(sections["- e3"], "")
 
     def test_a_tilde_line_does_not_close_a_backtick_fence(self):
         sections = WN.release_sections("## [1.0]\n```\n~~~\n# not a heading\n```\n- after\n")

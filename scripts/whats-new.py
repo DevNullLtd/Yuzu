@@ -692,21 +692,22 @@ def release_sections(changelog: str | None) -> dict[str, str | None]:
     be told: the line sits under a `#` or `##` heading that is not `## [X]` (tab-separated, a title, indented
     by one to three spaces before a bracket), before any heading, or under more than one version (a generic
     bullet repeated across releases), so naming one version could name the wrong one. Headings inside a code
-    fence are ignored and the version in force before it is restored when it closes; a `## [X]` line inside
-    one that never closes names no version."""
+    fence are not read as headings; a `## [X]` line inside one leaves the version unknown until the next
+    heading outside a fence, because a fence that never closes cannot be told from a sample."""
     sections: dict[str, str | None] = {}
     version: str | None = ""
-    fenced = ""  # the character of the code fence open at this line, "" when none
-    outside = version  # the version in force where that fence opened
+    fence, flen = "", 0  # the character and length of the code fence open at this line
     for line in lines_of((changelog or "").removeprefix("\ufeff")):
         text = line.lstrip()
-        if fenced:
-            if text.startswith(fenced * 3):
-                fenced, version = "", outside  # sample headings inside a balanced fence change nothing
+        run = len(text) - len(text.lstrip(text[:1])) if text[:1] in ("`", "~") else 0
+        if fence:
+            if run >= flen and text[0] == fence:
+                fence = ""
             elif line.startswith("## ["):
-                version = ""  # a heading or sample text, and an unclosed fence cannot be told apart: name no version
-        elif text[:1] in ("`", "~") and text.startswith(text[:1] * 3):
-            fenced, outside = text[0], version
+                # A heading, or sample text in a fence that may never close: either way name no version.
+                version = ""
+        elif run >= 3:
+            fence, flen = text[0], run
         elif re.match(r"(?:#{1,2}(?:[ \t\r]|$)| {1,3}##[ \t]*\[)", line):
             m = re.match(r"## \[([^\]\n]*)\]", line)
             name = m.group(1).strip() if m else ""
