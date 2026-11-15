@@ -7074,11 +7074,11 @@ TEST_CASE("REST gs.status: unordered_agents and unordered_agent_ids report the a
     const auto d = nlohmann::json::parse(res->body)["data"];
     CHECK(d["unordered_agents"].get<int>() == 3);
     CHECK(rest_id_array(d["unordered_agent_ids"]) == std::vector<std::string>{"M", "U1", "U2"});
-    // The note says what the pair is and that nothing compares it yet (reverting the wording must
-    // turn this red).
+    // The note says the server orders a verdict by the pair (reverting the wording must turn this
+    // red).
     const auto note = d["note"].get<std::string>();
     CHECK(note.find("unordered_agents counts agents") != std::string::npos);
-    CHECK(note.find("not yet compared") != std::string::npos);
+    CHECK(note.find("orders a census verdict by the emit-order pair") != std::string::npos);
 }
 
 TEST_CASE("REST gs.status: the unordered ids are capped at 50 and the count is exact",
