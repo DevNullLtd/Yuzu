@@ -177,6 +177,12 @@ bookmark). `same-site` is refused because a sibling origin is not this origin. T
 reason, metric, label or alert; the audit `target_id` is `GET <path>` or `HEAD <path>`. The audit
 `detail` text is the fixed write wording ("browser write refused") for a guarded request too.
 
+**Note (2026-11-12).** The HTTP response policy (`http_response_policy.hpp`) now answers `HEAD` on a
+non-exempt dynamic route `405` with `Allow: GET`, without running the handler. The gate is unchanged
+and still runs first: an admitted guarded `HEAD` (for example `Sec-Fetch-Site: same-origin`) passes the
+same-site gate and is then refused `405` by the response policy, so it no longer reaches the handler; a
+refused guarded `HEAD` is still a `403` with its audit row. The conclusions above stand.
+
 **Evidence.** The policy truth table covers every table entry for both methods; the pipeline fixture
 registers one guarded canary and asserts refusal shape, counter, audit row, handler not run, admission
 and the fallback cases; `tests/unit/server/test_same_site_exempt_inventory.cpp` fails on a table entry

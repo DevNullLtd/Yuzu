@@ -928,7 +928,8 @@ def main() -> int:
         return 77
     # YUZU_TL_JS may point at a mutated copy of the script (mutation checks).
     env = dict(os.environ, YUZU_TL_JS=os.environ.get("YUZU_TL_JS", str(JS)))
-    r = subprocess.run([node, "-e", DRIVER], capture_output=True, text=True, timeout=30, env=env)
+    # stdin, not -e: the driver is over the Windows command-line limit (#6386).
+    r = subprocess.run([node, "-"], input=DRIVER, capture_output=True, encoding="utf-8", timeout=30, env=env)
     sys.stdout.write(r.stdout)
     sys.stderr.write(r.stderr)
     return r.returncode

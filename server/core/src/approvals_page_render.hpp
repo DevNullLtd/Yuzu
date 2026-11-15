@@ -15,8 +15,9 @@
 ///     [<div class="ops-foot hint">Showing the 100 most recent. ...</div>]
 ///   </div>
 /// A row carries the whole request in `data-*` so the page's single detail panel is filled
-/// from the selected row with no further request: scope and reviewer comment appear in full
-/// ONLY there (`data-scope`, `data-comment`); the visible cell shows a clipped copy.
+/// from the selected row with no further request: scope (clipped to `kScopeAttrBytes`) and
+/// reviewer comment appear ONLY there (`data-scope`, `data-comment`); the visible cell shows a
+/// shorter clipped copy.
 ///
 /// A BOUND ticket (#6062: `request_json` non-empty) also carries `data-request`, a
 /// plain-text rendering of what the reviewer is approving (definition name + hash,
@@ -29,6 +30,7 @@
 /// carries `data-unreadable="1"` and a `data-request` that is the fixed "do not approve"
 /// notice; the controller offers Reject only.
 
+#include "approval_request_limits.hpp" // kMaxRequestJsonBytes (no libpq)
 #include "name_lookup_memo.hpp"
 
 #include <cstdint>
@@ -37,6 +39,26 @@
 #include <vector>
 
 namespace yuzu::server::operate_pages {
+
+/// The most scope text a row (or the legacy fragment's cell) ever carries in the markup: the
+/// `data-scope` attribute holds the scope clipped to this, never in full. A ticket's scope is the
+/// caller's canonical arguments, so an unbounded copy lets one ticket ship its whole body to
+/// every load of the page. A BOUND ticket's whole request is capped at `kMaxRequestJsonBytes`
+/// and the bound must stay strictly above that, so the approver always reads a bound ticket's
+/// scope in full (a smaller clip could hide trailing arguments). Only an UNBOUND ticket from a
+/// tool without its own bound can exceed it; such a row is marked `data-scope-clipped="<total
+/// bytes>"`, the page shows a notice and withholds Approve (Reject stays), and the legacy
+/// fragment does the same.
+inline constexpr std::size_t kScopeAttrBytes = kMaxRequestJsonBytes + 1024;
+static_assert(kScopeAttrBytes > kMaxRequestJsonBytes,
+              "the scope clip must stay above the bound-request cap or an approver can be shown "
+              "a bound ticket's scope with trailing arguments hidden");
+
+/// Whether a ticket's scope would be clipped by `kScopeAttrBytes` (the approver cannot read it
+/// in full, so Approve is withheld).
+[[nodiscard]] inline bool scope_is_clipped(const std::string& scope) {
+    return scope.size() > kScopeAttrBytes;
+}
 
 struct ApprovalRowView {
     std::string id;

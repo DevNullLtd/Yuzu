@@ -15,6 +15,8 @@ table disagree, the table wins.
   case (ADR-2002 §5: every replica polls its own bus, or non-leader SSE goes dark);
   the `/readyz` Postgres reachability probe (`pg_reachability_probe.tick`, HA WS-8)
   is another — each replica must measure its own path to Postgres.
+  The collation-version recheck (`pg_collation_recheck.tick`) is a third: each replica exports its
+  own `yuzu_pg_collation_version_mismatch` gauge.
 - **FencedLeaderOnly** — side-effecting singleton work that double-fires across
   replicas (agent dispatch: schedule tick, policy remediation, quarantine
   reconcile; CRL numbering). Runs only on the WS-3 fenced leader. *Enforcement is
@@ -42,11 +44,12 @@ one unit of work — with the caveat that the many trivially-identical read-only
 passes on `health_recompute_thread_` are folded into a single
 `health_store.recompute_metrics` entry (they are all ReplicaSafe; the CRL publish,
 which is NOT, is enumerated separately). Passes on their own dedicated component
-threads (cert reloader, catalogue rollup, software-title normalisation, provisional-MFA
+threads (cert reloader, catalogue rollup, software-title normalisation, the PostgreSQL collation-version
+recheck, provisional-MFA
 cleanup, OTA watchdog, MCP projector, the two store-worker delivery pools, and — since HA
 WS-8 — the Postgres reachability probe) each get their own entry too — the 2026-09-07 sweep
 (methodology recorded in the `kBackgroundJobs` header) brought the table to 40 after
-an earlier revision missed eight of these; later additions (51 passes now, including the one-shot
+an earlier revision missed eight of these; later additions (53 passes now, including the one-shot
 `inventory_store.purge_typed_sources` on `typed_purge_thread_` and the hourly
 `software_normalization_job.run_tick` on `SoftwareNormalizationJob::thread_`) are recorded in
 that header.
@@ -67,7 +70,7 @@ that header.
   and the must-run-per-replica / shared-PG-writing passes the sweep added: cert reloader, catalogue rollup, software-title normalisation (`software_normalization_job.run_tick`), provisional-MFA cleanup, OTA watchdog, MCP
   projector, MCP bridge sweep + session gc, the Guardian reconcile claim sweep
   `guardian_reconcile_gate.sweep` (#5513), store-worker delivery pools, the HA WS-8
-  Postgres reachability probe).
+  Postgres reachability probe, the collation-version recheck).
 - That proves **named⇒classified** for those sites. It does **not** yet prove
   **pass⇒named** for every dispatch site — a `consteval`/CI sweep visiting *all* of
   them is a tracked follow-up (#4094) — so completeness rests on this table, the

@@ -283,7 +283,16 @@ public:
     /// warn, as `query_live_ids` does). A truncated read increments
     /// `yuzu_server_agent_presence_roster_truncated_total` (a steady state on a fleet over the cap,
     /// so it is a counter and a debug log, not a per-read warn).
-    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
+    ///
+    /// `live_ttl` (#7566) asks the same statement which of those rows are connected now, so the
+    /// Online/Offline view needs no second presence read that can fail or be truncated on its own:
+    /// each row's `OfflineEndpoint::live` is `session_id <> '' AND last_seen_at >= now() - TTL` on the
+    /// database clock (the predicate `query_live_ids` and `fleet_state_counts` use). The default
+    /// `0` means "not asked": `live` is `false` for every row, which is what the viz and
+    /// hostname-map consumers, who never read it, get. The TTL is a presence TTL, normally
+    /// `Config::session_timeout`.
+    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window,
+                                                       std::chrono::seconds live_ttl = {});
 
     /// One agent's endpoint row if its last heartbeat is within `window` of now (#5712) — the same
     /// window predicate as `query_stale_within`, answered by a primary-key lookup, so it is EXACT
@@ -293,8 +302,13 @@ public:
     /// `yuzu_server_agent_presence_store_failed_total{op=find_within}`), never "absent".
     /// `Truncated` is never produced: one row is read. Display/identity read only — it grants no
     /// authority, and the callers authorise the id BEFORE calling it.
+    /// `live_ttl` is the same optional presence TTL as `query_stale_within`'s (#7566, which also
+    /// fixed #7551): with a non-zero value the row's `live` says whether the agent is connected to
+    /// ANY replica, so the per-device record no longer reads a device that is live on another
+    /// replica as offline.
     [[nodiscard]] OfflineEndpointRead find_within(std::string_view agent_id,
-                                                  std::chrono::seconds window);
+                                                  std::chrono::seconds window,
+                                                  std::chrono::seconds live_ttl = {});
 
     /// Fleet tallies over the same roster window `query_stale_within` serves (exact past the cap),
     /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement.
