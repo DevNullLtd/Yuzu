@@ -1185,10 +1185,10 @@ pf_rule() {
     esac
     tok_is "$7" from || return 1
     shift 7
+    [ $# -ge 5 ] || return 1
     p_port=
     case $p_dir in
         out)
-            [ $# -ge 5 ] || return 1
             tok_is "$1" any || return 1
             tok_is "$2" to || return 1
             is_addr "$3" || return 1
@@ -1196,7 +1196,6 @@ pf_rule() {
             shift 3
             ;;
         *)
-            [ $# -ge 5 ] || return 1
             is_addr "$1" || return 1
             p_addr=$1
             shift 1
@@ -1727,7 +1726,8 @@ check_install() {
             warn "missing dir: $dir"; ((errs++)); continue
         fi
         local owner
-        owner=$(stat -f '%Su' "$dir" 2>/dev/null || stat -c '%U' "$dir")
+        owner=$(file_owner_mode "$dir" 2>/dev/null || true)
+        owner=${owner%%:*}
         if [[ "$owner" != "$ACCOUNT_NAME" ]]; then
             warn "wrong owner on $dir: got $owner, expected $ACCOUNT_NAME"
             ((errs++))

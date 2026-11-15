@@ -1468,6 +1468,8 @@ class HelperDirectoryVerdict(unittest.TestCase):
             body = body[:body.index("\n}\n")]
             self.assertIn('[[ "$PLATFORM" == "macos" ]]', body, fn)
             self.assertNotRegex(body, r"stat[^\n]*\|\|", fn)
+        # And nowhere else in the installer (`check_install` once chained `stat -f ... || stat -c ...`).
+        self.assertNotRegex(text, r"\bstat +-[^\n]*\|\|")
         self.assertIn("stat -L -f '%u %Lp %Sg'", text)
         self.assertIn("stat -L -c '%u %a %G'", text)
         self.assertIn("stat -f '%Su:%Sg %Lp'", text)
