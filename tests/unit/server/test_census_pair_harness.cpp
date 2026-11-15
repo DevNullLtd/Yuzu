@@ -17,16 +17,29 @@
  * paired row holds the greatest pair, truth != row implies flagged) hold of the SQL exactly where
  * they hold of the model.
  *
+ * WHAT THIS IS, PLAINLY. A differential against a ported model; invariants are not asserted here.
+ * The model is the oracle for every expected value, so a bug the model shares with the SQL is not
+ * found by this file, and an invariant (no apply reversal, a clean paired row holds the greatest
+ * pair, truth != row implies flagged) is checked only through "the SQL equals the model".
+ *
+ * NOT COVERED. No second stamping sender and no fresh-pair gap repair (the generator never makes
+ * either), no `delete_rule`, no `delete_agent`, and no commit-visibility schedule (the F6-A case:
+ * a pending event that commits after a newer verdict; it is a fixed case in
+ * test_census_pair_order.cpp). Stored clocks are never in the database's future, so the
+ * future-slack arm of the freshness test is not reached. The simulated clock is only accurate to
+ * about 60 s (the real clock runs while the model's does not). The threaded pairs prove same-agent
+ * serialisation only, not an interleaving of different agents. Keys are never capped or zero.
+ *
  * WHERE THE EXPECTED VALUES COME FROM. The model is `pend.Store("plan", REC2)` and the generator
- * `pend.gen_actions` over `ext.gen2` of the plan's prototype (the session scratch directory
- * ~/yuzu-scratch/up14-server-model/o1; it is NOT a dependency of this file). Both are ported here,
+ * `pend.gen_actions` over `ext.gen2`, kept in the repo under tests/unit/server/pair_model/ (see its
+ * README.md; it is NOT a dependency of this file or of the build). Both are ported here,
  * with a port of CPython's Mersenne Twister so that `random.Random(seed)` and this file draw the
  * same numbers. The port is held faithful by the case "census pair harness: the C++ port agrees
  * with the Python model": it needs no database, and compares an FNV-1a digest of the first 64
  * seeds' schedules and model traces with digests produced by the Python model (the table
  * `kPythonDigests`, from the canonical forms `schedule_text` and `snap_text` below, produced by
- * harness_digests.py beside the Python model). A model change is a change to the table:
- * regenerate it with the Python model, never edit a digest by hand.
+ * tests/unit/server/pair_model/harness_digests.py). A model change is a change to the table:
+ * regenerate it with that script, never edit a digest by hand.
  *
  * SEEDS AND REPLAY. A seed is the Python seed, so seed 17 here is `random.Random(17)` there.
  *   YUZU_TEST_PAIR_HARNESS_SEEDS=N  runs seeds 0..N-1 (default 64; the plan's campaigns use
