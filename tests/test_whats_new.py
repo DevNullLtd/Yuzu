@@ -2036,6 +2036,24 @@ class VersionsFlagAndMarkers(GitCase):
         self.assertIn("- **Pending thing.**\n", out)
         self.assertEqual(out.count("[released"), 1)
 
+    def test_a_bullet_the_release_editor_dropped_is_not_marked_released(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-two.added.md", "- **Kept.**\n- **Dropped by the editor.**\n- **Reworded later.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.put(repo, "CHANGELOG.md", text.replace("- **Dropped by the editor.**\n", ""))
+        self.commit(repo, "release, with one bullet cut")
+        text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.put(repo, "CHANGELOG.md", text.replace("- **Reworded later.**", "- **Reworded later, polished.**"))
+        self.commit(repo, "polish the release notes")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (3, 2 already released)", out)
+        self.assertIn("- **Kept.**  [released 1.3.0]", out)
+        self.assertIn("- **Dropped by the editor.**\n", out)
+        self.assertIn("- **Reworded later.**  [released]", out)
+
     def test_nothing_is_marked_when_no_release_is_in_the_range(self):
         repo = self.init()
         old = self.seed(repo)

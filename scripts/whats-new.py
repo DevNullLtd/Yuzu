@@ -674,13 +674,14 @@ def unrecognised_names(repo: Repo, old: str, new: str) -> list[str]:
 
 
 class Fragments(dict):
-    """{key: body}; `promoted` holds the keys of entries a release moved into CHANGELOG.md, and `released`
-    maps each to the version section it sits under at the end of the range ("" when that is not findable)."""
+    """{key: body}; `promoted` holds the keys of entries a release moved into CHANGELOG.md, and `released` maps
+    each to {first line of a bullet the release carried: the version section it sits under at the end of the
+    range ("" when that is not findable)}. A bullet the release editor dropped is not in it."""
 
     def __init__(self) -> None:
         super().__init__()
         self.promoted: set[str] = set()
-        self.released: dict[str, str] = {}
+        self.released: dict[str, dict[str, str]] = {}
         # Fragments a merge-commit release removed whose text matched no line the range added to CHANGELOG.md.
         self.unmatched: list[str] = []
 
@@ -862,10 +863,13 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
             key = path if path not in found else f"{path}#{sha[:10]}"
             found[key] = body
             found.promoted.add(key)
-            # Under [Unreleased] nothing is released; a line the changelog no longer carries (reworded after) is
-            # still known to have been released, just not in which version.
-            if sections.get(line, "") is not None:
-                found.released[key] = sections.get(line) or ""
+            # Per bullet: one the release editor dropped was never added to CHANGELOG.md. Under [Unreleased]
+            # nothing is released; a line the changelog no longer carries (reworded after) is still known to
+            # have been released, just not in which version.
+            for item in bullets(body):
+                bl = item.split("\n")[0].rstrip()
+                if bl in changelog_added and sections.get(bl, "") is not None:
+                    found.released.setdefault(key, {})[bl] = sections.get(bl) or ""
         elif orphans.get(path) == sha:
             found.unmatched.append(path)
     return found
@@ -896,9 +900,10 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
             is_breaking = first.lower().startswith("- **breaking")
             breaking += is_breaking
             tag = ""
-            if path in released:
+            marks = released.get(path, {})
+            if first.rstrip() in marks:
                 already += 1
-                tag = tag_for(released[path])
+                tag = tag_for(marks[first.rstrip()])
             if full or section in NEVER_TRUNCATE or is_breaking:
                 # Continuation lines are indented so that none starts at column 0, where text taken
                 # from a fragment could pass for one of this report's own headings.

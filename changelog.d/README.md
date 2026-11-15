@@ -96,7 +96,9 @@ It prints, in this order:
   removed, deprecated, changed, added, fixed. The heading counts them, and
   says how many are already released and how many are breaking. An entry a
   release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
-  when its first line sits under one `## [X.Y.Z]` heading at `HEAD`, and
+  when its first line sits under one `## [X.Y.Z]` heading at `HEAD` (each bullet
+  of a multi-bullet fragment is judged by its own first line, so a bullet the
+  release editor cut gets no marker), and
   `[released]` when the version cannot be told: the release editorial pass
   reworded the line (the usual cause), the line is under two versions, under
   a column-0 `#` or `##` heading that is not `## [X]`, or before any heading,
@@ -118,7 +120,8 @@ It prints, in this order:
   old one. A fragment added after your base and since promoted by a release is
   shown, under its last path and section, when its first line is a line a commit
   in the range added to `CHANGELOG.md`, even if the line was edited by hand after
-  the release; a name a release promoted twice in the range is shown each time
+  the release (unless a merge commit was the only commit that added the line, see
+  below); a name a release promoted twice in the range is shown each time
   (once, if the two texts are identical). A promoted entry shows the fragment's
   wording as it was promoted, not a later hand edit of the release text, so a
   note says so and `CHANGELOG.md` has the final text. A release that deletes a
@@ -132,7 +135,8 @@ It prints, in this order:
   outer whitespace dropped). A release finished by a merge commit (a release
   branch that merges `dev` and removes the fragments there) counts as promoting
   them, shown with the wording last committed before the merge; one the merge
-  itself reworded, or one that was withdrawn, matches no `CHANGELOG.md` line and
+  itself reworded, one that was withdrawn, or one whose line only that merge
+  added and a later commit then edited, matches no `CHANGELOG.md` line and
   is named on a `!` line instead. A fragment file over 1 MiB is not read.
   A file added under `changelog.d/` whose name is not a fragment name (or that
   is in a subdirectory), a fragment name that is a submodule, and a fragment
