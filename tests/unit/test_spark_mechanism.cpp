@@ -16518,7 +16518,8 @@ TEST_CASE("File spark (real mechanism): stop() with a lost path whose completion
     // narrower: stop() on a lost-path watch whose completion is being held back returns
     // promptly and quarantines nothing. The real case (a read that never completes, so
     // stop() waits and then quarantines) needs a blackholed redirector or a minifilter and
-    // is Gate 5 chaos scenario C-1. The completion is deliberately never released here:
+    // is the never-completing cancelled read scenario (a Gate 5 flip-time chaos scenario,
+    // not run). The completion is deliberately never released here:
     // the stash then holds a raw DirWatch* that is never dereferenced (a release after
     // unwatch/stop would be a use-after-free; see the paired case above).
     DeafWatchTree tree("path_lost_stop");
