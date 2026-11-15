@@ -67,15 +67,20 @@ python3 scripts/whats-new.py --versions               # only the version bumps (
 ```
 
 On Windows, where `python3` is often not on `PATH`, use the launcher:
-`py -3 scripts\whats-new.py`. The script uses only the standard library and
-needs `git` on `PATH`.
+`py -3 scripts\whats-new.py`. The script uses only the standard library
+(Python 3.9 or later, for `str.removeprefix`) and needs `git` on `PATH`.
 
 The header counts the entries that start `**Breaking` (a `Breaking` line,
 shown only when there are some), so you see them before reading further.
 `--versions` prints that header, the version bumps, the rebuild / redeploy
-notes and the Docker image bumps, and leaves out the changelog entries and
-the other dependency bumps (`--full` lists those); it is the short form for
-"do I need to rebuild?".
+notes and the Docker image bumps. It leaves out the changelog entries, and
+shows the other dependency bumps only as a count (`--full` lists them under
+their own heading). It is a quick look at what may need a rebuild, not a
+proof that nothing does: the rebuild notes watch `vcpkg`, `proto/`,
+`gateway/`, `sdk/` and the deploy files, and say nothing about `server/`,
+`agents/` or `common/` source changes, which only the file counts in the
+header show. Fragments the script could not read or list still get their
+`!` line in `--versions` mode, because the `Breaking` count leaves them out.
 
 It prints, in this order:
 
@@ -90,12 +95,16 @@ It prints, in this order:
 - **Changelog entries:** the fragments this range adds, grouped security,
   removed, deprecated, changed, added, fixed. The heading counts them, and
   says how many are already released and how many are breaking. An entry a
-  release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`,
-  the version section its first line sits under at `HEAD`; it ends `[released]`
-  when that line was edited since, so the version cannot be found, and has no
-  marker when the line is under `[Unreleased]`. Every other entry is
-  unreleased, which is the usual case for a pull of `dev`, so unreleased
-  entries carry no marker. Each shows its first line, cut at
+  release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
+  when its first line sits under exactly one `## [X.Y.Z]` heading at `HEAD`. It
+  ends `[released]` when the version cannot be told: the release editorial pass
+  reworded the line (the usual cause), it appears under more than one heading
+  or under a `##` heading that is not `## [X]`, or `CHANGELOG.md` is gone;
+  read `CHANGELOG.md` for the release. A line that is only under
+  `[Unreleased]` has no marker. No marker means no release in the range moved
+  the entry, which is the usual case for a pull of `dev`. The marker is read
+  from `CHANGELOG.md` text, not from a tag, so it is a reading aid and not
+  release evidence. Each shows its first line, cut at
   200 characters. Security, removed and deprecated entries, and entries starting
   `**Breaking` (in any case), are shown whole, continuation lines included;
   other entries show their continuation lines only with `--full`. A fragment

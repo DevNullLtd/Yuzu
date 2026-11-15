@@ -2134,12 +2134,214 @@ class VersionsFlagAndMarkers(GitCase):
         self.assertIsNone(sections["- **Pending.**"])
         self.assertEqual(sections["- **New.**"], "1.3.0")
         self.assertEqual(sections["- **Old.**"], "1.2.0")
-        self.assertEqual(sections["- **Twice.**"], "1.3.0")  # the first occurrence wins
+        self.assertEqual(sections["- **Twice.**"], "")  # under two headings: no version is named
         self.assertEqual(WN.release_sections(None), {})
 
     def test_versions_is_in_the_help(self):
         res = self.run_script(self.dir, "--help")
         self.assertIn("--versions", res.stdout)
+
+    def test_an_abbreviation_of_a_flag_is_refused(self):
+        repo = self.init()
+        self.seed(repo)
+        for flag in ("--version", "--v", "--ful"):
+            res = self.run_script(repo, flag)
+            self.assertEqual(res.returncode, 2, flag)
+            self.assertIn("unrecognized arguments", res.stderr)
+
+
+class MarkerAmbiguity(GitCase):
+    """A marker never names a version the CHANGELOG cannot support, and a released entry is never read as pending
+    for a reason this script can see. Governance round 1 (SG-F1, UP-1, UP-2, UP-3 and their scenarios)."""
+
+    def release_into(self, repo, changelog, old, first_line="- **Shipped thing.**"):
+        """Add a fragment, then a release commit that writes `changelog` and removes the fragment."""
+        self.put(repo, "changelog.d/2-rel.added.md", first_line + "\n")
+        self.commit(repo, "add")
+        self.put(repo, "CHANGELOG.md", changelog)
+        self.git(repo, "rm", "-qf", "changelog.d/2-rel.added.md")
+        self.commit(repo, "release")
+
+    def base(self, name="repo"):
+        repo = self.init(name)
+        return repo, self.seed(repo)
+
+    def test_a_line_under_two_releases_is_not_given_either_version(self):
+        repo, old = self.base()
+        log = ("# Changelog\n\n## [Unreleased]\n\n## [1.1.0] - 2026-10-30\n\n- **Shipped thing.**\n\n"
+               "## [1.0.0] - 2026-09-01\n\n- **Shipped thing.**\n")
+        self.release_into(repo, log, old)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**  [released]\n", out)
+        self.assertNotIn("[released 1.", out)
+
+    def test_a_line_under_unreleased_and_a_release_is_released_without_a_version(self):
+        repo, old = self.base()
+        log = "# Changelog\n\n## [Unreleased]\n\n- **Shipped thing.**\n\n## [1.0.0] - 2026-09-01\n\n- **Shipped thing.**\n"
+        self.release_into(repo, log, old)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**  [released]\n", out)
+
+    def test_a_heading_that_is_not_bracketed_names_no_version(self):
+        repo, old = self.base()
+        log = "# Changelog\n\n## [1.1.0] - 2026-10-30\n\n- **Other.**\n\n## 1.0.0\n\n- **Shipped thing.**\n"
+        self.release_into(repo, log, old)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**  [released]\n", out)
+        self.assertNotIn("[released 1.1.0]", out)
+
+    def test_a_byte_order_mark_before_the_first_heading_is_ignored(self):
+        repo, old = self.base()
+        log = "\ufeff## [1.0.0] - 2026-09-01\n\n- **Shipped thing.**\n"
+        self.release_into(repo, log, old)
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**  [released 1.0.0]\n", out)
+        self.assertNotIn("\ufeff", out)
+
+    def test_unreleased_in_any_case_or_spacing_is_not_released(self):
+        for n, heading in enumerate(("## [UNRELEASED]", "## [ unreleased ]", "## [Unreleased] - TBD")):
+            with self.subTest(heading=heading):
+                repo, old = self.base(f"repo{n}")
+                self.release_into(repo, f"# Changelog\n\n{heading}\n\n- **Shipped thing.**\n", old)
+                out = self.ok(repo, "--since", old)
+                self.assertIn("Shipped thing", out)
+                self.assertNotIn("[released", out)
+
+    def test_a_fragment_still_present_at_head_is_listed_without_a_marker(self):
+        repo, old = self.base()
+        self.put(repo, "changelog.d/2-rel.added.md", "- **Shipped thing.**\n")
+        self.commit(repo, "add")
+        self.put(repo, "CHANGELOG.md", "# Changelog\n\n## [1.0.0] - 2026-09-01\n\n- **Shipped thing.**\n")
+        self.commit(repo, "release that kept the fragment")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Shipped thing.**\n", out)
+        self.assertNotIn("[released", out)
+
+    def test_changelog_missing_at_head_marks_promoted_entries_without_a_version(self):
+        repo, old = self.base()
+        self.put(repo, "changelog.d/2-rel.added.md", "- **Shipped thing.**\n")
+        self.commit(repo, "add")
+        self.put(repo, "CHANGELOG.md", CHANGELOG + "\n## [1.3.0] - 2026-10-30\n\n- **Shipped thing.**\n")
+        self.git(repo, "rm", "-qf", "changelog.d/2-rel.added.md")
+        self.commit(repo, "release")
+        self.git(repo, "rm", "-qf", "CHANGELOG.md")
+        self.commit(repo, "delete the changelog")
+        res = self.run_script(repo, "--since", old)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("- **Shipped thing.**  [released]\n", res.stdout)
+
+    def test_a_hostile_version_heading_is_cut_and_cannot_forge_a_line(self):
+        repo, old = self.base()
+        name = "1.0.0\x1b[2J\u202e" + "A" * 300_000
+        log = f"# Changelog\n\n## [{name}]\n\n" + "- **Shipped thing.**\n"
+        self.release_into(repo, log, old)
+        out = self.ok(repo, "--since", old)
+        tag = [ln for ln in out.splitlines() if "Shipped thing" in ln]
+        self.assertEqual(len(tag), 1)
+        self.assertLess(len(tag[0]), 120)
+        self.assertTrue(tag[0].endswith("...]"), tag[0])
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\u202e", out)
+
+    def test_every_mode_agrees_on_a_compound_changelog(self):
+        repo, old = self.base()
+        log = ("\ufeff# Changelog\n\n## [Unreleased]\n\n- **Dup.**\n\n## [1.1.0] - 2026-10-30\n\n- **Dup.**\n- **Plain.**\n\n"
+               "## 1.0.0\n\n- **Dup.**\n")
+        self.put(repo, "changelog.d/2-a.added.md", "- **Dup.**\n")
+        self.put(repo, "changelog.d/3-b.added.md", "- **Plain.**\n")
+        self.commit(repo, "add")
+        self.put(repo, "CHANGELOG.md", log)
+        self.git(repo, "rm", "-qf", "changelog.d/2-a.added.md", "changelog.d/3-b.added.md")
+        self.commit(repo, "release")
+        for flags in ((), ("--full",), ("--versions",), ("--versions", "--full")):
+            with self.subTest(flags=flags):
+                res = self.run_script(repo, "--since", old, *flags)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertNotIn("Traceback", res.stderr)
+                if "--versions" not in flags:
+                    self.assertIn("- **Dup.**  [released]\n", res.stdout)
+                    self.assertIn("- **Plain.**  [released 1.1.0]\n", res.stdout)
+                    self.assertNotIn("[released 1.0.0]", res.stdout)
+
+
+class VersionsModeNotices(GitCase):
+    """--versions prints the same `!` notices as the full report, so the Breaking count is never presented as
+    complete when a fragment was not read (SG-F1)."""
+
+    def breaking_repo(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-b.changed.md", "- **Breaking: readable.**\n")
+        return repo, old
+
+    def check(self, repo, old, needle):
+        self.commit(repo, "fragments")
+        for flags in (("--versions",), ("--versions", "--full"), ()):
+            with self.subTest(flags=flags):
+                out = self.ok(repo, "--since", old, *flags)
+                self.assertIn(needle, out)
+                if "--versions" in flags:
+                    self.assertIn("Not read or not listed, so not in the Breaking count above", out)
+                    self.assertIn("Breaking  1 changelog entry", out)
+                    self.assertNotIn("Changelog entries added", out)
+
+    def test_an_oversized_fragment(self):
+        repo, old = self.breaking_repo()
+        self.put(repo, "changelog.d/3-big.changed.md", "- **Breaking: big.** " + "x" * (2 * 1024 * 1024) + "\n")
+        self.check(repo, old, "over 1024 KiB, not read")
+
+    def test_a_misnamed_file(self):
+        repo, old = self.breaking_repo()
+        self.put(repo, "changelog.d/notes.txt", "x\n")
+        self.check(repo, old, "not named like fragments")
+
+    def test_a_fragment_with_no_bullet(self):
+        repo, old = self.breaking_repo()
+        self.put(repo, "changelog.d/3-none.added.md", "no bullet here\n")
+        self.check(repo, old, "with no '- ' bullet")
+
+    def test_no_notice_line_when_everything_was_read(self):
+        repo, old = self.breaking_repo()
+        self.commit(repo, "fragments")
+        out = self.ok(repo, "--since", old, "--versions")
+        self.assertNotIn("Not read or not listed", out)
+        self.assertNotIn("\n! ", out)
+
+    def test_versions_full_names_the_other_dependency_bumps(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, ".github/workflows/ci.yml", "a\n")
+        self.commit(repo, "build(deps): bump docker/login-action")
+        out = self.ok(repo, "--since", old, "--versions", "--full")
+        self.assertIn("Other dependency bumps (1)", out)
+        self.assertIn("docker/login-action", out)
+        self.assertNotIn("Other dependency bumps", self.ok(repo, "--since", old, "--versions"))
+        none = self.init("none")
+        old2 = self.seed(none)
+        self.put(none, "server/x.cpp", "x\n")
+        self.commit(none, "fix: x")
+        self.assertNotIn("Other dependency bumps", self.ok(none, "--since", old2, "--versions", "--full"))
+
+    def test_versions_with_a_breaking_entry_and_no_bump_says_both(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-b.changed.md", "- **Breaking: x.**\n")
+        self.commit(repo, "fragment")
+        out = self.ok(repo, "--since", old, "--versions")
+        self.assertIn("(run without --versions to read them)", out)
+        self.assertIn("none of the tracked versions changed", out)
+
+    def test_both_heading_suffixes_come_in_the_documented_order(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-rel.changed.md", "- **Breaking: shipped.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        self.put(repo, "changelog.d/3-p.added.md", "- **Pending.**\n")
+        self.commit(repo, "pending")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (2, 1 already released, 1 breaking)", out)
 
 
 class RoundEight(GitCase):

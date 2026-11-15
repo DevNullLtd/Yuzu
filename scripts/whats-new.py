@@ -9,7 +9,14 @@ Prints, for the range OLD..HEAD of the current checkout:
   2. surfaces touched that may need a rebuild or redeploy;
   3. dependency bumps: commits titled `build(deps):` / `chore(deps):` (Dependabot's
      title convention), which normally add no fragment and touch none of the files in 1;
-  4. the changelog.d/ fragments added in the range, grouped by section.
+  4. the changelog.d/ fragments added in the range, grouped by section. The header counts the entries
+     that start `**Breaking`; the heading counts those a release in the range already moved into
+     CHANGELOG.md, and each of those ends `[released X]` (the version section its line is under at HEAD)
+     or `[released]` (that version cannot be told, say because the release notes were reworded).
+     An entry with no marker was not moved by a release in the range.
+
+`--versions` prints the header, 1, 2 and the Docker image bumps, and still prints a `!` line for any
+fragment it could not read.
 
 Unreleased changes are recorded as fragments (changelog.d/README.md) and only
 assembled into CHANGELOG.md at release, so this is the way to read them
@@ -679,17 +686,25 @@ class Fragments(dict):
 
 
 def release_sections(changelog: str | None) -> dict[str, str | None]:
-    """{line: version} for the lines of a CHANGELOG.md, the version being that of the nearest `## [X]` heading above
-    (the first place a line occurs wins; None under `[Unreleased]`, where nothing has been released)."""
+    """{line: version} for the lines of a CHANGELOG.md, the version being that of the `## [X]` heading above it.
+
+    None when the line is only under `[Unreleased]`, where nothing has been released. "" when the version cannot
+    be told: the line sits under a `##` heading that is not `## [X]`, before any heading, or under more than
+    one heading (a generic bullet repeated across releases), so naming one version could name the wrong one."""
     sections: dict[str, str | None] = {}
-    version: str | None = None
-    for line in lines_of(changelog or ""):
-        m = re.match(r"## \[([^\]\n]*)\]", line)
-        if m:
-            version = None if m.group(1).strip().lower() == "unreleased" else m.group(1).strip()
+    version: str | None = ""
+    for line in lines_of((changelog or "").removeprefix("\ufeff")):
+        if line.startswith("## "):
+            m = re.match(r"## \[([^\]\n]*)\]", line)
+            name = m.group(1).strip() if m else ""
+            version = None if name.lower() == "unreleased" else name
             continue
         if line.strip():
-            sections.setdefault(line.rstrip(), version)
+            key = line.rstrip()
+            if key not in sections:
+                sections[key] = version
+            elif sections[key] != version:
+                sections[key] = ""
     return sections
 
 
@@ -856,8 +871,9 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
 
 
 def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int, list[str], int, int]:
-    """(lines, bullet count, names of fragments that yielded no '- ' bullet, how many bullets are
-    **Breaking, how many a release in the range already moved into CHANGELOG.md)."""
+    """(lines, bullet count, names of fragments that yielded no '- ' bullet, the number of bullets that
+    start `**Breaking`, the number of bullets a release in the range already moved into CHANGELOG.md).
+    BRIEF_MAX cuts the bullet's own text; a `[released X]` tag follows the cut."""
     released = getattr(frags, "released", {})
     breaking = already = 0
     by_section: dict[str, list[str]] = {s: [] for s in SECTION_ORDER}
@@ -881,7 +897,7 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
             tag = ""
             if path in released:
                 already += 1
-                tag = f"  [released {one(released[path])}]" if released[path] else "  [released]"
+                tag = tag_for(released[path])
             if full or section in NEVER_TRUNCATE or is_breaking:
                 # Continuation lines are indented so that none starts at column 0, where text taken
                 # from a fragment could pass for one of this report's own headings.
@@ -898,6 +914,18 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
             lines.extend(by_section[section])
             lines.append("")
     return lines, total, empty, breaking, already
+
+
+TAG_VERSION_MAX = 40
+
+
+def tag_for(version: str) -> str:
+    """The `[released X]` suffix of an entry; a version heading is repository text of any length, and the
+    tag is printed once per entry, so it is cut."""
+    if not version:
+        return "  [released]"
+    v = one(version)
+    return f"  [released {v[:TAG_VERSION_MAX - 3] + '...' if len(v) > TAG_VERSION_MAX else v}]"
 
 
 def name_list(names: list[str], limit: int = 20) -> str:
@@ -939,16 +967,42 @@ def build_report(repo: Repo, since: str | None, full: bool, versions_only: bool 
         out.extend(f"  * {n}" for n in notes)
         out.append("")
 
+    odd = unrecognised_names(repo, old, head)
+    not_regular = sorted(set(repo.not_regular))
+    too_big = sorted(set(repo.too_big))
+    unmatched = sorted(set(getattr(frags, "unmatched", [])))
+    # Fragments that were not read or not listed. They are printed in every mode: the Breaking count in the
+    # header is only complete if none of them is missing, and --versions must not read as an all-clear.
+    notices: list[str] = []
+    if unmatched:
+        notices.append(f"! {plural(len(unmatched), 'fragment')} removed by a merge commit matched no line added to CHANGELOG.md "
+                       f"(withdrawn, or reworded in the merge), not listed: {name_list(unmatched)}; read CHANGELOG.md for the release text")
+    if empty:
+        notices.append(f"! {plural(len(empty), 'fragment')} with no '- ' bullet, not summarised: {name_list(empty)}")
+    if odd:
+        notices.append(f"! {plural(len(odd), 'file')} added under {FRAGMENT_DIR}/ not named like fragments (or not directly in it), "
+                       f"not listed: {name_list(odd)}")
+    if not_regular:
+        notices.append(f"! {plural(len(not_regular), 'path')} named like fragments but not regular files (a submodule), "
+                       f"not listed: {name_list(not_regular)}")
+    if too_big:
+        notices.append(f"! {plural(len(too_big), 'fragment file')} over {MAX_FRAGMENT_BYTES // 1024} KiB, not read: {name_list(too_big)}")
+
     images, other = dependency_bumps(repo, old, head)
     if versions_only:
         if images:
             out.append(f"Docker image bumps ({len(images)})")
             out.extend(f"  {s}" for s in images)
             out.append("")
-        if full:
+        if full and other:
+            out.append(f"Other dependency bumps ({len(other)})")
             out.extend(f"  {s}" for s in other)
+            out.append("")
         elif other:
             out.append(f"+ {plural(len(other), 'other dependency bump')} (workflows, pip, npm); --full lists them")
+        if notices:
+            out.append("Not read or not listed, so not in the Breaking count above (run without --versions for the full report):")
+            out.extend(notices)
         return out
     if images or other:
         out.append(f"Dependency bumps (build(deps)/chore(deps) commits): {plural(len(images), 'Docker image')}, {len(other)} other")
@@ -959,10 +1013,6 @@ def build_report(repo: Repo, since: str | None, full: bool, versions_only: bool 
             out.append(f"  + {plural(len(other), 'other bump')} (workflows, pip, npm); --full lists them")
         out.append("")
 
-    odd = unrecognised_names(repo, old, head)
-    not_regular = sorted(set(repo.not_regular))
-    too_big = sorted(set(repo.too_big))
-    unmatched = sorted(set(getattr(frags, "unmatched", [])))
     if lines:
         counts = [str(total)]
         if released_count:
@@ -980,24 +1030,12 @@ def build_report(repo: Repo, since: str | None, full: bool, versions_only: bool 
     else:
         out.append("No changelog fragments were added in this range (refactors, CI and test-only changes may skip them;")
         out.append(f"`git log --first-parent --oneline {old[:10]}..HEAD` lists every merged PR).")
-    if unmatched:
-        out.append(f"! {plural(len(unmatched), 'fragment')} removed by a merge commit matched no line added to CHANGELOG.md "
-                   f"(withdrawn, or reworded in the merge), not listed: {name_list(unmatched)}; read CHANGELOG.md for the release text")
-    if empty:
-        out.append(f"! {plural(len(empty), 'fragment')} with no '- ' bullet, not summarised: {name_list(empty)}")
-    if odd:
-        out.append(f"! {plural(len(odd), 'file')} added under {FRAGMENT_DIR}/ not named like fragments (or not directly in it), "
-                   f"not listed: {name_list(odd)}")
-    if not_regular:
-        out.append(f"! {plural(len(not_regular), 'path')} named like fragments but not regular files (a submodule), "
-                   f"not listed: {name_list(not_regular)}")
-    if too_big:
-        out.append(f"! {plural(len(too_big), 'fragment file')} over {MAX_FRAGMENT_BYTES // 1024} KiB, not read: {name_list(too_big)}")
+    out.extend(notices)
     return out
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(description="Summarise what changed in this checkout since the last pull.")
+    ap = argparse.ArgumentParser(description="Summarise what changed in this checkout since the last pull.", allow_abbrev=False)
     ap.add_argument("--since", help="ref, tag or commit, or a date (YYYY-MM-DD[ HH:MM[:SS]], yesterday, \"N days ago\"); default: your last pull")
     ap.add_argument("--full", action="store_true",
                     help="print whole bullets (not first lines) and list every non-image dependency bump")
