@@ -8564,25 +8564,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     detail_text);
             };
 
-            // EVERY management-group row after the `attempted` row (the `*_revoked` failure rows
-            // and the outcome row) is written after the session may be gone (the recheck and the
-            // store's pool wait both come first), when the re-resolving `audit_fn` would stamp an
-            // empty principal. They go through the session-bound writer
-            // (`ToolDeps::audit_as_session_fn`, the one REST binds its session-bound rows to)
-            // with the session this call resolved BEFORE the `attempted` row, so they name the
-            // same principal as that row. server.cpp binds the writer only where the
-            // runtime-config store is open (the DEX score policy tools' deps, whose tripwire pins
-            // that wiring); with none wired (that deployment, tests) they use mg_audit, whose row
-            // re-resolves the session. Any exception from the writer is caught like mg_audit's.
-            auto mg_audit_bound = [&](const char* action, const char* result_status,
-                                         const std::string& target_id,
-                                         const std::string& detail_text) -> bool {
+            // EVERY management-group row that names the caller (the `attempted` row, the
+            // `*_revoked` failure rows and the outcome row) is written after the session may be
+            // gone (the handler resolves it first, then waits on the pool for the group read, the
+            // enrolment lookup, the audit write and the store call), when the re-resolving
+            // `audit_fn` would stamp an empty principal and break principal-based pairing of the
+            // rows. They go through the session-bound writer (`ToolDeps::audit_as_session_fn`,
+            // the one REST binds its session-bound rows to) with the session this call resolved
+            // at the top of the handler and the role taken from it ONCE, here, so every row of
+            // one call carries the same principal and role. server.cpp binds the writer only
+            // where the runtime-config store is open (the DEX score policy tools' deps, whose
+            // tripwire pins that wiring); with none wired (that deployment, tests) they use
+            // mg_audit, whose row re-resolves the session. Any exception from the writer is
+            // caught like mg_audit's.
+            auto mg_audit_bound = [&, role = auth::role_to_string(auth::effective_role(*session))](
+                                      const char* action, const char* result_status,
+                                      const std::string& target_id,
+                                      const std::string& detail_text) -> bool {
                 if (!tool_deps_.audit_as_session_fn)
                     return mg_audit(action, result_status, target_id, detail_text);
                 try {
-                    return tool_deps_.audit_as_session_fn(
-                        req, *session, auth::role_to_string(auth::effective_role(*session)),
-                        action, result_status, "ManagementGroup", target_id, detail_text);
+                    return tool_deps_.audit_as_session_fn(req, *session, role, action,
+                                                          result_status, "ManagementGroup",
+                                                          target_id, detail_text);
                 } catch (...) {
                     spdlog::warn("audit_as_session_fn threw on management-group row action={} "
                                  "target={}",
@@ -8602,7 +8606,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                                      const std::string& target_id,
                                                      const std::string& detail_text,
                                                      const char* refused_detail) -> bool {
-                if (mg_audit(action, "attempted", target_id, detail_text))
+                if (mg_audit_bound(action, "attempted", target_id, detail_text))
                     return true;
                 mcp_audit("failure", refused_detail);
                 // The approval ticket of a supervised call was spent before this handler ran, so
@@ -13774,8 +13778,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // row, with a fixed refusal text. Only the tool-level mcp.* row is written.
                 if (!mgmt_group_name_ok(name)) {
                     mcp_audit("denied", "invalid_name");
-                    res.set_content(a4_error(kInvalidParams, std::string(kMgmtGroupNameInvalidText)),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kInvalidParams, std::string(kMgmtGroupNameInvalidText)),
+                        "application/json");
                     return;
                 }
                 if (!mgmt_group_id_ok(param_str(args, "parent_id"))) { // names no group
@@ -14270,8 +14275,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     // `failure` outcome row with a fixed token so the `attempted` row is never
                     // left without one.
                     if (info.retry_after_ms > 0 && mgmt_group_confirmed_absent(*mgmt_store, group_id)) {
-                        (void)mg_audit_bound("management_group.add_member", "failure", group_id,
-                                             mgmt_group_failure_detail("group_not_found", agent_id));
+                        (void)mg_audit_bound(
+                            "management_group.add_member", "failure", group_id,
+                            mgmt_group_failure_detail("group_not_found", agent_id));
                         mcp_audit("denied", "group not found");
                         res.set_content(a4_error(kInvalidParams, "group not found"),
                                         "application/json");

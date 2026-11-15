@@ -95,6 +95,12 @@ struct AuditFirstHarness {
     /// the outcome row is written. A row the re-resolving `audit_fn` stamps from then on names
     /// nobody, so a row that names the session was written through the session-bound writer.
     bool session_gone_after_recheck = false;
+    /// The session is already gone when the `attempted` row itself is written (it lapsed in the
+    /// window after the route resolved it, e.g. across a pool wait): the re-resolving `audit_fn`
+    /// names nobody on an `attempted` row, so a row that names the session went through the
+    /// session-bound writer. Pair it with `session_gone_after_attempted` for a route that then
+    /// refuses at the re-check.
+    bool session_gone_at_attempted = false;
     std::size_t post_attempted_auth_calls = 0;
     /// Runs ONCE, between the `attempted` row and the membership write (the first auth_fn call
     /// after the attempted row is stored): the deterministic injection point for a change that
@@ -173,8 +179,10 @@ struct AuditFirstHarness {
                 return false;
             // Production re-resolves the session from the request at write time: once it is
             // gone the row names nobody.
-            const bool session_alive = !(session_gone_after_attempted && attempted_stored()) &&
-                                       !(session_gone_after_recheck && post_attempted_auth_calls > 0);
+            const bool session_alive =
+                !(session_gone_after_attempted && attempted_stored()) &&
+                !(session_gone_after_recheck && post_attempted_auth_calls > 0) &&
+                !(session_gone_at_attempted && result == "attempted");
             audits.push_back({action, result, target_type, target_id, detail,
                               session_alive ? "tester" : "", /*bound=*/false});
             return true;
@@ -1518,6 +1526,66 @@ TEST_CASE("DELETE /management-groups/{id}/members/{agent}: the success and store
         CHECK(rows[1].detail == "store_error agent-b3");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
+    }
+}
+
+// ── The attempted row is session-bound too ──────────────────────────────────────────────────────
+// The route resolves the session before the `attempted` row, and the row can wait on the audit
+// pool, so the session can lapse in between. The re-resolving `audit_fn` would then stamp an empty
+// principal on the `attempted` row while every later row names the user, which breaks pairing the
+// rows by principal. The harness's `audit_fn` models that (principal "" for an `attempted` row
+// once `session_gone_at_attempted`), so these cases fail on a route that writes it through
+// `audit_fn`.
+
+TEST_CASE("POST /management-groups: the attempted row is written through the session-bound writer "
+          "and names the principal when the session lapsed before it",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    h.session_gone_at_attempted = true;
+    h.session_gone_after_attempted = true; // the re-check then refuses
+    auto res = h.create(R"({"name":"attempt-bound"})");
+    REQUIRE(res);
+    CHECK(res->status == 401);
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[0].bound);
+    CHECK(h.audits[0].principal == "tester");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].bound);
+    CHECK(h.audits[1].principal == h.audits[0].principal);
+    CHECK_FALSE(h.group_exists("attempt-bound"));
+}
+
+TEST_CASE("POST and DELETE members: the attempted row is written through the session-bound writer "
+          "and names the principal when the session lapsed before it",
+          "[pg][rest][mgmt_group][mgmt-audit-first][security]") {
+    AuditFirstHarness h;
+    const std::string gid = make_group(h, "attempt-bound-members");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    h.session_gone_at_attempted = true;
+    h.session_gone_after_attempted = true;
+
+    SECTION("add member") {
+        auto res = h.add_member(gid, R"({"agent_id":"agent-2"})");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kAdd);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[0].bound);
+        CHECK(rows[0].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(h.member_count(gid) == 1);
+    }
+    SECTION("remove member") {
+        auto res = h.remove_member(gid, "agent-1");
+        REQUIRE(res);
+        const auto rows = h.rows_of(kRemove);
+        REQUIRE(rows.size() == 2);
+        CHECK(rows[0].result == "attempted");
+        CHECK(rows[0].bound);
+        CHECK(rows[0].principal == "tester");
+        CHECK(rows[1].principal == rows[0].principal);
+        CHECK(h.member_count(gid) == 1);
     }
 }
 

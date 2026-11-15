@@ -4735,7 +4735,8 @@ void RestApiV1::register_routes(
     sink.Post("/api/v1/management-groups", [auth_fn, perm_fn, audit_fn, mgmt_store,
                                             mgmt_write_failed,
                                             audit_as_session = audit_as_session_fn_](
-                                               const httplib::Request& req, httplib::Response& res) {
+                                               const httplib::Request& req,
+                                               httplib::Response& res) {
         if (!perm_fn(req, res, "ManagementGroup", "Write"))
             return;
         if (!mgmt_store) {
@@ -4789,15 +4790,16 @@ void RestApiV1::register_routes(
         auto session = auth_fn(req, res);
         if (session)
             g.created_by = session->username;
-        // EVERY row after the `attempted` row (the `*_revoked` failure rows and the outcome row)
-        // is written after the session may be gone (the recheck below and create_group's pool
-        // wait both come first), when the re-resolving `audit_fn` would stamp an empty principal:
-        // they are stamped from the session resolved here, before the `attempted` row (the one
-        // that row names). Without a session writer wired (tests) they fall back to `audit_fn`.
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here: each can
+        // be written after the session is gone (the audit pool wait, the recheck below and
+        // create_group's pool wait), when the re-resolving `audit_fn` would stamp an empty
+        // principal and break principal-based pairing of the rows. Without a session writer
+        // wired (tests) they fall back to `audit_fn`.
         const AuditFn bound_audit =
             (session && audit_as_session) ? audit_as(audit_as_session, *session) : audit_fn;
 
-        if (!detail::audit_attempted(audit_fn, req, res, "management_group.create",
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
                                      "ManagementGroup", "", g.name))
             return;
 
@@ -4807,7 +4809,8 @@ void RestApiV1::register_routes(
         if (!fresh_session) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
-                                                mgmt_group_failure_detail("session_revoked", g.name));
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
             if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "authentication required"),
@@ -5061,10 +5064,10 @@ void RestApiV1::register_routes(
     // mutation; then the outcome row. Failure rows carry a FIXED token and the agent id the
     // `attempted` row carries (`mgmt_group_failure_detail`), never store text. This is the
     // post-attempted re-check, the member twin of the one in POST /api/v1/management-groups.
-    // `bound_audit` stamps every row after the `attempted` row (these two `*_revoked` failure
-    // rows and the outcome row) from the session the route resolved BEFORE the `attempted` row
-    // (see the create route): the re-resolving `audit_fn` would stamp an empty principal once
-    // the session is gone.
+    // `bound_audit` stamps every row that names the caller (the `attempted` row, these two
+    // `*_revoked` failure rows and the outcome row) from the session the route resolved BEFORE
+    // the `attempted` row (see the create route): the re-resolving `audit_fn` would stamp an
+    // empty principal once the session is gone.
     const auto mgmt_member_recheck = [auth_fn, perm_fn](const httplib::Request& req,
                                                         httplib::Response& res, const char* action,
                                                         const std::string& group_id,
@@ -5073,7 +5076,8 @@ void RestApiV1::register_routes(
         if (!auth_fn(req, res)) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, action, "failure",
                                                 "ManagementGroup", group_id,
-                                                mgmt_group_failure_detail("session_revoked", agent_id));
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          agent_id));
             if (res.status < 400) { // auth_fn writes its own 401; cover one that did not
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "authentication required"),
@@ -5162,14 +5166,14 @@ void RestApiV1::register_routes(
                   // accepted (an operator may stage a membership ahead of the device) and no lookup
                   // outcome refuses the add. Unreadable is recorded as neither known nor unknown.
                   const AgentKnown agent_known = lookup_agent_known(auth_db, agent_id);
-                  // The session the `attempted` row names, resolved before it (see the create
-                  // route): every row after the `attempted` row is stamped from it.
+                  // The session every row names, the `attempted` row included, resolved before it
+                  // (see the create route): each is stamped from it.
                   const auto session = auth_fn(req, res); // writes its own 401
                   if (!session)
                       return;
                   const AuditFn bound_audit =
                       audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
-                  if (!detail::audit_attempted(audit_fn, req, res, "management_group.add_member",
+                  if (!detail::audit_attempted(bound_audit, req, res, "management_group.add_member",
                                                "ManagementGroup", group_id, agent_id))
                       return;
                   if (!mgmt_member_recheck(req, res, "management_group.add_member", group_id,
@@ -5229,7 +5233,8 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, "group not found"), "application/json");
                 return;
             }
-            if (!mgmt_group_agent_id_length_ok(agent_id)) { // no row; an unclean id keeps its denied row
+            // No row; an unclean id keeps its denied row.
+            if (!mgmt_group_agent_id_length_ok(agent_id)) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, std::string(kMgmtGroupAgentIdTooLongText)),
                                 "application/json");
@@ -5245,13 +5250,14 @@ void RestApiV1::register_routes(
             }
             // Idempotent as before: removing an absent member (or from an absent group) is a
             // success, so there is no group-exists answer here, only the audit-first order.
-            // The session the `attempted` row names, resolved before it (see the create route).
+            // The session every row names, the `attempted` row included, resolved before it (see
+            // the create route).
             const auto session = auth_fn(req, res); // writes its own 401
             if (!session)
                 return;
             const AuditFn bound_audit =
                 audit_as_session ? audit_as(audit_as_session, *session) : audit_fn;
-            if (!detail::audit_attempted(audit_fn, req, res, "management_group.remove_member",
+            if (!detail::audit_attempted(bound_audit, req, res, "management_group.remove_member",
                                          "ManagementGroup", group_id, agent_id))
                 return;
             if (!mgmt_member_recheck(req, res, "management_group.remove_member", group_id,

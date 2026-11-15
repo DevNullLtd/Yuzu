@@ -7002,10 +7002,10 @@ void SettingsRoutes::register_routes(
     // are POST /api/v1/management-groups and the MCP create_management_group tool. Every refusal
     // that needs no write to decide (permission, empty name, `validate_new_group`) answers first
     // and burns no row. The `attempted` row can wait on the audit pool, so the session and the
-    // permission are decided again after it. Failure rows carry a FIXED token and the group name the `attempted` row carries
-    // (`mgmt_group_failure_detail`), never store text, and
-    // no store text reaches the page: a store fault answers a fixed message, a validation
-    // refusal echoes its own closed text, HTML-escaped. The form swaps the response body into
+    // permission are decided again after it. Failure rows carry a FIXED token and the group name
+    // the `attempted` row carries (`mgmt_group_failure_detail`), never store text, and no store
+    // text reaches the page: a store fault answers a fixed message, a validation refusal echoes
+    // its own closed text, HTML-escaped. The form swaps the response body into
     // #mgmt-groups-section (htmx drops a 4xx/5xx body), so a refusal that must be seen carries
     // an HX-Trigger toast too.
     sink.Post("/api/settings/management-groups", [this](const httplib::Request& req,
@@ -7069,11 +7069,11 @@ void SettingsRoutes::register_routes(
         auto session = auth_fn_(req, res);
         if (session)
             g.created_by = session->username;
-        // EVERY row after the `attempted` row (the `*_revoked` failure rows and the outcome row)
-        // is written after the session may be gone, when the re-resolving `audit_read_fn_` would
-        // stamp an empty principal: they are stamped from the session resolved here, before the
-        // `attempted` row (the one that row names), as the MFA disable does. Without a session
-        // writer wired (tests) they use `audit_read_fn_`.
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here, as the MFA
+        // disable does: each can be written after the session is gone, when the re-resolving
+        // `audit_read_fn_` would stamp an empty principal and break principal-based pairing of
+        // the rows. Without a session writer wired (tests) they use `audit_read_fn_`.
         const AuditReadFn bound_audit = [&]() -> AuditReadFn {
             if (!session || !audit_as_session_fn_)
                 return audit_read_fn_;
@@ -7086,7 +7086,7 @@ void SettingsRoutes::register_routes(
             };
         }();
 
-        if (!detail::audit_attempted(audit_read_fn_, req, res, "management_group.create",
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
                                      "ManagementGroup", "", g.name)) {
             // audit_attempted wrote the 503 A4 envelope + Sec-Audit-Failed; the form would show
             // nothing for it, so add the toast.
@@ -7100,7 +7100,8 @@ void SettingsRoutes::register_routes(
         if (!fresh_session) {
             (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
                                                 "failure", "ManagementGroup", "",
-                                                mgmt_group_failure_detail("session_revoked", g.name));
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
             if (res.status < 400) { // auth_fn_ writes its own 401; cover one that did not
                 res.status = 401;
                 res.set_content(detail::a4_error(res, "authentication required"),

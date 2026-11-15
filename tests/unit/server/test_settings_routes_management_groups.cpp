@@ -97,6 +97,10 @@ struct MgmtGroupsHarness {
     /// outcome row is written. A row the re-resolving hook stamps from then on names nobody, so a
     /// row that names the session went through the session-bound writer.
     bool session_gone_after_recheck{false};
+    /// The session is already gone when the `attempted` row itself is written (it lapsed in the
+    /// window after the route resolved it): the re-resolving hook names nobody on an `attempted`
+    /// row, so a row that names the session went through the session-bound writer.
+    bool session_gone_at_attempted{false};
     std::size_t post_attempted_auth_calls{0};
     /// Runs ONCE, the first time the session is resolved after an `attempted` row is stored: the
     /// deterministic injection point for a change that lands between the route's pre-check and
@@ -168,21 +172,24 @@ struct MgmtGroupsHarness {
             const bool attempted = result == "attempted";
             const bool ok = attempted ? attempt_audit_ok : outcome_audit_ok;
             const bool alive = !(session_gone_after_attempt && attempted_stored()) &&
-                               !(session_gone_after_recheck && post_attempted_auth_calls > 0);
+                               !(session_gone_after_recheck && post_attempted_auth_calls > 0) &&
+                               !(session_gone_at_attempted && attempted);
             calls.push_back({action, result, target_type, target_id, detail, ok,
                              alive ? "admin" : "", /*bound=*/false});
             return ok;
         };
         // The session-bound writer, as `AuthRoutes::audit_as_session_fn()` is wired in production.
-        // It only ever writes rows AFTER the `attempted` row, so `outcome_audit_ok` governs it.
+        // It writes every row of the create, the `attempted` row included, so the same two
+        // switches govern it as govern the re-resolving hook.
         routes.set_audit_as_session_fn(
             [this](const httplib::Request&, const auth::Session& session, const std::string&,
                    const std::string& action, const std::string& result,
                    const std::string& target_type, const std::string& target_id,
                    const std::string& detail) -> bool {
-                calls.push_back({action, result, target_type, target_id, detail, outcome_audit_ok,
+                const bool ok = result == "attempted" ? attempt_audit_ok : outcome_audit_ok;
+                calls.push_back({action, result, target_type, target_id, detail, ok,
                                  session.username, /*bound=*/true});
-                return outcome_audit_ok;
+                return ok;
             });
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
                                auto_approve,
@@ -817,6 +824,31 @@ TEST_CASE("Settings group create: the success and failure outcome rows are sessi
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == rows[0].principal);
     }
+}
+
+// The route resolves the session before the `attempted` row, and the row can wait on the audit
+// pool, so the session can lapse in between: the re-resolving hook would stamp an empty principal
+// on the `attempted` row while every later row names the user. The harness hook models that, so
+// this case fails on a route that writes the `attempted` row through `audit_read_fn_`.
+TEST_CASE("Settings group create: the attempted row is written through the session-bound writer "
+          "and names the principal when the session lapsed before it",
+          "[pg][settings][management-groups][mgmt-audit-first][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_routes_tpl);
+    MgmtGroupsHarness h(db.dsn());
+    h.session_gone_at_attempted = true;
+    h.session_gone_after_attempt = true; // the re-check then refuses
+
+    auto res = h.create("Attempt Bound");
+    REQUIRE(res);
+    const auto rows = h.create_rows();
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].result == "attempted");
+    CHECK(rows[0].bound);
+    CHECK(rows[0].principal == "admin");
+    CHECK(rows[1].result == "failure");
+    CHECK(rows[1].bound);
+    CHECK(rows[1].principal == rows[0].principal);
+    CHECK(h.group_names().empty());
 }
 
 // A create's target_id is empty on both rows, so the group name is what pairs a failure row with
