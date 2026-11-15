@@ -259,6 +259,17 @@ struct DegradeLog {
     std::uint64_t occurrence;
 };
 
+// The sampling decision alone: log the first occurrence of an episode (one that follows a quiet
+// gap of `kDegradeEpisodeGapSecs`) and every `kReadDegradeLogSample`th after it.
+DegradeLog sample_degrade_log(std::atomic<std::uint64_t>& count,
+                              std::atomic<std::int64_t>& last_ts) {
+    const std::int64_t now = now_epoch();
+    const std::int64_t prev = last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
+    return {new_episode || (n % kReadDegradeLogSample) == 0, n};
+}
+
 DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
                              const char* source, DegradeSampler& s) {
     if (metrics)
@@ -266,11 +277,7 @@ DegradeLog note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason,
             ->counter("yuzu_server_guardian_read_degrade_total",
                       {{"reason", reason}, {"source", source}})
             .increment();
-    const std::int64_t now = now_epoch();
-    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
-    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
-    const bool new_episode = prev == 0 || (now - prev) > kDegradeEpisodeGapSecs;
-    return {new_episode || (n % kReadDegradeLogSample) == 0, n};
+    return sample_degrade_log(s.count, s.last_ts);
 }
 
 // Increment the persisted policy generation via one atomic UPDATE ...
@@ -1747,6 +1754,37 @@ void count_decision(yuzu::MetricsRegistry* metrics,
     }
 }
 
+// The process-wide admission of a Repair (`GuaranteedStateStore::kRepairMaxConcurrent`): a
+// non-blocking try-acquire on a plain atomic count, released by the destructor on every exit
+// (a return, an exception unwinding out of the Repair). Never held across a wait of its own, and
+// never a mutex: a miss answers at once. The count never exceeds the cap (a compare-exchange, not
+// an add that is undone), so a concurrent acquirer is never refused because of another's
+// transient overshoot.
+class RepairAdmission {
+public:
+    RepairAdmission(std::atomic<int>& in_flight, int cap) noexcept : in_flight_(in_flight) {
+        int cur = in_flight_.load(std::memory_order_relaxed);
+        while (cur < cap) {
+            if (in_flight_.compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
+                                                 std::memory_order_relaxed)) {
+                held_ = true;
+                return;
+            }
+        }
+    }
+    RepairAdmission(const RepairAdmission&) = delete;
+    RepairAdmission& operator=(const RepairAdmission&) = delete;
+    ~RepairAdmission() {
+        if (held_)
+            in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    [[nodiscard]] bool admitted() const noexcept { return held_; }
+
+private:
+    std::atomic<int>& in_flight_;
+    bool held_{false};
+};
+
 // The decision column of the census upsert's one row, as the closed `CensusDecision`
 // (`interpret_census_decision`): NULL is a real answer ONLY for an unpaired-mode event (the key
 // rule refused it, which v4 never labelled); a NULL for any other mode, or a label outside the
@@ -2757,6 +2795,13 @@ agent_order_step(PGconn* conn,
     // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
     if (!control(("SET LOCAL lock_timeout = " + std::to_string(lock_timeout_ms)).c_str()))
         return {AgentStepOutcome::Abandoned, {}};
+    // The same value as a statement timeout (M1): lock_timeout is per lock WAIT, and a share lock
+    // taken by a Repair does not queue behind this step's waiting FOR UPDATE, so a chain of
+    // overlapping Repairs can keep one wait going past the lock bound. The statement timeout
+    // counts the whole statement, waits included. A 57014 takes the failed-step path below, as a
+    // 55P03 does.
+    if (!control(("SET LOCAL statement_timeout = " + std::to_string(lock_timeout_ms)).c_str()))
+        return {AgentStepOutcome::Abandoned, {}};
 
     const std::vector<std::string> ensure_params{row.agent_id};
     const std::vector<std::string> decide_params{row.agent_id, std::to_string(pair.boot_epoch),
@@ -2796,8 +2841,9 @@ agent_order_step(PGconn* conn,
         rows = run(AgentStepGap::RetryEnsureToDecide);
     }
     if (rows == 1) {
-        // RELEASE keeps a SET LOCAL, so give the pool's lock_timeout back first.
-        if (!control("SET LOCAL lock_timeout TO DEFAULT"))
+        // RELEASE keeps a SET LOCAL, so give the pool's timeouts back first.
+        if (!control("SET LOCAL lock_timeout TO DEFAULT") ||
+            !control("SET LOCAL statement_timeout TO DEFAULT"))
             return {AgentStepOutcome::Abandoned, {}};
         return control("RELEASE SAVEPOINT agent_step")
                    ? AgentStepResult{AgentStepOutcome::Decided, decision, true}
@@ -2927,6 +2973,43 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                 // still acks the event, so a redelivery happens only if the agent re-sends it; a
                 // stranded row is covered by the pending-evidence sweep follow-up (#7147).
                 if (matched->pending && bearing) {
+                    // The cap on concurrent Repairs, checked at the first point the code knows
+                    // this is one: the lease is held here only for the BEGIN, the failed INSERT,
+                    // the ROLLBACK TO and the compare SELECT (milliseconds), never across a Repair
+                    // statement or a lock wait. A miss does NOT wait: nothing was written, so the
+                    // return below lets `txn` roll the transaction back and the lease go back to
+                    // the pool at once. The event stays pending and untouched (evidence kept, no
+                    // census write, no order write).
+                    //
+                    // What the ingest answers on a miss is the same as for a Failed Repair:
+                    // `Redelivered`. There is no backpressure to give: the direct Subscribe loop and
+                    // ForwardGuardianMessage both discard the outcome (the RPC is acknowledged
+                    // unconditionally, `ingest_guardian_response` returns void), so an `Error`
+                    // would reach no agent either, and it would count on
+                    // `events_ingest_errors_total`, whose alert reads a sustained rate as a broken
+                    // ingest. A shed Repair is therefore the stranded class of #7147 (the agent
+                    // stops resending; a later journal replay, or a later applied verdict for the
+                    // pair, is what clears it). It counts as a failed Repair on the existing
+                    // series, and logs a sampled WARN.
+                    RepairAdmission admission(repairs_in_flight_,
+                                              repair_max_concurrent_.load(std::memory_order_relaxed));
+                    if (!admission.admitted()) {
+                        census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
+                        count_projection(metrics_, ProjectionSource::Repair, CensusOutcome::Failed);
+                        // The sampler counts the shed (`repairs_shed_`) and decides the log.
+                        if (const auto d = sample_degrade_log(repairs_shed_, repair_shed_last_ts_);
+                            d.should_log)
+                            spdlog::warn(
+                                "GuaranteedStateStore: repair shed, {} repairs are already in "
+                                "flight (the cap); the event stays pending and is not repaired "
+                                "until it is redelivered (occurrence {}) event_id={} agent_id={} "
+                                "rule_id={}",
+                                repair_max_concurrent_.load(std::memory_order_relaxed),
+                                d.occurrence, log_id_token(row.event_id),
+                                log_id_token(row.agent_id), log_id_token(row.rule_id));
+                        events_redelivered_.fetch_add(1, std::memory_order_relaxed);
+                        return {EventInsertOutcome::Redelivered, {}};
+                    }
                     std::optional<CensusDecision> decision;
                     const CensusOutcome repaired = project_rule_status(
                         conn, census_proj_failures_, census_lock_barrier_, row,

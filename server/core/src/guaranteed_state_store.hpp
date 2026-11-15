@@ -353,6 +353,30 @@ public:
         repair_statement_timeout_ms_.store(ms, std::memory_order_relaxed);
     }
 
+    /// How many Repairs of pending events may run at once in this process (the cap on a lease
+    /// held across a Repair's statements). A Repair holds a pooled connection for the sum of its
+    /// statements (up to the order step's lock bound, the clock read and five census statements
+    /// under the 2 s statement bound), and the pool (16 connections) is shared with auth and audit,
+    /// so an unbounded storm of Repairs, which a gateway reconnect replays at up to 50 in flight per
+    /// node, would starve them: the measured cost of 50 Repairs parked behind one row lock was 16
+    /// failed acquires in 18 at the audit store's 500 ms bound, and 0 in 8. At the cap, a Repair
+    /// that finds it full is SHED: the event stays pending and untouched, the transaction is rolled
+    /// back and the lease returned at once (see `insert_event_classified`). Repairs only: a first
+    /// delivery or a batch row is never refused by it.
+    static constexpr int kRepairMaxConcurrent = 4;
+
+    /// Test seam: the Repair cap (default `kRepairMaxConcurrent`). A test lowers or raises it to
+    /// reach the shed path with few threads. Production never sets it. Atomic, so a setter never
+    /// races an ingest on another thread.
+    void set_repair_max_concurrent_for_test(int n) noexcept {
+        repair_max_concurrent_.store(n, std::memory_order_relaxed);
+    }
+
+    /// Repairs in flight now (holding an admission), and how many were shed at the cap since
+    /// start. Lock-free reads, for tests.
+    int repairs_in_flight() const noexcept { return repairs_in_flight_.load(); }
+    uint64_t repairs_shed_total() const noexcept { return repairs_shed_.load(); }
+
     /// The census statements whose PLANS a test pins (P-1), exactly as the store sends them: the
     /// upsert (`$1`..`$12`) and the fold (`$1`..`$4`). A read of two string constants, no state.
     struct CensusSqlForTest {
@@ -752,6 +776,10 @@ private:
     std::atomic<bool> agent_step_enabled_{true};    // test seam, true in production
     std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
     std::atomic<int> repair_statement_timeout_ms_{kRepairStatementTimeoutMs};   // test seam, 2000
+    std::atomic<int> repair_max_concurrent_{kRepairMaxConcurrent};              // test seam, 4
+    std::atomic<int> repairs_in_flight_{0};     // Repairs holding an admission (the cap's count)
+    std::atomic<uint64_t> repairs_shed_{0};     // Repairs refused at the cap (also the log sampler's count)
+    std::atomic<int64_t> repair_shed_last_ts_{0}; // the log sampler's last-shed time
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
