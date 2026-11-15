@@ -47,7 +47,9 @@
 #       Linux: /usr/local/sbin.  macOS: /Library/PrivilegedHelperTools.
 #       Each is written from a quoted heredoc below, to a temporary file in the same
 #       directory and renamed into place, and each goes in BEFORE the sudoers file that
-#       names it. See the helper's own header for the argument shapes it accepts.
+#       names it. The sudoers file is written only when BOTH helpers were installed in
+#       that run; otherwise the installer removes it and exits 1. See the helper's own
+#       header for the argument shapes it accepts.
 # 7.  (Optional) On both platforms, prints a verifying summary that the
 #       operator can spot-check.
 #
@@ -70,7 +72,10 @@
 # present. Running this script twice is safe and changes nothing on the
 # second pass. The sudoers file is overwritten each run (so you can
 # update the privilege list and re-run), but only after passing
-# `visudo -cf`.
+# `visudo -cf`, and only when both helpers were installed in that run. When a helper
+# cannot be installed (its directory is not owned by root, or other users can write to
+# it) the installer removes the sudoers file and exits 1, so no grant names a helper
+# that is not there. Correct the directory and re-run to get the file back.
 #
 # UPGRADES
 # ────────
@@ -123,9 +128,11 @@
 # EXIT CODES
 # ──────────
 #   0  - install/check/uninstall succeeded
-#   1  - install/check/uninstall failed; details on stderr
+#   1  - install/check/uninstall failed; details on stderr (an install that could not
+#        install a helper also exits 1, after removing the sudoers file)
 #   2  - argument or precondition error (not run as root, unsupported OS)
-#   3  - sudoers file failed visudo validation; install was rolled back
+#   3  - sudoers file failed visudo validation; it was not installed and an earlier
+#        one, if any, is left in place
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -136,6 +143,7 @@ set -uo pipefail
 # ── argument defaults ────────────────────────────────────────────────────────
 
 ACTION="install"           # install | check | uninstall
+SUDOERS_FILE="/etc/sudoers.d/yuzu-agent"   # fixed: never read from the environment
 DRY_RUN=0
 ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
@@ -597,7 +605,7 @@ install_sudoers() {
         return 0
     fi
 
-    local target="/etc/sudoers.d/yuzu-agent"
+    local target="$SUDOERS_FILE"
     local tmp
     tmp=$(mktemp -t yuzu-sudoers.XXXXXX)
     # Cleanup on any exit path: the temp file should never linger.
@@ -630,7 +638,7 @@ install_sudoers() {
 }
 
 remove_sudoers() {
-    local target="/etc/sudoers.d/yuzu-agent"
+    local target="$SUDOERS_FILE"
     if [[ -f "$target" ]]; then
         log "removing $target"
         run rm -f "$target"
@@ -670,7 +678,8 @@ remove_sudoers() {
 # The services helper's contract is in its own header (the C++ twin is the builders in
 # agents/plugins/services/src/services_parsers.hpp). Each is installed root:<root group> 0755,
 # written to a temporary file in the same directory and renamed into place, and always BEFORE the
-# sudoers file that names it.
+# sudoers file that names it. The sudoers file is written only when both are installed; a failed
+# helper removes it instead.
 
 generate_fw_helper_content() {
     cat <<'YUZU_FW_HELPER'
@@ -1622,7 +1631,8 @@ install_helper() {
 }
 
 # install_helpers: both helpers, before the sudoers file that names them. A failure of one does not
-# stop the other; the return is non-zero when either failed.
+# stop the other; the return is non-zero when either failed, and the install then removes the
+# sudoers file instead of writing it (the dispatch below).
 install_helpers() {
     local rc=0
     install_helper "$FW_HELPER_PATH" generate_fw_helper_content || rc=1
@@ -1744,16 +1754,16 @@ check_install() {
     # condition this user can't resolve here. Detect explicitly and
     # report a SKIP-with-instructions instead of a misleading FAIL.
     if [[ "$SKIP_SUDOERS" -eq 0 ]]; then
-        if [[ ! -f /etc/sudoers.d/yuzu-agent ]]; then
-            warn "/etc/sudoers.d/yuzu-agent is missing"; ((errs++))
-        elif [[ ! -r /etc/sudoers.d/yuzu-agent ]]; then
-            log "/etc/sudoers.d/yuzu-agent present but not readable by $(id -un)"
+        if [[ ! -f "$SUDOERS_FILE" ]]; then
+            warn "$SUDOERS_FILE is missing"; ((errs++))
+        elif [[ ! -r "$SUDOERS_FILE" ]]; then
+            log "$SUDOERS_FILE present but not readable by $(id -un)"
             log "  (mode 0440 root:wheel/root is correct; rerun --check as root to validate)"
         else
-            if ! visudo -cf /etc/sudoers.d/yuzu-agent >/dev/null 2>&1; then
-                warn "/etc/sudoers.d/yuzu-agent fails visudo validation"; ((errs++))
+            if ! visudo -cf "$SUDOERS_FILE" >/dev/null 2>&1; then
+                warn "$SUDOERS_FILE fails visudo validation"; ((errs++))
             else
-                log "/etc/sudoers.d/yuzu-agent present and visudo-valid"
+                log "$SUDOERS_FILE present and visudo-valid"
             fi
         fi
     fi
@@ -1805,15 +1815,29 @@ case "$ACTION" in
             fi
         fi
         create_state_dirs
-        # The helpers go in BEFORE the sudoers file that names them. A failed helper does not hold
-        # the sudoers file back (replacing it is what drops the earlier lines); it fails the run at
-        # the end instead.
+        # The helpers go in BEFORE the sudoers file that names them, and the file is written only
+        # when both are in: a grant that names a path with nothing root-owned behind it is worse
+        # than no grant. When a helper fails (install_helpers has said why) the file is removed,
+        # earlier lines included, and the run fails at the end. Both helpers share one directory
+        # per platform, so a refused directory fails both.
         helper_rc=0
-        install_helpers || helper_rc=1
-        install_sudoers
+        sudoers_rc=0
+        if install_helpers; then
+            install_sudoers || sudoers_rc=$?
+        else
+            helper_rc=1
+            remove_sudoers
+        fi
         apply_setcap
         if [[ "$helper_rc" -ne 0 ]]; then
-            fail "a root-owned helper was not installed; firewall containment and services.set_start_mode will fail on this host until it is"
+            if [[ -e "$SUDOERS_FILE" ]]; then
+                fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
+            fi
+            fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by other users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"
+        fi
+        if [[ "$sudoers_rc" -ne 0 ]]; then
+            warn "$SUDOERS_FILE was not installed (status $sudoers_rc); an earlier file, if any, is unchanged"
+            exit "$sudoers_rc"
         fi
         log "install complete. Verify with: $0 --check"
         ;;

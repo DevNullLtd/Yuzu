@@ -212,6 +212,8 @@ yuzu ALL=(root) NOPASSWD: /absolute/path/to/binary [fixed-arguments]
 
 The install script always validates the generated file with `visudo -cf <tempfile>` before atomic move into place. A syntactically invalid sudoers file would brick every sudo call on the host, so this validation is non-optional.
 
+The sudoers file is written only when both helpers were installed in that run. When a helper cannot be installed (its directory must be owned by root and not writable by other users) the installer removes `/etc/sudoers.d/yuzu-agent`, says so and exits non-zero, so no entry names a helper that is not there.
+
 ---
 
 ## How LSA privileges are granted (Windows)
@@ -289,6 +291,7 @@ The agent shelled out to `sudo /sbin/pfctl` (or similar) and sudo asked for a pa
 - The agent is running as a different account than the one in sudoers → check `ps -o user= -p $(pgrep yuzu-agent)`.
 - The host was provisioned before the firewall helper existed, or the installer has not been re-run with this agent upgrade: the sudoers file does not name `/usr/local/sbin/yuzu-fw-helper`, so sudo asks for a password. `quarantine` then fails with `nft_load_failed` on an nft host and `iptables_list_failed` on an iptables-only host, and the detail carries sudo's own message (for example `sudo: a password is required`). Re-run `install-agent-user.sh`, which installs the helper before the sudoers file; `install-agent-user.sh --check` reports a missing or stale helper.
 - The host was provisioned before the services helper existed, or the installer has not been re-run with this agent upgrade: the sudoers file does not name `yuzu-svc-helper` (`/usr/local/sbin` on Linux, `/Library/PrivilegedHelperTools` on macOS), so sudo asks for a password and `services.set_start_mode` fails with `error|systemctl command failed for '<name>' (exit=1): sudo: a password is required` (`launchctl` on macOS). On macOS the same applies to the firewall helper `/Library/PrivilegedHelperTools/yuzu-fw-helper`: `quarantine` and `quarantine_allow` fail there with `pf_load_failed` and sudo's own message in the detail. Re-run `install-agent-user.sh` on every Linux and macOS host provisioned with it; it installs both helpers before the sudoers file, and `--check` reports a missing or stale helper.
+- The installer exited non-zero because a helper could not be installed: the helper's directory (`/usr/local/sbin` on Linux, `/Library/PrivilegedHelperTools` on macOS) must be owned by root and not writable by other users, and the installer removed `/etc/sudoers.d/yuzu-agent`, so a non-root agent has no sudo grants. Correct the directory and re-run `install-agent-user.sh`; `--check` reports the missing helper or the directory.
 
 ### `pfctl: Operation not permitted` (macOS) or `iptables: Permission denied` (Linux)
 

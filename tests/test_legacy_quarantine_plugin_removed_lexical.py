@@ -377,7 +377,7 @@ class IptablesHelperGrant(unittest.TestCase):
     def test_the_helpers_are_installed_before_the_sudoers_file_and_removed_and_checked(self):
         text = read_text(INSTALLER)
         dispatch = text[text.index('case "$ACTION" in'):]
-        self.assertLess(dispatch.index("install_helpers ||"), dispatch.index("install_sudoers"))
+        self.assertLess(dispatch.index("if install_helpers; then"), dispatch.index("install_sudoers"))
         self.assertIn("remove_helpers", dispatch)
         check = text[text.index("check_install() {"):text.index("# ── action dispatch")]
         self.assertIn("check_helpers ||", check)
@@ -1623,6 +1623,125 @@ class InstallerDryRun(unittest.TestCase):
             self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, fw), out, platform)
             self.assertIn("[dry-run]   %s ALL=(root) NOPASSWD: %s\n" % (acct, svc), out, platform)
             self.assertNotRegex(out, r"NOPASSWD: /usr/sbin/ip6?tables", platform)
+
+
+@unittest.skipIf(sys.platform == "win32", "runs the installer under bash")
+class InstallerFailedHelper(unittest.TestCase):
+    """The installer's real install dispatch, run from a copy with the account, state-directory and
+    setcap steps stubbed and every path pointed into a temporary directory: the sudoers file is
+    written only when both helpers were installed in the run. When one was not, the file is removed
+    (an earlier file's lines included), `install_sudoers` is never reached and the run exits 1; a
+    sudoers file that fails to install ends the run with its own status and no "install complete"."""
+
+    BASH = "/bin/bash" if os.path.exists("/bin/bash") else "bash"   # macOS: 3.2, the oldest the installer meets
+    ANCHOR = 'case "$ACTION" in\n    install)\n'
+    MARK = "# yuzu-test-splice"
+    EARLIER = "yuzu ALL=(root) NOPASSWD: /usr/sbin/iptables *\n"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = read_text(INSTALLER)
+        assert cls.text is not None and cls.text.count(cls.ANCHOR) == 1, "the install dispatch moved"
+
+    def run_install(self, d, helper_dir_mode=None, sudoers_rc=0, stubs=""):
+        """Runs the install dispatch. helper_dir_mode None: a directory the verdict accepts (its
+        owner and mode are stubbed), else the directory is created with that mode and judged as it
+        is. Returns (returncode, stdout, stderr, install_sudoers_was_reached, helper_dir)."""
+        helper_dir = os.path.join(d, "helpers")
+        os.mkdir(helper_dir)
+        if helper_dir_mode is not None:
+            os.chmod(helper_dir, helper_dir_mode)
+        calls = os.path.join(d, "calls")
+        sudoers = os.path.join(d, "yuzu-agent")
+        stub = "\n".join([
+            self.MARK,
+            "require_root() { :; }",
+            "macos_create_user() { :; }",
+            "linux_user_exists() { return 0; }",
+            "create_state_dirs() { :; }",
+            "apply_setcap() { :; }",
+            "chown() { :; }",
+            "SUDOERS_FILE='%s'" % sudoers,
+            "FW_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-fw-helper"),
+            "SVC_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-svc-helper"),
+            "install_sudoers() { echo install_sudoers >> '%s'; return %d; }" % (calls, sudoers_rc),
+            "" if helper_dir_mode is not None else "dir_info() { echo '0 755 root'; }",
+            stubs,
+            "",
+        ])
+        spliced = self.text.replace(self.ANCHOR, stub + self.ANCHOR, 1)
+        # An unspliced copy is the real installer, and CI may run as root: never run one.
+        self.assertEqual(spliced.count(self.MARK), 1)
+        script = os.path.join(d, "install.sh")
+        with open(script, "w") as f:
+            f.write(spliced)
+        r = subprocess.run([self.BASH, script], capture_output=True, text=True, timeout=120)
+        reached = os.path.exists(calls)
+        return r.returncode, r.stdout, r.stderr, reached, helper_dir
+
+    def seed_sudoers(self, d):
+        path = os.path.join(d, "yuzu-agent")
+        with open(path, "w") as f:
+            f.write(self.EARLIER)
+        return path
+
+    def test_a_refused_helper_directory_removes_the_sudoers_file_and_fails_the_run(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_") as d:
+            sudoers = self.seed_sudoers(d)
+            rc, out, err, reached, helper_dir = self.run_install(d, helper_dir_mode=0o777)
+            self.assertEqual(rc, 1, (out, err))
+            self.assertFalse(os.path.exists(sudoers), "the earlier file's lines must not stay")
+            self.assertFalse(reached, "install_sudoers must not be reached")
+            self.assertEqual(os.listdir(helper_dir), [], "no helper, and no temporary file")
+            self.assertIn("was removed", err)
+            self.assertNotIn("install complete", out)
+
+    def test_one_failed_helper_removes_the_sudoers_file_and_the_other_stays(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_") as d:
+            sudoers = self.seed_sudoers(d)
+            rc, out, err, reached, helper_dir = self.run_install(
+                d, stubs="generate_svc_helper_content() { return 1; }")
+            self.assertEqual(rc, 1, (out, err))
+            self.assertFalse(os.path.exists(sudoers))
+            self.assertFalse(reached)
+            self.assertEqual(os.listdir(helper_dir), ["yuzu-fw-helper"])
+            self.assertIn("was removed", err)
+            self.assertNotIn("install complete", out)
+
+    def test_a_file_that_cannot_be_removed_is_reported_as_such(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_") as d:
+            os.mkdir(os.path.join(d, "yuzu-agent"))   # not a file: remove_sudoers leaves it
+            rc, out, err, reached, _ = self.run_install(d, helper_dir_mode=0o777)
+            self.assertEqual(rc, 1, (out, err))
+            self.assertFalse(reached)
+            self.assertIn("could not be removed", err)
+            self.assertNotIn("was removed", err)
+
+    def test_both_helpers_installed_reaches_install_sudoers_and_completes(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_") as d:
+            sudoers = self.seed_sudoers(d)
+            rc, out, err, reached, helper_dir = self.run_install(d)
+            self.assertEqual(rc, 0, (out, err))
+            self.assertTrue(reached)
+            self.assertTrue(os.path.exists(sudoers), "only a failed helper removes the file")
+            self.assertEqual(sorted(os.listdir(helper_dir)), ["yuzu-fw-helper", "yuzu-svc-helper"])
+            self.assertIn("install complete", out)
+
+    def test_a_sudoers_file_that_fails_to_install_ends_the_run_with_its_status(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_") as d:
+            sudoers = self.seed_sudoers(d)
+            rc, out, err, reached, _ = self.run_install(d, sudoers_rc=3)
+            self.assertEqual(rc, 3, (out, err))
+            self.assertTrue(reached)
+            self.assertTrue(os.path.exists(sudoers), "an earlier file is left in place")
+            self.assertIn("was not installed (status 3)", err)
+            self.assertNotIn("install complete", out)
+
+    def test_the_file_path_is_one_plain_assignment_never_read_from_the_environment(self):
+        lines = [l for l in self.text.splitlines() if l.startswith("SUDOERS_FILE=")]
+        self.assertEqual(len(lines), 1)
+        self.assertRegex(lines[0], r'^SUDOERS_FILE="/etc/sudoers\.d/yuzu-agent"(?:\s+#.*)?$')
+        self.assertNotIn("${SUDOERS_FILE", self.text)
 
 
 class PatternSelfTest(unittest.TestCase):
