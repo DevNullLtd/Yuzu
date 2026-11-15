@@ -3,7 +3,8 @@
 /// @file hardware_ci_page_model.hpp
 /// The ONE pure model behind the bulk device-CI read: `GET /api/v1/hardware/ci` and its MCP twin.
 /// One keyset page of the stored `device_ci` rows (scalar fields only, no sections), ordered by
-/// `agent_id`, with the caller's scope pushed into SQL. Parameter parsing, the cursor codec, the
+/// the BYTE value of `agent_id` (the store reads `agent_id COLLATE "C"`, so the walk does not depend
+/// on the database collation), with the caller's scope pushed into SQL. Parameter parsing, the cursor codec, the
 /// scope decision, the audit text and the JSON shapes live here so REST and MCP cannot drift.
 /// No httplib, no MCP, no libpq, no store type: the store is reached through a `Reader` closure.
 ///
@@ -14,7 +15,10 @@
 ///
 /// Scope: the caller's `authz::VisibleSet` is the SOLE filter. TOP (nullopt) reads everything, in
 /// any number of pages; an engaged-empty set reads nothing and runs no SQL; a set of at most
-/// `kMaxPushdownScopeIds` ids is applied in SQL as `agent_ids`, so every page is exact. A larger
+/// `kMaxPushdownScopeIds` ids is applied in SQL as `agent_ids`, so no page is filtered after the
+/// read. A walk is still NOT a snapshot: a device registered, removed or newly in scope while it
+/// runs can be missed or can vanish, so a client confirms a device with `agent_id` before retiring
+/// it. A larger
 /// set is NOT applied in SQL and no page of rows is ever filtered after the read: without an
 /// `agent_id` the read is refused (`ReadError::kScopeTooWide`, no SQL), because a post-filter over
 /// a wider set would make a short page, or a cursor that skips past hidden rows, tell the caller
@@ -33,6 +37,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <functional>
@@ -51,6 +56,12 @@ inline constexpr std::size_t kCursorMaxBytes = 2048;
 /// The most scope ids pushed into SQL as one `agent_ids` array. Above it a read without an
 /// `agent_id` is refused (see the file comment).
 inline constexpr std::size_t kMaxPushdownScopeIds = 10000;
+/// `read_error_message`, the MCP tool description and the user manual all spell this number.
+static_assert(kMaxPushdownScopeIds == 10000,
+               "update read_error_message, the MCP description and the docs");
+/// The MCP default page size, smaller than the REST default: each page lands in an agentic
+/// worker's context. The input schema's `default` and `request_from_args` both read this.
+inline constexpr std::int64_t kMcpDefaultLimit = 20;
 
 using Params = std::multimap<std::string, std::string>;
 
@@ -65,13 +76,16 @@ struct Request {
 /// decimal integer (an optional leading `-` and digits) is refused; any such integer outside
 /// [1, kPageMax], including one too large for 64 bits, is clamped. A cursor over
 /// kCursorMaxBytes, and an `agent_id` that is over `auth::kMaxAgentIdLength` bytes or carries a
-/// byte below 0x20, are refused. Text must be strict UTF-8 without NUL. An empty `agent_id` or
-/// `cursor` means "not given". The error is the 400 message.
+/// byte below 0x20, are refused. Text must be strict UTF-8 without NUL (a cursor that is not
+/// valid text gets the same message as every other refused cursor). An empty `cursor` means the
+/// first page; an `agent_id` that is present but empty is refused (it would otherwise read the
+/// whole fleet where the caller meant one device), the same refusal MCP makes. The error is the 400 message.
 [[nodiscard]] std::expected<Request, std::string> parse_params(const Params& p);
 
-/// Which refusal an MCP argument error is, where the caller's remedy differs. `kCursorTooLong` is
-/// the over-long cursor: the same remedy as a cursor that fails to decode (omit it).
-enum class ArgFault { kOther, kCursorTooLong };
+/// Which refusal an MCP argument error is, where the caller's remedy differs. `kCursorRefused` is
+/// a cursor refused before it is decoded (over-long, or not valid text): the same remedy as a
+/// cursor that fails to decode (omit it).
+enum class ArgFault { kOther, kCursorRefused };
 
 /// The kInvalidParams message of a refused MCP request, and what kind of refusal it was.
 struct ArgError {
@@ -80,16 +94,17 @@ struct ArgError {
 };
 
 /// Remediation and audit detail for EVERY refused cursor on the MCP channel: an over-long one
-/// (`ArgFault::kCursorTooLong`) and one that fails to decode (`ReadError::kCursorMalformed` or
+/// (`ArgFault::kCursorRefused`) and one that fails to decode (`ReadError::kCursorMalformed` or
 /// `kCursorFilterMismatch`). One spelling each, so the two refusals read the same to a caller and
 /// in the audit trail. The detail carries no part of the cursor.
 inline constexpr std::string_view kCursorRefusedRemediation = "omit cursor to restart from the first page";
 inline constexpr std::string_view kCursorRefusedAuditDetail = "invalid arguments: cursor";
 
-/// MCP's STRICT argument read (REST clamps, MCP refuses): a wrong JSON type, a `limit` outside
-/// [1, kPageMax], an empty or unsafe `agent_id`, an over-long cursor or text that cannot be bound
-/// is refused. Unknown names are ignored. The error carries the kInvalidParams message and, for
-/// an over-long cursor, `ArgFault::kCursorTooLong`.
+/// MCP's STRICT argument read (REST clamps, MCP refuses): `args` that is neither null nor an
+/// object, a wrong JSON type, a `limit` outside [1, kPageMax], an empty or unsafe `agent_id`, an
+/// over-long cursor or text that cannot be bound is refused. An absent `limit` is
+/// `kMcpDefaultLimit`. Unknown names are ignored. The error carries the kInvalidParams message and, for
+/// a cursor refused before decoding, `ArgFault::kCursorRefused`.
 [[nodiscard]] std::expected<Request, ArgError> request_from_args(const nlohmann::json& args);
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
@@ -150,7 +165,37 @@ inline constexpr std::string_view kScopeTooWideRemediation =
     "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
     "caller's scope";
 
-/// One page: decode the cursor, apply the scope as described in the file comment, read.
+/// Which transport is answering: it picks the wording of the audit detail and the audit rows the
+/// transport writes (`REST` / `MCP` in the text), nothing else.
+enum class Surface { kRest, kMcp };
+
+/// Everything a transport needs to answer a failed `read_page`, decided in ONE place so REST and
+/// MCP cannot drift (a new `ReadError` enumerator is a `-Wswitch` warning in
+/// `describe_read_error` and fails the every-enumerator test, instead of silently becoming a
+/// cursor refusal in one transport).
+///  - `unavailable`: a store read failed (REST 503 with `retry_after_ms`, MCP store-unreadable
+///    answer). Otherwise the request is refused (REST 400, MCP -32602) and never retried.
+///  - `remediation`: the A4 hint, empty = none. REST sends none for a refused cursor; MCP sends
+///    `kCursorRefusedRemediation`.
+///  - `domain_audit_row`: the transport writes an `inventory.devices.ci` row (`audit_outcome`,
+///    `audit_detail`). A refused cursor writes none. MCP also writes its generic row
+///    (`audit_outcome`, `audit_detail`) whenever `audit_detail` is non-empty; REST writes only
+///    the domain row, and none when `audit_detail` is empty.
+struct ReadFailure {
+    bool unavailable{false};
+    std::string_view message;
+    std::string_view remediation;
+    std::int64_t retry_after_ms{-1}; ///< REST 503 hint; -1 = none
+    bool domain_audit_row{false};
+    std::string_view audit_outcome;
+    std::string audit_detail;
+};
+
+/// The answer to a failed read. One `switch` over `ReadError` with no `default`.
+[[nodiscard]] ReadFailure describe_read_error(ReadError e, Surface surface);
+
+/// One page: decode the cursor, apply the scope as described in the file comment, read. A
+/// `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never produce one).
 [[nodiscard]] std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope);
 
@@ -172,8 +217,8 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope)
 /// The status for a CONFINED caller (the gate's VisibleSet was a present set), applied to a
 /// `page_json` body by REST and MCP alike: `scope_basis` "authority_scoped" is added, whether or
 /// not any device lies outside the scope. No count of hidden devices exists anywhere in the body
-/// (the read is exact), so there is nothing to remove. An unconfined caller's body is left as it
-/// is.
+/// (no row is filtered after the read), so there is nothing to remove. An unconfined caller's body
+/// is left as it is.
 void apply_scope_disclosure(nlohmann::json& body, bool confined);
 
 // ── Audit text ───────────────────────────────────────────────────────────────

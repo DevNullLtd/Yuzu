@@ -55,9 +55,9 @@ namespace {
 // legal row exists yet. #6700 decides the row shape.
 //  - three /crypto tools (`export_crypto_cbom`, `list_crypto_widgets`,
 //    `set_crypto_dashboard_layout`): the recorded owner ruling on #6558 PR 2, tracked by #6700.
-//  - `list_hardware_ci_records` (REST twin GET /api/v1/hardware/ci): added by commit e362c2e4f4
-//    for the same reason. The owner's approval is stated in that commit message and is still to be
-//    recorded on #6700.
+//  - `list_hardware_ci_records` (REST twin GET /api/v1/hardware/ci): the name was added with the
+//    bulk device-CI read, for the same reason. The owner's approval of that exception is still to
+//    be recorded on #6700.
 // The change that lands #6700's row shape deletes all four names and lowers the cap back to 0.
 const std::set<std::string> kLedgerBackfill{"export_crypto_cbom", "list_crypto_widgets",
                                             "set_crypto_dashboard_layout",

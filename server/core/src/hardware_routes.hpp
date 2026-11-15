@@ -331,7 +331,7 @@ public:
         CiDetailFn ci_detail_fn;
         /// GET /api/v1/hardware/ci: the keyset read of the stored CI rows (production binds
         /// `DeviceInventoryStore::list_device_ci_after`). Reads the CI table directly, never
-        /// the roster. Empty == the route answers 503.
+        /// the roster, in byte order of agent_id. Empty == the route answers 503.
         hardware_ci_page::Reader ci_page_reader;
         ActionsFn actions_fn;
         ClassifyFn classify_fn;

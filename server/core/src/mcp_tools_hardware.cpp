@@ -199,9 +199,10 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // clamp.
     const auto rq = hardware_ci_page::request_from_args(ctx.args);
     if (!rq) {
-        // An over-long cursor reads exactly like one that fails to decode below: the same
-        // remediation and the same audit detail, so a caller and the audit trail see one refusal.
-        const bool cursor_refused = rq.error().fault == hardware_ci_page::ArgFault::kCursorTooLong;
+        // An over-long or non-text cursor reads exactly like one that fails to decode below: the
+        // same remediation and the same audit detail, so a caller and the audit trail see one
+        // refusal.
+        const bool cursor_refused = rq.error().fault == hardware_ci_page::ArgFault::kCursorRefused;
         const bool audit_ok = ctx.audit("denied", cursor_refused
                                                       ? std::string(hardware_ci_page::kCursorRefusedAuditDetail)
                                                       : "invalid arguments: " + rq.error().message);
@@ -214,47 +215,36 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     }
     const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope);
     if (!read) {
-        using hardware_ci_page::ReadError;
-        const ReadError why = read.error();
-        if (why == ReadError::kScopeTooWide) {
-            // TERMINAL: the caller's own scope is the cause and no store read ran. Audited as a
-            // refusal on the domain verb and the generic row, with no count in either.
-            const std::string denied_detail = hardware_ci_page::audit_detail_scope_too_wide("MCP");
-            const bool domain_ok = yuzu::server::detail::try_persist_audit(
-                deps->audit_fn, ctx.req, "inventory.devices.ci", "denied",
+        // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
+        const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
+        if (f.unavailable) {
+            // A failed store read is never an empty page (ADR-0016 section 7).
+            answer_store_unreadable(ctx, std::string(f.message).c_str(), "inventory.devices.ci",
+                                    hardware_ci_page::audit_target_type(*rq).c_str(),
+                                    hardware_ci_page::audit_target_id(*rq), f.audit_detail);
+            return;
+        }
+        // A refusal (scope too wide: TERMINAL, the caller's own scope is the cause and no store
+        // read ran; or a refused cursor). The domain verb's row is written only where the
+        // description says so (scope too wide), the generic row always; neither carries a count.
+        const bool domain_ok =
+            !f.domain_audit_row ||
+            yuzu::server::detail::try_persist_audit(
+                deps->audit_fn, ctx.req, "inventory.devices.ci", std::string(f.audit_outcome),
                 hardware_ci_page::audit_target_type(*rq), hardware_ci_page::audit_target_id(*rq),
-                denied_detail);
-            const bool generic_ok = ctx.audit("denied", denied_detail);
-            // retry-hint-exempt: caller-input rejection
-            answer(ctx, ctx.a4_error(kInvalidParams,
-                                     std::string(hardware_ci_page::read_error_message(why)),
-                                     std::string(hardware_ci_page::kScopeTooWideRemediation), -1, {},
-                                     domain_ok && generic_ok));
-            return;
-        }
-        if (why != ReadError::kDegraded) { // a refused cursor
-            const bool audit_ok =
-                ctx.audit("denied", std::string(hardware_ci_page::kCursorRefusedAuditDetail));
-            // retry-hint-exempt: caller-input rejection
-            answer(ctx, ctx.a4_error(kInvalidParams,
-                                     std::string(hardware_ci_page::read_error_message(why)),
-                                     std::string(hardware_ci_page::kCursorRefusedRemediation), -1, {},
-                                     audit_ok));
-            return;
-        }
-        // A failed store read is never an empty page (ADR-0016 section 7).
-        answer_store_unreadable(ctx, "hardware CI records unavailable", "inventory.devices.ci",
-                                hardware_ci_page::audit_target_type(*rq).c_str(),
-                                hardware_ci_page::audit_target_id(*rq),
-                                "hardware CI records (MCP) state=store unreadable");
+                f.audit_detail);
+        const bool generic_ok = ctx.audit(std::string(f.audit_outcome), f.audit_detail);
+        // retry-hint-exempt: caller-input rejection (the store-unreadable arm above carries its hint)
+        answer(ctx, ctx.a4_error(kInvalidParams, std::string(f.message), std::string(f.remediation), -1,
+                                 {}, domain_ok && generic_ok));
         return;
     }
     const hardware_ci_page::Page& page = *read;
 
     // Both rows are attempted (no short-circuit) so a drop of one never hides the other. A
     // confined caller never receives an out-of-scope row, id or count: the scope is applied in SQL,
-    // so the page is exact and neither the body, the cursor nor the audit detail has anything to
-    // carry. Confinement is reported as a STATUS instead (the same rule REST applies,
+    // so no row is filtered after the read and neither the body, the cursor nor the audit detail
+    // has anything to carry. Confinement is reported as a STATUS instead (the same rule REST applies,
     // hardware_ci_page::apply_scope_disclosure). A named device outside the scope gets the same
     // empty page as a device with no record; only the audit outcome differs: a `denied` row
     // (the domain row, plus the generic MCP row) instead of a `success` row.
@@ -414,24 +404,30 @@ constexpr ToolRecord kToolRecords[] = {
      "Pull the stored hardware CI records of many devices, one page at a time: one row per device "
      "with the full scalar CI block (manufacturer, model, serial, system UUID, BIOS, CPU, RAM, "
      "disks summary, MACs, OS, first_seen, last_seen, and the chassis_*, board_* and machine_id_* "
-     "values) plus the stored content_hash and blob_version. Built for a daily pull into an "
-     "external CMDB: call with no arguments, pass next_cursor back as cursor until next_cursor is "
-     "empty, and compare content_hash with your copy (equal means the stored record is "
-     "unchanged apart from first_seen and last_seen, which move without a hash change, so always "
-     "take last_seen from the row; unequal means re-read). The data is each device's last "
-     "daily-sync snapshot: normally refreshed daily while the agent reports, but a record can be "
-     "arbitrarily old until the device is decommissioned, and last_seen is the staleness signal. "
-     "Rows are "
-     "in agent_id order; limit is 1..1000 (default 100); agent_id restricts the read to one "
+     "values) plus the stored content_hash and blob_version. For agentic workers: every row is "
+     "personal data that lands in your context, so pass limit up to 20 (the default here is 20) "
+     "or an agent_id. A scheduled pull into an external CMDB belongs on the REST route GET "
+     "/api/v1/hardware/ci instead, which serves the same pages and cursor with limit up to 1000 "
+     "(default 100). To walk the records: call with no arguments, pass next_cursor back as cursor "
+     "until next_cursor is empty, and compare content_hash with your copy (equal means the stored "
+     "record is unchanged apart from first_seen and last_seen, which move without a hash change, "
+     "so always take last_seen from the row; unequal means re-read). A complete walk is not a "
+     "snapshot: a device registered, removed or newly in your scope during the walk can be missed "
+     "or can vanish, so confirm a device with agent_id before you retire it. The data is each "
+     "device's last daily-sync snapshot: normally refreshed daily while the agent reports, but a "
+     "record can be arbitrarily old until the device is decommissioned, and last_seen is the "
+     "staleness signal. "
+     "Rows are in byte order of agent_id (not locale order); limit is 1..1000 (default 20); "
+     "agent_id restricts the read to one "
      "device (take agent_id values from list_hardware_ci) and an empty devices array with an "
-     "agent_id means no record or outside your scope, which are indistinguishable by design. It "
+     "agent_id means no record or outside your scope, which are indistinguishable by design. An "
+     "empty devices array without agent_id means no stored CI records exist for the devices you "
+     "may read (none has synced one yet), not an error. It "
      "reads the stored CI table, not the device roster, so a device that has been offline for more "
      "than 30 days is still returned while its record exists (a record is removed when the "
      "device's stored data is removed), and it carries no online state, tags or DEX score: for "
      "those use list_hardware_ci, and for one device's section rows (CPU, DIMM, disk, volume, "
-     "partition) and installed software use get_hardware_ci. For agentic workers: each page of "
-     "the default 100 rows is a large block of personal data in your context, so prefer limit 20 "
-     "or less, or an agent_id; use the REST route GET /api/v1/hardware/ci for a bulk pull. "
+     "partition) and installed software use get_hardware_ci. "
      "Read-only. A cursor belongs to the agent_id it was issued with; a refused cursor (malformed, "
      "over 2048 bytes, or used with a different agent_id) is -32602: omit cursor to restart. "
      "Confined: results are narrowed to the devices the caller may read and carry scope_basis authority_scoped (a "
@@ -448,7 +444,7 @@ constexpr ToolRecord kToolRecords[] = {
      "loop), never an empty page. Serial, system UUID, MAC and the chassis and board serials are "
      "personal data: every served page is audited as inventory.devices.ci and, unlike most MCP "
      "reads, fails CLOSED (no data, retryable error) when that audit row cannot be persisted.",
-     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":100,"description":"Maximum devices in the page, 1..1000."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}}})j",
+     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":20,"description":"Maximum devices in the page, 1..1000. Default 20; prefer 20 or less for agentic use."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}}})j",
      kRecordsOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "List hardware CI records (bulk)", &handle_list_hardware_ci_records},
     {"get_hardware_ci",

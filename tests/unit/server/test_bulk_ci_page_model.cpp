@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
@@ -126,16 +127,66 @@ TEST_CASE("hardware ci page: REST parameters default, clamp and refuse", "[hardw
         CHECK_FALSE(hcp::parse_params(params({{"agent_id", "bad\xFF"}})).has_value());
         CHECK_FALSE(hcp::parse_params(params({{"agent_id", std::string("a\0b", 3)}})).has_value());
         CHECK_FALSE(hcp::parse_params(params({{"cursor", std::string(2049, 'c')}})).has_value());
-        // present-empty means "not given"
-        const auto r = hcp::parse_params(params({{"agent_id", ""}, {"cursor", ""}, {"limit", ""}}));
+        // An empty cursor is the first page and an empty limit is the default.
+        const auto r = hcp::parse_params(params({{"cursor", ""}, {"limit", ""}}));
         REQUIRE(r.has_value());
         CHECK(r->agent_id.empty());
+        CHECK(r->cursor.empty());
         CHECK(r->limit == 100);
+    }
+    // Kills: reading a present-but-empty agent_id as "every device" (the page of OTHER devices'
+    // records a client that interpolated a missing id would then attach to the wrong device), and
+    // REST and MCP refusing it in different words.
+    SECTION("a present-but-empty agent_id is refused, with the MCP wording") {
+        for (const hcp::Params& p : {params({{"agent_id", ""}}), params({{"agent_id", ""}, {"agent_id", "x"}}),
+                                     params({{"agent_id", ""}, {"limit", "5"}})}) {
+            const auto r = hcp::parse_params(p);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == "agent_id must be a non-empty string when given");
+        }
+        const auto mcp = hcp::request_from_args(json{{"agent_id", ""}});
+        REQUIRE_FALSE(mcp.has_value());
+        CHECK(mcp.error().message == "agent_id must be a non-empty string when given");
+        // a named id is still fine, and an absent key is the whole fleet
+        CHECK(hcp::parse_params(params({{"agent_id", "x"}}))->agent_id == "x");
+        CHECK(hcp::parse_params(params({{"limit", "5"}}))->agent_id.empty());
+    }
+    // Kills: judging the agent_id and the cursor in an order that gives a NUL or non-UTF-8 cursor
+    // a different message from every other refused cursor (it used to read "invalid parameter
+    // encoding"), so a caller and the audit trail saw two cursor refusals.
+    SECTION("a cursor that is not valid text reads as every other refused cursor") {
+        const std::string expected = "invalid cursor; restart from the first page";
+        for (const std::string& bad : {std::string("a\0b", 3), std::string("bad\xFF"), std::string("\xC0\x80"),
+                                       std::string(2049, 'c')}) {
+            INFO(bad.size());
+            const auto r = hcp::parse_params(params({{"cursor", bad}}));
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == expected);
+            // even beside an agent_id that is itself bad: the cursor is judged first
+            const auto both = hcp::parse_params(params({{"cursor", bad}, {"agent_id", "a\nb"}}));
+            REQUIRE_FALSE(both.has_value());
+            CHECK(both.error() == expected);
+        }
+        CHECK(hcp::parse_params(params({{"agent_id", "a\nb"}})).error() == "invalid agent_id");
+        CHECK(hcp::parse_params(params({{"agent_id", "bad\xFF"}})).error() == "invalid parameter encoding");
     }
 }
 
 TEST_CASE("hardware ci page: MCP arguments are refused, not clamped", "[hardware_ci_page][params]") {
-    CHECK(hcp::request_from_args(json::object())->limit == 100);
+    // The MCP default page is 20 (each page lands in an agent's context); REST's stays 100.
+    CHECK(hcp::request_from_args(json::object())->limit == 20);
+    CHECK(hcp::request_from_args(json(nullptr))->limit == 20);
+    CHECK(hcp::kMcpDefaultLimit == 20);
+    CHECK(hcp::Request{}.limit == 100);
+    CHECK(hcp::parse_params({})->limit == 100);
+    // Kills: reading arguments that are not an object as "no arguments", which is a default
+    // request for the whole fleet.
+    for (const json& not_object : {json::array(), json("x"), json(5), json(true), json(1.5)}) {
+        INFO(not_object.dump());
+        const auto r = hcp::request_from_args(not_object);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().message == "arguments must be a JSON object");
+    }
     CHECK(hcp::request_from_args(json{{"limit", 1}})->limit == 1);
     CHECK(hcp::request_from_args(json{{"limit", 1000}})->limit == 1000);
     CHECK_FALSE(hcp::request_from_args(json{{"limit", 0}}).has_value());
@@ -149,13 +200,23 @@ TEST_CASE("hardware ci page: MCP arguments are refused, not clamped", "[hardware
     CHECK_FALSE(hcp::request_from_args(json{{"limit", INT64_MIN}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", 5}}).has_value());
     CHECK_FALSE(hcp::request_from_args(json{{"agent_id", ""}}).has_value());
-    // The fault kind: only the over-long cursor is kCursorTooLong; every other refusal is kOther,
-    // including a wrongly typed cursor and the other two text checks.
+    // The fault kind: a cursor refused before decoding (over-long, or not valid text) is
+    // kCursorRefused, with the one cursor message; every other refusal is kOther, including a
+    // wrongly typed cursor and the other two text checks.
     {
         const auto too_long = hcp::request_from_args(json{{"cursor", std::string(hcp::kCursorMaxBytes + 1, 'x')}});
         REQUIRE_FALSE(too_long.has_value());
-        CHECK(too_long.error().fault == hcp::ArgFault::kCursorTooLong);
+        CHECK(too_long.error().fault == hcp::ArgFault::kCursorRefused);
         CHECK(too_long.error().message == "invalid cursor; restart from the first page");
+        // A NUL or non-UTF-8 cursor is the same refusal (message, fault), even beside a bad agent_id.
+        for (const std::string& bad : {std::string("a\0b", 3), std::string("bad\xFF")}) {
+            for (const json& args : {json{{"cursor", bad}}, json{{"cursor", bad}, {"agent_id", "a\nb"}}}) {
+                const auto r = hcp::request_from_args(args);
+                REQUIRE_FALSE(r.has_value());
+                CHECK(r.error().fault == hcp::ArgFault::kCursorRefused);
+                CHECK(r.error().message == "invalid cursor; restart from the first page");
+            }
+        }
         CHECK(hcp::request_from_args(json{{"cursor", std::string(hcp::kCursorMaxBytes, 'x')}}).has_value());
         for (const json& other : {json{{"cursor", 7}}, json{{"agent_id", ""}}, json{{"agent_id", "a\nb"}},
                                   json{{"limit", 0}}}) {
@@ -670,6 +731,184 @@ TEST_CASE("hardware ci page: a refused cursor surfaces its reason", "[hardware_c
     REQUIRE_FALSE(mismatch.has_value());
     CHECK(mismatch.error() == hcp::ReadError::kCursorFilterMismatch);
     CHECK(store.reads == 0);
+}
+
+// ── byte order, rows moving during a walk, the limit bound ─────────────────────
+
+// The ids a locale-aware collation would arrange differently from their bytes (case, punctuation,
+// digits against letters, a space, non-ASCII). The walk serves each exactly once, in byte order.
+TEST_CASE("hardware ci page: ids a locale would reorder are served once each, in byte order",
+          "[hardware_ci_page][walk][order]") {
+    const std::vector<std::string> ids = {
+        "Agent-1", "agent_1", "agent-1", "agent1", "PC-1", "pc-0042", "Zeta", "zeta", "AB", "ab",
+        "a b",     "a-b",     "a_b",     "-x",     "_x",   "10",      "2",    "\xC3\xA9t\xC3\xA9", "Z\xC3\xA9"};
+    std::vector<std::string> expected = ids;
+    std::sort(expected.begin(), expected.end()); // std::string orders by unsigned byte value
+    for (const int limit : {1, 2, 5, 1000}) {
+        FakeStore store;
+        for (const auto& id : ids)
+            store.add(id);
+        hcp::Request rq;
+        rq.limit = limit;
+        INFO(limit);
+        CHECK(walk(store, rq, std::nullopt) == expected);
+    }
+    // Spot-check the pairs a locale-aware order would swap, so the expectation is not circular.
+    const auto pos = [&](const std::string& id) {
+        return std::ranges::find(expected, id) - expected.begin();
+    };
+    CHECK(pos("Zeta") < pos("agent-1")); // upper case before lower case
+    CHECK(pos("AB") < pos("a b"));       // 'B' (0x42) before ' b'... 'A' < 'a'
+    CHECK(pos("-x") < pos("10"));        // '-' (0x2D) before digits
+    CHECK(pos("10") < pos("2"));         // digits are compared as text
+    CHECK(pos("_x") > pos("Zeta"));      // '_' (0x5F) is after upper case, before lower case
+    CHECK(pos("_x") < pos("a b"));
+    CHECK(pos("agent-1") < pos("agent1")); // '-' before '1'
+    CHECK(pos("agent1") < pos("agent_1")); // '1' (0x31) before '_' (0x5F)
+}
+
+// Kills: a second page that repeats, skips or reorders when a row appears ahead of, or the cursor's
+// own row is deleted from, the table between the two reads. The page is compared EXACTLY.
+TEST_CASE("hardware ci page: the second page is exact when a row is inserted ahead of the cursor or the "
+          "cursor's row is deleted",
+          "[hardware_ci_page][walk]") {
+    FakeStore store;
+    for (const char* id : {"d1", "d2", "d3", "d4", "d5", "d6"})
+        store.add(id);
+    hcp::Request rq;
+    rq.limit = 2;
+    const auto first = hcp::read_page(store.reader(), rq, std::nullopt);
+    REQUIRE(first.has_value());
+    REQUIRE(ids_of(*first) == std::vector<std::string>{"d1", "d2"});
+    REQUIRE_FALSE(first->next_cursor.empty());
+    rq.cursor = first->next_cursor;
+
+    SECTION("a row inserted ahead of the cursor is served on the page where it sorts") {
+        store.add("d25"); // between d2 (the cursor) and d3
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt);
+        REQUIRE(second.has_value());
+        CHECK(ids_of(*second) == std::vector<std::string>{"d25", "d3"});
+        CHECK_FALSE(second->next_cursor.empty());
+    }
+    SECTION("a row inserted behind the cursor is missed by this walk, never served twice") {
+        store.add("d15"); // between d1 and d2: already passed
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt);
+        REQUIRE(second.has_value());
+        CHECK(ids_of(*second) == std::vector<std::string>{"d3", "d4"});
+    }
+    SECTION("the cursor's own row deleted: the next page continues after its key") {
+        store.erase("d2");
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt);
+        REQUIRE(second.has_value());
+        CHECK(ids_of(*second) == std::vector<std::string>{"d3", "d4"});
+        CHECK_FALSE(second->next_cursor.empty());
+    }
+    SECTION("every later row deleted: an empty final page with no cursor") {
+        for (const char* id : {"d3", "d4", "d5", "d6"})
+            store.erase(id);
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt);
+        REQUIRE(second.has_value());
+        CHECK(second->rows.empty());
+        CHECK(second->next_cursor.empty());
+    }
+}
+
+// Kills: handing the store a zero, negative or overflowing limit (the store reads <= 0 as its whole
+// row ceiling, and `limit + 1` overflows at INT_MAX) when a Request is built by hand.
+TEST_CASE("hardware ci page: a hand-built Request's limit is clamped before it reaches the store",
+          "[hardware_ci_page][walk]") {
+    FakeStore store;
+    for (int i = 0; i < 1010; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "d%05d", i);
+        store.add(buf);
+    }
+    for (const int bad : {0, -5, INT_MIN}) {
+        hcp::Request rq;
+        rq.limit = bad;
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt);
+        REQUIRE(page.has_value());
+        INFO(bad);
+        CHECK(page->rows.size() == 1); // clamped up to 1
+        CHECK(store.queries.back().limit == 2);
+    }
+    for (const int big : {1001, INT_MAX}) {
+        hcp::Request rq;
+        rq.limit = big;
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt);
+        REQUIRE(page.has_value());
+        INFO(big);
+        CHECK(page->rows.size() == 1000); // clamped down to kPageMax
+        CHECK(store.queries.back().limit == 1001);
+    }
+}
+
+// ── one answer per read failure, shared by both transports ─────────────────────
+
+// Kills: a new ReadError enumerator that one transport treats as a cursor refusal and the other
+// does not (the cascades were hand-copied before), and drift between the two transports' wording.
+// Every value the enumerator's range could hold is walked, so adding an enumerator without a case
+// in describe_read_error and in this table fails here, not just as a -Wswitch warning.
+TEST_CASE("hardware ci page: every ReadError has one answer on both transports", "[hardware_ci_page][errors]") {
+    struct Expect {
+        hcp::ReadError e;
+        bool unavailable;
+        const char* message;
+        bool domain_row;
+        const char* outcome;
+        const char* rest_detail;
+        const char* mcp_detail;
+        const char* rest_remediation;
+        const char* mcp_remediation;
+    };
+    const std::vector<Expect> table = {
+        {hcp::ReadError::kDegraded, true, "hardware CI records unavailable", true, "failure",
+         "hardware CI records (REST) state=store unreadable",
+         "hardware CI records (MCP) state=store unreadable", "", ""},
+        {hcp::ReadError::kCursorMalformed, false, "invalid cursor; restart from the first page", false,
+         "denied", "", "invalid arguments: cursor", "", "omit cursor to restart from the first page"},
+        {hcp::ReadError::kCursorFilterMismatch, false, "invalid cursor; restart from the first page",
+         false, "denied", "", "invalid arguments: cursor", "", "omit cursor to restart from the first page"},
+        {hcp::ReadError::kScopeTooWide, false,
+         "the caller's scope covers more than 10000 devices and no agent_id was given; a credential "
+         "with global read has no such limit",
+         true, "denied", "hardware CI records (REST) state=scope too wide",
+         "hardware CI records (MCP) state=scope too wide",
+         "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
+         "caller's scope",
+         "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
+         "caller's scope"},
+    };
+    int known = 0;
+    for (int v = 0; v < 32; ++v) {
+        const auto e = static_cast<hcp::ReadError>(v);
+        if (hcp::read_error_message(e) == "invalid request")
+            continue; // not an enumerator: the switch fell through
+        ++known;
+        const auto it = std::ranges::find_if(table, [&](const Expect& x) { return x.e == e; });
+        INFO("enumerator " << v);
+        REQUIRE(it != table.end()); // a new enumerator needs a row here
+        const auto rest = hcp::describe_read_error(e, hcp::Surface::kRest);
+        const auto mcp = hcp::describe_read_error(e, hcp::Surface::kMcp);
+        for (const auto* f : {&rest, &mcp}) {
+            CHECK(f->unavailable == it->unavailable);
+            CHECK(f->message == it->message);
+            CHECK(f->message == hcp::read_error_message(e));
+            CHECK(f->domain_audit_row == it->domain_row);
+            CHECK(f->audit_outcome == it->outcome);
+            // a refusal is never retried; an unavailable read carries the 5 s hint
+            CHECK(f->retry_after_ms == (it->unavailable ? 5000 : -1));
+        }
+        CHECK(rest.audit_detail == it->rest_detail);
+        CHECK(mcp.audit_detail == it->mcp_detail);
+        CHECK(rest.remediation == it->rest_remediation);
+        CHECK(mcp.remediation == it->mcp_remediation);
+    }
+    CHECK(known == static_cast<int>(table.size()));
+    // an out-of-range value is a refusal that audits nothing and retries nothing
+    const auto bogus = hcp::describe_read_error(static_cast<hcp::ReadError>(99), hcp::Surface::kRest);
+    CHECK_FALSE(bogus.unavailable);
+    CHECK_FALSE(bogus.domain_audit_row);
 }
 
 // ── JSON ─────────────────────────────────────────────────────────────────────

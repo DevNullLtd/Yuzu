@@ -3160,10 +3160,29 @@ TEST_CASE("route: GET /api/v1/hardware/ci clamps limit and refuses a non-integer
     auto ctl = h.sink.Get("/api/v1/hardware/ci?agent_id=a%0Ab");
     REQUIRE(ctl);
     CHECK(ctl->status == 400);
-    // an empty agent_id is "not given" on REST: the whole fleet
-    auto empty_id = h.sink.Get("/api/v1/hardware/ci?agent_id=");
-    REQUIRE(empty_id);
-    CHECK(empty_id->status == 200);
+    // Kills: reading a present-but-empty agent_id as "every device": a client that interpolated a
+    // missing id would be served a page of other devices' serials and UUIDs. It is a 400 in the
+    // MCP twin's words, with no read and no audit row (like the other argument refusals), and an
+    // empty cursor or limit beside it is still "not given".
+    const auto reads_before = h.ci_store.reads;
+    const auto audits_before = h.audit_full.size();
+    for (const char* url : {"/api/v1/hardware/ci?agent_id=", "/api/v1/hardware/ci?agent_id=&limit=5",
+                            "/api/v1/hardware/ci?agent_id=&agent_id=a"}) {
+        INFO(url);
+        auto empty_id = h.sink.Get(url);
+        REQUIRE(empty_id);
+        CHECK(empty_id->status == 400);
+        CHECK(empty_id->has_header("X-Correlation-Id"));
+        const auto body = nlohmann::json::parse(empty_id->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        CHECK_FALSE(body.contains("data"));
+        CHECK(contains(empty_id->body, "agent_id must be a non-empty string when given"));
+    }
+    CHECK(h.ci_store.reads == reads_before);
+    CHECK(h.audit_full.size() == audits_before);
+    auto empty_cursor = h.sink.Get("/api/v1/hardware/ci?cursor=&limit=");
+    REQUIRE(empty_cursor);
+    CHECK(empty_cursor->status == 200);
     CHECK(h.audit_full.back() == "inventory.devices.ci|success|Inventory|fleet");
 }
 
@@ -3171,13 +3190,24 @@ TEST_CASE("route: GET /api/v1/hardware/ci refuses invalid UTF-8 in agent_id or c
           "[hardware][route][rest][ci_page]") {
     HwHarness h;
     seed_ci(h, {"a"});
-    for (const char* url : {"/api/v1/hardware/ci?agent_id=%FF", "/api/v1/hardware/ci?cursor=%FF",
-                            "/api/v1/hardware/ci?agent_id=a%00b"}) {
+    for (const char* url : {"/api/v1/hardware/ci?agent_id=%FF", "/api/v1/hardware/ci?agent_id=a%00b"}) {
         INFO(url);
         auto res = h.sink.Get(url);
         REQUIRE(res);
         CHECK(res->status == 400);
         CHECK(contains(res->body, "invalid parameter encoding"));
+    }
+    // A cursor that is not valid text is the SAME refusal as every other bad cursor (one message),
+    // with no remediation hint on REST, even beside a bad agent_id.
+    for (const char* url : {"/api/v1/hardware/ci?cursor=%FF", "/api/v1/hardware/ci?cursor=a%00b",
+                            "/api/v1/hardware/ci?cursor=%FF&agent_id=a%0Ab", "/api/v1/hardware/ci?cursor=garbage"}) {
+        INFO(url);
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(contains(res->body, "invalid cursor; restart from the first page"));
+        CHECK_FALSE(contains(res->body, "invalid parameter encoding"));
+        CHECK_FALSE(contains(res->body, "remediation"));
     }
     CHECK(h.ci_store.reads == 0);
     CHECK(h.audit_full.empty());

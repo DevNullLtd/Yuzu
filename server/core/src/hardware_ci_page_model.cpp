@@ -25,6 +25,8 @@ using model_detail::read_length_prefixed;
 using model_detail::valid_text;
 
 constexpr std::string_view kCursorPrefix = "h1";
+// The refusal of a present-but-empty `agent_id`, spelled once for REST and MCP.
+constexpr std::string_view kEmptyAgentIdMessage = "agent_id must be a non-empty string when given";
 
 std::vector<std::string_view> split_colon(std::string_view s) {
     std::vector<std::string_view> out;
@@ -64,13 +66,17 @@ struct TextFault {
     ArgFault fault{ArgFault::kOther};
 };
 
+// A cursor that is not valid text (NUL, bad UTF-8) or is over-long is refused with the SAME
+// message and fault as every other refused cursor, so a caller and the audit trail see one cursor
+// refusal whatever made the token unusable. The cursor is judged first for that reason.
 std::optional<TextFault> text_error(const std::string& agent_id, const std::string& cursor) {
-    if (!valid_text(agent_id) || !valid_text(cursor))
+    if (!valid_text(cursor) || cursor.size() > kCursorMaxBytes)
+        return TextFault{std::string(cursor_error_message(CursorError::kMalformed)),
+                         ArgFault::kCursorRefused};
+    if (!valid_text(agent_id))
         return TextFault{"invalid parameter encoding"};
     if (!agent_id.empty() && !id_is_audit_safe(agent_id))
         return TextFault{"invalid agent_id"};
-    if (cursor.size() > kCursorMaxBytes)
-        return TextFault{"invalid cursor; restart from the first page", ArgFault::kCursorTooLong};
     return std::nullopt;
 }
 
@@ -88,6 +94,12 @@ std::expected<Request, std::string> parse_params(const Params& p) {
     r.cursor = first("cursor");
     if (const auto bad = text_error(r.agent_id, r.cursor))
         return std::unexpected(bad->message);
+    // A present-but-empty `agent_id` is refused, not read as "every device": a client that
+    // interpolates a missing id into the query would otherwise be served a page of OTHER devices'
+    // records and could attach the first to the wrong one. An empty `cursor` is the first page.
+    if (const auto it = p.lower_bound("agent_id"); it != p.end() && it->first == "agent_id" &&
+                                                    r.agent_id.empty())
+        return std::unexpected(std::string(kEmptyAgentIdMessage));
     if (const std::string limit = first("limit"); !limit.empty()) {
         const auto n = parse_rest_limit(limit);
         if (!n)
@@ -99,15 +111,20 @@ std::expected<Request, std::string> parse_params(const Params& p) {
 
 std::expected<Request, ArgError> request_from_args(const nlohmann::json& args) {
     Request r;
-    if (!args.is_object())
+    r.limit = static_cast<int>(kMcpDefaultLimit);
+    if (args.is_null())
         return r;
+    // Anything but an object would otherwise read as "no arguments", a default request for the
+    // whole fleet.
+    if (!args.is_object())
+        return std::unexpected(ArgError{"arguments must be a JSON object"});
     for (const char* key : {"agent_id", "cursor"})
         if (args.contains(key) && !args[key].is_string())
             return std::unexpected(ArgError{std::string(key) + " must be a JSON string"});
     if (args.contains("agent_id")) {
         r.agent_id = args["agent_id"].get<std::string>();
         if (r.agent_id.empty())
-            return std::unexpected(ArgError{"agent_id must be a non-empty string when given"});
+            return std::unexpected(ArgError{std::string(kEmptyAgentIdMessage)});
     }
     if (args.contains("cursor"))
         r.cursor = args["cursor"].get<std::string>();
@@ -206,6 +223,43 @@ std::string_view read_error_message(ReadError e) {
     return "invalid request";
 }
 
+ReadFailure describe_read_error(ReadError e, Surface surface) {
+    const std::string_view name = surface == Surface::kRest ? "REST" : "MCP";
+    ReadFailure f;
+    f.message = read_error_message(e);
+    switch (e) {
+    case ReadError::kDegraded:
+        // A failed store read is never an empty page (ADR-0016 section 7).
+        f.unavailable = true;
+        f.retry_after_ms = 5000;
+        f.domain_audit_row = true;
+        f.audit_outcome = "failure";
+        f.audit_detail = std::format("hardware CI records ({}) state=store unreadable", name);
+        return f;
+    case ReadError::kCursorMalformed:
+    case ReadError::kCursorFilterMismatch:
+        // The same refusal as an over-long or non-text cursor (`kCursorRefusedAuditDetail`). Only
+        // MCP audits it, as its generic row; REST writes no row and sends no hint.
+        f.audit_outcome = "denied";
+        if (surface == Surface::kMcp) {
+            f.remediation = kCursorRefusedRemediation;
+            f.audit_detail = std::string(kCursorRefusedAuditDetail);
+        }
+        return f;
+    case ReadError::kScopeTooWide:
+        // TERMINAL: the caller's own scope is the cause and no store read ran. No count anywhere.
+        f.remediation = kScopeTooWideRemediation;
+        f.domain_audit_row = true;
+        f.audit_outcome = "denied";
+        f.audit_detail = audit_detail_scope_too_wide(name);
+        return f;
+    }
+    // Unreachable for a named enumerator (the switch above has no default, so a new one is a
+    // -Wswitch warning). An out-of-range value is answered as a refusal with no audit row.
+    f.audit_outcome = "denied";
+    return f;
+}
+
 std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope) {
     const std::string fp = filter_fingerprint(rq);
@@ -245,11 +299,15 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope)
 
     // Every returned row is in scope. One extra row is read to know whether the page is the last,
     // so a final page carries no cursor.
-    q.limit = rq.limit + 1;
+    // `rq.limit` is clamped here so that a caller that built a Request by hand (the parsers never
+    // produce one outside [1, kPageMax]) cannot reach `limit + 1` overflow or a zero/negative
+    // store limit, which the store reads as its whole row ceiling.
+    const int want = std::clamp(rq.limit, 1, static_cast<int>(kPageMax));
+    q.limit = want + 1;
     auto rows = read(q);
     if (!rows)
         return std::unexpected(ReadError::kDegraded);
-    const auto limit = static_cast<std::size_t>(rq.limit);
+    const auto limit = static_cast<std::size_t>(want);
     if (rows->size() > limit) {
         rows->resize(limit);
         out.next_cursor = encode_cursor({rows->back().agent_id}, fp);
@@ -276,10 +334,12 @@ nlohmann::json page_json(const Page& page) {
     auto devices = nlohmann::json::array();
     for (const auto& r : page.rows)
         devices.push_back(row_json(r));
-    return nlohmann::json{
-        {"devices", std::move(devices)},
-        {"next_cursor", page.next_cursor},
-    };
+    // Element assignment, not an initializer list: a braced list copies every element, which for a
+    // 1000-row page is a deep copy of the whole array.
+    nlohmann::json out = nlohmann::json::object();
+    out["devices"] = std::move(devices);
+    out["next_cursor"] = page.next_cursor;
+    return out;
 }
 
 void apply_scope_disclosure(nlohmann::json& body, bool confined) {

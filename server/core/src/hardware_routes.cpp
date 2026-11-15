@@ -764,47 +764,32 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const hardware_ci_page::Request& rq = *parsed;
         const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope);
         if (!read) {
-            using hardware_ci_page::ReadError;
-            const ReadError why = read.error();
-            if (why == ReadError::kScopeTooWide) {
-                // TERMINAL, no retry hint: the caller's own scope is the cause, and no store read
-                // ran. Audited as a refusal; the text carries no count. The row is best effort
-                // like the neighbouring refusal below (nothing is served, and a row that does not
-                // persist still marks the response Sec-Audit-Failed).
+            // ONE answer per failure, shared with MCP (hardware_ci_page::describe_read_error): a
+            // scope too wide is TERMINAL (400, no retry hint, audited as a refusal with no count),
+            // a refused cursor is a 400 with no row, and a failed store read is a 503 with a retry
+            // hint and is never an empty page (ADR-0016 section 7). The domain row is best effort
+            // (nothing is served, and a row that does not persist still marks the response
+            // Sec-Audit-Failed).
+            const auto f = hardware_ci_page::describe_read_error(read.error(),
+                                                                 hardware_ci_page::Surface::kRest);
+            if (f.domain_audit_row)
                 (void)detail::emit_behavioral_audit(
-                    deps_.audit_fn, req, res, "inventory.devices.ci", "denied",
+                    deps_.audit_fn, req, res, "inventory.devices.ci", std::string(f.audit_outcome),
                     hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
-                    hardware_ci_page::audit_detail_scope_too_wide("REST"));
-                res.status = 400;
-                res.set_content(
-                    detail::a4_error(res, std::string(hardware_ci_page::read_error_message(why)),
-                                     {.remediation = hardware_ci_page::kScopeTooWideRemediation}),
-                    "application/json");
-                return;
-            }
-            if (why != ReadError::kDegraded) { // a refused cursor
-                res.status = 400;
-                res.set_content(
-                    detail::a4_error(res, std::string(hardware_ci_page::read_error_message(why))),
-                    "application/json");
-                return;
-            }
-            // A failed store read is never an empty page (ADR-0016 section 7).
-            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.devices.ci",
-                                                "failure", hardware_ci_page::audit_target_type(rq),
-                                                hardware_ci_page::audit_target_id(rq),
-                                                "hardware CI records (REST) state=store unreadable");
-            res.status = 503;
-            res.set_content(detail::a4_error(res, "hardware CI records unavailable",
-                                             {.retry_after_ms = 5000}),
-                            "application/json");
+                    f.audit_detail);
+            res.status = f.unavailable ? 503 : 400;
+            detail::A4ErrorOpts opts;
+            if (f.retry_after_ms >= 0)
+                opts.retry_after_ms = f.retry_after_ms;
+            opts.remediation = f.remediation;
+            res.set_content(detail::a4_error(res, std::string(f.message), opts), "application/json");
             return;
         }
         const hardware_ci_page::Page& page = *read;
 
         // A confined caller never receives an out-of-scope row, id or count: the scope is applied
-        // in SQL, so the page is exact and neither the body, the cursor nor the audit detail has
-        // anything to carry. Confinement is reported as a status instead
+        // in SQL, so no row is filtered after the read and neither the body, the cursor nor the
+        // audit detail has anything to carry. Confinement is reported as a status instead
         // (hardware_ci_page::apply_scope_disclosure, shared with MCP). A named device outside the
         // scope gets the same empty page as a device with no record; only the audit outcome
         // differs: one `denied` row instead of a `success` row.
@@ -824,10 +809,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         nlohmann::json data = hardware_ci_page::page_json(page);
         hardware_ci_page::apply_scope_disclosure(data, confined);
-        nlohmann::json out = {
-            {"data", std::move(data)},
-            {"meta", {{"api_version", "v1"}}},
-        };
+        // Element assignment, not a braced list: a braced list deep-copies the 1000-row page.
+        nlohmann::json out = {{"meta", {{"api_version", "v1"}}}};
+        out["data"] = std::move(data);
         // The body carries serials, UUIDs and MACs: no cache (shared or private) may keep it. Set
         // on the served page only; the refusals above carry no device data, and the per-id route
         // and the neighbouring REST reads set none.

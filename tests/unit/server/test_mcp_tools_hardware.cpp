@@ -32,6 +32,7 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -1679,6 +1680,7 @@ TEST_CASE("mcp list_hardware_ci_records: served as a confined Inventory:Read rea
     const auto& p = tool["inputSchema"]["properties"];
     CHECK(p["limit"]["minimum"] == 1);
     CHECK(p["limit"]["maximum"] == 1000);
+    CHECK(p["limit"]["default"] == 20); // the handler's default (agents), not REST's 100
     CHECK(p["cursor"]["maxLength"] == 2048);
     CHECK(p["agent_id"]["minLength"] == 1);
     CHECK(p["agent_id"]["maxLength"] == 256);
@@ -1686,8 +1688,18 @@ TEST_CASE("mcp list_hardware_ci_records: served as a confined Inventory:Read rea
     CHECK(desc.find("retry_after_ms") != std::string::npos);
     // the decision-grade facts a worker needs before it calls
     for (const char* needle : {"more than 10000 devices", "-32602", "scope_basis", "daily-sync snapshot",
-                               "from list_hardware_ci", "indistinguishable", "limit 20 or less"})
+                               "from list_hardware_ci", "indistinguishable", "limit up to 20",
+                               "GET /api/v1/hardware/ci", "byte order", "not a snapshot",
+                               "confirm a device with agent_id before you retire it",
+                               "empty devices array without agent_id"})
         CHECK(desc.find(needle) != std::string::npos);
+    // The agentic guidance LEADS (it comes before the CMDB walk instructions), and the retired
+    // "built for a daily pull" lead and the old default are gone.
+    CHECK(desc.find("For agentic workers") < desc.find("To walk the records"));
+    CHECK(desc.find("Built for a daily pull") == std::string::npos);
+    CHECK(desc.find("(default 100)") != std::string::npos); // REST's default, named as REST's
+    CHECK(desc.find("limit is 1..1000 (default 20)") != std::string::npos);
+    CHECK(desc.find("Rows are in agent_id order") == std::string::npos);
     // the retired wide-scope remark is gone
     CHECK(desc.find("can be empty while next_cursor is not") == std::string::npos);
     CHECK(desc.find("devices_omitted") == std::string::npos);
@@ -1987,6 +1999,93 @@ TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids with an agent_id r
     CHECK(t.domain_rows.back() == "inventory.devices.ci|denied|Agent|out-b");
 }
 
+// Kills: the MCP default staying at REST's 100 (each page lands in an agent's context) and the
+// two transports sharing one default; both limits are observable as the store's limit + 1.
+TEST_CASE("mcp list_hardware_ci_records: the default page is 20 rows, REST's stays 100",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    for (int i = 0; i < 130; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "d%03d", i);
+        t.ci_store.add(std::string(buf));
+    }
+    t.ci_store.queries.clear();
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(record_ids(r["result"]["structuredContent"]).size() == 20);
+    CHECK_FALSE(r["result"]["structuredContent"]["next_cursor"].get<std::string>().empty());
+    REQUIRE(t.ci_store.queries.size() == 1);
+    CHECK(t.ci_store.queries[0].limit == 21);
+
+    t.ci_store.queries.clear();
+    const json rest = t.rest_data("/api/v1/hardware/ci");
+    CHECK(record_ids(rest).size() == 100);
+    REQUIRE(t.ci_store.queries.size() == 1);
+    CHECK(t.ci_store.queries[0].limit == 101);
+    // an explicit limit is honoured on both, up to 1000
+    CHECK(record_ids(t.call("list_hardware_ci_records", {{"limit", 130}})["result"]["structuredContent"])
+              .size() == 130);
+}
+
+// Kills: REST and MCP answering a present-but-empty agent_id differently (REST used to read the
+// whole fleet where MCP refused), and either transport touching the store or auditing a page.
+TEST_CASE("route and mcp agree: a present-but-empty agent_id is refused with the same words, before any read",
+          "[mcp][hardware][ci_page]") {
+    Twin t;
+    seed(t, {"a", "b"});
+    t.clear_audit();
+    const int reads = t.ci_store.reads;
+    auto rest = t.sink.Get("/api/v1/hardware/ci?agent_id=");
+    REQUIRE(rest);
+    CHECK(rest->status == 400);
+    const json mcp_r = t.call("list_hardware_ci_records", {{"agent_id", ""}});
+    REQUIRE(mcp_r.contains("error"));
+    CHECK(mcp_r["error"]["code"] == mcp::kInvalidParams);
+    const std::string expected = "agent_id must be a non-empty string when given";
+    CHECK(json::parse(rest->body)["error"]["message"] == expected);
+    CHECK(mcp_r["error"]["message"] == expected);
+    CHECK(t.ci_store.reads == reads);
+    CHECK(t.domain_rows.empty());
+    CHECK_FALSE(rest->body.find("\"devices\"") != std::string::npos);
+}
+
+// A confined caller walks the same pages on both transports: the same ids, in the same order,
+// with the same cursors, and nothing outside the scope on either. (The ids are chosen so the
+// scope is not a prefix of the byte order.)
+TEST_CASE("route and mcp agree for a confined caller: same ids, same order, same cursors, nothing hidden",
+          "[mcp][hardware][ci_page][security]") {
+    Twin t;
+    seed(t, {"Zeta", "agent-3", "out-1", "agent-1", "out-2", "_underscore", "agent-2", "out-3"});
+    t.scope = std::unordered_set<std::string>{"Zeta", "agent-3", "agent-1", "_underscore", "agent-2"};
+
+    std::vector<std::string> mcp_seen, rest_seen;
+    std::string cursor;
+    for (int pages = 0; pages < 20; ++pages) {
+        json args = {{"limit", 2}};
+        std::string url = "/api/v1/hardware/ci?limit=2";
+        if (!cursor.empty()) {
+            args["cursor"] = cursor;
+            url += "&cursor=" + cursor;
+        }
+        const json mcp_r = t.call("list_hardware_ci_records", args);
+        REQUIRE_FALSE(mcp_r.contains("error"));
+        const json mcp_page = mcp_r["result"]["structuredContent"];
+        const json rest_page = t.rest_data(url);
+        CHECK(mcp_page == rest_page); // same ids, order, next_cursor and scope_basis
+        CHECK(mcp_page["scope_basis"] == "authority_scoped");
+        for (const auto& id : record_ids(mcp_page))
+            mcp_seen.push_back(id);
+        for (const auto& id : record_ids(rest_page))
+            rest_seen.push_back(id);
+        cursor = mcp_page["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    const std::vector<std::string> visible = {"Zeta", "_underscore", "agent-1", "agent-2", "agent-3"};
+    CHECK(mcp_seen == visible);
+    CHECK(rest_seen == visible);
+}
+
 TEST_CASE("mcp list_hardware_ci_records: arguments are refused, never clamped, and a bad cursor is -32602",
           "[mcp][hardware][ci_page]") {
     Twin t;
@@ -2038,6 +2137,8 @@ TEST_CASE("mcp list_hardware_ci_records: every refused cursor has one remediatio
 
     const std::vector<json> refused_cursors = {
         {{"cursor", std::string(2049, 'x')}},               // over-long, refused at parse time
+        {{"cursor", std::string("a\0b", 3)}},               // NUL: not valid text, same refusal
+        {{"cursor", std::string("a\0b", 3)}, {"agent_id", "a\nb"}}, // judged before the agent_id
         {{"cursor", "garbage"}},                            // fails to decode
         {{"agent_id", "a"}, {"cursor", good}},              // issued for another agent_id filter
     };

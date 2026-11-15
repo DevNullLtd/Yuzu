@@ -3,8 +3,13 @@
 /// @file test_fake_ci_keyset_store.hpp
 /// An in-memory stand-in for `DeviceInventoryStore::list_device_ci_after`, shared by the model,
 /// route and MCP tests of the bulk CI page. Same keyset semantics as the SQL: `agent_id > after`,
-/// the optional `agent_id` / `agent_ids` narrowing, then up to `limit` rows, ordered by `agent_id`. A present-empty `agent_ids` reads nothing. `degraded` makes every
-/// read fail (nullopt), as a closed store or a query error does.
+/// the optional `agent_id` / `agent_ids` narrowing, then up to `limit` rows, ordered by `agent_id`.
+/// The order is BYTE order (`std::string`'s comparison is unsigned-byte lexicographic), which is
+/// the SAME contract as the store's `agent_id COLLATE "C"`, not a stand-in for locale order: a
+/// test that adds ids the two orders would arrange differently (upper and lower case, `-` and `_`,
+/// digits against letters) checks this fake and the real store against one rule. A present-empty
+/// `agent_ids` reads nothing. `degraded` makes every read fail (nullopt), as a closed store or a
+/// query error does.
 ///
 /// It exists so a confinement test can assert the EXACT set of devices that came back: a fake
 /// that only recorded the scope it was handed would stay green with the intersection deleted.
@@ -50,6 +55,10 @@ struct FakeCiKeysetStore {
                   [](const auto& a, const auto& b) { return a.agent_id < b.agent_id; });
     }
     void add(const std::string& id) { add(make_ci_record(id)); }
+    /// Removes the row (a device decommissioned while a walk is in progress).
+    void erase(const std::string& id) {
+        std::erase_if(rows, [&](const auto& r) { return r.agent_id == id; });
+    }
 
     std::optional<std::vector<DeviceCiRecord>> read(const DeviceCiKeysetQuery& q) {
         ++reads;
