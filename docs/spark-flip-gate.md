@@ -1807,8 +1807,10 @@ flip, with a red-first test each:
     test hook, so by `stop()` no read is outstanding and the 2 s drain wait and the quarantine path are never reached;
     it does NOT model a read the OS never completes, which is a Gate 5 flip-time chaos scenario, a never-completing
     cancelled read including `stop()`, not run), an OK completion queued on the stale read when the path is found
-    lost is drained and never fired, a throw while the lost path's read drains still ends in one Recovered, and
-    the retry window is not counted as a slow establishment.
+    lost is drained and never fired, a throw while the lost path's read drains still ends in one Recovered, a throw
+    on the OK completion of a lost path whose old handle can no longer be read (the unwind's OK-completion arm, its
+    reissue-failure sub-branch) still ends in one Recovered with the slow-establishment count
+    unchanged, and the retry window is not counted as a slow establishment.
     *Registry: a KNOWN GAP, parked.* The case for the parent of the watched key renamed (`RegRenameKey`) is a hidden
     case tagged `[.][known-gap-5719]` (owner ruling): no default run, shard or CI leg executes it, and run
     explicitly it is red (the rename succeeds, the watch keeps reporting `Notification` coverage, no `fault()` is
@@ -2013,6 +2015,41 @@ flip, with a red-first test each:
     pattern (49 cases, a superset of the 20 File cases of the earlier rounds) ran 20 of 20 green in a loop. The
     mutation table was not re-run (no production code line changed). No agent re-review covered this round; the
     confirmation is the rig run and the diff check alone.
+    Fix round 7 (the OK-completion arm's reissue-failure guard, mutation M12), rig bytes: no production change; the one
+    new case is in commit `d7b59efcc1` (whole-repo tree `b5dce0b1de00bb7be5ac6a6129fc4e2e10b23ea9`), which adds a case
+    and three fields to `OkDrainState` in `test_spark_mechanism.cpp` and nothing else. The rig tree was a tar of the
+    tracked files at `b46d17d999` with the working copy of that one test file copied over (the same bytes as
+    `d7b59efcc1`), and the md5 of the three source files on the rig equalled the md5 of the committed files at that
+    commit (`spark_file.cpp` `d31bdf4a50103f2e6afea0bd38309264` and `spark_mechanism.hpp`
+    `81d44cb03545293a6e7f76db72a32099`, both unchanged; `test_spark_mechanism.cpp` `7c3497518f46f74e6042c6141ab62f7a`);
+    the tree hash names the whole repository and was not itself checked on the rig. The commit `040cbe21aa` that follows
+    changes three comment lines of the same test file (its md5 is `e017b27ae03c611cc96acb109e06b525`; it was compiled on
+    Linux, not run on the rig) and this documentation change changes no source. **M12 is now caught.** The new case,
+    "a throw on the OK completion of a lost path whose old handle can no longer be read still ends in one Recovered and
+    a verified watch", needs no new seam: the OK-drain case's construction leaves an `ok` completion on the stale read
+    while the owner is held in a pass whose sweep then finds the path lost; `completion_hook` removes the renamed
+    directory and throws; the unwind's OK arm reissues `ReadDirectoryChangesW` on the old handle, which the OS refuses
+    (measured on the rig: FALSE with ERROR_ACCESS_DENIED for a handle whose directory was removed), so the reissue-failure
+    sub-branch and its grace guard run. It asserts `probe_launch_failed` rose and `path_lost_drained_ok` stayed 0 (the
+    sub-branch ran, not the drain), the first Faulted detail is the loss reason, `slow_op_total` is unchanged across the
+    episode (the discriminating check: the detail line reads only the first Faulted event and cannot see an overwrite),
+    and that the watch recovers, fires after repair and stays verified. It uses a 300 ms admission seed so a sweep
+    falls inside the retry wait. Model limits, stated in the case: the `ok` completion completed before the cancel (that
+    CancelIoEx ever completes a read `ok` is not shown), removing the directory is the only reissue-failure cause
+    exercised, and the 150 ms is a notification allowance that fails loudly on a counter rather than passing
+    vacuously. The reissue-SUCCESS sub-branch of the same arm (which converges through the sweep's re-cancel) is still
+    exercised by no case. Windows (weecolin, MSVC, debug-type build without debug info): the new case 20 of 20 green
+    normally and 50 of 50 green with one busy-loop process per logical core; `[mechanism]` 188 cases (5675 assertions),
+    `[5719]` 63 (2098) and `[4415prA]` 105 (3544) green, the parked Registry case red when run by tag (1 case, 16
+    assertions, 2 failed). Linux debug: `[mechanism]` 62 cases (3526 assertions), `[5719]` 43 (1262) and `[4415prA]` 105
+    (3544) green. Mutations on the rig bytes, each built from the restored source and restored afterwards (the restored
+    md5 equalled the committed one): M12 (the guard line deleted at the OK arm) was built twice, and in both builds the
+    new case was red on its first run while the other three lost-path cases run (the throw-while-draining, the
+    OK-completion-drain and the retry-window cases) were green 3 of 3; a third build ran the new case three times, red
+    3 of 3, every time on the single check `slow_op_total` (1 against 0). M11 (the same guard on the failed-completion arm) was
+    built twice and in both the throw-while-draining case was red on its first run and the new case and the other two
+    were green 3 of 3. Not re-run this round: the other 19 File cases' loops, the full 22-mutation table, and the
+    `File spark (real mechanism): *` pattern loop (it now matches 50 cases). No agent re-review covered this round.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
