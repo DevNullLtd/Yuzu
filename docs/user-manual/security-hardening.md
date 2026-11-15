@@ -760,7 +760,7 @@ Two consequences worth planning for:
   exempt from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
   the plugin-presence filter and a degraded plugin-config store, so none of them can strand a contained
   device. **A plugin-level `firewall` kill-switch row never stops those four and still stops `state`
-  and `rules`**, so `protective_exempt=true` on that row means "covers a protective action", not "gates
+  and `rules`**, so `protective_exempt=partial` on that row means "covers a protective action", not "gates
   nothing". A kill-switch row for one of these pairs is still accepted and displayed, but it is
   informational only. To stop Guardian rule delivery during an incident, disable or remove the rules
   instead; see [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).

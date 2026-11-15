@@ -334,7 +334,7 @@ TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence for
     const KillSwitchScope plain{"echo", "sql", ""};
     CHECK(kill_switch_set_detail(plain, false) == "enabled=false");
     CHECK(kill_switch_set_detail(plain, true, "") == "enabled=true");
-    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false) ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", ""}, false) ==
           "enabled=false, protective_exempt=true");
     // A plugin-level firewall row exempts the protective four but still gates state and rules:
     // labelled `partial`, never the complete-exemption `true`. An action-level firewall row is

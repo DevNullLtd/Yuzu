@@ -11395,7 +11395,7 @@ narrow the all-OS layer but never widen it, and within the OS layer an `action@o
 
 For a **protective action** (the firewall plugin's `quarantine`/`release`/`quarantine_status`/`quarantine_allow`
 and `__guard__.push_rules`) the state shown is for information only: `enabled: false` can be displayed
-while dispatch still goes ahead. A plugin-level `firewall` row never stops those four and still stops `state` and `rules`, so `protective_exempt=true` on it means 'covers a protective action', not 'gates nothing' (see
+while dispatch still goes ahead. A plugin-level `firewall` row never stops those four and still stops `state` and `rules`, so `protective_exempt=partial` on it means 'covers a protective action', not 'gates nothing' (see
 [Security Hardening](security-hardening.md) and [Upgrading](upgrading.md)).
 
 **Errors:** `400` (invalid plugin/action/os, or `?os=` present but empty), `503` (store unavailable).

@@ -276,7 +276,7 @@ inline constexpr std::size_t kListRowCap = 5000;
         // A plugin-level row (at any OS layer) for a plugin that also declares ordinary actions
         // (today only `firewall`: `state`, `rules`) exempts the protective ones yet still gates
         // the rest: `partial`, so a post-mortem cannot read it as a complete exemption.
-        // `quarantine` and `__guard__` declare only protective actions, and an action-level row
+        // `__guard__` declares only protective actions, and an action-level row
         // is exact: both stay `true`.
         const bool partial =
             scope.action.empty() &&

@@ -2299,7 +2299,7 @@ TEST_CASE("MCP 2g: tool families cover exactly the tools/list surface (staleness
 // The kill-switch tools' published descriptions are decision-grade machine
 // metadata: an agentic worker reads them to decide whether a switch is a real
 // emergency stop. They must keep carrying the protective-action caveat (the
-// quarantine control actions and __guard__.push_rules are never refused by a
+// firewall containment actions and __guard__.push_rules are never refused by a
 // switch), or a stale "reliable emergency stop" claim can reappear unnoticed.
 TEST_CASE("MCP kill-switch tools advertise the protective-action caveat",
           "[mcp][protective]") {
