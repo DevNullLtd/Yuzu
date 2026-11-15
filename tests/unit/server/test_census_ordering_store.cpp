@@ -3225,9 +3225,9 @@ TEST_CASE("census ordering: a paired apply stores the pair on the event and on t
         CHECK(event_pair_text(db.dsn(), "e2") == "5/11");
         CHECK(event_pair_text(db.dsn(), "e1") == "5/10"); // written once, never updated
         CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
-        // The verdict is the v4 verdict: the pair changed nothing about it.
-        CHECK(census(db.dsn(), "a", "r1") ==
-              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+        // The verdict follows the pair rule ((5,11) is above (5,10)), and a clean in-order pair
+        // apply raises no mark: the ts_hwm column stays NULL.
+        CHECK(census(db.dsn(), "a", "r1") == "drifted|" + key_str(kBase + 200) + "|-|false");
     }
     SECTION("an unpaired event stores NULL/NULL on both tables") {
         REQUIRE(store.insert_event_classified(ev("e1", "r1", "a", kCompliant, kBase + 100)).outcome ==
@@ -3241,10 +3241,16 @@ TEST_CASE("census ordering: a paired apply stores the pair on the event and on t
                         with_pair(ev("e1", "r1", "a", kCompliant, kBase + 100), 5, 10))
                     .outcome == EventInsertOutcome::Inserted);
         REQUIRE(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        // The hold has expired: the agent's pair clock is two hours old, so an unpaired event
+        // applies by arrival over the paired verdict (inside the hold it would be refused). That
+        // transition is flagged and folds its key into the mark.
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_order SET epoch_recv_ns = epoch_recv_ns - "
+                               "7200000000000 WHERE agent_id = 'a'");
         REQUIRE(store.insert_event_classified(ev("e2", "r1", "a", kDrifted, kBase + 200)).outcome ==
                 EventInsertOutcome::Inserted);
         CHECK(census(db.dsn(), "a", "r1") ==
-              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
         CHECK(census_pair_text(db.dsn(), "a", "r1") == "-/-");
         CHECK(event_pair_text(db.dsn(), "e1") == "5/10");
         CHECK(event_pair_text(db.dsn(), "e2") == "-/-");
@@ -3268,7 +3274,7 @@ TEST_CASE("census ordering: a refused event's pair is never written to the censu
     REQUIRE(store.is_open());
     REQUIRE(store.create_rule(make_rule("r1", "guard-one")));
 
-    SECTION("an older key with a higher pair is refused by the v4 rule and keeps the row's pair") {
+    SECTION("an older key with a higher epoch applies by pair and the row takes its pair") {
         REQUIRE(store
                     .insert_event_classified(
                         with_pair(ev("e1", "r1", "a", kDrifted, kBase + 200), 5, 10))
@@ -3277,10 +3283,23 @@ TEST_CASE("census ordering: a refused event's pair is never written to the censu
                     .insert_event_classified(
                         with_pair(ev("e2", "r1", "a", kCompliant, kBase + 100), 6, 99))
                     .outcome == EventInsertOutcome::Inserted);
-        CHECK(census(db.dsn(), "a", "r1") ==
-              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
-        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        CHECK(census(db.dsn(), "a", "r1") == "compliant|" + key_str(kBase + 100) + "|-|false");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "6/99");
         CHECK(event_pair_text(db.dsn(), "e2") == "6/99"); // the event keeps its own pair
+    }
+    SECTION("a lower sequence with a higher key is refused and keeps the row's pair") {
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e1", "r1", "a", kDrifted, kBase + 200), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        REQUIRE(store
+                    .insert_event_classified(
+                        with_pair(ev("e2", "r1", "a", kCompliant, kBase + 300), 5, 9))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(census(db.dsn(), "a", "r1") ==
+              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 300) + "|true");
+        CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
+        CHECK(event_pair_text(db.dsn(), "e2") == "5/9"); // the event keeps its own pair
     }
     SECTION("a refused unpaired event does not clear the row's pair") {
         REQUIRE(store
@@ -3320,8 +3339,7 @@ TEST_CASE("census ordering: a repair projects the pair stored with the event, ne
     }
     CHECK(store.insert_event_classified(redelivered).outcome == EventInsertOutcome::Redelivered);
     CHECK(pending_count(db.dsn()) == "0");
-    CHECK(census(db.dsn(), "a", "r1") ==
-          "drifted|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|false");
+    CHECK(census(db.dsn(), "a", "r1") == "drifted|" + key_str(kBase + 100) + "|-|false");
     CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
     CHECK(event_pair_text(db.dsn(), "e1") == "5/10"); // the replay did not rewrite the event
 }
@@ -3336,14 +3354,14 @@ TEST_CASE("census ordering: the batch path stores the pair on both tables",
     REQUIRE(store.create_rule(make_rule("r2", "guard-two")));
     const auto n = store.insert_events(
         {with_pair(ev("b1", "r1", "a", kDrifted, kBase + 200), 4, 20),
-         with_pair(ev("b2", "r1", "a", kCompliant, kBase + 100), 4, 21), // refused by key
+         with_pair(ev("b2", "r1", "a", kCompliant, kBase + 100), 4, 21), // applies by pair
          ev("b3", "r2", "a", kCompliant, kBase + 100)});                 // unpaired
     REQUIRE(n.has_value());
     CHECK(*n == 3);
     CHECK(event_pair_text(db.dsn(), "b1") == "4/20");
     CHECK(event_pair_text(db.dsn(), "b2") == "4/21");
     CHECK(event_pair_text(db.dsn(), "b3") == "-/-");
-    CHECK(census_pair_text(db.dsn(), "a", "r1") == "4/20"); // b2 was refused, its pair not written
+    CHECK(census_pair_text(db.dsn(), "a", "r1") == "4/21"); // b2 applies: (4,21) is above (4,20)
     CHECK(census_pair_text(db.dsn(), "a", "r2") == "-/-");
 }
 
@@ -3402,8 +3420,7 @@ TEST_CASE("census ordering: a redelivery never compares or rewrites the pair",
         CHECK(store.events_dropped_total() == dropped);
         CHECK(store.events_redelivered_total() == redelivered + 1);
         CHECK(store.event_count() == 1);
-        CHECK(census(db.dsn(), "a", "r1") ==
-              "compliant|" + key_str(kBase + 100) + "|" + key_str(kBase + 100) + "|false");
+        CHECK(census(db.dsn(), "a", "r1") == "compliant|" + key_str(kBase + 100) + "|-|false");
         CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/10");
         CHECK(event_pair_text(db.dsn(), "e1") == "5/10");
     }
@@ -3416,8 +3433,7 @@ TEST_CASE("census ordering: a redelivery never compares or rewrites the pair",
         replay.boot_epoch.reset();
         replay.emit_seq.reset();
         CHECK(store.insert_event_classified(replay).outcome == EventInsertOutcome::Redelivered);
-        CHECK(census(db.dsn(), "a", "r1") ==
-              "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+        CHECK(census(db.dsn(), "a", "r1") == "drifted|" + key_str(kBase + 200) + "|-|false");
         CHECK(census_pair_text(db.dsn(), "a", "r1") == "5/11");
     }
     SECTION("(d) a replay whose pair differs is a Redelivery, never a Conflict") {
@@ -3430,12 +3446,14 @@ TEST_CASE("census ordering: a redelivery never compares or rewrites the pair",
     }
 }
 
-TEST_CASE("census ordering: an applied event whose pair equals the row's pair is flagged (F8)",
+TEST_CASE("census ordering: an event whose pair equals the row's pair is refused and flags the row "
+          "(F8)",
           "[pg][guaranteed_state_store][db][census][ordering][pair]") {
-    // Two processes of one agent under one boot epoch can send the same pair. PR A has no
-    // comparator, so the v4 rule applies the later key. v5's extended legacy-write trigger flags
-    // a state change that leaves a NON-NULL pair unchanged, where v4 leaves the row clean. This is
-    // a change of the FLAG, never of the VERDICT: the verdict, key and marks below are v4's.
+    // Two processes of one agent under one boot epoch can send the same pair. The census
+    // comparator refuses the equal pair (the second process's event) and flags the row, folding
+    // the refused key into the mark; the verdict stays. (v5's extended legacy-write trigger flags a
+    // state change that leaves a NON-NULL pair unchanged; no applied event does that any more, it
+    // remains for an earlier build's write.)
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -3451,7 +3469,7 @@ TEST_CASE("census ordering: an applied event whose pair equals the row's pair is
     CHECK(census(db.dsn(), "a", "r2") ==
           "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
 
-    // Control: a pair that MOVES with the verdict is clean.
+    // Control: a pair that MOVES with the verdict is clean, and a clean pair apply raises no mark.
     REQUIRE(store
                 .insert_event_classified(
                     with_pair(ev("m1", "r1", "a", kCompliant, kBase + 100), 5, 10))
@@ -3460,10 +3478,9 @@ TEST_CASE("census ordering: an applied event whose pair equals the row's pair is
                 .insert_event_classified(
                     with_pair(ev("m2", "r1", "a", kDrifted, kBase + 200), 5, 11))
                 .outcome == EventInsertOutcome::Inserted);
-    CHECK(census(db.dsn(), "a", "r1") ==
-          "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|false");
+    CHECK(census(db.dsn(), "a", "r1") == "drifted|" + key_str(kBase + 200) + "|-|false");
 
-    // The F8 shape: the later key applies (v4 verdict) with the SAME pair as the row.
+    // The F8 shape: a later key with the SAME pair as the row is refused and flagged.
     REQUIRE(store
                 .insert_event_classified(
                     with_pair(ev("f1", "r1", "b", kCompliant, kBase + 100), 5, 10))
@@ -3473,7 +3490,7 @@ TEST_CASE("census ordering: an applied event whose pair equals the row's pair is
                     with_pair(ev("f2", "r1", "b", kDrifted, kBase + 200), 5, 10))
                 .outcome == EventInsertOutcome::Inserted);
     CHECK(census(db.dsn(), "b", "r1") ==
-          "drifted|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
+          "compliant|" + key_str(kBase + 100) + "|" + key_str(kBase + 200) + "|true");
     CHECK(census_pair_text(db.dsn(), "b", "r1") == "5/10");
 }
 
@@ -3652,17 +3669,18 @@ TEST_CASE("census ordering: a lower sequence in the live epoch is a straggler th
     send("e3", 300, 5, 9); // below the mark
     CHECK(order_text(db.dsn(), "a") == "5|11|-|0|0|0|1|0|0|0");
     CHECK(order_recv_ns(db.dsn(), "a") == clock);
-    send("e4", 400, 5, 11); // equal to the mark is not above it
-    CHECK(order_text(db.dsn(), "a") == "5|11|-|0|0|0|2|0|0|0");
+    send("e4", 400, 5, 11); // equal to the mark is not above it, and equal to the row's pair:
+                            // a refused duplicate, counted on the agent's pair_duplicates
+    CHECK(order_text(db.dsn(), "a") == "5|11|-|0|0|0|2|0|1|0");
     CHECK(order_recv_ns(db.dsn(), "a") == clock);
 
     send("e5", 500, 5, 12); // above the mark: current, refreshes
-    CHECK(order_text(db.dsn(), "a") == "5|12|-|0|0|0|2|0|0|0");
+    CHECK(order_text(db.dsn(), "a") == "5|12|-|0|0|0|2|0|1|0");
     CHECK(query_scalar(db.dsn(), std::string("SELECT epoch_recv_ns > ") + clock + " FROM " +
                                      kSchema + ".guardian_agent_order WHERE agent_id = 'a'") ==
           "t");
     send("e6", 600, 6, 1); // a higher epoch is current whatever its sequence
-    CHECK(order_text(db.dsn(), "a") == "6|1|-|0|0|0|2|0|0|0");
+    CHECK(order_text(db.dsn(), "a") == "6|1|-|0|0|0|2|0|1|0");
 }
 
 TEST_CASE("census ordering: a lower epoch is refused while the clock is fresh, re-bases after the "
@@ -3753,6 +3771,12 @@ TEST_CASE("census ordering: the pair clock is fresh up to an hour old and five m
                      "::bigint * 1000000000, unpaired_events = 0, unpaired_held = 0, "
                      "pair_regressions = 0, pair_stragglers = 0, pair_recoveries = 0, "
                      "pair_duplicates = 0, retired_events = 0 WHERE agent_id = 'a'");
+        // The census row's pair too: an earlier probe's stale-clock event re-bases the row to
+        // (5,9) (or leaves it unpaired), and a later (5,9) probe would then equal the row's pair
+        // and count as a duplicate. Every probe meets the same (5,10) row.
+        exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
+                               ".guardian_agent_rule_status SET boot_epoch = 5, emit_seq = 10 "
+                               "WHERE agent_id = 'a' AND rule_id = 'r1'");
         ++n;
         auto e = ev("p" + std::to_string(n), "r1", "a", kDrifted, kBase + 1000 + 100 * n);
         if (paired)
