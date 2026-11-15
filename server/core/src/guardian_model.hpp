@@ -52,7 +52,9 @@ class BaselineStore;
 /// by `errored_rule_count` (INV-3) — never a C++ post-filter. `total_rules`
 /// is the global rule-catalogue size and is NEVER confined (a rule has no
 /// agent/management-group dimension of its own). Returns `nullopt` on a
-/// degraded `rule_names()`/`errored_rule_count()` read.
+/// degraded `rule_names()`/`errored_rule_count()`/`uncertain_rule_count()`/`unordered_agents()` read.
+/// `unordered_agents`/`unordered_agent_ids` (the stored emit-order pair state, UP-14) are confined by
+/// the same `agent_scope`, in SQL: a hidden agent is in neither the count nor the ids.
 std::optional<GuardianStatusRollup>
 guardian_status_rollup(GuaranteedStateStore& store,
                        const std::optional<std::vector<std::string>>& agent_scope);
@@ -126,15 +128,16 @@ guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& 
 /// no census row, `unrepresented_pending_for_agent`, #7217) as a count plus a
 /// capped id list, separate from `guards`.
 ///
-/// Three reads, issued in this order: `unrepresented_pending_for_agent`, then
-/// `agent_rule_statuses_for_agent`, then `rule_names_for`. The unrepresented read goes FIRST
+/// Four reads, issued in this order: `unrepresented_pending_for_agent`, then
+/// `agent_rule_statuses_for_agent`, then `rule_names_for`, then `agent_order_for_agent` (the
+/// device's stored emit-order pair state, `ordering`; no row is `nullopt`, not a failure). The unrepresented read goes FIRST
 /// (#7217), so that a pair repaired between the two reads can then only appear in BOTH
 /// categories (a harmless over-report), never in neither. The reads are NOT one atomic snapshot:
 /// a pair may appear both in `guards` and in the unrepresented list for one request after a
 /// concurrent repair, and the counts are exact per read, not a joint snapshot.
 ///
 /// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
-/// `rule_names_for()`/`unrepresented_pending_for_agent()` read — caller MUST
+/// `rule_names_for()`/`unrepresented_pending_for_agent()`/`agent_order_for_agent()` read — caller MUST
 /// refuse to render (503 on REST), never render an empty list as "this device
 /// has no guards". `fault` (may be null) is set to `kNone` on entry and, on a
 /// `nullopt` return, to `kStatementTimeout` when the unrepresented read ran past its time budget

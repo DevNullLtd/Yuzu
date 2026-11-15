@@ -186,7 +186,11 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **Known asymmetry on the lookup fields (SAM-17).** The eight lookup fields of `GET /api/v1/inventory/software` rows (`hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`, `install_location`, `instance_key`), its `match`, `version_min`, `version_max` and `status` filters and its `totals` block are REST-only: `query_installed_software` keeps the 14 package fields until its twin is widened (SAM-21). The row stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by issue #7396 (revisit by 2026-12-31); the exception is recorded as the 2026-11-09 entry of the exception ledger in `docs/adr/1005-headless-platform-use-case-engines.md`, which also absorbs the `#5699` filter asymmetry above.
 
+**Known asymmetry on purl and vers (SAM-43).** The `purl` field of `GET /api/v1/inventory/software` rows (and the 23rd CSV column), its `purl` and `vers` filters and the `vers` filter of `GET /api/v1/inventory/software/components` are REST-only: `query_installed_software` keeps its 14 package fields and five arguments, as for the SAM-17 lookup fields above. The row stays `twinned` on the paged shape; the gap is recorded here so it is not silent. Tracked by issue #7749 (revisit by 2026-12-31), which rides with #7396 (the twin of the SAM-17 lookup fields); the exception is recorded as the 2026-11-14 entry of the exception ledger in `docs/adr/1005-headless-platform-use-case-engines.md`.
+
 **New REST route with its MCP twin pending (SAM-17).** `GET /api/v1/inventory/software/components` (components found inside applications: instances, devices, last poll, status) is a REST v1 capability whose MCP twin is built by SAM-21. The ledger keys no row on it: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (it is in `paths`). The pending twin is recorded here so it is not silent, and in the same 2026-11-09 ADR-1005 exception entry (revisit by 2026-12-31).
+
+**New REST routes with their MCP twins pending.** `GET /api/v1/inventory/software/hosts`, `GET /api/v1/inventory/software/hosts/{agent_id}`, `GET /api/v1/inventory/software/changes`, `GET /api/v1/inventory/software/summary` and `GET /api/v1/inventory/software/plugin-health` (per-host collection health, the install-change feed, the fleet summary and per-collector health) are REST v1 capabilities with no MCP tool yet. The ledger keys no row on them: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (each is in `paths`). The pending twins are tracked by issue #7765, which rides with #7396, and are recorded here so they are not silent.
 
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
@@ -221,7 +225,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | viz | 2 | 2 | 0 |
 | executions | 6 | 0 | 6 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 27 | 16 | 11 |
+| instructions | 27 | 22 | 5 |
 | compliance-policy | 22 | 5 | 17 |
 | settings | 30 | 11 | 19 |
 | rbac | 17 | 6 | 11 |
@@ -232,12 +236,12 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | ota | 15 | 1 | 14 |
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
-| other | 82 | 31 | 51 |
-| **Total** | **351** | **147** | **204** |
+| other | 82 | 34 | 48 |
+| **Total** | **351** | **156** | **195** |
 
-Registered `/api/vN/*` routes: 287. OpenAPI `paths` entries: 286. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 220.
+Registered `/api/vN/*` routes: 301. OpenAPI `paths` entries: 300. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 229.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 204. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 78.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 195. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 69.
 
 <!-- END GENERATED -->
 

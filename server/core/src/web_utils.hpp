@@ -167,6 +167,52 @@ inline std::string html_escape(const std::string& s) {
     return out;
 }
 
+/// The code point of a bidirectional-control or zero-width character starting at `s[i]`, or 0 when
+/// none does. The list is final and deliberately narrow: U+061C, U+200B-U+200F, U+202A-U+202E,
+/// U+2060-U+2064, U+2066-U+2069 and U+FEFF. Ordinary spaces (U+00A0, U+3000, U+2000-U+200A, U+2028,
+/// U+2029) are legitimate in names and are not on it. Reads at most three bytes and never past the
+/// end, so a truncated or malformed sequence is simply "none".
+[[nodiscard]] inline std::uint32_t invisible_code_point_at(const std::string& s, std::size_t i) {
+    const auto b = [&](std::size_t k) { return static_cast<unsigned char>(s[i + k]); };
+    const std::size_t left = s.size() - i;
+    if (b(0) == 0xD8 && left >= 2 && b(1) == 0x9C)
+        return 0x061C;
+    if (b(0) == 0xE2 && left >= 3) {
+        const unsigned lead = b(1);
+        const unsigned tail = b(2);
+        if (lead == 0x80 && ((tail >= 0x8B && tail <= 0x8F) || (tail >= 0xAA && tail <= 0xAE)))
+            return 0x2000u + (tail & 0x3Fu);
+        if (lead == 0x81 && ((tail >= 0xA0 && tail <= 0xA4) || (tail >= 0xA6 && tail <= 0xA9)))
+            return 0x2040u + (tail & 0x3Fu);
+    }
+    if (b(0) == 0xEF && left >= 3 && b(1) == 0xBB && b(2) == 0xBF)
+        return 0xFEFF;
+    return 0;
+}
+
+/// `html_escape` for a TEXT NODE that prints an agent-reported or stored name: each bidirectional
+/// control or zero-width character (see `invisible_code_point_at`) is printed as the visible text
+/// `<U+XXXX>` (escaped, so it shows as `&lt;U+202E&gt;`). Marked, never stripped: stripping would
+/// make two different names print identically. Never use this inside a tag: an attribute value the
+/// browser sends back (a form value, a search box) must keep its raw bytes.
+[[nodiscard]] inline std::string html_escape_marked(const std::string& s) {
+    // Every listed character starts with 0xD8, 0xE2 or 0xEF; without one there is nothing to mark.
+    if (s.find_first_of("\xD8\xE2\xEF") == std::string::npos)
+        return html_escape(s);
+    std::string work;
+    work.reserve(s.size() + 16);
+    for (std::size_t i = 0; i < s.size();) {
+        const std::uint32_t cp = invisible_code_point_at(s, i);
+        if (cp == 0) {
+            work += s[i++];
+            continue;
+        }
+        work += std::format("<U+{:04X}>", cp);
+        i += cp == 0x061C ? 2 : 3;
+    }
+    return html_escape(work);
+}
+
 /// Percent-encode `s` for use as ONE URL path segment (RFC 3986): everything
 /// outside the unreserved set (`A-Za-z0-9-._~`) becomes `%XX`, so `/`, `?`,
 /// `#`, `%`, `&`, `;` and every non-ASCII byte can never end the segment or
