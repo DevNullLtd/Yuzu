@@ -1112,8 +1112,9 @@ nft_load() {
     esac
     # Not the boundary: a link or a non-regular file is refused here, but the file can change
     # between these tests and the open below. The boundary is nft_apply, which reads the one opened
-    # file and gives nft only text it built itself. A FIFO present at the tests is refused; one put
-    # there after them blocks the open until a writer appears.
+    # file and gives nft only text it built itself. A FIFO present at the tests is refused; a FIFO
+    # or device node put there after them is opened with whatever side effects opening it has, and
+    # a FIFO blocks the open until a writer appears.
     if [ -L "$path" ] || [ ! -f "$path" ]; then
         refuse
     fi
