@@ -7,13 +7,13 @@
  *
  * WHAT IT DOES. For each seed the harness generates a delivery schedule (first deliveries, lost
  * events replayed as 0/0, failed census writes, redeliveries), runs it through a C++ port of the
- * delivery plan's executable model, then replays the SAME schedule through the real
+ * executable model of the regime machine, then replays the SAME schedule through the real
  * GuaranteedStateStore one delivery at a time. After EVERY delivery it compares the model's
  * census rows, pending set and agent order row (epoch, sequence mark, retired epoch, all seven
  * counters) with the database's, and the decision label the delivery counted. The model is the
  * oracle: a mismatch is a disagreement between the model and the SQL for the reader to
  * adjudicate, and no expectation here is loosened to make a seed pass. Because equality is
- * checked after every delivery, the plan's per-arrival invariants (no apply reversal, a clean
+ * checked after every delivery, the model's per-arrival invariants (no apply reversal, a clean
  * paired row holds the greatest pair, truth != row implies flagged) hold of the SQL exactly where
  * they hold of the model.
  *
@@ -42,8 +42,8 @@
  * regenerate it with that script, never edit a digest by hand.
  *
  * SEEDS AND REPLAY. A seed is the Python seed, so seed 17 here is `random.Random(17)` there.
- *   YUZU_TEST_PAIR_HARNESS_SEEDS=N  runs seeds 0..N-1 (default 64; the plan's campaigns use
- *                                   thousands, widen for a mutation hunt)
+ *   YUZU_TEST_PAIR_HARNESS_SEEDS=N  runs seeds 0..N-1 (default 64; a campaign of
+ *                                   thousands of seeds, or a mutation hunt, widens it)
  *   YUZU_TEST_PAIR_HARNESS_ONLY=S   runs seed S alone, with the full schedule printed
  * To replay a failure: YUZU_TEST_POSTGRES_DSN=... YUZU_TEST_PAIR_HARNESS_ONLY=<seed> \
  *   yuzu_server_tests "census pair harness: seeds replayed through the store*"
@@ -1052,7 +1052,7 @@ struct AgentStepLockWait {
 constexpr const char* kCompliant = "guard.compliant";
 constexpr const char* kErrored = "guard.unhealthy";
 
-// The census pair decision metric (plan 2.6): a closed set of ten labels, from the census SQL.
+// The census pair decision metric: a closed set of ten labels, from the census SQL.
 constexpr const char* kDecisionCounter = "yuzu_server_guardian_census_pair_decisions_total";
 constexpr std::array<const char*, 10> kDecisionLabels = {
     "applied_pair",       "applied_key",     "transition_to_pair", "transition_to_key",

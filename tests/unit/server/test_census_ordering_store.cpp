@@ -1677,8 +1677,8 @@ TEST_CASE("census ordering: two concurrent first deliveries to one pair match th
 TEST_CASE(
     "census ordering: a state change that did not come from this version's upsert flags the row",
     "[pg][guaranteed_state_store][db][census][ordering][k]") {
-    // UP-2: an earlier build's census write changes state/updated_at and leaves the ordering tuple
-    // alone. The trigger flags it; this version's own writes are not flagged by it.
+    // UP-2: a hand edit changes state/updated_at and leaves the ordering tuple alone. The trigger
+    // flags it; this version's own writes are not flagged by it.
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
@@ -1692,7 +1692,7 @@ TEST_CASE(
 
     exec_sql(db.dsn(), std::string("UPDATE ") + kSchema +
                            ".guardian_agent_rule_status SET state = 'compliant', updated_at = "
-                           "'2026-01-01T00:00:00Z'"); // what the previous build's upsert does
+                           "'2026-01-01T00:00:00Z'"); // a direct edit, ordering tuple untouched
     CHECK(census(db.dsn(), "a", "r1") ==
           "compliant|" + key_str(kBase + 200) + "|" + key_str(kBase + 200) + "|true");
 }
@@ -3453,7 +3453,7 @@ TEST_CASE("census ordering: an event whose pair equals the row's pair is refused
     // comparator refuses the equal pair (the second process's event) and flags the row, folding
     // the refused key into the mark; the verdict stays. (v5's extended legacy-write trigger flags a
     // state change that leaves a NON-NULL pair unchanged; no applied event does that any more, it
-    // remains for an earlier build's write.)
+    // remains as a tripwire for a hand edit.)
     YUZU_REQUIRE_PG_DB_TPL(db, ordering_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);

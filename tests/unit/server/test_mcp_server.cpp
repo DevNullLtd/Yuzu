@@ -53370,7 +53370,7 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
 // ── UP-14 server PR A5a: the stored per-agent ordering state on the two MCP twins ──
 // get_guardian_status gains unordered_agents / unordered_agent_ids (scoped by the same
 // require_list_read gate as errored_rules); get_guardian_device_guards gains the `ordering` block.
-// Stored and counted, not yet compared.
+// The census verdicts the pair decides are pinned in test_census_pair_order.cpp.
 namespace {
 
 void mcp_seed_paired(GuaranteedStateStore& store, const std::string& event_id,

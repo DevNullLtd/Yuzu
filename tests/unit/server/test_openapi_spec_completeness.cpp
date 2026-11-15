@@ -2401,8 +2401,8 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
 }
 
 // UP-14 server PR A5a: the stored per-agent ordering state. The key sets are pinned above; this
-// pins each new property's type, nullability and bound, and that the description says the pair is
-// stored and counted, not yet compared.
+// pins each new property's type, nullability and bound, and that the description says the server
+// orders a census verdict by the pair (the pre-B "not yet compared" wording is gone).
 TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bounded and described",
           "[openapi][guardian][ordering][pair]") {
     for (const bool with_guides : {false, true}) {
