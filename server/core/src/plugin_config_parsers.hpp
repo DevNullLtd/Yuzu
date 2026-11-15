@@ -242,15 +242,6 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
-/// True iff the row is a plugin-level one for a plugin that declares ordinary actions beside its
-/// protective ones, so the row exempts the protective actions yet still gates the rest (today only
-/// `firewall`: `state` and `rules`). The audit label says `partial` for it, so a post-mortem cannot
-/// read the row as a complete exemption. A plugin that declares only protective actions
-/// (`quarantine`, `__guard__`) is fully exempt, and so is any action-level row.
-[[nodiscard]] inline bool kill_switch_row_partly_covers_protective(const KillSwitchScope& scope) {
-    return scope.action.empty() && yuzu::protective::detail::iequals(scope.plugin, "firewall");
-}
-
 /// Reason cap — an operator-entered free-text explanation for a kill-switch
 /// flip. Capped so a pathological submission can't bloat the audit/kill-
 /// switch row indefinitely; control characters other than tab rejected (it renders in an
@@ -281,9 +272,15 @@ inline constexpr std::size_t kListRowCap = 5000;
 [[nodiscard]] inline std::string kill_switch_set_detail(const KillSwitchScope& scope, bool enabled,
                                                         std::string_view reason = {}) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
-    if (kill_switch_row_covers_protective(scope))
-        detail += kill_switch_row_partly_covers_protective(scope) ? ", protective_exempt=partial"
-                                                                  : ", protective_exempt=true";
+    if (kill_switch_row_covers_protective(scope)) {
+        // A plugin-level row for a plugin that also declares ordinary actions (today only `firewall`:
+        // `state`, `rules`) exempts the protective ones yet still gates the rest: `partial`, so a
+        // post-mortem cannot read it as a complete exemption. `quarantine` and `__guard__` declare
+        // only protective actions, and an action-level row is exact: both stay `true`.
+        const bool partial =
+            scope.action.empty() && yuzu::protective::detail::iequals(scope.plugin, "firewall");
+        detail += partial ? ", protective_exempt=partial" : ", protective_exempt=true";
+    }
     if (!reason.empty()) {
         std::size_t keep = reason.size() < kMaxReasonBytes ? reason.size() : kMaxReasonBytes;
         // A continuation byte (10xxxxxx) at the cut means the cut tears a sequence: back up.
