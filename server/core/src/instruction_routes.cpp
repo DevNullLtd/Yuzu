@@ -374,6 +374,14 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 // Normalize action to lowercase
                 for (auto& c : def.action)
                     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                // Restating the stored value in another case is not a change: keep the stored
+                // spelling (a legacy row may hold a mixed-case action), so it neither rewrites the
+                // column nor clears a stored YAML below.
+                std::string stored_lower = (*existing_result)->action;
+                for (auto& c : stored_lower)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (def.action == stored_lower)
+                    def.action = (*existing_result)->action;
             }
             if (j.contains("description"))
                 def.description = j["description"].get<std::string>();
@@ -1175,6 +1183,12 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // A canonical definition names itself via metadata.id — honor
             // it (the store 409s on conflict), matching bundled-importer
             // semantics; without one the store generates an id.
+            // The plugin / action identifier rule validate-yaml and the v1 YAML save apply, on a
+            // CREATE only (an update keeps a stored row with an odd value editable).
+            if (auto err = check_yaml_dispatch_fields(fields)) {
+                respond("Create failed: " + *err, false);
+                return;
+            }
             def.id = fields.id;
             auto result = deps.store->create_definition(def);
             if (!result) {

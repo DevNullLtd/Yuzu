@@ -2,9 +2,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <utility>
+
 namespace yuzu::server::data_export {
 
-std::string json_array_to_csv(const std::string& json_str) {
+CsvResult json_array_to_csv_checked(const std::string& json_str, std::size_t max_output_bytes) {
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded() || !parsed.is_array() || parsed.empty()) {
         return {};
@@ -21,7 +24,7 @@ std::string json_array_to_csv(const std::string& json_str) {
         return {};
 
     std::string csv;
-    csv.reserve(json_str.size());
+    csv.reserve(std::min(json_str.size(), max_output_bytes));
 
     // Header row
     for (size_t i = 0; i < columns.size(); ++i) {
@@ -51,9 +54,17 @@ std::string json_array_to_csv(const std::string& json_str) {
             }
         }
         csv += "\r\n";
+        // Stop at the first row that crosses the limit: the output is bounded by it, not by how
+        // many columns the first object named times how many rows follow.
+        if (csv.size() > max_output_bytes)
+            return {CsvStatus::kTooLarge, {}};
     }
 
-    return csv;
+    return {CsvStatus::kOk, std::move(csv)};
+}
+
+std::string json_array_to_csv(const std::string& json_str) {
+    return json_array_to_csv_checked(json_str).csv;
 }
 
 } // namespace yuzu::server::data_export

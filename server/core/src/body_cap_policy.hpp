@@ -254,6 +254,15 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // Bodyless GET/DELETE on this prefix are unaffected: the measurability
     // rule fires only for POST/PUT/PATCH (web_utils.hpp body_unmeasurable).
     {kBodyCapAnyMethod, "/api/v1/uploads", 8u * 1024 * 1024, true, "upload_session", kJsonValuesOff},
+    // POST /api/v1/uploads/{id}/commit — the one JSON body under the upload subtree: `{"sha256":
+    // "<hex>"}` (file_retrieval_routes.cpp parses it with nlohmann::json). The row above matches by
+    // prefix and admits 8 MiB of CHUNK bytes for any method, so without this one the commit POST
+    // inherited 8 MiB with no value budget: a body of `[],[],...` built a tree 16 to 27 times its size
+    // (#2146 review). 4 KiB is generous for a 64-hex-digit field, which bounds the tree at about
+    // 100 KB, so no value budget is needed (a cap at or below 1 MiB is not scanned). POST only: the
+    // chunk PUT keeps the row above. The trailing slash keeps the exact `POST /api/v1/uploads`
+    // (session open, headers only) on that row (the longer prefix wins).
+    {"POST", "/api/v1/uploads/", 4u * 1024, false, "upload_commit", kJsonValuesOff},
     // /api/v1/plugin-config — the PR1.5 config/secret/kill-switch plane. The
     // store's own grammar caps a config value at 8 KiB and a secret plaintext
     // at 64 KiB (plugin_config_parsers.hpp kMaxConfigValueBytes/

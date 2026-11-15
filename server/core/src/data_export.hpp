@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -68,6 +69,25 @@ inline std::string csv_escape(const std::string& field) {
 
 // Convert a JSON array string to CSV.  Expects a JSON array of objects
 // with uniform keys.  Returns CSV with header row.
+/// The most bytes of CSV one export may produce. The input is capped (16 MiB, and a value budget),
+/// but the OUTPUT is not bounded by either: a first object with thousands of keys followed by
+/// hundreds of thousands of `{}` rows is a few MiB of JSON and gigabytes of commas (a comma per
+/// column per row). 64 MiB is four times the input cap, far above a real export's size.
+inline constexpr std::size_t kMaxCsvOutputBytes = 64u * 1024 * 1024;
+
+enum class CsvStatus { kOk, kInvalid, kTooLarge };
+struct CsvResult {
+    CsvStatus status{CsvStatus::kInvalid};
+    std::string csv;
+};
+
+/// Convert a JSON array of objects to CSV. `kInvalid`: not a non-empty array whose first element is
+/// a non-empty object. `kTooLarge`: the CSV would exceed `max_output_bytes`; the build stops at the
+/// first row that crosses it, so the memory is bounded by the limit, not by the input's shape.
+CsvResult json_array_to_csv_checked(const std::string& json_str,
+                                    std::size_t max_output_bytes = kMaxCsvOutputBytes);
+
+/// The CSV text, empty for an invalid or oversized input (see `json_array_to_csv_checked`).
 std::string json_array_to_csv(const std::string& json_str);
 
 } // namespace yuzu::server::data_export

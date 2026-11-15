@@ -633,6 +633,72 @@ TEST_CASE("instruction_routes: PUT with an empty plugin is refused 400 and the s
     CHECK(same->status == 200);
 }
 
+// Review fix: the legacy PUT lowercases a supplied `action`, so restating a stored MIXED-CASE action
+// (a legacy row) compared as a change, rewrote the column and cleared the stored YAML. Restating the
+// stored value in any case is not a change. Turns red if the handler goes back to comparing the
+// lowercased value with the stored spelling.
+TEST_CASE("instruction_routes: legacy PUT restating a stored mixed-case action keeps the column and "
+          "the stored YAML",
+          "[pg][server][routes][instruction_routes][yaml-merge]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.put.case\n  displayName: Put Case\nspec:\n  plugin: "
+        "os_info\n  action: os_name\n  type: question\n";
+    auto create = h.sink.Post("/api/instructions/yaml", "yaml_source=" + url_encode_form(yaml),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    const std::string id = "test.route.put.case";
+    REQUIRE((*w.store.get_definition(id)).has_value());
+    const std::string yaml_stored = (**w.store.get_definition(id)).yaml_source;
+    REQUIRE_FALSE(yaml_stored.empty());
+    // A legacy row with a mixed-case action (the create path lowercases, so set it directly).
+    {
+        pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        REQUIRE(pg::exec_params(c.get(),
+                                "UPDATE instruction_store.instruction_definitions SET action = "
+                                "'OS_Name' WHERE id = $1",
+                                std::vector<std::string>{id})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE((**w.store.get_definition(id)).action == "OS_Name");
+    // Restating the stored action in another case: nothing changes, the YAML stays.
+    auto put = h.sink.Put("/api/instructions/" + id, json{{"action", "OS_NAME"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    const auto after = **w.store.get_definition(id);
+    CHECK(after.action == "OS_Name");
+    CHECK(after.yaml_source == yaml_stored);
+}
+
+// Review fix: the dashboard YAML save's CREATE applies the plugin / action identifier rule that
+// validate-yaml and the v1 YAML save apply (an update keeps a stored odd row editable).
+TEST_CASE("instruction_routes: the YAML save refuses a create whose plugin breaks the identifier rule",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    const std::string yaml =
+        "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  "
+        "id: test.route.yaml.badplugin\n  displayName: Bad Plugin\nspec:\n  plugin: "
+        "\"a b;c\"\n  action: os_name\n  type: question\n";
+    auto r = h.sink.Post("/api/instructions/yaml", "yaml_source=" + url_encode_form(yaml),
+                         "application/x-www-form-urlencoded");
+    REQUIRE(r);
+    CHECK(r->body.find("Create failed") != std::string::npos);
+    CHECK(r->body.find("plugin") != std::string::npos);
+    auto stored = w.store.get_definition("test.route.yaml.badplugin");
+    REQUIRE(stored.has_value());
+    CHECK_FALSE(stored->has_value());
+}
+
 // UP-5 on the legacy route (Gate 8 F2). Turns red if the legacy PUT handler stops calling
 // clear_stale_yaml_source (the YAML stays stale and a later dashboard YAML round trip reverts the
 // edit), or if the predicate grows `enabled` back (the first section).

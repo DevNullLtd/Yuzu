@@ -231,8 +231,15 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto csv = data_export::json_array_to_csv(req.body);
-        if (csv.empty()) {
+        auto csv = data_export::json_array_to_csv_checked(req.body);
+        if (csv.status == data_export::CsvStatus::kTooLarge) {
+            res.status = 413;
+            res.set_content(
+                R"({"error":{"code":413,"message":"the CSV would exceed 64 MiB; split the export into several requests"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        if (csv.status != data_export::CsvStatus::kOk || csv.csv.empty()) {
             res.status = 400;
             res.set_content(
                 R"({"error":{"code":400,"message":"invalid JSON array"},"meta":{"api_version":"v1"}})",
@@ -240,7 +247,7 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
-        res.set_content(csv, "text/csv; charset=utf-8");
+        res.set_content(csv.csv, "text/csv; charset=utf-8");
     });
 
     // -- Scope API --------------------------------------------------------

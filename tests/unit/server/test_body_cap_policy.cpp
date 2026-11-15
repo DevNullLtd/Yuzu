@@ -22,6 +22,7 @@
 #include "body_cap_policy.hpp"
 #include "dex_score_policy_form.hpp"
 #include "post_read_stage_test_support.hpp"
+#include "data_export.hpp"
 #include "json_value_budget.hpp"
 #include "step_up_wiring.hpp"
 #include "raw_close_probe.hpp"
@@ -115,7 +116,9 @@ constexpr ExpectedResolution kExpected[] = {
     // cancel DELETE, session-open POST on the bare prefix) share the class.
     {"PUT",    "/api/v1/uploads/abc123/chunk",            8u * 1024 * 1024,   true,  "upload_session"},
     {"POST",   "/api/v1/uploads",                          8u * 1024 * 1024,  true,  "upload_session"},
-    {"POST",   "/api/v1/uploads/abc123/commit",            8u * 1024 * 1024,  true,  "upload_session"},
+        // #2146 review: the commit POST's JSON body has its own 4 KiB class; the chunk PUT and the
+    // session open keep the 8 MiB upload_session row.
+    {"POST",   "/api/v1/uploads/abc123/commit",           4u * 1024,          false, "upload_commit"},
     // body_cap_policy.hpp plugin_config row — the PR1.5 config/secret/
     // kill-switch plane. 256 KiB = the 64 KiB secret-plaintext grammar cap
     // (plugin_config_parsers.hpp) plus JSON framing headroom.
@@ -286,6 +289,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "json_to_csv_export",
     "result_sets",
     "workflow_execute",
+    "upload_commit",
     "nvd_match",
     "ca_import_chain",
     "ca_issue_code_signing",
@@ -481,7 +485,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // software_collection_settings(1: the collection settings subtree) + default(1).
     // + result_sets(1: POST /api/v1/result-sets, the 200000-value budget of device_ids).
     // + workflow_execute(1: POST under /api/workflows/, the execute subtree, 4 MiB and 30000 values).
-    CHECK(std::size(kBodyCapTable) == 44);
+    // + upload_commit(1: POST under /api/v1/uploads/, the commit's small JSON body, 4 KiB).
+    CHECK(std::size(kBodyCapTable) == 45);
 }
 
 // The dex_score_policy_form row is derived from the document's own limits (body_cap_policy.hpp),
@@ -1427,6 +1432,62 @@ TEST_CASE("resolve_body_cap: the JSON value budgets of the named classes",
     CHECK(resolve_body_cap("POST", "/api/workflows/wf_abc/execute").max_body_bytes ==
           4u * 1024 * 1024);
     CHECK(resolve_body_cap("POST", "/api/no/such/route").max_json_values == kJsonValuesDefault);
+}
+
+// The upload commit POST parses a `{"sha256": ...}` body with nlohmann::json; the `/api/v1/uploads`
+// row admits 8 MiB of chunk bytes for any method and has no value budget, so the commit POST has its
+// own 4 KiB class (#2146 review). The chunk PUT and the session open keep the 8 MiB row.
+TEST_CASE("resolve_body_cap: the upload commit POST has its own small class; the chunk PUT does not",
+          "[body_cap][json_budget]") {
+    const auto commit = resolve_body_cap("POST", "/api/v1/uploads/0123abcd/commit");
+    CHECK(commit.path_class == "upload_commit");
+    CHECK(commit.max_body_bytes == 4u * 1024);
+    CHECK(resolve_body_cap("PUT", "/api/v1/uploads/0123abcd/chunk").path_class == "upload_session");
+    CHECK(resolve_body_cap("PUT", "/api/v1/uploads/0123abcd/chunk").max_body_bytes ==
+          8u * 1024 * 1024);
+    CHECK(resolve_body_cap("POST", "/api/v1/uploads").path_class == "upload_session");
+    // A hostile 8 MiB body of [],[],... is refused for its size before any handler parses it.
+    yuzu::MetricsRegistry metrics;
+    httplib::Request req;
+    req.method = "POST";
+    req.path = "/api/v1/uploads/0123abcd/commit";
+    req.body.assign(5u * 1024, 'x');
+    httplib::Response res;
+    const yuzu::server::StepUpChokepointDeps deps{.metrics = &metrics};
+    CHECK(yuzu::server::detail::run_post_read_stage(req, res, deps) ==
+          httplib::Server::HandlerResponse::Handled);
+    CHECK(res.status == 413);
+}
+
+// json_array_to_csv: the OUTPUT is bounded by a byte limit, not only the input by a size cap and a
+// value budget. A first object with thousands of keys followed by many `{}` rows is a few MiB of JSON
+// and gigabytes of commas (a comma per column per row); the build stops at the first row over the
+// limit.
+TEST_CASE("data_export::json_array_to_csv_checked: a wide header with many empty rows is refused "
+          "at the output limit, and an ordinary export is not",
+          "[body_cap][json_budget][export]") {
+    using yuzu::server::data_export::CsvStatus;
+    using yuzu::server::data_export::json_array_to_csv_checked;
+    std::string wide = "[{";
+    for (int i = 0; i < 5000; ++i)
+        wide += std::string(i ? "," : "") + "\"k" + std::to_string(i) + "\":1";
+    wide += "}";
+    for (int i = 0; i < 20000; ++i)
+        wide += ",{}"; // 20000 rows x 5000 columns = about 100 MB of commas at the default limit
+    wide += "]";
+    const auto big = json_array_to_csv_checked(wide);
+    CHECK(big.status == CsvStatus::kTooLarge);
+    CHECK(big.csv.empty());
+    // An explicit small limit refuses a small output the same way.
+    CHECK(json_array_to_csv_checked(R"([{"a":"x","b":"y"},{"a":"1","b":"2"}])", 8).status ==
+          CsvStatus::kTooLarge);
+    // Ordinary exports pass; the plain wrapper keeps its contract (empty for invalid input).
+    const auto ok = json_array_to_csv_checked(R"([{"a":"x","b":"y"},{"a":"1","b":"2"}])");
+    CHECK(ok.status == CsvStatus::kOk);
+    CHECK(ok.csv == "a,b\r\nx,y\r\n1,2\r\n");
+    CHECK(json_array_to_csv_checked("not json").status == CsvStatus::kInvalid);
+    CHECK(json_array_to_csv_checked("[]").status == CsvStatus::kInvalid);
+    CHECK(yuzu::server::data_export::json_array_to_csv("not json").empty());
 }
 
 TEST_CASE("json_exceeds_value_count: the shared raw-text counter",
