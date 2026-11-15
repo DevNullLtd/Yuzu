@@ -120,9 +120,10 @@ Caveats, all of which bound how these numbers may be used:
   applies a migration in a transaction).
 - Every `agent_id` comparison in the read is spelled `COLLATE "C"`: the cursor bound, the scope
   membership test, the single-device filter and the `ORDER BY`. The result is the byte order of
-  `agent_id`, which no library upgrade can change, and each page is an index scan. Correctness comes
-  from the `COLLATE` spelling; the index keeps the read from becoming a scan plus a sort per page
-  (about 317 ms a page at one million rows, measured as above).
+  `agent_id`, which no library upgrade can change. Correctness comes from the `COLLATE` spelling; the index makes
+  an index scan available for each page, and the plans measured on a representative table use it,
+  which keeps the read from becoming a scan plus a sort per page (about 317 ms a page at one million
+  rows, measured as above). The planner decides; nothing forces the plan.
 - At each start the server checks that the index exists with the byte-ordered definition and logs a
   WARN naming the manual statement when it does not. The read stays correct without it.
 

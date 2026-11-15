@@ -880,7 +880,9 @@ DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q)
     // Byte order, not the database collation: every `agent_id` comparison and the ORDER BY are
     // spelled `agent_id COLLATE "C"`. That keeps a collation change under the primary key's index
     // from making the walk skip or miss a row (a duplicate row that a write admitted through a stale
-    // primary key is a write-side residual and would still be served twice), from making the single-device read miss an
+    // primary key is a write-side residual: it may be served more than once, and a page boundary on
+    // a duplicated id can hide the extra copies because the cursor is strictly `agent_id > after`;
+    // at least one row per id is always served), from making the single-device read miss an
     // existing id (a plain `agent_id = $n` is served by that same primary key), and lets the
     // planner use the v4 expression index, which serves only a query spelling exactly this
     // expression. All four sites must keep it.
