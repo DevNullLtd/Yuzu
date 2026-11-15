@@ -193,8 +193,8 @@ enabling the SLE sources — deny-override wins).
   the agent-decommission cascade to an audited REST route that clears the nine stores in
   the cascade for a removed device (inventory, installed-software, device-CI, app-perf,
   detected-licence, app-usage, presence, fleet-certificate and Guardian compliance-census rows).
-  For the Guardian store, `deleted` means the device's census rows were erased and its pending
-  census evidence retired; the Guardian event log and DEX observations are not erased by the
+  For the Guardian store, `deleted` means the device's census rows and its per-agent emit-order
+  row were erased and its pending census evidence retired; the Guardian event log and DEX observations are not erased by the
   decommission. They are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Because it erases well beyond licences, it is gated on a
   single dedicated securable, **`Decommission:Delete`**, scoped to the device (ADR-0024 Decision 9,
   amended Wave 7 PR7.2; see [RBAC](rbac.md)). Administrator and ITServiceOwner hold it by default; a custom
