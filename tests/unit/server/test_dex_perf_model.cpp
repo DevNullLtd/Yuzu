@@ -377,6 +377,37 @@ TEST_CASE("perf fragment: cohort values are HTML-escaped (no stored XSS)",
     CHECK(html.find("&lt;script&gt;") != std::string::npos);
 }
 
+// #7535: a cohort key or value that carries a zero-width character prints a marker in its text and
+// keeps its raw bytes in every form value and URL, or the filter would stop matching its own cohort.
+TEST_CASE("perf fragment: a cohort option value keeps its raw bytes while its label is marked",
+          "[dex][perf][render][marking]") {
+    const std::string zwsp = "\xE2\x80\x8B";
+    DexPerfSnapshot snap;
+    snap.cohort_key = "mo" + zwsp + "del";
+    snap.available_keys = {snap.cohort_key};
+    for (int i = 0; i < 3; ++i)
+        snap.devices.push_back(dev("a-" + std::to_string(i), 10.0, 50.0, 1.0, "a" + zwsp));
+    for (int i = 0; i < 3; ++i)
+        snap.devices.push_back(dev("b-" + std::to_string(i), 40.0, 70.0, 3.0, "b"));
+    const auto html = render_dex_perf_fragment(snap, 7);
+    // The key picker's option: raw value, marked label.
+    CHECK(html.find("<option value=\"mo" + zwsp + "del\" selected>mo&lt;U+200B&gt;del</option>") !=
+          std::string::npos);
+    // The cohort's cell is marked, and its drill link carries the raw bytes.
+    CHECK(html.find(">a&lt;U+200B&gt;</button>") != std::string::npos);
+    CHECK(html.find("cohort_value=a%E2%80%8B") != std::string::npos);
+    // The A/B cohort pickers: raw option values, marked labels.
+    CHECK(html.find("<option value=\"a" + zwsp + "\"") != std::string::npos);
+    CHECK(html.find(">a&lt;U+200B&gt;</option>") != std::string::npos);
+    // Never inside a tag.
+    for (std::size_t at = html.find('<'); at != std::string::npos; at = html.find('<', at + 1)) {
+        const auto end = html.find('>', at);
+        REQUIRE(end != std::string::npos);
+        INFO(html.substr(at, end - at));
+        CHECK(html.substr(at, end - at).find("&lt;U+") == std::string::npos);
+    }
+}
+
 TEST_CASE("devices fragment: titles, escape, honest empty states", "[dex][perf][render]") {
     auto snap = two_cohorts(3, 0);
     snap.devices.push_back(dev("<img src=x>", 50.0, 50.0, 1.0, "a"));
@@ -386,8 +417,13 @@ TEST_CASE("devices fragment: titles, escape, honest empty states", "[dex][perf][
     CHECK(worst.find("Worst devices by current CPU") != std::string::npos);
     CHECK(worst.find("<img src=x>") == std::string::npos); // agent_id escaped
     CHECK(worst.find("&lt;img") != std::string::npos);
+    // Its back link and device drills are text-link buttons, and a pane swap drops the previous
+    // fragment's <style>: the shared reset rule must ride in this fragment (else they paint as
+    // user-agent buttons).
+    CHECK(worst.find("<button type=\"button\" class=\"dx-lk") != std::string::npos);
+    CHECK(worst.find("where(button.dx-lk") != std::string::npos);
 
-    auto nr = render_dex_perf_devices_fragment(snap, DexPerfMetric::kCpu, true, std::nullopt,
+    auto nr =render_dex_perf_devices_fragment(snap, DexPerfMetric::kCpu, true, std::nullopt,
                                                50, 7);
     CHECK(nr.find("Everyone is reporting") != std::string::npos); // honest empty complement
 }

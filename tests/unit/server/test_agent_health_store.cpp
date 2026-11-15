@@ -3604,3 +3604,85 @@ TEST_CASE("REAL AgentHealthStore: guardian backend meta gauges publish at zero, 
     CHECK(series_val(out, "yuzu_fleet_guardian_backend_tag_rejected ") == 0.0);
     CHECK(out.find("\nyuzu_fleet_guardian_backend{") == std::string::npos);
 }
+
+// ── dex_observer_for (the Apps page's live observer split) ───────────────────
+
+namespace {
+void observer_beat(yuzu::server::detail::AgentHealthStore& store, const std::string& id,
+                   const std::optional<std::string>& armed) {
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    if (armed)
+        tags[std::string(yuzu::server::detail::kDexObserverArmedTag)] = *armed;
+    store.upsert(id, tags);
+}
+} // namespace
+
+TEST_CASE("REAL AgentHealthStore dex_observer_for: tag 1 is Armed, 0 is Disarmed, everything else "
+          "is NoneReported",
+          "[dex][observer][real]") {
+    using yuzu::server::DexObserverState;
+    yuzu::server::detail::AgentHealthStore store;
+    observer_beat(store, "armed", "1");
+    observer_beat(store, "disarmed", "0");
+    observer_beat(store, "absent", std::nullopt);
+    observer_beat(store, "other", "yes");
+    observer_beat(store, "empty", "");
+    const std::vector<std::string> ids{"armed", "disarmed", "absent", "other", "empty", "unknown"};
+    const auto out = store.dex_observer_for(ids, std::chrono::seconds{300});
+    REQUIRE(out.size() == ids.size());
+    CHECK(out[0] == DexObserverState::Armed);
+    CHECK(out[1] == DexObserverState::Disarmed);
+    CHECK(out[2] == DexObserverState::NoneReported);
+    CHECK(out[3] == DexObserverState::NoneReported);
+    CHECK(out[4] == DexObserverState::NoneReported);
+    CHECK(out[5] == DexObserverState::NoneReported); // an id the store has never seen
+    // A negative window makes every snapshot stale, deterministically (no clock to wait on).
+    for (const auto s : store.dex_observer_for(ids, std::chrono::seconds{-1}))
+        CHECK(s == DexObserverState::NoneReported);
+}
+
+TEST_CASE("REAL AgentHealthStore dex_observer_for: aligned with the input, duplicates and all, and "
+          "one entry per id across more than one slice",
+          "[dex][observer][real]") {
+    using yuzu::server::DexObserverState;
+    using yuzu::server::detail::kGuardianBackendSlice;
+    yuzu::server::detail::AgentHealthStore store;
+    CHECK(store.dex_observer_for({}, std::chrono::seconds{300}).empty());
+    observer_beat(store, "a", "1");
+    observer_beat(store, "b", "0");
+    const std::vector<std::string> dup{"b", "a", "b", "missing", "a"};
+    const auto small = store.dex_observer_for(dup, std::chrono::seconds{300});
+    REQUIRE(small.size() == dup.size());
+    CHECK(small[0] == DexObserverState::Disarmed);
+    CHECK(small[1] == DexObserverState::Armed);
+    CHECK(small[2] == DexObserverState::Disarmed);
+    CHECK(small[3] == DexObserverState::NoneReported);
+    CHECK(small[4] == DexObserverState::Armed);
+
+    const std::size_t n = (2 * kGuardianBackendSlice) + 7;
+    std::vector<std::string> ids;
+    ids.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        ids.push_back("sl-" + std::to_string(i));
+        if (i % 3 != 2)
+            observer_beat(store, ids.back(), i % 3 == 0 ? "1" : "0");
+    }
+    const auto big = store.dex_observer_for(ids, std::chrono::seconds{300});
+    REQUIRE(big.size() == n);
+    for (std::size_t i = 0; i < n; ++i)
+        CHECK(big[i] == (i % 3 == 0   ? DexObserverState::Armed
+                         : i % 3 == 1 ? DexObserverState::Disarmed
+                                      : DexObserverState::NoneReported));
+}
+
+TEST_CASE("REAL AgentHealthStore: the disarmed gauge reads the same tag constant",
+          "[dex][observer][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+    observer_beat(store, "x", "0");
+    observer_beat(store, "y", "1");
+    observer_beat(store, "z", "0");
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    CHECK(metrics.serialize().find("yuzu_fleet_agents_dex_observer_disarmed 2") != std::string::npos);
+}
