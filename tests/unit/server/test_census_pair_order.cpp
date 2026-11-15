@@ -2151,3 +2151,27 @@ TEST_CASE("census pair order, UP-9: an implausible pair is ALWAYS held at first 
                                          ".guaranteed_state_events") == "0");
     }
 }
+
+// ── B3: the batch path and the decision metric ───────────────────────────────────────────────
+
+TEST_CASE("census pair order, B3: a batch row decided as a duplicate counts on the agent's "
+          "pair_duplicates and on the decision metric",
+          PAIR_TAGS) {
+    // The batch holds the agent's order row FOR UPDATE through its order step, like a first
+    // delivery, so it is allowed to write `pair_duplicates` (a Repair is not). Two rows of one
+    // agent carry the same pair with different verdicts: the second is a same-epoch sequence that
+    // is not above the live mark (a straggler on the clock) and an equal pair on the census row
+    // (a duplicate): refused, flagged, and counted once on each. No existing assertion covers
+    // this path: the batch has no caller and B1's duplicate cases deliver one event at a time.
+    PAIR_FIXTURE();
+    const DecisionCounts counts = decision_counts(metrics);
+    const auto r = store.insert_events({
+        with_pair(stamped("b1", "r1", "a", kCompliant, 1000), 5, 10),
+        with_pair(stamped("b2", "r1", "a", kDrifted, 1010), 5, 10),
+    });
+    REQUIRE(r.has_value());
+    CHECK(*r == 2);
+    CHECK(verdict(db.dsn(), "a", "r1") == "C F 5/10");
+    CHECK(order_text(db.dsn(), "a") == "5|10|-|0|0|0|1|0|1|0");
+    CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate");
+}

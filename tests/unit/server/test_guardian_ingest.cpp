@@ -1144,3 +1144,66 @@ TEST_CASE("guardian pair mode: the SQL's mode set is closed, an unknown or empty
     CHECK(yuzu::server::default_pair_decision(true).mode == PairMode::Current);
     CHECK_FALSE(yuzu::server::default_pair_decision(true).retired_epoch.has_value());
 }
+
+TEST_CASE("guardian census decision: the label set is the closed ten, NULL is legitimate only "
+          "for an unpaired mode, and the metric is pre-seeded at 0",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::CensusDecision;
+    using yuzu::server::PairMode;
+    const std::vector<std::string> expected = {
+        "applied_pair",       "applied_key",     "transition_to_pair",
+        "transition_to_key",  "rebase",          "held_unpaired",
+        "refused_regression", "refused_retired", "refused_duplicate",
+        "refused_straggler"};
+    REQUIRE(yuzu::server::kCensusDecisions.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        INFO(expected[i]);
+        const CensusDecision d = yuzu::server::kCensusDecisions[i];
+        CHECK(std::string(yuzu::server::census_decision_label(d)) == expected[i]);
+        const auto parsed = yuzu::server::parse_census_decision(expected[i]);
+        REQUIRE(parsed.has_value());
+        CHECK(*parsed == d);
+    }
+    for (const char* bad : {"", "Applied_Pair", "applied_pair ", " applied_pair", "applied",
+                            "implausible_held", "current", "refused_", "0"}) {
+        INFO("[" << bad << "]");
+        CHECK_FALSE(yuzu::server::parse_census_decision(bad).has_value());
+    }
+
+    // NULL: only an unpaired mode may lack a label; every other mode, including a hold the census
+    // never sees, fails the write rather than read as no decision.
+    std::optional<CensusDecision> out;
+    std::string why;
+    for (const PairMode m : {PairMode::Unpaired, PairMode::UnpairedHeld}) {
+        CHECK(yuzu::server::interpret_census_decision(std::nullopt, m, out, why));
+        CHECK_FALSE(out.has_value());
+    }
+    for (const PairMode m :
+         {PairMode::RefusedRetired, PairMode::Current, PairMode::CurrentStraggler,
+          PairMode::CurrentRebase, PairMode::RefusedRegression, PairMode::ImplausibleHeld}) {
+        why.clear();
+        CHECK_FALSE(yuzu::server::interpret_census_decision(std::nullopt, m, out, why));
+        CHECK_FALSE(out.has_value());
+        CHECK(why.find("NULL") != std::string::npos);
+    }
+    // A label outside the set fails for every mode, an unpaired one included.
+    for (const PairMode m : {PairMode::Unpaired, PairMode::Current}) {
+        why.clear();
+        CHECK_FALSE(yuzu::server::interpret_census_decision("applied_pairs", m, out, why));
+        CHECK_FALSE(out.has_value());
+        CHECK(why.find("unknown census decision") != std::string::npos);
+    }
+    CHECK(yuzu::server::interpret_census_decision("rebase", PairMode::CurrentRebase, out, why));
+    CHECK(out == CensusDecision::Rebase);
+
+    // Pre-seeded: every series exists at 0 before any decision, so a rate over it never starts
+    // from an absent series.
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::preseed_census_pair_decision_metric(metrics);
+    const std::string text = metrics.serialize();
+    for (const std::string& label : expected) {
+        INFO(label);
+        CHECK(text.find(std::string(yuzu::server::detail::kGuardianCensusPairDecisionsMetric) +
+                        "{decision=\"" + label + "\"} 0\n") != std::string::npos);
+    }
+}
