@@ -2,6 +2,7 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 #include "guardian_generation_raise.hpp" // kMaxPolicyGenerationTarget
+#include "guardian_pair_mode.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -1569,8 +1570,10 @@ std::expected<void, std::string> project_observation(PGconn* conn,
 // delivery and batch row takes it `FOR UPDATE` in the agent step (above `kAgentOrderEnsure`)
 // BEFORE the pair's pending rows, the census row and the rule row, and holds it to the end of the
 // transaction, so every rule of one agent serialises on it: the order is agent row, pending rows,
-// census row, rule row. No counter on it is written outside the DECIDE statement. A Repair takes
-// no agent-row lock and writes nothing to the order table. `delete_agent` is the one other
+// census row, rule row. No counter on it is written outside the DECIDE statement. A Repair runs
+// Ensure and takes the row `FOR SHARE` as its first lock (see `project_rule_status`); it writes no
+// clock or counter, and gives back what it did to the order table unless it touched the census
+// row. `delete_agent` is the one other
 // agent-row-first writer: its first statement deletes the agent's order row (waiting on a first
 // delivery that holds it, or making one wait that arrives after), and only then does it lock the
 // agent's pending rows and delete its census rows, in the same transaction. It adds no advisory
@@ -1694,6 +1697,35 @@ void count_projection(yuzu::MetricsRegistry* metrics, ProjectionSource source,
             .increment();
     } catch (...) { // best-effort metric
     }
+}
+
+// How a Repair reads the agent's pair clock (see `project_rule_status`): `enabled` is the step
+// seam (false: no Ensure, no share lock, the default decision) and `lock_timeout_ms` the bound on
+// each of its lock waits.
+struct RepairOrderStep {
+    bool enabled{true};
+    int lock_timeout_ms{1000};
+};
+
+// Read the mode and the retired epoch off a one-row result whose columns are (mode, retired_epoch).
+// `nullopt` with `why` set when the mode is NULL or outside the closed set: the caller fails the
+// step (or the Repair), it never defaults the mode.
+std::optional<PairDecision> read_pair_decision(PGresult* r, std::string& why) {
+    if (PQgetisnull(r, 0, 0)) {
+        why = "the pair mode is NULL";
+        return std::nullopt;
+    }
+    const std::string_view text(PQgetvalue(r, 0, 0));
+    const std::optional<PairMode> mode = parse_pair_mode(text);
+    if (!mode) {
+        why = "unknown pair mode '" + std::string(text.substr(0, 40)) + "'";
+        return std::nullopt;
+    }
+    PairDecision d;
+    d.mode = *mode;
+    if (!PQgetisnull(r, 0, 1))
+        d.retired_epoch = to_i64(PQgetvalue(r, 0, 1));
+    return d;
 }
 
 // COMMIT of an aborted transaction reports success to libpq (the server answers ROLLBACK), so a
@@ -1947,6 +1979,36 @@ constexpr const char* kAgentOrderDecide =
     "WHERE g.agent_id = old.agent_id "
     "RETURNING old.mode, g.retired_epoch";
 
+// A Repair's mode: the same clock, read WITHOUT writing it. A Repair is a late delivery by
+// definition, so it never refreshes the clock, never re-bases it and never sets a fence: a stale
+// clock gives `current_straggler` (same epoch) or `refused_regression` (lower epoch) where the
+// first delivery's CASE above would re-base. Plan 2.2 and the validated prototype (`gen_v5.py`
+// RO_MODE) state this CASE; it differs from `YUZU_AGENT_ORDER_MODE_` only in those two re-base
+// arms. The row is locked FOR SHARE in the inner select and the CASE runs above it, on the locked
+// version (the same shape as DECIDE's `old`), so a first delivery that bumped the clock while this
+// waited is read, not missed. $1 agent, $2 boot_epoch (0 = unpaired), $3 emit_seq. EXACTLY one row
+// is the only answer the caller accepts: no row (the agent was decommissioned between Ensure and
+// here) must never read as a clock that has seen nothing.
+#define YUZU_AGENT_ORDER_MODE_RO_                                                                  \
+    "CASE WHEN $2::bigint = 0 THEN (CASE WHEN o.epoch IS NOT NULL AND " YUZU_AGENT_ORDER_FRESH_    \
+    " THEN 'unpaired_held' ELSE 'unpaired' END) "                                                  \
+    "WHEN o.retired_epoch = $2::bigint THEN 'refused_retired' "                                    \
+    "WHEN o.epoch IS NULL OR $2::bigint > o.epoch "                                                \
+    "     OR ($2::bigint = o.epoch AND $3::bigint > o.emit_seq_hwm) THEN 'current' "               \
+    "WHEN $2::bigint = o.epoch THEN 'current_straggler' ELSE 'refused_regression' END"
+
+constexpr const char* kAgentOrderDecideReadOnly =
+    "SELECT " YUZU_AGENT_ORDER_MODE_RO_ " AS mode, o.retired_epoch "
+    "FROM (SELECT a.* FROM guaranteed_state_store.guardian_agent_order a "
+    "      WHERE a.agent_id = $1::text FOR SHARE) o";
+
+// The pair stored with a pending event, read by a plain unlocked SELECT before any lock: the pair
+// of a stored event never changes, so no lock is needed to read it.
+constexpr const char* kRepairStoredPair =
+    "SELECT boot_epoch, emit_seq FROM guaranteed_state_store.guaranteed_state_events "
+    "WHERE event_id = $1";
+
+#undef YUZU_AGENT_ORDER_MODE_RO_
 #undef YUZU_AGENT_ORDER_MODE_
 #undef YUZU_AGENT_ORDER_FRESH_
 
@@ -1980,29 +2042,45 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 //   Abandoned: a savepoint control statement, or the outer pending-evidence write, failed, so
 //              the transaction may be aborted: the caller must return an error without
 //              committing (COMMIT of an aborted transaction reports success to libpq).
-// For a Repair the three inputs and the pair are overwritten from the locked row's stored values.
-[[nodiscard]] CensusOutcome project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
-                                                const std::function<void()>& lock_barrier,
-                                                const GuaranteedStateEventRow& row,
-                                                const char* state, ProjectionSource source,
-                                                std::int64_t key, std::int64_t seq, bool capped) {
+// For a Repair the key, capped flag and sequence are overwritten from the locked row's stored
+// values, and the pair is the one stored with the event, read once by a plain SELECT before any
+// lock; that one pair feeds both the mode and the census write.
+//
+// The pair mode. A first delivery or batch row arrives with the mode its order step decided
+// (`decided`). A Repair has no step: it runs the idempotent Ensure for the agent's order row, takes
+// that row FOR SHARE as its first lock and reads the mode from the clock without writing it, all
+// INSIDE `census_upsert` and under the step's lock bound (`repair_step.lock_timeout_ms`, 1 s by
+// default), restored right after the share lock so the pending-row locks, the fold and the upsert
+// keep the connection's own bound. Everything the Repair did to the order table is therefore undone
+// by the ROLLBACK TO of every exit that projects nothing (the event retired concurrently, a
+// failed statement, a missing rule): a blank order row survives only a Repair that touched the
+// census row. A Repair that only retires its own evidence (RefusedNoop) keeps its savepoint,
+// because the retire is inside it: an Ensure that created the row then stays too. A Repair whose
+// lock wait times out, or whose clock read does not answer with exactly one row of a known mode,
+// is Failed with its evidence kept; it never falls back to a default mode. With the step seam off
+// the Repair does none of this and uses the default decision (`unpaired` for 0/0, `current` for a
+// pair). The census statements below do not read the mode yet.
+[[nodiscard]] CensusOutcome
+project_rule_status(PGconn* conn, std::atomic<uint64_t>& failures,
+                    const std::function<void()>& lock_barrier, const GuaranteedStateEventRow& row,
+                    const char* state, ProjectionSource source, std::int64_t key, std::int64_t seq,
+                    bool capped, const PairDecision& decided, const RepairOrderStep& repair_step) {
     const auto control = [conn](const char* sql) {
         return pg::exec_params(conn, sql, std::vector<std::string>{}).status() ==
                PGRES_COMMAND_OK;
     };
     if (!control("SAVEPOINT census_upsert"))
         return CensusOutcome::Abandoned;
-    // A Repair projects the pair stored with the event (read back below), never the redelivery's.
+    // A first delivery or batch row projects the pair the ingest boundary validated; a Repair
+    // projects the pair stored with the event (read below), never the redelivery's.
     CensusPair pair = source == ProjectionSource::Repair
                           ? CensusPair{}
                           : census_pair(row.boot_epoch, row.emit_seq);
+    PairDecision decision = decided;
 
-    const auto fail = [&](pg::PgResult& res) -> CensusOutcome {
-        const char* state_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
-        const char* name_p = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
-        const bool rejected = state_p != nullptr && std::string_view(state_p) == "23503" &&
-                              name_p != nullptr && std::string_view(name_p) == kCensusRuleFkName;
-        const std::string err = PQresultErrorMessage(res.get());
+    const auto fail_with = [&](std::string_view sqlstate, std::string_view constraint,
+                               const std::string& err) -> CensusOutcome {
+        const bool rejected = sqlstate == "23503" && constraint == kCensusRuleFkName;
         // ROLLBACK TO keeps the savepoint defined, so release it too.
         if (!control("ROLLBACK TO SAVEPOINT census_upsert") ||
             !control("RELEASE SAVEPOINT census_upsert")) {
@@ -2057,6 +2135,76 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
                       log_id_token(row.rule_id), ::yuzu::log_key_token(err));
         return CensusOutcome::Failed;
     };
+    const auto fail = [&](pg::PgResult& res) -> CensusOutcome {
+        const char* state_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        const char* name_p = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
+        return fail_with(state_p != nullptr ? state_p : "", name_p != nullptr ? name_p : "",
+                         PQresultErrorMessage(res.get()));
+    };
+    // A Repair that projects nothing gives back everything it did inside the savepoint, the
+    // order row its Ensure may have made included.
+    const auto retired_exit = [&]() -> CensusOutcome {
+        spdlog::debug("GuaranteedStateStore: pending evidence retired concurrently, no repair "
+                      "event_id={}",
+                      log_id_token(row.event_id));
+        return control("ROLLBACK TO SAVEPOINT census_upsert") &&
+                       control("RELEASE SAVEPOINT census_upsert")
+                   ? CensusOutcome::PendingRetired
+                   : CensusOutcome::Abandoned;
+    };
+
+    if (source == ProjectionSource::Repair) {
+        pg::PgResult stored =
+            pg::exec_params(conn, kRepairStoredPair, std::vector<std::string>{row.event_id});
+        if (stored.status() != PGRES_TUPLES_OK)
+            return fail(stored);
+        if (PQntuples(stored.get()) != 1)
+            return retired_exit(); // the event is gone: nothing to repair
+        const auto stored_col = [&](int col) -> std::optional<std::int64_t> {
+            if (PQgetisnull(stored.get(), 0, col))
+                return std::nullopt;
+            return to_i64(PQgetvalue(stored.get(), 0, col));
+        };
+        pair = census_pair(stored_col(0), stored_col(1));
+        decision = default_pair_decision(pair.boot_epoch != 0);
+        if (repair_step.enabled) {
+            if (!control(("SET LOCAL lock_timeout = " + std::to_string(repair_step.lock_timeout_ms))
+                             .c_str()))
+                return CensusOutcome::Abandoned;
+            const std::vector<std::string> ensure_params{row.agent_id};
+            const std::vector<std::string> mode_params{
+                row.agent_id, std::to_string(pair.boot_epoch), std::to_string(pair.emit_seq)};
+            std::optional<PairDecision> read;
+            // Ensure, then the share lock and the read. A row deleted between the two answers zero
+            // rows: run both once more, and a second zero is a failure, never a clock that has seen
+            // nothing.
+            for (int attempt = 0; attempt < 2 && !read; ++attempt) {
+                pg::PgResult ensure = pg::exec_params(conn, kAgentOrderEnsure, ensure_params);
+                if (ensure.status() != PGRES_COMMAND_OK)
+                    return fail(ensure);
+                pg::PgResult ro = pg::exec_params(conn, kAgentOrderDecideReadOnly, mode_params);
+                if (ro.status() != PGRES_TUPLES_OK)
+                    return fail(ro);
+                const int n = PQntuples(ro.get());
+                if (n == 0)
+                    continue;
+                std::string why;
+                if (n != 1)
+                    return fail_with(
+                        "", "", "the repair clock read returned " + std::to_string(n) + " rows");
+                read = read_pair_decision(ro.get(), why);
+                if (!read)
+                    return fail_with("", "", "the repair clock read: " + why);
+            }
+            if (!read)
+                return fail_with("", "", "no agent order row to read after one retry");
+            decision = *read;
+            // RELEASE keeps a SET LOCAL, so give the connection's own bound back now.
+            if (!control("SET LOCAL lock_timeout TO DEFAULT"))
+                return CensusOutcome::Abandoned;
+        }
+    }
+    static_cast<void>(decision); // held for the census write; the statements below do not read it
 
     pg::PgResult lock =
         pg::exec_params(conn, kCensusLockAll, std::vector<std::string>{row.agent_id, row.rule_id});
@@ -2077,21 +2225,12 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
             key = PQgetisnull(lock.get(), i, 1) ? 0 : to_i64(PQgetvalue(lock.get(), i, 1));
             capped = to_bool(PQgetvalue(lock.get(), i, 2));
             seq = to_i64(PQgetvalue(lock.get(), i, 3));
-            const auto nullable = [&](int col) -> std::optional<std::int64_t> {
-                if (PQgetisnull(lock.get(), i, col))
-                    return std::nullopt;
-                return to_i64(PQgetvalue(lock.get(), i, col));
-            };
-            pair = census_pair(nullable(4), nullable(5));
+            // The pair is the one read before the locks (the same value: a stored pair is
+            // immutable), so the mode and the census write cannot be decided on two readings.
         }
     }
-    if (source == ProjectionSource::Repair && !self_found) {
-        spdlog::debug("GuaranteedStateStore: pending evidence retired concurrently, no repair "
-                      "event_id={}",
-                      log_id_token(row.event_id));
-        return control("RELEASE SAVEPOINT census_upsert") ? CensusOutcome::PendingRetired
-                                                          : CensusOutcome::Abandoned;
-    }
+    if (source == ProjectionSource::Repair && !self_found)
+        return retired_exit();
 
     std::vector<std::string_view> seen_views(seen.begin(), seen.end());
     const std::string seen_arr = pg::to_text_array(seen_views);
@@ -2145,18 +2284,26 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 // step. See the Timeouts paragraph on `agent_order_step`.
 
 enum class AgentStepOutcome {
-    Decided,   // DECIDE returned exactly one row; the savepoint is released
+    Decided,   // DECIDE returned exactly one row with a known mode; the savepoint is released
     Failed,    // rolled back to the savepoint and released: the transaction is still usable and
                // the step's writes (including a row Ensure made) are undone
     Abandoned, // a savepoint control statement failed: the caller must return an error without
                // committing
 };
 
+// What the step hands back. `decision` is meaningful only when `outcome == Decided`.
+struct AgentStepResult {
+    AgentStepOutcome outcome{AgentStepOutcome::Failed};
+    PairDecision decision;
+};
+
 // The per-agent order step of ONE census-bearing first delivery or batch row (statements and the
 // zero-row rule above `kAgentOrderEnsure`), in the caller's open transaction under its own
 // SAVEPOINT agent_step, so a failure inside it (a lock wait that times out, a cancelled
 // statement, a second missing row) costs the step and never the transaction that holds the
-// event. Never called for a Repair: a Repair runs no step and leaves the order table untouched.
+// event. Never called for a Repair: a Repair runs no step and never writes the order clock or a
+// counter (it may Ensure the row and share-lock it, inside its census savepoint; see
+// `project_rule_status`).
 //
 // Timeouts: the step sets its own `lock_timeout` (`kAgentStepLockTimeoutMs`, 1 s by default) and
 // leaves the statement timeout to the connection's pool option (30 s by default). The bound applies
@@ -2169,18 +2316,20 @@ enum class AgentStepOutcome {
 // the pool. A waiter whose wait reaches the step's bound takes the failed-step path below (SQLSTATE
 // 55P03: the event is stored pending and the census write is skipped), the same cost at a fraction
 // of the lease time. The `SET LOCAL` value is absolute: it does not take the smaller of its own and
-// the connection's value, so a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the step.
-// The bound is set under the step's savepoint and restored before the success RELEASE: ROLLBACK TO
-// reverts a SET LOCAL, RELEASE does not, so without the restore the census upsert and the fold
-// that follow in the same transaction would run under the step's bound instead of the
+// the connection's value, so a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the
+// step. The bound is set under the step's savepoint and restored before the success RELEASE:
+// ROLLBACK TO reverts a SET LOCAL, RELEASE does not, so without the restore the census upsert and
+// the fold that follow in the same transaction would run under the step's bound instead of the
 // connection's own. `TO DEFAULT` restores the connection's session reset value: the pool's startup
 // option `-c lock_timeout` (10 s by default), or a `options=` value in the DSN, or else the
 // role, database or server setting. A statement timeout below a lock wait ends the statement with
 // 57014 instead. All of these take the same path as any other error here.
 //
-// `pair` is the validated wire pair (0/0 = unpaired). The decided mode is not read: stored and
-// counted, not compared.
-[[nodiscard]] AgentStepOutcome
+// `pair` is the validated wire pair (0/0 = unpaired). The step returns the decided mode and the
+// retired epoch, parsed into the closed `PairMode` set INSIDE the step, before the savepoint is
+// released: a NULL or unknown mode is a failure of the step (rolled back, so DECIDE's counter and
+// clock writes are undone with it), never a default that reads as `current`.
+[[nodiscard]] AgentStepResult
 agent_order_step(PGconn* conn,
                  const std::function<void(AgentStepGap, const std::string&)>& gap_hook,
                  const GuaranteedStateEventRow& row, const CensusPair& pair, int lock_timeout_ms) {
@@ -2189,16 +2338,18 @@ agent_order_step(PGconn* conn,
                PGRES_COMMAND_OK;
     };
     if (!control("SAVEPOINT agent_step"))
-        return AgentStepOutcome::Abandoned;
+        return {AgentStepOutcome::Abandoned, {}};
     // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
     if (!control(("SET LOCAL lock_timeout = " + std::to_string(lock_timeout_ms)).c_str()))
-        return AgentStepOutcome::Abandoned;
+        return {AgentStepOutcome::Abandoned, {}};
 
     const std::vector<std::string> ensure_params{row.agent_id};
     const std::vector<std::string> decide_params{row.agent_id, std::to_string(pair.boot_epoch),
                                                  std::to_string(pair.emit_seq)};
     std::string why; // empty until something went wrong
-    // Ensure, the test hook, DECIDE. Returns the DECIDE row count, or -1 with `why` set.
+    PairDecision decision;
+    // Ensure, the test hook, DECIDE. Returns the DECIDE row count, or -1 with `why` set (a row
+    // whose mode cannot be read is -1, not a row count: it is never retried).
     const auto run = [&](AgentStepGap gap) -> int {
         pg::PgResult ensure = pg::exec_params(conn, kAgentOrderEnsure, ensure_params);
         if (ensure.status() != PGRES_COMMAND_OK) {
@@ -2212,7 +2363,14 @@ agent_order_step(PGconn* conn,
             why = std::string("decide failed: ") + PQresultErrorMessage(decide.get());
             return -1;
         }
-        return PQntuples(decide.get());
+        const int n = PQntuples(decide.get());
+        if (n == 1) {
+            const std::optional<PairDecision> d = read_pair_decision(decide.get(), why);
+            if (!d)
+                return -1;
+            decision = *d;
+        }
+        return n;
     };
 
     int rows = run(AgentStepGap::EnsureToDecide);
@@ -2225,9 +2383,10 @@ agent_order_step(PGconn* conn,
     if (rows == 1) {
         // RELEASE keeps a SET LOCAL, so give the pool's lock_timeout back first.
         if (!control("SET LOCAL lock_timeout TO DEFAULT"))
-            return AgentStepOutcome::Abandoned;
-        return control("RELEASE SAVEPOINT agent_step") ? AgentStepOutcome::Decided
-                                                       : AgentStepOutcome::Abandoned;
+            return {AgentStepOutcome::Abandoned, {}};
+        return control("RELEASE SAVEPOINT agent_step")
+                   ? AgentStepResult{AgentStepOutcome::Decided, decision}
+                   : AgentStepResult{AgentStepOutcome::Abandoned, {}};
     }
     if (rows >= 0)
         why = rows == 0 ? "no agent order row to decide after one retry"
@@ -2239,14 +2398,14 @@ agent_order_step(PGconn* conn,
                       "abandoned event_id={} agent_id={}: {}",
                       log_id_token(row.event_id), log_id_token(row.agent_id),
                       ::yuzu::log_key_token(why));
-        return AgentStepOutcome::Abandoned;
+        return {AgentStepOutcome::Abandoned, {}};
     }
     spdlog::error("GuaranteedStateStore: agent order step failed (a first delivery keeps the "
                   "event stored with pending census evidence and writes no census row, a batch "
                   "is rolled back) event_id={} agent_id={}: {}",
                   log_id_token(row.event_id), log_id_token(row.agent_id),
                   ::yuzu::log_key_token(why));
-    return AgentStepOutcome::Failed;
+    return {AgentStepOutcome::Failed, {}};
 }
 
 } // namespace
@@ -2349,10 +2508,13 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                 // still acks the event, so a redelivery happens only if the agent re-sends it; a
                 // stranded row is covered by the pending-evidence sweep follow-up (#7147).
                 if (matched->pending && bearing) {
-                    const CensusOutcome repaired =
-                        project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,
-                                            event_state_from_type(row.event_type),
-                                            ProjectionSource::Repair, 0, 0, false);
+                    const CensusOutcome repaired = project_rule_status(
+                        conn, census_proj_failures_, census_lock_barrier_, row,
+                        event_state_from_type(row.event_type), ProjectionSource::Repair, 0, 0,
+                        false, PairDecision{},
+                        RepairOrderStep{
+                            agent_step_enabled_.load(std::memory_order_relaxed),
+                            agent_step_lock_timeout_ms_.load(std::memory_order_relaxed)});
                     count_projection(metrics_, ProjectionSource::Repair, repaired);
                     if (repaired == CensusOutcome::Abandoned)
                         return op_error(std::string("census savepoint failed: ") +
@@ -2421,19 +2583,20 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         // failed census write still leaves the agent's pair clock having seen the event. A failed
         // step (rolled back to its own savepoint) stores the event pending, exactly as a failed
         // census write does, and the census write is skipped: it has no decided mode to follow.
-        const AgentStepOutcome step =
+        const AgentStepResult step =
             agent_step_enabled_.load(std::memory_order_relaxed)
                 ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair,
                                    agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
-                : AgentStepOutcome::Decided;
+                : AgentStepResult{AgentStepOutcome::Decided,
+                                  default_pair_decision(wire_pair.boot_epoch != 0)};
         // An abandoned step is counted as the census write's own Abandoned outcome is: it aborts
         // the transaction and is also an ingest error.
-        if (step == AgentStepOutcome::Abandoned) {
+        if (step.outcome == AgentStepOutcome::Abandoned) {
             count_projection(metrics_, ProjectionSource::FirstDelivery, CensusOutcome::Abandoned);
             return op_error(std::string("agent order savepoint failed: ") + PQerrorMessage(conn),
                             kReasonQueryError);
         }
-        if (step == AgentStepOutcome::Failed) {
+        if (step.outcome == AgentStepOutcome::Failed) {
             pg::PgResult mark =
                 pg::exec_params(conn, kCensusMarkPending, std::vector<std::string>{row.event_id});
             if (mark.status() != PGRES_COMMAND_OK) {
@@ -2454,7 +2617,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             const CensusOutcome projected = project_rule_status(
                 conn, census_proj_failures_, census_lock_barrier_, row,
                 event_state_from_type(row.event_type), ProjectionSource::FirstDelivery,
-                ordering.key, ingest_seq, ordering.capped);
+                ordering.key, ingest_seq, ordering.capped, step.decision, RepairOrderStep{});
             count_projection(metrics_, ProjectionSource::FirstDelivery, projected);
             if (projected == CensusOutcome::Abandoned)
                 return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
@@ -2565,26 +2728,27 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             // The agent step, as in insert_event_classified. The batch has no pending evidence
             // to fall back on, so a failed step (a second missing row included) aborts and rolls
             // back the whole batch and the caller re-issues it.
-            const AgentStepOutcome step =
+            const AgentStepResult step =
                 agent_step_enabled_.load(std::memory_order_relaxed)
                     ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair,
-                                   agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
-                    : AgentStepOutcome::Decided;
-            if (step == AgentStepOutcome::Abandoned) {
+                                       agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
+                    : AgentStepResult{AgentStepOutcome::Decided,
+                                      default_pair_decision(wire_pair.boot_epoch != 0)};
+            if (step.outcome == AgentStepOutcome::Abandoned) {
                 count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Abandoned);
                 return std::unexpected(std::string("agent order savepoint failed: ") +
                                        PQerrorMessage(conn));
             }
-            if (step == AgentStepOutcome::Failed) {
+            if (step.outcome == AgentStepOutcome::Failed) {
                 census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                 count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Failed);
                 return std::unexpected("agent order step failed for event_id '" + row.event_id +
                                        "'; batch rolled back");
             }
-            const CensusOutcome projected =
-                project_rule_status(conn, census_proj_failures_, census_lock_barrier_, row,
-                                    event_state_from_type(row.event_type), ProjectionSource::Batch,
-                                    ordering.key, ingest_seq, ordering.capped);
+            const CensusOutcome projected = project_rule_status(
+                conn, census_proj_failures_, census_lock_barrier_, row,
+                event_state_from_type(row.event_type), ProjectionSource::Batch, ordering.key,
+                ingest_seq, ordering.capped, step.decision, RepairOrderStep{});
             count_projection(metrics_, ProjectionSource::Batch, projected);
             if (projected == CensusOutcome::Abandoned)
                 return std::unexpected(std::string("census savepoint failed: ") +
