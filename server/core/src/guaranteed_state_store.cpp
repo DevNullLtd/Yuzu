@@ -1893,11 +1893,13 @@ constexpr const char* kCensusFold =
 // `max(s.ingest_seq + 0)`, not `max(s.ingest_seq)` (P-1, the one deviation from the validated
 // prototype text; the value is identical). With a plain `max(ingest_seq)` the planner may answer
 // the subquery as a BACKWARD scan of `idx_gse_ingest_seq` with a heap filter on `event_id`, which
-// reads every event newer than the OLDEST seen one: measured 0.5 s at 1.3 M events and 10.9 s at
-// 5.3 M for 10 000 old pending events of one (agent, rule), under the agent order row (a Repair
-// holds it FOR SHARE through this statement), so first deliveries then time out and are stored
-// pending, growing the set. The `+ 0` makes the aggregate argument an expression, not the indexed
-// column, so the index cannot order it and the subquery is a primary-key lookup per seen id.
+// reads every event newer than the OLDEST seen one. Governance's performance review measured 0.5 s
+// at 1.3 M events and 10.9 s at 5.3 M for 10 000 old pending events of one (agent, rule), under the
+// agent order row (a Repair holds it FOR SHARE through this statement), so first deliveries then
+// time out and are stored pending, growing the set; reproduced on PostgreSQL 17.11 as 115 ms
+// against 0.16 ms for the bare subquery with 150 old pending events at 1.3 M events. The `+ 0`
+// makes the aggregate argument an expression, not the indexed column, so the index cannot order
+// it and the subquery reads the seen ids through the primary key.
 // Pinned structurally by the "census pair order, P-1 plan" test (no backward index scan under
 // the subquery).
 #define YUZU_CENSUS_SEEN_MAX_SEQ_                                                                  \
