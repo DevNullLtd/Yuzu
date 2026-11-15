@@ -3768,7 +3768,8 @@ plugin's protective actions either, and still gates any non-protective action th
 (`quarantine` declares only its four and `__guard__` dispatches only `push_rules`; a plugin-level
 `firewall` row still gates `firewall.state` and `firewall.rules`). A
 `PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
-detail and logs a warning. If you stopped Guardian rule delivery by switching
+detail (`protective_exempt=partial` for a plugin-level `firewall` row, which still gates `state` and
+`rules`) and logs a warning. If you stopped Guardian rule delivery by switching
 `__guard__.push_rules` off, that stop **ends when you upgrade**: rules deploy on the next Baseline
 deploy or heartbeat reconcile.
 

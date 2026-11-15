@@ -70,7 +70,13 @@ class Guards(unittest.TestCase):
 
 
 def row(token):
-    return {"responses": [{"agent_id": "a", "status": 0, "output": f"status|{token}"}], "count": 1}
+    """The terminal answer: CommandResponse.status SUCCESS (1) carries the plugin output."""
+    return {"responses": [{"agent_id": "a", "status": 1, "output": f"status|{token}"}], "count": 1}
+
+
+def running():
+    """The interim row an agent writes first: status RUNNING (0), no output yet."""
+    return {"responses": [{"agent_id": "a", "status": 0, "output": ""}], "count": 1}
 
 
 EMPTY = {"responses": [], "count": 0}
@@ -93,21 +99,85 @@ class Status(unittest.TestCase):
     def test_only_this_agents_whole_status_line_counts(self):
         # an error string, another agent's row, a non-status line and a mid-line mention are not an answer
         spoof = {"error": "x status|inactive", "responses": [
-            {"agent_id": "other", "status": 0, "output": "status|inactive"},
+            {"agent_id": "other", "status": 1, "output": "status|inactive"},
             {"agent_id": "a", "status": 1, "output": "refused|x status|inactive"},
-            {"agent_id": "a", "status": 0, "output": "note|status|inactive"}]}
+            {"agent_id": "a", "status": 1, "output": "note|status|inactive"}]}
         self.assertEqual(self.tok(spoof), "")
-        real = {"responses": [{"agent_id": "a", "status": 0, "output": "verify|control=ok\nstatus|active|probe\nnote|x"}]}
+        real = {"responses": [{"agent_id": "a", "status": 1, "output": "verify|control=ok\nstatus|active|probe\nnote|x"}]}
         self.assertEqual(self.tok(real), "active")
 
-    def test_a_failed_row_is_not_an_answer(self):
-        failed = {"responses": [{"agent_id": "a", "status": 1, "output": "status|inactive",
-                                 "error_detail": "plugin crashed"}]}
-        self.assertEqual(self.tok(failed), "")
+    def test_only_a_success_row_is_an_answer(self):
+        # RUNNING (0) is interim; FAILURE (2), TIMEOUT (3) and REJECTED (4) carry no usable status; a row
+        # with no status, or one that is not an integer, never counts (True == 1 must not slip through).
+        for status in (0, 2, 3, 4, None, True, "1", 1.0):
+            with self.subTest(status=status):
+                r = {"agent_id": "a", "output": "status|inactive", "error_detail": "plugin crashed"}
+                if status is not None:
+                    r["status"] = status
+                self.assertEqual(self.tok({"responses": [r]}), "")
+
+    def test_a_running_row_beside_the_terminal_one_does_not_hide_the_answer(self):
+        both = {"responses": [{"agent_id": "a", "status": 0, "output": ""},
+                              {"agent_id": "a", "status": 1, "output": "status|active"}]}
+        self.assertEqual(self.tok(both), "active")
 
     def test_disagreeing_rows_are_not_an_answer(self):
-        two = {"responses": [{"agent_id": "a", "status": 0, "output": "status|inactive\nstatus|active"}]}
+        two = {"responses": [{"agent_id": "a", "status": 1, "output": "status|inactive\nstatus|active"}]}
         self.assertEqual(self.tok(two), "")
+
+
+class Poll(unittest.TestCase):
+    """Client.poll_response against a scripted get_json: it must poll PAST a RUNNING row to the terminal one."""
+
+    def poll(self, replies, timeout_s=20):
+        client = fc.Client("http://127.0.0.1:9")
+        seq = list(replies)
+        with mock.patch.object(client, "get_json", side_effect=lambda _p: seq.pop(0) if len(seq) > 1 else seq[0]), \
+                mock.patch.object(fc.time, "sleep"):
+            return client.poll_response("cid", timeout_s=timeout_s), seq
+
+    def test_it_polls_past_running_to_the_terminal_row(self):
+        got, _ = self.poll([EMPTY, running(), running(), row("inactive")])
+        self.assertEqual(got, row("inactive"))
+
+    def test_a_row_that_never_leaves_running_is_returned_at_the_deadline_and_is_no_answer(self):
+        with mock.patch.object(fc.time, "monotonic", side_effect=[0, 1, 2, 3, 100, 100]):
+            client = fc.Client("http://127.0.0.1:9")
+            with mock.patch.object(client, "get_json", return_value=running()), mock.patch.object(fc.time, "sleep"):
+                got = client.poll_response("cid", timeout_s=10)
+        self.assertEqual(got, running())
+        with mock.patch.object(fc, "dispatch", return_value=got):
+            self.assertEqual(fc.status_token(None, "a"), "")
+
+    def test_a_terminal_failure_row_ends_the_poll(self):
+        failed = {"responses": [{"agent_id": "a", "status": 2, "output": "", "error_detail": "boom"}]}
+        got, _ = self.poll([running(), failed])
+        self.assertEqual(got, failed)
+
+
+class Login(unittest.TestCase):
+    """A 200/302 from the login POST proves nothing: the session is proven by an authenticated read."""
+
+    def login(self, get_json):
+        client = fc.Client("http://127.0.0.1:9")
+        with mock.patch.object(client.opener, "open", return_value=mock.MagicMock()), \
+                mock.patch.object(client, "get_json", side_effect=get_json):
+            client.login("a", "b")
+
+    def test_an_authenticated_read_is_a_login(self):
+        self.login(lambda _p: {"agents": []})
+
+    def test_a_login_page_instead_of_json_is_a_failed_login(self):
+        def page(_p):
+            raise ValueError("Expecting value")  # json.JSONDecodeError is a ValueError
+        with self.assertRaises(fc.LoginError):
+            self.login(page)
+
+    def test_a_401_on_the_authenticated_read_is_a_failed_login(self):
+        def denied(_p):
+            raise fc.urllib.error.HTTPError("u", 401, "no", None, None)
+        with self.assertRaises(fc.LoginError):
+            self.login(denied)
 
 
 class Local(unittest.TestCase):
@@ -239,16 +309,32 @@ class Flow(unittest.TestCase):
                               dashboard="http://192.0.2.7:8080")
         self.assertEqual(rc, fc.EXIT_OK)         # a probe-only run changes nothing, so any dashboard is fine
 
-    def test_no_registered_agent_and_a_failed_login_exit_before_any_dispatch(self):
+    def test_zero_or_several_registered_agents_exit_before_any_dispatch(self):
+        for agents in ([], [{"agent_id": "a"}, {"agent_id": "b"}]):
+            with self.subTest(n=len(agents)):
+                client = mock.MagicMock()
+                client.get_json.return_value = {"agents": agents}
+                rc, calls = self.run_main({}, apply=False, agent=False, client=client)
+                self.assertEqual(rc, fc.EXIT_PRECONDITION)
+                self.assertEqual(calls, [])
+
+    def test_a_lone_registered_agent_is_picked_by_the_probe_only(self):
         client = mock.MagicMock()
-        client.get_json.return_value = {"agents": []}
-        rc, calls = self.run_main({}, agent=False, client=client)
+        client.get_json.return_value = {"agents": [{"agent_id": "a"}]}
+        rc, calls = self.run_main({"quarantine_status": [row("inactive")]}, apply=False, agent=False, client=client)
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(calls, ["quarantine_status"])
+
+    def test_the_apply_names_its_agent(self):
+        rc, calls = self.run_main({}, agent=False)
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
+
+    def test_a_failed_login_exits_2_before_any_dispatch(self):
         client = mock.MagicMock()
-        client.login.side_effect = OSError("refused")
+        client.login.side_effect = fc.LoginError("login failed: HTTP Error 401")
         rc, calls = self.run_main({}, client=client)
-        self.assertEqual(rc, fc.EXIT_FAIL)
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
 
     def test_an_already_contained_host_is_refused_before_any_change(self):

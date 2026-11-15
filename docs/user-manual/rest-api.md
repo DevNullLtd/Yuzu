@@ -11196,7 +11196,7 @@ change the switch for one OS only. **Permission:** `PluginConfig:Write`. **Audit
 row exists. `false` kills it. `reason` is optional, at most 512 bytes; it is stored unredacted in the audit log, which every `AuditLog:Read` holder can read for the retention period, so do not put secrets or personal data in it. Every dispatch gate that checks
 this switch fails closed on a store error, so switching it off is a reliable emergency stop.
 **Exception:** a row for a protective action is stored and returned but has no effect on dispatch.
-Its audit detail is marked `protective_exempt=true` and the server logs a warning. To stop Guardian
+Its audit detail is marked `protective_exempt=true` (`protective_exempt=partial` for a plugin-level `firewall` row, which still gates `firewall.state` and `firewall.rules`) and the server logs a warning. To stop Guardian
 rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
 not the effective state, in the same shape as the `GET` above.
 

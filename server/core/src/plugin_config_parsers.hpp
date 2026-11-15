@@ -242,6 +242,15 @@ parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw
     return yuzu::protective::is_protective_action(scope.plugin, scope.action);
 }
 
+/// True iff the row is a plugin-level one for a plugin that declares ordinary actions beside its
+/// protective ones, so the row exempts the protective actions yet still gates the rest (today only
+/// `firewall`: `state` and `rules`). The audit label says `partial` for it, so a post-mortem cannot
+/// read the row as a complete exemption. A plugin that declares only protective actions
+/// (`quarantine`, `__guard__`) is fully exempt, and so is any action-level row.
+[[nodiscard]] inline bool kill_switch_row_partly_covers_protective(const KillSwitchScope& scope) {
+    return scope.action.empty() && yuzu::protective::detail::iequals(scope.plugin, "firewall");
+}
+
 /// Reason cap — an operator-entered free-text explanation for a kill-switch
 /// flip. Capped so a pathological submission can't bloat the audit/kill-
 /// switch row indefinitely; control characters other than tab rejected (it renders in an
@@ -255,8 +264,9 @@ inline constexpr std::size_t kListRowCap = 5000;
 
 /// The `plugin_config.kill_switch.set` audit detail: `enabled=<bool>`, plus
 /// `, protective_exempt=true` when the row covers a protective action (stored
-/// but never gating the protective actions; a plugin-level `firewall` row still
-/// gates that plugin's ordinary actions), plus `, reason="<text>"` when the operator gave
+/// but never gating the protective actions), or `, protective_exempt=partial` for a
+/// plugin-level `firewall` row (it exempts the protective actions but still gates
+/// that plugin's ordinary ones, `state` and `rules`), plus `, reason="<text>"` when the operator gave
 /// one. The reason survives on the live row only until the next flip, so without
 /// it here the audit trail cannot answer "why was this switched off". It is
 /// already validated (<= 512 bytes, no control characters but tab) by
@@ -272,7 +282,8 @@ inline constexpr std::size_t kListRowCap = 5000;
                                                         std::string_view reason = {}) {
     std::string detail = enabled ? "enabled=true" : "enabled=false";
     if (kill_switch_row_covers_protective(scope))
-        detail += ", protective_exempt=true";
+        detail += kill_switch_row_partly_covers_protective(scope) ? ", protective_exempt=partial"
+                                                                  : ", protective_exempt=true";
     if (!reason.empty()) {
         std::size_t keep = reason.size() < kMaxReasonBytes ? reason.size() : kMaxReasonBytes;
         // A continuation byte (10xxxxxx) at the cut means the cut tears a sequence: back up.

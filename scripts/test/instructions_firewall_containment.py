@@ -22,13 +22,18 @@ the allow set (loopback plus the agent's control channel). It refuses to run whe
 is detected (SSH_CONNECTION / SSH_CLIENT / SSH_TTY) unless --i-have-console-access is given, and
 never runs without --apply-containment. The SSH check reads environment variables that `sudo` and a
 long-lived tmux/screen session can drop, so --i-have-console-access is the real control. The dashboard
-must be loopback (this host), or the release could not reach it while contained. --ttl-seconds is 0 (none) or at least 240, so the limit outlasts the release
+must be loopback (this host), or the release could not reach it while contained. --ttl-seconds is 0 (none) or at least 300, so the limit outlasts the release
 confirmation. Run it on a local box with a keyboard and a screen.
 
 Exit codes: 0 passed; 1 a check failed; 2 precondition or usage error (nothing changed);
 3 release could not be confirmed: clear the firewall by hand (see agents/plugins/firewall/README.md).
 
-The status is read from the exact `status|<token>` row of the agent's reply. The flow is covered
+--agent-id is required with --apply-containment (it never contains "the first agent listed"); a probe-only
+run picks the agent itself only when exactly one is registered. A login that does not yield an authenticated
+session exits 2.
+
+The status is read from the exact `status|<token>` row of the agent's reply, taken only from a SUCCESS
+(status 1) row once no row is still RUNNING (status 0); FAILURE, TIMEOUT and REJECTED rows are no answer. The flow is covered
 against a recording fake (tests/test_firewall_containment_ceremony.py); the live apply/release round
 trip needs a UAT stack on a local host and has not been run live on any OS yet.
 """
@@ -59,7 +64,17 @@ SSH_VARS = ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")
 POLL_S = 20
 POLL_APPLY_S = 90
 RELEASE_READS = 4
-MIN_TTL_S = 240  # the release dispatch (90 s) plus the status re-reads (4 x ~22 s) must fit inside the limit
+# The limit must outlast the longest the ceremony can hold the containment: the status read after the apply
+# (2 s + 20 s), the release dispatch (90 s), then RELEASE_READS re-reads (4 x (2 s + 20 s)) = 200 s, plus
+# the apply's own wait (up to 90 s, which can run past the point the plugin starts the clock) = 290 s.
+MIN_TTL_S = 300
+# CommandResponse.status (proto/yuzu/agent/v1/agent.proto): only SUCCESS is an answer; RUNNING is an
+# interim row to poll past; FAILURE, TIMEOUT and REJECTED carry no usable status.
+STATUS_RUNNING, STATUS_SUCCESS = 0, 1
+
+
+class LoginError(RuntimeError):
+    """The dashboard did not give this client an authenticated session."""
 
 
 class Client:
@@ -74,9 +89,13 @@ class Client:
         body = urllib.parse.urlencode({"username": user, "password": password}).encode()
         req = urllib.request.Request(f"{self.base}/login", data=body,
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
-        with self.opener.open(req, timeout=self.timeout) as r:
-            if r.status not in (200, 302, 303):
-                raise RuntimeError(f"login failed: HTTP {r.status}")
+        try:
+            self.opener.open(req, timeout=self.timeout).close()
+            # A rejected login can still answer 200/302 (the login page), so the session is proven by an
+            # authenticated read, never by the status of the form POST.
+            self.get_json("/api/agents")
+        except (OSError, ValueError) as e:  # URLError/HTTPError are OSError; a login page is not JSON
+            raise LoginError(f"login failed: {e}") from e
 
     def get_json(self, path: str):
         with self.opener.open(urllib.request.Request(self.base + path), timeout=self.timeout) as r:
@@ -89,11 +108,14 @@ class Client:
             return json.loads(r.read() or b"{}")
 
     def poll_response(self, command_id: str, timeout_s: int = POLL_S) -> dict:
+        """The responses once every row has left RUNNING (a RUNNING row is interim, not the answer), or
+        whatever was last read when the deadline passes."""
         deadline, last = time.monotonic() + timeout_s, {}
         while time.monotonic() < deadline:
             try:
                 last = self.get_json(f"/api/responses/{urllib.parse.quote(command_id)}")
-                if last.get("responses"):
+                rows = [r for r in last.get("responses") or [] if isinstance(r, dict)]
+                if rows and not any(r.get("status") == STATUS_RUNNING for r in rows):
                     return last
             except (urllib.error.HTTPError, urllib.error.URLError):
                 pass
@@ -123,7 +145,7 @@ def dispatch(client: Client, agent_id: str, action: str, params: dict) -> dict:
                                              "params": {k: str(v) for k, v in params.items()}})
     cid = sent.get("command_id", "")
     # an apply or release can take the plugin up to a minute plus its verify: wait for the answer
-    wait = POLL_APPLY_S if action in ("quarantine", "release", "quarantine_allow") else POLL_S
+    wait = POLL_APPLY_S if action in ("quarantine", "release") else POLL_S
     return client.poll_response(cid, timeout_s=wait) if cid else {}
 
 
@@ -132,14 +154,16 @@ _STATUS_ROW = re.compile(r"status\|([a-z_]+)(?:\|.*)?")
 
 def status_token(client: Client, agent_id: str) -> str:
     """The `status|<token>` row of this agent's `quarantine_status` output, exactly: `active`, `inactive`,
-    `active_unproven`, `partial`, `degraded`. Only a whole output LINE of a response row that names this
-    agent counts (a substring of an error string, or another agent's row, never does), and the rows must
-    agree. Empty when no agent answered -- never a guess ("inactive" contains "active")."""
+    `active_unproven`, `partial`, `degraded`. Only a whole output LINE of a SUCCESS (status 1) response row
+    that names this agent counts: a RUNNING, FAILURE, TIMEOUT or REJECTED row, a row with no integer status,
+    a substring of an error string and another agent's row never do, and the rows must agree. Empty when
+    no agent answered -- never a guess ("inactive" contains "active")."""
     answer = dispatch(client, agent_id, "quarantine_status", {})
     tokens = set()
     for r in answer.get("responses") or []:
-        if (not isinstance(r, dict) or r.get("agent_id") != agent_id or r.get("status") not in (0, None)
-                or not isinstance(r.get("output"), str)):
+        status = r.get("status") if isinstance(r, dict) else None
+        if (not isinstance(r, dict) or r.get("agent_id") != agent_id or type(status) is not int
+                or status != STATUS_SUCCESS or not isinstance(r.get("output"), str)):
             continue
         for line in r["output"].splitlines():
             m = _STATUS_ROW.fullmatch(line.strip().lower())
@@ -211,6 +235,10 @@ def main(argv=None) -> int:
         print(f"refused: --ttl-seconds below {MIN_TTL_S} could end the containment before the release "
               "confirmation finishes (use 0 for none)", file=sys.stderr)
         return EXIT_PRECONDITION
+    if args.apply_containment and not args.agent_id:
+        print("refused: --agent-id is required with --apply-containment (the ceremony contains exactly the "
+              "host you name, never the first agent the dashboard lists)", file=sys.stderr)
+        return EXIT_PRECONDITION
     if args.apply_containment and not dashboard_is_local(args.dashboard):
         print("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
               "while this host is contained", file=sys.stderr)
@@ -227,8 +255,9 @@ def main(argv=None) -> int:
         if not agent_id:
             agents = client.get_json("/api/agents")
             agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
-            if not agents:
-                print("precondition failed: no agent registered", file=sys.stderr)
+            if len(agents or []) != 1:
+                print(f"precondition failed: {len(agents or [])} agents registered; pass --agent-id "
+                      "(the probe picks one only when exactly one is registered)", file=sys.stderr)
                 return EXIT_PRECONDITION
             agent_id = agents[0].get("agent_id") or agents[0].get("id", "")
         before = status_token(client, agent_id)
@@ -278,6 +307,9 @@ def main(argv=None) -> int:
         if err is not None:
             raise err
         return EXIT_OK if ok else EXIT_FAIL
+    except LoginError as e:
+        print(f"precondition failed: {e}", file=sys.stderr)
+        return EXIT_PRECONDITION
     except KeyboardInterrupt:
         return EXIT_FAIL
     except Exception as e:  # noqa: BLE001 - a script exit code, not a library
