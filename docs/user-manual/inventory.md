@@ -1639,14 +1639,6 @@ sync, defeating the hash-skip protocol.
   not read; storage topology is planned everywhere). The stored sections are served by
   `GET /api/v1/hardware/{id}` and the MCP `get_hardware_ci` tool (they are not rendered in the
   dashboard Hardware pages yet).
-- **Bulk pull.** To read every stored record without one call per device, page through
-  `GET /api/v1/hardware/ci` (MCP: `list_hardware_ci_records`): the scalar `ci` fields of each
-  device plus its stored `content_hash` and `blob_version`, 100 devices per page by default and
-  1000 at most, with no sections. It reads the stored records, not the 30-day device roster, so a
-  device that has been offline longer still appears while its record exists. Walk the pages one
-  at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
-  the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
-  audit writes. See [REST API](rest-api.md#get-apiv1hardwareci).
   `blob_version` says which format an agent last sent. A device whose agent is still on
   the original format has **no** section rows stored — read that as "not stored", not
   "the device has none". A section reported `constrained` with reason `server_cap:<n>`
@@ -1704,6 +1696,14 @@ sync, defeating the hash-skip protocol.
   Chassis, board and DIMM serial numbers are personal data on the same footing as the
   device serial and system UUID. Agents keep working unchanged; upgrade the server
   before the agents.
+- **Bulk pull.** To read every stored record without one call per device, page through
+  `GET /api/v1/hardware/ci` (MCP: `list_hardware_ci_records`): the scalar `ci` fields of each
+  device plus its stored `content_hash` and `blob_version`, 100 devices per page by default and
+  1000 at most, with no sections. It reads the stored records, not the 30-day device roster, so a
+  device that has been offline longer still appears while its record exists. Walk the pages one
+  at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
+  the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
+  audit writes. Rows are ordered by the byte value of `agent_id`, not by the database's collation, and the page query uses an index on that byte order, so a change to the operating system's collation rules cannot make this walk skip or repeat a device (the rest of the database is not protected that way: see "PostgreSQL collation version" in [Server administration](server-admin.md#postgresql-collation-version)). A complete walk is not a snapshot: confirm a device with `?agent_id=<id>` before retiring it. See [REST API](rest-api.md#get-apiv1hardwareci).
 - **What the agent sends.** An agent that carries this change always sends the versioned
   record; there is no flag to fall back to the earlier format, and `--inventory-disable`
   still stops the collection. Each section reports one of four levels:
