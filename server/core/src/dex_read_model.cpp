@@ -223,6 +223,10 @@ DexStabilityFigures apps_figures(const DexAppStabilityRow& r, std::optional<int6
     // population) and `distinct_devices` vs `distinct_devices_online` show the gap.
     if (f.score.score && r.affected_devices > affected)
         f.score = stability_detail::withheld_result("offline_affected");
+    // The tier is named once here, under the policy that scored the row, so the page and the
+    // payload print one value.
+    if (f.score.score && f.score.band)
+        f.tier = dex_tier_name(eff.tiers, *f.score.band);
     return f;
 }
 
@@ -236,6 +240,7 @@ json figures_json(const DexStabilityFigures& f) {
         deductions.push_back({{"name", d.name}, {"points", d.points}, {"assessed", d.assessed}});
     json score{{"score", f.score.score ? json(stability_display_score(*f.score.score)) : json(nullptr)},
                {"band", f.score.band ? json(stability_band_label(*f.score.band)) : json(nullptr)},
+               {"tier", f.tier.empty() ? json(nullptr) : json(f.tier)},
                {"withheld", f.score.withheld[0] ? json(f.score.withheld) : json(nullptr)},
                {"deductions", std::move(deductions)}};
     return {{"crashes", f.crashes},
@@ -263,6 +268,7 @@ json policy_json(const DexPolicyInForce& p) {
     return {{"source", p.source},
             {"revision", p.revision},
             {"fault", p.fault.empty() ? json(nullptr) : json(p.fault)},
+            {"interval_confidence", p.policy.interval_confidence},
             {"tiers", std::move(tiers)}};
 }
 
@@ -341,6 +347,44 @@ std::vector<std::string> dex_apps_online_ids(const DexFleet& fleet, std::string_
     return ids;
 }
 
+std::optional<std::vector<DexObserverSplit>>
+dex_apps_observer_split(const DexFleet& fleet, std::string_view scope,
+                        const std::vector<DexObserverState>& states) {
+    std::vector<DexObserverSplit> rows;
+    if (scope == kDexAppsScopeAll) {
+        for (const char* p : {kDexAppsScopeWindows, kDexAppsScopeLinux, kDexAppsScopeMacos, "other"})
+            rows.push_back({p, 0, 0, 0});
+    } else {
+        rows.push_back({std::string(scope), 0, 0, 0});
+    }
+    std::size_t i = 0;
+    for (const auto& [id, os] : fleet.connected_agents) {
+        if (scope != kDexAppsScopeAll && os != scope)
+            continue;
+        if (i >= states.size())
+            return std::nullopt;
+        std::size_t row = 0;
+        if (scope == kDexAppsScopeAll) {
+            row = os == kDexAppsScopeWindows ? 0 : os == kDexAppsScopeLinux ? 1
+                  : os == kDexAppsScopeMacos ? 2 : 3;
+        }
+        switch (states[i++]) {
+        case DexObserverState::Armed:
+            ++rows[row].armed;
+            break;
+        case DexObserverState::Disarmed:
+            ++rows[row].disarmed;
+            break;
+        case DexObserverState::NoneReported:
+            ++rows[row].none_reported;
+            break;
+        }
+    }
+    if (i != states.size())
+        return std::nullopt;
+    return rows;
+}
+
 std::string dex_apps_population_basis(std::string_view scope) {
     return std::string{scope} + "_online";
 }
@@ -380,6 +424,7 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
     }
     if (!store) {
         m.degraded = true;
+        m.degraded_reason = dex_read_fault_token(DexReadFault::kStoreNotOpen);
         return m;
     }
     // Scoped to the platform ("" = every platform), and the share numerators
@@ -397,6 +442,7 @@ DexAppsModel build_dex_apps_model(GuaranteedStateStore* store, const std::string
         subject_caps);
     if (!rows) {
         m.degraded = true;
+        m.degraded_reason = dex_read_fault_token(rows.error());
         return m;
     }
     return dex_apps_model_from_rows(
@@ -434,6 +480,15 @@ std::string dex_apps_json(const DexAppsModel& model) {
         coverage[os] = c;
     out["crash_source_coverage"] = std::move(coverage);
     out["policy"] = policy_json(model.policy);
+    json observers = nullptr;
+    if (model.observer_state) {
+        observers = json::object();
+        for (const auto& o : *model.observer_state)
+            observers[o.platform] = {{"armed", o.armed},
+                                     {"disarmed", o.disarmed},
+                                     {"none_reported", o.none_reported}};
+    }
+    out["observer_state"] = std::move(observers);
     return out.dump();
 }
 

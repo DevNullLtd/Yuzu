@@ -45,6 +45,15 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 // Validated trees never approach it (`create_group` caps hierarchy at 5).
 constexpr int kMaxHierarchyDepth = 10;
 
+// Roles `assign_role` refuses at management-group scope. Add the next one here. This is NOT the
+// delegation allowlist: any other role name still stores, so a caller that must restrict which
+// roles it hands out (the REST and MCP routes allow only Operator and Viewer) applies its own
+// check first. EXACT byte match only: no case folding, no trimming. Every consumer of a stored
+// role name matches it exactly, and `sanitize_pg_text` only SUBSTITUTES bad bytes (it never
+// deletes one), so a stored value equals the name only if the input did; a variant
+// ("itserviceowner", a trailing space, an embedded NUL) is an ordinary custom role, not this one.
+constexpr std::array<std::string_view, 1> kRefusedGroupScopedRoles = {"ITServiceOwner"};
+
 // Read-degrade reason labels (ADR-0037 convention).
 constexpr const char* kReasonStoreClosed = "store_not_open";
 constexpr const char* kReasonPoolTimeout = "pool_acquire_timeout";
@@ -739,6 +748,13 @@ ManagementGroupStore::assign_role(const GroupRoleAssignment& assignment) {
     if (assignment.principal_type == "engine")
         return std::unexpected(
             "engine principals cannot hold scoped role assignments in this release");
+    // A role that must never be held at group scope. BEFORE validate_assignment (whose messages
+    // echo caller text) and the pool acquire. ONE fixed message: never echo the caller's value
+    // (REST and MCP put a non-fault refusal verbatim into the response and the audit detail) and
+    // never start it with a fault prefix (mgmt_group_error.hpp), so it is a 400-class refusal.
+    for (const auto refused : kRefusedGroupScopedRoles)
+        if (assignment.role_name == refused)
+            return std::unexpected("this role cannot be assigned at management-group scope");
     // Shared engine-principal assignment guard — see RbacStore::validate_assignment.
     if (auto v = RbacStore::validate_assignment(assignment.principal_type, assignment.principal_id,
                                                 assignment.role_name);
