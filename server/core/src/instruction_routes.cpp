@@ -71,8 +71,8 @@ std::string stamp_import_creator(const std::string& body, const std::string& use
 
 /// The v1 routes' plugin / action identifier rule (`check_dispatch_identifier`, the one shared
 /// helper) on a legacy JSON route: a non-empty `value` that fails it is answered `400
-/// {"error": "<field> ..."}` and true is returned. An empty value passes here: the store owns
-/// "plugin is required", and an empty action is legal.
+/// {"error": "<field> ..."}` and true is returned. An empty value passes here: an empty action is
+/// legal, and an empty plugin is refused by the caller (the PUT below) or by the store (a create).
 bool refuse_bad_dispatch_identifier(httplib::Response& res, std::string_view field,
                                     const std::string& value) {
     if (value.empty())
@@ -393,6 +393,17 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
 
             // The identifier rule applies only to a plugin / action this request CHANGES, so a
             // stored row with an odd value stays editable through its other fields.
+            // A present plugin must stay usable: the store's update never checks it, so an empty
+            // value would blank the column (the v1 and MCP updates refuse it the same way).
+            if (j.contains("plugin") && def.plugin.empty() &&
+                !(*existing_result)->plugin.empty()) {
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json({{"error", *check_dispatch_identifier("plugin", def.plugin)}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
             if ((def.plugin != (*existing_result)->plugin &&
                  refuse_bad_dispatch_identifier(res, "plugin", def.plugin)) ||
                 (def.action != (*existing_result)->action &&
@@ -445,9 +456,10 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                 "application/json");
                 return;
             }
-            // The detail records a change to plugin/action/approval_mode/concurrency_mode/enabled
-            // (old -> new), so an approval downgrade or a repoint is visible here as it is on the
-            // YAML save and the v1 twin; empty when none of the five changed.
+            // The detail records a change to plugin/action/approval_mode/enabled (old -> new; this
+            // route never changes concurrency_mode), so an approval downgrade or a repoint is
+            // visible here as it is on the YAML save and the v1 twin, and a `yaml_source cleared`
+            // note when the edit cleared a stored YAML; empty when neither happened.
             (void)deps.audit_fn(req, "instruction.update", "success", "InstructionDefinition", id,
                                 describe_dispatch_binding_change(**existing_result, def));
             deps.emit_event_fn("instruction.updated", req, {}, {{"instruction_id", id}});
@@ -501,6 +513,14 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = status;
                 res.set_content(detail::a4_error(res, message), "application/json");
+                // The Instructions page's Delete button is a plain hx-delete and htmx swaps no
+                // 4xx/5xx body, so the refusal is also a toast (an HX-Trigger header is processed
+                // whatever the status). ensure_ascii keeps the header 7-bit.
+                const nlohmann::json trigger = {
+                    {"showToast", {{"message", std::string(message)}, {"level", "error"}}}};
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', true,
+                                            nlohmann::json::error_handler_t::replace));
             };
             if (!stored)
                 return refuse(503, "error", "db_error",

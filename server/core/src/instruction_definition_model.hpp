@@ -188,7 +188,8 @@ apply_definition_update_body(const nlohmann::json& body, InstructionDefinition& 
 /// `name=... plugin=... action=... approval_mode=... concurrency_mode=... enabled=true|false`,
 /// each free-text value bounded (`bounded_definition_id`) then folded through `log_token`
 /// (CWE-117). Shared by the v1 REST and MCP delete twins and the legacy `DELETE
-/// /api/instructions/{id}` success row (which reads the pre-image best effort).
+/// /api/instructions/{id}` success row (which reads the pre-image before the referrer check: an
+/// unreadable definition is a 503, so the detail is empty only for an id that was absent then).
 [[nodiscard]] std::string describe_deleted_definition(const InstructionDefinition& def);
 
 /// Build the set a `POST /instruction-sets` body describes: `name` and `description` strings, no

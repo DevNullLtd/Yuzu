@@ -188,8 +188,12 @@ void seed_instruction_param_rejected_metrics(yuzu::MetricsRegistry& metrics) {
 // unavailability, not "this item doesn't exist"; using the tolerated not_found prefix here
 // would let the caller (ProductPackStore::uninstall()/install()'s compensation path) proceed
 // as if the item were already gone while it's still live underneath. PolicyFragment/Policy's
-// origin stores are still bool-only — `false` there maps to a tolerated not_found, matching
-// pre-ADR-0058 behaviour for those kinds.
+// origin stores are still bool-only: `delete_fragment`/`delete_policy` answer a bare `false` for
+// "absent", for "a policy still uses this fragment" (a refusal) and for a database fault alike. A
+// `false` is therefore read back (get_fragment/get_policy, and for a fragment the policies that
+// use it) so only the first two stay a tolerated not_found; a fault, or a read that cannot tell,
+// is a db_error and aborts the uninstall before the pack is tombstoned. Without the read-back a
+// lost lease on the fragment delete answered 200 and left a fragment naming a deleted definition.
 static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
                                            PolicyStore* policy_store,
                                            WorkflowEngine* workflow_engine) {
@@ -202,13 +206,40 @@ static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
                                        "instruction store unavailable");
             return instruction_store->delete_definition(item_id);
         } else if (kind == "PolicyFragment") {
-            if (policy_store && policy_store->delete_fragment(item_id))
+            if (!policy_store)
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
+            if (policy_store->delete_fragment(item_id))
                 return {};
-            return std::unexpected("not_found: policy fragment '" + item_id + "'");
+            const auto db_error = [&](const char* why) {
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "policy fragment '" + item_id + "' " + why);
+            };
+            const auto present = policy_store->get_fragment(item_id);
+            if (!present)
+                return db_error("could not be confirmed after a failed delete");
+            if (!*present)
+                return std::unexpected("not_found: policy fragment '" + item_id + "'");
+            const auto used = policy_store->query_policies(
+                PolicyQuery{.fragment_filter = item_id, .limit = 1});
+            if (!used)
+                return db_error("could not be checked for policies that use it");
+            if (!used->empty())
+                return std::unexpected("not_found: policy fragment '" + item_id +
+                                       "' is still used by a policy");
+            return db_error("was not deleted and no policy uses it");
         } else if (kind == "Policy") {
-            if (policy_store && policy_store->delete_policy(item_id))
+            if (!policy_store)
+                return std::unexpected("not_found: policy '" + item_id + "'");
+            if (policy_store->delete_policy(item_id))
                 return {};
-            return std::unexpected("not_found: policy '" + item_id + "'");
+            const auto present = policy_store->get_policy(item_id);
+            if (!present)
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) + "policy '" +
+                                       item_id + "' could not be confirmed after a failed delete");
+            if (!*present)
+                return std::unexpected("not_found: policy '" + item_id + "'");
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) + "policy '" + item_id +
+                                   "' was not deleted");
         } else if (kind == "Workflow") {
             if (!workflow_engine)
                 return std::unexpected(std::string(kProductPackDbErrorPrefix) +
@@ -4493,7 +4524,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto id = req.matches[1].str();
 
         // M2: refuse BEFORE the first item is deleted (uninstall() deletes items one at a time, so
-        // a refusal part-way would leave a half-uninstalled pack). A pack whose InstructionDefinition
+        // a refusal part-way would leave a pack with some items gone and the rest left). A pack whose InstructionDefinition
         // is still named by a schedule, a workflow or a policy fragment is not uninstalled; the
         // pack's OWN workflow items and the own policy fragments no policy uses do not count, they
         // are removed by this same uninstall. A pack that carries no InstructionDefinition item
@@ -4568,6 +4599,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     }
                     for (const auto& item : (*pack)->items) {
                         if (item.kind != "InstructionDefinition")
+                            continue;
+                        // No definition has an empty id, and the referrer sources treat an empty
+                        // id as "no filter" (they would answer unrelated schedules and fragments),
+                        // so a corrupt empty-id item is left out of the lookup.
+                        if (item.item_id.empty())
                             continue;
                         auto referrers = referrers_fn(item.item_id, exclusions);
                         if (!referrers)

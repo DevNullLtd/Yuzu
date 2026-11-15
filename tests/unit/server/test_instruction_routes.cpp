@@ -595,6 +595,43 @@ TEST_CASE("instruction_routes: PUT success audit detail records a plugin/action/
     CHECK(h.audits[0].detail.empty());
 }
 
+// A present, empty `plugin` on the legacy PUT is a 400 (the v1 and MCP updates refuse it the same
+// way): the store's update never checks plugin, so it would blank the column. An absent plugin and
+// a same-value plugin still pass. Turns red if the guard in the PUT handler is removed (200, and
+// the stored plugin is "").
+TEST_CASE("instruction_routes: PUT with an empty plugin is refused 400 and the stored plugin is kept",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Keep plugin"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"}}
+                                  .dump());
+    REQUIRE(create);
+    REQUIRE(create->status == 200);
+    const auto id = body(create->body)["id"].get<std::string>();
+    h.audits.clear();
+
+    auto blank = h.sink.Put("/api/instructions/" + id, json{{"plugin", ""}}.dump());
+    REQUIRE(blank);
+    CHECK(blank->status == 400);
+    CHECK(blank->body.find("plugin") != std::string::npos);
+    auto kept = w.store.get_definition(id);
+    REQUIRE(kept.has_value());
+    REQUIRE(kept->has_value());
+    CHECK((*kept)->plugin == "os_info");
+
+    auto same = h.sink.Put("/api/instructions/" + id,
+                           json{{"plugin", "os_info"}, {"description", "ok"}}.dump());
+    REQUIRE(same);
+    CHECK(same->status == 200);
+}
+
 // UP-5 on the legacy route (Gate 8 F2). Turns red if the legacy PUT handler stops calling
 // clear_stale_yaml_source (the YAML stays stale and a later dashboard YAML round trip reverts the
 // edit), or if the predicate grows `enabled` back (the first section).
@@ -1790,6 +1827,12 @@ TEST_CASE("instruction_routes: DELETE a definition that a schedule names is refu
     const auto msg = body(del->body)["error"]["message"].get<std::string>();
     CHECK(msg.find("schedule " + *sid) != std::string::npos);
     CHECK(msg.find("NOT deleted") != std::string::npos);
+    // The Instructions page's Delete button is a plain hx-delete that swaps no 4xx body, so the
+    // refusal is also an error toast (HX-Trigger).
+    const auto trigger = json::parse(del->get_header_value("HX-Trigger"));
+    CHECK(trigger["showToast"]["level"] == "error");
+    CHECK(trigger["showToast"]["message"].get<std::string>().find("schedule " + *sid) !=
+          std::string::npos);
     auto still = w.store.get_definition(id);
     REQUIRE(still.has_value());
     CHECK(still->has_value());
@@ -1844,6 +1887,7 @@ TEST_CASE("instruction_routes: DELETE with a failing or unwired referrer lookup 
     REQUIRE(del);
     CHECK(del->status == 503);
     CHECK(del->body.find("nothing was deleted") != std::string::npos);
+    CHECK(json::parse(del->get_header_value("HX-Trigger"))["showToast"]["level"] == "error");
     auto still = w.store.get_definition(id);
     REQUIRE(still.has_value());
     CHECK(still->has_value());

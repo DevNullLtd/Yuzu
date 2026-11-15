@@ -1707,7 +1707,7 @@ TEST_CASE("instruction authoring: wiring -- server.cpp builds the referrer looku
     };
     CHECK(wired(src));
 
-    // Mutation: dropping any one of the three wiring lines from the source turns the tripwire red
+    // Mutation: dropping any one of the wiring lines from the source turns the tripwire red
     // (each needle is load-bearing, so a pattern that stopped matching cannot pass vacuously).
     for (const std::string_view needle : kNeedles) {
         SECTION(std::string("mutation: ") + std::string(needle.substr(0, 40))) {

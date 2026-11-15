@@ -88,10 +88,17 @@
 ///     simulating the race. A genuine DB error (either read or write leg)
 ///     audits `"error"`. A plain validation 400 is NOT audited. Success
 ///     audits `"success"`, its detail naming any change to plugin, action,
-///     approval_mode or enabled as `field: old -> new` (#2146 batch C; empty
-///     when none of the four changed).
-///   - `DELETE /:id`: a DB error audits `"error"`; a not-found audits
-///     `"denied"`; success audits `"success"`.
+///     approval_mode or enabled as `field: old -> new` and a `yaml_source
+///     cleared` note when the edit cleared a stored YAML (#2146 batch C; empty
+///     when neither happened).
+///   - `DELETE /:id`: a DB error on the pre-read or the delete audits
+///     `"error"` (`db_error`); an unwired or failing referrer check audits
+///     `"error"` (`referrer_check_unwired` / `referrer_check_unavailable`) and
+///     a referenced definition audits `"denied"` (`referenced`), each refusal
+///     deleting nothing; a not-found audits `"denied"`; success audits
+///     `"success"`, its detail the pre-image (`plugin`, `action`,
+///     `approval_mode`, `concurrency_mode`) and, when packs contain the
+///     definition, `packs=<ids>`.
 ///   - `POST /api/instructions/import`: a DB error audits `"error"`; EVERY
 ///     other rejection (conflict or otherwise) audits `"denied"` — unlike
 ///     the plain JSON create route, `import` audits every non-DB-error
