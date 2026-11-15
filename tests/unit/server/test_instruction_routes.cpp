@@ -1851,6 +1851,46 @@ TEST_CASE("instruction_routes: DELETE a definition that a schedule names is refu
     CHECK(h.audits[0].result == "success");
 }
 
+// The toast on a refused legacy DELETE is cut to 600 bytes (plus "...") so a long referrer list cannot
+// outgrow a proxy's response-header buffer, while the body keeps the full list. Turns red if the cap
+// is removed (the toast is then as long as the body) or if the toast stops being a prefix of it.
+TEST_CASE("instruction_routes: a long referrer list is cut in the toast and complete in the body",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.referrers = [](const std::string&)
+        -> std::expected<std::vector<yuzu::server::DefinitionReferrer>, std::string> {
+        std::vector<yuzu::server::DefinitionReferrer> many;
+        for (int i = 0; i < 25; ++i)
+            many.push_back({"schedule", std::string(60, static_cast<char>('a' + i % 26)), {}});
+        return many;
+    };
+    h.wire();
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Many referrers"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"}}
+                                  .dump());
+    REQUIRE(create);
+    const auto id = body(create->body)["id"].get<std::string>();
+
+    auto del = h.sink.Delete("/api/instructions/" + id);
+    REQUIRE(del);
+    CHECK(del->status == 409);
+    const auto full = body(del->body)["error"]["message"].get<std::string>();
+    CHECK(full.size() > 600);
+    CHECK(full.find("and 5 more") != std::string::npos);
+    const auto toast =
+        json::parse(del->get_header_value("HX-Trigger"))["showToast"]["message"].get<std::string>();
+    CHECK(toast.size() <= 603);
+    REQUIRE(toast.size() > 3);
+    CHECK(toast.substr(toast.size() - 3) == "...");
+    CHECK(full.rfind(toast.substr(0, toast.size() - 3), 0) == 0);
+}
+
 // M2-1 fail closed. A failing or unwired lookup is never "no referrers": 503, nothing deleted, an
 // `error` row. An id that does not exist keeps its 404 whatever the wiring. Turns red if the handler
 // treats an error or an unset function as an empty list.

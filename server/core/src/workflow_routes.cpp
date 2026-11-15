@@ -4636,8 +4636,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         // Uninstall callback: delegate to the appropriate store (same dispatch install's
         // compensate_fn uses — see make_item_delete_fn's doc comment for the per-kind
-        // db_error/not_found split, currently unreachable here since instruction_store_ and
-        // product_pack_store_ share one boot latch, kept as defense-in-depth).
+        // db_error/not_found split: reachable for PolicyFragment and Policy items (a failed
+        // delete is read back), unreachable for InstructionDefinition and Workflow items since
+        // instruction_store_ and product_pack_store_ share one boot latch, kept as
+        // defense-in-depth).
         auto uninstall_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
