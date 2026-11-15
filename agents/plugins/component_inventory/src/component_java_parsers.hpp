@@ -239,7 +239,7 @@ inline std::optional<std::string_view> archive_version_prefix(std::string_view s
     if (version.empty())
         return std::nullopt;
     for (std::size_t at = stem.rfind(sep); at != std::string_view::npos && at > 0;
-         at = at == 1 ? std::string_view::npos : stem.rfind(sep, at - 1)) {
+         at = stem.rfind(sep, at - 1)) {
         const std::string_view rest = stem.substr(at + 1);
         if (rest.starts_with(version) && (rest.size() == version.size() || rest[version.size()] == '-'))
             return stem.substr(0, at);

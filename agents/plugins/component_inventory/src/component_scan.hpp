@@ -275,11 +275,10 @@ struct ArchiveRead {
 
 /// The file-name prefix an archive's own version anchors: `value` (from a pom, or a manifest whose
 /// Bundle-Version uses '_') must follow it in the stem as <prefix>-<V> or <prefix>-<V>-... Without the
-/// anchor the archive's value may belong to something it bundles, and the file name stands.
+/// anchor the archive's value may belong to something it bundles, and the file name stands. `leaf` is a
+/// name `parse_jar_filename` accepted, so it is at least 5 bytes and ends in a 4-byte archive suffix.
 [[nodiscard]] inline std::optional<std::string_view> anchored_prefix(std::string_view leaf, std::string_view value,
                                                                      std::string_view source) {
-    if (leaf.size() <= 4)
-        return std::nullopt;
     const auto stem = leaf.substr(0, leaf.size() - 4);
     if (const auto p = archive_version_prefix(stem, value, '-'))
         return p;
