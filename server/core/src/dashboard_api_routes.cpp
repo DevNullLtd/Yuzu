@@ -235,7 +235,7 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
         if (csv.status == data_export::CsvStatus::kTooLarge) {
             res.status = 413;
             res.set_content(
-                R"({"error":{"code":413,"message":"the CSV would exceed 64 MiB; split the export into several requests"},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":413,"message":"the CSV would exceed 16 MiB; split the export into several requests"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

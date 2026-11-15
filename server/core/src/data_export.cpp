@@ -24,7 +24,7 @@ CsvResult json_array_to_csv_checked(const std::string& json_str, std::size_t max
         return {};
 
     std::string csv;
-    csv.reserve(std::min(json_str.size(), max_output_bytes));
+    csv.reserve(std::min(json_str.size() * 2, max_output_bytes));
 
     // Header row
     for (size_t i = 0; i < columns.size(); ++i) {

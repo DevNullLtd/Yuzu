@@ -70,8 +70,10 @@ inline std::string csv_escape(const std::string& field) {
 /// The most bytes of CSV one export may produce. The input is capped (16 MiB, and a value budget),
 /// but the OUTPUT is not bounded by either: a first object with thousands of keys followed by
 /// hundreds of thousands of `{}` rows is a few MiB of JSON and gigabytes of commas (a comma per
-/// column per row). 64 MiB is four times the input cap, far above a real export's size.
-inline constexpr std::size_t kMaxCsvOutputBytes = 64u * 1024 * 1024;
+/// column per row). 16 MiB equals the input cap: a real export's CSV is no larger than its JSON (it
+/// drops the keys), so only a sparse or wide-header shape reaches it. Together with the parse tree
+/// and the doubling of the output string, a worst-case request holds roughly 100 to 180 MiB.
+inline constexpr std::size_t kMaxCsvOutputBytes = 16u * 1024 * 1024;
 
 enum class CsvStatus { kOk, kInvalid, kTooLarge };
 struct CsvResult {

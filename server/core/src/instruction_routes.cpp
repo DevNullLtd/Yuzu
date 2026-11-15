@@ -1044,8 +1044,9 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         // (#1993): YAML that passes validation always carries what Save
         // needs, and a failing Save names the actual missing field
         // instead of a blanket "Missing required fields" for all three. (The plugin / action
-        // identifier rule is validate-yaml's only: a save re-states a stored row's plugin and
-        // action from its YAML, so refusing an odd stored value would make the row uneditable.)
+        // identifier rule is applied by validate-yaml and by a CREATE below, not by an update: a
+        // save re-states a stored row's plugin and action from its YAML, so refusing an odd
+        // stored value would make the row uneditable.)
         auto errors = validate_yaml_source(yaml_source);
         if (!errors.empty()) {
             std::string html =
