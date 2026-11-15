@@ -3738,14 +3738,26 @@ public:
             "Durable session-store operations that hit a degraded PostgreSQL read/"
             "write on the auth hot path (labelled by op: validate / create / touch / "
             "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
-            "elevate); a validate degrade fails the request closed, and elevate / "
-            "revoke (via invalidate_user) degrades fail the privileged op closed, except "
+            "elevate / account_state, the last being the read of the account store "
+            "that gates a durable local session); a validate degrade fails the request "
+            "closed, and elevate / revoke (via invalidate_user) degrades fail the "
+            "privileged op closed, except "
             "that an invalidate_user after an already-committed MFA clear leaves the "
             "clear in place and ends partial",
             "counter");
         for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
-                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+                        "invalidate_user", "invalidate", "mark_mfa", "elevate", "account_state"})
             metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_account_inactive_total",
+                          "Durable local sessions refused at validation because their account "
+                          "is not active (inactive or deleted)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_account_inactive_total");
+        metrics_.describe("yuzu_auth_session_unknown_source_total",
+                          "Durable sessions refused at validation because the stored auth "
+                          "source is not local, oidc or saml",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_unknown_source_total");
         // WS-6 6.2: enrollment tokens + pending agents are AuthDB-only (Postgres,
         // shared by every replica) and fail CLOSED on any store failure. This
         // counts each degrade so an operator can tell "agents cannot enroll /
