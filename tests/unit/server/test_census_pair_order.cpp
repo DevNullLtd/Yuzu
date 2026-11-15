@@ -3084,7 +3084,7 @@ TEST_CASE("census pair order, Gate 7 M1: a first delivery starved of its order r
     // `lock_timeout` is per wait, and a FOR SHARE locker does not queue behind a waiting FOR
     // UPDATE, so a rolling chain of overlapping share holders keeps the first delivery's wait going
     // past the 1 s lock bound (measured on PG 17: 4 s and 8 s). The step's statement timeout counts
-    // the whole statement, waits included, so it ends at 1 s with SQLSTATE 57014, which takes the
+    // the whole statement, waits included, so it ends at 1.5 s with SQLSTATE 57014, which takes the
     // failed-step path: the event is stored pending, the step's writes are undone, the delivery is
     // acked. Production bounds throughout; only the chain's own length is generous.
     PAIR_FIXTURE();
@@ -3117,8 +3117,9 @@ TEST_CASE("census pair order, Gate 7 M1: the step's statement timeout is the loc
           PAIR_TAGS) {
     // A trigger on each table records the lock_timeout and statement_timeout in force as its
     // statement runs, as the Repair's QE-2 case does. The step's Ensure and DECIDE writes run under
-    // the 1 s lock bound AND the 1 s statement bound; the census write that follows runs under the
-    // pool's own 10 s and 30 s, and so does the commit: neither SET LOCAL leaks past the RELEASE.
+    // the 1 s lock bound AND the 1.5 s statement bound; the census write that follows runs under
+    // the pool's own 10 s and 30 s, and so does the commit: neither SET LOCAL leaks past the
+    // RELEASE.
     PAIR_FIXTURE();
     const std::string log = std::string(kSchema) + ".yuzu_test_lt_log";
     exec_sql(db.dsn(), "CREATE TABLE " + log + " (stage text, lt text, st text)");
@@ -3152,7 +3153,7 @@ TEST_CASE("census pair order, Gate 7 M1: the step's statement timeout is the loc
     CHECK(query_scalar(db.dsn(), "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT "
                                  "stage || '=' || lt || '/' || st AS x FROM " +
                                      log + ") t") ==
-          "guardian_agent_order=1s/1s,guardian_agent_rule_status=10s/30s");
+          "guardian_agent_order=1s/1500ms,guardian_agent_rule_status=10s/30s");
     CHECK(lt_at_commit == "10s");
     CHECK(st_at_commit == "30s");
 }
