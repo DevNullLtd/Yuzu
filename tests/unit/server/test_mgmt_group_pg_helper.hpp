@@ -22,16 +22,20 @@
 // `[pg]` tag.
 
 #include "management_group_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace yuzu::test {
 
@@ -94,5 +98,26 @@ private:
     std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<yuzu::server::ManagementGroupStore> store_;
 };
+
+/// TEST-ONLY. Inserts one management_group_roles row by direct SQL, bypassing
+/// ManagementGroupStore::assign_role and every check it makes. Not a production
+/// path: it exists so a test can stand a row up that the store refuses to author
+/// (a state an older build, or a later refusal rule, leaves behind). Takes a DSN
+/// rather than a bundle because several rigs reach the database only through
+/// `dsn()`. A plain INSERT (no ON CONFLICT): a duplicate key or a missing group
+/// fails the test rather than being absorbed.
+inline void plant_group_role_row(const std::string& dsn,
+                                 const yuzu::server::GroupRoleAssignment& a) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "INSERT INTO management_group_store.management_group_roles "
+        "(group_id, principal_type, principal_id, role_name) VALUES ($1, $2, $3, $4)",
+        std::vector<std::string>{a.group_id, a.principal_type, a.principal_id, a.role_name});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+    REQUIRE(std::string(PQcmdTuples(res.get())) == "1");
+}
 
 } // namespace yuzu::test

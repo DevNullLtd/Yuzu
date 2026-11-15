@@ -52,9 +52,10 @@ Recommended order for a fresh install:
 > **on** immediately applies role-scoped visibility — a user without a
 > management-group role assignment will see **no agents** (including on the Echo
 > fleet scan), and the role-grant endpoints themselves require an existing group
-> role, which can be a chicken-and-egg lockout. The broadest grant is an
-> `ITServiceOwner` role on the root "All Devices" group; see
-> [`management-groups.md`](management-groups.md) for the delegation API.
+> role, which can be a chicken-and-egg lockout. The management-group roles that
+> can be delegated are `Operator` and `Viewer` (a group-scoped `ITServiceOwner`
+> grant is refused); see [`management-groups.md`](management-groups.md) for the
+> delegation API.
 
 > **SSO-only fleets:** only a LOCAL `auth.users` administrator can pass the
 > enable guard above — an SSO session cannot pass the RBAC-off predicate
@@ -523,7 +524,7 @@ Settings uses, so the two stay equivalent.
   does; if that row cannot be saved the panel is still drawn and the response carries
   `Sec-Audit-Failed`. A grant table that cannot be read is a red message, never an empty table.
 - **Assign and remove a role.** For a caller the server would admit, the panel offers **Assign role** (a
-  username and one of the seven fleet-wide roles; ITServiceOwner needs a management group and is not
+  username and one of the seven fleet-wide roles; ITServiceOwner cannot be assigned fleet-wide and is not
   offered; the account does not have to exist yet) and **Remove** on a grant. These call
   `POST` and `DELETE /api/v1/rbac/roles/{name}/assignments`, which need a durable Administrator
   and a fresh MFA check. Whether the controls are drawn is decided by the same check those routes
@@ -644,8 +645,8 @@ What each kind of caller sees (RBAC enforcement off is the default install):
 | Administrator, or a session elevated to it | Yes | All |
 | Legacy `user` account, RBAC enforcement off | Yes | All |
 | Viewer, RBAC on | Yes | Those in their scope |
-| `ITServiceOwner` on the root group (global) | Yes | Those in their scope |
-| `ITServiceOwner` on one group only | No (`403`) | Those in their scope if the fragment is called directly; the page cannot reach it because the list is refused |
+| A pre-existing `ITServiceOwner` row on the root group (global; no new one can be assigned) | Yes | Those in their scope |
+| A pre-existing `ITServiceOwner` row on one group only | No (`403`) | Those in their scope if the fragment is called directly; the page cannot reach it because the list is refused |
 | Operator scoped to a group | No (`403`): Operator holds no `ManagementGroup` permission | Not reachable |
 | Service-scoped API token, RBAC on | No (`403`) | Those within the token's service scope |
 
@@ -946,7 +947,7 @@ curl -s -b cookies.txt \
 
 Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role **creation** are planned but **not yet implemented** — there is no HTMX Settings UI fragment for this either (`settings_routes.cpp` has no RBAC role-CRUD registration). Currently, a genuinely NEW custom role can only be created directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
 
-**Assigning one of the 7 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 8th built-in role, is assignable only at management-group scope — see "Scoped Role Assignments"). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
+**Assigning one of the 7 fleet-wide-assignable built-in roles to a human user is implemented — see "Fleet-Wide Role Assignment" below** (`ITServiceOwner`, the 8th built-in role, is not assignable at management-group scope either: the management-group role routes accept only `Operator` and `Viewer`, and the management-group store refuses a group-scoped `ITServiceOwner` grant. The seeded role remains the authority ceiling for service-scoped API tokens; see "Service-scoped tokens and `ITServiceOwner`" above). Only AUTHORING a brand-new custom role (and narrowing/widening a seeded system role's own permission set) remains planned.
 
 **Planned endpoints (not yet available):**
 
@@ -988,7 +989,7 @@ These two examples send `Origin` because a session-cookie call without a same-si
 Key constraints:
 
 - **`principal_type` must be `"user"`.** Group-scoped fleet-wide assignment is not supported yet — `rbac_store.group_members` is written solely by IdP group-sync, so a group-held grant would make the IdP the admin-authority source, a decision not made by this surface.
-- **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 92-permission grant is designed around the holder being CONFINED to the member devices of the management group they hold the role on (for a `Service: {name}` group, a snapshot of the devices tagged at the time the group was created) — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. Assign `ITServiceOwner` via the management-group role route instead (see "Scoped Role Assignments" below).
+- **`ITServiceOwner` is explicitly rejected**, not silently mis-assigned. Its 93-permission grant is designed around the holder being CONFINED to the member devices of the management group they hold the role on (for a `Service: {name}` group, a snapshot of the devices tagged at the time the group was created) — but that confinement is enforced entirely by `ManagementGroupStore::get_visible_agents`, which reads only the group-scoped `management_group_roles` table, never `principal_roles` (this surface's only write target). A fleet-wide `ITServiceOwner` grant would resolve unconfined/global on every type-level permission check while showing the holder zero visible devices on any per-device list read — wrong both ways. A group-scoped `ITServiceOwner` grant is refused as well (the management-group role routes accept only `Operator` and `Viewer`, and the management-group store refuses the role), so there is no assignment route for it; the seeded role remains the authority ceiling for service-scoped API tokens (see "Service-scoped tokens and `ITServiceOwner`" above).
 - **Only the 7 named roles above are accepted** — enforced against a closed allow-list (`rbac_assignable_roles.hpp`), not "any role that happens to exist in the store". A pre-existing custom role (`is_system=false`, creatable only via direct SQL today — `RbacStore::create_role` has no route caller) is rejected exactly like an unknown role name, except that a non-system role holding the name of a built-in role is refused with a distinct `409` (REST) or invalid params (MCP) naming the collision (see "Role name collision" in the upgrade guide). An unknown/custom role name and `ITServiceOwner` all return the identical client-facing rejection message — the specific reason is recorded in the audit log only, so a caller cannot enumerate the role catalog by diffing error text.
 - **A caller may not revoke the fleet's last remaining `Administrator` grant through this surface.** The store-level guard runs inside the same transaction as the delete, so two concurrent revokes cannot both succeed and leave zero administrators. It counts only `principal_type='user'` rows that ALSO name a currently-active `auth.users` account — a grant naming a nonexistent, deactivated, or (soft-)deleted username is never treated as a survivor.
   - **A principal reactivated while an unassign is in flight is caught (Doomgoose external review, PR #4985).** The guard first locks the candidate Administrator grant rows (`FOR UPDATE OF pr`) and deliberately does not lock the candidate set of `auth.users` rows, because that would serialize unassigns against unrelated logins and role changes. A grant whose account was deactivated at that moment is therefore excluded from that snapshot and could be reactivated by an independent transaction (for example an account reactivation) before the delete runs. After the delete, in the same transaction, and only when the removed grant was not already among the counted rows, the guard re-reads the deleted principal's own `auth.users` row with `FOR UPDATE`: a reactivation that has already committed is seen, one still in flight makes the guard wait and re-read it, and one that starts later blocks until this transaction finishes. If the reactivated principal is the fleet's only real Administrator, the removal is refused. This is closed for an existing account only. One case remains outside the guard: a pre-provisioned grant whose `auth.users` row is created concurrently (there is no row to lock), tracked at #4966. Deactivating a surviving Administrator is guarded separately, takes the same grant-row locks in the same order, and is described under "Last-Administrator guard for account deactivation and demotion" below. A lock wait is bounded by the database pool's lock timeout (10 seconds by default; the pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is set, and the wait is then bounded only if that setting, or the server or role default, sets a `lock_timeout`); on timeout nothing is deleted, the REST route answers `503`, and the MCP twin answers an internal error with a retry hint.
