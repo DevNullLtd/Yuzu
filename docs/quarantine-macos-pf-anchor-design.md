@@ -407,10 +407,11 @@ typed, validated value and re-checked against a strict charset (`is_safe_token`,
 `is_safe_ruleset_line`: no whitespace in a token, no `;`, quote, `$`, backtick,
 `|`, `&`, `#`, backslash or newline anywhere; the pf token is digits only, 1-24),
 and the only way into those functions is a server-dispatched, catalogue-gated
-action. The same statement applies to the Linux `nft -f *` grant and is repeated in
-`docs/agent-privilege-model.md`. Anyone who gains arbitrary code execution as the
-agent account can already author any ruleset these grants will load; that is an
-accepted property of the grant, not a reason to widen it.
+action. The Linux nftables load is not covered by this statement: it goes through the
+root-owned firewall helper, which checks the staged file itself
+(`docs/agent-privilege-model.md`). Anyone who gains arbitrary code execution as the
+agent account can already author any ruleset the pf grants will load; that is an
+accepted property of those grants, not a reason to widen them.
 
 **The bare `/sbin/pfctl` grant is removed**, so the narrow lines above are the whole
 grant (`tests/test_legacy_quarantine_plugin_removed_lexical.py` pins that), and the
@@ -423,13 +424,14 @@ the agent, no group or other access) before every use, in a file created with
 system temp directory, where another local user could swap the content between the
 write and the privileged read. When `agent.data_dir` is unset or the directory
 cannot be made safe the apply is refused (`refused|staging_unavailable`) before
-anything is touched. The Linux `nft -f` leg shares the same staging.
+anything is touched. The Linux nftables load shares the same staging.
 
-For the Linux leg, sized in the same pass: the unused bare `/usr/sbin/nft` grant
-is replaced by `nft -f *`, `nft delete table inet yuzu_quarantine` and
+For the Linux leg, sized in the same pass: the sudoers file names the firewall
+helper (which loads the staged ruleset after checking it, and runs iptables and
+ip6tables) and two fixed commands, `nft delete table inet yuzu_quarantine` and
 `nft list table inet yuzu_quarantine` (the status fallback when the netlink dump
-is refused for lack of `CAP_NET_ADMIN`). The iptables and ip6tables grants are
-unchanged.
+is refused for lack of `CAP_NET_ADMIN`). There is no bare `/usr/sbin/nft` grant and
+no `nft` line that takes a file name.
 
 ## 6. Why the leg is allowed to rely on the pure core
 

@@ -1060,7 +1060,8 @@ TEST_CASE("live (linux nft): a failed update keeps the previous generation in fo
     if (::access("/usr/sbin/nft", X_OK) != 0)
         SKIP("nft is not installed on this host");
     FlakyLoadRunner runner;
-    fq::NftLeg leg(runner.fn(), real_stage());
+    // The live run needs root (LIVE_OR_SKIP), and a root agent runs nft itself: no helper.
+    fq::NftLeg leg(runner.fn(), real_stage(), fq::ToolAccess::direct);
     MemStore store;
     fq::Env fenv{leg, store,
                  [](const std::string& ip, int port, std::chrono::milliseconds t) {

@@ -4754,12 +4754,14 @@ test('issue lifecycle docs',
 
 # The old standalone containment agent plugin is removed and nothing names it again (device
 # containment is the firewall plugin's four actions): no tracked file outside the history
-# allowlist names its files, actions, rule or chain prefixes or definition ids.
+# allowlist names its files, actions, rule or chain prefixes or definition ids. The same file runs
+# the Linux firewall helper under every POSIX shell on the host (a few hundred short processes), so
+# its budget is wider than the source-text gates around it.
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
   suite: 'docs',
-  timeout: 30,
+  timeout: 120,
 )
 
 # Two quarantine facts no behavioural test can fail on: the apply claim is stamped and tested on the

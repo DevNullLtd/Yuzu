@@ -39,10 +39,11 @@
 #         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
 # 6.  (Linux only) Installs /usr/local/sbin/yuzu-fw-helper (root:root 0755), the
 #       one program the sudoers file lets the agent account run as root for
-#       iptables and ip6tables. It is written from a quoted heredoc below,
-#       to a temporary file in the same directory and renamed into place,
-#       and it goes in BEFORE the sudoers file that names it. See the
-#       helper's own header for the argument shapes it accepts.
+#       iptables, ip6tables and loading the nftables ruleset. It is written
+#       from a quoted heredoc below, to a temporary file in the same
+#       directory and renamed into place, and it goes in BEFORE the sudoers
+#       file that names it. See the helper's own header for the argument
+#       shapes it accepts.
 # 7.  (Optional) On both platforms, prints a verifying summary that the
 #       operator can spot-check.
 #
@@ -70,11 +71,11 @@
 # UPGRADES
 # ────────
 # A host provisioned by an earlier copy of this script has no helper and its
-# sudoers file still carries the earlier iptables lines. Re-run this script
-# (with the agent upgrade) on every host whose containment falls back to
-# iptables: it installs the helper and replaces the sudoers file. Until it
-# has run, sudo refuses the helper and the iptables-fallback containment
-# actions fail on that host.
+# sudoers file still carries the earlier firewall lines. Re-run this script
+# (with the agent upgrade) on EVERY Linux host provisioned with it: it
+# installs the helper and replaces the sudoers file. Until it has run, the
+# containment actions fail on that host (the nftables load and the iptables
+# fallback both go through the helper), unless the agent runs as root.
 #
 # UNINSTALL
 # ─────────
@@ -510,26 +511,27 @@ $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/bin/security delete-certificate -t /Libr
 EOF
     else  # linux
         cat <<EOF
-# firewall plugin — iptables / ip6tables, the containment fallback when nft is absent. The agent
-# account may run exactly one program as root for them: the helper the installer wrote to
-# $FW_HELPER_PATH (root:root 0755). This line names the helper with no argument and no wildcard;
-# the helper takes the tokens of one fixed argument shape (list, or create / append / insert the
-# jump / remove the jump / flush / delete on a yuzu-fwq-* generation chain), validates every
-# variable token itself, and runs /usr/sbin/iptables or /usr/sbin/ip6tables with an argument list
-# it builds from its own literals plus the validated values. It never passes the caller's
-# arguments on, and anything outside the shapes exits non-zero having run nothing. There is no
-# iptables, ip6tables, iptables-save or iptables-restore grant. A sudo regular expression could pin
-# the arguments in this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04
-# and earlier and Debian 11 do not ship. A host provisioned before the helper existed has none of
-# this until the installer is re-run.
+# firewall plugin — Linux containment (nftables, or iptables / ip6tables when nft is absent). The
+# agent account may run exactly one program as root to change them: the helper the installer wrote
+# to $FW_HELPER_PATH (root:root 0755). This line names the helper with no argument and no
+# wildcard. For iptables and ip6tables the helper takes the tokens of one fixed argument shape
+# (list, or create / append / insert the jump / remove the jump / flush / delete on a yuzu-fwq-*
+# generation chain), validates every variable token itself, and runs /usr/sbin/iptables or
+# /usr/sbin/ip6tables with an argument list it builds from its own literals plus the validated
+# values. For nftables it takes the ruleset file the plugin staged (nft load <file>), checks every
+# line of it against the ruleset the plugin generates, and gives nft a ruleset it builds from its
+# own literals plus the checked values on standard input; the file is never handed to nft. It
+# never passes the caller's arguments on, and anything outside these shapes exits non-zero having
+# run nothing. There is no iptables, ip6tables, iptables-save, iptables-restore or nft grant that
+# takes a file name or an argument pattern. A sudo regular expression could pin the arguments in
+# this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04 and earlier and
+# Debian 11 do not ship. A host provisioned before the helper existed has none of this until the
+# installer is re-run.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
-# firewall plugin — nftables containment (own table inet yuzu_quarantine). These lines NARROW
-# the argv shape; they do not confine nft: sudo globs match concatenated args, and the file
-# named by -f is agent-generated. The confinement is the firewall plugin's token validation
-# (agents/plugins/firewall/src/firewall_quarantine_parsers.hpp). The bare /usr/sbin/nft grant
-# that used to sit here was never called by any plugin and is replaced by these three.
-$ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft -f *
+# firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
+# through the helper above, so no line here takes a file name. Removing the table and listing it
+# are the two fixed commands below, with no argument pattern.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft delete table inet yuzu_quarantine
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /usr/sbin/nft list table inet yuzu_quarantine
 
@@ -607,18 +609,24 @@ remove_sudoers() {
 
 # ── Linux firewall helper ───────────────────────────────────────────────────
 #
-# The sudoers file names ONE program for iptables / ip6tables: $FW_HELPER_PATH. It is a POSIX sh
-# script, written from the quoted heredoc below (nothing in it is expanded by this script). The
-# installer is standalone and has no build output to copy, so the text lives here, and --check
-# compares the installed file with it byte for byte.
+# The sudoers file names ONE program for the Linux firewall work (iptables, ip6tables and the
+# nftables ruleset load): $FW_HELPER_PATH. It is a POSIX sh script, written from the quoted
+# heredoc below (nothing in it is expanded by this script). The installer is standalone and has
+# no build output to copy, so the text lives here, and --check compares the installed file with it
+# byte for byte.
 #
-# Contract (the C++ twin is iptables_helper_argv in
-# agents/plugins/firewall/src/firewall_quarantine_parsers.hpp; the two grammars move together and
+# Contract (the C++ twins are iptables_helper_argv and nft_ruleset_text in
+# agents/plugins/firewall/src/firewall_quarantine_parsers.hpp; the grammars move together and
 # tests/test_legacy_quarantine_plugin_removed_lexical.py runs this text against the same cases):
-#   - it matches the token count and every fixed token with `case`, validates every variable
-#     token, and then execs the tool with an argument list it builds from its own literals plus the
-#     validated values. No token ever reaches a shell parser: no eval, no `sh -c`, no arithmetic on a
-#     token before its digit check, no environment read.
+#   - iptables / ip6tables: it matches the token count and every fixed token with `case`,
+#     validates every variable token, and then execs the tool with an argument list it builds from
+#     its own literals plus the validated values. No token ever reaches a shell parser: no eval,
+#     no `sh -c`, no arithmetic on a token before its digit check, no environment read.
+#   - nft load: it reads the staged file ONCE, checks every line against the ruleset the plugin
+#     generates, and gives nft a ruleset it builds from its own literals plus the checked tokens on
+#     standard input. The file's bytes never reach nft: a shell `read` and nft do not split the same
+#     bytes the same way (NUL, CR, backslash-newline), so a copy that passed a shell check would not
+#     be proven to be what nft parses. There is no temporary file to leave behind or cut short.
 #   - anything else exits 64 having run nothing.
 # Installed root:root 0755, written to a temporary file in the same directory and renamed into
 # place, and always BEFORE the sudoers file that names it. Linux only.
@@ -627,11 +635,12 @@ generate_fw_helper_content() {
     cat <<'YUZU_FW_HELPER'
 #!/bin/sh
 # yuzu-fw-helper: the one program the Yuzu agent account may run as root to change iptables and
-# ip6tables. Installed by scripts/install-agent-user.sh (Linux only), root:root 0755, and named in
-# /etc/sudoers.d/yuzu-agent with no argument and no wildcard. Do not edit by hand: the installer's
-# --check compares this file with its own text.
+# ip6tables and to load the nftables ruleset. Installed by scripts/install-agent-user.sh (Linux
+# only), root:root 0755, and named in /etc/sudoers.d/yuzu-agent with no argument and no wildcard.
+# Do not edit by hand: the installer's --check compares this file with its own text.
 #
 # Usage: yuzu-fw-helper iptables|ip6tables <tokens>
+#        yuzu-fw-helper nft load <path>
 # <tokens> are exactly those of one of these shapes (<ours> is a yuzu-fwq-<generation>[-f] chain,
 # the generation 1 to 10 digits and at most 2147483647):
 #   -S
@@ -648,13 +657,27 @@ generate_fw_helper_content() {
 #   -p icmpv6 --icmpv6-type 133|134|135|136 -j ACCEPT
 #   [-s|-d <address>[/<prefix>]] -p tcp|udp [--sport <port>] [--dport <port>]
 #       [--tcp-flags ACK ACK|RST RST (tcp only)] -j ACCEPT
-# <address> is an IPv4 literal (digits, exactly three dots) or an IPv6 literal (lower-case hex and
-# colons, two or more colons), at most 43 characters with its prefix; <port> is 1 to 65535 in
-# plain decimal.
+# <address> is an IPv4 literal (four decimal parts of 0 to 255, no leading zero, exactly three
+# dots) or an IPv6 literal (lower-case hex and colons, two or more colons), at most 43 characters
+# with its prefix; <port> is 1 to 65535 in plain decimal.
 #
 # The caller's arguments are never passed on. Each branch below matches the token count and the
 # fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
 # own literals plus the validated values. Anything else exits 64, having run nothing.
+#
+# nft load <path>: <path> is absolute, at most 512 characters with no control character, in a
+# directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits, . _ ->.nft. The
+# file is read ONCE, at most 262145 bytes of it, and must hold exactly the ruleset the plugin
+# generates (nft_ruleset_text): thirteen fixed lines in order, rule lines only in the input and
+# output chains, at most 512 lines of at most 512 characters, nothing after the closing brace. A
+# rule line is `iif lo accept` (input), `oif lo accept` (output), the neighbour-discovery line, or
+#   [ip|ip6 saddr|daddr <address>] (meta l4proto tcp|udp | [P sport <port>] [P dport <port>])
+#       [tcp flags & (syn|ack) != syn] accept
+# with one protocol P per line, the flags only with tcp, `ip` only with an IPv4 address and `ip6`
+# only with an IPv6 one. The whole file is checked before anything runs; then nft is given a
+# ruleset this script builds from its own literals plus the checked tokens, on standard input
+# (nft -f /dev/stdin). Nothing read from the file is printed. The link, file-type and path checks
+# are not atomic with the open, so they are not the boundary: the line grammar is.
 
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -662,6 +685,13 @@ LC_ALL=C
 export PATH LC_ALL
 IPT=/usr/sbin/iptables
 IP6T=/usr/sbin/ip6tables
+NFT=/usr/sbin/nft
+# No pathname expansion and a single-space field separator before any word split below.
+set -f
+IFS=' '
+nl='
+'
+ND_RULE='icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept'
 
 refuse() {
     printf 'yuzu-fw-helper: refused\n' >&2
@@ -719,6 +749,19 @@ is_port() {
     esac
 }
 
+# is_octet TOKEN: one IPv4 part: 1 to 3 digits, no leading zero unless the token is 0, at most 255.
+is_octet() {
+    case $1 in
+        0) return 0 ;;
+        '' | 0* | *[!0123456789]*) return 1 ;;
+    esac
+    case ${#1} in
+        1 | 2) return 0 ;;
+        3) [ "$1" -le 255 ] ;;
+        *) return 1 ;;
+    esac
+}
+
 # is_addr TOKEN: an IPv4 or IPv6 literal with an optional /prefix.
 is_addr() {
     [ "${#1}" -le 43 ] || return 1
@@ -741,7 +784,16 @@ is_addr() {
             ;;
         *:*) return 1 ;;
         *[!0123456789.]* | .* | *. | *..* | *.*.*.*.*) return 1 ;;
-        *.*.*.*) lim=32 ;;
+        *.*.*.*)
+            o1=${addr_part%%.*}
+            rest=${addr_part#*.}
+            o2=${rest%%.*}
+            rest=${rest#*.}
+            o3=${rest%%.*}
+            o4=${rest#*.}
+            is_octet "$o1" && is_octet "$o2" && is_octet "$o3" && is_octet "$o4" || return 1
+            lim=32
+            ;;
         *) return 1 ;;
     esac
     [ -z "$pre" ] || [ "$pre" -le "$lim" ]
@@ -844,10 +896,233 @@ parse_rule() {
     return 0
 }
 
+# want LITERAL: the current input line ($line) is exactly LITERAL. The literal, never the input's
+# own bytes, is the next line of the text nft is given.
+want() {
+    tok_is "$line" "$1" || refuse
+    nft_text=$nft_text$1$nl
+}
+
+# nft_rule CHAIN RULE: RULE (a line without its four-space indent) is a rule the plugin emits into
+# CHAIN, input or output. Sets rule_out to the rule rebuilt from literals plus the validated
+# address and ports, and succeeds only when that is RULE character for character.
+nft_rule() {
+    rule=$2
+    case $rule in
+        'iif lo accept')
+            [ "$1" = input ] || return 1
+            rule_out='iif lo accept'
+            return 0
+            ;;
+        'oif lo accept')
+            [ "$1" = output ] || return 1
+            rule_out='oif lo accept'
+            return 0
+            ;;
+        "$ND_RULE")
+            rule_out=$ND_RULE
+            return 0
+            ;;
+    esac
+    r_fam=
+    r_dir=
+    r_addr=
+    r_proto=
+    r_sport=
+    r_dport=
+    r_flags=
+    set -- $rule
+    [ $# -ge 1 ] || return 1
+    case $1 in
+        ip | ip6)
+            [ $# -ge 3 ] || return 1
+            case $1 in
+                ip) r_fam=ip ;;
+                *) r_fam=ip6 ;;
+            esac
+            case $2 in
+                saddr) r_dir=saddr ;;
+                daddr) r_dir=daddr ;;
+                *) return 1 ;;
+            esac
+            is_addr "$3" || return 1
+            case $r_fam in
+                ip)
+                    case $3 in
+                        *:*) return 1 ;;
+                    esac
+                    ;;
+                *)
+                    case $3 in
+                        *:*) ;;
+                        *) return 1 ;;
+                    esac
+                    ;;
+            esac
+            r_addr=$3
+            shift 3
+            ;;
+    esac
+    [ $# -ge 3 ] || return 1
+    case $1 in
+        meta)
+            tok_is "$2" l4proto || return 1
+            case $3 in
+                tcp) r_proto=tcp ;;
+                udp) r_proto=udp ;;
+                *) return 1 ;;
+            esac
+            shift 3
+            ;;
+        tcp | udp)
+            case $1 in
+                tcp) r_proto=tcp ;;
+                *) r_proto=udp ;;
+            esac
+            if tok_is "$2" sport; then
+                is_port "$3" || return 1
+                r_sport=$3
+                shift 3
+                if [ $# -ge 3 ] && tok_is "$1" "$r_proto" && tok_is "$2" dport; then
+                    is_port "$3" || return 1
+                    r_dport=$3
+                    shift 3
+                fi
+            elif tok_is "$2" dport; then
+                is_port "$3" || return 1
+                r_dport=$3
+                shift 3
+            else
+                return 1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    if [ $# -eq 7 ]; then
+        tok_is "$r_proto" tcp || return 1
+        tok_is "$1 $2 $3 $4 $5 $6" 'tcp flags & (syn|ack) != syn' || return 1
+        r_flags=1
+        shift 6
+    fi
+    [ $# -eq 1 ] || return 1
+    tok_is "$1" accept || return 1
+    rule_out=
+    [ -z "$r_fam" ] || rule_out="$r_fam $r_dir $r_addr "
+    if [ -n "$r_sport$r_dport" ]; then
+        [ -z "$r_sport" ] || rule_out="$rule_out$r_proto sport $r_sport "
+        [ -z "$r_dport" ] || rule_out="$rule_out$r_proto dport $r_dport "
+    else
+        rule_out="${rule_out}meta l4proto $r_proto "
+    fi
+    [ -z "$r_flags" ] || rule_out="${rule_out}tcp flags & (syn|ack) != syn "
+    rule_out="${rule_out}accept"
+    [ "$rule_out" = "$rule" ]
+}
+
+# nft_rule_line CHAIN: the current input line ($line) is an indented rule of CHAIN.
+nft_rule_line() {
+    case $line in
+        '    '*) ;;
+        *) refuse ;;
+    esac
+    nft_rule "$1" "${line#    }" || refuse
+    nft_text=$nft_text'    '$rule_out$nl
+}
+
+# nft_apply: reads ALL of standard input (the staged file, already capped by the caller) and checks
+# it line by line against the ruleset the plugin generates. Only when the whole input passed does
+# it give nft the text built by want / nft_rule_line, on standard input: never a stream of the
+# file. It always ends in exit, with nft's status or 64.
+nft_apply() {
+    nft_text=
+    nft_n=
+    st=1
+    while IFS= read -r line; do
+        nft_n=${nft_n}x
+        [ "${#nft_n}" -le 512 ] || refuse
+        [ "${#line}" -le 512 ] || refuse
+        case $st in
+            1) want 'table inet yuzu_quarantine {}'; st=2 ;;
+            2) want 'flush table inet yuzu_quarantine'; st=3 ;;
+            3) want 'table inet yuzu_quarantine {'; st=4 ;;
+            4) want '  chain input {'; st=5 ;;
+            5) want '    type filter hook input priority -100; policy drop;'; st=6 ;;
+            6)
+                if tok_is "$line" '  }'; then
+                    want '  }'
+                    st=7
+                else
+                    nft_rule_line input
+                fi
+                ;;
+            7) want '  chain output {'; st=8 ;;
+            8) want '    type filter hook output priority -100; policy drop;'; st=9 ;;
+            9)
+                if tok_is "$line" '  }'; then
+                    want '  }'
+                    st=10
+                else
+                    nft_rule_line output
+                fi
+                ;;
+            10) want '  chain forward {'; st=11 ;;
+            11) want '    type filter hook forward priority -100; policy drop;'; st=12 ;;
+            12) want '  }'; st=13 ;;
+            13) want '}'; st=14 ;;
+            *) refuse ;;
+        esac
+    done
+    [ "$st" = 14 ] || refuse
+    printf '%s' "$nft_text" | "$NFT" -f /dev/stdin
+    exit $?
+}
+
+# nft_load PATH: yuzu-fw-helper nft load PATH. Never returns.
+nft_load() {
+    path=$1
+    case $path in
+        /*) ;;
+        *) refuse ;;
+    esac
+    [ "${#path}" -le 512 ] || refuse
+    case $path in
+        *[[:cntrl:]]*) refuse ;;
+    esac
+    dir=${path%/*}
+    leaf=${path##*/}
+    case $dir in
+        */firewall-staging) ;;
+        *) refuse ;;
+    esac
+    case $leaf in
+        yuzu-fwq-*.nft) ;;
+        *) refuse ;;
+    esac
+    mid=${leaf#yuzu-fwq-}
+    mid=${mid%.nft}
+    case $mid in
+        '' | *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*) refuse ;;
+    esac
+    # Not the boundary: a link or a non-regular file is refused here, but the file can change
+    # between these tests and the open below. The boundary is nft_apply, which reads the one opened
+    # file and gives nft only text it built itself. The tests keep a FIFO from blocking the open.
+    if [ -L "$path" ] || [ ! -f "$path" ]; then
+        refuse
+    fi
+    head -c 262145 < "$path" | nft_apply
+    exit $?
+}
+
 [ $# -ge 2 ] || refuse
 case $1 in
     iptables) tool=$IPT ;;
     ip6tables) tool=$IP6T ;;
+    nft)
+        [ $# -eq 3 ] || refuse
+        tok_is "$2" load || refuse
+        nft_load "$3"
+        refuse
+        ;;
     *) refuse ;;
 esac
 op=$2
@@ -932,6 +1207,46 @@ esac
 YUZU_FW_HELPER
 }
 
+# fw_dir_verdict UID OCTAL_MODE: pure, no I/O. For the directory that holds the helper, with the
+# owner uid and octal mode `stat -L -c '%u %a'` reports, prints ok, warn or refuse. refuse: the
+# owner is not uid 0 or the mode has the other-write bit (anyone could replace the helper). warn: the
+# mode has the group-write bit (Debian policy ships /usr/local directories root:staff 2775, so a
+# flat refusal would stop the installer there). Anything that is not a uid and an octal mode refuses.
+fw_dir_verdict() {
+    case $1 in '' | *[!0123456789]*) echo refuse; return ;; esac
+    case $2 in '' | *[!01234567]*) echo refuse; return ;; esac
+    [ "$1" = 0 ] || { echo refuse; return; }
+    local mode=$2 rest other group
+    other=${mode#"${mode%?}"}
+    rest=${mode%?}
+    group=${rest#"${rest%?}"}
+    case $other in 2 | 3 | 6 | 7) echo refuse; return ;; esac
+    case $group in 2 | 3 | 6 | 7) echo warn; return ;; esac
+    echo ok
+}
+
+# check_fw_dir DIR: applies fw_dir_verdict to DIR as it is now. Prints the warning on warn and
+# carries on (returns 0); returns non-zero on refuse or when the owner and mode cannot be read.
+check_fw_dir() {
+    local dir="$1" info uid mode grp
+    info=$(stat -L -c '%u %a %G' "$dir" 2>/dev/null) || {
+        warn "cannot read the owner and mode of $dir"
+        return 1
+    }
+    read -r uid mode grp <<<"$info"
+    case "$(fw_dir_verdict "$uid" "$mode")" in
+        ok) return 0 ;;
+        warn)
+            warn "$dir is writable by group $grp (mode $mode): its members can replace the files in it, including the firewall helper"
+            return 0
+            ;;
+        *)
+            warn "$dir is owned by uid $uid with mode $mode: the firewall helper must live in a directory owned by root that other users cannot write to"
+            return 1
+            ;;
+    esac
+}
+
 install_fw_helper() {
     if [[ "$PLATFORM" != "linux" || "$SKIP_SUDOERS" -eq 1 ]]; then return 0; fi
 
@@ -946,6 +1261,10 @@ install_fw_helper() {
     log "installing the firewall helper $FW_HELPER_PATH (root:root 0755)"
     # Create the directory only when missing: never reset a site-customised owner or mode.
     [[ -d "$dir" ]] || run install -d -m 0755 -o root -g root "$dir"
+    # Stop before writing when anyone but root could replace the helper.
+    check_fw_dir "$dir" || return 1
+    # A killed earlier run can leave its temporary file; none of them is ours to keep.
+    rm -f "$dir"/.yuzu-fw-helper.??????
     # A temporary file in the SAME directory, so the final rename is atomic: sudo never sees a
     # half-written helper, and a failed write leaves the previous helper in place.
     tmp=$(mktemp "$dir/.yuzu-fw-helper.XXXXXX") || { warn "cannot create a temp file in $dir"; return 1; }
@@ -975,6 +1294,7 @@ check_fw_helper() {
         warn "$FW_HELPER_PATH is missing (re-run this installer)"
         return 1
     fi
+    check_fw_dir "$(dirname "$FW_HELPER_PATH")" || return 1
     local owner_mode
     owner_mode=$(stat -c '%U:%G %a' "$FW_HELPER_PATH" 2>/dev/null || true)
     if [[ "$owner_mode" != "root:root 755" ]]; then
@@ -1131,7 +1451,7 @@ case "$ACTION" in
         install_sudoers
         apply_setcap
         if [[ "$fw_helper_rc" -ne 0 ]]; then
-            fail "the firewall helper was not installed; iptables containment will fail on this host until it is"
+            fail "the firewall helper was not installed; firewall containment will fail on this host until it is"
         fi
         log "install complete. Verify with: $0 --check"
         ;;

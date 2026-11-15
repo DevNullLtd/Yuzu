@@ -1100,7 +1100,9 @@ TEST_CASE("QuarantineStore: apply_fence_token is the generation when no claim is
 }
 
 namespace {
-// Stamp the record's claim `age_secs` old on the DATABASE clock, the clock the store judges it by.
+// Stamp the record's claim `age_secs` old, counted back from the database's now(). The test host
+// and the database share a clock, so this pins the edges of the window, not which clock the store
+// reads: that is tests/test_quarantine_wiring_lexical.py's job.
 void stamp_claim_age(const std::string& dsn, std::int64_t id, std::int64_t age_secs) {
     exec_sql(dsn, "UPDATE quarantine_store.quarantine_records SET apply_claimed_at = "
                   "EXTRACT(EPOCH FROM now())::bigint - " +
@@ -1108,8 +1110,8 @@ void stamp_claim_age(const std::string& dsn, std::int64_t id, std::int64_t age_s
 }
 } // namespace
 
-TEST_CASE("QuarantineStore: the 120 s claim window is the database's clock, at the claim, the token "
-          "read and both fenced ends: 110 s old is live, 121 s old is expired",
+TEST_CASE("QuarantineStore: at the 120 s claim window edge a claim 110 s old is live and one 121 s "
+          "old is expired for the claim and the token read and both fenced ends",
           "[pg][quarantine][apply_fence]") {
     YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

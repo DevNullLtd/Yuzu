@@ -23516,10 +23516,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         // store_error / no_active_record: nothing was dispatched
                         // by this call — retry the whole request rather than
                         // report isolated on a record that turned out not to be
-                        // there. no_active_record also covers a refused claim
-                        // (the record is there and another apply holds it); the
-                        // retry is right then too, and the device is contained
-                        // either way.
+                        // there. no_active_record also covers a refused claim:
+                        // the record is there and another apply holds it, and
+                        // that apply is the one dispatching the containment, so
+                        // this call has not contained the device. The retry is
+                        // still right.
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));
                         res.set_content(a4_error(kInternalError, err.detail, "retry the request",

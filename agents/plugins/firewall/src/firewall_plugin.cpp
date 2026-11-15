@@ -1663,12 +1663,14 @@ private:
 }
 
 /// The agent-private directory a ruleset is staged in: `<agent.data_dir>/
-/// firewall-staging`, mode 0700 and owned by the agent. The privileged `nft -f` /
-/// `pfctl -f` reads the file after it is written, so a world-writable temp dir
-/// would let another local user swap the content in between. An existing
-/// directory is trusted only when it is a real directory (not a link) owned by
-/// us with no group/other access. Empty when `agent.data_dir` is unset or the
-/// directory cannot be made safe: the apply is then refused, never staged in /tmp.
+/// firewall-staging`, mode 0700 and owned by the agent. The privileged load (the helper's
+/// `nft load` on Linux, `pfctl -f` on macOS) reads the file after it is written, so a
+/// world-writable temp dir would let another local user swap the content in between. The
+/// directory name and the `yuzu-fwq-*.nft` file name NftLeg stages are the shape the Linux
+/// helper accepts (scripts/install-agent-user.sh; pinned by
+/// tests/test_legacy_quarantine_plugin_removed_lexical.py). An existing directory is trusted
+/// only when it is a real directory (not a link) owned by us with no group/other access. Empty
+/// when `agent.data_dir` is unset or the directory cannot be made safe: the apply is then refused, never staged in /tmp.
 [[maybe_unused]] std::string private_staging_dir(YuzuPluginContext* raw) {
     const auto data_dir = config_value(raw, "agent.data_dir");
     if (data_dir.empty())
@@ -1787,8 +1789,11 @@ private:
     if (use != fq::BackendKind::nft && use != fq::BackendKind::iptables)
         use = has_nft ? fq::BackendKind::nft
                       : (has_ipt ? fq::BackendKind::iptables : fq::BackendKind::none);
+    // A static decision on the euid, the one sudo_wrap makes: a root agent has no sudoers grant to
+    // bound and runs the tools itself; any other agent goes through the root-owned helper.
+    const auto access = ::geteuid() == 0 ? fq::ToolAccess::direct : fq::ToolAccess::helper;
     if (use == fq::BackendKind::nft)
-        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw),
+        return std::make_unique<fq::NftLeg>(sudo_runner(), temp_file_stage(raw), access,
                                             read_quarantine_table_netlink);
     if (use == fq::BackendKind::iptables) {
         // Apply decides IPv6 from the tool AND the stack (iptables_v6_plan refuses a
@@ -1798,7 +1803,7 @@ private:
         const bool has_ip6 = ::access("/usr/sbin/ip6tables", X_OK) == 0;
         const auto mode = for_apply ? fq::iptables_v6_plan(has_ip6, ipv6_stack_present())
                                     : (has_ip6 ? fq::V6Mode::cover : fq::V6Mode::v4_only);
-        return std::make_unique<fq::IptablesLeg>(sudo_runner(), mode);
+        return std::make_unique<fq::IptablesLeg>(sudo_runner(), mode, access);
     }
     return nullptr;
 }
@@ -3018,7 +3023,7 @@ int do_quarantine_status(yuzu::CommandContext& ctx, YuzuPluginContext* raw,
 // run_bounded_subprocess argv (rung 2), the fallback once neither native
 // backend is reachable. `state` and `rules` never mutate firewall state. The
 // four containment actions below do: Windows over COM (rung 1), Linux over
-// `sudo nft -f` / iptables argv (rung 2, with the status read rung 1 -> 2),
+// the root-owned helper's nft load / iptables argv (rung 2, with the status read rung 1 -> 2),
 // macOS over `sudo pfctl` (rung 2): an own sub-anchor plus a pf enable reference.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
@@ -3049,8 +3054,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "quarantine",
         /* .linux_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2,
-         "sudo nft -f of an own inet table applied as one transaction (policy-drop chains); "
-         "iptables/ip6tables generation chain via run_bounded_subprocess when nft is absent",
+         "sudo yuzu-fw-helper nft load of an own inet table applied as one transaction "
+         "(policy-drop chains); iptables/ip6tables generation chain via run_bounded_subprocess "
+         "when nft is absent",
          "the packaged systemd unit (NoNewPrivileges, no sudoers) refuses every containment action "
          "privilege_unavailable; needs the installer's sudoers grant on a unit without NoNewPrivileges; "
          "contains the host's own IP traffic and traffic the host routes (L2-bridged guests and "

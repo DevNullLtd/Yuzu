@@ -17,11 +17,16 @@
  * between any two runner calls.
  *
  * THIS FILE IS THE PRIVILEGE BOUNDARY. The sudoers lines that let the agent
- * run nft / pfctl narrow the argv SHAPE but cannot confine it (sudo globs match
- * concatenated args; `nft -f` and `pfctl -a ... -f` execute agent-generated file
- * content). iptables and ip6tables are not granted to the agent at all: it may
- * run only the root-owned helper (kFwHelperPath), whose argument grammar
- * iptables_helper_argv states and the helper enforces itself. What actually confines the privileged call is
+ * run pfctl narrow the argv SHAPE but cannot confine it (sudo globs match
+ * concatenated args; `pfctl -a ... -f` executes agent-generated file content).
+ * On Linux the agent is granted no iptables, ip6tables or file-taking nft
+ * command: it may run only the root-owned helper (kFwHelperPath), whose
+ * iptables grammar is iptables_helper_argv and whose `nft load <staged file>`
+ * action checks every line of the staged file against the text nft_ruleset_text
+ * emits and gives nft a ruleset it rebuilt itself; the helper enforces both
+ * itself. (`nft delete table` and `nft list table` are fixed commands, granted
+ * as they are.) An agent that runs as root has no grant to bound and runs the
+ * tools directly (ToolAccess::direct). What actually confines the privileged call is
  * that every token reaching an argv or a ruleset line is built here from a
  * typed, validated value and then re-checked against a strict charset
  * (is_safe_token: no whitespace, `;`, quote, `$`, backtick, `|`, `&`, `#`, `\` or
@@ -2450,10 +2455,28 @@ struct IptablesListing {
     return out;
 }
 
-/// The root-owned helper the sudoers file grants in place of iptables and ip6tables (#7634):
-/// `scripts/install-agent-user.sh` writes it (root:root 0755, Linux only) and names this path in
-/// sudoers with no argument and no wildcard. The agent never runs the tools themselves.
+/// The root-owned helper the sudoers file grants in place of iptables, ip6tables and a file-taking
+/// nft (#7634): `scripts/install-agent-user.sh` writes it (root:root 0755, Linux only) and names
+/// this path in sudoers with no argument and no wildcard. An agent that is not root never runs
+/// those tools itself.
 inline constexpr std::string_view kFwHelperPath = "/usr/local/sbin/yuzu-fw-helper";
+
+/// How a Linux leg reaches the privileged tool. `helper`: through kFwHelperPath, the one program
+/// the sudoers file lets a non-root agent run for them. `direct`: the agent is root, which
+/// sudo_wrap already treats as needing no sudo and which has no sudoers grant to bound, so the leg
+/// runs the tool itself and does not need the helper installed. A static decision on the euid,
+/// made by the shell (make_leg) and passed in; this header never reads the euid, and a leg is
+/// never built without saying which.
+enum class ToolAccess : std::uint8_t { direct, helper };
+
+/// The argv that has the helper load a staged nft ruleset (`<helper> nft load <staged file>`). The
+/// path is checked by Exec::call_staged like any staged path, and again by the helper, which
+/// accepts only `.../firewall-staging/yuzu-fwq-<token>.nft` and then only the ruleset text that
+/// nft_ruleset_text emits (the staging name is the stem and suffix NftLeg::apply hands to its
+/// Stage).
+[[nodiscard]] inline std::vector<std::string> nft_helper_load_argv(std::string_view path) {
+    return {std::string{kFwHelperPath}, "nft", "load", std::string{path}};
+}
 
 namespace detail {
 
@@ -2478,10 +2501,12 @@ namespace detail {
     return is_digits(p, 1, 5) && p.front() != '0' && parse_uint(p, 65535).has_value();
 }
 
-/// An IPv4 literal (digits, exactly three dots, no empty part) or an IPv6 literal (lower-case hex
-/// and colons, two or more colons, no `:::`), then an optional `/<1 to 3 digits>` not above 32 or
-/// 128; at most 43 characters in all. Deliberately a charset-and-shape check, not a parse: the
-/// tool rejects what is not an address, and no name can pass for one.
+/// An IPv4 literal (four decimal parts of 0 to 255, no leading zero: parse_ipv4) or an IPv6 literal
+/// (lower-case hex and colons, two or more colons, no `:::`), then an optional `/<1 to 3 digits>`
+/// not above 32 or 128; at most 43 characters in all. The IPv4 half is a full parse, so no host
+/// name and no out-of-range quad (`999.1.1.1`) can pass for an address; the IPv6 half stays a
+/// charset-and-shape check (a name has no two colons and no all-hex-and-colon form the tool would
+/// resolve).
 [[nodiscard]] inline bool helper_addr(std::string_view t) {
     if (t.size() > 43)
         return false;
@@ -2505,9 +2530,7 @@ namespace detail {
     } else if (colons == 1) {
         return false;
     } else {
-        if (addr.find_first_not_of("0123456789.") != std::string_view::npos || addr.empty() ||
-            addr.front() == '.' || addr.back() == '.' || addr.find("..") != std::string_view::npos ||
-            std::count(addr.begin(), addr.end(), '.') != 3)
+        if (!parse_ipv4(addr))
             return false;
         limit = 32;
     }
@@ -3149,17 +3172,18 @@ public:
         }
         return run(argv);
     }
-    /// An iptables / ip6tables command, given as the plan argv the builders above emit. It runs
-    /// only as the root-owned helper's argv (iptables_helper_argv): a plan argv outside the
-    /// helper's grammar is `unsafe_argv` and nothing is spawned. The grammar is stricter than
-    /// is_safe_token, so the charset check call() makes is not repeated.
-    [[nodiscard]] std::optional<ToolResult> call_iptables(const Argv& plan) {
+    /// An iptables / ip6tables command, given as the plan argv the builders above emit. A plan argv
+    /// outside the helper's grammar (iptables_helper_argv) is `unsafe_argv` and nothing is
+    /// spawned, in both modes. `helper` runs the helper's argv; `direct` (a root agent) runs the
+    /// plan argv as it is. The grammar is stricter than is_safe_token, so the charset check call()
+    /// makes is not repeated.
+    [[nodiscard]] std::optional<ToolResult> call_iptables(const Argv& plan, ToolAccess access) {
         auto helper = iptables_helper_argv(plan);
         if (!helper) {
             reason_ = "unsafe_argv";
             return std::nullopt;
         }
-        return run(*helper);
+        return run(access == ToolAccess::helper ? *helper : plan);
     }
     /// A command whose LAST token is a staged file: that one token is checked with
     /// is_safe_staged_path (a space in the data directory is fine), every other with
@@ -3216,8 +3240,11 @@ private:
 
 class NftLeg final : public Leg {
 public:
-    NftLeg(Runner run, Stage stage, NftChainReader reader = {})
-        : run_(std::move(run)), stage_(std::move(stage)), reader_(std::move(reader)) {}
+    /// `access` says how the ruleset load reaches nft: through the helper (a non-root agent) or
+    /// as `nft -f <staged file>` (a root agent). `delete` and `list` are the same in both.
+    NftLeg(Runner run, Stage stage, ToolAccess access, NftChainReader reader = {})
+        : run_(std::move(run)), stage_(std::move(stage)), access_(access),
+          reader_(std::move(reader)) {}
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::nft; }
 
@@ -3234,7 +3261,9 @@ public:
         if (!staged)
             return StepResult::fail("stage_failed");
         detail::Exec ex(run_, dl);
-        const auto r = ex.call_staged(nft_apply_argv(staged->path), *staged);
+        const auto argv = access_ == ToolAccess::helper ? nft_helper_load_argv(staged->path)
+                                                        : nft_apply_argv(staged->path);
+        const auto r = ex.call_staged(argv, *staged);
         if (!r)
             return StepResult::fail(ex.reason());
         if (!r->ok())
@@ -3284,6 +3313,7 @@ public:
 private:
     Runner run_;
     Stage stage_;
+    ToolAccess access_;
     NftChainReader reader_;
 };
 
@@ -3324,7 +3354,8 @@ enum class V6Mode : std::uint8_t {
 
 class IptablesLeg final : public Leg {
 public:
-    IptablesLeg(Runner run, V6Mode v6) : run_(std::move(run)), v6_(v6) {}
+    IptablesLeg(Runner run, V6Mode v6, ToolAccess access)
+        : run_(std::move(run)), v6_(v6), access_(access) {}
 
     [[nodiscard]] BackendKind kind() const override { return BackendKind::iptables; }
 
@@ -3350,7 +3381,7 @@ public:
         detail::Exec ex(run_, dl);
         std::uint32_t max_gen = 0;
         for (auto& f : fams) {
-            const auto r = ex.call_iptables({std::string{f.tool}, "-S"});
+            const auto r = ex.call_iptables({std::string{f.tool}, "-S"}, access_);
             if (!r)
                 return StepResult::fail(ex.reason());
             if (!r->ok())
@@ -3365,7 +3396,7 @@ public:
         auto run_all = [&](const std::vector<Argv>& plan, std::string& why,
                            std::string& detail_out) {
             for (const auto& a : plan) {
-                const auto r = ex.call_iptables(a);
+                const auto r = ex.call_iptables(a, access_);
                 if (!r) {
                     why = ex.reason();
                     return false;
@@ -3395,7 +3426,7 @@ public:
                     plan.push_back({std::string{f.tool}, "-X", c});
                 }
                 for (const auto& a : plan)
-                    (void)cx.call_iptables(a);
+                    (void)cx.call_iptables(a, access_);
             }
         };
 
@@ -3417,7 +3448,7 @@ public:
         // is tidying, so a failure here is a note, not a failed update.
         for (const auto& f : fams) {
             for (const auto& a : iptables_remove_plan(f.tool, f.before, eff)) {
-                const auto r = ex.call_iptables(a);
+                const auto r = ex.call_iptables(a, access_);
                 if (!r || !r->ok()) {
                     ok.notes.emplace_back("old_generation_left=1");
                     break;
@@ -3437,7 +3468,7 @@ public:
         for (int pass = 0; pass < 2; ++pass) {
             bool clean = true;
             for (const auto tool : tools) {
-                const auto r = ex.call_iptables({std::string{tool}, "-S"});
+                const auto r = ex.call_iptables({std::string{tool}, "-S"}, access_);
                 if (!r)
                     return StepResult::fail(ex.reason());
                 if (!r->ok()) {
@@ -3452,7 +3483,7 @@ public:
                     continue;
                 clean = false;
                 for (const auto& a : iptables_remove_plan(tool, listing, 0)) {
-                    const auto c = ex.call_iptables(a);
+                    const auto c = ex.call_iptables(a, access_);
                     if (!c && ex.reason() == "deadline_exceeded")
                         return StepResult::fail(ex.reason());
                 }
@@ -3474,7 +3505,7 @@ public:
             tools.push_back(kIp6tablesPath);
         bool all = true;
         for (const auto tool : tools) {
-            const auto r = ex.call_iptables({std::string{tool}, "-S"});
+            const auto r = ex.call_iptables({std::string{tool}, "-S"}, access_);
             if (!r || !r->ok())
                 return st;
             const auto l = parse_iptables_listing(r->output);
@@ -3495,6 +3526,7 @@ private:
 
     Runner run_;
     V6Mode v6_;
+    ToolAccess access_;
 };
 
 // ── macOS leg ───────────────────────────────────────────────────────────────
