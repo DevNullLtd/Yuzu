@@ -1775,6 +1775,8 @@ TEST_CASE("instruction_routes: DELETE success audit detail carries the deleted d
     auto again = h.sink.Delete("/api/instructions/" + id);
     REQUIRE(again);
     CHECK(again->status == 404);
+    // A stale list (the row is already gone) is also an error toast, not a silent button.
+    CHECK(json::parse(again->get_header_value("HX-Trigger"))["showToast"]["level"] == "error");
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "denied");
     CHECK(h.audits[0].detail == "not_found");
@@ -1848,6 +1850,8 @@ TEST_CASE("instruction_routes: DELETE a definition that a schedule names is refu
     auto ok = h.sink.Delete("/api/instructions/" + id);
     REQUIRE(ok);
     CHECK(ok->status == 200);
+    // The success keeps the success toast: the error toast is for refusals only.
+    CHECK(json::parse(ok->get_header_value("HX-Trigger"))["showToast"]["level"] == "success");
     REQUIRE(h.audits.size() == 1);
     CHECK(h.audits[0].result == "success");
 }

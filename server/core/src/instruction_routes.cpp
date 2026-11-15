@@ -569,6 +569,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                "db_error"))
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Instruction store delete failed","level":"error"}})");
             res.set_content(
                 R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
                 "application/json");
@@ -579,6 +581,9 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                "not_found"))
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 404;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Instruction definition not found","level":"error"}})");
             res.set_content(
                 R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
                 "application/json");

@@ -4558,6 +4558,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                         const char* audit_detail, std::string_view message) {
                     audit_fn(req, "product_pack.uninstall", audit_result, "ProductPack", id,
                              audit_detail);
+                    // An unwired lookup is a server wiring fault, not a transient: say so in the
+                    // log (a fixed text, no request data), since the 503 reads like any other.
+                    if (std::string_view(audit_detail) == "referrer_check_unwired")
+                        spdlog::error("DELETE /api/product-packs/:id refused: the definition "
+                                      "reference check is not wired (a server wiring fault)");
                     res.status = status;
                     res.set_content(detail::a4_error(res, message), "application/json");
                 };

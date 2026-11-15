@@ -7296,6 +7296,9 @@ TEST_CASE("N4-2b: a failed delete of a pack's own policy aborts the uninstall an
     fault.repair();
     REQUIRE(failed);
     CHECK(failed->status == 503);
+    REQUIRE(h.audit_calls.size() == 1);
+    CHECK(h.audit_calls[0].action == "product_pack.uninstall");
+    CHECK(h.audit_calls[0].result == "denied");
     auto still_pack = h.product_pack_store->get(*installed);
     REQUIRE(still_pack.has_value());
     CHECK(still_pack->has_value());
@@ -7309,6 +7312,9 @@ TEST_CASE("N4-2b: a failed delete of a pack's own policy aborts the uninstall an
     auto gone_policy = policies.get_policy(policy_id);
     REQUIRE(gone_policy.has_value());
     CHECK_FALSE(gone_policy->has_value());
+    auto gone_pack = h.product_pack_store->get(*installed);
+    REQUIRE(gone_pack.has_value());
+    CHECK_FALSE(gone_pack->has_value());
 }
 
 // N4-3: UP-7. The referrer sources read an empty definition id as "no filter" and would answer
