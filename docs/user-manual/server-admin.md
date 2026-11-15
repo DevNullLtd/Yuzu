@@ -4921,17 +4921,6 @@ Held-open SSE streams also lease this pool: each re-validates its credential eve
 
 **`endpoint_state` holds last-seen history for departed devices.** For a connected agent the identity fields (hostname, OS, agent version, architecture) are repopulated from its next heartbeat. The schema is also the only record of every device that has since disconnected: `/hardware` lists those devices as Offline, with their real last-seen time, for 30 days, and the retention prune's clock anchor is stored beside the rows (`endpoint_state.retention_meta`). Neither regenerates from heartbeats, so include the schema in a full restore; a targeted restore that omits it loses the Offline history until each device reconnects. Retention: a row is deleted 37 days after its device was last seen (the 30-day roster window plus a 7-day margin). Each replica runs the prune hourly and removes at most 12,000 rows per hour. The first pass runs about a minute after the server starts. On the first start after the upgrade it only records its clock anchor, so deletions begin with the next hourly pass; on every later start it already deletes; a backlog inherited from an older release (for example 100,000 rows) drains at that rate, in about 8 hours. A decommissioned device's row is erased by the decommission route (#5682); a device that is never decommissioned ages out under the same 37-day rule.
 
-### PostgreSQL collation version
-
-Text-keyed indexes are ordered by the database's collation, which comes from the operating system's C library (or ICU) at the time the database was created. If an operating-system or libc upgrade changes the collation rules, an existing index can disagree with the new rules, and an ordered read of a text key can then skip or repeat rows. Several server reads page through a text primary key with a keyset walk (for example `GET /api/v1/hardware/ci`, which walks `agent_id`); the "no device is skipped or served twice" property of such a walk holds only while the indexes agree with the collation.
-
-PostgreSQL records the collation version a database was created with and reports a collation version mismatch in its own log when it opens a database whose recorded version differs from the operating system's. After an operating-system or libc upgrade that changes collation rules:
-
-1. Reindex the text-keyed indexes (`REINDEX DATABASE <name>`, run while connected to that database), or recreate the database with a `C` collation, whose ordering does not depend on the library.
-2. Refresh the recorded version: `ALTER DATABASE <name> REFRESH COLLATION VERSION`.
-
-Both statements need the database owner or a superuser. A database created with the `C` (or `POSIX`) collation has no collation version and is not affected.
-
 ### Provisioning a native (non-container) install
 
 Docker Compose deployments get PostgreSQL automatically — every tracked compose bundles a `postgres` service (the `ghcr.io/devnullltd/yuzu-postgres` image: PostgreSQL 18 + pgvector + first-boot role/database init). The server's PostgreSQL client library is libpq 18.4; it was measured against a PostgreSQL 16 server with scram and md5 roles (14 of 14 tests each), while PostgreSQL 17 servers are not measured and servers below the documented 16+ floor are not supported. Native installs use the provisioning helper instead:
