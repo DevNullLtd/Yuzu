@@ -2667,8 +2667,9 @@ TEST_CASE("route: GET /api/v1/hardware/ci never returns a device outside the cal
         REQUIRE(res->status == 200);
         CHECK_FALSE(contains(res->body, "out-c"));
         CHECK(nlohmann::json::parse(res->body)["data"]["devices"].empty());
-        // Audited as ONE refusal row, target Agent/<id>. (The software devices route differs: it
-        // writes a denied row and then a success row for the same request.)
+        // Audited as ONE refusal row, target Agent/<id>. (The dashboard fragment
+        // GET /fragments/inventory/software/devices differs: its verb inventory.software.query
+        // can write a denied row and then a success row for the same request.)
         REQUIRE(h.audit_full.size() == 1);
         CHECK(h.audit_full[0] == "inventory.devices.ci|denied|Agent|out-c");
         CHECK(h.audit_details[0] == "hardware CI records (REST) state=agent_id outside the caller's scope");
