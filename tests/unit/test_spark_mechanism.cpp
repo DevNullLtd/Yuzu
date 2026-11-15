@@ -15515,11 +15515,20 @@ struct DeafWatchTree {
     std::filesystem::path parent;
     std::filesystem::path file;
     explicit DeafWatchTree(const char* tag) {
-        root = yuzu::test::unique_temp_path(std::string("yuzu_test_5719_") + tag + "_");
-        parent = root / "watched";
-        file = parent / "file.txt";
-        std::filesystem::create_directories(parent);
-        std::ofstream(file) << "seed";
+        // A throwing constructor does not run the destructor, so a partially created tree
+        // is removed here and the exception rethrown (the seed write and the directory
+        // creation are the throwing steps; remove_all on a never-created root is a no-op).
+        try {
+            root = yuzu::test::unique_temp_path(std::string("yuzu_test_5719_") + tag + "_");
+            parent = root / "watched";
+            file = parent / "file.txt";
+            std::filesystem::create_directories(parent);
+            std::ofstream(file) << "seed";
+        } catch (...) {
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+            throw;
+        }
     }
     ~DeafWatchTree() {
         std::error_code ec;
