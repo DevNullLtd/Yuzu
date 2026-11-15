@@ -29370,7 +29370,7 @@ TEST_CASE("MCP create_management_group: a store fault on create answers a fixed 
     McpTestServer ts;
     ts.mgmt_store_for_test = &store;
     ts.start();
-    yuzu::test::LogCapture cap;
+    yuzu::test::LogCapture cap(spdlog::level::err);
     auto res = ts.call(mg_create_body({{"name", "doomed"}}));
     cap.stop();
     REQUIRE(res);

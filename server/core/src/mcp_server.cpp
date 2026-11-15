@@ -6289,7 +6289,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // B4 (#2146 API-parity) — management-group mutations.
     // create_management_group: pure INSERT of a new group → Additive, matching
     // create_engine_principal's reasoning above. Not idempotent — a repeat call
-    // with the same name mints a SECOND group (name is not unique).
+    // with the same name creates nothing: management_groups.name is UNIQUE
+    // (`management_groups_name_key`), so the second call is refused as a name
+    // conflict and answers an error, not the first call's group id.
     {"create_management_group", {ToolEffect::Additive, false, "Create management group"}},
     // update_management_group: UPDATE overwrites the group's existing fields
     // (name/description/parent/membership_type/scope_expression) → Destructive.

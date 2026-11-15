@@ -19,13 +19,13 @@
 ///
 /// EXTEND this file, never copy it into a handler. No store, no I/O, no wire types.
 
-#include "rbac_text.hpp"
-
 #include <yuzu/log_token.hpp> // yuzu::utf8_sequence_length
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <cstddef>
 #include <string_view>
+
+#include "rbac_text.hpp"
 
 namespace yuzu::server {
 

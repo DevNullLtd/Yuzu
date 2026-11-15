@@ -20,7 +20,8 @@
 /// device first appears. The flag only RECORDS it. The three outcomes are deliberately distinct:
 ///   Known       an enrolment row exists (any status: pending, approved or denied).
 ///   Unknown     the table answered and has no such id, or the store refused the id as input it
-///               cannot hold (`StoreError::InvalidInput`: a comma, an over-long id). A caller-input
+///               cannot hold (`StoreError::InvalidInput`: a control byte, DEL, a comma or an
+///               over-long id). A caller-input
 ///               outcome, not an outage.
 ///   Unreadable  the lookup could not be made (store outage, any other error, or no AuthDB wired).
 ///               It is NEVER recorded as Unknown: "could not check" must not read as "checked, and
@@ -38,7 +39,6 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
 
-#include <exception>
 #include <expected>
 #include <optional>
 #include <string>

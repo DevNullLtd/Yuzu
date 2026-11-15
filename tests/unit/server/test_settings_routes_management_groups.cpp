@@ -29,6 +29,7 @@
 #include <httplib.h>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <memory>
@@ -210,6 +211,17 @@ struct MgmtGroupsHarness {
     }
 };
 
+/// The `showToast` payload of an `HX-Trigger` response header, parsed: the header is JSON, so the
+/// message and level are asserted as fields, not as substrings of the raw text.
+nlohmann::json toast_of(const httplib::Response& res) {
+    const auto header = res.get_header_value("HX-Trigger");
+    const auto parsed = nlohmann::json::parse(header, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(parsed.is_discarded());
+    REQUIRE(parsed.is_object());
+    REQUIRE(parsed.contains("showToast"));
+    return parsed.at("showToast");
+}
+
 // Runs `sql` on the test database over its own connection (the harness pool is not reachable).
 void exec_sql(const std::string& dsn, const char* sql) {
     std::unique_ptr<PGconn, decltype(&PQfinish)> conn{PQconnectdb(dsn.c_str()), &PQfinish};
@@ -306,10 +318,9 @@ TEST_CASE("Settings group create: an unstorable attempted row refuses with 503, 
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     // htmx drops a 5xx body, so the operator's only view of the refusal is the toast.
-    const auto toast = res->get_header_value("HX-Trigger");
-    CHECK(toast.find("showToast") != std::string::npos);
-    CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
-    CHECK(toast.find("Audit log unavailable: the group was not created") != std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Audit log unavailable: the group was not created");
     CHECK(res->body.find("audit log unavailable") != std::string::npos);
 
     CHECK(h.group_names().empty());
@@ -388,9 +399,11 @@ TEST_CASE("Settings group create: a store that cannot answer the validation refu
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    // Declared BEFORE `routes`: the audit callback registered below captures it by reference, and
+    // `routes` (which holds that callback) must be destroyed first.
+    std::vector<AuditRow> calls;
     SettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
-    std::vector<AuditRow> calls;
     auto auth_fn = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
         auth::Session s;
         s.username = "admin";
@@ -427,9 +440,9 @@ TEST_CASE("Settings group create: a store that cannot answer the validation refu
     CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
                          "try again</span>") != std::string::npos);
     CHECK(res->body.find("database not open") == std::string::npos);
-    const auto toast = res->get_header_value("HX-Trigger");
-    CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
-    CHECK(toast.find("Management group store unavailable, try again") != std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Management group store unavailable, try again");
     CHECK(calls.empty());
 }
 
@@ -501,10 +514,9 @@ TEST_CASE("Settings group create: a lost outcome row keeps the success and shows
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
-    const auto toast = res->get_header_value("HX-Trigger");
-    CHECK(toast.find("\"level\":\"warning\"") != std::string::npos);
-    CHECK(toast.find("Group created, but its audit record could not be stored") !=
-          std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "warning");
+    CHECK(toast.value("message", "") == "Group created, but its audit record could not be stored");
     CHECK(res->body.find("Outcome Lost") != std::string::npos); // the refreshed section
 
     // Nothing rolled back; the attempted row stands as "started, outcome unknown".
@@ -538,10 +550,11 @@ TEST_CASE("Settings group create: a store fault answers fixed text, writes failu
     for (const char* leak : {"relation \"", "does not exist", "management_groups", "ERROR",
                              "failed to create group"})
         CHECK(res->body.find(leak) == std::string::npos);
-    const auto toast = res->get_header_value("HX-Trigger");
-    CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Management group store unavailable, try again");
     for (const char* leak : {"relation \"", "does not exist", "management_groups", "ERROR"})
-        CHECK(toast.find(leak) == std::string::npos);
+        CHECK(toast.dump().find(leak) == std::string::npos);
 
     const auto rows = h.create_rows();
     REQUIRE(rows.size() == 2);
@@ -633,9 +646,9 @@ TEST_CASE("Settings group create: a missing group store refuses with the fixed t
     CHECK(res->status == 200);
     CHECK(res->body.find("<span class=\"feedback-error\">Management group store unavailable, "
                          "try again</span>") != std::string::npos);
-    const auto toast = res->get_header_value("HX-Trigger");
-    CHECK(toast.find("showToast") != std::string::npos);
-    CHECK(toast.find("\"level\":\"error\"") != std::string::npos);
+    const auto toast = toast_of(*res);
+    CHECK(toast.value("level", "") == "error");
+    CHECK(toast.value("message", "") == "Management group store unavailable, try again");
     CHECK(calls.empty());
 }
 

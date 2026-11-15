@@ -1878,7 +1878,7 @@ if build_server
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
       'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
-      'unit/server/test_rest_mgmt_group_audit_first.cpp', # #7074: REST group create stores its `attempted` audit row first
+      'unit/server/test_rest_mgmt_group_audit_first.cpp', # #7074: REST group create, add member and remove member store their `attempted` audit row first
       'unit/server/test_mgmt_group_agent_known.cpp', # #6967/#7074: add member flags an unknown agent id (pure classification, no PG)
       'unit/server/test_mgmt_group_owner_gate.cpp', # owner-arm predicate: surface, token class, engine, grant rows (pure, no PG)
       'unit/server/test_rest_rbac_role_reads.cpp', # PR-0b: GET /rbac/roles + /rbac/roles/{role}/permissions fail closed (503) and 404 an unknown role
