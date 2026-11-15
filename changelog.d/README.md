@@ -98,23 +98,27 @@ It prints, in this order:
   A path you had and edited is not listed, nor is its promotion. A path you had,
   that a release promoted and that was added back with different text, is
   listed; added back with identical text, it is not. A fragment you had, moved
-  out of `changelog.d/` and back, is listed again only if its text changed. Fragments are read the way
-  `promote` reads them (line endings normalised, outer whitespace dropped).
+  out of `changelog.d/` and back, is listed again only if its text changed.
+  Fragments are read the way `promote` reads them (line endings normalised,
+  outer whitespace dropped), and a release finished by a merge commit (a
+  release branch that merges `dev` and removes the fragments there) counts as
+  promoting them. A fragment file over 1 MiB is not read.
   A file added under `changelog.d/` whose name is not a fragment name (or that
-  is in a subdirectory), and a fragment name that is a submodule or a directory,
-  is named on a `!` line and is not listed (`README.md` and `.gitkeep` are
-  exempt). Releases rewrite `CHANGELOG.md` by hand too, so a bullet that never
-  had a fragment does not appear; fragments began on 2026-07-04, so a base
-  before that cannot show entries written straight into `CHANGELOG.md`. A `!` line anywhere in the report means that
-  part could not be read or compared; it is never "no change".
+  is in a subdirectory), a fragment name that is a submodule, and a fragment
+  file over the size limit are each named on a `!` line (at most 20 names, then
+  a count) and are not listed. Only the top-level `changelog.d/README.md` and
+  `changelog.d/.gitkeep` are exempt. Releases rewrite `CHANGELOG.md` by hand
+  too, so a bullet that never had a fragment does not appear; fragments began on
+  2026-07-04, so a base before that cannot show entries written straight into
+  `CHANGELOG.md`. A `!` line anywhere in the report means that part could not be
+  read or compared; it is never "no change".
 
 "Your last pull" is read from the reflog of the branch you are on: the newest
 `git pull` that names no source or names that branch's upstream (or, when the
 branch has no upstream, the branch itself; `dev:dev` counts as `dev`, `:x` does
-not), or `git merge <upstream>` after a fetch (`git merge -s ours` and `git pull -s ours` take none of the
-upstream and are not counted), and the commit the
-branch was on before it. The `Via` line prints the
-reflog entry used. A pull on another branch is in that branch's reflog, and
+not), or `git merge <upstream>` after a fetch (`git merge -s ours` and
+`git pull -s ours` take none of the upstream and are not counted), and the
+commit the branch was on before it. The `Via` line prints the reflog entry used. A pull on another branch is in that branch's reflog, and
 `checkout`, a local `merge`, `reset`, `git pull <other branch>` and a merge of a
 different branch (`origin/dev-hotfix` is not `origin/dev`) are not counted, so
 none of them can move the base later. A pull the script does not recognise, such

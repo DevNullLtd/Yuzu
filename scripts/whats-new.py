@@ -57,6 +57,8 @@ FRAGMENT_RE = re.compile(
     r"^(?P<stem>[A-Za-z0-9][A-Za-z0-9._-]*)\.(?P<section>" + "|".join(SECTION_ORDER) + r")\.md\Z"
 )
 FRAGMENT_DIR = "changelog.d"
+# A fragment is a few lines; a larger file is not read (a hostile history could otherwise make this allocate without bound).
+MAX_FRAGMENT_BYTES = 1 << 20
 BRIEF_MAX = 200
 # Sections whose entries are shown whole: the tail of a breaking or security entry is the
 # step the reader has to take.
@@ -117,6 +119,8 @@ class Repo:
         self.root = root
         # Paths `blobs` found to be something other than a file (a submodule, a tree): never listed.
         self.not_regular: list[str] = []
+        # Fragment files over MAX_FRAGMENT_BYTES, which `blobs` does not read.
+        self.too_big: list[str] = []
 
     def _run(self, *args: str, stdin: str | None = None, binary: bool = False) -> subprocess.CompletedProcess:
         # Bytes in, bytes out, decoded here: text mode would turn a lone CR into a newline before
@@ -163,43 +167,64 @@ class Repo:
         raise GitError(f"could not read {path} at {ref[:10]}: {proc.stderr.strip()}")
 
     def blobs(self, specs: list[str], required: bool = True) -> dict[str, str | None]:
-        """Contents of `<rev>:<path>` specs in one process; None for something that is not a file.
+        """Contents of `<rev>:<path>` specs; None for something that is not a file, or too big to read.
 
         Every caller names an object the history says exists, so a missing one (a damaged
         repository, a partial clone that may not fetch) raises: skipping it would print "nothing
-        changed". `required=False` returns None for it instead.
+        changed". `required=False` returns None for it instead. The sizes are asked for first
+        and each distinct object is read once, so a fragment added and deleted many times, or a
+        huge one, cannot make this read an unbounded amount.
         """
         if not specs:
             return {}
-        proc = self._run("cat-file", "--batch", stdin="\n".join(specs) + "\n", binary=True)
+        proc = self._run("cat-file", "--batch-check", stdin="\n".join(specs) + "\n", binary=True)
         if proc.returncode != 0:
-            raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git cat-file --batch failed")
-        out: dict[str, str | None] = {}
-        data, pos = proc.stdout, 0
-        for spec in specs:
-            end = data.index(b"\n", pos)
-            header = data[pos:end].decode("utf-8", "replace")
-            pos = end + 1
+            raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git cat-file --batch-check failed")
+        headers = proc.stdout.decode("utf-8", "replace").split("\n")
+        if len(headers) < len(specs):
+            raise GitError("unexpected reply from git cat-file --batch-check")
+        out: dict[str, str | None] = {spec: None for spec in specs}
+        oids: dict[str, str] = {}
+        for spec, header in zip(specs, headers):
+            path = spec.split(":", 1)[1]
             if header.endswith(" missing"):
                 if required:
-                    raise GitError(f"could not read {spec.split(':', 1)[1]} at {spec.split(':', 1)[0][:10]}: object missing")
-                out[spec] = None
+                    raise GitError(f"could not read {path} at {spec.split(':', 1)[0][:10]}: object missing")
                 continue
             fields = header.split(" ")
-            if len(fields) == 2 and fields[1] == "submodule":  # a gitlink: no content follows
-                self.not_regular.append(spec.split(":", 1)[1])
-                out[spec] = None
+            if len(fields) == 2 and fields[1] == "submodule":  # a gitlink: no content
+                self.not_regular.append(path)
                 continue
             try:
                 size = int(fields[-1])
             except ValueError as exc:
-                raise GitError(f"unexpected reply from git cat-file --batch: {header!r}") from exc
+                raise GitError(f"unexpected reply from git cat-file --batch-check: {header!r}") from exc
             if len(fields) == 3 and fields[1] != "blob":  # a tree or a commit where a file was expected
-                self.not_regular.append(spec.split(":", 1)[1])
-                out[spec] = None
+                self.not_regular.append(path)
+            elif size > MAX_FRAGMENT_BYTES:
+                self.too_big.append(path)
             else:
-                out[spec] = data[pos:pos + size].decode("utf-8", "replace")
+                oids[spec] = fields[0]
+        if not oids:
+            return out
+        distinct = list(dict.fromkeys(oids.values()))
+        proc = self._run("cat-file", "--batch", stdin="\n".join(distinct) + "\n", binary=True)
+        if proc.returncode != 0:
+            raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git cat-file --batch failed")
+        texts: dict[str, str] = {}
+        data, pos = proc.stdout, 0
+        for oid in distinct:
+            end = data.index(b"\n", pos)
+            header = data[pos:end].decode("utf-8", "replace")
+            pos = end + 1
+            try:
+                size = int(header.split(" ")[-1])
+            except ValueError as exc:
+                raise GitError(f"unexpected reply from git cat-file --batch: {header!r}") from exc
+            texts[oid] = data[pos:pos + size].decode("utf-8", "replace")
             pos += size + 1
+        for spec, oid in oids.items():
+            out[spec] = texts[oid]
         return out
 
     def resolves(self, rev: str) -> str | None:
@@ -324,8 +349,8 @@ def date_cutoff(since: str, now: datetime | None = None) -> str:
     if not m:
         raise GitError(
             f"--since {since!r} is not a ref in this repository; for a date use YYYY-MM-DD, "
-            "\"YYYY-MM-DD HH:MM\", yesterday or \"N days ago\" (N up to 4 digits; seconds, minutes, hours, "
-            "days, weeks, months or years)"
+            "\"YYYY-MM-DD HH:MM\", yesterday or \"N days ago\" (N up to 4 digits; the unit is lowercase: seconds, "
+            "minutes, hours, days, weeks, months or years)"
         )
     if m.group("day"):
         if not 1970 <= int(m.group("day")[:4]) <= 2099:
@@ -381,7 +406,8 @@ def resolve_base(repo: Repo, since: str | None, head: str) -> tuple[str, str, st
             raise GitError("the commit before your last pull shares no history with HEAD; pass --since")
         old, how = base, "your last pull (rebased onto it; range starts at the common ancestor)"
     if old == head:
-        raise GitError(f"{how}: HEAD has not moved since then, so there is nothing to compare; "
+        raise GitError((f"{how} is HEAD itself" if since is not None and repo.resolves(since) == head else f"{how}: HEAD has not moved since then")
+                       + ", so there is nothing to compare; "
                        + ("use an earlier --since" if since is not None else "pass --since to look further back"))
     return old, how, via
 
@@ -571,14 +597,20 @@ def bullets(body: str) -> list[str]:
     return ["\n".join(b).rstrip() for b in items]
 
 
-def _records(out: str) -> list[tuple[str, list[str]]]:
-    """[(commit sha, NUL-separated tokens)] from `git log -z --format=%x01%H`."""
-    recs: list[tuple[str, list[str]]] = []
+def _records(out: str) -> list[tuple[str, list[str], list[str]]]:
+    """[(commit sha, parent shas, NUL-separated tokens)] from `git log -z --format=%x01%H %P`.
+
+    With -m a merge commit appears once per parent, each time with the changes against that parent."""
+    recs: list[tuple[str, list[str], list[str]]] = []
     for tok in out.split("\0"):
-        if tok[:1] == "\x01" and SHA_RE.fullmatch(tok[1:]):
-            recs.append((tok[1:], []))
-        elif recs:
-            recs[-1][1].append(tok.lstrip("\n") if not recs[-1][1] else tok)
+        if tok[:1] == "\x01":
+            sha, _, rest = tok[1:].partition(" ")
+            parents = rest.split()
+            if SHA_RE.fullmatch(sha) and all(SHA_RE.fullmatch(x) for x in parents):
+                recs.append((sha, parents, []))
+                continue
+        if recs:
+            recs[-1][2].append(tok.lstrip("\n") if not recs[-1][2] else tok)
     return recs
 
 
@@ -593,11 +625,13 @@ def _rename_pairs(repo: Repo, old: str, new: str) -> tuple[dict[str, tuple[str, 
     A name that is not a fragment name on either side is not a fragment rename: the reader never
     had a fragment under it.
     """
-    out = repo.git("log", "--full-history", "-m", "-z", "-M", "--diff-filter=R", "--name-status", "--format=%x01%H",
+    out = repo.git("log", "--full-history", "-m", "-z", "-M", "--diff-filter=R", "--name-status", "--format=%x01%H %P",
                    f"{old}..{new}", "--", FRAGMENT_DIR + "/")
-    pairs: dict[str, tuple[str, int]] = {}
-    sources: dict[tuple[str, str], tuple[str, int]] = {}
-    for sha, toks in _records(out):
+    # (commit, source, destination) -> the similarity it had against each parent that showed it.
+    seen: dict[tuple[str, str, str], list[int]] = {}
+    parent_count: dict[str, int] = {}
+    for sha, parents, toks in _records(out):
+        parent_count[sha] = max(len(parents), 1)
         i = 0
         while i + 2 < len(toks):
             if toks[i][:1] != "R":
@@ -606,12 +640,20 @@ def _rename_pairs(repo: Repo, old: str, new: str) -> tuple[dict[str, tuple[str, 
             score = int(toks[i][1:]) if toks[i][1:].isdigit() else 0
             src, dst = toks[i + 1], toks[i + 2]
             i += 3
-            if not (_fragment_path_ok(src) and _fragment_path_ok(dst)):
-                continue
-            if (sha, src) not in sources or score > sources[(sha, src)][1]:
-                sources[(sha, src)] = (dst, score)
-            if dst not in pairs or score > pairs[dst][1]:
-                pairs[dst] = (src, score)
+            if _fragment_path_ok(src) and _fragment_path_ok(dst):
+                seen.setdefault((sha, src, dst), []).append(score)
+    pairs: dict[str, tuple[str, int]] = {}
+    sources: dict[tuple[str, str], tuple[str, int]] = {}
+    for (sha, src, dst), scores in seen.items():
+        # A merge's diff against one parent can pair a deletion with an addition that other parent
+        # already had; only a rename that every parent's diff shows is the merge's own.
+        if len(scores) < parent_count[sha]:
+            continue
+        score = min(scores)
+        if (sha, src) not in sources or score > sources[(sha, src)][1]:
+            sources[(sha, src)] = (dst, score)
+        if dst not in pairs or score > pairs[dst][1]:
+            pairs[dst] = (src, score)
     return pairs, sources
 
 
@@ -636,9 +678,9 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
 
     A fragment counts when it exists at `new` and did not at `old` (the net diff, so a rewording
     or revert inside the range cannot list one change twice or list a withdrawn one). A fragment
-    that only reached `new` through commits that each renamed it UNCHANGED (git's 100% similarity) from a path that existed at `old` is not an add: the reader already has that
-    entry. A deletion in one commit and a byte-identical addition in another is not a rename, so
-    that addition counts.
+    that only reached `new` through commits that each renamed it UNCHANGED (git's 100% similarity)
+    from a path that existed at `old` is not an add: the reader already has that entry. A deletion
+    in one commit and a byte-identical addition in another is not a rename, so that addition counts.
 
     A fragment a release promoted inside the range counts too: the commit that deleted it is not the
     source half of a rename, and its body's first line is a line a commit in the range added to
@@ -648,26 +690,43 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
     or `path#<commit>` for a second life of the same path.
     """
     pathspec = FRAGMENT_DIR + "/"
-    net = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=A", "--name-only", old, new, "--", pathspec)
+    # A and T: a name that was a submodule or a link at `old` and is a file now is a type change.
+    net = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=AT", "--name-only", old, new, "--", pathspec)
            if _fragment_path_ok(p)]
     # -m so adds made inside merge commits are seen too. A fragment that already existed at `old`
     # can show up here (a merge diffs against its side parent), so each is checked against both ends.
-    ever = {p for p in repo.names("log", "--full-history", "-m", "-z", "--no-renames", "--diff-filter=A", "--name-only",
-                                  "--format=", f"{old}..{new}", "--", pathspec)
-            if _fragment_path_ok(p)}
-    changed = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=M", "--name-only", old, new, "--", pathspec)
+    ever: set[str] = set()
+    # path -> the newest ordinary commit (one parent) of the range that added it. A merge "adds" whatever the
+    # parent it is diffed against lacks, and a root commit (a shallow clone's boundary) adds the whole tree.
+    added_by: dict[str, str] = {}
+    for sha, parents, toks in _records(repo.git("log", "--full-history", "-m", "-z", "--no-renames", "--diff-filter=AT", "--name-only",
+                                                "--format=%x01%H %P", f"{old}..{new}", "--", pathspec)):
+        for p in toks:
+            if p and _fragment_path_ok(p):
+                ever.add(p)
+                if len(parents) == 1:
+                    added_by.setdefault(p, sha)
+    changed = [p for p in repo.names("diff", "-z", "--no-renames", "--diff-filter=MT", "--name-only", old, new, "--", pathspec)
                if _fragment_path_ok(p) and p in ever]
-    # Every commit that deleted a fragment path, newest first.
+    # Every commit that deleted a fragment path, newest first. Not -m: a merge of a stale branch
+    # "deletes" every fragment that branch still has and the trunk already released.
     deleters: dict[str, list[str]] = {}
-    for sha, toks in _records(repo.git("log", "--full-history", "-z", "--no-renames", "--diff-filter=D", "--name-only", "--format=%x01%H",
-                                       f"{old}..{new}", "--", pathspec)):
+    parents_of: dict[str, list[str]] = {}
+    for sha, parents, toks in _records(repo.git("log", "--full-history", "-z", "--no-renames", "--diff-filter=D", "--name-only",
+                                                "--format=%x01%H %P", f"{old}..{new}", "--", pathspec)):
+        parents_of[sha] = parents
         for p in toks:
             if p and _fragment_path_ok(p) and sha not in deleters.setdefault(p, []):
                 deleters[p].append(sha)
-    if not (net or changed or deleters):
+    if not (net or changed or deleters or ever):
         return {}
     tree_old = set(repo.names("ls-tree", "-r", "-z", "--name-only", old, "--", pathspec))
     renames, rename_sources = _rename_pairs(repo, old, new)
+    renamed_away = {src for _, src in rename_sources}
+    # Added in the range, gone at its end, and no commit deleted it: a merge commit removed it (a release
+    # branch that merges `dev`, promotes and drops the fragments in the merge). Its text is read where it was added.
+    orphans = {p: sha for p, sha in added_by.items()
+               if p not in net and p not in tree_old and p not in deleters and p not in renamed_away}
 
     def old_root(path: str) -> str | None:
         """The path at `old` that `path` reached by renames git saw as 100% identical, if any.
@@ -717,6 +776,7 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
                 ended.append((p, sha))
             elif hit[1] != 100:
                 inexact[(p, sha)] = hit[0]
+    ended.extend(orphans.items())
     if not (ended or inexact):
         return found
     # Lines a commit of the range added to CHANGELOG.md, so a line polished after its release still matches.
@@ -728,8 +788,14 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
                                   f"{old}..{new}", "--", "CHANGELOG.md")):
         if line.startswith("+") and not line.startswith("+++"):
             changelog_added.add(line[1:].rstrip())
-    specs = {(p, sha): f"{sha}^:{p}" for p, sha in [*ended, *inexact]}
-    bodies = repo.blobs(list(specs.values()))
+    # The text a deleting commit removed is in the parent that had the path: the only parent of an
+    # ordinary commit, one or more of a merge's.
+    specs = {(p, sha): [f"{sha}:{p}"] if orphans.get(p) == sha else [f"{par}:{p}" for par in parents_of[sha]]
+             for p, sha in [*ended, *inexact]}
+    single = [v[0] for v in specs.values() if len(v) == 1]
+    multi = [x for v in specs.values() if len(v) > 1 for x in v]
+    found_bodies = {**repo.blobs(single), **repo.blobs(multi, required=False)}
+    bodies = {key: next((b for x in v if (b := found_bodies.get(x)) is not None), None) for key, v in specs.items()}
     kept = repo.blobs([f"{sha}:{dst}" for (_, sha), dst in inexact.items()], required=False)
 
     def first_line(body: str | None) -> str:
@@ -738,8 +804,8 @@ def added_fragments(repo: Repo, old: str, new: str) -> dict[str, str]:
 
     refs = {p: r for p, _ in specs if (r := reference(p)) is not None}
     ref_bodies = repo.blobs([f"{old}:{r}" for r in set(refs.values())])
-    for (path, sha), spec in specs.items():
-        body = bodies[spec]
+    for (path, sha) in specs:
+        body = bodies[(path, sha)]
         if body is None:
             continue
         if path in refs and ref_bodies[f"{old}:{refs[path]}"] == body:
@@ -790,13 +856,22 @@ def render_fragments(frags: dict[str, str], full: bool) -> tuple[list[str], int,
     return lines, total, empty
 
 
+def name_list(names: list[str], limit: int = 20) -> str:
+    """The names on a `!` line, repo text made safe for one line, cut at `limit` so a flood of them stays short."""
+    shown = ", ".join(one(n) for n in names[:limit])
+    return shown + (f", and {len(names) - limit} more" if len(names) > limit else "")
+
+
 def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
-    head = repo.git("rev-parse", "HEAD").strip()
+    head = repo.resolves("HEAD")
+    if head is None:
+        raise GitError("this repository has no commits")
     old, how, via = resolve_base(repo, since, head)
     count = repo.git("rev-list", "--count", f"{old}..{head}").strip()
     files = repo.names("diff", "-z", "--no-renames", "--name-only", old, head)
     out = [
-        f"Changes since {how}: {plural(int(count), 'commit')}, {plural(len(files), 'file')} ({top_level_summary(files)})",
+        f"Changes since {how}: {plural(int(count), 'commit')}, {plural(len(files), 'file')}"
+        + (f" ({top_level_summary(files)})" if files else ""),
         f"Base {repo.git('log', '-1', '--format=%h %cs %s', old).strip()}",
         f"Head {repo.git('log', '-1', '--format=%h %cs %s', head).strip()}",
     ]
@@ -817,19 +892,19 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
 
     images, other = dependency_bumps(repo, old, head)
     if images or other:
-        out.append(f"Dependency bumps (build(deps)/chore(deps) commits): {len(images)} Docker "
-                   f"image{'' if len(images) == 1 else 's'}, {len(other)} other")
+        out.append(f"Dependency bumps (build(deps)/chore(deps) commits): {plural(len(images), 'Docker image')}, {len(other)} other")
         out.extend(f"  {s}" for s in images)
         if full:
             out.extend(f"  {s}" for s in other)
         elif other:
-            out.append(f"  + {len(other)} other bumps (workflows, pip, npm); --full lists them")
+            out.append(f"  + {plural(len(other), 'other bump')} (workflows, pip, npm); --full lists them")
         out.append("")
 
     frags = added_fragments(repo, old, head)
     lines, total, empty = render_fragments(frags, full)
     odd = unrecognised_names(repo, old, head)
     not_regular = sorted(set(repo.not_regular))
+    too_big = sorted(set(repo.too_big))
     if lines:
         out.append(f"Changelog entries added ({total})")
         out.append("")
@@ -837,19 +912,21 @@ def build_report(repo: Repo, since: str | None, full: bool) -> list[str]:
         if getattr(frags, "promoted", None):
             out.append("Note: entries a release inside this range moved into CHANGELOG.md show the fragment's wording as it was")
             out.append("promoted; CHANGELOG.md has the release text, which may differ.")
-    elif empty or odd or not_regular:
+    elif empty or odd or not_regular or too_big:
         out.append("No changelog entries could be listed for this range (see the ! lines below).")
     else:
         out.append("No changelog fragments were added in this range (refactors, CI and test-only changes may skip them;")
         out.append(f"`git log --first-parent --oneline {old[:10]}..HEAD` lists every merged PR).")
     if empty:
-        out.append(f"! {len(empty)} fragment(s) had no '- ' bullet and are not summarised: {', '.join(empty)}")
+        out.append(f"! {plural(len(empty), 'fragment')} with no '- ' bullet, not summarised: {name_list(empty)}")
     if odd:
-        out.append(f"! {len(odd)} file(s) added under {FRAGMENT_DIR}/ are not named like fragments (or are not directly in it) "
-                   "and are not listed: " + ", ".join(one(n) for n in odd))
+        out.append(f"! {plural(len(odd), 'file')} added under {FRAGMENT_DIR}/ not named like fragments (or not directly in it), "
+                   f"not listed: {name_list(odd)}")
     if not_regular:
-        out.append(f"! {len(not_regular)} path(s) named like fragments are not regular files (a submodule or a directory) "
-                   "and are not listed: " + ", ".join(one(n) for n in not_regular))
+        out.append(f"! {plural(len(not_regular), 'path')} named like fragments but not regular files (a submodule), "
+                   f"not listed: {name_list(not_regular)}")
+    if too_big:
+        out.append(f"! {plural(len(too_big), 'fragment file')} over {MAX_FRAGMENT_BYTES // 1024} KiB, not read: {name_list(too_big)}")
     return out
 
 
@@ -867,7 +944,11 @@ def main(argv: list[str]) -> int:
         pass
     try:
         top = Repo(args.repo or Path.cwd())
-        root = top.git("rev-parse", "--show-toplevel").strip()
+        proc = top._run("rev-parse", "--show-toplevel", binary=True)
+        if proc.returncode != 0:
+            raise GitError(proc.stderr.decode("utf-8", "replace").strip() or "git rev-parse --show-toplevel failed")
+        # Exactly the newline git adds, no more: a directory name may end in a space, and may not be UTF-8.
+        root = os.fsdecode(proc.stdout.removesuffix(b"\n"))
         report = build_report(Repo(Path(root)), args.since, args.full)
     except GitError as exc:
         print(f"whats-new: {clean(str(exc))}", file=sys.stderr)
