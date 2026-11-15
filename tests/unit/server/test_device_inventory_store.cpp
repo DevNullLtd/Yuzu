@@ -3201,6 +3201,143 @@ TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once ea
     CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"Zeta", "agent-1"});
 }
 
+// Kills: dropping `COLLATE "C"` from the ORDER BY or from the named read's equality of the keyset
+// statement (each mutation checked: the walk and the named read fail). It does NOT kill dropping it
+// from the `>` bound alone: with the ORDER BY on the C index the bound is a row filter, decided
+// bytewise once the database collation is C, so only the byte-order walk above can see that one
+// (and only under a collation that is not C). This reproduces the drift the evidence note measures: the primary key
+// index is built under the database's collation, the database's collation is then changed under it
+// with no REINDEX, and a NEW connection (the old one keeps the old rules) reads through a stale
+// index. Control first, so the test cannot pass vacuously: the naive default-collation keyset,
+// forced onto the stale primary key, must skip ids on this server; if it does not, the emulation
+// did not take effect here and the test SKIPs. Then the production keyset must serve every id once,
+// in byte order, and the named read must find every id.
+// The throwaway database is the fixture's own (dropped by the fixture); only its pg_database row is
+// changed, by the admin connection, and only when that connection may do so (else SKIP).
+TEST_CASE("list_device_ci_after and the named read survive a collation change under the primary key",
+          "[pg][device_ci][keyset][drift]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+
+    std::vector<std::string> ids = {"Agent-1", "agent_1", "agent-1", "agent1", "PC-1", "pc-0042",
+                                    "Zeta",    "zeta",    "AB",      "ab",     "a b",  "a-b",
+                                    "a_b",     "-x",      "_x",      "10",     "2",    "B-1",
+                                    "b-1",     "b_1",     "Z-9",     "z-9",    "A1",   "a1"};
+    for (int g = 1; g <= 400; ++g) {
+        std::string id;
+        switch (g % 4) {
+            case 0: id = "agent-" + std::to_string(g); break;
+            case 1: id = "PC-" + std::to_string(g); break;
+            case 2: id = "Host_" + std::to_string(g); break;
+            default: id = "a-B" + std::to_string(g) + "-z"; break;
+        }
+        if (std::ranges::find(ids, id) == ids.end()) // the fixed ids above include "PC-1"
+            ids.push_back(std::move(id));
+    }
+    std::vector<std::string> expected = ids;
+    std::sort(expected.begin(), expected.end()); // unsigned byte order
+    REQUIRE(std::ranges::adjacent_find(expected) == expected.end()); // ids are distinct
+
+    {
+        // Load through the real write path under the ORIGINAL collation, so the primary key index
+        // is built under it. This pool is closed before the flip.
+        PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+        REQUIRE(pool.valid());
+        DeviceInventoryStore store{pool};
+        REQUIRE(store.is_open());
+        for (const auto& id : ids)
+            store_ci(store, id, "host-" + id);
+
+        // Is the database's default collation distinguishable from byte order over these ids?
+        const auto ordered = [&](const char* order_by) {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                (std::string("SELECT agent_id FROM device_inventory_store.device_ci ORDER BY ") +
+                 order_by).c_str(),
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_TUPLES_OK);
+            std::vector<std::string> out;
+            for (int i = 0; i < PQntuples(res.get()); ++i)
+                out.emplace_back(PQgetvalue(res.get(), i, 0));
+            return out;
+        };
+        if (ordered("agent_id") == ordered("agent_id COLLATE \"C\""))
+            SKIP("this database's default collation orders the test ids as bytes (C or C.UTF-8), "
+                 "so a collation change under the primary key cannot be emulated here");
+    }
+
+    // Flip THIS database's collation under the existing primary key index, no REINDEX.
+    {
+        yuzu::server::pg::PgConn admin{PQconnectdb(yuzu::test::pg_admin_dsn_env())};
+        if (PQstatus(admin.get()) != CONNECTION_OK)
+            SKIP("admin connection failed, cannot flip the collation: " << PQerrorMessage(admin.get()));
+        const std::string flip =
+            "UPDATE pg_database SET datcollate = 'C', datctype = 'C' WHERE datname = '" +
+            db.db_name() + "'";
+        yuzu::server::pg::PgResult res{PQexec(admin.get(), flip.c_str())};
+        if (res.status() != PGRES_COMMAND_OK || std::string(PQcmdTuples(res.get())) != "1")
+            SKIP("the admin connection may not update pg_database (not a superuser?), so the "
+                 "collation drift cannot be emulated: "
+                 << PQerrorMessage(admin.get()));
+    }
+
+    // CONTROL: the naive keyset a default-collation implementation would run, forced onto the stale
+    // primary key (a table this small would otherwise be read by a sequential scan), on a NEW
+    // connection (it takes the new collation).
+    std::size_t control_served = 0;
+    {
+        yuzu::server::pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        for (const char* set : {"SET enable_seqscan = off", "SET enable_bitmapscan = off",
+                                "SET enable_sort = off"}) {
+            yuzu::server::pg::PgResult r{PQexec(c.get(), set)};
+            REQUIRE(r.status() == PGRES_COMMAND_OK);
+        }
+        std::string after;
+        for (std::size_t guard = 0; guard < ids.size() + 10; ++guard) {
+            const char* vals[1] = {after.c_str()};
+            yuzu::server::pg::PgResult r{PQexecParams(
+                c.get(),
+                "SELECT agent_id FROM device_inventory_store.device_ci WHERE agent_id > $1 "
+                "ORDER BY agent_id LIMIT 1",
+                1, nullptr, vals, nullptr, nullptr, 0)};
+            REQUIRE(r.status() == PGRES_TUPLES_OK);
+            if (PQntuples(r.get()) == 0)
+                break;
+            ++control_served;
+            after = PQgetvalue(r.get(), 0, 0);
+        }
+    }
+    INFO("the default-collation keyset served " << control_served << " of " << ids.size());
+    if (control_served >= ids.size())
+        SKIP("the emulated collation drift did not make the default-collation keyset skip any id on "
+             "this server, so this test cannot tell the fix from the old query here");
+
+    // A fresh pool and store: every connection opened from here has the new collation.
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const int limit : {1, 7, 1000}) {
+        INFO("limit " << limit);
+        CHECK(keyset_walk(store, limit) == expected);
+    }
+    // the named read: every stored id is found by `agent_id` (a plain `=` through the stale primary
+    // key would miss many of them)
+    std::size_t named_missed = 0;
+    for (const auto& id : ids) {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_id = id;
+        q.limit = 10;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        if (page->size() != 1 || (*page)[0].agent_id != id)
+            ++named_missed;
+    }
+    CHECK(named_missed == 0);
+}
+
 // Kills: an `ORDER BY hostname, agent_id` (or any order that is not the keyset key): here the
 // hostnames sort AGAINST the agent_id order, so only a walk ordered by agent_id serves the rows in
 // agent_id order and a cursor made of the last agent_id never skips one.
