@@ -1850,7 +1850,10 @@ TEST_CASE("census pair order, already holds: a Repair queued behind a concurrent
     SECTION("the real delete_agent retires it: no order row is left behind") {
         // delete_agent deletes the order row first and retires the pending event in its own
         // transaction, so the Repair's own Ensure may have to recreate the row it needs and must
-        // give it back when it finds the event gone.
+        // give it back when it finds the event gone. The Repair's Ensure parks behind
+        // delete_agent's uncommitted order-row delete and must WAIT AND SUCCEED: its lock bound is
+        // 10 s here, not the 1 s production one a loaded runner can overrun (as the F7-A cases).
+        AgentStepLockWait lock_wait(store);
         writers.start([&] {
             deleted = store.delete_agent("a");
             retire_done.store(true);
@@ -2588,5 +2591,216 @@ TEST_CASE("census pair order, P-1: a Repair whose census statement exceeds its s
         CHECK(query_scalar(db.dsn(), "SELECT string_agg(DISTINCT val, ',') FROM " + log) == "2s");
         // ... and the transaction went on under the pool's own 30 s.
         CHECK(at_commit == "30s");
+    }
+}
+
+TEST_CASE("census pair order, Gate 3 QE-2: a Repair's lock bound covers its order statements only, "
+          "its statement bound covers every census statement, and neither reaches the commit",
+          PAIR_TAGS) {
+    // A trigger on each table records the lock_timeout and statement_timeout in force as its
+    // statement runs. The Repair's Ensure (a BEFORE INSERT trigger fires on the attempted insert
+    // even when ON CONFLICT DO NOTHING skips it) runs under the 1 s lock bound; the census write
+    // runs under the connection's own lock bound again (`SET LOCAL lock_timeout TO DEFAULT` after
+    // the clock read; RELEASE keeps a SET LOCAL) and under the Repair's 2 s statement bound; the
+    // transaction commits under the connection's own bound for both.
+    PAIR_FIXTURE();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    const std::string log = std::string(kSchema) + ".yuzu_test_lt_log";
+    exec_sql(db.dsn(), "CREATE TABLE " + log + " (stage text, lt text, st text)");
+    exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                           ".yuzu_test_lt_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                           "INSERT INTO " +
+                           log +
+                           " VALUES (TG_TABLE_NAME, current_setting('lock_timeout'), "
+                           "current_setting('statement_timeout')); RETURN NEW; END $$");
+    for (const char* table : {"guardian_agent_order", "guardian_agent_rule_status"})
+        exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_lt_note BEFORE INSERT OR UPDATE "
+                                       "ON ") +
+                               kSchema + "." + table + " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                               ".yuzu_test_lt_note()");
+    std::string lt_at_commit;
+    std::string st_at_commit;
+    store.set_pre_commit_hook_for_test([&](void* c) {
+        auto* conn = static_cast<PGconn*>(c);
+        pg::PgResult lt{PQexec(conn, "SHOW lock_timeout")};
+        pg::PgResult st{PQexec(conn, "SHOW statement_timeout")};
+        if (lt.ok() && PQntuples(lt.get()) == 1)
+            lt_at_commit = PQgetvalue(lt.get(), 0, 0);
+        if (st.ok() && PQntuples(st.get()) == 1)
+            st_at_commit = PQgetvalue(st.get(), 0, 0);
+    });
+    const EventInsertResult res = store.insert_event_classified(e1);
+    store.set_pre_commit_hook_for_test({});
+    REQUIRE(res.outcome == EventInsertOutcome::Redelivered);
+    CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+    // Ensure: the 1 s lock bound and the 2 s statement bound. Census write: the pool's own lock
+    // bound (10 s) and the Repair's 2 s statement bound.
+    CHECK(query_scalar(db.dsn(), "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT "
+                                 "stage || '=' || lt || '/' || st AS x FROM " +
+                                     log + ") t") ==
+          "guardian_agent_order=1s/2s,guardian_agent_rule_status=10s/2s");
+    // Neither SET LOCAL survives into the commit (the pool's own bounds: 10 s lock, 30 s
+    // statement).
+    CHECK(lt_at_commit == "10s");
+    CHECK(st_at_commit == "30s");
+}
+
+namespace {
+
+// Makes the agent's order row vanish between a Repair's Ensure and its clock read: a
+// statement-level AFTER INSERT trigger on guardian_agent_order (it fires for the Ensure's INSERT
+// even when ON CONFLICT DO NOTHING inserts nothing) deletes the row. `once` disarms it after one
+// firing; a sequence counts every firing (a sequence is not rolled back with a failed Repair's
+// savepoint, a table row would be) so a test sees how many Ensures ran.
+void install_order_row_vanishes(const std::string& dsn, bool once) {
+    const std::string gap = std::string(kSchema) + ".yuzu_test_gap";
+    const std::string fires = std::string(kSchema) + ".yuzu_test_gap_fires";
+    exec_sql(dsn, "CREATE TABLE " + gap + " (mode text)");
+    exec_sql(dsn, "CREATE SEQUENCE " + fires);
+    exec_sql(dsn,
+             "INSERT INTO " + gap + " VALUES ('" + std::string(once ? "once" : "always") + "')");
+    exec_sql(dsn, std::string("CREATE FUNCTION ") + kSchema +
+                      ".yuzu_test_gap_fn() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                      "PERFORM nextval('" +
+                      fires + "'); IF EXISTS (SELECT 1 FROM " + gap + ") THEN DELETE FROM " + gap +
+                      " WHERE mode = 'once'; DELETE FROM " + kSchema +
+                      ".guardian_agent_order WHERE agent_id = 'a'; END IF; RETURN NULL; "
+                      "END $$");
+    exec_sql(dsn, std::string("CREATE TRIGGER yuzu_test_gap AFTER INSERT ON ") + kSchema +
+                      ".guardian_agent_order FOR EACH STATEMENT EXECUTE FUNCTION " + kSchema +
+                      ".yuzu_test_gap_fn()");
+}
+
+} // namespace
+
+TEST_CASE("census pair order, Gate 3 QE-3: a Repair whose order row vanishes after its Ensure runs "
+          "Ensure and the read once more, and a second miss is Failed with its evidence kept",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    const std::string fires = std::string(kSchema) + ".yuzu_test_gap_fires";
+
+    SECTION("the row vanishes once: the retry re-creates it and the Repair applies the event") {
+        install_order_row_vanishes(db.dsn(), true);
+        const EventInsertResult res = store.insert_event_classified(e1);
+        CHECK(res.outcome == EventInsertOutcome::Redelivered);
+        CHECK(query_scalar(db.dsn(), "SELECT last_value FROM " + fires) == "2"); // Ensure ran twice
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+        CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "0");
+        CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+
+    SECTION("the row vanishes every time: no second chance, Failed, evidence kept, no default "
+            "mode") {
+        install_order_row_vanishes(db.dsn(), false);
+        const auto failures_before = store.census_proj_failures_total();
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        const EventInsertResult res = store.insert_event_classified(e1);
+        cap.stop();
+        CHECK(res.outcome == EventInsertOutcome::Redelivered); // a failed Repair is still acked
+        CHECK(query_scalar(db.dsn(), "SELECT last_value FROM " + fires) == "2"); // one retry only
+        CHECK(cap.text().find("no agent order row to read after one retry") != std::string::npos);
+        CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "1");
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "0");
+        CHECK(store.census_proj_failures_total() == failures_before + 1);
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent"); // not decided as `current`
+        CHECK(pending_count(db.dsn()) == "1");           // the evidence stays
+        // The cause gone, the next redelivery repairs.
+        exec_sql(db.dsn(),
+                 std::string("DROP TRIGGER yuzu_test_gap ON ") + kSchema + ".guardian_agent_order");
+        CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+        CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+        CHECK(pending_count(db.dsn()) == "0");
+    }
+}
+
+TEST_CASE("census pair order, Gate 3 QE-3: a Repair whose backend ends mid-Repair is Abandoned, "
+          "and one whose COMMIT fails is an ingest error that keeps its evidence",
+          PAIR_TAGS) {
+    // The 57014 cancel of a Repair statement is covered by the P-1 statement-bound case above.
+    PAIR_FIXTURE();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    const std::string order_before = order_snapshot(db.dsn());
+    const std::string order_table = std::string(kSchema) + ".guardian_agent_order";
+
+    SECTION("the backend ends under the Repair's Ensure: Abandoned, an error, evidence kept") {
+        // Ensure's BEFORE INSERT trigger ends its own backend, so the ROLLBACK TO that follows
+        // cannot run.
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_repair_kill() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                               "BEGIN PERFORM pg_terminate_backend(pg_backend_pid()); "
+                               "PERFORM pg_sleep(5); RETURN NEW; END $$");
+        exec_sql(db.dsn(), "CREATE TRIGGER yuzu_test_repair_kill BEFORE INSERT ON " + order_table +
+                               " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                               ".yuzu_test_repair_kill()");
+        const auto errors_before = store.events_ingest_errors_total();
+        yuzu::test::LogCapture cap(spdlog::level::err);
+        const EventInsertResult res = store.insert_event_classified(e1);
+        cap.stop();
+        CHECK(res.outcome == EventInsertOutcome::Error);
+        CHECK(res.error.find("census savepoint failed") != std::string::npos);
+        CHECK(cap.text().find("census write abandoned") != std::string::npos);
+        CHECK(store.events_ingest_errors_total() == errors_before + 1);
+        CHECK(repair_outcome_count_text(metrics, "repair", "abandoned") == "1");
+        CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "0");
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent");
+        CHECK(pending_count(db.dsn()) == "1");
+        CHECK(order_snapshot(db.dsn()) == order_before);
+        // The store serves again once the cause is gone, and the pool lost no connection.
+        exec_sql(db.dsn(), "DROP TRIGGER yuzu_test_repair_kill ON " + order_table);
+        CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+        CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+        CHECK(pending_count(db.dsn()) == "0");
+        CHECK(pool.in_use() == 0);
+    }
+
+    SECTION("the COMMIT fails: an ingest error, the Repair undone, the evidence still there") {
+        // A deferred constraint trigger on the census row raises when the transaction commits.
+        exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                               ".yuzu_test_commit_fail() RETURNS trigger LANGUAGE plpgsql AS $$ "
+                               "BEGIN RAISE EXCEPTION 'forced commit failure' USING ERRCODE = "
+                               "'XX000'; END $$");
+        exec_sql(db.dsn(), std::string("CREATE CONSTRAINT TRIGGER yuzu_test_commit_fail AFTER "
+                                       "INSERT ON ") +
+                               kSchema +
+                               ".guardian_agent_rule_status DEFERRABLE INITIALLY DEFERRED FOR "
+                               "EACH ROW EXECUTE FUNCTION " +
+                               kSchema + ".yuzu_test_commit_fail()");
+        const auto errors_before = store.events_ingest_errors_total();
+        const EventInsertResult res = store.insert_event_classified(e1);
+        CHECK(res.outcome == EventInsertOutcome::Error);
+        CHECK(res.error.find("commit failed") != std::string::npos);
+        CHECK(store.events_ingest_errors_total() == errors_before + 1);
+        CHECK(verdict(db.dsn(), "a", "r1") == "absent"); // nothing of the Repair persisted
+        CHECK(pending_count(db.dsn()) == "1");           // the evidence stays for the next one
+        CHECK(order_snapshot(db.dsn()) == order_before);
+        exec_sql(db.dsn(), std::string("DROP TRIGGER yuzu_test_commit_fail ON ") + kSchema +
+                               ".guardian_agent_rule_status");
+        CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+        CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+        CHECK(pool.in_use() == 0);
     }
 }
