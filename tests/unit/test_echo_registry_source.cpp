@@ -5322,7 +5322,7 @@ std::string legacy_cursor_with_secret() {
         RegistryRootState{true, 100, 110, 120, "capped", false, {kRoot + "\\Denied"}, true};
     cur.loss = {{30, 40}};
     cur.hku = {"S-1-5-21-1"};
-    cur.offline = {{"S-1-5-21-2", "C:\\Users\\yuzu_test_u"}};
+    cur.offline = {{"S-1-5-21-2", "C:\\Users\\jsmith"}};
     auto held = cand("added", "DefaultPassword", 1, utf16(kLogonSecret).size(), 10, 20);
     held.key = kWinlogon;
     cur.held = {held};
