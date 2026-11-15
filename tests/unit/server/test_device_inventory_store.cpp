@@ -3203,10 +3203,12 @@ TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once ea
 
 // Kills: dropping `COLLATE "C"` from the ORDER BY or from the named read's equality of the keyset
 // statement (each mutation checked: the walk and the named read fail). It does NOT kill dropping it
-// from the `>` bound alone: with the ORDER BY on the C index the bound is a row filter, decided
-// bytewise once the database collation is C, so only the byte-order walk above can see that one
-// (and only under a collation that is not C). This reproduces the drift the evidence note measures: the primary key
-// index is built under the database's collation, the database's collation is then changed under it
+// from the `>` bound alone: under the default plan, with the ORDER BY on the C index, the bound is
+// a row filter, decided bytewise once the database collation is C (a plan that pushes the bound
+// into the stale primary key as an index condition would see it), so only the byte-order walk
+// above can see that one, and only under a collation that is not C. This reproduces the drift the
+// evidence note measures: the primary key index is built under the database's collation, the
+// database's collation is then changed under it
 // with no REINDEX, and a NEW connection (the old one keeps the old rules) reads through a stale
 // index. Control first, so the test cannot pass vacuously: the naive default-collation keyset,
 // forced onto the stale primary key, must skip ids on this server; if it does not, the emulation

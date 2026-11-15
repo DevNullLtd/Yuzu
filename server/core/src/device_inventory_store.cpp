@@ -215,10 +215,13 @@ constexpr const char* kMigrationV3Sql =
 // orders and compares `agent_id COLLATE "C"` (byte order). Its CORRECTNESS comes from that
 // spelling in the query: the primary key's index is built under the DATABASE collation, so a
 // libc/ICU upgrade under an existing volume (no REINDEX) leaves it stale, and a keyset walk
-// ordered by it can skip rows with no error (measured on a mechanical emulation of a collation change: 11,945 of 50,030 ids at limit 1; see docs/security-reviews/hardware-ci-bulk-read-collation-drift-2026-11-15.md). "C" is byte
+// ordered by it can skip rows with no error (measured on a mechanical emulation of a collation
+// change: 11,945 of 50,030 ids at limit 1; see
+// docs/security-reviews/hardware-ci-bulk-read-collation-drift-2026-11-15.md). "C" is byte
 // comparison, which no library upgrade changes, so the query stays correct without this index. The
-// index keeps each page an index scan: only an index on that exact expression can serve the
-// query, and without it every page is a scan plus a sort (about 317 ms a page at 1M rows).
+// index makes an index scan available for each page (the planner decides): only an index on that
+// exact expression can serve the query, and without it every page is a scan plus a sort (about
+// 317 ms a page at 1M rows).
 // ADDITIVE and idempotent (IF NOT EXISTS; no existing object is touched). Not CONCURRENTLY: the
 // runner applies a migration in a transaction, where CONCURRENTLY is refused. A plain build takes
 // a SHARE lock on device_ci (writes wait, reads do not): about 0.5 s of blocked ingest per

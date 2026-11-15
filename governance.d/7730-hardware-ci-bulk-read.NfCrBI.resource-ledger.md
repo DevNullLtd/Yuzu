@@ -1,6 +1,6 @@
 # Resource Ledger: the bulk device-CI read (PR 1 of 3)
 
-Range reviewed: `origin/dev..f025c558a0` (merge-base `6a5e29add2`; the branch is 23 commits). Companion to the
+Range reviewed: `origin/dev..811c9b6844` (merge-base `6a5e29add2`; the branch is 30 commits; the rename a8bea07368 and the drift test 3468632360 are included). Companion to the
 `7730-hardware-ci-bulk-read.*.jsonl` fragment. Gate 1 summary as corrected by `cpp-safety` in Gate 3 and
 Gate 8 rounds 1 to 3.
 
@@ -32,6 +32,18 @@ database object, not a C++ resource.
 | `LogCapture` | existing RAII helper | `stop()` before `text()` |
 | Throwaway databases | `YUZU_REQUIRE_PG_DB_TPL` (fresh generated name per test and per `SECTION`) | index drops and creates leak nothing into other tests |
 | `FakeCiKeysetStore` (`reader()` captures `this`; `erase()` is `std::erase_if` on a vector) | test-local object owned by the harness | `read()` returns copies; no iterator is held across calls |
+
+## Round-5 additions (the drift regression test, 3468632360)
+
+| Resource | Owner type | Acquired | Released | Failure cleanup |
+|---|---|---|---|---|
+| First `PgPool`, its `DeviceInventoryStore` and the `ordered()` lease used to load the ids | `PgPool` and lease RAII, in an inner block | test body | the block ends before the collation flip; `~PgPool` waits for `leased_ == 0` | a failed `REQUIRE` unwinds the block before anything is flipped |
+| Admin `PgConn` (`PQconnectdb` on the fixture's admin DSN) and the UPDATE `PgResult` | `PgConn` and `PgResult` RAII | before the flip | scope exit | SKIPs (never fails) when it cannot connect or cannot update `pg_database`; released on every SKIP, `REQUIRE` or exception |
+| Side effect: `UPDATE pg_database SET datcollate='C', datctype='C' WHERE datname = <the fixture's own generated database name>` (requires exactly one row updated) | the fixture owns the database (`unique_db_name()`: digits and underscores only) | during the test | the fixture's `DROP DATABASE ... WITH (FORCE)`, which runs last | nothing is restored and nothing leaks; the clone template is never touched; no REINDEX |
+| Control `PgConn c` (private, not pooled) with `SET enable_seqscan`, `enable_bitmapscan` and `enable_sort` = off, and one `PgResult` per walk iteration | `PgConn` and `PgResult` RAII | control walk | scope end | the session settings die with the connection; no pooled connection is touched |
+| Fresh `PgPool` and `DeviceInventoryStore` opened after the flip | locals declared after the fixture `db` | after the flip | destroyed in the order store, pool, then the fixture drops the database | the SKIP paths (default collation already orders ids as bytes, no superuser, control walk skips nothing) leave no resource: Catch2 `SKIP` throws, so every destructor runs |
+
+No thread, detach, cast or temp path in the added test code; the production code is unchanged apart from comments.
 
 ## Sanitizer evidence
 
