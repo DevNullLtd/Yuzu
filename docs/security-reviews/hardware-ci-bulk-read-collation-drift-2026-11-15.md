@@ -7,7 +7,7 @@
 named read, the robust migration and the index check at open) and `fd490b9d31` (the exact index-shape
 check).
 **Branch:** `feat/hardware-ci-bulk-read`
-**Status:** implemented; owner acceptance of the residual exposures below is PENDING and not recorded.
+**Status:** implemented; the residual exposures below were accepted by the owner for release on 2026-11-15, with the review trigger the merge of PR 3 (the `device_ci` write pause). The acceptance is recorded in the section "Owner acceptance of the residual" and is not posted to GitHub.
 **Author of the measurements:** the change author's governance run (Claude Code session). The
 independent reproductions below were made during review, by a separate reviewer in that run.
 
@@ -53,16 +53,65 @@ collation change, `agent_id = $1` served by the primary key missed 32,764 existi
 `agent_id COLLATE "C" = $1`, served by the new index, missed none. This mattered because the
 documented safety step for a consumer is to confirm a device with `?agent_id=<id>` before retiring it.
 
-The same independent reproduction, in a second setup (20,000 mixed ids, the same collation change, then
-an upsert of every existing id with `INSERT ... ON CONFLICT (agent_id) DO UPDATE` under drift),
-observed the table grow from 20,000 to 33,868 rows (a stale primary key admitting a second row for an
-`agent_id` that exists). That figure illustrates the write-side exposure below and is not relied on.
-Both reproductions are in the appendix and were re-run when this note was written (the named-read
-count came out at 32,792 on that run, the growth at 33,868 again).
+The write-side consequences of the same drift are measured in the next section ("Independent
+validation"); the growth figure of an earlier second setup (20,000 mixed ids, a single set-based
+upsert, the table growing from 20,000 to 33,868 rows) is repeated in appendix C, with its oracle
+corrected.
 
 Cost of the index: the 317 ms a page quoted below was measured on PostgreSQL 18.4 with one million
 rows and no index on the byte-ordered expression (every page a scan plus a sort); 16 concurrent
 walkers saw an average of 3.3 s a page. With the index a page at depth took about 1 ms.
+
+## Independent validation (2026-11-15)
+
+A second reproduction, made while the fix round for this change was reviewed, measured the
+consequences of the drift for every code path that goes through the primary key, using the ingest
+and decommission shapes the server really issues. Setup: a throwaway `postgres:18.4-bookworm`
+container, a libc `en_US.utf8` database, 20,000 `device_ci`-shaped rows with mixed-case,
+punctuated and hexadecimal ids (6,000 `agent-NNNNNN`, 4,000 `Agent_N`, 4,000 `PC-N`, 6,000 upper and
+lower case md5 strings), then `UPDATE pg_database SET datcollate='C'` and a reconnect, no `REINDEX`.
+Each case was run on the table as it stood after the stated step.
+
+| Case | Result |
+|---|---|
+| Point lookups by primary key (the hash-skip `SELECT`, the per-id reads `GET /api/v1/hardware/{id}` and MCP `get_hardware_ci`, the upsert conflict probe) over the 20,000 existing devices | 12,219 not found (61%) |
+| Four full-ingest cycles, `INSERT ... ON CONFLICT (agent_id) DO UPDATE` once per device per cycle, physical rows after each cycle | 34,119, 36,151, 37,214, 37,842 (from 20,000) |
+| `unique_violation` errors in those cycles | 0, 0, 34, 62 (ingest starts failing from the third cycle) |
+| The byte-ordered keyset walk over the table after the four cycles | 37,668 rows served for 20,000 devices; 14,291 devices served more than once, with divergent content; for 115 devices the newest stored copy is not the copy served; no device missing |
+| Decommission, `DELETE FROM device_ci WHERE agent_id = $1` once per device on a fresh 20,000-row table | every statement succeeds; 7,781 rows removed for 20,000 devices; 12,219 decommissioned devices stay stored |
+| The walk after that decommission | serves 12,219 rows, the ghost devices |
+
+A second independent run of the ingest case gave 20,000 to 33,868, 35,604 and 36,126 rows. On the
+re-run made for this note (the same scripts, one run) every figure in the table was identical to the
+first measurement, because the setup is deterministic.
+
+What the table shows, in terms of mechanism:
+
+- A stale primary key cannot find a row that exists, so the conflict probe of an upsert misses it and
+  inserts a second physical row; later cycles add more. From the third cycle some inserts are also
+  refused with `unique_violation`, which is a failed ingest for that device (the measured outcome;
+  the path inside the index that produces it was not analysed).
+- The byte-ordered walk reads the table in an order the stale primary key does not govern, so it
+  sees every physical row: duplicate rows for one device are served, with different content, and the
+  copy served need not be the newest.
+- The decommission statement succeeds and reports success whether or not it removed a row
+  (`device_inventory_store.cpp`, near line 1176), so a device the stale primary key cannot find is
+  never removed and the walk keeps serving it.
+- `GET /api/v1/devices/{id}` reads the in-memory session registry (`device_api.cpp:49`,
+  `lookup_device` through `registry_.get_session`): it answers only for a device with a live session
+  on the serving replica. A long-offline device answers `404` although its record exists, so a `404`
+  there is not evidence that a CI record was removed.
+
+Caveats, all of which bound how these numbers may be used:
+
+- This is a mechanical emulation (a catalogue `UPDATE` under an existing index), not a measured libc
+  or ICU upgrade. The rates are an upper bound for a real upgrade, where only some ids change order;
+  the mechanisms are what the note relies on.
+- Each figure is from one run on one container (PostgreSQL 18.4).
+- The index plans were forced with `enable_seqscan = off` (and `enable_bitmapscan = off`) for the
+  primary-key cases, because a 20,000-row table would otherwise be read by a sequential scan that
+  does not touch the stale index at all. A production table large enough to be served by its index
+  behaves this way without the setting.
 
 ## The fix
 
@@ -79,10 +128,17 @@ walkers saw an average of 3.3 s a page. With the index a page at depth took abou
 
 ## Residual exposures (not fixed by this change)
 
-1. **The primary key and every write.** Upserts into `device_ci` still go through the primary key,
-   which follows the drifting database collation. A stale primary key can admit a second row for an
-   existing `agent_id`. The stored data itself is not protected, and this read would serve the pair
-   twice; a page boundary between the two copies would hide one of them.
+1. **The primary key and every write.** Upserts, decommission deletes, the hash-skip read and the
+   per-id reads of `device_ci` still go through the primary key, which follows the drifting database
+   collation. Measured on the emulation above (not a prediction for a real upgrade, see its caveats):
+   61% of existing devices are not found by primary key, so the hash-skip and the per-id reads
+   (`GET /api/v1/hardware/{id}`, MCP `get_hardware_ci`) report a stored device as missing; every
+   full-ingest cycle adds physical rows (20,000 to 37,842 in four cycles) instead of updating them;
+   from the third cycle ingest also fails with `unique_violation` for some devices (refused ingest);
+   the byte-ordered walk then serves duplicate rows for one device with divergent content, and for
+   some devices not the newest copy; and a decommission succeeds without removing the row (7,781 of
+   20,000 removed), so ghost devices stay stored and the walk serves them. The stored data itself is
+   not protected. This change fixes none of it; the write pause (PR 3) is the control.
 2. **Every other keyset read** in the server that orders or compares a text key by the database
    collation can still skip or repeat rows under drift.
 3. **Detection delay.** The mismatch gauge is report-only and can lag the drift by up to about an
@@ -93,13 +149,19 @@ walkers saw an average of 3.3 s a page. With the index a page at depth took abou
    of the caller's scope between pages, can be missed. A consumer confirms a device with
    `?agent_id=<id>` using a global-read credential before retiring it; an empty confirm page means no
    stored record or outside the credential's scope, so it is read as "not found", not "deleted".
+   `GET /api/v1/devices/{id}` is not a substitute: it answers only for a device with a live session,
+   so its `404` does not show that a record was removed. A CI is retired only through the
+   integrator's own decommission process, never from absence in a walk or from that `404`.
 
 ## Contract for the follow-up change (PR 3)
 
 PR 3 owns the write-side control. For this read it must:
 
-- **Not gate this read on the collation check.** The read no longer depends on the database
-  collation, so a refusal on a failed or mismatching check would make a safe read unavailable.
+- **Decide, deliberately, whether to withhold this read while the check reports a mismatch.** The
+  read's SQL is correct under drift (byte-ordered, served by its own index), but the table contents
+  may not be: duplicate and ghost rows can be present (residual 1). PR 3 chooses between serving the
+  read with a caveat and refusing it while the mismatch gauge stands; either way it must NOT change
+  the byte-order SQL or the index to do so.
 - **Not bind an ordering epoch into this read's cursor.** If it binds anything, it must bump the
   cursor prefix from `h1` to `h2`, because `h1` now means "the last device in byte order" and an old
   cursor would otherwise be read under a different meaning.
@@ -112,14 +174,19 @@ PR 3 owns the write-side control. For this read it must:
   `mcp.md`, `server-admin.md`, the SOC 2 answer, the changelog fragment and the OpenAPI description) once
   the pause ships, because "the server only reports a mismatch and stops no write" stops being true.
 
-## Owner acceptance of the residual: PENDING, not recorded
+## Owner acceptance of the residual
 
-No owner has accepted residual exposures 1 to 4. This section is a placeholder and does not record an
-acceptance.
+The repository owner accepted residual exposures 1 to 4 (the list above, including the measured
+write-side behaviour) for release.
 
-- Owner: (not recorded)
-- Date: (not recorded)
-- Review trigger: (not recorded)
+- Decision recorded by the orchestrating session from the owner's answer in the working session; it
+  is not a signature and not an external approval.
+- Owner: the repository owner (Dave).
+- Date: 2026-11-15.
+- Scope: the residual list above (items 1 to 5).
+- Review trigger: the merge of PR 3, the change that adds the `device_ci` write pause. The
+  acceptance is revisited then, and ends if PR 3 does not follow quickly.
+- Not posted to GitHub; to be mirrored in the PR body.
 
 ## Appendix: reproduction
 
@@ -241,6 +308,7 @@ INSERT INTO t (agent_id)
 SELECT CASE g % 4 WHEN 0 THEN 'agent-' || g WHEN 1 THEN 'PC-' || g
                   WHEN 2 THEN 'Host_' || g ELSE 'a-B' || g || '-z' END
 FROM generate_series(1, 20000) g;
+CREATE TABLE ids AS SELECT agent_id FROM t;
 \c postgres
 UPDATE pg_database SET datcollate = 'C' WHERE datname = 'ch2';
 \c ch2
@@ -250,5 +318,29 @@ RESET enable_seqscan;
 SELECT count(*) AS rows_after, count(DISTINCT agent_id) AS distinct_ids FROM t;
 ```
 
-On the re-run: `rows_after` 33,868, `distinct_ids` 33,864 (the table grew from 20,000 rows, with
-duplicate `agent_id` values admitted through the stale primary key).
+The first run of this note counted distinct ids with `count(DISTINCT agent_id)` and got `distinct_ids`
+33,864. That figure is an artefact and must not be used: the planner answers that query with an index-only
+scan of the stale primary key (`Index Only Scan using t_pkey`), whose order no longer matches the
+comparison the distinct step uses, so equal ids are not adjacent and are counted more than once. With
+index scans disabled the same `count(DISTINCT agent_id)` returns 20,000, which is the true number of
+distinct ids. Use an oracle that does not touch the index: force a
+sequential scan and group by the byte value of the id, which is a hash aggregate.
+
+```sql
+SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_bitmapscan = off;
+SELECT count(*) AS rows_total FROM t;
+SELECT count(*) AS distinct_ids
+  FROM (SELECT agent_id COLLATE "C" FROM t GROUP BY agent_id COLLATE "C") g;
+SELECT count(*) AS ids_with_more_than_one_row
+  FROM (SELECT 1 FROM t GROUP BY agent_id COLLATE "C" HAVING count(*) > 1) g;
+-- the stored id set equals the original id set, compared by hash (needs `CREATE TABLE ids AS
+-- SELECT agent_id FROM t` before the drift)
+SELECT md5(string_agg(agent_id, ',' ORDER BY agent_id COLLATE "C"))
+  FROM (SELECT DISTINCT agent_id COLLATE "C" AS agent_id FROM t) d;
+SELECT md5(string_agg(agent_id, ',' ORDER BY agent_id COLLATE "C")) FROM ids;
+```
+
+On the re-run, with the original `count(DISTINCT agent_id)` still reading 33,864: `rows_total` 33,868,
+`distinct_ids` 20,000, `ids_with_more_than_one_row` 13,868 (20,000 plus 13,868 is 33,868), and the two
+md5 values equal (`d9648d27d72b3f6b4fa9dd12a3124e1f`), so no device was lost and 13,868 were
+duplicated. One run on one container.
