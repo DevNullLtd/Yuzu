@@ -102,7 +102,7 @@ const char* const kSettingsDataPageTemplate =
         });
       }
       if (r.status === 401) { window.location.href = '/login'; return; }
-      if (r.status === 413) { say('Too large. The limit is 16 MiB or 1,000,000 values; split the export.'); return; }
+      if (r.status === 413) { say('Too large. The limits are 16 MiB of JSON, 1,000,000 values and 64 MiB of CSV; split the export.'); return; }
       if (r.status === 429) { say('Too many requests. Try again in a moment.'); return; }
       return r.json().then(function (j) {
         var m = (j && j.error && j.error.message) || 'The request was refused.';

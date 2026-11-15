@@ -119,6 +119,8 @@ constexpr ExpectedResolution kExpected[] = {
         // #2146 review: the commit POST's JSON body has its own 4 KiB class; the chunk PUT and the
     // session open keep the 8 MiB upload_session row.
     {"POST",   "/api/v1/uploads/abc123/commit",           4u * 1024,          true,  "upload_commit"},
+    {"POST",   "/api/v1/uploads/abc123/commit/extra",     4u * 1024,          true,  "upload_commit"},
+    {"POST",   "/api/v1/uploadsevil",                     4u * 1024 * 1024,   false, "default"},
     // body_cap_policy.hpp plugin_config row — the PR1.5 config/secret/
     // kill-switch plane. 256 KiB = the 64 KiB secret-plaintext grammar cap
     // (plugin_config_parsers.hpp) plus JSON framing headroom.
@@ -457,7 +459,7 @@ TEST_CASE("kBodyCapTable: the path_class label set is exactly the documented, fi
 TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // Independent of the label-set check above: a new row using an EXISTING
     // label (e.g. a second SCIM method already covered) would pass that
-    // check while still silently growing the table. 41 = mcp(1) +
+    // check while still silently growing the table. Base 41 = mcp(1) +
     // commands(1: POST /api/v1/commands, the REST v1 twin of execute_instruction) +
     // bundles(1) + ota_upload(1) + json_to_csv_export(1) + nvd_match(1) +
     // ca_import_chain(1) + ca_issue_code_signing(1: gap-matrix #10) +
@@ -585,7 +587,7 @@ TEST_CASE("resolve_body_cap: the largest legitimate Scoring form fits under its 
 // regression on the upload_session opt-in would have shipped with this
 // test green.
 TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session and "
-         "hardware and dex_score_policy and dex_score_policy_form and OFF for every other named class",
+         "upload_commit and hardware and dex_score_policy and dex_score_policy_form and OFF for every other named class",
          "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
@@ -1455,7 +1457,7 @@ TEST_CASE("resolve_body_cap: the upload commit POST has its own small class; the
     CHECK(resolve_body_cap("PUT", "/api/v1/uploads/0123abcd/chunk").max_body_bytes ==
           8u * 1024 * 1024);
     CHECK(resolve_body_cap("POST", "/api/v1/uploads").path_class == "upload_session");
-    // A hostile 8 MiB body of [],[],... is refused for its size before any handler parses it.
+    // A 5 KiB body (over the 4 KiB cap) is refused for its size before any handler parses it.
     yuzu::MetricsRegistry metrics;
     httplib::Request req;
     req.method = "POST";
@@ -1494,6 +1496,10 @@ TEST_CASE("data_export::json_array_to_csv_checked: a wide header with many empty
     const auto ok = json_array_to_csv_checked(R"([{"a":"x","b":"y"},{"a":"1","b":"2"}])");
     CHECK(ok.status == CsvStatus::kOk);
     CHECK(ok.csv == "a,b\r\nx,y\r\n1,2\r\n");
+    // The limit is `>`: an output of exactly the limit passes, one byte under it refuses.
+    const std::string two_rows = R"([{"a":"x","b":"y"},{"a":"1","b":"2"}])";
+    CHECK(json_array_to_csv_checked(two_rows, 15).status == CsvStatus::kOk); // 15 bytes
+    CHECK(json_array_to_csv_checked(two_rows, 14).status == CsvStatus::kTooLarge);
     CHECK(json_array_to_csv_checked("not json").status == CsvStatus::kInvalid);
     CHECK(json_array_to_csv_checked("[]").status == CsvStatus::kInvalid);
     CHECK(yuzu::server::data_export::json_array_to_csv("not json").empty());

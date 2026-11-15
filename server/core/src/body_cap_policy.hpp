@@ -82,10 +82,10 @@
 /// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
 /// default above, a chunked or Content-Length-less body is NOT refused BEFORE
 /// BEING READ on any class that keeps `requires_measurable` off (all but the
-/// five listed above); this table's pre-routing chokepoint
+/// seven listed above); this table's pre-routing chokepoint
 /// admits it, up to httplib's own 100 MiB backstop, without checking this
 /// table's cap at all. A comment or doc that says chunked bodies are
-/// "refused" without naming all five classes that require a measurable body is wrong.
+/// "refused" without naming all seven classes that require a measurable body is wrong.
 /// This is a recorded adjudication, not an oversight — see the paragraph
 /// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
@@ -238,11 +238,12 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // not "simplify" this entry away.
     {"POST", "/api/v1/bundles", 70u * 1024 * 1024, false, "bundles", 5'000},
     // /api/v1/uploads — the PR1.6a authenticated chunked-receive surface
-    // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
+    // (session open POST, chunk PUT, status GET, cancel DELETE; the commit POST is carved out into
+    // `upload_commit` below).
     // ANY method: only the chunk PUT carries a large body, but scoping to PUT
     // would silently drop every sibling verb on this prefix to the catch-all
     // (rule 4 in the routed-concern row: a mutating route needs its own entry or a
-    // reviewed catch-all decision). Any-method rows are preferred. Cap = the
+    // reviewed catch-all decision). Cap = the
     // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
     // (upload_grant_parsers.hpp; bound by a static_assert in
     // file_retrieval_routes.cpp so the two cannot drift). requires_measurable
@@ -262,7 +263,8 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // (#2146 review). 4 KiB is generous for a 64-hex-digit field, which bounds the tree at about
     // 100 KB, so no value budget is needed (a cap at or below 1 MiB is not scanned). POST only: the
     // chunk PUT keeps the row above. The trailing slash keeps the exact `POST /api/v1/uploads`
-    // (session open, headers only) on that row (the longer prefix wins).
+    // (session open, headers only) on that row (the longer prefix wins). A NEW POST route under
+    // `/api/v1/uploads/` inherits this 4 KiB: give it its own row if its body is larger.
     // requires_measurable=true, as on the row above, which this commit POST previously resolved to:
     // the pre-routing gate refuses a chunked or undeclared body with 411 BEFORE httplib buffers it,
     // so the carve-out must not weaken that (an unmeasurable body here would otherwise be read in

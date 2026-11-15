@@ -699,6 +699,55 @@ TEST_CASE("instruction_routes: the YAML save refuses a create whose plugin break
     CHECK_FALSE(stored->has_value());
 }
 
+// Same rule for the action; and the CREATE-only half: an UPDATE of a stored row whose plugin is
+// already odd stays accepted, so a legacy row is never made uneditable.
+TEST_CASE("instruction_routes: the YAML save refuses a create with a bad action but updates a stored "
+          "row whose plugin is odd",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    const auto yaml_for = [](const std::string& id, const std::string& plugin,
+                             const std::string& action) {
+        return "---\napiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\nmetadata:\n  id: " +
+               id + "\n  displayName: Odd\nspec:\n  plugin: " + plugin + "\n  action: " + action +
+               "\n  type: question\n";
+    };
+    auto bad = h.sink.Post(
+        "/api/instructions/yaml",
+        "yaml_source=" + url_encode_form(yaml_for("test.route.yaml.badaction", "os_info", "\"a b;c\"")),
+        "application/x-www-form-urlencoded");
+    REQUIRE(bad);
+    CHECK(bad->body.find("Create failed") != std::string::npos);
+    CHECK(bad->body.find("action") != std::string::npos);
+    REQUIRE_FALSE((*w.store.get_definition("test.route.yaml.badaction")).has_value());
+    // A stored row with an odd plugin (as a trusted import can leave) is still updatable.
+    const std::string id = "test.route.yaml.oddstored";
+    auto create = h.sink.Post("/api/instructions/yaml",
+                              "yaml_source=" + url_encode_form(yaml_for(id, "os_info", "os_name")),
+                              "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    REQUIRE((*w.store.get_definition(id)).has_value());
+    {
+        pg::PgConn c{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(c.get()) == CONNECTION_OK);
+        REQUIRE(pg::exec_params(c.get(),
+                                "UPDATE instruction_store.instruction_definitions SET plugin = "
+                                "'odd plugin;x' WHERE id = $1",
+                                std::vector<std::string>{id})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    auto upd = h.sink.Post("/api/instructions/yaml",
+                           "yaml_source=" + url_encode_form(yaml_for(id, "\"odd plugin;x\"", "os_name")) +
+                               "&id=" + id,
+                           "application/x-www-form-urlencoded");
+    REQUIRE(upd);
+    CHECK(upd->body.find("Create failed") == std::string::npos);
+    CHECK((**w.store.get_definition(id)).plugin == "odd plugin;x");
+}
+
 // UP-5 on the legacy route (Gate 8 F2). Turns red if the legacy PUT handler stops calling
 // clear_stale_yaml_source (the YAML stays stale and a later dashboard YAML round trip reverts the
 // edit), or if the predicate grows `enabled` back (the first section).

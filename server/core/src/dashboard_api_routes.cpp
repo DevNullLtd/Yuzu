@@ -247,7 +247,7 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         res.set_header("Content-Disposition", "attachment; filename=\"export.csv\"");
-        res.set_content(csv.csv, "text/csv; charset=utf-8");
+        res.set_content(std::move(csv.csv), "text/csv; charset=utf-8");
     });
 
     // -- Scope API --------------------------------------------------------
