@@ -1833,7 +1833,7 @@ flip, with a red-first test each:
     a long quiet stretch still add up. The 3rd undecided result lands about 10 s after the first one (two further 5 s
     samples), and a watch whose handle may still have been working is then cancelled and dropped, and is retried on the
     same route as above (30 s first retry, backing off to the 300 s cap on repeated failure). Excluding
-    resource-exhaustion errors from the streak is FOLLOW-UP-ISSUE-TBD(verify-streak-resource-errors). The shapes this
+    resource-exhaustion errors from the streak is tracked in #7874. The shapes this
     cost statement covers are a herd of N watches that go blind together for up to 300 s under handle or memory pressure
     (review id UP-G8-3), and an SMB blip longer than the streak whose cancelled read then does not drain (the
     never-draining case below). A directory that stays unverifiable but openable will re-fault about every (3 intervals
@@ -1871,7 +1871,7 @@ flip, with a red-first test each:
     is retried after 50 ms (counted in `verify_launch_failed`, which counts only launches that were attempted); the
     stuck-drain wait has no deadline-driven recovery, only the observation, so a lost path whose cancelled read never
     drains stays Faulted with the sweep re-cancelling at 20 Hz (observe-only, accepted by owner ruling as a documented
-    residual, #5719 PR-B review id UP-1; FOLLOW-UP-ISSUE-TBD(never-draining-read)); one not-found sample faults the
+    residual, #5719 PR-B review id UP-1; tracked in #7875); one not-found sample faults the
     watch with no hysteresis, and an atomic directory swap that spans a sample can leave a healthy watch Faulted for
     about 35 s (review id UP-4); a hung verification costs a standing 20 Hz sweep for as long as it is outstanding, and
     a `CreateFileW` parked in a verification at agent stop races the F3 hard exit (review id UP-7); a network path that
@@ -1884,7 +1884,10 @@ flip, with a red-first test each:
     a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
     (review id UP-9); renaming the parent of N watched directories gives N Faulted edges, N warns (one per Lost) and N
     infos (one per drain), and N probes that all retry at the same instant against the probe lane (review id UP-10); and every re-fault cycle
-    delivers one resync `Fired` event per key when the watch is re-established.
+    delivers one resync `Fired` event per key when the watch is re-established. The File deaf-watch verification
+    residuals above (UP-4, UP-7, UP-9 and UP-10) and the further ones carried in the governance ledger (UP-5, UP-11,
+    QE-R4, QE-G8-6, CS-G8R3-1, G8R4-QE-COVERAGE, G8R4-STARVE-WARN, and the damping that under-applies) are tracked
+    together in #7877.
     **Before any flip (File), not done here:** (1) the verification-failure signals (`verify_unverifiable`,
     `verify_refused`, `verify_launch_failed`, `path_lost_stuck`, `verify_starved`, `path_lost_flaps`, and the
     debug-only `sweep_passes`) are debug counters visible only to tests; of these only `verify_unverifiable` (one warn
@@ -1900,7 +1903,7 @@ flip, with a red-first test each:
     lever is `--spark-disable` (section 6), which is boot-time and restart-required and persists across restarts only
     on Linux (#3973). A runtime off switch is required before a flip and this verification does not add one: it is an
     agent flag with 0 meaning off, for the Spark File mechanism as a whole and not only this verification, and
-    `--spark-disable` stays the sole current lever (FOLLOW-UP-ISSUE-TBD(runtime-off-switch)). (3) The cost model in
+    `--spark-disable` stays the sole current lever (tracked in #7876). (3) The cost model in
     precondition (c) predates this verification: the File
     measurements there were taken before it existed and do not include its cost.
     (4) Gate 5 flip-time chaos scenarios, none run here: a cancelled read that never completes (a blackholed SMB share
@@ -1994,6 +1997,22 @@ flip, with a red-first test each:
     guard on the unwind OK-completion arm's reissue-failure sub-branch) was again NOT caught (untested guard, no
     seam). The mutated source was restored and the rig tree rebuilt after each (the restored md5 equalled the
     committed one).
+    Fix round 6 (the follow-up issues named in the comments, and the scratch-tree constructor), rig bytes: commit
+    `21d351f448` (whole-repo tree `0ef77039ca14cadf3c2cb096f561e8da80da1ac5`), which changes `test_spark_mechanism.cpp`
+    only (the `DeafWatchTree` constructor now removes a partially created scratch tree and rethrows; the throw path
+    itself has no seam and was not exercised) on top of `1ac4735c2f`, which changes one comment line in
+    `spark_file.cpp` (a placeholder token replaced by #7874) and nothing else. The rig tree was a tar of the tracked
+    files of the working tree at that commit, and the md5 of the three source files on the rig equalled the md5 of the
+    committed files (`spark_file.cpp` `d31bdf4a50103f2e6afea0bd38309264`, `spark_mechanism.hpp`
+    `81d44cb03545293a6e7f76db72a32099` unchanged, `test_spark_mechanism.cpp` `d4be52b15d86c188e027e3f6fb557ca3`); the
+    tree hash names the whole repository and was not itself checked on the rig. The two commits that follow (this
+    documentation change and the ledger rows) change no source. Linux debug: `[mechanism]` 62 cases (3526
+    assertions), `[5719]` 43 (1262) and `[4415prA]` 105 (3544) green. Windows (weecolin): `[mechanism]` 187 cases (5630
+    assertions), `[5719]` 62 (2052) and `[4415prA]` 105 (3544) green, the parked Registry case red when run by tag (1
+    case, 16 assertions, 2 failed) and still counted once among the hidden cases; the `File spark (real mechanism): *`
+    pattern (49 cases, a superset of the 20 File cases of the earlier rounds) ran 20 of 20 green in a loop. The
+    mutation table was not re-run (no production code line changed). No agent re-review covered this round; the
+    confirmation is the rig run and the diff check alone.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
