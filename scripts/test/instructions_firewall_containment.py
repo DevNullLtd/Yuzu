@@ -96,6 +96,16 @@ DEFAULT_TTL_S = 600
 STATUS_RUNNING, STATUS_SUCCESS = 0, 1
 
 
+# What to run on the host when the ceremony cannot confirm a release (the names are the plugin's own).
+HAND_RELEASE = ("Linux: sudo nft delete table inet yuzu_quarantine, or without nft flush and delete the "
+                "yuzu-fwq-* iptables chains and the jumps to them; macOS: sudo pfctl -a "
+                "com.apple/000.yuzu_quarantine -F all; or dispatch firewall.release from the dashboard")
+
+
+def signal_note(got: list) -> str:
+    return f"; interrupted by signal {got[0]}" if got else ""
+
+
 class LoginError(RuntimeError):
     """The dashboard did not give this client an authenticated session."""
 
@@ -118,7 +128,9 @@ class Client:
             # authenticated read, never by the status of the form POST.
             self.get_json("/api/agents")
         except (OSError, ValueError) as e:  # URLError/HTTPError are OSError; a login page is not JSON
-            raise LoginError(f"login failed: {e}") from e
+            why = (" (the session is valid but this user cannot read /api/agents: it needs Infrastructure:Read)"
+                   if getattr(e, "code", None) == 403 else "")
+            raise LoginError(f"login failed: {e}{why}") from e
 
     def get_json(self, path: str):
         with self.opener.open(urllib.request.Request(self.base + path), timeout=self.timeout) as r:
@@ -133,16 +145,18 @@ class Client:
     def poll_response(self, command_id: str, timeout_s: int = POLL_S) -> dict:
         """The responses once every row has left RUNNING (a RUNNING row is interim, not the answer), or
         whatever was last read when the deadline passes."""
-        deadline, last = time.monotonic() + timeout_s, {}
+        deadline, last, lost = time.monotonic() + timeout_s, {}, None
         while time.monotonic() < deadline:
             try:
                 last = self.get_json(f"/api/responses/{urllib.parse.quote(command_id)}")
                 rows = [r for r in last.get("responses") or [] if isinstance(r, dict)]
                 if rows and not any(r.get("status") == STATUS_RUNNING for r in rows):
                     return last
-            except (OSError, ValueError, http.client.HTTPException):
-                pass  # a reset, a timeout, a short read or a non-JSON 200 is one lost poll, not the answer
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                lost = e  # a reset, a timeout, a short read or a non-JSON 200 is one lost poll, not the answer
             time.sleep(0.5)
+        if lost is not None:  # say why a poll ended without an answer (an expired session reads 401/403)
+            print(f"poll for {command_id}: last transport error: {lost!r}", file=sys.stderr)
         return last
 
 
@@ -208,10 +222,27 @@ def status_token(client: Client, agent_id: str) -> str:
     return tokens.pop() if len(tokens) == 1 else ""
 
 
+# The only terminal states a FIRST clean apply of this run can answer: it took hold (`active`,
+# `active_unproven`, `partial`) or it undid itself (`rolled_back`).
+_OWN_APPLY_STATUSES = frozenset({"active", "active_unproven", "partial", "rolled_back"})
+
+
 def apply_was_not_ours(answer, agent_id: str) -> bool:
-    """True iff the `quarantine` answer says the host was already contained (or a containment was converged),
-    so this run did not create it and must leave it alone."""
-    return any(line in _NOT_OURS_NOTES for line in answer_lines(answer, agent_id))
+    """True iff the `quarantine` answer shows the containment is not this run's, so it is left alone: the
+    plugin said the host was already contained or converged (`already_active`, `repaired`,
+    `incomplete_apply_converged`), or it answered anything a first clean apply cannot (`degraded`, `busy`,
+    `refused`, `update_failed`: another actor's apply or record got there first). A lost or unreadable answer
+    (no status line at all) is NOT a verdict: the apply may still be landing, so the release runs."""
+    lines: list[str] = []
+    for r in (answer.get("responses") if isinstance(answer, dict) else None) or []:
+        if isinstance(r, dict) and r.get("agent_id") == agent_id:
+            for field in ("output", "error_detail"):  # a non-zero rc keeps its rows in either field
+                if isinstance(r.get(field), str):
+                    lines.extend(line.strip().lower() for line in r[field].splitlines())
+    statuses = {m.group(1) for line in lines if (m := _STATUS_ROW.fullmatch(line))}
+    if not statuses:
+        return False
+    return any(line in _NOT_OURS_NOTES for line in lines) or not statuses <= _OWN_APPLY_STATUSES
 
 
 def release_proven(answer, agent_id: str) -> bool:
@@ -263,21 +294,32 @@ def _host_names(name: str) -> set[str]:
     return {n, n[: -len(".local")]} - {""} if n.endswith(".local") else ({n} - {""})
 
 
-def agent_is_this_host(agents, agent_id: str, nodes) -> bool:
-    """True iff exactly one registry entry carries `agent_id` and its hostname equals one of this machine's
-    names (`nodes`). An empty or `localhost` hostname never binds. The ceremony cuts the named agent off the
+def agent_is_this_host(agents, agent_id: str, nodes, os_name: str = "") -> bool:
+    """True iff exactly one registry entry carries `agent_id`, its hostname equals one of this machine's
+    names (`nodes`), its `os` is this machine's (`os_name`, when given), and NO other registered agent has
+    a name of this machine's (two agents under one name, a clone or a default such as `ubuntu`, cannot be
+    told apart). An empty or `localhost` hostname never binds. The ceremony cuts the named agent off the
     network, so it must be the box in front of the operator."""
-    hits = [a for a in agents or [] if isinstance(a, dict) and (a.get("agent_id") or a.get("id")) == agent_id]
+    entries = [a for a in agents or [] if isinstance(a, dict)]
+    hits = [a for a in entries if (a.get("agent_id") or a.get("id")) == agent_id]
     if len(hits) != 1:
         return False
+    mine = {n for node in nodes for n in _host_names(node)}
     host = str(hits[0].get("hostname") or "").strip().lower().rstrip(".")
-    if host in ("", "localhost", "localhost.localdomain"):
+    if host in ("", "localhost", "localhost.localdomain", "localhost.") or not _host_names(host) & mine:
         return False
-    return bool(_host_names(host) & {n for node in nodes for n in _host_names(node)})
+    if os_name and str(hits[0].get("os") or "").strip().lower() != os_name.lower():
+        return False
+    return not any(a is not hits[0] and _host_names(str(a.get("hostname") or "")) & mine for a in entries)
 
 
 def this_host_names() -> list[str]:
     return [platform.node(), socket.gethostname()]
+
+
+def this_host_os() -> str:
+    """The `os` a registry entry of this machine carries (agents register `linux` / `darwin`)."""
+    return platform.system().lower()
 
 
 def dashboard_is_local(dashboard: str) -> bool:
@@ -339,11 +381,11 @@ def main(argv=None) -> int:
         agent_id = args.agent_id
         agents = client.get_json("/api/agents")
         agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
-        if args.apply_containment and not agent_is_this_host(agents, agent_id, this_host_names()):
+        if args.apply_containment and not agent_is_this_host(agents, agent_id, this_host_names(), this_host_os()):
             reg = [a.get("hostname") for a in agents or [] if isinstance(a, dict) and a.get("agent_id") == agent_id]
-            print(f"refused: agent {agent_id!r} is not registered once under this host's name (registry says "
-                  f"{reg or 'no such agent'}, this host is {this_host_names()}); the ceremony only contains the "
-                  "box you are sitting at", file=sys.stderr)
+            print(f"refused: agent {agent_id!r} is not the only agent registered under this host's name and "
+                  f"OS (registry says {reg or 'no such agent'}, this host is {this_host_names()} / "
+                  f"{this_host_os()}); the ceremony only contains the box you are sitting at", file=sys.stderr)
             return EXIT_PRECONDITION
         if not agent_id:
             if len(agents or []) != 1:
@@ -391,23 +433,24 @@ def main(argv=None) -> int:
             if not_ours:
                 # Somebody else's containment (or one this run did not create): releasing it would lift
                 # a containment the ceremony never applied.
-                print("the host was already contained by another actor (apply answered already_active / repaired "
-                      "/ incomplete_apply_converged); NOT released. Its own time limit, or a hand release "
-                      "(agents/plugins/firewall/README.md), ends it.", file=sys.stderr)
+                print("the containment is not this run's (the apply answered already_active / repaired / "
+                      "incomplete_apply_converged, or something a clean first apply cannot: degraded, busy, "
+                      "refused, update_failed): NOT released. Its own time limit, or a hand release "
+                      f"({HAND_RELEASE}), ends it{signal_note(got)}.", file=sys.stderr)
                 return EXIT_FAIL
             # ALWAYS release, then re-raise whatever stopped the containment step.
             released, proven = release_and_confirm(client, agent_id)
         print(f"released: {released}")
         if not released:
             print("RELEASE NOT CONFIRMED: the host did not read inactive after "
-                  f"{RELEASE_ATTEMPTS} release attempts; clear the firewall by hand "
-                  "(agents/plugins/firewall/README.md)"
-                  + (f"; interrupted by signal {got[0]}" if got else ""), file=sys.stderr)
+                  f"{RELEASE_ATTEMPTS} release attempts; clear the firewall by hand ({HAND_RELEASE})"
+                  + signal_note(got), file=sys.stderr)
             return EXIT_RELEASE_FAILED
         if not proven:
             print("release unproven: the host reads inactive, but no release command of this run succeeded and "
-                  "undid anything (it was refused or failed, or found nothing to undo because the dead-man limit "
-                  "or another actor had already ended the containment)", file=sys.stderr)
+                  "undid anything (it was refused or failed, found nothing to undo because the dead-man limit "
+                  "or another actor had already ended the containment, or this run's own apply had already "
+                  f"rolled itself back){signal_note(got)}", file=sys.stderr)
             return EXIT_FAIL
         if got:
             print(f"interrupted by signal {got[0]}; containment released", file=sys.stderr)

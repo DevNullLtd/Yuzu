@@ -50,7 +50,7 @@ TEST_CASE("is_firewall_control_plugin: the closed four-action set (case-insensit
     CHECK_FALSE(is_firewall_control_plugin("quarantine", "release"));
 }
 
-TEST_CASE("is_protective_action: quarantine and firewall control sets plus __guard__.push_rules only",
+TEST_CASE("is_protective_action: quarantine and firewall control sets plus __guard__.push_rules",
           "[protective][security]") {
     for (const auto action : {"quarantine", "unquarantine", "status", "whitelist"})
         CHECK(is_protective_action("quarantine", action));
@@ -91,7 +91,8 @@ TEST_CASE("plugin_owns_protective_actions: true exactly for plugins with a prote
           "[protective][security]") {
     // The tie between the two lists: fails if either drifts.
     for (const auto plugin :
-         {"quarantine", "Quarantine", "__guard__", "echo", "firewall", "Firewall", "firewalls", ""}) {
+         {"quarantine", "Quarantine", "__guard__", "echo", "firewall", "Firewall", "firewalls",
+          ""}) {
         bool any = false;
         for (const auto action :
              {"quarantine", "unquarantine", "status", "whitelist", "release", "quarantine_status",
@@ -104,13 +105,16 @@ TEST_CASE("plugin_owns_protective_actions: true exactly for plugins with a prote
 TEST_CASE("plugin_mixes_protective_and_ordinary_actions: only firewall, and only an owner",
           "[protective][security]") {
     for (const auto plugin :
-         {"quarantine", "Quarantine", "__guard__", "echo", "firewall", "Firewall", "firewalls", ""}) {
+         {"quarantine", "Quarantine", "__guard__", "echo", "firewall", "Firewall", "firewalls",
+          ""}) {
         const bool mixes = plugin_mixes_protective_and_ordinary_actions(plugin);
         // A plugin cannot mix without owning a protective action ...
         if (mixes)
             CHECK(plugin_owns_protective_actions(plugin));
-        // ... and the mixed plugin really has an ordinary action beside its protective ones.
-        CHECK(mixes == (std::string_view{plugin} == "firewall" || std::string_view{plugin} == "Firewall"));
+        // ... and the answer is the hand-written table: only `firewall` (any case) mixes.
+        const bool expected = plugin == std::string_view{"firewall"} ||
+                              plugin == std::string_view{"Firewall"};
+        CHECK(mixes == expected);
     }
     CHECK_FALSE(is_protective_action("firewall", "state"));
     CHECK_FALSE(is_protective_action("firewall", "rules"));

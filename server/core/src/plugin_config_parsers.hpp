@@ -257,7 +257,8 @@ inline constexpr std::size_t kListRowCap = 5000;
 /// `, protective_exempt=true` when the row covers a protective action (stored
 /// but never gating the protective actions), or `, protective_exempt=partial` for a
 /// plugin-level `firewall` row (it exempts the protective actions but still gates that plugin's
-/// ordinary ones, `state` and `rules`), plus `, reason="<text>"` when the operator gave one. The reason survives on the live row only until the next flip, so without
+/// ordinary ones, `state` and `rules`), plus `, reason="<text>"` when the operator gave one. The
+/// reason survives on the live row only until the next flip, so without
 /// it here the audit trail cannot answer "why was this switched off". It is
 /// already validated (<= 512 bytes, no control characters but tab) by
 /// `is_valid_reason`; this re-bounds it anyway so the evidence format never

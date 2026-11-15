@@ -187,6 +187,18 @@ class Transient(unittest.TestCase):
         self.assertEqual(replies, [])
 
 
+class PollSaysWhy(unittest.TestCase):
+    def test_a_poll_that_ends_without_an_answer_prints_the_last_transport_error(self):
+        client = fc.Client("http://127.0.0.1:9")
+        ticks = iter(range(0, 1000, 3))
+        err = io.StringIO()
+        with mock.patch.object(fc.time, "monotonic", side_effect=lambda: next(ticks)), \
+                mock.patch.object(client, "get_json", side_effect=fc.urllib.error.HTTPError("u", 401, "expired", None, None)), \
+                mock.patch.object(fc.time, "sleep"), contextlib.redirect_stderr(err):
+            self.assertEqual(client.poll_response("cid", timeout_s=10), {})
+        self.assertIn("401", err.getvalue())
+
+
 class Proof(unittest.TestCase):
     def test_a_release_row_must_be_a_real_success(self):
         good = {"responses": [{"agent_id": "a", "status": 1, "output": "status|inactive"}]}
@@ -199,17 +211,34 @@ class Proof(unittest.TestCase):
             self.assertFalse(fc.release_proven(bad, "a"), bad)
 
     def test_the_apply_notes_are_whole_lines_of_this_agents_success_rows(self):
-        def ans(**kw):
-            return {"responses": [dict(agent_id="a", status=1, output="note|already_active=1", **kw)]}
-        self.assertTrue(fc.apply_was_not_ours(ans(), "a"))
-        self.assertFalse(fc.apply_was_not_ours(ans(), "b"))
-        self.assertFalse(fc.apply_was_not_ours({"responses": [{"agent_id": "a", "status": 2,
-                                                               "output": "note|already_active=1"}]}, "a"))
-        self.assertFalse(fc.apply_was_not_ours({"responses": [{"agent_id": "a", "status": 1,
-                                                               "output": "x note|already_active=1"}]}, "a"))
+        def ans(output, status=1, agent="a", **kw):
+            return {"responses": [dict(agent_id=agent, status=status, output=output, **kw)]}
+        noted = "status|active\nnote|already_active=1"
+        self.assertTrue(fc.apply_was_not_ours(ans(noted), "a"))
+        self.assertFalse(fc.apply_was_not_ours(ans(noted), "b"))     # another agent's row says nothing
+        self.assertFalse(fc.apply_was_not_ours(ans("status|active\nx note|already_active=1"), "a"))  # not a line
+        # every answer a first clean apply of this run can give is ours; so is a lost or status-less one
+        for ours in ("status|active", "status|active_unproven|x", "status|partial|residue",
+                     "status|rolled_back|apply_failed\nrolled_back|apply_failed"):
+            self.assertFalse(fc.apply_was_not_ours(ans(ours, status=1 if "rolled" not in ours else 2), "a"), ours)
+        self.assertFalse(fc.apply_was_not_ours({}, "a"))
+        self.assertFalse(fc.apply_was_not_ours(ans("", status=3), "a"))        # a server TIMEOUT proves nothing
+        # whatever else is somebody else's: degraded, busy, refused, update_failed, in any status field
+        for foreign in ("status|degraded|os_unreadable", "status|busy", "status|refused|release_in_progress",
+                        "status|update_failed|x", "status|degraded"):
+            for st in (1, 2):
+                self.assertTrue(fc.apply_was_not_ours(ans(foreign, status=st), "a"), (foreign, st))
+        self.assertTrue(fc.apply_was_not_ours(ans("", status=2, error_detail="status|busy"), "a"))
 
 
 class Login(unittest.TestCase):
+    def test_a_403_names_the_missing_read_access(self):
+        def denied(_p):
+            raise fc.urllib.error.HTTPError("u", 403, "no", None, None)
+        with self.assertRaises(fc.LoginError) as cm:
+            self.login(denied)
+        self.assertIn("Infrastructure:Read", str(cm.exception))
+
     """A 200/302 from the login POST proves nothing: the session is proven by an authenticated read."""
 
     def login(self, get_json):
@@ -252,7 +281,7 @@ class Flow(unittest.TestCase):
         self.params = {}
         if client is None:
             client = mock.MagicMock()
-            client.get_json.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local"}]}
+            client.get_json.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local", "os": "linux"}]}
 
         def fake(_client, _agent, action, params):
             calls.append(action)
@@ -268,6 +297,7 @@ class Flow(unittest.TestCase):
                 mock.patch.object(fc, "install_check", return_value=(0, "")), \
                 mock.patch.object(fc, "Client", return_value=client), \
                 mock.patch.object(fc, "this_host_names", return_value=["box"]), \
+                mock.patch.object(fc, "this_host_os", return_value="linux"), \
                 mock.patch.object(fc.time, "sleep"), \
                 mock.patch.object(fc, "dispatch", side_effect=fake):
             return fc.main(argv), calls
@@ -358,9 +388,10 @@ class Flow(unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_OK)
 
     def test_the_limit_floor_covers_the_polling_budget(self):
-        # 22 s status read + 90 s release + 4 x 22 s re-reads + 90 s apply = 290 s must fit inside the floor
-        self.assertGreaterEqual(fc.MIN_TTL_S, 290)
-        self.assertEqual(fc.MIN_TTL_S, 300)
+        # status read after the apply + one release + its re-reads + the apply's own wait must fit the floor
+        budget = (2 + fc.POLL_S) + fc.POLL_APPLY_S + fc.RELEASE_READS * (2 + fc.POLL_S) + fc.POLL_APPLY_S
+        self.assertGreaterEqual(fc.MIN_TTL_S, budget)
+        self.assertEqual(fc.MIN_TTL_S, 300)  # the documented floor; a change here is a documented change
         rc, calls = self.run_main({}, extra=["--ttl-seconds", str(fc.MIN_TTL_S - 1)])
         self.assertEqual(rc, fc.EXIT_PRECONDITION)
         self.assertEqual(calls, [])
@@ -426,6 +457,19 @@ class Flow(unittest.TestCase):
                 self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": hostname}], "a", [node]))
         twice = [{"agent_id": "a", "hostname": "box"}, {"agent_id": "a", "hostname": "box"}]
         self.assertFalse(fc.agent_is_this_host(twice, "a", ["box"]))
+        # a clone registered under the same name cannot be told apart from this box: refused
+        clones = [{"agent_id": "a", "hostname": "ubuntu"}, {"agent_id": "remote", "hostname": "Ubuntu."}]
+        self.assertFalse(fc.agent_is_this_host(clones, "remote", ["ubuntu"]))
+        self.assertFalse(fc.agent_is_this_host(clones, "a", ["ubuntu"]))
+        # the registry os must be this machine's os; either of this machine's names binds
+        mine = [{"agent_id": "a", "hostname": "box", "os": "Linux"}]
+        self.assertTrue(fc.agent_is_this_host(mine, "a", ["other", "box"], "linux"))
+        self.assertFalse(fc.agent_is_this_host(mine, "a", ["box"], "darwin"))
+        self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": "box"}], "a", ["box"], "linux"))
+        self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": "localhost."}], "a", ["localhost."]))
+        with mock.patch.object(fc.platform, "node", return_value="n1"), \
+                mock.patch.object(fc.socket, "gethostname", return_value="n2"):
+            self.assertEqual(fc.this_host_names(), ["n1", "n2"])  # both names are offered to the binding
 
     def test_a_refused_release_followed_by_inactive_is_not_a_pass(self):
         # the apply is still in flight, the release is refused `busy`, yet a later status read says inactive
@@ -452,6 +496,37 @@ class Flow(unittest.TestCase):
                                            "quarantine": [answer], "release": [REL]})
                 self.assertIn("release", calls)
 
+    def test_an_apply_a_first_clean_run_cannot_give_is_never_released(self):
+        # another actor got in between the inactive read and our apply: nothing here may lift its containment
+        for foreign, st in (("status|degraded|os_unreadable", 1), ("status|degraded", 1), ("status|busy", 2),
+                            ("status|update_failed|converge", 2), ("status|refused|release_in_progress", 2),
+                            ("status|refused|state_unreadable", 2)):
+            with self.subTest(answer=foreign):
+                applied = {"responses": [{"agent_id": "a", "status": st, "output": foreign}]}
+                rc, calls = self.run_main({"quarantine_status": [row("inactive")], "quarantine": [applied],
+                                           "release": [REL]})
+                self.assertNotEqual(rc, fc.EXIT_OK)
+                self.assertNotIn("release", calls)
+        # ... while our own answers, a rolled-back apply and a lost one all reach the release
+        for own in ({"responses": [{"agent_id": "a", "status": 2, "output": "status|rolled_back|x"}]}, EMPTY,
+                    {"responses": [{"agent_id": "a", "status": 3, "output": ""}]}):
+            with self.subTest(own=own):
+                rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive")],
+                                           "quarantine": [own], "release": [REL]})
+                self.assertIn("release", calls)
+
+    def test_a_signal_is_named_on_the_not_ours_and_unproven_exits(self):
+        for answer, release in (({"responses": [{"agent_id": "a", "status": 2, "output": "status|busy"}]}, REL),
+                                ({}, {"responses": [{"agent_id": "a", "status": 1,
+                                                     "output": "status|inactive\nnote|no_state_record=1"}]})):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("inactive"), row("inactive")],
+                                       "quarantine": [lambda _c, a=answer: signal.raise_signal(signal.SIGTERM) or a],
+                                       "release": [release]})
+            self.assertEqual(rc, fc.EXIT_FAIL)
+            self.assertIn(f"interrupted by signal {int(signal.SIGTERM)}", err.getvalue())
+
     def test_a_release_that_found_nothing_to_undo_is_not_proof(self):
         for note in ("no_state_record=1", "state_unreadable=1"):
             with self.subTest(note=note):
@@ -459,6 +534,14 @@ class Flow(unittest.TestCase):
                 rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
                                        "quarantine": [{}], "release": [noop]})
                 self.assertEqual(rc, fc.EXIT_FAIL)  # the time limit (or someone else) released it, not this run
+
+    def test_a_proven_release_stays_proven_across_a_later_refused_attempt(self):
+        # attempt 1 worked but the host still read active; attempt 2 was refused (nothing left to release);
+        # the host then reads inactive: the run's own release is proven by the first attempt
+        reads = [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS + [row("inactive")]
+        rc, calls = self.run_main({"quarantine_status": reads, "quarantine": [{}], "release": [REL, BUSY]})
+        self.assertEqual(rc, fc.EXIT_OK)
+        self.assertEqual(calls.count("release"), 2)
 
     def test_a_refused_release_is_retried_until_it_works(self):
         rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS

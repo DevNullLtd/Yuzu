@@ -337,14 +337,16 @@ TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence for
     CHECK(kill_switch_set_detail(KillSwitchScope{"quarantine", "", ""}, false) ==
           "enabled=false, protective_exempt=true");
     // A plugin-level firewall row exempts the protective four but still gates state and rules:
-    // labelled `partial`, never the complete-exemption `true`. An action-level firewall row is exact.
+    // labelled `partial`, never the complete-exemption `true`. An action-level firewall row is
+    // exact.
     CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false) ==
           "enabled=false, protective_exempt=partial");
     CHECK(kill_switch_set_detail(KillSwitchScope{"Firewall", "", "linux"}, true, "drill") ==
           "enabled=true, protective_exempt=partial, reason=\"drill\"");
     CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "release", ""}, false) ==
           "enabled=false, protective_exempt=true");
-    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "state", ""}, false) == "enabled=false");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "state", ""}, false) ==
+          "enabled=false");
 }
 
 TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped reason",
