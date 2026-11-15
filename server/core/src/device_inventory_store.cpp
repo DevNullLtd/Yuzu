@@ -211,6 +211,20 @@ constexpr const char* kMigrationV3Sql =
     "ALTER TABLE device_ci_section ADD COLUMN IF NOT EXISTS row_count INTEGER NULL, "
     "ADD COLUMN IF NOT EXISTS content_digest TEXT NULL;";
 
+// v4: the index behind the bulk CI read's C-collated keyset (`list_device_ci_after`). That read
+// orders and compares `agent_id COLLATE "C"` (byte order), and only an index on that exact
+// expression can serve it. The point is correctness, not speed: the primary key's index is built
+// under the DATABASE collation, so a libc/ICU upgrade under an existing volume (no REINDEX) leaves
+// it stale and a keyset walk over it can skip rows with no error (measured: 24% of 50,030 ids at
+// limit 1). The "C" collation is byte comparison, which no library upgrade can change, so a walk
+// over this index cannot be made to skip or repeat a row by a collation change. ADDITIVE and
+// idempotent (IF NOT EXISTS; no existing object is touched). Not CONCURRENTLY: the runner applies
+// a migration in a transaction, where CONCURRENTLY is refused. A plain build takes a SHARE lock on
+// device_ci (writes wait, reads do not): about 0.5 s of blocked ingest per million rows, once, at
+// the first server start after the upgrade. Unqualified DDL - the runner sets search_path.
+constexpr const char* kMigrationV4Sql =
+    "CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_ci ((agent_id COLLATE \"C\"));";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
     // migration transaction, so `device_ci` lands in `device_inventory_store`.
@@ -252,6 +266,7 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX device_ci_hostname_idx ON device_ci (hostname);"},
         {2, kMigrationV2Sql},
         {3, kMigrationV3Sql},
+        {4, kMigrationV4Sql},
     };
     return kMigrations;
 }
@@ -775,9 +790,13 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     std::vector<std::string> params;
     std::string sql = std::string("SELECT ") + kSelectCols +
                       ", content_hash FROM device_inventory_store.device_ci WHERE true";
+    // Byte order, not the database collation: `agent_id COLLATE "C"` on the bound, the ANY
+    // membership and the ORDER BY, so the planner can use the v4 expression index and a collation
+    // change under the primary key's index cannot make the walk skip or repeat a row. The index
+    // serves only a query that spells exactly this expression, so all three must keep it.
     if (!q.after.empty()) {
         params.push_back(q.after);
-        sql += " AND agent_id > $" + std::to_string(params.size());
+        sql += " AND agent_id COLLATE \"C\" > $" + std::to_string(params.size());
     }
     if (q.agent_id) {
         params.push_back(*q.agent_id);
@@ -786,10 +805,10 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     if (q.agent_ids) {
         const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
         params.push_back(pg::to_text_array(ids));
-        sql += " AND agent_id = ANY($" + std::to_string(params.size()) + "::text[])";
+        sql += " AND agent_id COLLATE \"C\" = ANY($" + std::to_string(params.size()) + "::text[])";
     }
     params.push_back(std::to_string(eff));
-    sql += " ORDER BY agent_id ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
+    sql += " ORDER BY agent_id COLLATE \"C\" ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
 
     // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the
     // count_stale_agents idiom): this page holds one connection of the pool the RBAC and audit
@@ -826,6 +845,10 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     });
     if (ok)
         return out;
+    // `entered == false` means the callback never ran: no connection within the bound, OR the
+    // BEGIN on a leased connection failed (the helper does not tell the two apart, as in
+    // instruction_store.cpp's insert path). The counter label keeps its existing `pool_acquire_
+    // timeout` spelling, so it can also count a failed BEGIN; the log line below says both.
     static DegradeSampler pool_sampler;
     static DegradeSampler query_sampler;
     if (note_read_degrade(metrics_, entered ? kReasonQueryError : kReasonPoolTimeout,
@@ -834,7 +857,7 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
         // `err` is empty only when the callback returned true and the COMMIT then did not take: the
         // transaction helper does not expose the COMMIT's error text, so say so rather than log
         // nothing.
-        const std::string cause = !entered ? pool_.last_error()
+        const std::string cause = !entered ? "pool acquire timeout or BEGIN failed: " + pool_.last_error()
                                   : err.empty() ? std::string("commit failed")
                                                 : ::yuzu::log_key_token(err);
         spdlog::warn("DeviceInventoryStore: keyset list degraded: {}", cause);

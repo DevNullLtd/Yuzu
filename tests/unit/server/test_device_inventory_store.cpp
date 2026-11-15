@@ -35,6 +35,7 @@
 #include <iterator>
 #include <map>
 #include <latch>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -3051,12 +3052,16 @@ TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in
         CHECK(page->empty());
     }
 
-    SECTION("a limit of zero or below is the store's row ceiling, not zero rows") {
-        yuzu::server::DeviceCiKeysetQuery q;
-        q.limit = 0;
-        const auto page = store.list_device_ci_after(q);
-        REQUIRE(page.has_value());
-        CHECK(page->size() == 5);
+    // The ceiling itself (100000) is proved by its own test below; with five rows this only shows
+    // that a non-positive limit is not read as "zero rows".
+    SECTION("a limit of zero or below is not zero rows") {
+        for (const int bad : {0, -1}) {
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.limit = bad;
+            const auto page = store.list_device_ci_after(q);
+            REQUIRE(page.has_value());
+            CHECK(page->size() == 5);
+        }
     }
 
     SECTION("ids with quote, backslash, comma and brace characters travel as data") {
@@ -3084,6 +3089,236 @@ TEST_CASE("list_device_ci_after pages the stored rows by agent_id and narrows in
         page = store.list_device_ci_after(q);
         REQUIRE(page.has_value()); // a bound parameter, not SQL text
     }
+}
+
+namespace {
+
+std::vector<std::string> keyset_ids(const std::optional<std::vector<DeviceCiRecord>>& page) {
+    std::vector<std::string> out;
+    if (page)
+        for (const auto& r : *page)
+            out.push_back(r.agent_id);
+    return out;
+}
+
+// Stores one v2 record under `id` with the given hostname.
+void store_ci(DeviceInventoryStore& store, const std::string& id, const std::string& hostname) {
+    DeviceCiRecord r = distinct_v2_record("A");
+    r.hostname = hostname;
+    r.content_hash = "hash-" + id;
+    REQUIRE(store.apply_device_ci(id, DeviceInventoryStore::canonical_hash(r),
+                                  std::optional<DeviceCiRecord>{r}, 1) == InventoryIngestOutcome::kStored);
+}
+
+// A limit-1 walk by `after`, the harshest page size for a keyset (every row is a boundary).
+std::vector<std::string> keyset_walk(DeviceInventoryStore& store, int limit) {
+    std::vector<std::string> seen;
+    std::string after;
+    for (int guard = 0; guard < 1000; ++guard) {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.after = after;
+        q.limit = limit;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        if (page->empty())
+            break;
+        for (const auto& r : *page)
+            seen.push_back(r.agent_id);
+        after = page->back().agent_id;
+    }
+    return seen;
+}
+
+} // namespace
+
+// Kills: dropping `COLLATE "C"` from the bound, the ORDER BY or the ANY comparison. The test
+// database is created from template1 and so takes the server's default collation (a locale such as
+// en_US.UTF-8 on every runner image); under a locale `Agent-1`, `agent_1`, `a b`, `a-b`, `a_b` and
+// the digit strings sort in an order that is not their byte order, and a keyset over such an order
+// compared bytewise by the client's cursor skips or repeats rows. Each id is served exactly once,
+// in byte order, at every page size. (Under a database whose default collation is already C the
+// test cannot tell; the CH-1 run in the fix round measured the real skips under a changed collation.)
+TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once each, in byte order",
+          "[pg][device_ci][keyset][order]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::vector<std::string> ids = {
+        "Agent-1", "agent_1", "agent-1", "agent1", "PC-1",   "pc-0042", "Zeta",
+        "zeta",    "AB",      "ab",      "a b",    "a-b",    "a_b",     "-x",
+        "_x",      "10",      "2",       "\xC3\xA9t\xC3\xA9", "Z\xC3\xA9", "agent-10", "agent-2"};
+    for (const auto& id : ids)
+        store_ci(store, id, "host-" + id);
+    std::vector<std::string> expected = ids;
+    std::sort(expected.begin(), expected.end()); // unsigned byte order
+
+    for (const int limit : {1, 2, 7, 1000}) {
+        INFO("limit " << limit);
+        CHECK(keyset_walk(store, limit) == expected);
+    }
+    // the one-page read agrees, and the bound is compared bytewise too: after `Zeta` come the
+    // lower-case ids and `_x`, never `Agent-1` (which a case-insensitive locale puts before it)
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.after = "Zeta";
+    q.limit = 1000;
+    const auto tail = keyset_ids(store.list_device_ci_after(q));
+    REQUIRE_FALSE(tail.empty());
+    CHECK(std::ranges::find(tail, "Agent-1") == tail.end());
+    CHECK(std::ranges::find(tail, "AB") == tail.end());
+    CHECK(tail.front() == "Z\xC3\xA9"); // 'Z' then 0xC3: the next byte string after "Zeta"
+    // and an agent_ids set is compared bytewise (an id differing only by case is a different id)
+    q.after.clear();
+    q.agent_ids = std::vector<std::string>{"agent-1", "AGENT-1", "Zeta"};
+    CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"Zeta", "agent-1"});
+}
+
+// Kills: an `ORDER BY hostname, agent_id` (or any order that is not the keyset key): here the
+// hostnames sort AGAINST the agent_id order, so only a walk ordered by agent_id serves the rows in
+// agent_id order and a cursor made of the last agent_id never skips one.
+TEST_CASE("list_device_ci_after orders by agent_id even when the hostnames sort the other way",
+          "[pg][device_ci][keyset][order]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    // agent-a has the LAST hostname, agent-e the first
+    const std::vector<std::pair<std::string, std::string>> rows = {
+        {"agent-a", "zz-host"}, {"agent-b", "yy-host"}, {"agent-c", "xx-host"},
+        {"agent-d", "ww-host"}, {"agent-e", "vv-host"}};
+    for (const auto& [id, host] : rows)
+        store_ci(store, id, host);
+    const std::vector<std::string> by_id = {"agent-a", "agent-b", "agent-c", "agent-d", "agent-e"};
+    for (const int limit : {1, 2, 5})
+        CHECK(keyset_walk(store, limit) == by_id);
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.limit = 10;
+    CHECK(keyset_ids(store.list_device_ci_after(q)) == by_id);
+}
+
+// Kills: a keyset that repeats, skips or reorders when a row appears ahead of the cursor or the
+// cursor's own row goes away between two reads. The second page is compared exactly.
+TEST_CASE("list_device_ci_after's second page is exact when a row is inserted or the cursor row deleted",
+          "[pg][device_ci][keyset][walk]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    for (const char* id : {"d1", "d2", "d3", "d4", "d5", "d6"})
+        store_ci(store, id, std::string("h-") + id);
+    const auto second_page = [&](const std::string& cursor) {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.after = cursor;
+        q.limit = 2;
+        return keyset_ids(store.list_device_ci_after(q));
+    };
+    REQUIRE(second_page("") == std::vector<std::string>{"d1", "d2"});
+
+    SECTION("a row inserted ahead of the cursor is served where it sorts") {
+        store_ci(store, "d25", "h-d25");
+        CHECK(second_page("d2") == std::vector<std::string>{"d25", "d3"});
+    }
+    SECTION("a row inserted behind the cursor is not served on this walk, and nothing repeats") {
+        store_ci(store, "d15", "h-d15");
+        CHECK(second_page("d2") == std::vector<std::string>{"d3", "d4"});
+    }
+    SECTION("the cursor row deleted: the walk continues after its key") {
+        REQUIRE(store.delete_agent("d2"));
+        CHECK(second_page("d2") == std::vector<std::string>{"d3", "d4"});
+    }
+    SECTION("every later row deleted: an empty page") {
+        for (const char* id : {"d3", "d4", "d5", "d6"})
+            REQUIRE(store.delete_agent(id));
+        CHECK(second_page("d2").empty());
+    }
+}
+
+// Kills: dropping or renaming migration v4, which serves the C-collated keyset. The index is on the
+// expression `agent_id COLLATE "C"`: a query that spells that exact expression is the only one that
+// can use it, so the statement in list_device_ci_after and this index must change together.
+TEST_CASE("device_inventory_store has the C-collated agent_id index behind the bulk keyset read",
+          "[pg][device_ci][keyset][migration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+        "AND tablename = 'device_ci' AND indexname = 'device_ci_agent_id_c_idx'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    const std::string def = PQgetvalue(res.get(), 0, 0);
+    CHECK(def.find("COLLATE \"C\"") != std::string::npos);
+    CHECK(def.find("agent_id") != std::string::npos);
+    CHECK(def.find("CONCURRENTLY") == std::string::npos);
+    // additive: the primary key and the hostname index are still there beside it
+    auto all = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+        "AND tablename = 'device_ci' AND indexname IN ('device_ci_pkey', 'device_ci_hostname_idx', "
+        "'device_ci_agent_id_c_idx')",
+        std::vector<std::string>{});
+    REQUIRE(all.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(all.get(), 0, 0)) == "3");
+}
+
+// Kills: reading a non-positive or oversized limit as anything but the store's row ceiling
+// (100000), and the title of an earlier section that claimed to prove the ceiling with five rows.
+// 100001 rows are inserted in one statement, so the test reads exactly the ceiling.
+TEST_CASE("list_device_ci_after reads the 100000-row ceiling for a limit of zero, below zero or above it",
+          "[pg][device_ci][keyset][ceiling]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    exec_stmt(pool,
+              "INSERT INTO device_inventory_store.device_ci (agent_id, first_seen, last_seen) "
+              "SELECT 'g-' || lpad(i::text, 6, '0'), 1, 1 FROM generate_series(1, 100001) AS i");
+    for (const int limit : {0, -1, 100000 + 1, std::numeric_limits<int>::max()}) {
+        INFO("limit " << limit);
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.limit = limit;
+        const auto page = store.list_device_ci_after(q);
+        REQUIRE(page.has_value());
+        CHECK(page->size() == 100000);
+        CHECK(page->front().agent_id == "g-000001");
+        CHECK(page->back().agent_id == "g-100000");
+    }
+    // a limit below the ceiling is honoured
+    yuzu::server::DeviceCiKeysetQuery q;
+    q.limit = 3;
+    CHECK(keyset_ids(store.list_device_ci_after(q)) ==
+          std::vector<std::string>{"g-000001", "g-000002", "g-000003"});
+}
+
+// Kills: a deny-all scope that runs SQL (it would be a degrade here, where the only connection is
+// held elsewhere) instead of answering empty with no lease at all.
+TEST_CASE("list_device_ci_after answers a deny-all scope without taking a connection",
+          "[pg][device_ci][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    auto held = pool.acquire(); // the pool's only connection
+    REQUIRE(held);
+    yuzu::server::DeviceCiKeysetQuery deny_all;
+    deny_all.agent_ids = std::vector<std::string>{};
+    const auto page = store.list_device_ci_after(deny_all);
+    REQUIRE(page.has_value()); // not a degrade: no lease was needed
+    CHECK(page->empty());
+    // the same pool with the same held lease DOES degrade a read that needs SQL
+    CHECK_FALSE(store.list_device_ci_after({}).has_value());
 }
 
 // Kills: setting the timeout with a session-level SET (it would leak onto the pooled connection
