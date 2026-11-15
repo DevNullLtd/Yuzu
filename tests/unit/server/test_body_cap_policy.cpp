@@ -22,6 +22,8 @@
 #include "body_cap_policy.hpp"
 #include "dex_score_policy_form.hpp"
 #include "post_read_stage_test_support.hpp"
+#include "json_value_budget.hpp"
+#include "step_up_wiring.hpp"
 #include "raw_close_probe.hpp"
 #include "test_loopback_http.hpp"
 #include "web_utils.hpp"
@@ -79,6 +81,10 @@ using yuzu::server::kBodyCapAnyMethod;
 using yuzu::server::kBodyCapTable;
 using yuzu::server::resolve_body_cap;
 using yuzu::server::transfer_encoding_for_body_cap;
+using yuzu::server::json_exceeds_value_count;
+using yuzu::server::kJsonValuesDefault;
+using yuzu::server::kJsonValuesMcp;
+using yuzu::server::kJsonValuesOff;
 
 namespace {
 
@@ -119,7 +125,7 @@ constexpr ExpectedResolution kExpected[] = {
     // settings_routes.cpp:5146,:5206 — keeps httplib's 100 MiB backstop.
     {"POST",   "/api/settings/updates/upload",            100u * 1024 * 1024, false, "ota_upload"},
     // server.cpp:10809 — unbounded by design, kept at httplib's backstop.
-    {"POST",   "/api/export/json-to-csv",                 100u * 1024 * 1024, false, "json_to_csv_export"},
+    {"POST",   "/api/export/json-to-csv",                 16u * 1024 * 1024,  false, "json_to_csv_export"},
     // server.cpp:9258 — no aggregate contract, reasoned to realistic scale.
     {"POST",   "/api/nvd/match",                          8u * 1024 * 1024,   false, "nvd_match"},
     // ca_routes.cpp:24,:516.
@@ -278,6 +284,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "bundles",
     "ota_upload",
     "json_to_csv_export",
+    "result_sets",
     "nvd_match",
     "ca_import_chain",
     "ca_issue_code_signing",
@@ -471,7 +478,8 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // crypto_revocation_sources(1: ADR-0070 R1 registered CRL sources, 192 KiB) +
     // software_curation(1: the curation subtree) + software_alias_pack(1: the pack CSV) +
     // software_collection_settings(1: the collection settings subtree) + default(1).
-    CHECK(std::size(kBodyCapTable) == 42);
+    // + result_sets(1: POST /api/v1/result-sets, the 200000-value budget of device_ids).
+    CHECK(std::size(kBodyCapTable) == 43);
 }
 
 // The dex_score_policy_form row is derived from the document's own limits (body_cap_policy.hpp),
@@ -1366,6 +1374,161 @@ TEST_CASE("Pre-routing body cap: duplicate Content-Length headers cannot desync 
     }
 }
 #endif // !_WIN32
+
+// ── 10. JSON value budget (#2146): the size cap does not bound a parse tree ─
+//
+// A body of `[],[],...` builds an nlohmann tree 16 to 27 times its size, so each JSON class carries
+// `max_json_values`, counted on the raw text by `run_post_read_stage` before any handler parses.
+
+TEST_CASE("kBodyCapTable: every row states a JSON value budget; an unscanned class above 1 MiB is "
+          "a named one",
+          "[body_cap][json_budget]") {
+    // Not scanned, with a cap above 1 MiB: uploads (binary), the YAML-or-JSON creates (guarded at
+    // their JSON branch) and the form-encoded instruction YAML routes. A new such row must be added
+    // here on purpose.
+    const std::set<std::string> kUnscannedAbove1MiB = {"upload_session", "ota_upload",
+                                                       "workflow_yaml", "product_pack_yaml",
+                                                       "instruction_yaml"};
+    for (const auto& entry : kBodyCapTable) {
+        INFO("path_class=" << entry.path_class);
+        if (entry.max_json_values == kJsonValuesOff) {
+            if (entry.max_body_bytes > 1u * 1024 * 1024)
+                CHECK(kUnscannedAbove1MiB.contains(std::string(entry.path_class)));
+        } else {
+            // A budget bounds the tree: at about 100 bytes a value, at most about 100 MiB.
+            CHECK(entry.max_json_values <= 1'000'000);
+            CHECK(entry.max_json_values >= 1'000);
+        }
+    }
+}
+
+TEST_CASE("resolve_body_cap: the JSON value budgets of the named classes",
+          "[body_cap][json_budget]") {
+    CHECK(resolve_body_cap("POST", "/mcp/v1/").max_json_values == kJsonValuesMcp);
+    CHECK(resolve_body_cap("POST", "/api/v1/result-sets").max_json_values == kJsonValuesMcp);
+    CHECK(resolve_body_cap("POST", "/api/v1/result-sets/from-echo-query").max_json_values ==
+          kJsonValuesOff); // its own small row
+    CHECK(resolve_body_cap("POST", "/api/v1/commands").max_json_values == 30'000);
+    CHECK(resolve_body_cap("POST", "/api/v1/bundles").max_json_values == 5'000);
+    CHECK(resolve_body_cap("POST", "/api/instructions/import").max_json_values ==
+          kJsonValuesDefault);
+    CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_body_bytes == 16u * 1024 * 1024);
+    CHECK(resolve_body_cap("POST", "/api/export/json-to-csv").max_json_values == 1'000'000);
+    CHECK(resolve_body_cap("POST", "/api/workflows").max_json_values == kJsonValuesOff);
+    CHECK(resolve_body_cap("POST", "/api/no/such/route").max_json_values == kJsonValuesDefault);
+}
+
+TEST_CASE("json_exceeds_value_count: the shared raw-text counter",
+          "[body_cap][json_budget]") {
+    CHECK_FALSE(json_exceeds_value_count("", 0));
+    CHECK_FALSE(json_exceeds_value_count(R"({"a":[1,2,3]})", 4)); // '{' '[' and 2 commas
+    CHECK(json_exceeds_value_count(R"({"a":[1,2,3]})", 3));
+    // Structure inside a string literal is not counted; an escaped quote does not end the string.
+    CHECK_FALSE(json_exceeds_value_count(R"(["[,{,,,,,"])", 1));
+    CHECK_FALSE(json_exceeds_value_count(R"(["a\"[[[[,,,"])", 1));
+    CHECK(json_exceeds_value_count(R"(["\\",1])", 1)); // an escaped backslash ends the escape
+}
+
+namespace {
+/// `[` + n_commas commas of `1` + `]`: n_commas + 1 counted values.
+std::string flat_array_with(std::size_t values) {
+    std::string s = "[";
+    for (std::size_t i = 1; i < values; ++i)
+        s += "1,";
+    s += "1]";
+    return s;
+}
+
+struct StageRun {
+    httplib::Server::HandlerResponse result;
+    int status;
+    std::string body;
+};
+
+StageRun run_stage(std::string method, std::string path, std::string body,
+                   yuzu::MetricsRegistry& metrics) {
+    httplib::Request req;
+    req.method = std::move(method);
+    req.path = std::move(path);
+    req.body = std::move(body);
+    httplib::Response res;
+    const yuzu::server::StepUpChokepointDeps deps{.metrics = &metrics};
+    const auto result = yuzu::server::detail::run_post_read_stage(req, res, deps);
+    return {result, res.status, res.body};
+}
+
+bool refused_for_json_values(const StageRun& r) {
+    return r.result == httplib::Server::HandlerResponse::Handled && r.status == 413 &&
+           r.body.find("JSON values") != std::string::npos;
+}
+} // namespace
+
+TEST_CASE("Post-read JSON value budget: a body within the size cap but over its class's budget is "
+          "refused 413 before any handler, at the class's own number",
+          "[body_cap][post_read][json_budget]") {
+    yuzu::MetricsRegistry metrics;
+    // The catch-all: 100000 passes, 100001 does not (both far under the 4 MiB size cap).
+    CHECK_FALSE(refused_for_json_values(
+        run_stage("POST", "/api/no/such/route", flat_array_with(kJsonValuesDefault), metrics)));
+    const auto over = run_stage("POST", "/api/no/such/route",
+                                flat_array_with(kJsonValuesDefault + 1), metrics);
+    CHECK(refused_for_json_values(over));
+    CHECK(over.body.find("split the request") != std::string::npos);
+
+    // The MCP envelope and result-sets carry 200000: 150000 passes where the catch-all refuses.
+    CHECK_FALSE(refused_for_json_values(
+        run_stage("POST", "/mcp/v1/", flat_array_with(150'000), metrics)));
+    CHECK(refused_for_json_values(run_stage("POST", "/mcp/v1/", flat_array_with(kJsonValuesMcp + 1),
+                                            metrics)));
+    CHECK_FALSE(refused_for_json_values(
+        run_stage("POST", "/api/v1/result-sets", flat_array_with(150'000), metrics)));
+    CHECK(refused_for_json_values(
+        run_stage("POST", "/api/v1/result-sets", flat_array_with(kJsonValuesMcp + 1), metrics)));
+    CHECK(refused_for_json_values(
+        run_stage("POST", "/api/instructions/import", flat_array_with(150'000), metrics)));
+
+    // A class that is not scanned (a 256 KiB CA body; the YAML-or-JSON workflow create) is not
+    // refused by the budget however many values the body holds.
+    CHECK_FALSE(refused_for_json_values(
+        run_stage("POST", "/api/v1/ca/import-chain", flat_array_with(120'000), metrics)));
+    CHECK_FALSE(refused_for_json_values(
+        run_stage("POST", "/api/workflows", flat_array_with(300'000), metrics)));
+
+    // The Content-Type does not matter: a handler parses whatever it is sent.
+    httplib::Request req;
+    req.method = "POST";
+    req.path = "/api/no/such/route";
+    req.body = flat_array_with(kJsonValuesDefault + 1);
+    req.set_header("Content-Type", "text/plain");
+    httplib::Response res;
+    const yuzu::server::StepUpChokepointDeps deps{.metrics = &metrics};
+    CHECK(yuzu::server::detail::run_post_read_stage(req, res, deps) ==
+          httplib::Server::HandlerResponse::Handled);
+    CHECK(res.status == 413);
+
+    // The refusals are counted under the class label and the new reason.
+    CHECK(metrics
+              .counter("yuzu_body_cap_rejected_total",
+                       {{"path_class", "default"}, {"reason", "over_json_values_post_read"}})
+              .value() == 2);
+    CHECK(metrics
+              .counter("yuzu_body_cap_rejected_total",
+                       {{"path_class", "mcp"}, {"reason", "over_json_values_post_read"}})
+              .value() == 1);
+}
+
+TEST_CASE("Post-read JSON value budget: a hostile 4 MiB body of [],[],... is refused on the "
+          "catch-all and on the MCP path",
+          "[body_cap][post_read][json_budget]") {
+    // The measured case: about 1.4 million values at 4 MiB (a 258 to 429 MiB tree at 16 MiB).
+    std::string hostile = "[";
+    while (hostile.size() < 4u * 1024 * 1024 - 8)
+        hostile += "[],";
+    hostile += "[]]";
+    yuzu::MetricsRegistry metrics;
+    CHECK(refused_for_json_values(run_stage("POST", "/api/no/such/route", hostile, metrics)));
+    CHECK(refused_for_json_values(run_stage("POST", "/mcp/v1/", hostile, metrics)));
+}
 
 // ── 9. Post-read body cap, second stage (body-cap-post-read-stage) ────────
 //

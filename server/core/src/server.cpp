@@ -2130,7 +2130,10 @@ public:
             "class that requires one it can size; unsupported_encoding: a "
             "non-identity Content-Encoding, refused on every class; "
             "over_cap_post_read: the body was read in full - because it could not be "
-            "sized in advance - and turned out to be over the class's cap)",
+            "sized in advance - and turned out to be over the class's cap; "
+            "over_json_values_post_read: the body is within the class's size cap but holds "
+            "more structural JSON values than the class's budget, refused before any handler "
+            "parses it)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -2142,6 +2145,12 @@ public:
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "over_cap_post_read"}});
+            // Only a class that scans (`max_json_values` != off) can reach the value-budget refusal.
+            if (entry.max_json_values != yuzu::server::kJsonValuesOff) {
+                metrics_.counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(entry.path_class)},
+                                  {"reason", "over_json_values_post_read"}});
+            }
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},

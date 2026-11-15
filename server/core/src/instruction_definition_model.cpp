@@ -201,34 +201,7 @@ std::optional<std::string> apply_definition_fields(const nlohmann::json& body, b
 } // namespace
 
 bool json_exceeds_value_budget(std::string_view body, std::size_t max_values) noexcept {
-    std::size_t values = 0;
-    bool in_string = false;
-    bool escaped = false;
-    for (const char c : body) {
-        if (in_string) {
-            if (escaped)
-                escaped = false;
-            else if (c == '\\')
-                escaped = true;
-            else if (c == '"')
-                in_string = false;
-            continue;
-        }
-        switch (c) {
-        case '"':
-            in_string = true;
-            break;
-        case '[':
-        case '{':
-        case ',':
-            if (++values > max_values)
-                return true;
-            break;
-        default:
-            break;
-        }
-    }
-    return false;
+    return json_exceeds_value_count(body, max_values);
 }
 
 std::optional<std::string> check_dispatch_identifier(std::string_view field,

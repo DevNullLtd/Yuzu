@@ -7,6 +7,7 @@
 #include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
+#include "json_value_budget.hpp" // json_exceeds_value_count: the JSON-form body breadth bound
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "executions_page_render.hpp" // Operate O1: view=page renderers
 #include "workflows_page_render.hpp" // Operate WF-A: workflows + schedules page renderers
@@ -55,6 +56,10 @@
 namespace yuzu::server {
 
 namespace {
+/// The most structural JSON values of the JSON form of `POST /api/workflows` and `POST
+/// /api/product-packs` (`{"yaml_source": "..."}`, one field): the central body-cap stage does not
+/// scan these two classes because their other form is raw YAML, not JSON.
+constexpr std::size_t kYamlEnvelopeMaxJsonValues = 1'000;
 constexpr const char* kParamRejectRoute = "instruction_execute";
 constexpr const char* kParamRejectReasons[] = {"shape", "violation", "schema_invalid"};
 
@@ -2344,6 +2349,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string yaml_source;
         if (req.get_header_value("Content-Type").find("application/json") != std::string::npos) {
             try {
+                // The JSON form is a one-field envelope; the central body-cap stage does not scan
+                // this class (the raw-YAML form is not JSON), so the breadth bound lives here.
+                if (json_exceeds_value_count(req.body, kYamlEnvelopeMaxJsonValues))
+                    throw std::invalid_argument("too many JSON values");
                 auto j = nlohmann::json::parse(req.body);
                 yaml_source = j.value("yaml_source", "");
             } catch (const std::exception&) {
@@ -4315,6 +4324,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string yaml_bundle;
         if (req.get_header_value("Content-Type").find("application/json") != std::string::npos) {
             try {
+                // As for the workflow create: the JSON form is a one-field envelope.
+                if (json_exceeds_value_count(req.body, kYamlEnvelopeMaxJsonValues))
+                    throw std::invalid_argument("too many JSON values");
                 auto j = nlohmann::json::parse(req.body);
                 yaml_bundle = j.value("yaml_source", "");
             } catch (const std::exception&) {
