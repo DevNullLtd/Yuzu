@@ -302,6 +302,15 @@ change: a notification POST now answers `202` instead of `204`).
   session's `GET` stream after the POST has already answered. See
   `docs/mcp-server.md` "Streamed POST — SSE on the response" for the response
   shape, the close reasons, and the recovery rules.
+  **Scope-confined dispatchers (#7817).** Progress and terminal counts follow the
+  caller's `Execution:Read` scope, the same projection `GET /api/v1/events` applies.
+  A caller whose `Execution:Read` is limited to a management group (while it may
+  hold a global `Execution:Execute`) receives **no** `notifications/progress` frames,
+  and its final result carries the real `status` but no `agents_success`,
+  `agents_failure` or `agents_responded` keys; poll `get_execution_status` for the
+  counts it is allowed to see. If that scope cannot be resolved for the request, the
+  bridge uses this restricted view. A caller with an unrestricted `Execution:Read`
+  scope is unaffected.
   An engine principal's stream holds its per-principal quota **concurrency**
   slot for the stream's whole lifetime, the same as the other streaming routes
   covered by the PR 4.4 quota cap — so a long-lived stream counts against that
