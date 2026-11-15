@@ -414,9 +414,10 @@ row first).
   `guaranteed_state_store.cpp`, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
   holding such a pending unpaired event. It is not part of this change.
 - A Repair holds one pooled connection for the sum of its statements: the Ensure and the clock read, each
-  under the 1 s lock bound per wait, then five census statements under 2 s each, about 12 s in the worst case,
-  or about 14 s when the Repair loop's one retry (the Ensure and the clock read run again when the agent's
-  row is deleted mid-Repair) is taken. A Repair can also wait on the unique index when a redelivery overlaps
+  bounded by the Repair's 2 s statement bound (a lock wait is one stage of that statement and has its own 1 s
+  `lock_timeout`), then five census statements under 2 s each, about 14 s in the worst case, or about 18 s
+  when the Repair loop's one retry (the Ensure and the clock read run again when the agent's row is deleted
+  mid-Repair) is taken. A Repair can also wait on the unique index when a redelivery overlaps
   an in-flight first delivery of the same event id (before the cap check, bounded by the other transaction). Those
   are per-statement bounds, not a deadline for the whole Repair (a whole-Repair deadline is a follow-up, issue
   to be filed). At most `kRepairMaxConcurrent` (4, a compile-time constant with no operator setting) Repairs
@@ -436,7 +437,7 @@ row first).
   50-wide replay admits about 4); the cap is a fixed constant 4, not scaled to `--postgres-pool-size`, and
   assumes the default pool of 16; first deliveries, batch rows and `delete_rule` holders are not capped.
   Per-agent sub-cap, a pool-scaled cap, a bounded admission wait and backpressure are follow-ups (issue to be
-  filed). Only Repairs are capped; a first delivery or a batch row never is. The first delivery's
+  filed). The first delivery's
   order step also runs under `SET LOCAL statement_timeout` equal to its lock bound plus 2 s
   (`kAgentStepStatementMarginMs`), 3 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
   wait and a `FOR SHARE` locker does not queue behind a waiting `FOR UPDATE`, so a rolling chain of Repair
