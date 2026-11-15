@@ -2817,3 +2817,342 @@ TEST_CASE("census pair order, Gate 3 QE-3: a Repair whose backend ends mid-Repai
         CHECK(pool.in_use() == 0);
     }
 }
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// UP-14 PR B Gate 7: the cap on concurrent Repairs, and the first delivery's statement deadline.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Parks EVERY caller of the census lock barrier until released, counting how many are inside it at
+// once (`BarrierHold` parks only the first). Inside the barrier a Repair holds its pooled lease, so
+// the count is the number of Repairs that hold one.
+struct ParkAll {
+    std::promise<void> release_p;
+    std::shared_future<void> release_f = release_p.get_future().share();
+    std::atomic<int> inside{0};
+    std::atomic<int> max_inside{0};
+    std::atomic<bool> released{false};
+    void hit() {
+        const int now = inside.fetch_add(1) + 1;
+        int prev = max_inside.load();
+        while (now > prev && !max_inside.compare_exchange_weak(prev, now)) {}
+        release_f.wait();
+        inside.fetch_sub(1);
+    }
+    void release() {
+        if (!released.exchange(true))
+            release_p.set_value();
+    }
+};
+
+// Polls `pred` until it holds or the deadline passes (an observed state, never a fixed sleep).
+template <class Pred> bool wait_until(Pred pred, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return pred();
+}
+
+// Stores four census-bearing events of four agents (one rule) as pending, through the fail switch.
+void store_four_pending(GuaranteedStateStore& store, const std::string& dsn,
+                        std::array<GuaranteedStateEventRow, 4>& events) {
+    FailSwitch fail(dsn);
+    fail.on();
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        events[i] = with_pair(
+            stamped("cap-e" + std::to_string(i), "r1", "cap-a" + std::to_string(i), kDrifted, 1000),
+            5, 10);
+        REQUIRE(store.insert_event_classified(events[i]).outcome == EventInsertOutcome::Inserted);
+    }
+    fail.off();
+}
+
+} // namespace
+
+TEST_CASE("census pair order, Gate 7: Repairs past the cap are shed at once, their events stay "
+          "pending and untouched, the lease goes back, and a later redelivery repairs",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    std::array<GuaranteedStateEventRow, 4> events;
+    store_four_pending(store, db.dsn(), events);
+    REQUIRE(pending_count(db.dsn()) == "4");
+    const std::string order_before = order_snapshot(db.dsn());
+    const auto failures_before = store.census_proj_failures_total();
+    REQUIRE(store.repairs_in_flight() == 0);
+
+    store.set_repair_max_concurrent_for_test(2);
+    ParkAll park;
+    std::vector<EventInsertOutcome> outcomes(events.size(), EventInsertOutcome::Error);
+    store.set_census_lock_barrier_for_test([&] { park.hit(); });
+    std::vector<std::thread> threads;
+    {
+        // Every local a thread touches is declared above this guard, so it outlives the join.
+        struct Joiner {
+            ParkAll& park;
+            GuaranteedStateStore& store;
+            std::vector<std::thread>& threads;
+            ~Joiner() {
+                park.release();
+                for (auto& t : threads)
+                    if (t.joinable())
+                        t.join();
+                store.set_census_lock_barrier_for_test({});
+                store.set_repair_max_concurrent_for_test(
+                    GuaranteedStateStore::kRepairMaxConcurrent);
+            }
+        } joiner{park, store, threads};
+        for (std::size_t i = 0; i < events.size(); ++i)
+            threads.emplace_back(
+                [&, i] { outcomes[i] = store.insert_event_classified(events[i]).outcome; });
+
+        // Two Repairs are admitted and parked at the barrier; the other two are shed, with no wait.
+        REQUIRE(
+            wait_until([&] { return park.inside.load() == 2 && store.repairs_shed_total() == 2; },
+                       std::chrono::seconds(10)));
+        CHECK(store.repairs_in_flight() == 2);
+        CHECK(park.max_inside.load() == 2); // never more than the cap
+        // The shed Repairs hold no lease: only the two parked ones do (the pool has 4).
+        CHECK(pool.in_use() == 2);
+        {
+            auto a = pool.try_acquire_for(std::chrono::milliseconds(200));
+            auto b = pool.try_acquire_for(std::chrono::milliseconds(200));
+            CHECK(static_cast<bool>(a));
+            CHECK(static_cast<bool>(b));
+        }
+        CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "2");
+        CHECK(store.census_proj_failures_total() == failures_before + 2);
+        // Nothing of a shed Repair was written, and nothing of a parked one has committed.
+        CHECK(pending_count(db.dsn()) == "4");
+        CHECK(order_snapshot(db.dsn()) == order_before);
+        park.release();
+        for (auto& t : threads)
+            t.join();
+        threads.clear();
+    }
+    for (const auto o : outcomes)
+        CHECK(o == EventInsertOutcome::Redelivered); // a shed Repair is acked like a failed one
+    CHECK(park.max_inside.load() == 2);
+    CHECK(store.repairs_in_flight() == 0);
+    CHECK(store.repairs_shed_total() == 2);
+    CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "2");
+    CHECK(pending_count(db.dsn()) == "2"); // the two shed events are still pending
+
+    // With the holders finished, a redelivery of each event repairs it: the cap is a gate on
+    // concurrency, never a verdict, and the shed events lost nothing.
+    for (const auto& e : events)
+        CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Redelivered);
+    CHECK(pending_count(db.dsn()) == "0");
+    CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "4");
+    CHECK(store.repairs_shed_total() == 2);
+    CHECK(pool.in_use() == 0);
+}
+
+TEST_CASE("census pair order, Gate 7: a shed Repair logs a sampled warning, and the cap does not "
+          "touch a first delivery or a batch row",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    std::array<GuaranteedStateEventRow, 4> events;
+    store_four_pending(store, db.dsn(), events);
+    // Cap 0 sheds every Repair (an admitted one is the only way past it).
+    store.set_repair_max_concurrent_for_test(0);
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    for (const auto& e : events)
+        CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Redelivered);
+    // First deliveries and a batch row are never refused by the cap.
+    CHECK(
+        store
+            .insert_event_classified(with_pair(stamped("fd1", "r1", "fd-a", kDrifted, 2000), 5, 11))
+            .outcome == EventInsertOutcome::Inserted);
+    const std::vector<GuaranteedStateEventRow> batch{
+        with_pair(stamped("fd2", "r1", "fd-b", kDrifted, 2001), 5, 12)};
+    CHECK(store.insert_events(batch).has_value());
+    cap.stop();
+    CHECK(store.repairs_shed_total() == 4);
+    CHECK(repair_outcome_count_text(metrics, "repair", "failed") == "4");
+    CHECK(pending_count(db.dsn()) == "4");
+    CHECK(verdict(db.dsn(), "fd-a", "r1") == "D - 5/11");
+    CHECK(verdict(db.dsn(), "fd-b", "r1") == "D - 5/12");
+    // One warning for the episode, not one per shed Repair (the sampler logs the first of an
+    // episode and every 100th).
+    const std::string logged = cap.text();
+    std::size_t lines = 0;
+    for (std::size_t at = logged.find("repair shed"); at != std::string::npos;
+         at = logged.find("repair shed", at + 1))
+        ++lines;
+    CHECK(lines == 1);
+}
+
+TEST_CASE("census pair order, Gate 7: the Repair admission is released on every exit, an exception "
+          "included",
+          PAIR_TAGS) {
+    PAIR_FIXTURE();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+    {
+        FailSwitch fail(db.dsn());
+        fail.on();
+        REQUIRE(store.insert_event_classified(e1).outcome == EventInsertOutcome::Inserted);
+        fail.off();
+    }
+    REQUIRE(pending_count(db.dsn()) == "1");
+    int held_at_commit = -1;
+    store.set_pre_commit_hook_for_test([&](void*) {
+        held_at_commit = store.repairs_in_flight();
+        throw std::runtime_error("forced exception inside a Repair");
+    });
+    bool threw = false;
+    try {
+        (void)store.insert_event_classified(e1);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    store.set_pre_commit_hook_for_test({});
+    CHECK(held_at_commit == 1); // the admission is held across the Repair
+    CHECK(threw);               // (or the store turned it into an error: either way, released)
+    CHECK(store.repairs_in_flight() == 0);
+    CHECK(pending_count(db.dsn()) == "1");
+    CHECK(pool.in_use() == 0);
+    // A normal return releases it too, and the next Repair is admitted and repairs.
+    CHECK(store.insert_event_classified(e1).outcome == EventInsertOutcome::Redelivered);
+    CHECK(store.repairs_in_flight() == 0);
+    CHECK(store.repairs_shed_total() == 0);
+    CHECK(pending_count(db.dsn()) == "0");
+}
+
+namespace {
+
+// A rolling chain of overlapping FOR SHARE holders on one agent's order row, each a Repair-style
+// transaction, until `stop` is set or the cap passes. Shared locks do not queue behind a waiting
+// FOR UPDATE, so while the chain runs the row is never free for a first delivery's lock.
+class ShareChain {
+public:
+    ShareChain(std::string dsn, std::string agent, std::chrono::milliseconds cap)
+        : dsn_(std::move(dsn)), agent_(std::move(agent)), cap_(cap), thread_([this] { run(); }) {}
+    ShareChain(const ShareChain&) = delete;
+    ShareChain& operator=(const ShareChain&) = delete;
+    ~ShareChain() {
+        stop_.store(true);
+        if (thread_.joinable())
+            thread_.join();
+    }
+    bool started() const { return started_.load(); }
+
+private:
+    static bool exec(PGconn* c, const std::string& sql) {
+        pg::PgResult r{PQexec(c, sql.c_str())};
+        return r.ok();
+    }
+    void run() {
+        const auto end = std::chrono::steady_clock::now() + cap_;
+        std::vector<pg::PgConn> live;
+        const std::string lock = std::string("SELECT 1 FROM ") + kSchema +
+                                 ".guardian_agent_order WHERE agent_id = '" + agent_ +
+                                 "' FOR SHARE";
+        while (!stop_.load() && std::chrono::steady_clock::now() < end) {
+            pg::PgConn next{PQconnectdb(dsn_.c_str())};
+            if (PQstatus(next.get()) == CONNECTION_OK && exec(next.get(), "BEGIN") &&
+                exec(next.get(), lock)) {
+                live.push_back(std::move(next));
+                started_.store(true);
+            }
+            // Each holder overlaps the next: release the oldest only when two are held.
+            if (live.size() >= 2) {
+                exec(live.front().get(), "ROLLBACK");
+                live.erase(live.begin());
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        }
+        for (auto& c : live)
+            exec(c.get(), "ROLLBACK");
+    }
+    std::string dsn_;
+    std::string agent_;
+    std::chrono::milliseconds cap_;
+    std::atomic<bool> stop_{false};
+    std::atomic<bool> started_{false};
+    std::thread thread_;
+};
+
+} // namespace
+
+TEST_CASE("census pair order, Gate 7 M1: a first delivery starved of its order row by a chain of "
+          "overlapping Repair share locks is cut at the step's bound and stored pending",
+          PAIR_TAGS) {
+    // `lock_timeout` is per wait, and a FOR SHARE locker does not queue behind a waiting FOR
+    // UPDATE, so a rolling chain of overlapping share holders keeps the first delivery's wait going
+    // past the 1 s lock bound (measured on PG 17: 4 s and 8 s). The step's statement timeout counts
+    // the whole statement, waits included, so it ends at 1 s with SQLSTATE 57014, which takes the
+    // failed-step path: the event is stored pending, the step's writes are undone, the delivery is
+    // acked. Production bounds throughout; only the chain's own length is generous.
+    PAIR_FIXTURE();
+    // The agent's order row exists (a first delivery of another rule wrote it).
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("seed", "r2", "a", kDrifted, 900), 5, 9))
+            .outcome == EventInsertOutcome::Inserted);
+    REQUIRE(order_text(db.dsn(), "a") == "5|9|-|0|0|0|0|0|0|0");
+    const std::string order_before = order_snapshot(db.dsn());
+    const auto failures_before = store.census_proj_failures_total();
+    const auto e1 = with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10);
+
+    ShareChain chain(db.dsn(), "a", std::chrono::seconds(8));
+    REQUIRE(wait_until([&] { return chain.started(); }, std::chrono::seconds(5)));
+    const auto t0 = std::chrono::steady_clock::now();
+    const EventInsertResult res = store.insert_event_classified(e1);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    CHECK(res.outcome == EventInsertOutcome::Inserted);
+    CHECK(took < std::chrono::milliseconds(2500)); // the bound is 1 s, the margin generous
+    CHECK(repair_outcome_count_text(metrics, "first_delivery", "failed") == "1");
+    CHECK(store.census_proj_failures_total() == failures_before + 1);
+    CHECK(pending_count(db.dsn()) == "1");           // stored, with pending evidence
+    CHECK(verdict(db.dsn(), "a", "r1") == "absent"); // no census write
+    CHECK(order_snapshot(db.dsn()) == order_before); // the step's writes were undone
+    CHECK(pool.in_use() == 0);
+}
+
+TEST_CASE("census pair order, Gate 7 M1: the step's statement timeout is the lock bound while the "
+          "step runs and the pool's own once it ends",
+          PAIR_TAGS) {
+    // A trigger on each table records the lock_timeout and statement_timeout in force as its
+    // statement runs, as the Repair's QE-2 case does. The step's Ensure and DECIDE writes run under
+    // the 1 s lock bound AND the 1 s statement bound; the census write that follows runs under the
+    // pool's own 10 s and 30 s, and so does the commit: neither SET LOCAL leaks past the RELEASE.
+    PAIR_FIXTURE();
+    const std::string log = std::string(kSchema) + ".yuzu_test_lt_log";
+    exec_sql(db.dsn(), "CREATE TABLE " + log + " (stage text, lt text, st text)");
+    exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                           ".yuzu_test_lt_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                           "INSERT INTO " +
+                           log +
+                           " VALUES (TG_TABLE_NAME, current_setting('lock_timeout'), "
+                           "current_setting('statement_timeout')); RETURN NEW; END $$");
+    for (const char* table : {"guardian_agent_order", "guardian_agent_rule_status"})
+        exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_lt_note BEFORE INSERT OR UPDATE "
+                                       "ON ") +
+                               kSchema + "." + table + " FOR EACH ROW EXECUTE FUNCTION " + kSchema +
+                               ".yuzu_test_lt_note()");
+    std::string lt_at_commit;
+    std::string st_at_commit;
+    store.set_pre_commit_hook_for_test([&](void* c) {
+        auto* conn = static_cast<PGconn*>(c);
+        pg::PgResult lt{PQexec(conn, "SHOW lock_timeout")};
+        pg::PgResult st{PQexec(conn, "SHOW statement_timeout")};
+        if (lt.ok() && PQntuples(lt.get()) == 1)
+            lt_at_commit = PQgetvalue(lt.get(), 0, 0);
+        if (st.ok() && PQntuples(st.get()) == 1)
+            st_at_commit = PQgetvalue(st.get(), 0, 0);
+    });
+    const EventInsertResult res =
+        store.insert_event_classified(with_pair(stamped("e1", "r1", "a", kDrifted, 1000), 5, 10));
+    store.set_pre_commit_hook_for_test({});
+    REQUIRE(res.outcome == EventInsertOutcome::Inserted);
+    CHECK(verdict(db.dsn(), "a", "r1") == "D - 5/10");
+    CHECK(query_scalar(db.dsn(), "SELECT string_agg(x, ',' ORDER BY x) FROM (SELECT DISTINCT "
+                                 "stage || '=' || lt || '/' || st AS x FROM " +
+                                     log + ") t") ==
+          "guardian_agent_order=1s/1s,guardian_agent_rule_status=10s/30s");
+    CHECK(lt_at_commit == "10s");
+    CHECK(st_at_commit == "30s");
+}
