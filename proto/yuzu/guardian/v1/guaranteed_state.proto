@@ -145,8 +145,9 @@ message GuaranteedStateEvent {
   // compares (boot_epoch, emit_seq) lexicographically only between two events that both carry
   // a pair, treats a lower pair as a regression candidate rather than proof of order, and
   // holds an unpaired event against a paired verdict while the agent's pair clock is fresh
-  // (docs/spark-flip-gate.md, UP-14). It also holds, rather than orders by, a pair far above
-  // any honest one (emit_seq of 2^40 or more, or a boot_epoch over ten years past receipt).
+  // (docs/spark-flip-gate.md, UP-14). A pair far above any honest one (emit_seq of 2^40 or
+  // more, or a boot_epoch over ten years past receipt) is dropped at ingest and the event is
+  // judged as an unpaired event, so it is never ordered by.
   // Both are ordinals, NOT timestamps, and NEITHER is compared by stored_event_matches.
   uint64 boot_epoch = 24;
   uint64 emit_seq = 25;

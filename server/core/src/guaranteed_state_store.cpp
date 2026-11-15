@@ -1812,11 +1812,14 @@ constexpr const char* kCensusLockAll =
 // epoch, by `kCensusFold` as $4 and `kCensusClear` as $5): $9 boot_epoch and $10 emit_seq of the
 // EVENT being projected (0/0 = unpaired), $11 its pair mode (a `PairMode` label from the agent's
 // order step or a Repair's read), $12 the epoch the agent's latest lower-epoch recovery retired
-// (0 or NULL = none). The statements below are the validated v5 text of the UP-14 delivery plan
-// (section 2.5), transcribed from its generator and checked against it by a differential; they
-// are not to be edited by hand-copying a clause. They are NOT byte-identical to that prototype:
-// `YUZU_CENSUS_SEEN_MAX_SEQ_` below carries one deliberate, semantics-preserving deviation (`+ 0`,
-// P-1), re-derived in the prototype copy and re-checked by the differential.
+// (0 or NULL = none). The statements below implement the regime rules in
+// docs/user-manual/guaranteed-state.md, "What the server does with the pair". The executable model
+// of those rules is tests/unit/server/pair_model/ (`pend.py`); `test_census_pair_harness.cpp` ports
+// it to C++, replays seeded schedules through this store and compares after every delivery. The
+// text was transcribed from a generated form of that model, so a clause is not to be edited by
+// hand-copying: change the model and the harness in the same change. The text is NOT
+// byte-identical to the generated form: `YUZU_CENSUS_SEEN_MAX_SEQ_` below carries one deliberate,
+// semantics-preserving deviation (`+ 0`, P-1), re-checked by the same differential.
 #define YUZU_CENSUS_IN_EPOCH_ "$9::bigint"
 #define YUZU_CENSUS_IN_SEQ_ "$10::bigint"
 #define YUZU_CENSUS_MODE_ "$11::text"
@@ -1837,7 +1840,7 @@ constexpr const char* kCensusLockAll =
     "OR (e.proj_key <> 0 AND e.proj_key = COALESCE(c.key_ns, 0) "                                  \
     "    AND e.ingest_seq <> COALESCE(c.ingest_seq, 0)))"
 
-// The same question across regimes (plan 2.5). Both paired: the event's pair is at or above the
+// The same question across regimes. Both paired: the event's pair is at or above the
 // row's, or it carries the retired epoch, or it arrived after the verdict, or it is of another
 // epoch (an event of another epoch is a regression candidate). Exactly one paired: it disagrees
 // (the regimes are never compared, so the doubt is kept). Both unpaired: the key test above.
@@ -1890,8 +1893,8 @@ constexpr const char* kCensusFold =
 // events the final row dominates, so their arrival order must be remembered on the row or a later
 // apply with a higher key would clear the doubt they raised (the row tracks `seq_hwm` for this).
 //
-// `max(s.ingest_seq + 0)`, not `max(s.ingest_seq)` (P-1, the one deviation from the validated
-// prototype text; the value is identical). With a plain `max(ingest_seq)` the planner may answer
+// `max(s.ingest_seq + 0)`, not `max(s.ingest_seq)` (P-1, the one deviation from the generated
+// text of the model; the value is identical). With a plain `max(ingest_seq)` the planner may answer
 // the subquery as a BACKWARD scan of `idx_gse_ingest_seq` with a heap filter on `event_id`, which
 // reads every event newer than the OLDEST seen one. Governance's performance review measured 0.5 s
 // at 1.3 M events and 10.9 s at 5.3 M for 10 000 old pending events of one (agent, rule), under the
@@ -2249,13 +2252,14 @@ constexpr const char* kAgentOrderDecide =
 // A Repair's mode: the same clock, read WITHOUT writing it. A Repair is a late delivery by
 // definition, so it never refreshes the clock, never re-bases it and never sets a fence: a stale
 // clock gives `current_straggler` (same epoch) or `refused_regression` (lower epoch) where the
-// first delivery's CASE above would re-base. Plan 2.2 and the validated prototype (`gen_v5.py`
-// RO_MODE) state this CASE; it differs from `YUZU_AGENT_ORDER_MODE_` only in those two re-base
-// arms. The row is locked FOR SHARE in the inner select and the CASE runs above it, on the locked
-// version (the same shape as DECIDE's `old`), so a first delivery that bumped the clock while this
-// waited is read, not missed. $1 agent, $2 boot_epoch (0 = unpaired), $3 emit_seq. EXACTLY one row
-// is the only answer the caller accepts: no row (the agent was decommissioned between Ensure and
-// here) must never read as a clock that has seen nothing.
+// first delivery's CASE above would re-base. The model's `agent_mode_readonly`
+// (tests/unit/server/pair_model/pend.py) states this CASE; it differs from
+// `YUZU_AGENT_ORDER_MODE_` only in those two re-base arms. The row is locked FOR SHARE in the inner
+// select and the CASE runs above it, on the locked version (the same shape as DECIDE's `old`), so
+// a first delivery that bumped the clock while this waited is read, not missed. $1 agent,
+// $2 boot_epoch (0 = unpaired), $3 emit_seq. EXACTLY one row is the only answer the caller
+// accepts: no row (the agent was decommissioned between Ensure and here) must never read as a
+// clock that has seen nothing.
 #define YUZU_AGENT_ORDER_MODE_RO_                                                                  \
     "CASE WHEN $2::bigint = 0 THEN (CASE WHEN o.epoch IS NOT NULL AND " YUZU_AGENT_ORDER_FRESH_    \
     " THEN 'unpaired_held' ELSE 'unpaired' END) "                                                  \
@@ -2293,10 +2297,10 @@ constexpr const char* kAgentOrderCountDuplicate =
 // is recorded further than the slack in the database's future (a stepped-back replica clock: the
 // same reading `fresh` gives it, where the hold treats such a clock as stale, so the read side must
 // agree); this holds for a paired-only agent too, with no unpaired event at all. It never reads
-// NULL: a blank row (every column NULL) is not unordered. The value depends on the database clock,
-// so it can flip with no event, the moment a clock recorded in the future falls inside the slack.
-// Every reader (the per-device row, the fleet count and the id list) uses this text; no C++ copy
-// exists.
+// NULL: a blank row (no pair clock, no unpaired receipt time) is not unordered. The value depends
+// on the database clock, so it can flip with no event, the moment a clock recorded in the future
+// falls inside the slack. Every reader (the per-device row, the fleet count and the id list) uses
+// this text; no C++ copy exists.
 #define YUZU_AGENT_ORDER_UNORDERED_                                                                \
     "((o.unpaired_recv_ns IS NOT NULL AND o.unpaired_recv_ns > COALESCE(o.epoch_recv_ns, 0)) "     \
     "OR COALESCE(o.epoch_recv_ns > " YUZU_CENSUS_DB_NOW_NS_ " + " YUZU_CENSUS_FUTURE_SLACK_NS_     \
