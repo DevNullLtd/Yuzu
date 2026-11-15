@@ -1494,6 +1494,7 @@ if build_server
       'unit/server/test_route_inventory.cpp', # HttplibRouteSink records registrations in RouteInventory (bare httplib::Server, no listen)
       'unit/server/test_step_up_wiring.cpp', # step-up chokepoint wired as the post-read stage (registry + HttplibRouteSink wrapper), over a real httplib::Server (no PG)
       'unit/server/test_post_read_stage.cpp', # PostReadStageRegistry + HttplibRouteSink handler wrapper: order, short-circuit, install guards, unwrapped servers (no PG)
+      'unit/server/test_http_response_policy.cpp', # HEAD refusal + measured-quality brotli composed into HttplibRouteSink (pure, no socket, no PG)
       'unit/server/test_model_param_to_params.cpp', # model_detail::to_params: key-sorted copy of httplib params for the pure parsers (no PG)
       'unit/server/test_step_up_null_store.cpp', # the two unwired-auth-store 503 sites (server.cpp step_up_fn, auth_routes elevation_step_up); [stepup][null_store] pure + [pg] route cases
       'unit/server/test_step_up_gate.cpp',   # step-up decide/render split + request chokepoint; [stepup][gate] pure, [pg][mfa][stepup] equivalence matrix
@@ -1537,6 +1538,8 @@ if build_server
       'unit/server/test_audit_store.cpp',
       'unit/server/test_background_jobs.cpp',
       'unit/server/test_pg_retention_guard.cpp',
+      'unit/server/test_pg_collation_check.cpp',
+      'unit/server/test_pg_collation_recheck.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
       'unit/server/test_audit_token_hostile_bytes.cpp',
@@ -4369,6 +4372,17 @@ test('guardian_backend reader wiring lexical gate (#2240)',
   timeout: 60,
 )
 
+# DEX Apps page wiring (#7520, #7519): server.cpp hands DexRoutes the DexApi make_local_dex_api returned,
+# and that call passes an observer provider reading health_store_.dex_observer_for. Static lexical gate
+# with its own in-memory mutation self-test; no build required. Suite 'docs' for the same reason as the
+# gate above.
+test('DEX Apps wiring lexical gate (#7520, #7519)',
+  _python3_test,
+  args: [files('test_dex_apps_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-decommission cascade wiring (#5675): every field of AgentDecommissionStores must be handed a
 # live store pointer in ServerImpl::decommission_agent (server.cpp). A store registered in the
 # cascade but never wired there is Skipped for every operator decommission, and no unit test sees
@@ -4421,6 +4435,19 @@ test('settings engine session belt lexical gate',
 test('typed-source purge wiring lexical gate (2a-1b)',
   _python3_test,
   args: [files('test_typed_purge_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The PostgreSQL collation version check must stay wired in at both ends: the constructor-time call
+# in the ServerImpl constructor's substrate block (fed by the check, guarded by the probe, not tied
+# to startup_failed_) AND the recheck's construction, start and stop (run() / stop(), before
+# pg_pool_.reset()). Source-text only; suite 'docs' as the gates above; carries delete/move/`#if 0`
+# self-tests. Remaining limit: it cannot see `if (false)`, an uncalled lambda, or a start() in a
+# branch that never runs.
+test('pg collation check wiring lexical gate',
+  _python3_test,
+  args: [files('test_pg_collation_check_wiring_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -118,6 +118,18 @@ This SQL is unsupported and is not recorded in the in-product audit log, so reco
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build. A replica on an earlier build keeps the earlier behaviour, which is outside the deployment contract; this page does not describe it as supported, and it is not a procedure for a rolling or mixed-version upgrade.
 
+## ⚠️ Breaking: HEAD on a dynamic route is answered 405 with `Allow: GET`
+
+**What changed.** Every authenticated dynamic route (`/api/v1/`, the dashboard pages and fragments, `/metrics`) answers `HEAD` with `405 Method Not Allowed` and `Allow: GET`, and the handler is not run. Before, `HEAD` ran the whole handler and discarded the body. The paths that still answer `HEAD` are the four health probes (`/livez`, `/readyz`, `/health`, `/api/health`), static assets, the sign-in pages, the sign-in start and callback GET routes (`/auth/oidc/start`, `/auth/callback`, `/auth/saml/start`), the SCIM GET routes (`/scim/v2/`), and the public CA files (`/api/v1/ca/root`, `/api/v1/ca/crl`); they ride the same unauthenticated-path set as the sign-in pages. A route in that set that accepts only `POST` (`/saml/acs`, the `/login` form posts) has no `HEAD` handler and does not gain one. The `Allow` header names `GET` only, even on a path that also accepts writes. Brotli-encoded dynamic responses are now produced at quality 5 instead of the library's maximum (11), so a very large page is about 25 percent larger on the wire and about 250 times cheaper for the server for a server-rendered page (a 2.5 MB page: about 9 ms of one worker instead of about 2.5 s).
+
+**Before you upgrade.** Find anything that sends `HEAD` to a route that is not one of the paths listed above as still answering it, and switch it to `GET`, or to a probe path (`/livez`, `/readyz`, `/health`, `/api/health`) where all it needs is liveness: uptime and load balancer health checks, monitoring and synthetic checks, scripts, `curl -I` and `wget --spider` against a dashboard page, an API route or `/metrics`. After the upgrade such a check reads `405` and no longer proves the page or the API works. Nothing else changes: `GET` responses are the same bytes, compressed or not.
+
+## Behaviour change: the DEX Apps payload gains `observer_state`, `policy.interval_confidence` and `score.tier`
+
+**What changed.** `GET /api/v1/dex/apps` and the MCP tool `list_dex_apps` carry three additive keys: `observer_state` (the live count of online devices whose crash and hang observer is armed, not armed or not reporting, per platform; `null` when no observer source is wired), `policy.interval_confidence` and `score.tier` on every application and version score (`null` when the score is withheld). A degraded read's `503` message and MCP error now end with the cause as a token (`concurrency_budget`, `pool_acquire_timeout`, `statement_timeout`, `query_error`, `store_not_open`, `score_policy_unavailable`, `score_policy_invalid`), and `yuzu_server_guardian_read_degrade_total{source="guardian_state"}` now counts a read the database cancelled at its statement timeout under `reason="statement_timeout"` (it was `query_error`).
+
+**Action.** A client that rejects unknown keys must accept the three new ones. An alert keyed on `reason="query_error"` for `source="guardian_state"` sees fewer events; key it on `statement_timeout` as well. No schema change and no setting is reinterpreted.
+
 ## Behaviour change: the DEX Scoring tab edits the score policy from the dashboard
 
 **What changed.** (This section also covers the MCP tools `get_dex_score_policy`, `set_dex_score_policy` and `reset_dex_score_policy`; see **MCP tools** below.) The DEX page gains a **Scoring** tab that shows the score policy in force and edits all of it: tier edges and names, weights, model parameters and per-application overrides, with a pre-save tier-change preview and a reset to the shipped defaults. It writes through the same function as `PUT` and `DELETE /api/v1/dex/score-policy`, so validation, the `If-Match` revision check and the audit rows are the same, and editing needs the same `Infrastructure:Write` grant (viewing needs `GuaranteedState:Read`). See [DEX](dex.md#scoring).
@@ -210,6 +222,22 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - On Windows, deploy any private or inspection root that outbound HTTPS needs to the Windows certificate store (`certlm.msc` or group policy). A root installed only in one user's certificate store is not necessarily trusted by a service running under a different account, so install it in the machine store.
 
 **Rollback.** No migration and no schema change, and this change writes no new durable state. A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this page, and it does not reverse the Echo changes described in the "Echo stores roll-ups only" and "Echo holds `echo.db` to a byte budget" sections below.
+
+## Behaviour change: the server checks the PostgreSQL collation version (two gauges, a counter and three alerts)
+
+**What changed.** On the first start after this upgrade, a database that already differs (typically after an operating-system or libc upgrade, or a base-image change under an existing data volume) logs one `[PG]` error naming the database and both versions and sets `yuzu_pg_collation_version_mismatch` to `1`; nothing else changes. The server now compares the database's recorded collation version with the version the operating system of the PostgreSQL server reports, at each start and then at intervals. The check only reports: the server starts whatever it finds, and it does not stop or change anything because of the result.
+
+**What the server reports.** The counter `yuzu_pg_collation_check_total{result}` counts every check, and the gauge `yuzu_pg_collation_check_last_completed_timestamp_seconds` gives the time of the latest check that completed. While the picture is unsettled (a mismatch stands, no check has concluded yet, or the latest check could not run) the check repeats every minute instead of every hour. Drift that begins while the server runs is seen at the next check, up to an hour later. Once `docs/prometheus/yuzu-alerts.yml` is loaded, the alert `YuzuPgCollationVersionMismatch` (warning, after 1 minute, group `yuzu-postgres`) fires on the gauge, as one alert per job (any replica's gauge at 1 fires it), and clears without a restart after the fix. A second alert in the same group, `YuzuPgCollationCheckBlind` (warning), fires when the check has failed at least five times in ten minutes (held for 5 minutes), because the gauge is then stale. Measured with promtool v3.13.1 at one failure per minute (Prometheus 3 range semantics): exactly five failures go pending and never fire, six fire; on Prometheus 2.x, with closed ranges, five would fire (reasoned). Real scrape intervals and the check duration shift the count, so read it as about five to six failures. A third alert, `YuzuPgCollationCheckStale`, fires when no check has completed for two hours. `deploy/docker/docker-compose.yml` pins Prometheus v3.2.1.
+
+**What it does not do.** Nothing in the database is changed. A database on the libc `C`/`POSIX` collation or a PostgreSQL before 15 exports no mismatch series (a database on the `builtin` locale provider records a version, so it is checked and reads `0`). A check that could not run leaves the gauge as it was, and a gauge that was never set stays absent, which is not the same as healthy: the alert `YuzuPgCollationCheckBlind` covers this, and the server log has a WARN line naming the cause. The check does not detect a check that is stuck, or a replica that restarts more often than once a minute while the check keeps failing; the stuck case is covered by `YuzuPgCollationCheckStale`, the restart case by `YuzuServerRestartLoop` and your own `up == 0` alert.
+
+**What to check before upgrading.** Connected to the Yuzu database, run `SELECT datname, datcollversion, pg_database_collation_actual_version(oid) FROM pg_database WHERE datname = current_database()`. This needs PostgreSQL 15 or later: before 15 the `datcollversion` column does not exist, the SELECT fails, and the check reports not applicable. Two different values mean the first start will report a mismatch. A NULL `datcollversion` means the check does not apply. A recorded version with a NULL actual version (for example a database created on a host that reported a version and now running on one that reports none) is permanently unreadable: the check cannot run, `YuzuPgCollationCheckBlind` fires and does not clear, and `ALTER DATABASE ... REFRESH COLLATION VERSION` fails with `invalid collation version change` (measured on PostgreSQL 18.4 only, on a C-locale database with a forced recorded value that has the same facts); see "PostgreSQL collation version" in [server-admin.md](server-admin.md#postgresql-collation-version) for the exits.
+
+**What to do on a mismatch.** Follow "PostgreSQL collation version" in [server-admin.md](server-admin.md#postgresql-collation-version) as a change under your own process, with a verified backup first: reindex every index and confirm it finished, then refresh the recorded version (refreshing first clears the gauge over indexes that are still stale, because the check compares version strings only). The next check (within about a minute) clears the gauge. No restart is needed.
+
+**Start-up time.** The start-time check runs in the server's constructor before the listeners bind. It can add about 15 seconds in practice when the database is stalled (the 5 second acquire and two 5 second catalog reads; the `BEGIN` and `SET LOCAL` before them run under the pool's 30 second statement timeout and normally return at once), about 35 seconds on a network that drops packets, and longer if the database does not answer at all or the connection string sets its own `options` (the check has no client-side query deadline). A container healthcheck with a short start period may need to allow for it: the shipped reference compose file's server healthcheck uses `start_period: 30s` (`deploy/docker/docker-compose.reference.yml`); check the value in the compose file you actually use.
+
+**Rollback.** The check writes no state. A return to an earlier build removes the check, the gauges, the counter and the input of the three alerts; the rules in `docs/prometheus/yuzu-alerts.yml` then have no series to read (the mismatch rule stays silent, and `YuzuPgCollationCheckBlind` and `YuzuPgCollationCheckStale` see no series), and nothing in the database needs to be undone.
 
 ## Behaviour change: the webhook and offload drop counters carry a `reason` label, and delivery backlog is published
 
@@ -6302,9 +6330,22 @@ a rollback is genuinely needed.
   up to 15 s waiting for a `registry.write` audit write that a gateway
   forwarder thread has in flight (milliseconds unless the database is stuck
   or slow: a connect or a lock wait can use the whole bound). Stacked, this can reach
-  **~130 s** in the worst case if more than one stage is genuinely wedged;
-  the total and each stage's own bound are
-  unchanged by the reorder, only their relative sequence is. **(#3495) The policy
+  **~130 s** in the worst case if more than one stage is genuinely wedged.
+  One further wait, the join of the PostgreSQL collation-version recheck, runs
+  late in `stop()` (after the leader-lease release, the audit cleanup and the
+  offload flush, just before the PostgreSQL pool is reset) and is not in that
+  figure. The check is told to stop at the start of the drain and overlaps the
+  earlier stages, so the late join adds only what is left of a check in flight,
+  about 15 s in practice (about 35 s on a network that drops packets, and no bound
+  against a backend that never answers; the `BEGIN` and `SET LOCAL` that start a
+  check run under the pool's 30 s statement timeout and normally return at once).
+  The totals that follow are therefore UPPER BOUNDS on that assumption: about 145 s (about 165 s) in place of ~130 s, which the 210 s
+  shipped grace covers; on top of the ~190 s fallback path described in
+  `server-admin.md` about 205 s (about 225 s). 225 s exceeds the 210 s shipped
+  grace, and 205 s leaves only 5 s. If your network drops packets or you expect
+  the fallback path, raise `TimeoutStopSec` (systemd) or `stop_grace_period`
+  (compose) to 240 s or more.
+  The #3495 reorder leaves the total and each stage's own bound unchanged; only their relative sequence changed. **(#3495) The policy
   evaluation, pre-flight runner, quarantine containment reconciler, and
   schedule tick background threads' gRPC dispatch calls now ride on the
   same 5 s gRPC shutdown deadline bucket above, not a separate stage** —

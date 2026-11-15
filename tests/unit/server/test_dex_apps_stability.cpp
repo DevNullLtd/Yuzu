@@ -20,12 +20,14 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using Catch::Approx;
@@ -67,7 +69,7 @@ const DexPolicyInForce& def() {
 }
 
 constexpr const char* kDefaultPolicyBlock =
-    R"("policy":{"fault":null,"revision":"default","source":"default","tiers":{)"
+    R"("policy":{"fault":null,"interval_confidence":0.95,"revision":"default","source":"default","tiers":{)"
     R"("excellent":{"edge":90.0,"name":"excellent"},"fair":{"edge":60.0,"name":"fair"},)"
     R"("good":{"edge":75.0,"name":"good"},"poor":{"edge":0.0,"name":"poor"}}},)";
 
@@ -294,13 +296,14 @@ TEST_CASE("apps json: exact golden for the unknown-population model", "[dex][app
         R"("crashes":2,"distinct_devices":2,"distinct_devices_online":null,"hangs":1,)"
         R"("last_seen":"2026-10-14T00:00:00Z",)";
     const std::string tail =
-        R"("rate_per_1000":null,"score":{"band":null,"deductions":[],"score":null,"withheld":"no_population"},)"
+        R"("rate_per_1000":null,"score":{"band":null,"deductions":[],"score":null,"tier":null,"withheld":"no_population"},)"
         R"("share_affected":null)";
     const std::string expect =
         R"({"apps":[{)" + head + R"("profile":"default",)" + tail +
         R"(,"subject":"a.exe","version_count":1,"versions":[{)" + head + tail +
         R"(,"version":"1.0"}],"versions_truncated":false}],"apps_total":0,"apps_truncated":false,)" +
-        R"("crash_source_coverage":{"windows":"complete"},)" + kDefaultPolicyBlock + R"("population":null,"population_basis":"windows_online","window":"7d"})";
+        R"("crash_source_coverage":{"windows":"complete"},"observer_state":null,)" + kDefaultPolicyBlock +
+        R"("population":null,"population_basis":"windows_online","window":"7d"})";
     CHECK(dex_apps_json(m) == expect);
 }
 
@@ -356,7 +359,7 @@ TEST_CASE("apps json: an empty model", "[dex][apps_model]") {
     m.window = "7d";
     CHECK(dex_apps_json(m) ==
           std::string(R"({"apps":[],"apps_total":0,"apps_truncated":false,)") +
-              R"("crash_source_coverage":{"windows":"complete"},)" + kDefaultPolicyBlock +
+              R"("crash_source_coverage":{"windows":"complete"},"observer_state":null,)" + kDefaultPolicyBlock +
               R"("population":null,"population_basis":"windows_online","window":"7d"})");
 }
 
@@ -476,7 +479,7 @@ TEST_CASE("apps builder: an unrecognised or empty scope is degraded invalid_scop
     }
     const auto ok = build_dex_apps_model(nullptr, "7d", "2026-10-07T00:00:00Z", "windows", std::nullopt, def());
     CHECK(ok.degraded);
-    CHECK(ok.degraded_reason.empty());
+    CHECK(ok.degraded_reason == "store_not_open"); // a valid scope with no store: the store is not open
 }
 
 TEST_CASE("apps model: from_rows carries the scope it is given", "[dex][apps_model]") {
@@ -574,9 +577,13 @@ bool json_near(const nlohmann::json& a, const nlohmann::json& b) {
 TEST_CASE("apps model: the default policy reproduces the base build's JSON byte for byte",
           "[dex][apps_model]") {
     const auto m = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 12, 3, 7, 10, 3)}, 50, def());
-    // The pinned literal predates the additive crash_source_coverage key; every other key must still match.
+    // The pinned literal predates the additive keys (crash_source_coverage, observer_state,
+    // policy.interval_confidence, score.tier); every other key must still match.
     auto got = nlohmann::json::parse(dex_apps_json(m));
     CHECK(got.erase("crash_source_coverage") == 1);
+    CHECK(got.erase("observer_state") == 1);
+    CHECK(got["policy"].erase("interval_confidence") == 1);
+    CHECK(got["apps"][0]["score"].erase("tier") == 1);
     CHECK(json_near(got, nlohmann::json::parse(kBaseAppsJson)));
 }
 
@@ -651,4 +658,205 @@ TEST_CASE("apps model: a global per-device cap normalises the deductions and lea
     CHECK(f.score.deductions[2].points == Approx(b.score.deductions[2].points / 2.0));
     CHECK(f.score.deductions[1].points == Approx(0.4));
     CHECK(f.score.deductions[2].points == Approx(0.048));
+}
+
+// -- #7504: tier and interval confidence in the payload --------------------------
+
+TEST_CASE("apps model: score.tier is the override's tier name on the application and its versions, "
+          "the global name on a default row, and null when the score is withheld",
+          "[dex][apps_model][tier]") {
+    DexPolicyInForce in_force;
+    in_force.policy.tiers.names = {"Great", "Fine", "Meh", "Bad"};
+    DexScoreOverride o;
+    o.image = "strict.exe";
+    o.excellent = 95.0;
+    o.names[0] = "Gold";
+    o.names[1] = "Silver";
+    o.names[2] = "Bronze";
+    o.names[3] = "Tin";
+    in_force.policy.overrides.push_back(o);
+    REQUIRE_FALSE(dex_score_policy_fault(in_force.policy));
+    const auto m = dex_apps_model_from_rows(
+        "7d", kDexAppsScopeWindows,
+        {total_row("Strict.EXE", 12, 3, 7, 10, 3), version_row("Strict.EXE", "1.0", 12, 3, 7),
+         total_row("plain.exe", 12, 3, 7, 10, 3, 1)},
+        50, in_force);
+    REQUIRE(m.apps.size() == 2);
+    for (const auto& a : m.apps) {
+        if (a.subject == "Strict.EXE") {
+            CHECK(a.figures.tier == "Silver"); // good band, the override's second name
+            REQUIRE(a.versions.size() == 1);
+            CHECK(a.versions[0].figures.tier == "Silver");
+        } else {
+            CHECK(a.figures.tier == "Great"); // excellent band, the global first name
+        }
+    }
+    const auto j = nlohmann::json::parse(dex_apps_json(m));
+    for (const auto& a : j["apps"]) {
+        CHECK(a["score"]["tier"] == (a["subject"] == "Strict.EXE" ? "Silver" : "Great"));
+        for (const auto& v : a["versions"])
+            CHECK(v["score"]["tier"] == "Silver");
+    }
+    // Withheld: no population, and the offline_affected withhold after the score was built.
+    const auto none = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 2, 1, 2, 2, 1)},
+                                               std::nullopt, def());
+    CHECK(none.apps[0].figures.tier.empty());
+    CHECK(nlohmann::json::parse(dex_apps_json(none))["apps"][0]["score"]["tier"].is_null());
+    auto offline = total_row("b.exe", 5, 0, 4, 5, 0);
+    offline.affected_online = 3; // one affected device is offline
+    const auto off = dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {offline}, 50, def());
+    REQUIRE(off.apps[0].figures.score.withheld == std::string_view("offline_affected"));
+    CHECK(off.apps[0].figures.tier.empty());
+}
+
+TEST_CASE("apps json: policy.interval_confidence equals the policy's level, default and custom",
+          "[dex][apps_model][tier]") {
+    const auto d = nlohmann::json::parse(dex_apps_json(
+        dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 1, 0, 1, 1, 0)}, 50, def())));
+    CHECK(d["policy"]["interval_confidence"].get<double>() == Approx(0.95));
+    auto p = dex_default_score_policy();
+    p.interval_confidence = 0.90;
+    DexPolicyInForce custom;
+    custom.policy = p;
+    custom.source = "custom";
+    const auto c = nlohmann::json::parse(dex_apps_json(
+        dex_apps_model_from_rows("7d", kDexAppsScopeWindows, {total_row("a.exe", 1, 0, 1, 1, 0)}, 50, custom)));
+    CHECK(c["policy"]["interval_confidence"].get<double>() == Approx(0.90));
+}
+
+// -- #7519: the live observer split ---------------------------------------------
+
+namespace {
+using OS = DexObserverState;
+
+DexFleet mixed_fleet() {
+    DexFleet f;
+    f.connected_agents = {{"w1", "windows"}, {"w2", "windows"}, {"l1", "linux"},
+                          {"m1", "macos"},   {"m2", "macos"},   {"x1", "freebsd"}};
+    return f;
+}
+
+const DexObserverSplit* row_of(const std::vector<DexObserverSplit>& v, std::string_view p) {
+    for (const auto& r : v)
+        if (r.platform == p)
+            return &r;
+    return nullptr;
+}
+} // namespace
+
+TEST_CASE("dex_apps_observer_split: a mixed fleet counts armed, disarmed and opted out per platform",
+          "[dex][apps_model][observer]") {
+    const auto fleet = mixed_fleet();
+    // States are aligned to the scope's ids in fleet order.
+    const std::vector<OS> all_states = {OS::Armed, OS::Disarmed, OS::NoneReported,
+                                        OS::Armed, OS::Armed,    OS::NoneReported};
+    const auto all = dex_apps_observer_split(fleet, "all", all_states);
+    REQUIRE(all);
+    REQUIRE(all->size() == 4);
+    CHECK((*all)[0].platform == "windows");
+    CHECK((*all)[3].platform == "other");
+    const auto* w = row_of(*all, "windows");
+    CHECK((w->armed == 1 && w->disarmed == 1 && w->none_reported == 0));
+    const auto* l = row_of(*all, "linux");
+    CHECK((l->armed == 0 && l->disarmed == 0 && l->none_reported == 1));
+    const auto* m = row_of(*all, "macos");
+    CHECK((m->armed == 2 && m->disarmed == 0 && m->none_reported == 0));
+    const auto* o = row_of(*all, "other");
+    CHECK((o->armed == 0 && o->disarmed == 0 && o->none_reported == 1));
+
+    const auto win = dex_apps_observer_split(fleet, "windows", {OS::Armed, OS::Disarmed});
+    REQUIRE(win);
+    REQUIRE(win->size() == 1);
+    CHECK((*win)[0].platform == "windows");
+    CHECK(((*win)[0].armed == 1 && (*win)[0].disarmed == 1));
+    const auto mac = dex_apps_observer_split(fleet, "macos", {OS::NoneReported, OS::Armed});
+    REQUIRE(mac);
+    CHECK(((*mac)[0].none_reported == 1 && (*mac)[0].armed == 1));
+    const auto lin = dex_apps_observer_split(fleet, "linux", {OS::Disarmed});
+    REQUIRE(lin);
+    CHECK((*lin)[0].disarmed == 1);
+}
+
+TEST_CASE("dex_apps_observer_split: an empty scope is zero rows, and row sums equal the population",
+          "[dex][apps_model][observer]") {
+    const auto empty = dex_apps_observer_split(DexFleet{}, "all", {});
+    REQUIRE(empty);
+    CHECK(empty->size() == 4);
+    for (const auto& r : *empty)
+        CHECK((r.armed == 0 && r.disarmed == 0 && r.none_reported == 0));
+    const auto fleet = mixed_fleet();
+    for (const char* scope : {"all", "windows", "linux", "macos"}) {
+        const auto ids = dex_apps_online_ids(fleet, scope);
+        const auto split = dex_apps_observer_split(fleet, scope, std::vector<OS>(ids.size(), OS::Armed));
+        REQUIRE(split);
+        int64_t sum = 0;
+        for (const auto& r : *split)
+            sum += r.armed + r.disarmed + r.none_reported;
+        CHECK(sum == static_cast<int64_t>(ids.size()));
+    }
+}
+
+TEST_CASE("dex_apps_observer_split: an operating system nobody recognises lands in other under all",
+          "[dex][apps_model][observer]") {
+    DexFleet f;
+    f.connected_agents = {{"a", "freebsd"}, {"b", ""}, {"c", "windows"}};
+    const auto split = dex_apps_observer_split(f, "all", {OS::Armed, OS::Disarmed, OS::Armed});
+    REQUIRE(split);
+    const auto* o = row_of(*split, "other");
+    CHECK((o->armed == 1 && o->disarmed == 1));
+    CHECK(row_of(*split, "windows")->armed == 1);
+    // A platform scope never counts them.
+    const auto win = dex_apps_observer_split(f, "windows", {OS::Armed});
+    REQUIRE(win);
+    CHECK(win->size() == 1);
+}
+
+TEST_CASE("dex_apps_observer_split: a states vector of the wrong size is unknown, never wrong numbers",
+          "[dex][apps_model][observer]") {
+    const auto fleet = mixed_fleet();
+    CHECK_FALSE(dex_apps_observer_split(fleet, "all", {OS::Armed}));
+    CHECK_FALSE(dex_apps_observer_split(fleet, "windows", {OS::Armed, OS::Armed, OS::Armed}));
+    CHECK_FALSE(dex_apps_observer_split(fleet, "windows", {}));
+}
+
+TEST_CASE("apps json: observer_state is null when the model has none and never carries an agent id",
+          "[dex][apps_model][observer]") {
+    auto m = dex_apps_model_from_rows("7d", kDexAppsScopeAll, {}, 3, def());
+    CHECK(nlohmann::json::parse(dex_apps_json(m))["observer_state"].is_null());
+    m.observer_state = dex_apps_observer_split(mixed_fleet(), "all",
+                                               {OS::Armed, OS::Disarmed, OS::NoneReported, OS::Armed,
+                                                OS::Armed, OS::NoneReported});
+    const std::string text = dex_apps_json(m);
+    const auto j = nlohmann::json::parse(text);
+    REQUIRE(j["observer_state"].is_object());
+    CHECK(j["observer_state"]["windows"] ==
+          nlohmann::json{{"armed", 1}, {"disarmed", 1}, {"none_reported", 0}});
+    CHECK(j["observer_state"]["other"]["none_reported"] == 1);
+    for (const char* id : {"w1", "w2", "l1", "m1", "m2", "x1"})
+        CHECK(text.find(std::string("\"") + id + "\"") == std::string::npos);
+}
+
+// -- #7520: one vocabulary for why a read was refused --------------------------------
+
+TEST_CASE("dex_read_fault_token: the five metric label strings, carried by the degraded message",
+          "[dex][apps_model][fault]") {
+    CHECK(std::string(dex_read_fault_token(DexReadFault::kStoreNotOpen)) == "store_not_open");
+    CHECK(std::string(dex_read_fault_token(DexReadFault::kPoolTimeout)) == "pool_acquire_timeout");
+    CHECK(std::string(dex_read_fault_token(DexReadFault::kQueryError)) == "query_error");
+    CHECK(std::string(dex_read_fault_token(DexReadFault::kStatementTimeout)) == "statement_timeout");
+    CHECK(std::string(dex_read_fault_token(DexReadFault::kConcurrencyBudget)) == "concurrency_budget");
+    for (const auto f : {DexReadFault::kStoreNotOpen, DexReadFault::kPoolTimeout, DexReadFault::kQueryError,
+                         DexReadFault::kStatementTimeout, DexReadFault::kConcurrencyBudget}) {
+        DexAppsModel m;
+        m.degraded = true;
+        m.degraded_reason = dex_read_fault_token(f);
+        CHECK(dex_degraded_message(m) ==
+              std::string("DEX store read degraded (") + dex_read_fault_token(f) + ")");
+    }
+}
+
+TEST_CASE("apps builder: a null store degrades with store_not_open", "[dex][apps_model][fault]") {
+    const auto m = build_dex_apps_model(nullptr, "7d", "", kDexAppsScopeAll, std::nullopt, def());
+    CHECK(m.degraded);
+    CHECK(m.degraded_reason == "store_not_open");
 }
