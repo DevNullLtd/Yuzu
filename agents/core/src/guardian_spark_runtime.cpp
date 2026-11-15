@@ -4954,6 +4954,8 @@ bool GuardianSparkRuntime::stage_baseline_locked(const std::string& rule_id,
             return true;
         }
         staged_baselines_.emplace(rule_id, CapturedBaseline{rule_id, path, hash});
+        // #5605: still inside the try, so a throwing emplace leaves map and mirror both untouched.
+        staged_baseline_count_->store(staged_baselines_.size(), std::memory_order_relaxed);
         return true;
     } catch (...) {
         // bad_alloc: counted, and reported to the caller, which keeps the committed baseline,
@@ -5016,6 +5018,8 @@ GuardianSparkRuntime::snapshot_staged_baselines() const {
         std::size_t want = 0;
         {
             std::lock_guard<std::mutex> lk{registry_mu_};
+            assert(staged_baseline_count_->load(std::memory_order_relaxed) ==
+                   staged_baselines_.size());
             want = staged_baselines_.size();
         }
         if (want == 0)
@@ -5034,11 +5038,14 @@ GuardianSparkRuntime::snapshot_staged_baselines() const {
 void GuardianSparkRuntime::erase_staged_baselines_if_unchanged(
     std::span<const CapturedBaseline> done) {
     std::lock_guard<std::mutex> lk{registry_mu_};
+    assert(staged_baseline_count_->load(std::memory_order_relaxed) == staged_baselines_.size());
     for (const CapturedBaseline& d : done) {
         const auto it = staged_baselines_.find(d.rule_id);
         if (it != staged_baselines_.end() && it->second.path == d.path && it->second.hash == d.hash)
             staged_baselines_.erase(it);
     }
+    // #5605: the one erase site; store (not fetch_sub) so the mirror re-syncs to the exact size.
+    staged_baseline_count_->store(staged_baselines_.size(), std::memory_order_relaxed);
 }
 
 void GuardianSparkRuntime::stage_baseline_for_test(const std::string& rule_id,

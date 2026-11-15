@@ -745,6 +745,19 @@ public:
         const noexcept {
         return staged_baseline_drops_;
     }
+    /// #5605: the live size of the staging map (staged_baselines_.size()), mirrored into an
+    /// atomic so the heartbeat can read it with no lock. It is a CURRENT count of captures
+    /// staged and not yet erased after their KV write, not a pass-end count. Shared so a reader
+    /// (the persister) outlives this object safely. Set once at construction, never reseated.
+    [[nodiscard]] std::shared_ptr<const std::atomic<std::uint64_t>> staged_baseline_count_source()
+        const noexcept {
+        return staged_baseline_count_;
+    }
+    /// TEST-ONLY: the mirror's current value, for asserting mirror == staged_baselines_.size()
+    /// after every staging operation (the invariant the debug asserts also pin).
+    [[nodiscard]] std::uint64_t staged_baseline_count_mirror_for_test() const noexcept {
+        return staged_baseline_count_->load(std::memory_order_relaxed);
+    }
     /// Repeat Unknown evaluations whose guard.unhealthy was edge-suppressed (M1): a rule
     /// stuck errored is re-evaluated every convergence tick to catch recovery, but only the
     /// first Unknown of an episode emits a health event. Non-zero means at least one rule is
@@ -2846,6 +2859,14 @@ private:
     /// Allocation-failure and replaced-unpersisted-capture drops. A shared_ptr set at
     /// construction (never reseated) so GuardianBaselinePersister can read it without any lock.
     std::shared_ptr<std::atomic<std::uint64_t>> staged_baseline_drops_ =
+        std::make_shared<std::atomic<std::uint64_t>>(0);
+    /// #5605: mirror of staged_baselines_.size(). Written ONLY under registry_mu_, by
+    /// store(staged_baselines_.size()) at the two sites that change the size (the emplace in
+    /// stage_baseline_locked and the erase loop in erase_staged_baselines_if_unchanged), so it
+    /// cannot drift if a future site is instrumented only once. Read lock-free through
+    /// staged_baseline_count_source() by GuardianBaselinePersister. Set once at construction,
+    /// never reseated.
+    std::shared_ptr<std::atomic<std::uint64_t>> staged_baseline_count_ =
         std::make_shared<std::atomic<std::uint64_t>>(0);
     std::atomic<int> fail_next_stage_baseline_{0}; ///< TEST-ONLY allocation-failure seam (count)
     mutable std::atomic<bool> fail_next_snapshot_{false}; ///< TEST-ONLY snapshot-throw seam
