@@ -43,9 +43,24 @@ class MetricsRegistry;
 
 namespace yuzu::server::pg {
 class PgPool;
-}
+struct PgMigration;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
+
+/// The store's migration array (schema `device_inventory_store`), so a test can pin the text a
+/// migration carries (the transaction-local settings of v4) without a second copy of it.
+[[nodiscard]] const std::vector<pg::PgMigration>& device_inventory_migrations();
+
+/// The statement `DeviceInventoryStore::list_device_ci_after` runs for `q` and its bound
+/// parameters, in placeholder order. Exposed so a test can EXPLAIN the REAL statement (a copy of
+/// the text in a test would stay green with the store's spelling changed). Does not check the
+/// deny-all scope (`q.agent_ids` present and empty), which the store answers without SQL.
+struct DeviceCiKeysetStatement {
+    std::string sql;
+    std::vector<std::string> params;
+};
+[[nodiscard]] DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q);
 
 class DeviceInventoryStore {
 public:

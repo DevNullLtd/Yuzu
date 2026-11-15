@@ -219,6 +219,8 @@ std::string_view read_error_message(ReadError e) {
     case ReadError::kScopeTooWide:
         return "the caller's scope covers more than 10000 devices and no agent_id was given; a "
                "credential with global read has no such limit";
+    case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
+        break;
     }
     return "invalid request";
 }
@@ -253,6 +255,8 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         f.audit_outcome = "denied";
         f.audit_detail = audit_detail_scope_too_wide(name);
         return f;
+    case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
+        break;
     }
     // Unreachable for a named enumerator (the switch above has no default, so a new one is a
     // -Wswitch warning). An out-of-range value is answered as a refusal with no audit row.

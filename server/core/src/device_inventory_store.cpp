@@ -212,18 +212,33 @@ constexpr const char* kMigrationV3Sql =
     "ADD COLUMN IF NOT EXISTS content_digest TEXT NULL;";
 
 // v4: the index behind the bulk CI read's C-collated keyset (`list_device_ci_after`). That read
-// orders and compares `agent_id COLLATE "C"` (byte order), and only an index on that exact
-// expression can serve it. The point is correctness, not speed: the primary key's index is built
-// under the DATABASE collation, so a libc/ICU upgrade under an existing volume (no REINDEX) leaves
-// it stale and a keyset walk over it can skip rows with no error (measured: 24% of 50,030 ids at
-// limit 1). The "C" collation is byte comparison, which no library upgrade can change, so a walk
-// over this index cannot be made to skip or repeat a row by a collation change. ADDITIVE and
-// idempotent (IF NOT EXISTS; no existing object is touched). Not CONCURRENTLY: the runner applies
-// a migration in a transaction, where CONCURRENTLY is refused. A plain build takes a SHARE lock on
-// device_ci (writes wait, reads do not): about 0.5 s of blocked ingest per million rows, once, at
-// the first server start after the upgrade. Unqualified DDL - the runner sets search_path.
+// orders and compares `agent_id COLLATE "C"` (byte order). Its CORRECTNESS comes from that
+// spelling in the query: the primary key's index is built under the DATABASE collation, so a
+// libc/ICU upgrade under an existing volume (no REINDEX) leaves it stale, and a keyset walk
+// ordered by it can skip rows with no error (measured: 24% of 50,030 ids at limit 1). "C" is byte
+// comparison, which no library upgrade changes, so the query stays correct without this index. The
+// index keeps each page an index scan: only an index on that exact expression can serve the
+// query, and without it every page is a scan plus a sort (about 317 ms a page at 1M rows).
+// ADDITIVE and idempotent (IF NOT EXISTS; no existing object is touched). Not CONCURRENTLY: the
+// runner applies a migration in a transaction, where CONCURRENTLY is refused. A plain build takes
+// a SHARE lock on device_ci (writes wait, reads do not): about 0.5 s of blocked ingest per
+// million rows, once, at the first server start after the upgrade.
+// The pool's 30 s statement_timeout and 10 s lock_timeout would otherwise bound the build and the
+// lock wait, and a failed migration refuses to start the server on every restart. So, as in the
+// CaStore v5 and CommandOutboxStore v3 migrations, SET LOCAL (it ends with the migration's
+// transaction, so nothing leaks onto the pooled connection) lifts the statement timeout for the
+// build and allows a lock wait of 30 s (ca_store's value) behind a long ingest transaction.
 constexpr const char* kMigrationV4Sql =
+    "SET LOCAL lock_timeout = '30s'; "
+    "SET LOCAL statement_timeout = 0; "
     "CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_ci ((agent_id COLLATE \"C\"));";
+
+// The index as the runtime check (and an operator by hand) creates it: schema-qualified, because
+// no search_path is set outside the migration runner.
+constexpr const char* kAgentIdCIndexName = "device_ci_agent_id_c_idx";
+constexpr const char* kAgentIdCIndexCreateSql =
+    "CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+    "((agent_id COLLATE \"C\"))";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for the
@@ -325,7 +340,58 @@ int fill_record(PGresult* res, int row, DeviceCiRecord& out) {
     return c;
 }
 
+/// After migrations: is the v4 index really there, valid and defined as the keyset read needs it?
+/// `schema_meta` saying v4 is not proof (a restore, a hand `DROP INDEX`, or a same-named index of
+/// another definition that `IF NOT EXISTS` accepted). The read stays CORRECT without it (its
+/// `COLLATE "C"` spelling carries correctness), so a miss or a failed check is a WARN and the
+/// store still opens, but every page becomes a scan plus a sort, which a loaded server feels as a
+/// wedged pool, so the line says how to fix it. Never throws; a failed check logs and moves on.
+void warn_if_agent_id_c_index_unusable(PGconn* conn) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT i.indisvalid, i.indisready, i.indpred IS NOT NULL, pg_get_indexdef(i.indexrelid) "
+        "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE n.nspname = 'device_inventory_store' AND c.relname = $1 "
+        "AND i.indrelid = 'device_inventory_store.device_ci'::regclass",
+        std::vector<std::string>{kAgentIdCIndexName});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("DeviceInventoryStore: could not check index {} ({}); the bulk device-CI read "
+                     "stays correct but may be slow if it is missing",
+                     kAgentIdCIndexName, ::yuzu::log_key_token(PQerrorMessage(conn)));
+        return;
+    }
+    std::string problem;
+    if (PQntuples(res.get()) == 0) {
+        problem = "is missing";
+    } else {
+        const std::string valid = PQgetvalue(res.get(), 0, 0);
+        const std::string ready = PQgetvalue(res.get(), 0, 1);
+        const std::string partial = PQgetvalue(res.get(), 0, 2);
+        const std::string def = PQgetvalue(res.get(), 0, 3);
+        const bool by_c_bytes = def.find("COLLATE \"C\"") != std::string::npos &&
+                                def.find("agent_id") != std::string::npos &&
+                                def.find("USING btree") != std::string::npos;
+        if (valid != "t" || ready != "t")
+            problem = "is invalid (an interrupted build)";
+        else if (partial == "t" || !by_c_bytes)
+            problem = "is defined differently from the migration";
+    }
+    if (problem.empty())
+        return;
+    spdlog::warn("DeviceInventoryStore: index {} {}. GET /api/v1/hardware/ci and list_hardware_ci_"
+                 "records stay correct but every page becomes a scan plus a sort of device_ci "
+                 "(about 317 ms a page at 1M devices), which can exhaust the database pool under "
+                 "load. Create it as the table owner (DROP INDEX device_inventory_store.{} first if "
+                 "it exists but is invalid or differs): {};",
+                 kAgentIdCIndexName, problem, kAgentIdCIndexName, kAgentIdCIndexCreateSql);
+}
+
 } // namespace
+
+const std::vector<pg::PgMigration>& device_inventory_migrations() {
+    return migrations();
+}
 
 std::string DeviceInventoryStore::canonical_hash(const DeviceCiRecord& rec) {
     // v2: the agent's canonical bytes ARE the blob; the parser pinned its sha256 into
@@ -431,6 +497,7 @@ DeviceInventoryStore::DeviceInventoryStore(pg::PgPool& pool) : pool_(pool) {
             }
         }
     }
+    warn_if_agent_id_c_index_unusable(lease.get());
     open_ = true;
 }
 
@@ -775,6 +842,38 @@ std::optional<std::vector<DeviceCiRecord>> DeviceInventoryStore::list_device_ci(
     return out;
 }
 
+DeviceCiKeysetStatement device_ci_keyset_statement(const DeviceCiKeysetQuery& q) {
+    const int eff = q.limit > 0 && q.limit < kListRowCap ? q.limit : kListRowCap;
+    // The bound parameters are built alongside the placeholders, in order.
+    DeviceCiKeysetStatement st;
+    std::vector<std::string>& params = st.params;
+    std::string& sql = st.sql;
+    sql = std::string("SELECT ") + kSelectCols +
+          ", content_hash FROM device_inventory_store.device_ci WHERE true";
+    // Byte order, not the database collation: every `agent_id` comparison and the ORDER BY are
+    // spelled `agent_id COLLATE "C"`. That keeps a collation change under the primary key's index
+    // from making the walk skip or repeat a row, from making the single-device read miss an
+    // existing id (a plain `agent_id = $n` is served by that same primary key), and lets the
+    // planner use the v4 expression index, which serves only a query spelling exactly this
+    // expression. All four sites must keep it.
+    if (!q.after.empty()) {
+        params.push_back(q.after);
+        sql += " AND agent_id COLLATE \"C\" > $" + std::to_string(params.size());
+    }
+    if (q.agent_id) {
+        params.push_back(*q.agent_id);
+        sql += " AND agent_id COLLATE \"C\" = $" + std::to_string(params.size());
+    }
+    if (q.agent_ids) {
+        const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
+        params.push_back(pg::to_text_array(ids));
+        sql += " AND agent_id COLLATE \"C\" = ANY($" + std::to_string(params.size()) + "::text[])";
+    }
+    params.push_back(std::to_string(eff));
+    sql += " ORDER BY agent_id COLLATE \"C\" ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
+    return st;
+}
+
 std::optional<std::vector<DeviceCiRecord>>
 DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     if (!open_) {
@@ -785,31 +884,9 @@ DeviceInventoryStore::list_device_ci_after(const DeviceCiKeysetQuery& q) {
     }
     if (q.agent_ids && q.agent_ids->empty())
         return std::vector<DeviceCiRecord>{}; // a deny-all scope: nothing to read, no SQL
-    const int eff = q.limit > 0 && q.limit < kListRowCap ? q.limit : kListRowCap;
-    // The bound parameters are built alongside the placeholders, in order.
-    std::vector<std::string> params;
-    std::string sql = std::string("SELECT ") + kSelectCols +
-                      ", content_hash FROM device_inventory_store.device_ci WHERE true";
-    // Byte order, not the database collation: `agent_id COLLATE "C"` on the bound, the ANY
-    // membership and the ORDER BY, so the planner can use the v4 expression index and a collation
-    // change under the primary key's index cannot make the walk skip or repeat a row. The index
-    // serves only a query that spells exactly this expression, so all three must keep it.
-    if (!q.after.empty()) {
-        params.push_back(q.after);
-        sql += " AND agent_id COLLATE \"C\" > $" + std::to_string(params.size());
-    }
-    if (q.agent_id) {
-        params.push_back(*q.agent_id);
-        sql += " AND agent_id = $" + std::to_string(params.size());
-    }
-    if (q.agent_ids) {
-        const std::vector<std::string_view> ids(q.agent_ids->begin(), q.agent_ids->end());
-        params.push_back(pg::to_text_array(ids));
-        sql += " AND agent_id COLLATE \"C\" = ANY($" + std::to_string(params.size()) + "::text[])";
-    }
-    params.push_back(std::to_string(eff));
-    sql += " ORDER BY agent_id COLLATE \"C\" ASC LIMIT $" + std::to_string(params.size()) + "::bigint";
-
+    const DeviceCiKeysetStatement stmt = device_ci_keyset_statement(q);
+    const std::string& sql = stmt.sql;
+    const std::vector<std::string>& params = stmt.params;
     // Run in a transaction whose SELECT is capped by SET LOCAL statement_timeout (the
     // count_stale_agents idiom): this page holds one connection of the pool the RBAC and audit
     // stores share, so a slow SELECT is cancelled at 5 s rather than at the pool's 30 s default.

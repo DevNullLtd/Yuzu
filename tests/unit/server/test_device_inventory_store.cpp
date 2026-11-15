@@ -17,6 +17,7 @@
 #include "device_inventory_store.hpp"
 #include "hardware_list_model.hpp"
 #include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "sha256_hex.hpp"
 
@@ -3131,13 +3132,16 @@ std::vector<std::string> keyset_walk(DeviceInventoryStore& store, int limit) {
 
 } // namespace
 
-// Kills: dropping `COLLATE "C"` from the bound, the ORDER BY or the ANY comparison. The test
-// database is created from template1 and so takes the server's default collation (a locale such as
-// en_US.UTF-8 on every runner image); under a locale `Agent-1`, `agent_1`, `a b`, `a-b`, `a_b` and
-// the digit strings sort in an order that is not their byte order, and a keyset over such an order
-// compared bytewise by the client's cursor skips or repeats rows. Each id is served exactly once,
-// in byte order, at every page size. (Under a database whose default collation is already C the
-// test cannot tell; the CH-1 run in the fix round measured the real skips under a changed collation.)
+// Kills: dropping `COLLATE "C"` from the `>` bound or from the ORDER BY. The test database is
+// created from template1 and takes the server's default collation; on the runners checked that is
+// en_US.UTF-8, under which `Agent-1`, `agent_1`, `a b`, `a-b`, `a_b` and the digit strings sort in
+// an order that is not their byte order, so a keyset compared bytewise by the client's cursor
+// skips or repeats rows. Each id is served exactly once, in byte order, at every page size. Under
+// a database whose default collation is C or C.UTF-8 this test cannot tell (it SKIPs, visibly, when
+// the two orders of its own ids agree); the drift measurement (24% of 50,030 ids skipped at limit
+// 1 after a collation change under the primary key) is the evidence for the fix itself. The
+// `= ANY` comparison is an equality, which a deterministic collation decides bytewise, so no test
+// here can tell its `COLLATE "C"` from its absence; it is spelled for the v4 index.
 TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once each, in byte order",
           "[pg][device_ci][keyset][order]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
@@ -3155,6 +3159,28 @@ TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once ea
     std::vector<std::string> expected = ids;
     std::sort(expected.begin(), expected.end()); // unsigned byte order
 
+    // Is the database's default collation distinguishable from byte order over THESE ids? If the
+    // two orders agree the assertions below would pass vacuously, so say so and skip.
+    {
+        const auto ordered = [&](const char* order_by) {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            auto res = yuzu::server::pg::exec_params(
+                lease.get(),
+                (std::string("SELECT agent_id FROM device_inventory_store.device_ci ORDER BY ") +
+                 order_by).c_str(),
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_TUPLES_OK);
+            std::vector<std::string> out;
+            for (int i = 0; i < PQntuples(res.get()); ++i)
+                out.emplace_back(PQgetvalue(res.get(), i, 0));
+            return out;
+        };
+        if (ordered("agent_id") == ordered("agent_id COLLATE \"C\""))
+            SKIP("this database's default collation orders the test ids as bytes (C or C.UTF-8), "
+                 "so the byte-order walk cannot tell the fix from the old query here");
+    }
+
     for (const int limit : {1, 2, 7, 1000}) {
         INFO("limit " << limit);
         CHECK(keyset_walk(store, limit) == expected);
@@ -3169,7 +3195,7 @@ TEST_CASE("list_device_ci_after walks ids a locale would reorder exactly once ea
     CHECK(std::ranges::find(tail, "Agent-1") == tail.end());
     CHECK(std::ranges::find(tail, "AB") == tail.end());
     CHECK(tail.front() == "Z\xC3\xA9"); // 'Z' then 0xC3: the next byte string after "Zeta"
-    // and an agent_ids set is compared bytewise (an id differing only by case is a different id)
+    // and an agent_ids set matches whole ids (an id differing only by case is a different id)
     q.after.clear();
     q.agent_ids = std::vector<std::string>{"agent-1", "AGENT-1", "Zeta"};
     CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{"Zeta", "agent-1"});
@@ -3237,9 +3263,9 @@ TEST_CASE("list_device_ci_after's second page is exact when a row is inserted or
     }
 }
 
-// Kills: dropping or renaming migration v4, which serves the C-collated keyset. The index is on the
-// expression `agent_id COLLATE "C"`: a query that spells that exact expression is the only one that
-// can use it, so the statement in list_device_ci_after and this index must change together.
+// Kills: dropping or renaming migration v4 (the index behind the bulk keyset read). That the
+// keyset statement really plans on this index is the EXPLAIN test below; this one pins the
+// definition and that v4 is additive.
 TEST_CASE("device_inventory_store has the C-collated agent_id index behind the bulk keyset read",
           "[pg][device_ci][keyset][migration]") {
     YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
@@ -3269,6 +3295,230 @@ TEST_CASE("device_inventory_store has the C-collated agent_id index behind the b
         std::vector<std::string>{});
     REQUIRE(all.status() == PGRES_TUPLES_OK);
     CHECK(std::string(PQgetvalue(all.get(), 0, 0)) == "3");
+}
+
+namespace {
+
+// The plan of the REAL keyset statement for `q` (the store's own builder, not a copy of its text),
+// as one string. `ANALYZE` has run by the time a caller asks, so the planner has row counts.
+std::string keyset_plan(PgPool& pool, const yuzu::server::DeviceCiKeysetQuery& q) {
+    const auto st = yuzu::server::device_ci_keyset_statement(q);
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(lease.get(), ("EXPLAIN " + st.sql).c_str(), st.params);
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    std::string plan;
+    for (int i = 0; i < PQntuples(res.get()); ++i)
+        plan += std::string(PQgetvalue(res.get(), i, 0)) + "\n";
+    return plan;
+}
+
+} // namespace
+
+// Kills: spelling the single-device filter `agent_id = $n` again. That equality is served by the
+// PRIMARY KEY, whose index follows the database collation: after a collation change under an
+// existing volume it missed 32,764 existing ids (measured on PG 18.4), while `agent_id COLLATE "C"
+// = $n` missed none, and the docs tell a CMDB to confirm a device with `?agent_id=` before
+// retiring it. A test cannot make a fresh database drift, so the assertion is the PLAN: the named
+// read must use the C-collated index and not the primary key. Reverting the clause makes the plan
+// use device_ci_pkey and this fails. The results are checked too, over ids a case-folding or
+// punctuation-skipping comparison would confuse.
+TEST_CASE("list_device_ci_after's single-device read is byte-exact and plans on the C-collated index",
+          "[pg][device_ci][keyset][named]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    DeviceInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    const std::vector<std::string> ids = {"Agent-1", "agent-1", "AGENT-1", "agent_1", "agent1",
+                                          "a b",     "a-b",     "-x",      "_x"};
+    for (const auto& id : ids)
+        store_ci(store, id, "host-" + id);
+    exec_stmt(pool, "INSERT INTO device_inventory_store.device_ci (agent_id, hostname, first_seen, "
+                    "last_seen) SELECT 'g-' || lpad(i::text, 6, '0'), 'h' || i, 1, 1 "
+                    "FROM generate_series(1, 50000) AS i");
+    exec_stmt(pool, "ANALYZE device_inventory_store.device_ci");
+
+    SECTION("each stored id is found by exactly itself") {
+        for (const auto& id : ids) {
+            INFO(id);
+            yuzu::server::DeviceCiKeysetQuery q;
+            q.agent_id = id;
+            CHECK(keyset_ids(store.list_device_ci_after(q)) == std::vector<std::string>{id});
+        }
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_id = "agent-2";
+        CHECK(keyset_ids(store.list_device_ci_after(q)).empty());
+    }
+    SECTION("the named read plans on the C-collated index, not the primary key") {
+        yuzu::server::DeviceCiKeysetQuery q;
+        q.agent_id = "agent-1";
+        q.limit = 2;
+        const std::string plan = keyset_plan(pool, q);
+        INFO(plan);
+        CHECK(plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        CHECK(plan.find("device_ci_pkey") == std::string::npos);
+    }
+    SECTION("a page by bound and a scope-membership page plan on the same index") {
+        yuzu::server::DeviceCiKeysetQuery after;
+        after.after = "g-025000";
+        after.limit = 101;
+        const std::string after_plan = keyset_plan(pool, after);
+        INFO(after_plan);
+        CHECK(after_plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        CHECK(after_plan.find("device_ci_pkey") == std::string::npos);
+        yuzu::server::DeviceCiKeysetQuery scoped;
+        scoped.agent_ids = std::vector<std::string>{"g-000010", "g-000020", "agent-1"};
+        scoped.limit = 101;
+        const std::string scoped_plan = keyset_plan(pool, scoped);
+        INFO(scoped_plan);
+        CHECK(scoped_plan.find("device_ci_agent_id_c_idx") != std::string::npos);
+        CHECK(scoped_plan.find("device_ci_pkey") == std::string::npos);
+    }
+}
+
+// Kills: a v4 without its transaction-local settings. The migration runner applies a migration in
+// a transaction on a pooled connection that carries a 30 s statement_timeout and a 10 s
+// lock_timeout; a lock wait or a build past those fails the migration, the server then refuses to
+// start, and it repeats on every restart. The text carries `SET LOCAL` (it ends with the
+// transaction, so nothing leaks onto the pooled connection) for both, before the build, and still
+// creates the index idempotently and without CONCURRENTLY (the runner's transaction refuses it).
+TEST_CASE("migration v4 lifts the statement timeout and allows a longer lock wait for its index build",
+          "[device_ci][migration][v4]") {
+    const auto& all = yuzu::server::device_inventory_migrations();
+    REQUIRE(all.size() == 4);
+    REQUIRE(all.back().version == 4);
+    const std::string& sql = all.back().sql;
+    const auto at = [&](const char* needle) { return sql.find(needle); };
+    REQUIRE(at("SET LOCAL lock_timeout = '30s'") != std::string::npos);
+    REQUIRE(at("SET LOCAL statement_timeout = 0") != std::string::npos);
+    REQUIRE(at("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx") != std::string::npos);
+    CHECK(at("SET LOCAL lock_timeout") < at("CREATE INDEX"));
+    CHECK(at("SET LOCAL statement_timeout") < at("CREATE INDEX"));
+    CHECK(sql.find("CONCURRENTLY") == std::string::npos);
+    CHECK(sql.find("COLLATE \"C\"") != std::string::npos);
+}
+
+// Kills: a v4 that does not tolerate a lock wait longer than the pool's lock_timeout. The pool here
+// allows 1 s; another session holds a lock that conflicts with the index build's SHARE lock (a
+// long ingest transaction) for 2.5 s. The migration must wait it out under its own SET LOCAL
+// lock_timeout, build the index over the EXISTING rows (a v3 database being upgraded) and open.
+// Without the setting the 1 s pool timeout fails the migration and the store does not open.
+TEST_CASE("a v3 database upgrades to v4 behind a lock held longer than the pool's lock timeout",
+          "[pg][device_ci][migration][v4]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "agent-up-1", "h1");
+        store_ci(seed, "Agent-up-2", "h2");
+    }
+    // a database as v3 left it: no index, recorded version 3
+    exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+    exec_stmt(pool, "UPDATE public.schema_meta SET version = 3 WHERE store = 'device_inventory_store'");
+
+    PgPool short_lock_pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 1000}};
+    REQUIRE(short_lock_pool.valid());
+
+    std::latch holding{1};
+    std::thread holder([&] {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(yuzu::server::pg::exec_params(lease.get(), "BEGIN", std::vector<std::string>{}).status() ==
+                PGRES_COMMAND_OK);
+        REQUIRE(yuzu::server::pg::exec_params(
+                    lease.get(), "LOCK TABLE device_inventory_store.device_ci IN ROW EXCLUSIVE MODE",
+                    std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+        holding.count_down();
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        (void)yuzu::server::pg::exec_params(lease.get(), "COMMIT", std::vector<std::string>{});
+    });
+    holding.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    DeviceInventoryStore store{short_lock_pool}; // runs v4 over the existing rows, waiting for the lock
+    const auto waited = std::chrono::steady_clock::now() - t0;
+    holder.join();
+
+    REQUIRE(store.is_open());
+    CHECK(waited > std::chrono::milliseconds(1500)); // it really did wait past the pool's 1 s
+    // the index exists and the pre-existing rows are served in byte order
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto res = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT count(*) FROM pg_indexes WHERE schemaname = 'device_inventory_store' "
+        "AND indexname = 'device_ci_agent_id_c_idx'",
+        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)) == "1");
+    yuzu::server::DeviceCiKeysetQuery q;
+    CHECK(keyset_ids(store.list_device_ci_after(q)) ==
+          std::vector<std::string>{"Agent-up-2", "agent-up-1"});
+}
+
+// Kills: no runtime check of the v4 index. `schema_meta` saying v4 is not proof the index exists (a
+// restore, a hand-run DROP INDEX, a same-named index of another definition that IF NOT EXISTS
+// accepted). Each case below leaves the store OPEN (the read is still correct) and logs one
+// WARN that names the index, the cost and the statement to run; a healthy open logs none. The walk
+// is checked after each, so "stays correct" is observed and not just claimed.
+TEST_CASE("opening the store warns when the C-collated index is missing, invalid or defined differently",
+          "[pg][device_ci][migration][v4][index_check]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, device_ci_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    {
+        DeviceInventoryStore seed{pool};
+        REQUIRE(seed.is_open());
+        store_ci(seed, "b-2", "h2");
+        store_ci(seed, "A-1", "h1");
+    }
+    const auto open_and_capture = [&](std::string& warn_text) {
+        yuzu::test::LogCapture cap(spdlog::level::warn);
+        DeviceInventoryStore reopened{pool};
+        cap.stop();
+        warn_text = cap.text();
+        REQUIRE(reopened.is_open());
+        yuzu::server::DeviceCiKeysetQuery q;
+        CHECK(keyset_ids(reopened.list_device_ci_after(q)) == std::vector<std::string>{"A-1", "b-2"});
+    };
+    std::string warn;
+
+    SECTION("a healthy index: no warning") {
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_idx") == std::string::npos);
+    }
+    SECTION("a dropped index") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        open_and_capture(warn);
+        CHECK(warn.find("device_ci_agent_id_c_idx is missing") != std::string::npos);
+        CHECK(warn.find("scan plus a sort") != std::string::npos);
+        CHECK(warn.find("CREATE INDEX IF NOT EXISTS device_ci_agent_id_c_idx ON "
+                        "device_inventory_store.device_ci ((agent_id COLLATE \"C\"))") !=
+              std::string::npos);
+    }
+    SECTION("a same-named index on the plain column") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "(agent_id)");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("a partial index of the right expression") {
+        exec_stmt(pool, "DROP INDEX device_inventory_store.device_ci_agent_id_c_idx");
+        exec_stmt(pool, "CREATE INDEX device_ci_agent_id_c_idx ON device_inventory_store.device_ci "
+                        "((agent_id COLLATE \"C\")) WHERE blob_version >= 2");
+        open_and_capture(warn);
+        CHECK(warn.find("is defined differently") != std::string::npos);
+    }
+    SECTION("an invalid index (an interrupted build)") {
+        exec_stmt(pool, "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+                        "'device_inventory_store.device_ci_agent_id_c_idx'::regclass");
+        open_and_capture(warn);
+        CHECK(warn.find("is invalid") != std::string::npos);
+    }
 }
 
 // Kills: reading a non-positive or oversized limit as anything but the store's row ceiling

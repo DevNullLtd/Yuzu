@@ -151,7 +151,10 @@ struct Page {
 ///  - `kScopeTooWide`: TERMINAL (a 400 / -32602, no retry hint). The caller's scope exceeds
 ///    `kMaxPushdownScopeIds` ids and the request names no `agent_id`. Decided from the scope size
 ///    and the request alone, before any read, and its text carries no count.
-enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScopeTooWide };
+///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
+///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
+///    like any out-of-range value. Add a new error BEFORE it.
+enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScopeTooWide, kCount };
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the
 /// same text on REST and MCP (it names the global-read way out and carries no count).
@@ -179,8 +182,11 @@ enum class Surface { kRest, kMcp };
 ///    `kCursorRefusedRemediation`.
 ///  - `domain_audit_row`: the transport writes an `inventory.devices.ci` row (`audit_outcome`,
 ///    `audit_detail`). A refused cursor writes none. MCP also writes its generic row
-///    (`audit_outcome`, `audit_detail`) whenever `audit_detail` is non-empty; REST writes only
-///    the domain row, and none when `audit_detail` is empty.
+///    (`audit_outcome`, `audit_detail`) on EVERY failure it answers, whatever `audit_detail`
+///    holds; REST writes only the domain row, and none when `domain_audit_row` is false.
+///  The `string_view` members (`message`, `remediation`, `audit_outcome`) point at string
+///  literals or `inline constexpr` views, so they stay valid for the life of the program; only
+///  `audit_detail` owns its text.
 struct ReadFailure {
     bool unavailable{false};
     std::string_view message;

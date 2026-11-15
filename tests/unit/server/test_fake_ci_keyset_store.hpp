@@ -8,8 +8,9 @@
 /// the SAME contract as the store's `agent_id COLLATE "C"`, not a stand-in for locale order: a
 /// test that adds ids the two orders would arrange differently (upper and lower case, `-` and `_`,
 /// digits against letters) checks this fake and the real store against one rule. A present-empty
-/// `agent_ids` reads nothing. `degraded` makes every read fail (nullopt), as a closed store or a
-/// query error does.
+/// `agent_ids` reads nothing. A `limit` of zero or below, or above `kStoreRowCeiling`, reads the
+/// ceiling, as the store does (it never answers zero rows for a non-positive limit). `degraded`
+/// makes every read fail (nullopt), as a closed store or a query error does.
 ///
 /// It exists so a confinement test can assert the EXACT set of devices that came back: a fake
 /// that only recorded the scope it was handed would stay green with the intersection deleted.
@@ -43,6 +44,10 @@ inline DeviceCiRecord make_ci_record(std::string id) {
     return r;
 }
 
+/// The store's own row ceiling (`kListRowCap` in device_inventory_store.cpp, 100000), which the
+/// store's ceiling test reads for real.
+inline constexpr int kStoreRowCeiling = 100000;
+
 struct FakeCiKeysetStore {
     std::vector<DeviceCiRecord> rows; // kept sorted by agent_id
     bool degraded = false;
@@ -68,6 +73,7 @@ struct FakeCiKeysetStore {
         std::vector<DeviceCiRecord> out;
         if (q.agent_ids && q.agent_ids->empty())
             return out;
+        const int eff = q.limit > 0 && q.limit < kStoreRowCeiling ? q.limit : kStoreRowCeiling;
         std::set<std::string> ids;
         if (q.agent_ids)
             ids.insert(q.agent_ids->begin(), q.agent_ids->end());
@@ -78,7 +84,7 @@ struct FakeCiKeysetStore {
                 continue;
             if (q.agent_ids && !ids.contains(r.agent_id))
                 continue;
-            if (static_cast<int>(out.size()) >= q.limit)
+            if (static_cast<int>(out.size()) >= eff)
                 break;
             out.push_back(r);
         }

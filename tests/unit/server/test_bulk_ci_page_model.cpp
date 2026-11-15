@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -847,8 +848,10 @@ TEST_CASE("hardware ci page: a hand-built Request's limit is clamped before it r
 
 // Kills: a new ReadError enumerator that one transport treats as a cursor refusal and the other
 // does not (the cascades were hand-copied before), and drift between the two transports' wording.
-// Every value the enumerator's range could hold is walked, so adding an enumerator without a case
-// in describe_read_error and in this table fails here, not just as a -Wswitch warning.
+// Every enumerator before the `kCount` sentinel is walked, so adding one without a row in this
+// table fails to compile (the static_assert) and, if the table were padded, fails the loop: an
+// enumerator that fell to describe_read_error's out-of-range branch answers "invalid request" and
+// is refused here, never skipped.
 TEST_CASE("hardware ci page: every ReadError has one answer on both transports", "[hardware_ci_page][errors]") {
     struct Expect {
         hcp::ReadError e;
@@ -861,7 +864,7 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
         const char* rest_remediation;
         const char* mcp_remediation;
     };
-    const std::vector<Expect> table = {
+    static constexpr std::array<Expect, 4> table = {{
         {hcp::ReadError::kDegraded, true, "hardware CI records unavailable", true, "failure",
          "hardware CI records (REST) state=store unreadable",
          "hardware CI records (MCP) state=store unreadable", "", ""},
@@ -878,13 +881,13 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "caller's scope",
          "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
          "caller's scope"},
-    };
-    int known = 0;
-    for (int v = 0; v < 32; ++v) {
+    }};
+    static_assert(table.size() == static_cast<std::size_t>(hcp::ReadError::kCount),
+                  "a new ReadError needs a row in this table (and a case in describe_read_error)");
+    for (int v = 0; v < static_cast<int>(hcp::ReadError::kCount); ++v) {
         const auto e = static_cast<hcp::ReadError>(v);
-        if (hcp::read_error_message(e) == "invalid request")
-            continue; // not an enumerator: the switch fell through
-        ++known;
+        // an enumerator that is in neither switch answers the out-of-range text: refuse it
+        REQUIRE(hcp::read_error_message(e) != "invalid request");
         const auto it = std::ranges::find_if(table, [&](const Expect& x) { return x.e == e; });
         INFO("enumerator " << v);
         REQUIRE(it != table.end()); // a new enumerator needs a row here
@@ -904,11 +907,13 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
         CHECK(rest.remediation == it->rest_remediation);
         CHECK(mcp.remediation == it->mcp_remediation);
     }
-    CHECK(known == static_cast<int>(table.size()));
-    // an out-of-range value is a refusal that audits nothing and retries nothing
-    const auto bogus = hcp::describe_read_error(static_cast<hcp::ReadError>(99), hcp::Surface::kRest);
-    CHECK_FALSE(bogus.unavailable);
-    CHECK_FALSE(bogus.domain_audit_row);
+    // the sentinel and an out-of-range value is a refusal that audits nothing and retries nothing
+    for (const auto v : {hcp::ReadError::kCount, static_cast<hcp::ReadError>(99)}) {
+        const auto bogus = hcp::describe_read_error(v, hcp::Surface::kRest);
+        CHECK_FALSE(bogus.unavailable);
+        CHECK_FALSE(bogus.domain_audit_row);
+        CHECK(bogus.message == "invalid request");
+    }
 }
 
 // ── JSON ─────────────────────────────────────────────────────────────────────
