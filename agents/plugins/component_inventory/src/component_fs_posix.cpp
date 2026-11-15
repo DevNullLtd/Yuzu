@@ -161,7 +161,10 @@ public:
         const int fd = a.dir.dir.fd();
         bool untyped = false;
         const auto walked = shared::walk_dir_capped(a.dir.dir.get(), cap, [&](const struct dirent* e) {
-            out.entries.push_back(DirEntry{e->d_name, classify_dirent(fd, dir, *e, mounts_, log_, untyped)});
+            if (const auto type = classify_dirent(fd, dir, *e, mounts_, log_))
+                out.entries.push_back(DirEntry{e->d_name, *type});
+            else
+                untyped = true;
             return true;
         });
         out.truncated = walked.truncated;
@@ -169,6 +172,8 @@ public:
             out.error = true;
             out.entries.clear();
         }
+        // readdir order is the filesystem's; sorted, the same tree keeps the same rows when a cap bites.
+        std::ranges::sort(out.entries, {}, &DirEntry::name);
         return out;
     }
 
@@ -283,9 +288,9 @@ std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& r
     return out;
 }
 
-DirEntry::Type classify_dirent(int dir_fd, const std::string& dir, const struct dirent& e,
-                               const std::unordered_set<std::string>& network_mounts, const AccessLog& on_access,
-                               bool& untyped) {
+std::optional<DirEntry::Type> classify_dirent(int dir_fd, const std::string& dir, const struct dirent& e,
+                                              const std::unordered_set<std::string>& network_mounts,
+                                              const AccessLog& on_access) {
     using Type = DirEntry::Type;
     const std::string full = walk_detail::join(dir, e.d_name);
     if (network_mounts.contains(full))
@@ -301,7 +306,7 @@ DirEntry::Type classify_dirent(int dir_fd, const std::string& dir, const struct 
     struct stat st {};
     if (::fstatat(dir_fd, e.d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno != ENOENT)
-            untyped = true;
+            return std::nullopt;
         return Type::other;
     }
     if (S_ISDIR(st.st_mode))
@@ -313,9 +318,11 @@ DirEntry::Type classify_dirent(int dir_fd, const std::string& dir, const struct 
 
 std::vector<std::string> candidate_roots() {
 #if defined(__APPLE__)
-    return {"/Applications", "/Library/Java", "/usr/local", "/opt/homebrew"};
+    // Cheap roots first: the walk has one entry budget, and /Applications (app bundles) can spend it all.
+    return {"/Library/Java", "/usr/local", "/opt/homebrew", "/Applications"};
 #else
-    return {"/opt", "/usr/share/java", "/usr/lib/jvm", "/usr/local/lib", "/usr/local/share", "/usr/share/maven"};
+    // Cheap roots first, for the same reason: a large /opt must not starve /usr/lib/jvm.
+    return {"/usr/lib/jvm", "/usr/share/java", "/usr/share/maven", "/usr/local/lib", "/usr/local/share", "/opt"};
 #endif
 }
 

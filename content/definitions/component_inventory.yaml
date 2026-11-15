@@ -3,7 +3,7 @@
 ## trees. Read-only, zero subprocess.
 ## Plugin: component_inventory | Action: scan
 ##
-## SHIPPED LEGS: Linux and macOS, machine-wide roots only (per-user locations are never read).
+## SHIPPED LEGS: Linux and macOS, machine-wide roots only (the root list holds no per-user location).
 ## Windows is planned: it answers one `unsupported` status row (`windows:planned`).
 ##   Linux:   /opt, /usr/share/java, /usr/lib/jvm, /usr/local/lib, /usr/local/share and
 ##            /usr/share/maven.
@@ -14,7 +14,11 @@
 ##            Network mounts are read from /proc/<pid>/mountinfo (Linux) or getmntinfo_r_np (macOS).
 ## Candidates are files ending .jar, .war or .ear. For each one the archive's central directory
 ## is read in-process; the libraries nested one level deep (BOOT-INF/lib/, WEB-INF/lib/ or lib/)
-## are listed from that directory alone, none is unpacked.
+## are listed from that directory alone, none is unpacked. The version is the file name's; the
+## archive's pom.properties or manifest is read when the name gave none or is ambiguous, and
+## replaces the name's split only when the name carries that version. A nested row, and an archive
+## with no pom or manifest, take the file name's word; a qualifier word the parser does not know
+## reads as a classifier (nested guava 31.1-jre reads 31.1).
 ##
 ## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
 ## entries per directory listing, 3,000 rows per top-level application folder, 20,000 rows in all,
@@ -24,11 +28,12 @@
 ## `comp|java|<name>|<version>|<version_source>|<path>|<size>|<mtime>|<anchor_app>` rows.
 ## A `supported` status means the scan finished with no bound reached and every directory and
 ## archive it opened read in full; it does not mean nothing is installed outside the roots above.
-## What it passed over on purpose rides the status row as an informational token, never silent:
-## `root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable`.
+## What it passed over on purpose rides a `supported` status row as an informational token, never
+## silent: `root_link_skipped`, `link_skipped`, `network_fs_skipped`, `version_unreadable`.
 ## A `constrained` status means a bound was hit, a directory
 ## or an archive could not be read in full, or the mount table was unreadable: the list may be
-## incomplete, and the rows that were reachable are still returned.
+## incomplete, and it names its one cause. The rows already read are still returned, but when time
+## runs out archives not yet read give no rows, and a walk that used the whole budget returns none.
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -42,10 +47,20 @@ metadata:
     found under the machine-wide application roots: one row per archive and per nested library
     (name, version and where the version came from, path, size, modification time and the
     application folder it sits under). Linux and macOS only; per-user locations are not read and
-    Windows is not read yet. Nothing is started or unpacked. A `supported` status means the scan
-    finished and read everything it opened in full, naming in a token any link or network mount it
-    passed over; a `constrained` status means a bound was hit or something could not be read in
-    full, so the list may be incomplete.
+    Windows is not read yet. No process is started and no nested archive is unpacked. A
+    `supported` status means the scan finished and read everything it opened in full, naming in a
+    token any link or network mount it passed over; a `constrained` status means a bound was hit
+    or something could not be read in full, so the list may be incomplete, and it names its one
+    cause. When time runs out, archives not yet read give no rows, and a walk that used the whole
+    budget returns none. Use it for software no package manager owns; for packaged applications
+    use crossplatform.software.inventory and for installed Java runtimes crossplatform.runtimes.jvm.
+    `supported` with no component rows means none was found at the roots, not that none is
+    installed. The result is a live read made when the instruction runs, not a stored snapshot,
+    at a cost of up to 45 seconds and 400,000 directory entries, and it cannot be cancelled once
+    started. Terminal causes (a repeat gives the same answer): budget_entries, section_rows,
+    anchor_rows, depth, dir_truncated, archive_unenumerated. Retryable causes: budget_time,
+    dir_unreadable, archive_changed, mount_table_unreadable, internal_error. The version comes from
+    the file name; the archive corrects it only when the name carries the archive's version.
   tags: [components, java, inventory]
 
 spec:
@@ -78,12 +93,12 @@ spec:
         platforms: [darwin, linux]
       - name: name
         type: string
-        description: 'Artifact name taken from the file name, without the version and extension (log4j-core-2.17.1.jar reads log4j-core). A name with bytes outside printable ASCII is kept with those bytes shown as ?. Status rows: the level (supported, constrained or unsupported).'
+        description: 'Artifact name taken from the file name, without the version and extension (log4j-core-2.17.1.jar reads log4j-core). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported).'
         example: log4j-core
         platforms: [darwin, linux]
       - name: version
         type: string
-        description: 'Version from the file name, else from the archive''s pom.properties, else from its MANIFEST.MF; empty when none gives one. Nested libraries take it from the entry name only. Status rows: the comma-joined cause tokens, or -.'
+        description: 'Version from the file name, corrected by the archive''s pom.properties or MANIFEST.MF only when the file name carries that version; when the name gives none, from pom.properties, else MANIFEST.MF; empty when none gives one. Nested libraries take it from the entry name only. A pre-release or build qualifier (rc, beta, M1, snapshot, a build number) stays in it. Status rows: the comma-joined cause tokens, or -.'
         example: 2.17.1
         platforms: [darwin, linux]
       - name: version_source

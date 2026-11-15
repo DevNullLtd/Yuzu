@@ -9,7 +9,7 @@
 /// @file plugin_action_catalogue_component_inventory.hpp
 /// One fragment of the command capability catalogue: `component_inventory`'s single
 /// read-only action (`agents/plugins/component_inventory/src/component_inventory_plugin.cpp`).
-/// Classified by READING the implementation (which now exists).
+/// Classified by READING the implementation.
 ///
 /// `scan` is ReadOnly/None: it lists directories and reads bounded, link-free file bytes
 /// (archive directories, two small entries per archive) under fixed machine roots, plus the

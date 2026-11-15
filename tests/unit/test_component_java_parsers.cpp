@@ -44,6 +44,23 @@ TEST_CASE("jar filename: artifact and version split", "[runtime][component_inven
         {"name-1.0-SNAPSHOT-32bit.jar", "name", "1.0-SNAPSHOT"},
         {"log4j-1.2-api-3.jar", "log4j-1.2-api", "3"},
         {"foo-64bit.jar", "foo", "64bit"},
+        // Pre-release and build qualifiers stay in the version; other words are classifiers.
+        {"my-app-1.0.0-rc1.jar", "my-app", "1.0.0-rc1"},
+        {"spring-core-6.0.0-M1.jar", "spring-core", "6.0.0-M1"},
+        {"foo-1.0-beta-2.jar", "foo", "1.0-beta-2"},
+        {"foo-1.0-20231101.123456-1.jar", "foo", "1.0-20231101.123456-1"},
+        {"foo-1.0-RC2-sources.jar", "foo", "1.0-RC2"},
+        {"guava-31.1-android.jar", "guava", "31.1"},
+        {"guava-31.1-jre.jar", "guava", "31.1"}, // a word it does not know: the archive can say more
+        // OSGi: the '_' splits, the version runs to the end of the stem.
+        {"org.eclipse.core.runtime_3.29.0.v20230101-1200.jar", "org.eclipse.core.runtime",
+         "3.29.0.v20230101-1200"},
+        {"bundle_1.2.3.jar", "bundle", "1.2.3"},
+        // ... but a later dotted '-' candidate is a Maven-style version.
+        {"a_1.2.3-api-2.0.jar", "a_1.2.3-api", "2.0"},
+        {"my_app_name.jar", "my_app_name", ""},
+        // A weak candidate (64bit) gives way to a later real one, adjacent or not.
+        {"foo-64bit-1.0.jar", "foo-64bit", "1.0"},
     };
     for (const auto& r : rows) {
         CAPTURE(r.file);
@@ -52,6 +69,28 @@ TEST_CASE("jar filename: artifact and version split", "[runtime][component_inven
         CHECK(n->artifact == r.artifact);
         CHECK(n->version == r.version);
     }
+}
+
+TEST_CASE("jar filename: exact only when nothing in the name is ambiguous", "[runtime][component_inventory][java]") {
+    for (const char* f : {"guava-31.1.jar", "my-app-1.0.0-rc1.jar", "foo-1.0-beta-2.jar",
+                          "org.eclipse.core.runtime_3.29.0.v20230101-1200.jar", "foo-64bit.jar"})
+        CHECK(parse_jar_filename(f)->exact);
+    // A classifier after the version, a second candidate, or no version at all: the archive is asked.
+    for (const char* f : {"guava-31.1-jre.jar", "log4j-1.2-api-2.17.1.jar", "name-1.0-64bit.jar", "ojdbc.jar",
+                          "my-app-1.0-SNAPSHOT-tests.jar"})
+        CHECK_FALSE(parse_jar_filename(f)->exact);
+}
+
+TEST_CASE("jar filename: an archive version anchors on the stem or not at all", "[runtime][component_inventory][java]") {
+    CHECK(archive_version_prefix("guava-31.1-jre", "31.1-jre", '-') == std::optional<std::string_view>{"guava"});
+    CHECK(archive_version_prefix("foo-1.0-linux-x86_64", "1.0", '-') == std::optional<std::string_view>{"foo"});
+    CHECK(archive_version_prefix("org.x_3.0.0.v1", "3.0.0.v1", '_') == std::optional<std::string_view>{"org.x"});
+    // Not anchored: a dependency's version, a longer number, an empty prefix, the wrong separator.
+    CHECK_FALSE(archive_version_prefix("myapp-2.0", "1.5", '-').has_value());
+    CHECK_FALSE(archive_version_prefix("foo-1.05", "1.0", '-').has_value());
+    CHECK_FALSE(archive_version_prefix("-1.0", "1.0", '-').has_value());
+    CHECK_FALSE(archive_version_prefix("org.x_3.0.0", "3.0.0", '-').has_value());
+    CHECK_FALSE(archive_version_prefix("foo-1.0", "", '-').has_value());
 }
 
 TEST_CASE("jar filename: non-archives and empties are rejected", "[runtime][component_inventory][java]") {
@@ -93,6 +132,9 @@ TEST_CASE("pom.properties: version property", "[runtime][component_inventory][ja
     CHECK(parse_pom_properties_version("#version=1\n") == std::nullopt);
     CHECK(parse_pom_properties_version("version=\n") == std::nullopt);
     CHECK(parse_pom_properties_version("version=1\x01" "2\n") == std::nullopt);
+    // An unresolved build placeholder is not a version.
+    CHECK(parse_pom_properties_version("version=${project.version}\n") == std::nullopt);
+    CHECK(parse_manifest_version("Implementation-Version: ${version}\n") == std::nullopt);
     CHECK(parse_pom_properties_version("version=" + std::string(128, '1')).has_value());
     CHECK(parse_pom_properties_version("version=" + std::string(129, '1')) == std::nullopt);
 }

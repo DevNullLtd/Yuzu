@@ -187,6 +187,16 @@ inline bool is_single_component(const char* name) noexcept {
     return true;
 }
 
+/// openat(), retried while a signal interrupts it (EINTR): a spurious failure would otherwise read
+/// as an unreadable directory or file and constrain a whole answer.
+inline int openat_retry(int dir_fd, const char* name, int flags) {
+    int fd;
+    do {
+        fd = ::openat(dir_fd, name, flags);
+    } while (fd < 0 && errno == EINTR);
+    return fd;
+}
+
 /// Takes ownership of raw_fd. After fdopendir succeeds the DIR* owns it; on
 /// failure it is closed here exactly once. No path leaves it owned twice.
 inline DirOpen finish_dir_open(int raw_fd) {
@@ -293,7 +303,7 @@ inline DirOpen open_dir_no_follow_at(int parent_fd, const char* name) {
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_dir_open(::openat(parent_fd, name, detail::kDirFlags));
+    return detail::finish_dir_open(detail::openat_retry(parent_fd, name, detail::kDirFlags));
 }
 
 /// Read the regular file at `path` up to `cap` bytes; `leaf` selects whether a symlink leaf is followed.
@@ -360,7 +370,7 @@ inline FileOpen open_file_no_follow_at(int dir_fd, const char* name) {
         out.err = EINVAL;
         return out;
     }
-    ScopedFile file{::openat(dir_fd, name, detail::kFileFlags)};
+    ScopedFile file{detail::openat_retry(dir_fd, name, detail::kFileFlags)};
     if (!file.valid()) {
         out.err = errno;
         out.error = out.err == ELOOP ? ReadError::symlink_refused : ReadError::io;

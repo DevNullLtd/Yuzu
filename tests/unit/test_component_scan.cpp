@@ -290,6 +290,97 @@ TEST_CASE("scan: with several pom.properties only one named for the archive is t
     }
 }
 
+TEST_CASE("scan: an archive's own version corrects the file name only when the file name anchors it",
+          "[runtime][component_scan][component_inventory]") {
+    const auto bundle_manifest = [](const std::string& version) {
+        return "Manifest-Version: 1.0\r\nBundle-Version: " + version + "\r\n\r\n";
+    };
+    SECTION("an anchored pom wins and names the row") {
+        MemTree tree;
+        // "-jre" is a word the file-name parser does not know: it reads 31.1; the pom says 31.1-jre.
+        tree.add_file("/opt/a/guava-31.1-jre.jar", build_zip({deflated(kPomEntry, pom_with("31.1-jre"))}).bytes);
+        const auto r = run(tree);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "guava");
+        CHECK(r.rows[0].version == "31.1-jre");
+        CHECK(r.rows[0].version_source == "pom");
+    }
+    SECTION("an anchored manifest value wins, with '_' for a Bundle-Version") {
+        MemTree tree;
+        tree.add_file("/opt/a/guava-31.1-jre.jar",
+                      build_zip({deflated("META-INF/MANIFEST.MF", manifest_with("31.1-jre"))}).bytes);
+        tree.add_file("/opt/a/org.acme.core_1.2.0.v2023-api-1.5-sources.jar",
+                      build_zip({deflated("META-INF/MANIFEST.MF", bundle_manifest("1.2.0.v2023"))}).bytes);
+        const auto r = run(tree);
+        REQUIRE(r.rows.size() == 2);
+        CHECK(find_row(r, "guava")->version == "31.1-jre");
+        CHECK(find_row(r, "guava")->version_source == "manifest");
+        const auto* osgi = find_row(r, "org.acme.core");
+        REQUIRE(osgi != nullptr);
+        CHECK(osgi->version == "1.2.0.v2023");
+        CHECK(osgi->version_source == "manifest");
+    }
+    SECTION("an unanchored sole pom does not override the file name") {
+        MemTree tree;
+        // A bundled dependency's pom (1.5) is not myapp's: the name does not contain -1.5.
+        tree.add_file("/opt/a/myapp-2.0-linux.jar", build_zip({deflated(kPomEntry, pom_with("1.5"))}).bytes);
+        const auto r = run(tree);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "myapp");
+        CHECK(r.rows[0].version == "2.0");
+        CHECK(r.rows[0].version_source == "filename");
+    }
+    SECTION("an exact name reads no pom or manifest entry at all") {
+        MemTree tree;
+        tree.add_file("/opt/a/myapp-2.0.jar", build_zip({deflated(kPomEntry, pom_with("1.5"))}).bytes);
+        const auto r = run(tree);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].version == "2.0");
+        CHECK(r.rows[0].version_source == "filename");
+        CHECK(tree.reads.size() == 2); // the tail and the directory, no entry
+
+        // Control: the same archive under a non-exact name does read the entry.
+        MemTree other;
+        other.add_file("/opt/a/myapp-2.0-linux.jar", build_zip({deflated(kPomEntry, pom_with("1.5"))}).bytes);
+        (void)run(other);
+        CHECK(other.reads.size() > 2);
+    }
+}
+
+TEST_CASE("scan: the three read caps are pinned by value", "[runtime][component_scan][component_inventory]") {
+    // Documented as 16 MiB, 1,024 bytes and 64 KiB in the README, the manual and the ADR: a change to
+    // a constant must change those with it, and this literal is the tripwire.
+    CHECK(kMaxCdBytes == 16777216);
+    CHECK(kMaxEntryNameLen == 1024);
+    CHECK(kMaxEntryBytes == 65536);
+}
+
+TEST_CASE("scan: a nested library takes the file name's word, qualifiers included",
+          "[runtime][component_scan][component_inventory]") {
+    MemTree tree;
+    tree.add_file("/opt/app/fat-1.0.jar",
+                  build_zip({nested_lib("BOOT-INF/lib/spring-core-6.0.0-M1.jar", 10),
+                             nested_lib("BOOT-INF/lib/guava-31.1-jre.jar", 10)})
+                      .bytes);
+    const auto r = run(tree);
+    REQUIRE(r.rows.size() == 3);
+    CHECK(find_row(r, "spring-core")->version == "6.0.0-M1");
+    CHECK(find_row(r, "guava")->version == "31.1"); // a word the parser does not know reads as a classifier
+}
+
+TEST_CASE("scan: a newline in a path never reaches a row as a line break",
+          "[runtime][component_scan][wire][component_inventory]") {
+    using namespace std::string_literals;
+    MemTree tree;
+    tree.add_file("/opt/we\nird/a\nb-1.0.jar", build_zip({stored("x", "y")}).bytes);
+    const auto r = run(tree);
+    REQUIRE(r.rows.size() == 1);
+    const auto line = format_component_row(r.rows[0]);
+    CHECK(line.find('\n') == std::string::npos);
+    CHECK(line.find('\r') == std::string::npos);
+    CHECK(std::count(line.begin(), line.end(), '|') == 8); // nine fields, none forged by the path
+}
+
 TEST_CASE("scan: a fat jar is one outer row and one row per nested library, none inflated",
           "[runtime][component_scan][component_inventory]") {
     MemTree tree;
@@ -610,6 +701,18 @@ TEST_CASE("scan: row caps are recorded, never silent", "[runtime][component_scan
         const auto r = run(tree, {"/opt"}, limits);
         CHECK(r.stop == Stop::anchor_rows);
         CHECK(r.rows.size() == 3);
+        CHECK(tree.total_opens == 1);
+    }
+    SECTION("a full anchor opens no further archive, and still says so") {
+        MemTree tree;
+        tree.add_file("/opt/app/fat-1.0.jar", fat());
+        tree.add_file("/opt/app/other-1.0.jar", build_zip({stored("x", "y")}).bytes);
+        WalkLimits limits;
+        limits.max_rows_per_anchor = 3;
+        const auto r = run(tree, {"/opt"}, limits);
+        CHECK(r.stop == Stop::anchor_rows);
+        CHECK(r.rows.size() == 3);
+        CHECK(tree.total_opens == 1); // the second archive of the full anchor is never opened
     }
     SECTION("per section") {
         MemTree tree;
@@ -650,6 +753,7 @@ TEST_CASE("scan: the rows-per-folder quota is per root, so same-named folders un
     const auto capped = run(one, {"/opt"}, limits);
     CHECK(capped.stop == Stop::anchor_rows);
     CHECK(capped.rows.size() == 3);
+    CHECK(one.total_opens == 3); // an anchor exactly full: the fourth archive is skipped, not opened
 }
 
 TEST_CASE("verdict: only a complete scan is supported; the table is a pure function",

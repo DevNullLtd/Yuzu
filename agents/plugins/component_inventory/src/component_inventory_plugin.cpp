@@ -45,6 +45,7 @@ namespace {
 // The internal_error token is a literal per OS: the catch-all must answer without allocating
 // outside its own guarded calls.
 #if defined(_WIN32)
+constexpr std::string_view kOs = "windows";
 constexpr std::string_view kInternalError = "windows:component_inventory:internal_error";
 #elif defined(__linux__)
 constexpr std::string_view kOs = "linux";
@@ -55,6 +56,10 @@ constexpr std::string_view kInternalError = "macos:component_inventory:internal_
 #else
 #error "component_inventory_plugin.cpp: unsupported host OS"
 #endif
+
+// The literal above is hand-typed per OS: it must be exactly <os>:component_inventory:internal_error.
+static_assert(kInternalError.starts_with(kOs) &&
+              kInternalError.substr(kOs.size()) == ":component_inventory:internal_error");
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {

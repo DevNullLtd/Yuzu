@@ -9,7 +9,9 @@
  * anything it cannot positively read.
  *
  * Version precedence is applied by the scan (component_scan.hpp: read_archive
- * and scan), not here: file name, then pom.properties, then manifest, else ''
+ * and scan), not here: the file name, corrected by a pom.properties or manifest
+ * version only when the file name anchors it (archive_version_prefix) and the name
+ * is not `exact`; with no file-name version, pom.properties, then manifest, else ''
  * with version_source `unreadable`. The component `name` is the artifact only
  * (no group:artifact).
  */
@@ -23,7 +25,8 @@ namespace yuzu::component_inventory {
 
 inline constexpr std::string_view kManifestEntry = "META-INF/MANIFEST.MF";
 
-/// Longest version string any parser will return.
+/// Longest version a pom.properties or MANIFEST.MF value may carry. A version read from a file name is
+/// bounded by kMaxJarFilenameBytes instead, so it can be longer.
 inline constexpr std::size_t kMaxJavaVersionBytes = 128;
 
 /// Longest archive file name parse_jar_filename accepts (the common
@@ -33,6 +36,9 @@ inline constexpr std::size_t kMaxJarFilenameBytes = 255;
 struct JarName {
     std::string artifact;
     std::string version; ///< '' when the file name carries no version
+    /// One digit-led candidate and it runs to the end of the stem (my-app-1.0.0-rc1, an OSGi
+    /// name_1.2.3.v2023): nothing in the name is ambiguous, so the archive is not asked.
+    bool exact{false};
 };
 
 namespace java_detail {
@@ -70,9 +76,80 @@ constexpr bool is_printable_ascii(std::string_view v) noexcept {
     return true;
 }
 
-/// Non-empty, <= kMaxJavaVersionBytes, printable ASCII (0x20..0x7E) only.
+/// Non-empty, <= kMaxJavaVersionBytes, printable ASCII (0x20..0x7E) only, and not an unresolved
+/// build placeholder (a "${project.version}" is the template, not a version).
 constexpr bool valid_value(std::string_view v) noexcept {
-    return !v.empty() && v.size() <= kMaxJavaVersionBytes && is_printable_ascii(v);
+    return !v.empty() && v.size() <= kMaxJavaVersionBytes && is_printable_ascii(v) &&
+           v.find("${") == std::string_view::npos;
+}
+
+/// A pre-release or build qualifier that stays inside a version when it follows one: alpha, beta, rc,
+/// cr, m, milestone, ea, preview or snapshot (any case, optional trailing digits), or only digits and
+/// dots (a build number or timestamp). Any other word (jre, sources, linux) is a classifier.
+constexpr bool is_version_qualifier(std::string_view t) noexcept {
+    if (t.empty())
+        return false;
+    bool numeric = true;
+    for (char c : t)
+        numeric = numeric && (is_digit(c) || c == '.');
+    if (numeric)
+        return true;
+    while (!t.empty() && is_digit(t.back()))
+        t.remove_suffix(1);
+    for (const std::string_view q : {"alpha", "beta", "rc", "cr", "m", "milestone", "ea", "preview", "snapshot"})
+        if (iequals(t, q))
+            return true;
+    return false;
+}
+
+/// Index of the '-' (or the end) that closes the '-'-separated token starting at `from`.
+constexpr std::size_t token_end(std::string_view s, std::size_t from) noexcept {
+    const auto d = s.find('-', from);
+    return d == std::string_view::npos ? s.size() : d;
+}
+
+/// `end` moved past every following "-<qualifier>" token.
+constexpr std::size_t extend_qualifiers(std::string_view stem, std::size_t end) noexcept {
+    while (end < stem.size() && stem[end] == '-') {
+        const std::size_t e = token_end(stem, end + 1);
+        if (!is_version_qualifier(stem.substr(end + 1, e - end - 1)))
+            break;
+        end = e;
+    }
+    return end;
+}
+
+/// Index of the '_' in an OSGi-style name_<major>.<minor>.<micro>[.qualifier][-build], or npos. The
+/// three numeric segments must follow the '_', the rest of the stem must be version text, and no later
+/// '-' may open a dotted digit-led token (that is a Maven-style version, e.g. a_1.2.3-api-2.0).
+constexpr std::size_t osgi_split(std::string_view stem) noexcept {
+    for (std::size_t u = stem.find('_', 1); u != std::string_view::npos; u = stem.find('_', u + 1)) {
+        std::size_t p = u + 1;
+        bool ok = true;
+        for (int seg = 0; seg < 3 && ok; ++seg) {
+            const std::size_t d0 = p;
+            while (p < stem.size() && is_digit(stem[p]))
+                ++p;
+            ok = p > d0 && (seg == 2 || (p < stem.size() && stem[p] == '.'));
+            if (seg < 2 && ok)
+                ++p;
+        }
+        if (!ok || (p < stem.size() && stem[p] != '.' && stem[p] != '-'))
+            continue;
+        for (std::size_t i = u + 1; ok && i < stem.size(); ++i) {
+            if (stem[i] == '-') {
+                if (i + 1 < stem.size() && is_digit(stem[i + 1])) {
+                    const std::size_t e = token_end(stem, i + 1);
+                    ok = stem.substr(i + 1, e - i - 1).find('.') == std::string_view::npos;
+                }
+            } else {
+                ok = is_version_char(stem[i]);
+            }
+        }
+        if (ok)
+            return u;
+    }
+    return std::string_view::npos;
 }
 
 /// Next line of `text` without its terminator ('\n', optional preceding '\r').
@@ -97,13 +174,17 @@ inline std::string_view next_line(std::string_view& text) noexcept {
 }
 
 /// <artifact>-<version>[-classifier] for .jar/.war/.ear (case-insensitive).
-/// The version is the digit-led run after the LAST '-' that starts one and is
-/// followed by end or '-' (so log4j-1.2-api-2.17.1.jar -> log4j-1.2-api /
-/// 2.17.1); a directly following "-SNAPSHOT" stays in the version.
-/// Classifier rule: a candidate with a letter and no '.' (64bit, 32bit) is a
-/// classifier, not a version, when an earlier dotted candidate exists
-/// (name-1.0-64bit.jar -> name / 1.0). Alone it is still read as the version
-/// (foo-64bit.jar), which the pom/manifest fallbacks may then override.
+/// The version starts at the LAST '-' that opens a digit-led token, then keeps every following
+/// pre-release or build qualifier token (is_version_qualifier): my-app-1.0.0-rc1 -> 1.0.0-rc1,
+/// foo-1.0-beta-2 -> 1.0-beta-2, foo-1.0-20231101.123456-1 -> the whole tail, my-app-1.0-SNAPSHOT-tests ->
+/// 1.0-SNAPSHOT. Any other word after it is a classifier and stays out (guava-31.1-jre -> 31.1,
+/// -linux-x86_64, -sources). A later dotted or all-digit candidate after such a word restarts the split
+/// (log4j-1.2-api-2.17.1 -> log4j-1.2-api / 2.17.1); a later digit-led candidate with a letter and no '.'
+/// (64bit, 32bit) never does once a version is found (name-1.0-64bit.jar -> name / 1.0), but alone it
+/// is still the version (foo-64bit.jar). An OSGi name (org.x_3.29.0.v2023-1200) splits at the '_'.
+/// This is the only source for a nested library, so it must be right alone; for an outer archive the
+/// scan may correct it from the archive (see component_scan.hpp). A qualifier word it does not know
+/// reads as a classifier (nested guava 31.1-jre reads 31.1).
 /// Names over kMaxJarFilenameBytes, or with any byte outside printable ASCII
 /// (NUL, control, non-ASCII), are rejected before anything is copied.
 // ponytail: the parser refuses a non-ASCII file name; the scan still emits a row
@@ -117,9 +198,11 @@ inline std::optional<JarName> parse_jar_filename(std::string_view filename) {
     if (stem.empty())
         return std::nullopt;
 
-    std::size_t best_start = std::string_view::npos;
-    std::size_t best_end = 0;
-    bool best_dotted = false;
+    if (const std::size_t u = osgi_split(stem); u != std::string_view::npos)
+        return JarName{std::string(stem.substr(0, u)), std::string(stem.substr(u + 1)), true};
+
+    std::size_t start = std::string_view::npos, end = 0, seen = 0;
+    bool weak = false; // the chosen candidate has a letter and no '.' (64bit): a classifier unless alone
     for (std::size_t i = 1; i + 1 < stem.size(); ++i) {
         if (stem[i] != '-' || !is_digit(stem[i + 1]))
             continue;
@@ -131,23 +214,37 @@ inline std::optional<JarName> parse_jar_filename(std::string_view filename) {
         }
         if (e != stem.size() && stem[e] != '-')
             continue;
-        if (!dotted && alpha && best_dotted)
+        ++seen;
+        const bool strong = dotted || !alpha;
+        if (start != std::string_view::npos && !strong)
             continue; // classifier such as 64bit after a real version
-        best_start = i;
-        best_end = e;
-        best_dotted = dotted;
+        start = i;
+        weak = !strong;
+        end = weak ? e : extend_qualifiers(stem, e);
+        i = end - 1; // resume at the '-' that closed the version
     }
-    if (best_start == std::string_view::npos)
+    if (start == std::string_view::npos)
         return JarName{std::string(stem), std::string{}};
+    if (weak)
+        end = extend_qualifiers(stem, end);
+    return JarName{std::string(stem.substr(0, start)), std::string(stem.substr(start + 1, end - start - 1)),
+                   seen == 1 && end == stem.size()};
+}
 
-    constexpr std::string_view kSnap = "-SNAPSHOT";
-    if (stem.substr(best_end, kSnap.size()) == kSnap) {
-        const std::size_t after = best_end + kSnap.size();
-        if (after == stem.size() || stem[after] == '-')
-            best_end = after;
+/// The file-name prefix when `stem` is <prefix><sep><version> or starts <prefix><sep><version>- with a
+/// non-empty prefix, else nullopt. Last such separator wins, like the file-name split. This is how the
+/// scan decides that an archive's own version describes THIS file name (and not a bundled dependency).
+inline std::optional<std::string_view> archive_version_prefix(std::string_view stem, std::string_view version,
+                                                              char sep) noexcept {
+    if (version.empty())
+        return std::nullopt;
+    for (std::size_t at = stem.rfind(sep); at != std::string_view::npos && at > 0;
+         at = at == 1 ? std::string_view::npos : stem.rfind(sep, at - 1)) {
+        const std::string_view rest = stem.substr(at + 1);
+        if (rest.starts_with(version) && (rest.size() == version.size() || rest[version.size()] == '-'))
+            return stem.substr(0, at);
     }
-    return JarName{std::string(stem.substr(0, best_start)),
-                   std::string(stem.substr(best_start + 1, best_end - best_start - 1))};
+    return std::nullopt;
 }
 
 /// The `version=` property of a Maven pom.properties (first occurrence).

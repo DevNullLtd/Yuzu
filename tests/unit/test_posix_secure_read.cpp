@@ -150,6 +150,31 @@ TEST_CASE("posix_secure_read: ScopedDir is move-only and move-assign releases th
     CHECK(closed_errno == EBADF);
 }
 
+TEST_CASE("posix_secure_read: ScopedFile is move-only and move-assign releases the old descriptor",
+          "[shared][posix_secure_read]") {
+    static_assert(!std::is_copy_constructible_v<ScopedFile>);
+    static_assert(!std::is_copy_assignable_v<ScopedFile>);
+    yuzu::test::TempDir tmp{"yuzu_test_psr_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    write_file(tmp.path / "a", "a");
+    write_file(tmp.path / "b", "b");
+    auto root = open_dir_no_follow(tmp.path.string());
+    REQUIRE(root.opened());
+    auto a = open_file_no_follow_at(root.dir.fd(), "a");
+    auto b = open_file_no_follow_at(root.dir.fd(), "b");
+    REQUIRE(a.opened());
+    REQUIRE(b.opened());
+    const int a_fd = a.file.fd();
+    const int b_fd = b.file.fd();
+    a.file = std::move(b.file); // closes a's old descriptor, takes b's
+    CHECK(a.file.fd() == b_fd);
+    CHECK(b.file.fd() < 0);
+    const int closed_rc = ::fcntl(a_fd, F_GETFD);
+    const int closed_errno = errno;
+    CHECK(closed_rc == -1);
+    CHECK(closed_errno == EBADF);
+}
+
 TEST_CASE("posix_secure_read: symlink to directory at the leaf is refused", "[shared][posix_secure_read]") {
     yuzu::test::TempDir tmp{"yuzu_test_psr_"};
     REQUIRE(fs::create_directory(tmp.path));

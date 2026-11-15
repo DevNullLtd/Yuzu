@@ -97,12 +97,13 @@ using MountTableReader = std::function<std::optional<std::vector<std::string>>()
 
 /// Types one entry of the directory `dir` (open as `dir_fd`). A path in `network_mounts` is
 /// network_mount decided from the path alone, whatever d_type says: it is never passed to stat. DT_UNKNOWN
-/// is otherwise resolved with fstatat(AT_SYMLINK_NOFOLLOW); `untyped` is set when that fails for a reason
-/// other than the entry having vanished (the caller then treats the listing as an error). Exposed so the
+/// is otherwise resolved with fstatat(AT_SYMLINK_NOFOLLOW); nullopt when that fails for a reason other
+/// than the entry having vanished (the caller then treats the listing as an error). Exposed so the
 /// DT_UNKNOWN branch is tested: the filesystems a test can build always report d_type.
-[[nodiscard]] DirEntry::Type classify_dirent(int dir_fd, const std::string& dir, const struct dirent& e,
-                                             const std::unordered_set<std::string>& network_mounts,
-                                             const AccessLog& on_access, bool& untyped);
+[[nodiscard]] std::optional<DirEntry::Type> classify_dirent(int dir_fd, const std::string& dir,
+                                                            const struct dirent& e,
+                                                            const std::unordered_set<std::string>& network_mounts,
+                                                            const AccessLog& on_access);
 
 /// The link-free filesystem for `targets`: every path is acquired hop by hop from "/" and no link is
 /// followed at any component; an entry named in targets.network_mounts is typed network_mount

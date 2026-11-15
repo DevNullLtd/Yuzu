@@ -133,6 +133,10 @@ struct ArchiveRead {
     z_stream zs{};
     if (inflateInit2(&zs, -15) != Z_OK)
         return std::nullopt;
+    // Casts, with their proof: zlib declares next_in as z_const Bytef* (older headers: Bytef*) and
+    // inflate() only ever reads through it, so dropping const writes nothing; `in` is a caller-owned view
+    // that outlives this call; char and unsigned char (Bytef) may alias any object, so reading the
+    // chars as bytes, and writing `out`'s chars as bytes, are permitted accesses. No alignment is assumed.
     zs.next_in = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(in.data()));
     zs.avail_in = static_cast<uInt>(in.size());
     zs.next_out = reinterpret_cast<Bytef*>(out.data());
@@ -163,16 +167,20 @@ struct ArchiveRead {
     const auto data_off = local_data_offset(std::as_bytes(std::span{*header}), e, tail.prefix);
     if (!data_off)
         return std::nullopt;
-    const auto data = read_exact(fv, *data_off, static_cast<std::size_t>(e.comp_size));
+    auto data = read_exact(fv, *data_off, static_cast<std::size_t>(e.comp_size));
     if (!data)
         return std::nullopt;
-    if (e.method == 0)
-        return e.comp_size == e.uncomp_size ? data : std::nullopt;
+    if (e.method == 0) {
+        if (e.comp_size != e.uncomp_size)
+            return std::nullopt;
+        return data;
+    }
     return inflate_raw_capped(*data, kMaxEntryBytes);
 }
 
-/// Open once; read the tail, the directory and (only when the file name gave no version) the
-/// pom.properties and MANIFEST.MF entries, all through the one FileView.
+/// Open once; read the tail, the directory and (only when `want_version`: the file name gave no
+/// version, or gave one that is not `exact`) the pom.properties and MANIFEST.MF entries, all through
+/// the one FileView.
 ///
 /// WHICH pom. A shaded archive carries its dependencies' META-INF/maven/<g>/<a>/pom.properties beside
 /// its own, and a dependency's version is not this archive's. So a pom is read only when it can only
@@ -265,6 +273,22 @@ struct ArchiveRead {
     return JarName{std::move(s), {}};
 }
 
+/// The file-name prefix an archive's own version anchors: `value` (from a pom, or a manifest whose
+/// Bundle-Version uses '_') must follow it in the stem as <prefix>-<V> or <prefix>-<V>-... Without the
+/// anchor the archive's value may belong to something it bundles, and the file name stands.
+[[nodiscard]] inline std::optional<std::string_view> anchored_prefix(std::string_view leaf, std::string_view value,
+                                                                     std::string_view source) {
+    if (leaf.size() <= 4)
+        return std::nullopt;
+    const auto stem = leaf.substr(0, leaf.size() - 4);
+    if (const auto p = archive_version_prefix(stem, value, '-'))
+        return p;
+    return source == kSourceManifest ? archive_version_prefix(stem, value, '_') : std::nullopt;
+}
+
+/// Where `add` left a row.
+enum class Added { ok, anchor_full, section_full };
+
 } // namespace scan_detail
 
 /**
@@ -287,22 +311,23 @@ struct ArchiveRead {
     // Outer + nested rows per (root, application folder): the walk counts its candidates the same way,
     // so same-named folders under different roots (/opt/acme, /usr/local/lib/acme) never share a quota.
     std::map<std::pair<std::size_t, std::string>, std::size_t> per_anchor;
-    // false = the section is full: stop reading archives.
+    using scan_detail::Added;
+    // section_full = stop reading archives; anchor_full = this anchor takes no more rows.
     const auto add = [&](Row&& r, std::size_t root) {
         if (out.rows.size() >= limits.max_rows) {
             record(Stop::section_rows);
-            return false;
+            return Added::section_full;
         }
         std::size_t& n = per_anchor[{root, r.anchor_app}];
         if (n >= limits.max_rows_per_anchor) {
             record(Stop::anchor_rows);
-            return true;
+            return Added::anchor_full;
         }
         ++n;
         if (r.version_source == kSourceUnreadable)
             ++out.version_unreadable;
         out.rows.push_back(std::move(r));
-        return true;
+        return Added::ok;
     };
 
     for (const auto& c : walked.candidates) {
@@ -310,18 +335,34 @@ struct ArchiveRead {
             record(Stop::budget_time);
             break;
         }
-        JarName jn = scan_detail::name_of(scan_detail::leaf_of(c.path));
-        const auto ar = scan_detail::read_archive(fs, c.path, jn.version.empty(), jn.artifact);
+        // A full anchor takes no more rows, so its archives are not opened (the cause is still recorded).
+        if (const auto f = per_anchor.find({c.root, c.anchor_app});
+            f != per_anchor.end() && f->second >= limits.max_rows_per_anchor) {
+            record(Stop::anchor_rows);
+            continue;
+        }
+        const std::string_view leaf = scan_detail::leaf_of(c.path);
+        JarName jn = scan_detail::name_of(leaf);
+        // The archive is asked when the name gave no version, or gave one that is not exact.
+        const auto ar = scan_detail::read_archive(fs, c.path, jn.version.empty() || !jn.exact, jn.artifact);
         if (!ar.enumerated)
             record(Stop::archive_unenumerated);
         if (ar.changed)
             record(Stop::archive_changed);
 
         Row outer;
+        // An archive version replaces the file name's split only when the file name anchors it.
+        if (!jn.version.empty() && ar.version)
+            if (const auto prefix = scan_detail::anchored_prefix(leaf, ar.version->first, ar.version->second)) {
+                jn.artifact = std::string(*prefix);
+                jn.version = ar.version->first;
+                outer.version_source = std::string(ar.version->second);
+            }
         outer.name = std::move(jn.artifact);
         if (!jn.version.empty()) {
             outer.version = std::move(jn.version);
-            outer.version_source = std::string(kSourceFilename);
+            if (outer.version_source.empty())
+                outer.version_source = std::string(kSourceFilename);
         } else if (ar.version) {
             outer.version = ar.version->first;
             outer.version_source = std::string(ar.version->second);
@@ -332,8 +373,11 @@ struct ArchiveRead {
         outer.size = ar.size;
         outer.mtime = ar.mtime;
         outer.anchor_app = c.anchor_app;
-        if (!add(std::move(outer), c.root))
+        const Added o = add(std::move(outer), c.root);
+        if (o == Added::section_full)
             break;
+        if (o == Added::anchor_full)
+            continue;
 
         bool full = false;
         for (const auto& n : ar.nested) {
@@ -346,10 +390,11 @@ struct ArchiveRead {
             row.size = n.size;
             row.mtime = ar.mtime;
             row.anchor_app = c.anchor_app;
-            if (!add(std::move(row), c.root)) {
+            const Added a = add(std::move(row), c.root);
+            if (a == Added::section_full)
                 full = true;
+            if (a != Added::ok)
                 break;
-            }
         }
         if (full)
             break;
@@ -503,6 +548,9 @@ template <class Targets, class MakeFs>
  * Write the answer: rows, then the typed result, then the cost keys (`kv` null = no plugin
  * context). `wrote` goes true only after a row has really been written, so the caller's catch-all
  * knows whether its own single status row is still owed. Rows found are written at both levels.
+ * `wrote` is an output parameter on purpose: this function can throw part-way, and a return value
+ * would not survive the throw, while the caller's catch (component_inventory_plugin.cpp) must know
+ * whether a row already went out.
  */
 template <class Ctx, class Kv>
 inline void emit_answer(Ctx& ctx, Kv* kv, const Answer& a, bool& wrote) {

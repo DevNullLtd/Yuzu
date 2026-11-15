@@ -160,15 +160,14 @@ TEST_CASE("component_legs: candidate_roots is exactly the documented machine-roo
     // manual, the privilege model, the definition and the descriptor: a root added or dropped here
     // must change this list and those documents together.
 #if defined(__APPLE__)
-    std::vector<std::string> want{"/Applications", "/Library/Java", "/usr/local", "/opt/homebrew"};
+    // In walk order, which is part of the contract: cheap roots first, because the walk has one entry
+    // budget and /Applications (macOS) or /opt (Linux) can spend all of it.
+    const std::vector<std::string> want{"/Library/Java", "/usr/local", "/opt/homebrew", "/Applications"};
 #else
-    std::vector<std::string> want{"/opt",           "/usr/share/java",  "/usr/lib/jvm",
-                                  "/usr/local/lib", "/usr/local/share", "/usr/share/maven"};
+    const std::vector<std::string> want{"/usr/lib/jvm",     "/usr/share/java",  "/usr/share/maven",
+                                        "/usr/local/lib", "/usr/local/share", "/opt"};
 #endif
-    auto got = candidate_roots();
-    std::ranges::sort(got);
-    std::ranges::sort(want);
-    CHECK(got == want);
+    CHECK(candidate_roots() == want);
 }
 
 TEST_CASE("component_legs: plan_targets drops a root on or under a network mount",
@@ -614,14 +613,12 @@ TEST_CASE("component_fs_posix: classify_dirent never stats a network mount, what
     const std::unordered_set<std::string> mounts{(t.root / "mnt").string()};
     std::vector<std::string> log;
     const AccessLog on_access = [&log](const std::string& p) { log.push_back(p); };
-    bool untyped = false;
     const auto root = t.root.string();
 
-    CHECK(classify_dirent(dir.fd, root, entry("mnt", DT_UNKNOWN), mounts, on_access, untyped) == Type::network_mount);
-    CHECK(classify_dirent(dir.fd, root, entry("mnt", DT_DIR), mounts, on_access, untyped) == Type::network_mount);
-    CHECK(classify_dirent(dir.fd, root, entry("mnt", DT_LNK), mounts, on_access, untyped) == Type::network_mount);
+    CHECK(classify_dirent(dir.fd, root, entry("mnt", DT_UNKNOWN), mounts, on_access) == Type::network_mount);
+    CHECK(classify_dirent(dir.fd, root, entry("mnt", DT_DIR), mounts, on_access) == Type::network_mount);
+    CHECK(classify_dirent(dir.fd, root, entry("mnt", DT_LNK), mounts, on_access) == Type::network_mount);
     CHECK(log.empty()); // nothing stat'ed or recorded
-    CHECK_FALSE(untyped);
 }
 
 TEST_CASE("component_fs_posix: classify_dirent resolves DT_UNKNOWN with a no-follow stat",
@@ -637,25 +634,21 @@ TEST_CASE("component_fs_posix: classify_dirent resolves DT_UNKNOWN with a no-fol
     std::vector<std::string> log;
     const AccessLog on_access = [&log](const std::string& p) { log.push_back(p); };
     const auto root = t.root.string();
-    const auto type_of = [&](const char* name, bool& untyped) {
-        return classify_dirent(dir.fd, root, entry(name, DT_UNKNOWN), none, on_access, untyped);
+    const auto type_of = [&](const char* name) {
+        return classify_dirent(dir.fd, root, entry(name, DT_UNKNOWN), none, on_access);
     };
 
-    bool untyped = false;
-    CHECK(type_of("d", untyped) == Type::dir);
-    CHECK(type_of("f.jar", untyped) == Type::file);
-    CHECK(type_of("lnk", untyped) == Type::link); // not followed: a link to a directory is still a link
-    CHECK(type_of("pipe", untyped) == Type::other);
-    CHECK_FALSE(untyped);
+    CHECK(type_of("d") == Type::dir);
+    CHECK(type_of("f.jar") == Type::file);
+    CHECK(type_of("lnk") == Type::link); // not followed: a link to a directory is still a link
+    CHECK(type_of("pipe") == Type::other);
     CHECK(std::ranges::find(log, (t.root / "d").string()) != log.end()); // the seam saw the stat
 
     // An entry that vanished between readdir and the stat is `other`, not a failed listing.
-    CHECK(type_of("gone", untyped) == Type::other);
-    CHECK_FALSE(untyped);
+    CHECK(type_of("gone") == Type::other);
 
     // Any other failure to learn the type fails the listing: here a descriptor that is not open.
-    CHECK(classify_dirent(-1, root, entry("d", DT_UNKNOWN), none, on_access, untyped) == Type::other);
-    CHECK(untyped);
+    CHECK_FALSE(classify_dirent(-1, root, entry("d", DT_UNKNOWN), none, on_access).has_value());
 }
 
 TEST_CASE("component_fs_posix: the walk over the real leg skips links and mounts and reaches the jars",
