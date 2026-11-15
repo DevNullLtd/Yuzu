@@ -37,7 +37,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `execution_artifacts` | ✅ ⛔ ⛔ | Windows execution-evidence sources: ShimCache, Amcache InventoryApplicationFile, and Prefetch. Forensics-gated, single-target, default-off | [README](../../agents/plugins/execution_artifacts/README.md) |
 | `filesystem` | ✅ ✅ ✅ | Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only) | [README](../../agents/plugins/filesystem/README.md) |
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
-| `firewall` | ✅ ✅ ✅ | Firewall status and rule listing | [README](../../agents/plugins/firewall/README.md) |
+| `firewall` | ✅ ✅ ✅ | Firewall status, rule listing and device containment | [README](../../agents/plugins/firewall/README.md) |
 | `firmware_posture` | ✅ 🟡 🟡 | Reports firmware/BIOS vendor, version, release date and update-pending posture | [README](../../agents/plugins/firmware_posture/README.md) |
 | `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers, chassis, baseboard, swap, machine id | [README](../../agents/plugins/hardware/README.md) |
 | `http_client` | ✅ ✅ ✅ | HTTP client — download files, GET/HEAD requests with hash verification (no shell-out) | [README](../../agents/plugins/http_client/README.md) |

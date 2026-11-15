@@ -82,7 +82,7 @@ TriggerEngine::~TriggerEngine() {
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
-void TriggerEngine::register_trigger(TriggerConfig config) {
+bool TriggerEngine::register_trigger(TriggerConfig config) {
     // Enforce minimum interval of 30 seconds
     if (config.type == TriggerType::Interval && config.interval_seconds < 30) {
         spdlog::warn("Trigger '{}': interval {} < 30s minimum, clamping to 30s", config.id,
@@ -99,17 +99,19 @@ void TriggerEngine::register_trigger(TriggerConfig config) {
         spdlog::info("Trigger '{}' replaced (type={})", config.id,
                      trigger_type_to_string(config.type));
         *it = std::move(config);
-    } else {
-        // Enforce maximum trigger count to prevent resource exhaustion
-        if (triggers_.size() >= max_triggers_) {
-            spdlog::warn("Trigger '{}' rejected: maximum trigger count ({}) reached", config.id,
-                         max_triggers_);
-            return;
-        }
-        spdlog::info("Trigger '{}' registered (type={}, plugin={}, action={})", config.id,
-                     trigger_type_to_string(config.type), config.plugin, config.action);
-        triggers_.push_back(std::move(config));
+        return true;
     }
+
+    // Enforce maximum trigger count to prevent resource exhaustion
+    if (triggers_.size() >= max_triggers_) {
+        spdlog::warn("Trigger '{}' rejected: maximum trigger count ({}) reached", config.id,
+                     max_triggers_);
+        return false;
+    }
+    spdlog::info("Trigger '{}' registered (type={}, plugin={}, action={})", config.id,
+                 trigger_type_to_string(config.type), config.plugin, config.action);
+    triggers_.push_back(std::move(config));
+    return true;
 }
 
 void TriggerEngine::unregister_trigger(const std::string& id) {

@@ -1559,6 +1559,18 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        "Software collection settings".
      - Recorded by the change author; ADR-owner acceptance pending.
 
+   - **2026-11-09 - the `firewall` plugin's four containment actions
+     (`firewall.quarantine`, `firewall.release`, `firewall.quarantine_status`,
+     `firewall.quarantine_allow`, PRQ.1) are reachable only by raw dispatch, with no
+     instruction definition.** `exception:PRQ.1 containment actions reachable by raw
+     dispatch without a definition; revisit: PRQ.2 re-points definitions`. REST and
+     MCP `execute_instruction` reach them through the shared gates (the capability
+     catalogue classifies `firewall.quarantine` Destructive and Reversible, so it needs
+     explicit targets and the approval gate), but no definition publishes their
+     parameters (`ttl_seconds`, `probe_target`, `exceptions`, `op`, `if_ttl_expired`,
+     `repair`), so discoverability (Decision 1) is not met for them yet. The server cut-over that
+     re-points the quarantine definitions at these actions is the change that adds
+     them; until then the plugin README documents the parameters.
    - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
      twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
      lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,

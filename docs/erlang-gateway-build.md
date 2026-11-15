@@ -18,6 +18,8 @@ bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl i
 
 `apps/yuzu_gw/test/ct` includes `yuzu_gw_scale_SUITE`, which starts the gateway, a fake server and a load generator as separate nodes and runs 500 simulated agents through seven scenarios (about 1 min of the CT run with the PR #5695 fixes); see `docs/testing/gateway-scale-tests.md` for the 5,000 and 25,000 sizes and the `gate` group.
 
+**Memory per idle agent connection.** The same suite's on-demand `idle_memory` case (not in the default run or CI) measures the gateway's marginal bytes per idle connection over TLS and plaintext, with real-shaped registrations, heartbeats and fleet snapshots, at N = 0 / 1k / 5k / 10k: run `scripts/test/gateway-idle-mem.sh` from the repo root (about 45 minutes). Linux is the platform the per-connection budget is judged on. What it reports, its settings and the ceiling file: `docs/testing/gateway-scale-tests.md`, "Idle memory per connection".
+
 **TLS test legs and `YUZU_REQUIRE_TLS_TESTS`.** Gateway TLS fixtures mint
 throwaway certificates with the `openssl` CLI in a private `0700` directory.
 The shared `yuzu_gw_authz_tests` fixture selects the first nonempty `TMPDIR`,

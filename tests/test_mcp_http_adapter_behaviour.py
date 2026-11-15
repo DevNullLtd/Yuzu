@@ -578,8 +578,14 @@ def main() -> int:
             for name in ("YUZU_MCP_MAX_INFLIGHT", "YUZU_MCP_TIMEOUT_MS", "YUZU_MCP_MAX_QUEUE"):
                 if value in ("-5", "2m", "1e3") and name != "YUZU_MCP_MAX_INFLIGHT":
                     continue  # one variable is enough for these; keeps the run short
-                p = run_adapter(node, stub.url, lines([PING]), {name: value})
-                label = "env %s=%r" % (name, value)
+                # YUZU_MCP_TIMEOUT_MS is a per-request deadline armed when the request is sent: 5 ms
+                # is a valid value but the connect and response round trip to the stub cannot be
+                # relied on to finish inside it under load, so use a generous valid one here. The
+                # in-flight and queue limits are counts, not times, so "5" tests nothing
+                # timing-sensitive there.
+                sent = "5000" if (name == "YUZU_MCP_TIMEOUT_MS" and value == "5") else value
+                p = run_adapter(node, stub.url, lines([PING]), {name: sent})
+                label = "env %s=%r" % (name, sent)
                 check(out_objs(p) == [ok] and p.returncode == 0, label + ": stdout %r" % p.stdout)
                 errs = p.stderr.splitlines()
                 if valid:

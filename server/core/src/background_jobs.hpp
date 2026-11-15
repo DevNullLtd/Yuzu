@@ -94,7 +94,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (53 passes). Verified against the source sweep
+/// The exhaustive inventory (54 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
@@ -104,8 +104,10 @@ struct BackgroundJobDecl {
 /// `inventory_store.purge_typed_sources`, the SAM.4 addition of
 /// `software_normalization_job.run_tick`, the #2146 addition of
 /// `workflow_engine.refresh_table_size_metrics`, and the SAM-14 addition of
-/// `software_inventory_store.run_retention_prune_changes`, and the collation-version
-/// recheck `pg_collation_recheck.tick`); keep the count
+/// `software_inventory_store.run_retention_prune_changes`, the SAM-17 addition of
+/// `software_catalog_rollup.refresh_component_rollup`, the SAM-33 addition of
+/// `software_catalog_rollup.refresh_fleet_snapshot`, and the collation-version recheck
+/// `pg_collation_recheck.tick`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -322,6 +324,13 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "(software_inventory_store:component_rollup, skip-if-held) then DELETE+INSERT replaces "
      "component_rollup whole and stamps component_rollup_meta; keep-last-good on failure, cancel "
      "or budget (rollback), so concurrent replicas serialize on the lock and a loser skips"},
+    {"software_catalog_rollup.refresh_fleet_snapshot", "SoftwareCatalogRollup::thread_",
+     BackgroundJobClass::ReplicaSafe,
+     "per-replica read-only (SAM-33): two bounded fleet reads (facet_health, software_summary) "
+     "feed THIS replica's facet gauges and its in-process snapshot holder, which serves globally "
+     "admitted callers of the software summary and plugin-health routes; writes no shared "
+     "state; keep-last-good on a failed read; MUST run per-replica, never leader-gate (a "
+     "follower would answer omitted=building indefinitely)"},
     {"software_normalization_job.run_tick", "SoftwareNormalizationJob::thread_",
      BackgroundJobClass::ReplicaSafe,
      "SHARED-PG, SINGLE-WRITER: every pass runs in its own transaction and, after its SET LOCAL "

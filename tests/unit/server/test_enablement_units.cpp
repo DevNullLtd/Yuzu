@@ -84,6 +84,11 @@ TEST_CASE("enablement units: the injected predicate is the canonical protective 
     // first production includer's own test must pin that (tracked by #5982).
     CHECK(kProtectivePredicate("__guard__", "push_rules"));
     CHECK(kProtectivePredicate("quarantine", "whitelist"));
+    // The firewall plugin's four containment actions (owner decision 2026-11-12) ...
+    for (const auto* a : {"quarantine", "release", "quarantine_status", "quarantine_allow"})
+        CHECK(kProtectivePredicate("firewall", a));
+    // ... and only those: its other actions stay ordinary units.
+    CHECK_FALSE(kProtectivePredicate("firewall", "state"));
     CHECK_FALSE(kProtectivePredicate("echo", "fleet_snapshot"));
 }
 
@@ -136,6 +141,12 @@ TEST_CASE("enablement units: the non-unit set is exactly the protective and rese
         {"__guard__.push_rules", R::ReservedName},
         {"__sync__", R::ReservedName},
         {"__sync__.now", R::ReservedName},
+        // firewall is a MIXED plugin: only its four containment actions are non-units, the
+        // plugin row itself and its other actions stay ordinary units (see below).
+        {"firewall.quarantine", R::Protective},
+        {"firewall.quarantine_allow", R::Protective},
+        {"firewall.quarantine_status", R::Protective},
+        {"firewall.release", R::Protective},
         {"quarantine", R::Protective},
         {"quarantine.quarantine", R::Protective},
         {"quarantine.status", R::Protective},
@@ -164,6 +175,12 @@ TEST_CASE("enablement units: system_reserved rows with D3 work are ordinary unit
     CHECK(ov.find("echo") != nullptr);
     CHECK(ov.find("asset_tags") != nullptr);
     CHECK(ov.find("quarantine") == nullptr);
+    // The firewall plugin is a mixed plugin: the plugin row and a non-containment action are
+    // ordinary units a kill switch may turn off; the containment actions are not.
+    CHECK(ov.find("firewall") != nullptr);
+    CHECK(ov.find("firewall.state") != nullptr);
+    CHECK(ov.find("firewall.release") == nullptr);
+    CHECK(ov.find_non_unit("firewall") == nullptr);
 
     CHECK(contains(off_names(resolve_all_for(ov, "echo")), "echo.fleet_snapshot"));
     CHECK(contains(off_names(resolve_all_for(ov, "asset_tags")), "asset_tags.sync"));
