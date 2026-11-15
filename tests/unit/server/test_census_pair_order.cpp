@@ -2319,3 +2319,39 @@ TEST_CASE("census pair order, B3 fix: DECIDE returns the retired epoch AFTER its
                  },
                  "3|1|5|0|0|0|0|1|0|0", "applied_pair,-,rebase");
 }
+
+TEST_CASE("census pair order, B3 fix: a decision whose savepoint is rolled back after the upsert "
+          "is not counted and moves no pair_duplicates",
+          PAIR_TAGS) {
+    // p (5,3) is stored pending (its census write fails). x (5,3) is then decided a refused
+    // duplicate by the upsert, which counts the duplicate, and the clear that retires p fails:
+    // the savepoint rolls back, so the label is not counted, the column does not move and x is
+    // stored pending beside p.
+    PAIR_FIXTURE();
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("e1", "r1", "a", kCompliant, 1000), 5, 3))
+            .outcome == EventInsertOutcome::Inserted);
+    FailSwitch fail(db.dsn());
+    fail.on();
+    REQUIRE(store.insert_event_classified(with_pair(stamped("p1", "r1", "a", kDrifted, 1010), 5, 3))
+                .outcome == EventInsertOutcome::Inserted);
+    fail.off();
+    REQUIRE(pending_count(db.dsn()) == "1");
+    exec_sql(db.dsn(), std::string("CREATE FUNCTION ") + kSchema +
+                           ".yuzu_test_fail_retire() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                           "IF OLD.projection_pending AND NOT NEW.projection_pending THEN RAISE "
+                           "EXCEPTION 'forced retire failure' USING ERRCODE = 'XX000'; END IF; "
+                           "RETURN NEW; END $$");
+    exec_sql(db.dsn(), std::string("CREATE TRIGGER yuzu_test_fail_retire BEFORE UPDATE ON ") +
+                           kSchema + ".guaranteed_state_events FOR EACH ROW EXECUTE FUNCTION " +
+                           kSchema + ".yuzu_test_fail_retire()");
+    const DecisionCounts counts = decision_counts(metrics);
+    yuzu::test::LogCapture cap(spdlog::level::err);
+    REQUIRE(store.insert_event_classified(with_pair(stamped("x1", "r1", "a", kErrored, 1020), 5, 3))
+                .outcome == EventInsertOutcome::Inserted);
+    cap.stop();
+    CHECK(pending_count(db.dsn()) == "2");
+    CHECK(verdict(db.dsn(), "a", "r1") == "C - 5/3");
+    CHECK(order_text(db.dsn(), "a") == "5|3|-|0|0|0|2|0|0|0"); // two stragglers, no duplicate
+    CHECK(decision_delta(counts, decision_counts(metrics)) == "-");
+}
