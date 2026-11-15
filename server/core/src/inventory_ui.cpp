@@ -920,7 +920,9 @@ std::string find_row_html(const SoftwareFindRow& r, bool comp, std::int64_t now)
 
 // The table body for one page: version groups (newest first, the catalogue's own comparator)
 // within the page, the rows of a group in the order the read returned them, then the Load-more
-// row. The keyset order is name -> device, so a group repeats on a later page.
+// row. The keyset order is name -> device, so a group repeats on a later page. The comparator is a
+// preorder (1.0 and 1.0.0 tie), so a tie breaks on the raw string, the greater first (the
+// catalogue's own tie rule): equal strings stay contiguous and share one group header.
 std::string find_body(const SoftwareFindData& d) {
     const bool comp = find_is_components(d.f);
     const auto& rows = *d.rows;
@@ -929,7 +931,8 @@ std::string find_body(const SoftwareFindData& d) {
     for (const auto& r : rows)
         order.push_back(&r);
     std::ranges::stable_sort(order, [](const SoftwareFindRow* a, const SoftwareFindRow* b) {
-        return software_catalog::catalog_version_compare(a->version, b->version) > 0;
+        const int c = software_catalog::catalog_version_compare(a->version, b->version);
+        return c != 0 ? c > 0 : a->version > b->version;
     });
     std::string body;
     const char* noun = comp ? " components" : " installs";
@@ -1301,7 +1304,7 @@ std::string render_software_find(const SoftwareFindData& d) {
          "aria-live=\"polite\"><b>" +
          fmt_int(d.shown_before) + "</b> rows " + (d.confined ? "on devices in your groups" : "loaded") +
          " &middot; " + (comp ? "component" : "application") +
-         " &rarr; version (newest first) &rarr; device</div><div class=\"inv-exports\"><a "
+         " &rarr; version (newest first on each page) &rarr; device</div><div class=\"inv-exports\"><a "
          "class=\"inv-btn sm\" href=\"" +
          esc(find_rest_path(d.f, true)) + "\" download=\"" +
          (comp ? "software-components.csv" : "software-installs.csv") +
@@ -1463,7 +1466,8 @@ document.body.addEventListener('htmx:beforeRequest', function (e) {
     }
     return;
   }
-  if (el.getAttribute('data-act') === 'dmore') {  /* the swapped row is replaced in place: remember its index */
+  var act = el.getAttribute('data-act');
+  if (act === 'dmore' || act === 'fmore') {  /* the swapped row is replaced in place: remember its index */
     var tr = el.closest('tr');
     if (tr) window.__swMore = { tb: tr.parentNode, i: tr.sectionRowIndex, btn: el };
   }

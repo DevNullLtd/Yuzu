@@ -1169,6 +1169,30 @@ TEST_CASE("find software: rows read application, version, device, newest version
     REQUIRE(has(h, "/api/v1/inventory/software?name=Example%20Application&amp;limit=50"));
 }
 
+TEST_CASE("find software: versions the comparator ties but that are written differently get one "
+          "header each, the greater string first",
+          "[inventory][ui][find]") {
+    // 1.0 and 1.0.0 tie in the catalogue's version order; a sort on that alone leaves equal strings
+    // interleaved (1.0, 1.0.0, 1.0) and the group loop would print three headers.
+    const std::string h = render_software_find(find_data({find_install("a1", "host-0001", "1.0"),
+                                                          find_install("a2", "host-0002", "1.0.0"),
+                                                          find_install("a3", "host-0003", "1.0")}));
+    const auto count = [&](const std::string& needle) {
+        std::size_t n = 0;
+        for (auto p = h.find(needle); p != std::string::npos; p = h.find(needle, p + 1))
+            ++n;
+        return n;
+    };
+    REQUIRE(count("<tr class=\"fs-vgrp\">") == 2);
+    REQUIRE(count("<span class=\"inv-mono\">1.0</span> <span class=\"inv-grey\">&middot; 2 installs "
+                  "on this page") == 1);
+    REQUIRE(count("<span class=\"inv-mono\">1.0.0</span> <span class=\"inv-grey\">&middot; 1 installs "
+                  "on this page") == 1);
+    const auto at = [&](const std::string& s) { return h.find(s); };
+    REQUIRE(at("host-0002") < at("host-0001")); // the greater string's group first
+    REQUIRE(at("host-0001") < at("host-0003")); // read order kept inside a group
+}
+
 TEST_CASE("find software: the filters ride every emitted URL in one order; only the fragment and the "
           "component REST call carry the kind",
           "[inventory][ui][find]") {

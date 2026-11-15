@@ -2177,7 +2177,8 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT name, version, publisher, install_date, kind, ecosystem, epoch, release, "
-        "arch, signature_status, distro_id, distro_version, package_id, source "
+        "arch, signature_status, distro_id, distro_version, package_id, source, "
+        "install_type, install_location "
         "FROM software_inventory_store.installed_software "
         "WHERE agent_id = $1 ORDER BY name, version LIMIT $2::bigint",
         std::vector<std::string>{std::string(agent_id), std::to_string(kFleetQueryRowCap)});
@@ -2207,6 +2208,8 @@ SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
         e.distro_version = PQgetvalue(res.get(), i, 11);
         e.package_id = PQgetvalue(res.get(), i, 12);
         e.source = PQgetvalue(res.get(), i, 13);
+        e.install_type = PQgetvalue(res.get(), i, 14);
+        e.install_location = PQgetvalue(res.get(), i, 15);
         out.push_back(std::move(e));
     }
     return out;

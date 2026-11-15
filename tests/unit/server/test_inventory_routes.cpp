@@ -1255,6 +1255,26 @@ TEST_CASE("find software: a service-scoped token is denied before any read", "[i
     CHECK(h.audited("inventory.software.query|denied"));
     CHECK_FALSE(contains(r->body, "host-"));
 
+    // A component search is denied under the components verb, as its REST twin; an unknown kind
+    // (refused later, before any read) keeps the installs verb.
+    InvHarness comp;
+    comp.service_scoped = true;
+    comp.component_rows = {find_component_row("a001", "2.14.1")};
+    auto cr = comp.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java");
+    REQUIRE(cr);
+    CHECK(cr->status == 403);
+    CHECK(comp.audited("inventory.components.view|denied"));
+    CHECK_FALSE(comp.audited("inventory.software.query|denied"));
+    CHECK_FALSE(comp.last_component_query);
+    CHECK(comp.calls.empty());
+    InvHarness odd;
+    odd.service_scoped = true;
+    auto orr = odd.sink.Get(std::string(kFind) + "?name=x&kind=native");
+    REQUIRE(orr);
+    CHECK(orr->status == 403);
+    CHECK(odd.audited("inventory.software.query|denied"));
+    CHECK_FALSE(odd.audited("inventory.components.view|denied"));
+
     // No fleet-read gate wired: 503, nothing read.
     InvHarness unwired(false);
     auto u = unwired.sink.Get(std::string(kFind) + "?name=ExampleApp");
@@ -1392,6 +1412,141 @@ TEST_CASE("find software: a confined caller gets rows on its devices and no flee
     CHECK(*h.last_fleet_query->agent_ids == std::vector<std::string>{"a001"});
 }
 
+TEST_CASE("find software: a scope wider than the push-down bound is post-filtered and audited "
+          "denied beside success, under each model's verb",
+          "[inventory][route][find]") {
+    authz::VisibleSet big{std::unordered_set<std::string>{}};
+    for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
+        big->insert("syn" + std::to_string(i));
+    big->insert("a001");
+
+    const auto dropped_row_audited = [](const InvHarness& h, const std::string& verb) {
+        CHECK(std::ranges::count(h.audits, verb + "|denied") == 1);
+        CHECK(h.audited(verb + "|success"));
+        for (std::size_t i = 0; i < h.audits.size(); ++i)
+            if (h.audits[i] == verb + "|denied")
+                CHECK(contains(h.audit_details[i], "filtered 1 out-of-scope device"));
+    };
+
+    InvHarness a;
+    a.scope = big;
+    a.hostnames = {{"a001", "host-0001"}, {"a002", "SECRET-HOST"}};
+    a.fleet_rows = {find_fleet_row("a001", "4.2.1"), find_fleet_row("a002", "4.2.1")};
+    auto ar = a.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(ar);
+    CHECK(ar->status == 200);
+    REQUIRE(a.last_fleet_query);
+    CHECK_FALSE(a.last_fleet_query->agent_ids); // the post-filter arm, not a pushed-down set
+    CHECK(table_agents(ar->body) == std::vector<std::string>{"a001"});
+    CHECK_FALSE(contains(ar->body, "SECRET-HOST"));
+    CHECK_FALSE(contains(ar->body, "a002"));
+    dropped_row_audited(a, "inventory.software.query");
+
+    InvHarness c;
+    c.scope = big;
+    c.hostnames = {{"a001", "host-0001"}, {"a002", "SECRET-HOST"}};
+    c.component_rows = {find_component_row("a001", "2.14.1"), find_component_row("a002", "2.14.1")};
+    auto cr = c.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java");
+    REQUIRE(cr);
+    CHECK(cr->status == 200);
+    REQUIRE(c.last_component_query);
+    CHECK_FALSE(c.last_component_query->agent_ids);
+    CHECK(table_agents(cr->body) == std::vector<std::string>{"a001"});
+    CHECK_FALSE(contains(cr->body, "SECRET-HOST"));
+    CHECK_FALSE(contains(cr->body, "a002"));
+    dropped_row_audited(c, "inventory.components.view");
+}
+
+TEST_CASE("find software: a confined caller whose scope is present but empty is served an honest "
+          "zero with nothing read from the fleet",
+          "[inventory][route][find]") {
+    InvHarness a;
+    a.scope = authz::deny_all();
+    a.fleet_rows = {find_fleet_row("a001", "4.2.1")};
+    a.hostnames = {{"a001", "SECRET-HOST"}};
+    auto ar = a.sink.Get(std::string(kFind) + "?name=ExampleApp");
+    REQUIRE(ar);
+    CHECK(ar->status == 200);
+    REQUIRE(a.last_fleet_query);
+    REQUIRE(a.last_fleet_query->agent_ids); // engaged and empty: the store answers without SQL
+    CHECK(a.last_fleet_query->agent_ids->empty());
+    CHECK(table_agents(ar->body).empty());
+    CHECK_FALSE(contains(ar->body, "SECRET-HOST"));
+    CHECK_FALSE(contains(ar->body, "fs-cards")); // no fleet figure, however small
+    CHECK(contains(ar->body, "Nothing found."));
+    CHECK(a.count("find_title_totals") == 0);
+    CHECK(a.count("find_version_totals") == 0);
+    CHECK(a.count("find_meta") == 0);
+    REQUIRE(a.audit_details.size() == 1);
+    CHECK(a.audits.front() == "inventory.software.query|success");
+    CHECK(contains(a.audit_details.front(), "rows=0"));
+
+    InvHarness c;
+    c.scope = authz::deny_all();
+    c.component_rows = {find_component_row("a001", "2.14.1")};
+    c.hostnames = {{"a001", "SECRET-HOST"}};
+    auto cr = c.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java");
+    REQUIRE(cr);
+    CHECK(cr->status == 200);
+    REQUIRE(c.last_component_query);
+    REQUIRE(c.last_component_query->agent_ids);
+    CHECK(c.last_component_query->agent_ids->empty());
+    CHECK(table_agents(cr->body).empty());
+    CHECK_FALSE(contains(cr->body, "SECRET-HOST"));
+    CHECK_FALSE(contains(cr->body, "fs-cards"));
+    CHECK(c.count("find_component_totals") == 0);
+    CHECK(c.count("find_component_meta") == 0);
+    CHECK(c.audits == std::vector<std::string>{"inventory.components.view|success"});
+}
+
+TEST_CASE("find software: a cursor minted for one model is refused by the other, in a 200 caveat "
+          "with no read and no success audit",
+          "[inventory][route][find]") {
+    const auto swap_kind = [](std::string url, const std::string& from, const std::string& to) {
+        const std::string key = "kind=" + from;
+        const auto p = url.find(key);
+        REQUIRE(p != std::string::npos);
+        url.replace(p, key.size(), "kind=" + to);
+        return url;
+    };
+
+    // An application cursor replayed against the components model.
+    InvHarness a;
+    for (int i = 0; i < 120; ++i) {
+        a.fleet_rows.push_back(find_fleet_row(dev_id(i), "4.2.1"));
+        a.component_rows.push_back(find_component_row(dev_id(i), "2.14.1"));
+    }
+    auto first = a.sink.Get(std::string(kFind) + "?name=ExampleApp&kind=app");
+    REQUIRE(first);
+    const std::string app_cursor_url = next_url(first->body, "fmore");
+    a.audits.clear();
+    a.calls.clear();
+    a.last_component_query.reset();
+    auto replay = a.sink.Get(swap_kind(app_cursor_url, "app", "java"));
+    REQUIRE(replay);
+    CHECK(replay->status == 200);
+    CHECK(replay->body.starts_with("<tr><td colspan=\"8\" class=\"fs-msg\">"));
+    CHECK(contains(replay->body, "inv-caveat"));
+    CHECK(table_agents(replay->body).empty());
+    CHECK_FALSE(a.last_component_query); // refused before the read
+    CHECK(a.count("find_component_totals") == 0);
+    CHECK(a.audits.empty());
+
+    // A component cursor replayed against the installs model.
+    auto cfirst = a.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java");
+    REQUIRE(cfirst);
+    const std::string comp_cursor_url = next_url(cfirst->body, "fmore");
+    a.audits.clear();
+    a.last_fleet_query.reset();
+    auto back = a.sink.Get(swap_kind(comp_cursor_url, "java", "app"));
+    REQUIRE(back);
+    CHECK(back->status == 200);
+    CHECK(contains(back->body, "inv-caveat"));
+    CHECK(table_agents(back->body).empty());
+    CHECK_FALSE(a.last_fleet_query);
+    CHECK(a.audits.empty());
+}
+
 TEST_CASE("find software: a version range resolves against the distinct versions and a status "
           "filter drops the count",
           "[inventory][route][find]") {
@@ -1452,6 +1607,9 @@ TEST_CASE("find software: a component range reads the component versions; a degr
     CHECK(h.count("component_versions") == 1);
     CHECK(h.count("install_versions") == 0);
     CHECK_FALSE(h.last_fleet_query);
+    // The component model's audit verb is the REST components lookup's, never the installs one.
+    CHECK(h.audited("inventory.components.view|success"));
+    CHECK_FALSE(h.audited("inventory.software.query|success"));
 
     // A degraded distinct-version read is the retry banner and a failure audit, with no page read.
     InvHarness d;
@@ -1459,7 +1617,8 @@ TEST_CASE("find software: a component range reads the component versions; a degr
     auto dr = d.sink.Get(std::string(kFind) + "?name=log4j-core&kind=java&version_min=2.13");
     REQUIRE(dr);
     CHECK(contains(dr->body, "Inventory store unavailable."));
-    CHECK(d.audited("inventory.software.query|failure"));
+    CHECK(d.audited("inventory.components.view|failure"));
+    CHECK_FALSE(d.audited("inventory.software.query|failure"));
     CHECK_FALSE(d.last_component_query);
 
     // A distinct-version read cut at the catalogue cap cannot be resolved: a 200 caveat, no page read.
@@ -1547,6 +1706,8 @@ TEST_CASE("find software: component Load more walks the cursor, reads the totals
     CHECK_FALSE(contains(third->body, "data-act=\"fmore\""));
     CHECK(h.count("find_component_totals") == 1);
     CHECK(h.audit_details.back().find("page=continuation") != std::string::npos);
+    // Every page, the continuations included, is audited under the components verb.
+    CHECK(h.audits == std::vector<std::string>(3, "inventory.components.view|success"));
 }
 
 TEST_CASE("find software: a match count that is an exact multiple of the page size ends on an empty "
