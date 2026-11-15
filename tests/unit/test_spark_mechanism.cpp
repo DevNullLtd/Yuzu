@@ -16247,6 +16247,10 @@ struct OkDrainState {
     std::atomic<bool> park_armed{false}, parked{false}, release{false};
     std::atomic<bool> want_write{false}, wrote{false};
     std::atomic<int> inside{0}; ///< workers currently between hook entry and hook exit
+    // Only the OK-arm unwind case uses these three (the OK-drain case leaves them untouched).
+    std::atomic<bool> throw_armed{false}; ///< completion_hook: remove the directory, then throw, once
+    std::atomic<int> threw{0};
+    std::atomic<bool> removed{false}; ///< the directory removal in completion_hook succeeded
 };
 
 struct ThrowState {
@@ -16771,6 +16775,132 @@ TEST_CASE("File spark (real mechanism): a throw while the lost path's cancelled 
     { std::ofstream(tree.file) << "recreated"; }
     expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
     // path_lost is false again (else nothing verifies), and the episode produced one pair.
+    expect_verified_stable_after_recovery(*raw, engine);
+    CHECK(count_kind(got, key, SparkEventKind::Faulted) == 1);
+    CHECK(count_kind(got, key, SparkEventKind::Recovered) == 1);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a throw on the OK completion of a lost path whose old "
+          "handle can no longer be read still ends in one Recovered and a verified watch "
+          "(#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    // The OK-completion arm of unwind_pass_locked, reissue-failure sub-branch: the twin of the
+    // throw-while-draining case above, which reaches the FAILED-completion arm. Construction,
+    // no production seam: (1) the OK-drain case's setup leaves an `ok` completion (a write into
+    // the renamed directory) queued on the stale read while the owner is held in a pass, and the
+    // same pass's sweep then finds the path lost, so path_lost is set when that completion is
+    // dequeued. (2) completion_hook, which runs first in process_completion_locked, removes the
+    // renamed directory and throws, so the pass unwinds with the completion consumed and ok.
+    // (3) unwind_pass_locked's OK arm reissues ReadDirectoryChangesW on the old handle; the
+    // directory is gone, so the OS refuses it (measured on the rig: a ReadDirectoryChangesW on a
+    // handle whose directory was removed returns FALSE with ERROR_ACCESS_DENIED), and the arm
+    // resets the handle and defers the retry. Its guard marks the lost path's grace spent;
+    // without it the next sweep counts slow_op_total and overwrites fault_reason, because
+    // accepted_at is from the original establishment. The discriminating check is
+    // `slow_op_total == slow0` (the 300 ms admission seed keeps a sweep inside the wait, so the
+    // mutant is counted well before the retry); the Faulted-detail line reads only the FIRST
+    // Faulted event, which was reported before the throw, so it cannot see an overwrite and is
+    // not credited with one.
+    // Model limits: (a) the `ok` completion is made by writing while the read is still
+    // outstanding, i.e. it completed BEFORE the cancel, not by a CancelIoEx that completes
+    // `ok`; whether the OS ever does the latter is not shown. (b) The reissue failure is
+    // produced by removing the directory, which is the trigger the review named; no other cause
+    // of a failing reissue (a share going away, a handle revoked) is exercised. (c) The 150 ms is
+    // a delivery allowance for the OS notification, not a proof: a stall past it fails loudly on
+    // a counter below, it does not pass vacuously. The reissue-failure sub-branch is
+    // distinguished from the success sub-branch (which converges through the sweep's re-cancel
+    // and bumps no counter) by probe_launch_failed, and from the drain by path_lost_drained_ok
+    // staying 0.
+    DeafWatchTree tree("ok_unwind");
+    const auto renamed = tree.root / "renamed";
+    auto st = std::make_shared<OkDrainState>();
+    st->renamed = renamed;
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        auto ctl = identity_controls(50ms);
+        ctl.admission_backoff_seed = 300ms;
+        // All three hooks capture the shared state by value. verify_hook runs on a detached,
+        // never-joined worker; pass_fail_hook and completion_hook run on the owner thread under
+        // mu_ and touch no mechanism member (filesystem calls and atomics only).
+        ctl.verify_hook = [st](std::wstring_view) -> unsigned long {
+            if (!st->park_armed.exchange(false, std::memory_order_acq_rel))
+                return 0;
+            st->inside.fetch_add(1, std::memory_order_acq_rel);
+            st->parked.store(true, std::memory_order_release);
+            while (!st->release.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(1ms);
+            st->inside.fetch_sub(1, std::memory_order_acq_rel);
+            return 0; // then the real check: the path is gone, so it reads lost
+        };
+        ctl.pass_fail_hook = [st] { // never throws
+            if (!st->want_write.exchange(false, std::memory_order_acq_rel))
+                return;
+            { std::ofstream(st->renamed / "file.txt", std::ios::app) << "x"; }
+            st->release.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(150ms);
+            // Armed before `wrote`: the stale completion is dequeued as soon as this pass
+            // ends, which can be before the test thread observes `wrote`.
+            st->throw_armed.store(true, std::memory_order_release);
+            st->wrote.store(true, std::memory_order_release);
+        };
+        ctl.completion_hook = [st](std::wstring_view) {
+            if (!st->throw_armed.exchange(false, std::memory_order_acq_rel))
+                return;
+            std::error_code rec;
+            std::filesystem::remove_all(st->renamed, rec);
+            st->removed.store(!rec && !std::filesystem::exists(st->renamed, rec),
+                              std::memory_order_release);
+            st->threw.fetch_add(1, std::memory_order_acq_rel);
+            throw std::runtime_error("injected throw on the OK completion of a lost path");
+        };
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    HookParkGuard park_guard{st};
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    const auto slow0 = raw->stats().slow_op_total;
+    const auto launch_failed0 =
+        verify_counter(*raw, &FileMechanismDebugCounters::probe_launch_failed);
+
+    st->park_armed.store(true, std::memory_order_release);
+    REQUIRE(eventually([&] { return st->parked.load(std::memory_order_acquire); }, kDeafBound));
+    std::error_code ec;
+    std::filesystem::rename(tree.parent, renamed, ec);
+    REQUIRE_FALSE(ec);
+    st->want_write.store(true, std::memory_order_release);
+    REQUIRE(eventually([&] { return st->wrote.load(std::memory_order_acquire); }, kDeafBound));
+    REQUIRE(eventually([&] { return st->threw.load(std::memory_order_acquire) == 1; },
+                       kDeafBound));
+    REQUIRE(st->removed.load(std::memory_order_acquire)); // the old directory really is gone
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
+                       kDeafBound));
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Recovered) >= 1; },
+                       kDeafBound));
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::pass_failed) >= 1);
+    // The reissue on the dead handle failed (the sub-branch under test) and the drain branch
+    // never took this completion.
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::probe_launch_failed) >=
+          launch_failed0 + 1);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_drained_ok) == 0);
+    CHECK(first_detail(got, key, SparkEventKind::Faulted) == kReasonLost);
+    CHECK(raw->stats().slow_op_total == slow0);
+
+    std::filesystem::create_directories(tree.parent, ec);
+    { std::ofstream(tree.file) << "recreated"; }
+    expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
     expect_verified_stable_after_recovery(*raw, engine);
     CHECK(count_kind(got, key, SparkEventKind::Faulted) == 1);
     CHECK(count_kind(got, key, SparkEventKind::Recovered) == 1);
