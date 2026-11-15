@@ -481,10 +481,17 @@ TEST_CASE("account gate: an active account is unaffected warm, cold and across a
         CHECK(poll_and_validate(*m, token).has_value());
 
     // The MFA proof and the idle window are untouched by the gate.
-    // (Stamped through the proof-carrying call: the account's real factor generation and a
-    // database instant, as /login/mfa/stepup writes them, #6079.)
+    // (Stamped through the proof-carrying call (#6079) with the account's current factor
+    // generation and a database instant. alice is not enrolled, so that generation is 0 and
+    // this is the unbound proof shape: what the case pins is that the account gate leaves a
+    // stored proof alone, not the binding, which a bound stamp would need an enrolled account
+    // to exercise.)
     const auto mfa_status = f.db->mfa_status("alice");
     REQUIRE(mfa_status.has_value());
+    // Not yet stamped: the cached anchor is absent.
+    const auto before_stamp = a.validate_session(token);
+    REQUIRE(before_stamp.has_value());
+    CHECK(before_stamp->steady_mfa_verified.time_since_epoch().count() == 0);
     REQUIRE(a.mark_session_mfa_verified(
         token, yuzu::server::LocalMfaProof{.factor_gen = mfa_status->factor_gen,
                                            .verified_ms = mfa_status->db_now_ms}));

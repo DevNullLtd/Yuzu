@@ -2257,9 +2257,10 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         // unrelated in-flight request whenever any session anywhere is created or revoked,
         // and a retry would add a second read for nothing. The next request finds no entry
         // and reads the authoritative row. The mint insert in persist_new_session is
-        // deliberately unguarded: the post-mint recheck compares only role, credential hash
-        // and active state, and revokes the account's sessions on a divergence in those; it
-        // does not otherwise evict a freshly minted entry.
+        // deliberately unguarded: the post-mint recheck compares the role, the credential
+        // hash and the active state (and, for a mint carrying a bound MFA proof, the factor
+        // generation), and revokes the account's sessions on a divergence in those; it does
+        // not otherwise evict a freshly minted entry.
         if (session_cache_epoch_ == cache_epoch)
             sessions_[key] = *session_copy;
     }
@@ -2649,12 +2650,14 @@ bool AuthManager::reactivate_user(const std::string& username) {
     // Wipe-first: sessions that exist when an account is reactivated are removed, so a
     // session left behind by an earlier deactivation (whose own wipe may not have persisted)
     // cannot become valid again. A sign-in whose credential check started after the
-    // reactivation is a new sign-in. One residual remains: a login whose first factor was
-    // verified before the deactivation can still mint after the reactivation (reactivation
-    // keeps the password), because the post-mint recheck compares only the role, the credential
-    // hash and the active state, and all three match. Local erase, then the durable wipe; if the
-    // wipe does not persist the account stays inactive and the caller retries (invalidate_user
-    // is idempotent).
+    // reactivation is a new sign-in. One residual remains: a login that carries no bound MFA
+    // proof, whose first factor was verified before the deactivation, can still mint after the
+    // reactivation (reactivation keeps the password), because the post-mint recheck compares
+    // the role, the credential hash and the active state, and all three match. A login that
+    // carries a bound proof is denied instead: the deactivation changed the account's factor
+    // generation and the recheck compares it. Local erase, then the durable wipe; if the wipe
+    // does not persist the account stays inactive and the caller retries (invalidate_user is
+    // idempotent).
     {
         std::unique_lock lock(mu_);
         drop_cached_user_sessions_locked(username);

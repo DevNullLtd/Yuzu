@@ -1902,6 +1902,14 @@ firm.
   route does not run), but the status class changes from `503` to `401`. A client
   or monitor that reads every `401` as "re-authenticate" will misread the outage;
   check the database first.
+  A cookie session whose cache entry is cold also gets a `401` when the read of the account
+  that gates a durable local session (`auth.users`) fails; that failure is counted as
+  `yuzu_auth_session_store_degrade_total{op="account_state"}`. The authentication store and
+  the session store share one connection pool, so pool trouble raises `op="validate"` and
+  `op="account_state"` together, and a fault of the `auth.users` table alone (a lock or a
+  privilege fault, for example) raises only `account_state`. Warm sessions that reach a
+  step-up route instead get the `503` described above. The two are one fault seen by
+  different callers; `YuzuSessionStoreDegraded` carries the `op` label.
 - **Engine principals get `401` too** (measured). An engine token is resolved by
   the same pre-routing authentication as a session, so while the database cannot
   answer it is not resolved and the request is refused `401` `unauthorized`: no
@@ -2049,7 +2057,7 @@ restart once the store is back.
 
 ## MFA binding enforcement failed
 
-**Triage first.** If `yuzu_auth_mfa_binding_enforcement_ok` reads `0` and `YuzuMfaBindingNotEnforced` is firing, continue here. If the gauge reads `1`, no alert fires, and an approver or step-up request is refused `503` `mfa_proof_unavailable`, do not reset anyone yet: run the generation query in "Enrolled accounts at generation 0" under "Post-restore verification". Only an account that query returns needs `yuzu-server --mfa-reset <user>`. A refusal that carries `retry_after_ms` `5000`, or one for an account the query does not return, is a transient read fault: retry once, then check `YuzuSessionStoreDegraded` and pool health.
+**Triage first.** If `yuzu_auth_mfa_binding_enforcement_ok` reads `0` and `YuzuMfaBindingNotEnforced` is firing, continue here. If the gauge reads `1`, no alert fires, and an approver or step-up request is refused `503` `mfa_proof_unavailable`, do not reset anyone yet: run the generation query in "Enrolled accounts at generation 0" under "Post-restore verification". Only an account that query returns needs `yuzu-server --mfa-reset <user>`. A refusal that carries `retry_after_ms` `5000`, or one for an account the query does not return, is a transient read fault: retry once, then check `YuzuSessionStoreDegraded` (read its `op` label: `validate` is a failed session-row or stored-proof read, `account_state` a failed read of `auth.users`, and the two share one connection pool, so pool trouble raises both; see "Step-up returns 503") and pool health.
 
 `YuzuMfaBindingNotEnforced` fires (critical) when `yuzu_auth_mfa_binding_enforcement_ok{store}` reads `0`
 for a minute. A validation on this replica has observed that one of the two database triggers that

@@ -1772,9 +1772,12 @@ private:
     /// (comparison only: no I/O, no mutex in the callback) and, when it is not `stamped_gen`
     /// (or cannot be read), clear the proof with `SessionStore::clear_mfa_proof` AFTER the
     /// lock has released. The clear is hygiene: the stored generation already differs from the
-    /// account's, which a binding gate refuses by equality, so a clear that fails leaves a
-    /// refused proof, never an admissible one. This replica's cached copy is dropped either
-    /// way. Returns `kHolds` when the generation still matches.
+    /// account's, which a binding gate refuses by equality, so after a CHANGED factor a clear
+    /// that fails leaves a refused proof, never an admissible one. After an UNVERIFIABLE
+    /// recheck the stored proof stays bound to the verifier's generation, which a binding gate
+    /// would admit unless a change raced; that is benign (the proof was earned with a valid
+    /// code) and the withdrawal is best-effort. This replica's cached proof is blanked or
+    /// re-derived in place, not erased. Returns `kHolds` when the generation still matches.
     [[nodiscard]] StampRecheck post_stamp_factor_recheck(const std::string& username,
                                                          const std::string& token_hash,
                                                          std::int64_t stamped_gen);

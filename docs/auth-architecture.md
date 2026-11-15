@@ -115,7 +115,7 @@ of the HA "safe-to-scale" gate. The design:
   validation captures the epoch before any store read and inserts its session at
   the tail only if it is unchanged (ADR-0012 section 4, rule 2). On a mismatch the
   session is still returned to that one request, uncached. The mint insert is
-  deliberately unguarded: the post-mint recheck re-reads the role, the credential hash and the active state and erases
+  deliberately unguarded: the post-mint recheck re-reads the role, the credential hash and the active state (and, for a mint carrying a bound MFA proof, the factor generation) and erases
   this replica's entries when they changed. (3) `AuthManager::reactivate_user`
   erases the account's cached sessions and wipes its durable ones first (also for
   an account that is already active), erases the cache a second time once that wipe
@@ -2784,9 +2784,12 @@ the same audit behavior described below, not a silent no-op:
   account is already active (a retry after a failed mirror write signs the
   user out again). If that session removal does not persist, the call answers
   `500` and the account stays inactive. A sign-in after the reactivation is a
-  new sign-in, with one residual: a login whose first factor was verified
-  before the deactivation can still mint after the reactivation, because the
-  post-mint recheck compares only role, credential hash and active state.
+  new sign-in, with one residual: a login that carries no bound MFA proof,
+  whose first factor was verified before the deactivation, can still mint after
+  the reactivation, because the post-mint recheck compares the role, the
+  credential hash and the active state, and for a login that carries a bound
+  MFA proof also the factor generation (a deactivation changes it, so such a
+  login is denied).
   Deactivation clears the TOTP secret and recovery codes, so a pending MFA
   login cannot complete unless the user re-enrols inside the pending window
   (`--mfa-login-pending-secs`, default 120).
