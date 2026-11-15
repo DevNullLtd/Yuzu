@@ -1006,8 +1006,8 @@ epoch, a same-epoch lower sequence, an equal pair and an unpaired event against 
 are refused and flag the row; once it is stale the next such event re-bases the clock and is
 applied by arrival, flagged, and a re-base to a lower epoch retires the former epoch so that its
 late events are refused. A pair far above any honest one (`emit_seq` of 2^40 or more, or a
-`boot_epoch` over ten years past receipt) is held at first delivery and never applied to the
-census. The server owns the comparison and the recovery path for a pinned or lost epoch; the
+`boot_epoch` over ten years past receipt) is dropped at ingest like an out-of-range one and the
+event is judged as an unpaired event. The server owns the comparison and the recovery path for a pinned or lost epoch; the
 operator reading is in `docs/user-manual/guaranteed-state.md`, "Running the pair regime".
 Acceptance list for the server change: see the UP-14 entry in `docs/spark-flip-gate.md` and
 issue #5690.
@@ -1330,7 +1330,7 @@ census write failed stays stored with `projection_pending`, and a redelivery of 
 stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Schema v5 (UP-14) stores the
 event's `(boot_epoch, emit_seq)` pair on the event row and the census row (NULL when
 unpaired), adds the per-agent table `guardian_agent_order`, and rejects a half-set or
-out-of-range pair at ingest as unpaired, counted, and holds an implausible one; the census
+out-of-range or implausible pair at ingest as unpaired, counted; the census
 verdict is decided by the pair so stored (see section 7.1). A census-bearing first delivery locks the agent's order row first, in its own
 savepoint (a repair runs no such step: it takes the order row `FOR SHARE` to read the pair clock and never writes the clock or a counter). Under one `census_upsert`
 savepoint a writer then locks every pending event of the pair in `ingest_seq` order in one

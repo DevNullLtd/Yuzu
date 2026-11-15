@@ -367,8 +367,7 @@ row first).
 
 - The order step gives every census-bearing first delivery or batch row a mode from the agent's pair clock
   (`unpaired`, `unpaired_held`, `current`, `current_straggler`, `current_rebase`, `refused_regression`,
-  `refused_retired`, plus `implausible_held`, set by the store from the ingest boundary and never returned by
-  the SQL), and the census statements decide the row by it. A mode label the code does not know, or a NULL,
+  `refused_retired`), and the census statements decide the row by it. A mode label the code does not know, or a NULL,
   is a failure of the step, never a default. Two unpaired events keep the key rule. A decision that is not a
   clean in-order pair apply flags the row. The decision label of each census write is a metric and a log
   line, never an input to a row decision.
@@ -379,7 +378,9 @@ row first).
 - A Repair (a redelivery of an event stored with pending evidence) runs no order step and never writes the
   pair clock or a counter. It runs the idempotent Ensure, takes the agent's order row `FOR SHARE` as its
   first lock and reads the mode without writing it, inside its `census_upsert` savepoint under the step's 1 s
-  lock bound (restored before the census statements); a stale clock gives `current_straggler` or
+  lock bound (restored before the census statements) and under a 2 s `statement_timeout` for all of its
+  census statements (`kRepairStatementTimeoutMs`, set and restored the same way, P-1): a statement over it
+  fails with SQLSTATE 57014 and the Repair is Failed with its evidence kept; a stale clock gives `current_straggler` or
   `refused_regression` where a first delivery would re-base. Everything it did to the order table is undone
   by every exit that projects nothing, so a blank order row survives only a Repair that touched the census
   row. A blank row is never "currently unordered". The consequence recorded in the 2026-11-12 Update stands:
@@ -398,10 +399,22 @@ row first).
   index, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
   holding such a pending unpaired event. It is not part of this change.
 - An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
-  more than ten years past receipt, is `implausible` and is HELD at first delivery whatever the clock says:
-  stored with pending evidence, the census untouched, counted as an unpaired event for the agent. The flag is
-  decided once, at first delivery, and is not stored, so a Repair judges the event as an unpaired one: the
-  hold is not durable. A batch cannot hold an event and rolls back instead.
+  more than ten years past receipt, is `implausible`. The pair is dropped at the ingest boundary, exactly as an
+  `out_of_range` one is, and the event is judged as an unpaired event at first delivery: its stored pair is
+  NULL, the agent's order row counts it as an unpaired event and its pair clock does not move, and it takes
+  the normal unpaired census write (flagged by the pair rules when it is refused or replaces a paired
+  verdict). The reason is counted on `yuzu_server_guardian_pair_rejected_total{reason="implausible"}`. There
+  is no held state and no pending row: `implausible` is decided in one place, the ingest classification.
+  Revised 2026-11-15, by owner ruling after governance Gate 3: this bullet first recorded a HOLD (stored
+  pending, census untouched, a Repair judging the stored unpaired event later). That was an
+  agent-triggerable, un-reapable pending row (any enrolled agent, any rule id; the reaper skips pending
+  rows) with no durable ordering effect, so it was replaced by "judged as unpaired at first delivery".
+- The seen-events subquery of the census upsert is `max(s.ingest_seq + 0)` (P-1), a deliberate,
+  semantics-preserving departure from the validated prototype text: with the bare column the planner can scan
+  `idx_gse_ingest_seq` backward with a heap filter on `event_id`, which reads every event newer than the
+  oldest seen one (seconds at millions of events for thousands of old pending events of one pair, under the
+  agent order row a Repair holds). The departure was re-validated against the prototype and the plan
+  differential, and a plan test pins the shape.
 - "Currently unordered" has one definition, in SQL (UP-5): the latest accepted unpaired event is later than
   the pair clock, or the pair clock is recorded more than five minutes in the database's future. The database
   decides it on every read, so it can change with no event; no C++ copy exists.
