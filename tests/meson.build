@@ -353,6 +353,8 @@ agent_test_exe = executable(
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
+    'unit/test_firewall_quarantine_parsers.cpp', # PRQ.1: pure quarantine core (allow set, exception grammar, verify/rollback, generations, phases, TTL, state, argv plans), fake seam, unguarded on every OS
+    'unit/test_firewall_quarantine_live.cpp', # PRQ.1: the built firewall plugin's action boundary ([agent][firewall_quarantine], refuses before any OS call, every OS) plus hidden [.] real-host runs; those need YUZU_FIREWALL_QUARANTINE_LIVE=1 and root/admin
     'unit/test_agent_csr.cpp',
     'unit/test_tls_policy.cpp', # #4722: shared TLS cipher policy (common/include/yuzu/tls_policy.hpp), pure
     'unit/test_enrollment_token_file.cpp', # --enrollment-token-file: shared token shape + text parser (common/include/yuzu/enrollment_token_shape.hpp), the no-follow reader and source precedence (agents/core/include/yuzu/agent/enrollment_token_file.hpp)
@@ -1166,7 +1168,10 @@ agent_shard_specs = {
   'B': ','.join(_agent_b_terms),
   'C': _agent_a_excl + _agent_b_excl + agent_shard_suffix,
 }
-agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin]
+# firewall_plugin_lib (agents/plugins/firewall/meson.build): the [firewall_quarantine]
+# action-boundary cases load the real plugin by path and FAIL when it is missing under
+# `meson test`, so the shards must build it first.
+agent_shard_deps = [reserved_name_fixture_plugin, invalid_name_fixture_plugin, retired_name_fixture_plugin, abi3_fixture_plugin, firewall_plugin_lib]
 # Per-shard meson timeouts. Only shard C is raised (#7135); A and B keep the old single
 # entry's 240s, because only C was measured to need more.
 #
@@ -1673,6 +1678,8 @@ if build_server
       'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
       'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_bounded_resolver.cpp', # bounded resolver + resolver error classifier
+      'unit/server/test_resolver_host_admission.cpp', # #7153: the lookup admission in front of the OIDC name lookup: refusal memory (keys, TTL, caps, which outcomes arm a name), per-name limit, lease lifetime, and the doc-figure pin
+      'unit/server/test_resolver_pool_metrics.cpp', # #7153 PR-4b: resolver pool metrics: register pre-seeds all five outcomes at 0, publish mirrors deltas, a baseline hides earlier history, a reset never goes negative
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_sha256_steps.cpp',
       'unit/server/test_oidc_routes.cpp',
@@ -1912,7 +1919,8 @@ if build_server
       'unit/server/test_mcp_tools_containment.cpp', # Seam PR2: list_quarantined_devices registry tool (gate, scope, degrade, audit, byte identity with the REST body)
       'unit/server/test_mcp_tools_crypto.cpp',     # #6558 PR2: the seven /crypto MCP tools (gate, confinement, audit-first layout write, retry hints, unwired providers)
       'unit/server/test_mcp_tools_dex.cpp',        # #6087: get/set/reset_dex_score_policy registry tools (gates, tiers, approval, If-Match/dry_run, audit-first, audit_persisted, retry hints, unwired providers)
-      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, scanned from server.cpp at test run time
+      'unit/server/test_revocation_source_degrade_wiring_lexical.cpp', # #7153: LEXICAL check (not behaviour) that server.cpp pre-seeds the CRL source degrade reasons (dns_busy included) and increments the counter under the reason it is handed, and that the service spells dns_busy for both lookup refusals, scanned from the sources at test run time
+      'unit/server/test_delivery_pool_metrics_wiring_lexical.cpp', # #7153: LEXICAL pin (not behaviour) that server.cpp registers the delivery pool metrics once and publishes each store under its own label from its own accessors, and that the OIDC resolver pool publisher is registered once and published once on the same tick and `bounded_resolve` counts through `note_outcome` once, scanned from server.cpp and bounded_resolver.hpp at test run time
       'unit/server/test_hw_ci_detail_wiring_lexical.cpp', # #7163: LEXICAL pin (not behaviour) that the hw_ci_detail_fn closure in server.cpp is the one handed to the REST routes and the MCP tools, and that CiRead::WithSections selects get_device_ci_with_sections, scanned from server.cpp at test run time
       'unit/server/test_store_wiring_order.cpp', # #3261: every agent_service_/gateway_service_ store setter runs after its member's construction, mechanically scanned from server.cpp at test run time
       'unit/server/test_presence_departure.cpp', # #5678: the one departure->presence mirror both disconnect paths share (pure helper cases)
@@ -4287,6 +4295,18 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
   timeout: 30,
 )
 
+# firewall containment regression (privilege model step 6): the guards of
+# scripts/test/instructions_firewall_containment.py -- the refusals (SSH, console flag, limit,
+# agent, host binding, login), the status/answer parsing and the whole apply/release flow against a
+# recording fake. No network and no firewall change; the live apply/release needs a UAT stack on a
+# local host.
+test('Firewall containment regression guards (privilege model step 6)',
+  _python3_test,
+  args: [files('test_firewall_containment_ceremony.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # virtualization `wsl`: static lexical gate over the Windows shell's wiring -- the one
 # with_user_hive call (default-on hive-file guard, no check argument), no HKEY_USERS enumeration,
 # REG_OPTION_OPEN_LINK on every registry open, and the SID-bearing mount name only in the agent
@@ -4307,6 +4327,55 @@ test('virtualization wsl Windows shell wiring lexical gate',
 test('agent OTA/ctx-slot wiring lexical gate (#2182)',
   _python3_test,
   args: [files('test_agent_ota_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Static lexical gate pinning that agent.cpp's yuzu_register_trigger still returns -5 when the
+# trigger engine reports a full table (no unit test can call the bridge: PluginContextImpl is
+# TU-local, no seam) and that TriggerEngine::register_trigger keeps its bool return. Carries its
+# own in-memory mutation self-test. No build required; one process, well under a second.
+test('agent trigger-register bridge wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_trigger_register_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# UP-8 (firewall containment): static lexical gate pinning how agent.cpp publishes the live control
+# peer to plugins as "agent.server_peer" (PluginContextImpl and AgentImpl are TU-local, no seam): the
+# atomic member, the get_config branch that reads it (never the unsynchronised config map), the
+# conversion of ClientContext::peer() through grpc_peer_literal before any per-plugin store, and the
+# Register-success call. Carries its own in-memory mutation self-test. No build required; one process,
+# well under a second.
+test('agent server-peer publish wiring lexical gate (UP-8)',
+  _python3_test,
+  args: [files('test_agent_server_peer_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Firewall containment (packaged-Linux privilege refusal): static lexical gate pinning that each of
+# do_quarantine / do_release / do_quarantine_allow / do_repair evaluates privilege_refusal() and
+# returns its refusal BEFORE constructing Containment, and that privilege_refusal()'s Linux branch
+# still calls fq::linux_privilege_refusal with the euid and PR_GET_NO_NEW_PRIVS reads. The helper is
+# `#if defined(__linux__)`, so no macOS or Windows build observes a dropped or reordered call. Carries
+# its own in-memory mutation self-test. No build required; one process, well under a second.
+test('firewall privilege-refusal call-site wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_privilege_refusal_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# Firewall containment (Windows release guard): static lexical gate pinning that WinLeg::remove()
+# returns release_incomplete when a profile's default action did not restore BEFORE it deletes the
+# allowance rules (a host left block/block with no allowance otherwise). The guard sits in the
+# `_WIN32` COM leg, so no macOS or Linux build observes it deleted or moved below the removal loop.
+# Carries its own in-memory mutation self-test. No build required; well under a second.
+test('firewall Windows release-guard wiring lexical gate',
+  _python3_test,
+  args: [files('test_firewall_release_guard_wiring_lexical.py')],
   suite: 'agent',
   timeout: 30,
 )
