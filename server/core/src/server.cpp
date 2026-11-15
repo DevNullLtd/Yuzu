@@ -100,6 +100,7 @@
 #include "grpc_on_behalf_interceptor.hpp"
 #include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_backend_fleet_tags.hpp" // yuzu.guardian_backend fleet gauge names + HELP (#2240)
+#include "guardian_baseline_fleet_tags.hpp" // Guardian baseline-persistence fleet gauge names + HELP (#5605)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
@@ -3228,6 +3229,15 @@ public:
                           detail::kGuardianIoCeilingReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
                           detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
+        // #5605 baseline-persistence fleet rollup, from the SAME table recompute_metrics clears and
+        // publishes from. Row 0 is a re-statable current gauge (the alerted one); rows 1 and 2 are
+        // monitor-only - see guardian_baseline_fleet_tags.hpp before writing an alert.
+        for (const auto& m : detail::kGuardianBaselineMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianBaselineReportingGauge,
+                          detail::kGuardianBaselineReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianBaselineTagRejectedGauge,
+                          detail::kGuardianBaselineTagRejectedHelp, "gauge");
         // #2240: yuzu.guardian_backend. A categorical {os,backend} partition count plus the two
         // unlabelled meta gauges, all registered from the SAME constants
         // AgentHealthStore::recompute_metrics clears and publishes with
