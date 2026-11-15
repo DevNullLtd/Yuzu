@@ -5420,6 +5420,15 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Implemented write tools
     {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
     {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
+    // execute_instruction stays `confined` although cancel/rerun above are `denied` for the same
+    // pair (#7817 weighed relabelling it). `confined` is true here by mcp_tool_registry.hpp's own
+    // definition: the dispatch chokepoint confines to `exec_visible`, and compose_exec_visible
+    // resolves a service-scoped token's tag scope FIRST and never as unfiltered, a real
+    // service-scope mechanism (cancel/rerun have only admit_confined_mutation, a management-group
+    // one). It is not USABLE by a service-scoped token: perm_fn(Execution, Execute) below refuses
+    // it, since the pair is not on the empty kServiceScopeGlobalSafe. `denied` would move that
+    // refusal to the C8 short-circuit, which answers with its own message and audit row, a
+    // behaviour change for a service-scoped caller that this label is not worth.
     {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
     // #2146: the REST twin gates on the plain, global Execution:Execute pair, which a
     // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so this is
