@@ -1505,7 +1505,8 @@ action runs on demand; the daily sync does not carry it yet.
 
 The version is the file name's, with pre-release and build qualifiers kept in it
 (`my-app-1.0.0-rc1.jar` reads `1.0.0-rc1`); other trailing words are classifiers. The archive is asked
-when the name gives no version or is ambiguous, and its value replaces the name's split only when the
+when the name gives no version or is ambiguous (a word follows the version that is not a known
+qualifier, such as a classifier, or the name holds more than one version-like part), and its value replaces the name's split only when the
 file name carries it (`<name>-<version>`, or `<name>_<version>` for a `Bundle-Version`). A `pom` version
 is read from the archive's only `pom.properties`, or, when it holds several, from the one whose artifact
 segment equals the archive's name (never by directory order). Known limits: an archive that has no pom

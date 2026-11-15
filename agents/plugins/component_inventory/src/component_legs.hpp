@@ -45,9 +45,10 @@ struct Targets {
 };
 
 /// The machine roots worth walking on this OS, all inside the machine allowlist of
-/// installed_software_v3.cpp (kMachineRoots). Linux: /opt, /usr/share/java, /usr/lib/jvm,
-/// /usr/local/lib, /usr/local/share, /usr/share/maven. macOS: /Applications, /Library/Java,
-/// /usr/local, /opt/homebrew.
+/// installed_software_v3.cpp (kMachineRoots), in walk order: cheap roots first, because the walk has
+/// one entry budget that a large /opt or /Applications can spend. Linux: /usr/lib/jvm,
+/// /usr/share/java, /usr/share/maven, /usr/local/lib, /usr/local/share, /opt. macOS: /Library/Java,
+/// /usr/local, /opt/homebrew, /Applications.
 [[nodiscard]] std::vector<std::string> candidate_roots();
 
 /// Pure. Keeps the `candidates` that are not on or under one of `network_mount_points` (a segment

@@ -128,8 +128,11 @@ inline std::expected<ZipTail, ZipError> find_central_directory(std::span<const s
         return std::unexpected(ZipError::not_zip);
 
     // Scan backwards. A candidate counts only if its comment length lands
-    // exactly on the end of the buffer, so a signature planted inside the
-    // archive comment (or in entry data) is skipped, not followed.
+    // exactly on the end of the buffer, so a planted signature whose length
+    // does not land on the end is skipped. The candidate nearest the end of
+    // the file wins, as in java.util.zip.ZipFile (findEND): an end record
+    // planted in the archive comment whose own comment length lands on the end
+    // is taken here as the JVM takes it.
     for (std::size_t pos = tail.size() - kEocdLen + 1; pos-- > 0;) {
         if (u32(tail, pos) != kEocdSig)
             continue;

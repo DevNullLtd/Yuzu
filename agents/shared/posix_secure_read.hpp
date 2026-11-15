@@ -188,7 +188,9 @@ inline bool is_single_component(const char* name) noexcept {
 }
 
 /// openat(), retried while a signal interrupts it (EINTR): a spurious failure would otherwise read
-/// as an unreadable directory or file and constrain a whole answer.
+/// as an unreadable directory or file and constrain a whole answer. Every open in this header goes
+/// through it (AT_FDCWD for the path forms, where openat is open). No test injects EINTR: that needs a
+/// syscall seam this leaf header does not have (the read loop below retries the same way).
 inline int openat_retry(int dir_fd, const char* name, int flags) {
     int fd;
     do {
@@ -288,7 +290,7 @@ inline DirOpen open_dir(const std::string& path, Leaf leaf) {
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_dir_open(::open(path.c_str(), detail::dir_flags(leaf)));
+    return detail::finish_dir_open(detail::openat_retry(AT_FDCWD, path.c_str(), detail::dir_flags(leaf)));
 }
 
 /// Open the directory at `path`; the leaf is not followed (intermediates are).
@@ -314,7 +316,7 @@ inline FileRead read_file(const std::string& path, std::size_t cap, Leaf leaf) {
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_file_open(::open(path.c_str(), detail::file_flags(leaf)), cap, leaf);
+    return detail::finish_file_open(detail::openat_retry(AT_FDCWD, path.c_str(), detail::file_flags(leaf)), cap, leaf);
 }
 
 /// Read the regular file `name` under `dir_fd` up to `cap` bytes; `leaf` selects whether a symlink is followed.
@@ -325,7 +327,7 @@ inline FileRead read_file_at(int dir_fd, const char* name, std::size_t cap, Leaf
         out.err = EINVAL;
         return out;
     }
-    return detail::finish_file_open(::openat(dir_fd, name, detail::file_flags(leaf)), cap, leaf);
+    return detail::finish_file_open(detail::openat_retry(dir_fd, name, detail::file_flags(leaf)), cap, leaf);
 }
 
 /// Read the regular file at `path` (leaf not followed) up to `cap` bytes.

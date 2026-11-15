@@ -172,7 +172,10 @@ public:
             out.error = true;
             out.entries.clear();
         }
-        // readdir order is the filesystem's; sorted, the same tree keeps the same rows when a cap bites.
+        // Sorting makes the order the walk consumes a listing independent of readdir order, so the
+        // scan-wide caps (entry budget, row quotas) cut the same rows on the same tree. It runs after the
+        // per-directory cut, so a listing truncated at max_dir_entries still holds whichever entries
+        // readdir returned first.
         std::ranges::sort(out.entries, {}, &DirEntry::name);
         return out;
     }

@@ -122,6 +122,9 @@ constexpr std::size_t extend_qualifiers(std::string_view stem, std::size_t end) 
 /// Index of the '_' in an OSGi-style name_<major>.<minor>.<micro>[.qualifier][-build], or npos. The
 /// three numeric segments must follow the '_', the rest of the stem must be version text, and no later
 /// '-' may open a dotted digit-led token (that is a Maven-style version, e.g. a_1.2.3-api-2.0).
+/// Limit: a trailing '-word' after an OSGi version stays in the version, so a Maven-style classifier on
+/// an OSGi-style name (bundle_1.2.3-sources) reads 1.2.3-sources, exact; kept because '-' is legal in
+/// an OSGi qualifier (1.0.0.v2023-r5).
 constexpr std::size_t osgi_split(std::string_view stem) noexcept {
     for (std::size_t u = stem.find('_', 1); u != std::string_view::npos; u = stem.find('_', u + 1)) {
         std::size_t p = u + 1;
@@ -220,6 +223,9 @@ inline std::optional<JarName> parse_jar_filename(std::string_view filename) {
             continue; // classifier such as 64bit after a real version
         start = i;
         weak = !strong;
+        // A weak candidate is not extended here: a numeric tail after it must stay visible as a later
+        // strong candidate (foo-64bit-1.0 reads foo-64bit / 1.0, not foo / 64bit-1.0). It is extended
+        // after the loop, only if it is still the choice.
         end = weak ? e : extend_qualifiers(stem, e);
         i = end - 1; // resume at the '-' that closed the version
     }

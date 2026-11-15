@@ -421,6 +421,21 @@ TEST_CASE("component_fs_posix: list types every entry from d_type", "[runtime][c
     CHECK(cut.truncated);
 }
 
+TEST_CASE("component_fs_posix: list returns entries sorted by name", "[runtime][component_inventory][fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "d"));
+    for (const char* n :
+         {"m.jar", "c.jar", "x.jar", "a.jar", "t.jar", "f.jar", "z.jar", "b.jar", "q.jar", "h.jar", "k.jar"})
+        write_file(t.root / "d" / n, "x");
+
+    const auto r = plain_ops().list((t.root / "d").string(), 100);
+    CHECK_FALSE(r.error);
+    CHECK(r.entries.size() == 11);
+    // MUTATION: without the sort in the listing this fails wherever readdir is not name-ordered (APFS),
+    // and the scan-wide caps would cut different rows on the same tree.
+    CHECK(std::ranges::is_sorted(r.entries, {}, &DirEntry::name));
+}
+
 TEST_CASE("component_fs_posix: list refuses a path that is missing, relative or holds a NUL",
           "[runtime][component_inventory][fs_posix]") {
     Tree t;

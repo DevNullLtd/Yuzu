@@ -434,15 +434,18 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   (`my-app-1.0.0-rc1.jar` reads `1.0.0-rc1`, `spring-core-6.0.0-M1.jar` reads `6.0.0-M1`), while
   other trailing words are classifiers (`netty-...-4.1.77.Final-linux-x86_64.jar` reads
   `4.1.77.Final`; `guava-31.1-jre.jar` reads `31.1` from the name alone). When the name gave no
-  version, or is ambiguous, the scan asks the archive: its `pom.properties`, then its manifest. An
+  version, or is ambiguous (a word follows the version that is not one of the qualifiers above, such
+  as a classifier, or the name holds more than one version-like part), the scan asks the archive:
+  its `pom.properties`, then its manifest. An
   archive value replaces the name's split only when the file name carries it (`guava-31.1-jre.jar`
   with a pom version `31.1-jre` reads `31.1-jre`, source `pom`). A `pom` version is read from the
   archive's only `pom.properties` or, when it holds several, the one named for the archive. An
   archive with no pom of its own that bundles exactly one dependency's reads that dependency's
-  version, but only when its file name carries that version too, so `myapp-2.0.jar` is not affected.
+  version, when its file name has no version (`app.jar`, `ROOT.war`); a name that carries a version
+  keeps it (`myapp-2.0.jar` is not affected) unless the archive's value sits in the name.
   A nested row, and an archive with no pom or manifest, take the file name's word.
 - **Bounds.** One scan stops at 400,000 directory entries or 45 seconds, reads at most 32
-  directory levels, 50,000 entries per directory, 3,000 rows per application folder and 20,000 rows
+  directory levels, 50,000 entries per directory, 3,000 rows per application folder under each root and 20,000 rows
   in all, and reads at most a 16 MiB archive directory and 64 KiB per version entry.
 - **When the list may be incomplete.** The status row reads `constrained` when any bound was
   reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`), a directory
