@@ -5,7 +5,6 @@
 #include "echo_tree_routes.hpp"
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
-#include "dispatch_denial_text.hpp" // describe_dispatch_denial: the status of a refused push dispatch (#7114)
 #include "http_route_sink.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial, detail::a4_error, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -1472,13 +1471,9 @@ void EchoTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn
                     audit, req, res, "echo.sources.configure", "failure", "Agent", device,
                     std::format("dispatch_denied reason={} {}", token, unsent));
                 // 403 for the permission-class reasons; 500 for unclassified / ambiguous, a
-                // catalogue fault on this server-chosen pair (respond_echo_dispatch_denied in
-                // dashboard_routes.cpp maps the same way).
-                const auto cls = describe_dispatch_denial(outcome.denied->reason, "echo",
-                                                          "configure", *outcome.denied,
-                                                          DenialSurface::kRest)
-                                     .cls;
-                res.status = cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+                // catalogue fault on this server-chosen pair (the same mapping as
+                // respond_echo_dispatch_denied in dashboard_routes.cpp, injected by server.cpp).
+                res.status = denial_status_fn_ ? denial_status_fn_(outcome) : 500;
                 const std::string message = std::format(
                     "Not permitted: {}. {} of {} change(s) were sent, the rest were not.", token,
                     applied, total);

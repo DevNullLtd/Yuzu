@@ -216,6 +216,14 @@ public:
         const std::string& target_id, const std::string& detail)>;
     void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
 
+    /// HTTP status of a push whose dispatch the chokepoint refused (`ConfinedDispatchOutcome::denied`):
+    /// 403 for the permission-class reasons, 500 for an unclassified or ambiguous catalogue fault.
+    /// Injected so this TU stays store-definition-free (the classifier lives in
+    /// dispatch_denial_text.hpp, whose closure reaches the store headers); server.cpp binds it.
+    /// Unset = 500.
+    using DenialStatusFn = std::function<int(const ConfinedDispatchOutcome&)>;
+    void set_denial_status_fn(DenialStatusFn fn) { denial_status_fn_ = std::move(fn); }
+
     /// External colleague review on PR #4143 (Doomgoose, BLOCKING, confirmed
     /// against ADR-0017 INV-4/INV-7 by direct source inspection): the two REST
     /// device-picker twins' PREVIOUS design intersected `fleet_read_fn_`'s
@@ -348,6 +356,7 @@ private:
     CallerFn caller_fn_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     AuditAsSessionFn audit_as_session_fn_;
+    DenialStatusFn denial_status_fn_;
 
     std::mutex cache_mu_;
     std::unordered_map<std::string, ReconEntry> cache_;

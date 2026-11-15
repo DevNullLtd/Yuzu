@@ -5342,7 +5342,7 @@ void check_same_position(const std::string& legacy, const std::string& rewritten
         REQUIRE_FALSE(want.at(member).empty());
     want["held"][0] =
         registry_detail::candidate_to_json(registry_detail::candidate_from_json(want["held"][0]));
-    CHECK(want["held"][0]["d"] == kRegistryMaskedData);
+    CHECK(want["held"][0]["d"] == std::string{kRegistryMaskedData});
     CHECK(nlohmann::json::parse(rewritten) == want);
 }
 

@@ -21413,6 +21413,14 @@ private:
         echo_tree_routes_->set_metrics(&metrics_); // yuzu_echo_sources_push_total
         // The capture-sources push stamps its rows from the session it resolved (never re-resolved).
         echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // A refused push dispatch answers 403 (permission-class reasons) or 500 (catalogue fault),
+        // the mapping respond_echo_dispatch_denied uses; injected so the route TU stays store-free.
+        echo_tree_routes_->set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
         // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's

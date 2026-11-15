@@ -12,6 +12,7 @@
 
 #include "authz_gates.hpp" // authz::FleetReadGate (#4027 fix round, CDX-P1-01/K4)
 #include "authz_model.hpp"
+#include "dispatch_denial_text.hpp" // describe_dispatch_denial: the mapping server.cpp injects
 #include "secure_random.hpp"
 #include "echo_tree_routes.hpp"
 #include "openapi_spec_access.hpp"
@@ -313,6 +314,13 @@ struct EchoHarness {
                        const std::string& tid, const std::string& d) -> bool {
                     return record_audit({a, r, tid, d, s.username});
                 });
+        // The status server.cpp injects for a refused push dispatch (403 permission-class, 500 otherwise).
+        routes.set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
         routes.set_metrics(&metrics);
         routes.set_fleet_read_fn(fleet_read); // #4027 fix round — REST twins' sole gate
         routes.set_all_devices_fn(all_devices); // #4143 review fix — REST twins' sole row source

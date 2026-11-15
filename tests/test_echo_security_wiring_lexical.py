@@ -34,6 +34,7 @@ ROUTES = ROOT / "server" / "core" / "src" / "echo_tree_routes.cpp"
 SERVER = ROOT / "server" / "core" / "src" / "server.cpp"
 PUSH_ROUTE = 'sink.Post("/fragments/echo/capture-sources/push"'
 WIRING = "echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn())"
+WIRING_STATUS = "echo_tree_routes_->set_denial_status_fn("
 HINT = (" (this gate pins the #7075/#3864 wiring; if the code was legitimately restructured,"
         " update tests/test_echo_security_wiring_lexical.py)")
 
@@ -99,6 +100,9 @@ def problems(plugin_src, routes_src, server_src):
 
     if WIRING + ";" not in s_code:  # as a statement, outside comments and literals
         out.append("server.cpp no longer wires the push's session-bound audit writer")
+    if WIRING_STATUS not in s_code:  # outside comments and literals
+        out.append("server.cpp no longer injects the push's denial status mapping (set_denial_status_fn): "
+                   "a refused dispatch would answer 500 instead of 403")
     return out
 
 
@@ -137,6 +141,8 @@ class EchoSecurityWiringLexical(unittest.TestCase):
             "the push loses the session-bound writer": dict(r=mutate(
                 r, "if (audit_as_session_fn_)", "if (audit_fn_)")),
             "server.cpp stops wiring the writer": dict(s=mutate(s, WIRING + ";", "")),
+            "server.cpp stops injecting the denial status": dict(s=mutate(
+                s, WIRING_STATUS, "echo_tree_routes_->unrelated_setter(")),
             "the wiring survives only in a block comment": dict(s=mutate(
                 s, WIRING + ";", "/* " + WIRING + "; */")),
             "the wiring survives only in a string literal": dict(s=mutate(
