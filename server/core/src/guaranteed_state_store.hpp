@@ -336,6 +336,14 @@ public:
         agent_step_lock_timeout_ms_.store(ms, std::memory_order_relaxed);
     }
 
+    /// The census statements whose PLANS a test pins (P-1), exactly as the store sends them: the
+    /// upsert (`$1`..`$12`) and the fold (`$1`..`$4`). A read of two string constants, no state.
+    struct CensusSqlForTest {
+        const char* upsert;
+        const char* fold;
+    };
+    [[nodiscard]] static CensusSqlForTest census_sql_for_test() noexcept;
+
     /// Test seam for `unrepresented_pending_for_agent` (#7217): while `fn` is set, every call that
     /// reaches the database step invokes it first and returns `std::unexpected` when it returns true,
     /// so a test can fail ONLY this read (the earlier reads on the same request keep working). The

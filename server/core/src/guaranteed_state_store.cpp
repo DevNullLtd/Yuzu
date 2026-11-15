@@ -1811,7 +1811,9 @@ constexpr const char* kCensusLockAll =
 // order step or a Repair's read), $12 the epoch the agent's latest lower-epoch recovery retired
 // (0 or NULL = none). The statements below are the validated v5 text of the UP-14 delivery plan
 // (section 2.5), transcribed from its generator and checked against it by a differential; they
-// are not to be edited by hand-copying a clause.
+// are not to be edited by hand-copying a clause. They are NOT byte-identical to that prototype:
+// `YUZU_CENSUS_SEEN_MAX_SEQ_` below carries one deliberate, semantics-preserving deviation (`+ 0`,
+// P-1), re-derived in the prototype copy and re-checked by the differential.
 #define YUZU_CENSUS_IN_EPOCH_ "$9::bigint"
 #define YUZU_CENSUS_IN_SEQ_ "$10::bigint"
 #define YUZU_CENSUS_MODE_ "$11::text"
@@ -1884,8 +1886,18 @@ constexpr const char* kCensusFold =
 // The highest arrival sequence among the seen (pending) events. The clear below retires the seen
 // events the final row dominates, so their arrival order must be remembered on the row or a later
 // apply with a higher key would clear the doubt they raised (the row tracks `seq_hwm` for this).
+//
+// `max(s.ingest_seq + 0)`, not `max(s.ingest_seq)` (P-1, the one deviation from the validated
+// prototype text; the value is identical). With a plain `max(ingest_seq)` the planner may answer
+// the subquery as a BACKWARD scan of `idx_gse_ingest_seq` with a heap filter on `event_id`, which
+// reads every event newer than the OLDEST seen one: measured 0.5 s at 1.3 M events and 10.9 s at
+// 5.3 M for 10 000 old pending events of one (agent, rule), under the agent order row (a Repair
+// holds it FOR SHARE through this statement), so first deliveries then time out and are stored
+// pending, growing the set. The `+ 0` makes the aggregate argument an expression, not the indexed
+// column, so the index cannot order it and the subquery is a primary-key lookup per seen id.
+// Pinned structurally by the "census plan" test (no backward index scan under the subquery).
 #define YUZU_CENSUS_SEEN_MAX_SEQ_                                                                  \
-    "(SELECT max(s.ingest_seq) FROM guaranteed_state_store.guaranteed_state_events s "             \
+    "(SELECT max(s.ingest_seq + 0) FROM guaranteed_state_store.guaranteed_state_events s "         \
     "WHERE s.event_id = ANY($8::text[]))"
 
 // The apply predicate P: the incoming (key, seq) is above the row's.
@@ -2754,6 +2766,10 @@ agent_order_step(PGconn* conn,
 }
 
 } // namespace
+
+GuaranteedStateStore::CensusSqlForTest GuaranteedStateStore::census_sql_for_test() noexcept {
+    return {kCensusUpsert, kCensusFold};
+}
 
 EventInsertResult
 GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row) {
