@@ -16062,8 +16062,10 @@ FaultWindow fault_window(Collector& got, const std::string& key) {
 ///     it and `set()` reads it only while the object is alive.
 ///   - the PACL from SetEntriesInAclW: `LocalFreed` (the file's LocalAlloc owner), one per
 ///     `set()` call, freed on every path including the early return.
-///   - the DACL on the directory is an effect on the world, not a resource: it is put back
-///     by the destructor, and a failed put-back is reported on stderr (it cannot throw).
+///   - the DACL on the directory is an effect on the world, not a resource: the destructor
+///     replaces it again with a protected one-entry DACL (the original DACL is not
+///     restored), and a failed replacement is reported on stderr with a fixed string (the
+///     case's INFO line names the scratch tree; a destructor cannot throw).
 /// Ctor throw safety: the only fallible allocation is `user_.resize`, and the DACL is
 /// changed by the LAST step (`set(DENY)`, which does not throw), so a throw earlier in the
 /// ctor leaves the directory untouched and every member destroyed by the unwinding.
@@ -16085,8 +16087,9 @@ public:
         if (applied_ && !set(GRANT_ACCESS, FILE_ALL_ACCESS)) {
             // A destructor cannot fail the test; say so, because the scratch tree below this
             // directory will then not be removable.
-            std::fprintf(stderr, "ScratchDenyAcl: could not put back full control on %ls\n",
-                         dir_.c_str()); // c_str() is wchar_t on Windows: no narrowing, no throw
+            std::fputs("ScratchDenyAcl: could not replace the DACL with a full-control one; "
+                       "the scratch tree may not be removable\n",
+                       stderr);
         }
     }
     ScratchDenyAcl(const ScratchDenyAcl&) = delete;
@@ -16127,7 +16130,10 @@ private:
 /// puts each back to its previous state on destruction. Resource ledger: the process-token
 /// HANDLE is `token_` (UniqueHandle, a member); the `was_enabled_` entries point at string
 /// literals; each AdjustTokenPrivileges result is checked, and a failed put-back is reported
-/// on stderr by the destructor. The identity check opens the path
+/// on stderr (a fixed string) by the destructor. `was_enabled_` is reserved to its maximum of
+/// two entries before the first privilege is switched off, so the `push_back` that follows a
+/// switch-off cannot throw and leave a privilege off with nothing recorded to turn it back
+/// on (the one remaining throw-hole of the ctor). The identity check opens the path
 /// with FILE_FLAG_BACKUP_SEMANTICS, which bypasses a directory's DACL while either privilege
 /// is ENABLED (an elevated administrator session has both enabled), so a DENY ACE can only
 /// refuse the open with them off. Process-wide, which is what the mechanism's worker threads
@@ -16136,6 +16142,7 @@ private:
 class ScopedBackupPrivilegesOff {
 public:
     ScopedBackupPrivilegesOff() {
+        was_enabled_.reserve(2); // before any privilege is switched off: see the class comment
         HANDLE raw = nullptr;
         if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw))
             return;
@@ -16149,7 +16156,9 @@ public:
             // A destructor cannot fail the test; a privilege that does not come back is only
             // reported (it affects later cases of this process, never this one).
             if (!adjust(name, true))
-                std::fprintf(stderr, "ScopedBackupPrivilegesOff: could not re-enable %ls\n", name);
+                std::fputs("ScopedBackupPrivilegesOff: could not re-enable SeBackupPrivilege or "
+                           "SeRestorePrivilege\n",
+                           stderr);
         }
     }
     ScopedBackupPrivilegesOff(const ScopedBackupPrivilegesOff&) = delete;
@@ -16403,8 +16412,9 @@ TEST_CASE("File spark (real mechanism): a replacement directory the agent may no
     ScratchDenyAcl deny(tree.parent);
     REQUIRE(deny.applied());
     // Taken before the interval is shortened, so no verification or retry has run since the
-    // baseline: the counter then moves by exactly two backend deferrals, the lost path's
-    // drain (defer_backend_retry_locked, log off) and the refused re-attach below.
+    // baseline: the counter then moves by at least two backend deferrals (the assertion
+    // below is a lower bound), the lost path's drain (defer_backend_retry_locked, log off)
+    // and the refused re-attach below.
     const auto backend0 = verify_counter(*raw, &FileMechanismDebugCounters::probe_backend_failed);
 
     set_verify_interval(*raw, 30ms);
@@ -16429,12 +16439,12 @@ TEST_CASE("File spark (real mechanism): a replacement directory the agent may no
     engine.stop();
 }
 
-TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never drains is "
-          "counted once, and the watch recovers when the completion finally arrives "
+TEST_CASE("File spark (real mechanism): a lost path whose cancelled read never drains "
+          "(hook-held completion) is counted once, and the watch recovers when the completion finally arrives "
           "(#5719 item 5)",
           "[spark][mechanism][windows][5719]") {
-    // completion_suppress_hook swallows the cancelled read's aborted completion, as if the
-    // OS never delivered it. Model limit: the swallowed read is no longer outstanding, so
+    // "Never drains" here means a HOOK-HELD completion: completion_suppress_hook swallows the
+    // cancelled read's aborted completion, as if the OS never delivered it. Model limit: the swallowed read is no longer outstanding, so
     // stop()'s cancel-and-reap does not wait for it; the real-stuck shutdown path (a
     // 2 s drain wait, then quarantine) is not exercised here.
     DeafWatchTree tree("path_lost_stuck");
@@ -16683,9 +16693,15 @@ TEST_CASE("File spark (real mechanism): a throw while the lost path's cancelled 
     REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Recovered) >= 1; },
                        kDeafBound));
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::pass_failed) >= 1);
-    // The failed-completion unwind arm defers the retry like the ordinary drain does, so its
-    // wait is not a slow establishment either (the health grace is spent), and the fault
-    // reason stays the one detection stamped.
+    // The failed-completion unwind arm defers the retry through defer_admission_locked (the
+    // 50 ms admission seed), where the ordinary drain uses defer_backend_retry_locked (the 30 s
+    // backend base); only the grace handling is shared: the lost path's wait is not a slow
+    // establishment (the health grace is spent), and the fault reason stays the one detection
+    // stamped. The discriminating check is `slow_op_total == slow0`: the overwrite it would
+    // otherwise show lands at the next sweep, and the sweep's slow-establishment count is what
+    // moves. The `first_detail(Faulted)` line below only reads the FIRST Faulted event, which
+    // was already reported before the throw, so it cannot see an overwrite and is NOT credited
+    // with covering one; it pins that the first event carries the detection reason.
     CHECK(first_detail(got, key, SparkEventKind::Faulted) == kReasonLost);
     CHECK(raw->stats().slow_op_total == slow0);
 
