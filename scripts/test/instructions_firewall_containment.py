@@ -110,9 +110,11 @@ def say(*args, **kw) -> None:
 
 
 # What to run on the host when the ceremony cannot confirm a release (the names are the plugin's own).
-HAND_RELEASE = ("Linux: sudo nft delete table inet yuzu_quarantine, or without nft flush and delete the "
-                "yuzu-fwq-* iptables chains and the jumps to them; macOS: sudo pfctl -a "
-                "com.apple/000.yuzu_quarantine -F all; or dispatch firewall.release from the dashboard")
+HAND_RELEASE = ("dispatch firewall.release from the dashboard (the plugin's own undo; a rule removed by hand "
+                "while its record is still active is re-applied within 60 s). Only when the agent cannot be "
+                "reached: stop the agent service first, then Linux: sudo nft delete table inet yuzu_quarantine "
+                "(without nft: delete the yuzu-fwq-* chains and the jumps to them, in iptables and ip6tables), "
+                "macOS: sudo pfctl -a com.apple/000.yuzu_quarantine -F rules -F nat")
 
 
 def signal_note(got: list) -> str:
@@ -451,10 +453,11 @@ def main(argv=None) -> int:
             if not_ours:
                 # Somebody else's containment (or one this run did not create): releasing it would lift
                 # a containment the ceremony never applied.
-                say("the containment is not this run's (the apply answered already_active / repaired / "
-                      "incomplete_apply_converged, or something a clean first apply cannot: degraded, busy, "
-                      "refused, update_failed): NOT released. Its own time limit, or a hand release "
-                      f"({HAND_RELEASE}), ends it{signal_note(got)}.", file=sys.stderr)
+                say("NOT released: either the containment is not this run's, or this run's own apply did not take "
+                      "hold (the apply answered already_active / repaired / incomplete_apply_converged, or "
+                      "something a clean first apply cannot: degraded, busy, refused, update_failed). Read "
+                      "quarantine_status; a containment that is there ends at its own time limit or by "
+                      f"({HAND_RELEASE}){signal_note(got)}.", file=sys.stderr)
                 return EXIT_FAIL
             # ALWAYS release, then re-raise whatever stopped the containment step.
             released, proven = release_and_confirm(client, agent_id)

@@ -467,6 +467,11 @@ class Flow(unittest.TestCase):
         self.assertFalse(fc.agent_is_this_host(mine, "a", ["box"], "darwin"))
         self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": "box"}], "a", ["box"], "linux"))
         self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": "localhost."}], "a", ["localhost."]))
+        # the same id under two hostnames is no single host; a bare name beside this host's `.local` name is a clone
+        self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": "box"},
+                                                {"agent_id": "a", "hostname": "other"}], "a", ["box"]))
+        self.assertFalse(fc.agent_is_this_host([{"agent_id": "a", "hostname": "box.local"},
+                                                {"agent_id": "b", "hostname": "box"}], "a", ["box.local"]))
         with mock.patch.object(fc.platform, "node", return_value="n1"), \
                 mock.patch.object(fc.socket, "gethostname", return_value="n2"):
             self.assertEqual(fc.this_host_names(), ["n1", "n2"])  # both names are offered to the binding
@@ -582,6 +587,21 @@ class Flow(unittest.TestCase):
                                    "quarantine": [{}], "release": [REL]})
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(calls.count("release"), 1)
+
+    def test_the_binding_gets_this_machines_os_and_names(self):
+        client = mock.MagicMock()
+        client.get_json.return_value = {"agents": [{"agent_id": "a", "hostname": "box", "os": "linux"}]}
+        with mock.patch.object(fc, "agent_is_this_host", wraps=fc.agent_is_this_host) as bound:
+            self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                           "quarantine": [{}], "release": [REL]}, client=client)
+        self.assertEqual(bound.call_args.args[2:], (["box"], "linux"))
+
+    def test_the_hand_release_text_names_the_plugins_own_objects(self):
+        for name in ("firewall.release", "yuzu_quarantine", "yuzu-fwq-", "com.apple/000.yuzu_quarantine",
+                     "-F rules -F nat", "ip6tables", "stop the agent service"):
+            self.assertIn(name, fc.HAND_RELEASE)
+        self.assertNotIn("-F all", fc.HAND_RELEASE)  # it flushes global states and counters the plugin leaves alone
+        self.assertLess(fc.HAND_RELEASE.index("firewall.release"), fc.HAND_RELEASE.index("nft"))
 
     def test_the_apply_names_its_agent(self):
         err = io.StringIO()
