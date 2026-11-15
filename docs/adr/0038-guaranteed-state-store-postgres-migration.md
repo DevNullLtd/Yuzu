@@ -379,8 +379,9 @@ row first).
   pair clock or a counter. It runs the idempotent Ensure, takes the agent's order row `FOR SHARE` as its
   first lock and reads the mode without writing it, inside its `census_upsert` savepoint under the step's 1 s
   lock bound (restored before the census statements) and under a 2 s `statement_timeout` for all of its
-  census statements (`kRepairStatementTimeoutMs`, set and restored the same way, P-1): a statement over it
-  fails with SQLSTATE 57014 and the Repair is Failed with its evidence kept; a stale clock gives `current_straggler` or
+  census statements (`kRepairStatementTimeoutMs`, set and restored the same way, P-1), a bound that counts
+  lock waits too: a statement over it fails with SQLSTATE 57014 and the Repair is Failed with its evidence
+  kept; a stale clock gives `current_straggler` or
   `refused_regression` where a first delivery would re-base. Everything it did to the order table is undone
   by every exit that projects nothing, so a blank order row survives only a Repair that touched the census
   row. A blank row is never "currently unordered". The consequence recorded in the 2026-11-12 Update stands:
