@@ -1798,8 +1798,8 @@ flip, with a red-first test each:
     change comments, documentation and the ledger only, and were not run on the rig. The rig-run bytes are those of
     `9ae268a80b` (`spark_file.cpp` md5 `809af7a9e2e01387e80db677fd5f883b`, `spark_mechanism.hpp`
     `f74eeae461ece34dc0f3f99a0c95d035`, `test_spark_mechanism.cpp`
-    `9a68a170a1805af64909cb33c5e11723`); `spark_file.cpp` and `spark_mechanism.hpp` now differ from those md5s by comment lines only (checked with a diff that ignores
-    comment lines), and the test file is byte-identical.
+    `9a68a170a1805af64909cb33c5e11723`); `spark_file.cpp` and `spark_mechanism.hpp` now differ from those md5s by
+    comment lines only (checked with a diff that ignores comment lines), and the test file is byte-identical.
     The oracle is the literal one in (e): within a bound the mechanism calls `fault()`. A watch that only drops
     its coverage, or only stops delivering, is a red case, not a pass; delivery after the object is repaired is a
     secondary check. The File cases LATCH on the Collector's Faulted event (the delivery of that `fault()` call)
@@ -2130,9 +2130,10 @@ flip, with a red-first test each:
     are stashed, so a ninth is not swallowed) and the banner states the File mechanism's own 5 s verification sampling.
     **The defect was reproduced.** Three new cases (24 item-5 File cases now, 21 before; the "20 File cases" of fix rounds
     4 to 6 above were the count at those rounds). MSVC AddressSanitizer build (debugoptimized, `/fsanitize=address /MD`,
-    string and vector annotations disabled, `halt_on_error=1`) of the production bytes before the stash cure (`e850a0f387`) plus the
-    new test file: the unwatch case reports a heap-use-after-free, WRITE of size 1, at `spark_file.cpp:3871` in `run()`,
-    freed from `unwatch()` via `SparkEngine::disarm`; the stop case and the ninth-swallow case are green there. The stop
+    string and vector annotations disabled, `halt_on_error=1`) of the production bytes before the stash cure
+    (`e850a0f387`) plus the new test file: the unwatch case reports a heap-use-after-free, WRITE of size 1, at
+    `spark_file.cpp:3871` in `run()`, freed from `unwatch()` via `SparkEngine::disarm`; the stop case and the
+    ninth-swallow case are green there. The stop
     case cannot go red on the old code by itself, because the kernel's write into freed memory is invisible to ASan; it
     pins the contract. On the cured bytes all three are green under ASan, and the whole ASan run reported nothing:
     `[mechanism]` 191 cases (5744 assertions), `[5719]` 66 (2165) and `[4415prA]` 105 (3544) green, the parked Registry case
@@ -2167,11 +2168,11 @@ flip, with a red-first test each:
     nightly leg (main only). The stop case is a contract pin, not an observer: the premature-reap half of the old defect
     (a reap that ended while another watch's read was pending) has no test observer, because a kernel write into freed
     memory is invisible to ASan and no counter or stat shows that no watch is `io_pending` when the reap ends; its
-    closure rests on the cure (a release posts nothing) and on code reading. A fourth case (25 item-5 File cases now,
-    24 before) pins that a release after `stop()` is harmless (no crash, no event, nothing dropped, nothing
-    quarantined; that the stash was cleared is not
-    directly observable). The ninth-swallow case now states "replayed once" against a control, the unswallowed ninth
-    watch, because one change yields two Fired events per completion on the rig, not one; its post-release check on the
+    closure rests on the cure (a release posts nothing) and on code reading. A fourth case (25 item-5 File cases now, 24
+    before) pins that a release after `stop()` is harmless (no crash, no event, nothing dropped, nothing quarantined;
+    that the stash was cleared is not directly observable). The ninth-swallow case now states "replayed once" against a
+    control, the unswallowed ninth watch, because one change yields two Fired events per completion on the rig, not one;
+    its post-release check on the
     hook's call count was trivially true and was removed. Test-only wording and ordering fixes: the park guard is declared
     after the engine, the new waits are scaled for the slow legs, the unwatch case takes its liveness baseline after a
     settle, and the comment on the backup-privilege guard no longer claims the privileges are enabled in an elevated
@@ -2191,17 +2192,19 @@ flip, with a red-first test each:
     test observer, and the existing seams do not reach a stash entry whose watch is removing or re-armed, so they are
     hardening by construction, not a tested guard. **The old bytes in a non-ASan build.** The production bytes before
     the stash cure (`e850a0f387`) with the first stash test file (`be187fea47`, whose unwatch case reproduced the
-    heap-use-after-free under ASan in fix round 8) in the NORMAL build: the unwatch, stop and ninth-swallow cases each passed 5 of 5. So without
-    the sanitizer the old defect is silent in these cases, which is why the counter assertion (on the old bytes there is
+    heap-use-after-free under ASan in fix round 8) in the NORMAL build: the unwatch, stop and ninth-swallow cases each
+    passed 5 of 5. So without the sanitizer the old defect is silent in these cases, which is why the counter assertion
+    (on the old bytes there is
     no drop to count: the entry's watch is dereferenced) and the windows-asan leg are the observers. That the counter
     assertion would turn red on the old design is by construction (the old design has no drop arm), not a measured
     mutation: the old bytes cannot compile against a test that reads `stash_dropped`. Not run: the retired-watch and
     re-armed-watch arms of the lookup (no existing seam reaches them), any TSan run, and the flip-time chaos
-    scenarios. **Corrections to the commit bodies (which are immutable).** The note in the `9ae268a80b` and
-    `b2344dc3c8` commit bodies that a stash push "cannot throw within the reserved capacity" holds only while
-    `replay_` is empty: a second release could push `replay_` past its reserve of 8, and that allocation would
-    happen on the test thread, under the lock, never on the worker. The statement in the `9ae268a80b` commit message
-    that nothing re-arms a swallowed watch in place (a resync builds a new watch with a new id) is unverified for
+    scenarios. **Corrections to the commit bodies (which are immutable).** The note in the `b2344dc3c8` commit
+    body (only that one; the `9ae268a80b` body does not carry it) that a stash push "cannot throw within the reserved
+    capacity" holds only while `replay_` is empty: a second release could push `replay_` past its reserve of 8, and
+    that allocation would happen on the test thread, under the lock, never on the worker. The statement in the
+    `9ae268a80b` commit message that nothing re-arms a swallowed watch in place (a resync builds a new watch with a new
+    id) is unverified for
     its resync part: the cpp-safety code reading of round 9 found that every site that sets `io_pending = true`
     needs a consumed completion or a probe commit. The stricter lookup's removing and `io_pending` predicates are
     by-construction hardening with no test observer (a mutation to id-only keeps every case green). A second entry
