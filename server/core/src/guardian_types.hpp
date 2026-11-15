@@ -118,14 +118,6 @@ struct GuaranteedStateEventRow {
     // pair, not the key. Like the key inputs above they stay OUT of the duplicate identity.
     std::optional<std::int64_t> boot_epoch;
     std::optional<std::int64_t> emit_seq;
-    // UP-9: the ingest boundary withheld a structurally valid pair because it failed the absolute
-    // plausibility bound (`kEmitSeqCeiling`, `kEpochSkewSeconds` in guardian_ingest.hpp). The pair
-    // stays unset (a held event is stored unpaired); this flag is the only record of why. The order
-    // step then decides the event as `implausible_held` whatever the pair clock says, and a first
-    // delivery stores it with pending census evidence and writes no census row. It is decided once,
-    // here: a Repair reads the stored unpaired event and does not see the flag. Not stored, and
-    // OUT of the duplicate identity.
-    bool pair_implausible{false};
 };
 
 struct GuaranteedStateEventQuery {

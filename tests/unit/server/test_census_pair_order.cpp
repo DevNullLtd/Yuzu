@@ -33,6 +33,7 @@
  */
 
 #include "guaranteed_state_store.hpp"
+#include "guardian_ingest.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -2084,71 +2085,115 @@ TEST_CASE("census pair order: with the agent step off a Repair does no Ensure an
     CHECK(pending_count(db.dsn()) == "0");
 }
 
-TEST_CASE("census pair order, UP-9: an implausible pair is ALWAYS held at first delivery and a "
-          "Repair judges the stored unpaired event as any other",
+TEST_CASE("census pair order, UP-9: an implausible pair is dropped at ingest and the event is "
+          "judged as an unpaired one: no hold, no pending row",
           PAIR_TAGS) {
+    // Owner ruling 2026-11-15: an implausible pair is dropped exactly as an out_of_range one is,
+    // at the ingest boundary (`apply_wire_pair`), and the event proceeds as an unpaired event. The
+    // store has no special case for it, so each section builds the event through the real ingest
+    // function and then proves it behaves like a twin event that never carried a pair (agent "u").
     PAIR_FIXTURE();
-    const auto held_event = [&](std::string id, const char* rule, char type, std::int64_t ts) {
-        auto e = stamped(std::move(id), rule, "a", type == 'C' ? kCompliant : kErrored, ts);
-        e.pair_implausible = true; // the ingest boundary withheld the pair
+    namespace ing = yuzu::server::detail;
+    const auto implausible = [&](std::string id, const char* rule, const char* agent,
+                                 const char* type, std::int64_t ts) {
+        auto e = stamped(std::move(id), rule, agent, type, ts);
+        // emit_seq at the ceiling: structurally valid, outside the absolute bound.
+        REQUIRE(ing::apply_wire_pair(e, 7, ing::kEmitSeqCeiling, 1'800'000'000) ==
+                std::optional<ing::PairReject>{ing::PairReject::Implausible});
+        REQUIRE_FALSE(e.boot_epoch.has_value());
+        REQUIRE_FALSE(e.emit_seq.has_value());
         return e;
     };
-    const auto held_count = [&](const char* source) {
-        return repair_outcome_count_text(metrics, source, "held");
+    const auto applied = [&](const char* source) {
+        return repair_outcome_count_text(metrics, source, "applied");
+    };
+    // Deliver `e` and return the decision labels it counted.
+    const auto deliver_counting = [&](const GuaranteedStateEventRow& e) {
+        const DecisionCounts before = decision_counts(metrics);
+        REQUIRE(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+        return decision_delta(before, decision_counts(metrics));
+    };
+    // Agent "a" gets the implausible event, agent "u" the same event with no pair at all.
+    const auto expect_twin = [&](const char* type, std::int64_t ts) {
+        const std::string da = deliver_counting(implausible("ia", "r1", "a", type, ts));
+        const std::string du = deliver_counting(stamped("iu", "r1", "u", type, ts));
+        CHECK(da == du);
+        CHECK(verdict(db.dsn(), "a", "r1") == verdict(db.dsn(), "u", "r1"));
+        CHECK(order_text(db.dsn(), "a") == order_text(db.dsn(), "u"));
+        CHECK(event_pair_text(db.dsn(), "ia") == "-/-");
+        CHECK(pending_count(db.dsn()) == "0");
+        return da;
     };
 
-    SECTION(
-        "no clock at all: stored, pending, the census untouched, the step saw an unpaired event") {
-        REQUIRE(store.insert_event_classified(held_event("h1", "r1", 'E', 1000)).outcome ==
-                EventInsertOutcome::Inserted);
-        CHECK(held_count("first_delivery") == "1");
-        CHECK(pending_count(db.dsn()) == "1");
-        CHECK(verdict(db.dsn(), "a", "r1") == "absent");
-        CHECK(order_text(db.dsn(), "a") == "-|-|-|1|0|0|0|0|0|0");
-        CHECK(event_pair_text(db.dsn(), "h1") == "-/-");
-        CHECK(store.census_proj_failures_total() == 0); // a hold is not a failure
-    }
-    SECTION("a stale clock does not release it, and a verdict already held is not changed") {
-        REQUIRE(store
-                    .insert_event_classified(
-                        with_pair(stamped("p1", "r1", "a", kCompliant, 1000), 5, 10))
-                    .outcome == EventInsertOutcome::Inserted);
-        age_pair_clock(db.dsn(), "a"); // an unpaired event now would NOT be held by the clock
-        REQUIRE(store.insert_event_classified(held_event("h1", "r1", 'E', 1100)).outcome ==
-                EventInsertOutcome::Inserted);
-        CHECK(held_count("first_delivery") == "1");
-        CHECK(verdict(db.dsn(), "a", "r1") == "C - 5/10");
-        CHECK(pending_count(db.dsn()) == "1");
-    }
-    SECTION("the step seam off: still held") {
-        store.set_agent_step_enabled_for_test(false);
-        REQUIRE(store.insert_event_classified(held_event("h1", "r1", 'E', 1000)).outcome ==
-                EventInsertOutcome::Inserted);
-        CHECK(held_count("first_delivery") == "1");
-        CHECK(verdict(db.dsn(), "a", "r1") == "absent");
-        CHECK(pending_count(db.dsn()) == "1");
-    }
-    SECTION("a Repair reuses the stored unpaired event: it is judged as an unpaired one") {
-        const auto h1 = held_event("h1", "r1", 'E', 1000);
-        REQUIRE(store.insert_event_classified(h1).outcome == EventInsertOutcome::Inserted);
-        REQUIRE(pending_count(db.dsn()) == "1");
-        // The redelivery carries the flag again; it must not matter: a Repair decides from the
-        // stored (unset) pair and holds nothing on the flag.
-        CHECK(store.insert_event_classified(h1).outcome == EventInsertOutcome::Redelivered);
-        CHECK(held_count("repair") == "0");
-        CHECK(repair_outcome_count_text(metrics, "repair", "applied") == "1");
+    SECTION("no clock at all: applied as an unpaired event, nothing pending, no failure") {
+        CHECK(expect_twin(kErrored, 1000) == "applied_key");
         CHECK(verdict(db.dsn(), "a", "r1") == "E - -/-");
-        CHECK(pending_count(db.dsn()) == "0");
+        // The order step saw an unpaired event: the unpaired counter moved, the clock did not.
+        CHECK(order_text(db.dsn(), "a") == "-|-|-|1|0|0|0|0|0|0");
+        CHECK(applied("first_delivery") == "2"); // both agents
+        CHECK(store.census_proj_failures_total() == 0);
     }
-    SECTION("the batch cannot hold, so it aborts and stores nothing") {
-        std::vector<GuaranteedStateEventRow> rows{
-            stamped("b1", "r1", "a", kCompliant, 1000),
-            held_event("b2", "r1", 'E', 1010),
+    SECTION(
+        "a fresh pair clock holds it as it holds any unpaired event: the paired verdict stays") {
+        for (const char* agent : {"a", "u"})
+            REQUIRE(
+                store
+                    .insert_event_classified(with_pair(
+                        stamped(std::string("p-") + agent, "r1", agent, kCompliant, 1000), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+        CHECK(expect_twin(kErrored, 1100) == "held_unpaired");
+        CHECK(verdict(db.dsn(), "a", "r1") == "C F 5/10"); // held, and the doubt is flagged
+        CHECK(order_text(db.dsn(), "a") == "5|10|-|1|1|0|0|0|0|0");
+    }
+    SECTION("a stale pair clock: the unpaired event replaces the paired verdict by the key rule") {
+        for (const char* agent : {"a", "u"}) {
+            REQUIRE(
+                store
+                    .insert_event_classified(with_pair(
+                        stamped(std::string("p-") + agent, "r1", agent, kCompliant, 1000), 5, 10))
+                    .outcome == EventInsertOutcome::Inserted);
+            age_pair_clock(db.dsn(), agent);
+        }
+        CHECK(expect_twin(kErrored, 1100) == "transition_to_key");
+        CHECK(verdict(db.dsn(), "a", "r1") == "E F -/-");
+    }
+    SECTION("the step seam off: still applied as an unpaired event") {
+        store.set_agent_step_enabled_for_test(false);
+        CHECK(expect_twin(kErrored, 1000) == "applied_key");
+        CHECK(verdict(db.dsn(), "a", "r1") == "E - -/-");
+        CHECK(order_text(db.dsn(), "a").empty()); // no step, no order row
+    }
+    SECTION("a redelivery of the event is a plain redelivery: nothing pending, nothing repaired") {
+        const auto e = implausible("ia", "r1", "a", kErrored, 1000);
+        REQUIRE(store.insert_event_classified(e).outcome == EventInsertOutcome::Inserted);
+        const std::string order_before = order_text(db.dsn(), "a");
+        CHECK(store.insert_event_classified(e).outcome == EventInsertOutcome::Redelivered);
+        CHECK(applied("repair") == "0");
+        CHECK(pending_count(db.dsn()) == "0");
+        CHECK(order_text(db.dsn(), "a") == order_before);
+        CHECK(verdict(db.dsn(), "a", "r1") == "E - -/-");
+    }
+    SECTION(
+        "the batch path no longer aborts: the implausible row is applied like an unpaired one") {
+        const auto batch_for = [&](const char* agent, bool implausible_pair) {
+            auto second = implausible_pair
+                              ? implausible("b2" + std::string(agent), "r1", agent, kErrored, 1010)
+                              : stamped("b2" + std::string(agent), "r1", agent, kErrored, 1010);
+            return store.insert_events({
+                with_pair(stamped("b1" + std::string(agent), "r1", agent, kCompliant, 1000), 5, 10),
+                second,
+            });
         };
-        const auto r = store.insert_events(rows);
-        CHECK_FALSE(r.has_value());
-        CHECK(query_scalar(db.dsn(), std::string("SELECT count(*) FROM ") + kSchema +
-                                         ".guaranteed_state_events") == "0");
+        const auto ra = batch_for("a", true);
+        const auto ru = batch_for("u", false);
+        REQUIRE(ra.has_value());
+        REQUIRE(ru.has_value());
+        CHECK(*ra == 2);
+        CHECK(*ru == 2);
+        CHECK(verdict(db.dsn(), "a", "r1") == verdict(db.dsn(), "u", "r1"));
+        CHECK(order_text(db.dsn(), "a") == order_text(db.dsn(), "u"));
+        CHECK(pending_count(db.dsn()) == "0");
+        CHECK(event_pair_text(db.dsn(), "b2a") == "-/-");
     }
 }
 

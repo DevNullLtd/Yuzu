@@ -100,9 +100,10 @@ inline constexpr std::int64_t kEpochSkewSeconds = 315'576'000;
 
 /// Why a wire emit-order pair was not taken as a pair (D5). `None` covers both a valid pair and
 /// the legitimate unpaired 0/0 (a journal replay, or an agent whose epoch claim failed); neither is
-/// counted. `Implausible` (UP-9) is a structurally valid pair outside the absolute bound above;
-/// unlike the other two it is HELD, not judged as an unpaired event (see
-/// `GuaranteedStateEventRow::pair_implausible`).
+/// counted. `Implausible` (UP-9) is a structurally valid pair outside the absolute bound above. It
+/// is handled exactly like the other two: the pair is dropped HERE, once, and the event is judged
+/// as an unpaired one at first delivery (stored pair NULL, the normal unpaired census write). No
+/// later stage knows the reason.
 enum class PairReject { None, HalfSet, OutOfRange, Implausible };
 
 /// The wire `(boot_epoch, emit_seq)` pair as validated at the ingest boundary: `paired` is true
@@ -123,15 +124,15 @@ struct WirePair {
 /// (`kEmitSeqCeiling`, `kEpochSkewSeconds`) against `receipt_unix_s`, the server's receipt time in
 /// whole Unix seconds. A pair that fails only the bound is `Implausible` (unpaired, `paired`
 /// false). The two-argument form checks structure only and exists for callers with no receipt; the
-/// ingest boundary never uses it.
+/// ingest boundary never uses it (production ingest must use this overload, or the bound is not
+/// applied).
 [[nodiscard]] WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq,
                                       std::int64_t receipt_unix_s) noexcept;
 
 /// Counter of wire emit-order pairs the ingest boundary withheld, by `reason` (`half_set`,
-/// `out_of_range`, `implausible`). Not a refusal: the event is stored. A `half_set` or
-/// `out_of_range` event is judged as an unpaired one (the census row's stored pair becomes
-/// NULL/NULL only when that unpaired verdict is applied); an `implausible` one is HELD: stored with
-/// pending census evidence, never applied to the census at first delivery. This is separate from
+/// `out_of_range`, `implausible`). Not a refusal: the event is stored. A withheld pair of any of
+/// the three reasons is judged as an unpaired event (the census row's stored pair becomes
+/// NULL/NULL only when that unpaired verdict is applied). This is separate from
 /// `kGuardianEventsRejectedMetric`. Counted once per withheld pair: only when the store reports the
 /// event `Inserted`, so a redelivery of the same event does not count again. Pre-seeded
 /// (server.cpp) from `kGuardianPairRejectReasons` so each series reads 0, not absent. Never
@@ -143,8 +144,7 @@ inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of
 /// Counter of census decisions by `decision` (the closed `CensusDecision` set,
 /// `guardian_pair_mode.hpp`), one per census write whose upsert returned a labelled row and whose
 /// savepoint released: a first delivery, a Repair and a batch row. A key-mode event the key rule
-/// refuses has no label and counts nothing; an implausible held event never reaches the census, so
-/// it counts nothing here (it is on the projection counter as `held`). Best-effort and counted
+/// refuses has no label and counts nothing. Best-effort and counted
 /// before the transaction commits, as the projection counter is. Pre-seeded (server.cpp) from
 /// `kCensusDecisions` so each series reads 0, not absent. Never labelled by agent.
 inline constexpr char kGuardianCensusPairDecisionsMetric[] =
@@ -182,9 +182,9 @@ static_assert(std::string_view(pair_reject_reason(PairReject::HalfSet)) == "half
                                                         std::uint64_t emit_seq);
 
 /// The production form (UP-9): as above with the plausibility bound applied against
-/// `receipt_unix_s`. An `Implausible` pair leaves `boot_epoch`/`emit_seq` unset AND sets
-/// `row.pair_implausible`, which the store reads to hold the event (it is decided once, here, and a
-/// Repair reuses the stored unset pair). Every other outcome clears `row.pair_implausible`.
+/// `receipt_unix_s`. An `Implausible` pair leaves `boot_epoch`/`emit_seq` unset and is returned as
+/// the reason, like `HalfSet` and `OutOfRange`; it is decided once, here, and nothing downstream
+/// distinguishes it (a Repair reads the stored unset pair).
 [[nodiscard]] std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row,
                                                         std::uint64_t boot_epoch,
                                                         std::uint64_t emit_seq,

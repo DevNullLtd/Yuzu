@@ -4387,13 +4387,11 @@ public:
             "yuzu_server_guardian_census_projection_total",
             "Compliance-census projections by source (first_delivery, repair, "
             "batch) and outcome (applied, refused_flagged, refused_noop, "
-            "pending_retired, held, rejected, failed, abandoned). A refused outcome "
+            "pending_retired, rejected, failed, abandoned). A refused outcome "
             "means "
             "the event was dominated by the stored verdict; refused_flagged also "
             "marks the pair order_uncertain. pending_retired is a repair that found "
-            "its evidence already retired; held is a first delivery whose emit-order "
-            "pair was implausible: it is stored with pending evidence and the "
-            "census is not touched (a batch aborts instead); rejected is a write "
+            "its evidence already retired; rejected is a write "
             "refused because the "
             "rule is gone (not a fault); failed is a fault that leaves pending "
             "evidence, except for source batch, whose failure rolls back the whole batch "
@@ -4415,9 +4413,8 @@ public:
                           "server restart.",
                           "counter");
         for (const char* source : {"first_delivery", "repair", "batch"})
-            for (const char* outcome :
-                 {"applied", "refused_flagged", "refused_noop", "pending_retired", "held",
-                  "rejected", "failed", "abandoned"})
+            for (const char* outcome : {"applied", "refused_flagged", "refused_noop",
+                                        "pending_retired", "rejected", "failed", "abandoned"})
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
         metrics_.describe(
@@ -4438,8 +4435,7 @@ public:
             "pair refused: two processes share one epoch) and refused_straggler (a same-epoch "
             "lower sequence refused while the pair clock is fresh). A Repair of a stored event "
             "counts its decision too. An unpaired event the key rule refuses has no label and "
-            "counts nothing; an implausible pair held at first delivery never reaches the census "
-            "(see the projection counter's held outcome). Counted when the projection returns, "
+            "counts nothing. Counted when the projection returns, "
             "after the census_upsert savepoint is released and before the transaction commits, so "
             "a transaction that later rolls back as a whole (a failed later statement or commit) "
             "still counts. Resets on server restart.",
@@ -4452,11 +4448,10 @@ public:
                           "set. out_of_range: a set pair had a value of 2^62 or more. "
                           "implausible: a set pair in range whose emit_seq was 2^40 or more or "
                           "whose boot_epoch was more than ten years past the receipt time. The "
-                          "event is still stored, unpaired; it is not a refusal. A half_set or "
-                          "out_of_range event is judged as an unpaired one; an implausible event "
-                          "is held: stored with pending census evidence and never applied to the "
-                          "census at first delivery (the census row's stored pair becomes NULL "
-                          "only when an unpaired verdict is applied). "
+                          "event is still stored, unpaired; it is not a refusal. An event with "
+                          "a withheld pair of any of the three reasons is judged as an unpaired "
+                          "one (the census row's stored pair becomes NULL only when an unpaired "
+                          "verdict is applied). "
                           "Counted once per withheld pair: a redelivery of the same event does "
                           "not count again. Resets on server restart.",
                           "counter");

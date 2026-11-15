@@ -310,7 +310,6 @@ namespace {
 std::optional<PairReject> apply_validated_pair(GuaranteedStateEventRow& row, const WirePair& wire) {
     row.boot_epoch.reset();
     row.emit_seq.reset();
-    row.pair_implausible = wire.reject == PairReject::Implausible;
     if (wire.paired) {
         row.boot_epoch = wire.boot_epoch;
         row.emit_seq = wire.emit_seq;

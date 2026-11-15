@@ -1032,6 +1032,22 @@ TEST_CASE("guardian ingest: a rejected pair does not refuse the event (UP-14 D5)
     // A different event with the same half pair is a new withheld pair and counts.
     ingest("p-half-2", 3, 0);
     CHECK(pair_rejected_count(metrics, "half_set") == 2);
+
+    // UP-9: an implausible pair (emit_seq at the 2^40 ceiling) is dropped at this boundary like the
+    // two above. The event is stored unpaired, counted once under `implausible`, judged as an
+    // unpaired event (no pending evidence, no hold) and a redelivery does not count again.
+    CHECK(pair_rejected_count(metrics, "implausible") == 0);
+    const auto pending = [&] {
+        return scalar("SELECT count(*) FROM guaranteed_state_store.guaranteed_state_events WHERE "
+                      "projection_pending");
+    };
+    ingest("p-implausible", 7, yuzu::server::detail::kEmitSeqCeiling);
+    CHECK(pair_rejected_count(metrics, "implausible") == 1);
+    CHECK(event_pair("p-implausible") == "-/-");
+    CHECK(pending() == "0");
+    ingest("p-implausible", 7, yuzu::server::detail::kEmitSeqCeiling);
+    CHECK(pair_rejected_count(metrics, "implausible") == 1);
+    CHECK(pending() == "0");
 }
 
 // ── UP-14 PR B B2: the absolute plausibility bound (UP-9) and the closed pair mode ────────────
@@ -1071,8 +1087,8 @@ TEST_CASE("guardian ingest: pair_from_wire with a receipt applies the absolute p
     CHECK(pair_from_wire(7, kEmitSeqCeiling).paired);
 }
 
-TEST_CASE("guardian ingest: apply_wire_pair with a receipt sets pair_implausible only for an "
-          "implausible pair and withholds the pair (UP-9)",
+TEST_CASE("guardian ingest: apply_wire_pair with a receipt withholds an implausible pair and "
+          "returns its reason, exactly as for half_set and out_of_range (UP-9)",
           "[guardian][ingest][pair]") {
     using yuzu::server::GuaranteedStateEventRow;
     using yuzu::server::detail::apply_wire_pair;
@@ -1083,23 +1099,21 @@ TEST_CASE("guardian ingest: apply_wire_pair with a receipt sets pair_implausible
 
     CHECK(apply_wire_pair(row, 7, kEmitSeqCeiling, receipt) ==
           std::optional<PairReject>{PairReject::Implausible});
-    CHECK(row.pair_implausible);
     CHECK_FALSE(row.boot_epoch.has_value());
     CHECK_FALSE(row.emit_seq.has_value());
-    // A later call on the same row clears the flag and sets the pair.
+    // A later call on the same row sets the pair.
     CHECK_FALSE(apply_wire_pair(row, 7, 11, receipt).has_value());
-    CHECK_FALSE(row.pair_implausible);
     CHECK(row.boot_epoch == 7);
     CHECK(row.emit_seq == 11);
-    // half_set and out_of_range are withheld but are NOT held.
+    // The other two reasons leave the pair unset the same way (one decision site, no other state).
     CHECK(apply_wire_pair(row, 5, 0, receipt) == std::optional<PairReject>{PairReject::HalfSet});
-    CHECK_FALSE(row.pair_implausible);
+    CHECK_FALSE(row.boot_epoch.has_value());
     CHECK(apply_wire_pair(row, k2p62, 5, receipt) ==
           std::optional<PairReject>{PairReject::OutOfRange});
-    CHECK_FALSE(row.pair_implausible);
-    // The three-argument form never sets the flag.
+    CHECK_FALSE(row.boot_epoch.has_value());
+    // The three-argument form is structural only: the implausible pair is taken.
     CHECK_FALSE(apply_wire_pair(row, 7, kEmitSeqCeiling).has_value());
-    CHECK_FALSE(row.pair_implausible);
+    CHECK(row.emit_seq == static_cast<std::int64_t>(kEmitSeqCeiling));
 }
 
 TEST_CASE("guardian ingest: the implausible reason has its own label and is counted by "
@@ -1122,7 +1136,7 @@ TEST_CASE("guardian ingest: the implausible reason has its own label and is coun
 }
 
 TEST_CASE("guardian pair mode: the SQL's mode set is closed, an unknown or empty label never "
-          "parses and implausible_held is never read from SQL",
+          "parses",
           "[guardian][ingest][pair]") {
     using yuzu::server::PairMode;
     using yuzu::server::parse_pair_mode;
@@ -1138,8 +1152,6 @@ TEST_CASE("guardian pair mode: the SQL's mode set is closed, an unknown or empty
         INFO("[" << bad << "]");
         CHECK_FALSE(parse_pair_mode(bad).has_value());
     }
-    CHECK(std::string(yuzu::server::pair_mode_label(PairMode::ImplausibleHeld)) ==
-          "implausible_held");
     CHECK(yuzu::server::default_pair_decision(false).mode == PairMode::Unpaired);
     CHECK(yuzu::server::default_pair_decision(true).mode == PairMode::Current);
     CHECK_FALSE(yuzu::server::default_pair_decision(true).retired_epoch.has_value());
@@ -1170,8 +1182,8 @@ TEST_CASE("guardian census decision: the label set is the closed ten, NULL is le
         CHECK_FALSE(yuzu::server::parse_census_decision(bad).has_value());
     }
 
-    // NULL: only an unpaired mode may lack a label; every other mode, including a hold the census
-    // never sees, fails the write rather than read as no decision.
+    // NULL: only an unpaired mode may lack a label; every other mode fails the write rather than
+    // read as no decision.
     std::optional<CensusDecision> out;
     std::string why;
     for (const PairMode m : {PairMode::Unpaired, PairMode::UnpairedHeld}) {
@@ -1180,7 +1192,7 @@ TEST_CASE("guardian census decision: the label set is the closed ten, NULL is le
     }
     for (const PairMode m :
          {PairMode::RefusedRetired, PairMode::Current, PairMode::CurrentStraggler,
-          PairMode::CurrentRebase, PairMode::RefusedRegression, PairMode::ImplausibleHeld}) {
+          PairMode::CurrentRebase, PairMode::RefusedRegression}) {
         why.clear();
         CHECK_FALSE(yuzu::server::interpret_census_decision(std::nullopt, m, out, why));
         CHECK_FALSE(out.has_value());
