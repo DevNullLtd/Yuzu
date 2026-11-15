@@ -677,13 +677,23 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
     CHECK(count_occurrences(flat, "RefusalLogThrottle(std::chrono::seconds(60),4)") == 1);
     // Three call sites (the pool-full line, the probe line, the refusals before the pool).
     CHECK(count_occurrences(flat, "should_warn(") == 3);
-    // Four fixed keys in all: the two pool warnings and the two refusals before the pool. The
-    // key set must fit the throttle's budget, so the literals are distinct and number the budget.
-    const std::vector<std::string> keys = {"oidc_lookup_busy", "oidc_nat64_probe_busy",
-                                           "oidc_lookup_refused_recent",
-                                           "oidc_lookup_refused_name_limit"};
-    CHECK(std::set<std::string>(keys.begin(), keys.end()).size() == keys.size());
-    CHECK(keys.size() == 4); // the `4` in RefusalLogThrottle(std::chrono::seconds(60),4) above
+    // Four fixed keys in all: the two pool warnings and the two refusals before the pool. They are
+    // read out of the source (every literal passed to should_warn or assigned to `key`), so a fifth
+    // key fails here, and the set must number the throttle's budget.
+    std::set<std::string> source_keys;
+    for (const std::string_view anchor : {std::string_view("should_warn(\""), std::string_view("key=\"")})
+        for (auto at = flat.find(anchor); at != std::string::npos; at = flat.find(anchor, at + 1)) {
+            const auto begin = at + anchor.size();
+            source_keys.insert(flat.substr(begin, flat.find('"', begin) - begin));
+        }
+    const std::set<std::string> expected = {"oidc_lookup_busy", "oidc_nat64_probe_busy",
+                                            "oidc_lookup_refused_recent",
+                                            "oidc_lookup_refused_name_limit"};
+    CHECK(source_keys == expected);
+    const std::string budget_prefix = "RefusalLogThrottle(std::chrono::seconds(60),";
+    const auto budget_at = flat.find(budget_prefix);
+    REQUIRE(budget_at != std::string::npos);
+    CHECK(std::stoul(flat.substr(budget_at + budget_prefix.size(), 3)) == source_keys.size());
     CHECK(count_occurrences(flat, "\"oidc_lookup_busy\"") == 1);
     CHECK(count_occurrences(flat, "\"oidc_nat64_probe_busy\"") == 1);
     CHECK(count_occurrences(flat, "\"oidc_lookup_refused_recent\"") == 1);

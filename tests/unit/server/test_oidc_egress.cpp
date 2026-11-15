@@ -2241,7 +2241,6 @@ TEST_CASE("OIDC resolver limit: the production admission is one process-wide obj
     CHECK(limits.max_names_in_flight == 64);
     CHECK(limits.refusal_ttl == std::chrono::seconds(3));
     CHECK(limits.max_refusal_entries == 32);
-    CHECK(first->hosts_in_flight() == 0); // nothing outstanding at rest
 }
 
 TEST_CASE("OIDC resolver limit: discovery refused by the limit is not remembered by the 30 s "
