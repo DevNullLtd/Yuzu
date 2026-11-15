@@ -117,6 +117,10 @@ void preseed_census_pair_decision_metric(yuzu::MetricsRegistry& metrics) {
                         {{"decision", census_decision_label(decision)}});
 }
 
+void preseed_guardian_repairs_shed_metric(yuzu::MetricsRegistry& metrics) {
+    metrics.counter(kGuardianRepairsShedMetric);
+}
+
 void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
                                              const GuaranteedStateStore& store) {
     // Published only on success: an unanswered read must not read as zero, and a failed one leaves

@@ -323,18 +323,28 @@ public:
     }
 
     /// The agent order step's own `lock_timeout` and `statement_timeout` (this value plus
-    /// `kAgentStepStatementMarginMs`), in milliseconds. The lock
-    /// bound is per lock wait, the statement bound is the whole of each statement (Ensure, DECIDE,
-    /// and the one re-run after a concurrent delete), so a step can hold its pooled connection for
-    /// the sum of its statements. See the Timeouts paragraph on `agent_order_step`.
+    /// `kAgentStepStatementMarginMs`), in milliseconds. The lock bound is per lock wait and the
+    /// statement bound is the whole of each statement (Ensure, DECIDE, and the one re-run after a
+    /// concurrent delete), so a step can hold its pooled connection for the sum of its statements.
+    /// See the Timeouts paragraph on `agent_order_step`.
     static constexpr int kAgentStepLockTimeoutMs = 1000;
 
-    /// The margin by which the step's `statement_timeout` exceeds its `lock_timeout`. The statement
-    /// bound must not fire first on an ordinary wait: a lock wait begins after its statement does,
-    /// so at equal values the statement timeout would always end it (57014) and the lock timeout
-    /// (55P03) could never be reached. With the margin a plain wait still ends on the lock bound,
-    /// and the statement bound is the ceiling for a wait the lock bound does not end.
-    static constexpr int kAgentStepStatementMarginMs = 500;
+    /// The margin by which the step's `statement_timeout` exceeds its `lock_timeout` (so the
+    /// statement bound is 1 s + 2 s = 3 s). It is above the lock bound for two reasons. First, a
+    /// lock wait begins after its statement does, so at equal values the statement timeout would
+    /// always end the wait (57014) and the lock timeout (55P03) could never be reached. Second,
+    /// and the reason it is 2 s and not a few hundred ms: one statement can wait in TWO stages,
+    /// the tuple-lock queue and then the holder's transaction, and each stage has its own
+    /// `lock_timeout`, so a single statement's waits can total two lock bounds even when every
+    /// individual wait is under one. Measured on a toy schema with the real Ensure and DECIDE
+    /// shapes: with a 1.5 s statement bound, a burst of about 50 first deliveries on one agent row,
+    /// each holding the row for a 10 to 20 ms commit, failed 12 to 37 of 50 with 57014 although
+    /// every individual lock wait was under 1 s. A failed delivery is stored pending and is not
+    /// resent (acks are unconditional), so that is a stranded row from plain same-agent contention.
+    /// At 2 s of margin the statement bound covers two full lock bounds. It is still a ceiling, not
+    /// a promise: a same-agent burst whose waits exceed it stores the delivery pending (see the
+    /// Timeouts paragraph on `agent_order_step`).
+    static constexpr int kAgentStepStatementMarginMs = 2000;
 
     /// Test seam: the `lock_timeout` the agent order step applies, in milliseconds (default
     /// `kAgentStepLockTimeoutMs`). A test that parks a delivery behind a held lock and expects the
@@ -351,7 +361,8 @@ public:
     /// statement (P-1) would hold that lock, and a pooled connection, for the pool's 30 s
     /// statement timeout. At this bound the Repair is `Failed` instead (SQLSTATE 57014 rolled back
     /// to its savepoint, the evidence kept for the next redelivery). First deliveries and batch
-    /// rows keep the connection's own statement timeout.
+    /// rows keep the connection's own statement timeout for their census statements (the first
+    /// delivery's order step has its own 3 s bound).
     static constexpr int kRepairStatementTimeoutMs = 2000;
 
     /// Test seam: the statement timeout a Repair applies, in milliseconds (default
@@ -364,11 +375,13 @@ public:
 
     /// How many Repairs of pending events may run at once in this process (the cap on a lease
     /// held across a Repair's statements). A Repair holds a pooled connection for the sum of its
-    /// statements (up to the order step's lock bound, the clock read and five census statements
-    /// under the 2 s statement bound), and the pool (16 connections) is shared with auth and audit,
-    /// so an unbounded storm of Repairs, which a gateway reconnect replays at up to 50 in flight
-    /// per node, would starve them: the measured cost of 50 Repairs parked behind one row lock was
-    /// 16 failed acquires in 18 at the audit store's 500 ms bound, and 0 in 8. At the cap, a Repair
+    /// statements (the Ensure and the clock read, each under the 1 s lock bound per wait, then five
+    /// census statements under 2 s each), and the pool (16 connections) is shared with auth and
+    /// audit, so an unbounded storm of Repairs, which a gateway reconnect replays at up to 50 in
+    /// flight per node, would starve them. Measured on one host with a toy schema: 16 of 18 probe
+    /// acquires failed at a 500 ms probe bound with 50 Repair-like threads parked, and 0 with 8
+    /// parked. (500 ms is the bound of Guardian's own `kIngestTimeout`; the heartbeat's is 250 ms;
+    /// the audit store's are 2 s read and 4 s write.) At the cap, a Repair
     /// that finds it full is SHED: the event stays pending and untouched, the transaction is rolled
     /// back and the lease returned at once (see `insert_event_classified`). Repairs only: a first
     /// delivery or a batch row is never refused by it.

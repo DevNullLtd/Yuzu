@@ -39,6 +39,12 @@ inline constexpr std::int64_t kEpochSkewSeconds = 315'576'000;
 /// boundary and server.cpp pre-seed it.
 inline constexpr char kGuardianCensusPairDecisionsMetric[] =
     "yuzu_server_guardian_census_pair_decisions_total";
+
+/// The Repair-shed counter's name: one per Repair of a pending event the store refused at its
+/// process-wide cap (`GuaranteedStateStore::kRepairMaxConcurrent`). A plain counter with no
+/// labels, counted by the store and pre-seeded to 0 at boot
+/// (`preseed_guardian_repairs_shed_metric`).
+inline constexpr char kGuardianRepairsShedMetric[] = "yuzu_server_guardian_repairs_shed_total";
 } // namespace detail
 
 enum class PairMode {

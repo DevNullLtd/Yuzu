@@ -1754,6 +1754,17 @@ void count_decision(yuzu::MetricsRegistry* metrics,
     }
 }
 
+// Count one Repair shed at the cap (`kGuardianRepairsShedMetric`). Best-effort, like the other
+// counters here: a metrics failure must never reach the ingest thread.
+void count_repair_shed(yuzu::MetricsRegistry* metrics) noexcept {
+    if (metrics == nullptr)
+        return;
+    try {
+        metrics->counter(detail::kGuardianRepairsShedMetric).increment();
+    } catch (...) { // best-effort metric
+    }
+}
+
 // The process-wide admission of a Repair (`GuaranteedStateStore::kRepairMaxConcurrent`): a
 // non-blocking try-acquire on a plain atomic count, released by the destructor on every exit
 // (a return, an exception unwinding out of the Repair). Never held across a wait of its own, and
@@ -2753,15 +2764,23 @@ struct AgentStepResult {
 // `project_rule_status`).
 //
 // Timeouts: the step sets its own `lock_timeout` (`kAgentStepLockTimeoutMs`, 1 s by default) and,
-// to that plus `kAgentStepStatementMarginMs` (500 ms), its own `statement_timeout`; the
+// to that plus `kAgentStepStatementMarginMs` (2 s), its own `statement_timeout` (3 s); the
 // connection's pool options are 10 s and 30 s.
 // `lock_timeout` is PER LOCK WAIT, and a wait is not a promise of a 1 s total: a FOR SHARE locker
 // (a Repair) does not queue behind a waiting FOR UPDATE, so a rolling chain of overlapping
 // Repair share locks on one agent can keep the step's FOR UPDATE waiting past the bound
-// (measured on PG 17: waits of 4 s and 8 s under a 1 s `lock_timeout`). The statement
-// timeout counts the WHOLE statement, waits included, so each statement of the step (Ensure,
-// DECIDE) ends at 1.5 s with 57014 however the lock wait is fed; an ordinary wait still ends on
-// the lock bound first (a lock wait starts after its statement does, hence the margin). The step
+// (measured on PG 17: waits of 4 s and 8 s under a 1 s `lock_timeout`). One statement can also
+// wait in two stages, the tuple-lock queue and then the holder's transaction, each with its own
+// `lock_timeout`. The lock bound therefore ends a single wait, and the statement timeout, which
+// counts the WHOLE statement, waits included, is the total ceiling for each statement of the step
+// (Ensure, DECIDE): a statement ends at 3 s with 57014 however its lock waits are fed. The margin
+// is 2 s, not a few hundred ms, because the two wait stages can each take a full lock bound: at a
+// 1.5 s statement bound a burst of about 50 first deliveries on one agent row, each holding it
+// for a 10 to 20 ms commit, failed 12 to 37 of 50 with 57014 although every individual wait was
+// under 1 s (measured on a toy schema with the real Ensure and DECIDE shapes). A same-agent burst
+// whose waits still exceed the 3 s ceiling stores the delivery pending, and that row is
+// stranded: acks are unconditional, so the agent does not resend it (backpressure needs an ack
+// contract change; follow-up issue to be filed). The step
 // can still run more than one statement, Ensure, DECIDE, and the one re-run of both after a
 // concurrent delete of the agent's row, so a pooled connection can be held for the sum of those
 // bounds, not for one. The agent row is the one lock every first delivery of an agent queues on,
@@ -2771,7 +2790,7 @@ struct AgentStepResult {
 // that reaches either bound takes the failed-step path below (SQLSTATE 55P03 or 57014: the event is
 // stored pending and the census write is skipped), the same cost at a fraction of the lease time.
 // Both `SET LOCAL` values are absolute: neither takes the smaller of its own and the connection's
-// value, so a pool or DSN `lock_timeout` below 1 s, or `statement_timeout` below 1.5 s, is
+// value, so a pool or DSN `lock_timeout` below 1 s, or `statement_timeout` below 3 s, is
 // loosened for the step. The bounds are set under the step's savepoint and restored before the
 // success RELEASE: ROLLBACK TO reverts a SET LOCAL, RELEASE does not, so without the restore the
 // census upsert and the fold that follow in the same transaction would run under the step's bounds
@@ -2797,18 +2816,18 @@ agent_order_step(PGconn* conn,
     // statement bound in `project_rule_status`: `pg::PgTxn` owns the connection state (an exception
     // unwinds to its ROLLBACK), and every other exit is control flow that must return Failed or
     // Abandoned. The exits: a rows==1 success restores `lock_timeout` and `statement_timeout TO
-    // DEFAULT` then RELEASEs; a
-    // failure ROLLBACKs TO the savepoint (undoing the SET LOCAL) then RELEASEs; a failed control
-    // statement returns Abandoned and the caller's PgTxn rolls the transaction back.
+    // DEFAULT` then RELEASEs; a failure ROLLBACKs TO the savepoint (undoing both SET LOCALs) then
+    // RELEASEs; a failed control statement returns Abandoned and the caller's PgTxn rolls the
+    // transaction back.
     // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
     if (!control(("SET LOCAL lock_timeout = " + std::to_string(lock_timeout_ms)).c_str()))
         return {AgentStepOutcome::Abandoned, {}};
     // The lock bound plus a margin as a statement timeout (M1): lock_timeout is per lock WAIT, and
     // a share lock taken by a Repair does not queue behind this step's waiting FOR UPDATE, so a
     // chain of overlapping Repairs can keep one wait going past the lock bound. The statement
-    // timeout counts the whole statement, waits included. The margin keeps an ordinary wait ending
-    // on the lock bound (55P03), as it always did. A 57014 takes the failed-step path below, as a
-    // 55P03 does.
+    // timeout counts the whole statement, waits included, so it is the total ceiling for the
+    // step's statements while the lock bound ends a single wait (see the Timeouts paragraph above
+    // for the margin). A 57014 takes the failed-step path below, as a 55P03 does.
     if (!control(
             ("SET LOCAL statement_timeout = " +
              std::to_string(lock_timeout_ms + GuaranteedStateStore::kAgentStepStatementMarginMs))
@@ -3000,21 +3019,27 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                     // would reach no agent either, and it would count on
                     // `events_ingest_errors_total`, whose alert reads a sustained rate as a broken
                     // ingest. A shed Repair is therefore the stranded class of #7147 (the agent
-                    // stops resending; a later journal replay, or a later applied verdict for the
-                    // pair, is what clears it). It counts as a failed Repair on the existing
-                    // series, and logs a sampled WARN.
+                    // does not resend an event it was acknowledged for). What clears it is a later
+                    // applying verdict on that (agent, rule), a rule delete, a decommission, or,
+                    // only when the agent's lifecycle journal is active, a journal replay (the
+                    // journal is currently inert in production). It counts as a failed Repair on
+                    // the existing series, on its own `kGuardianRepairsShedMetric`, and logs a
+                    // sampled WARN.
                     RepairAdmission admission(
                         repairs_in_flight_, repair_max_concurrent_.load(std::memory_order_relaxed));
                     if (!admission.admitted()) {
                         census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                         count_projection(metrics_, ProjectionSource::Repair, CensusOutcome::Failed);
+                        // The shed's own series: a capacity signal apart from a Repair fault, which
+                        // the failed series above also counts.
+                        count_repair_shed(metrics_);
                         // The sampler counts the shed (`repairs_shed_`) and decides the log.
                         if (const auto d = sample_degrade_log(repairs_shed_, repair_shed_last_ts_);
                             d.should_log)
                             spdlog::warn(
                                 "GuaranteedStateStore: repair shed, {} repairs are already in "
-                                "flight (the cap); the event stays pending and is not repaired "
-                                "until it is redelivered (occurrence {}) event_id={} agent_id={} "
+                                "flight (the cap); the event stays pending (stranded unless the "
+                                "agent resends it) (occurrence {}) event_id={} agent_id={} "
                                 "rule_id={}",
                                 repair_max_concurrent_.load(std::memory_order_relaxed),
                                 d.occurrence, log_id_token(row.event_id),

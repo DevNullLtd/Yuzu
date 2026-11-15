@@ -225,6 +225,10 @@ inline constexpr char kGuardianEventStoreDurationMetric[] =
 /// (server.cpp) and in tests that assert the family.
 void preseed_census_pair_decision_metric(yuzu::MetricsRegistry& metrics);
 
+/// Birth `kGuardianRepairsShedMetric` (no labels) at 0, so it reads 0 rather than absent from
+/// boot. Call once at startup (server.cpp) and in tests that assert the series.
+void preseed_guardian_repairs_shed_metric(yuzu::MetricsRegistry& metrics);
+
 /// Birth all four `status` series (inserted|redelivered|conflict|error) with the custom ladder
 /// so the boundaries are pinned before the first observe and the series appear on /metrics from
 /// boot. Call once at startup (server.cpp) and in tests that assert the histogram.

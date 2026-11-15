@@ -4375,9 +4375,14 @@ public:
             "until a redelivery of that event repairs the census row or a later event for the "
             "pair arrives. A repair runs no order step, so an event whose first delivery failed "
             "that step never reaches the agent's order clock. A "
-            "repair that fails is counted here again. >0 means the census may be "
-            "stale; the server log line 'census upsert failed' names the agent "
-            "and rule (the order step logs 'agent order step failed' with the agent and event). "
+            "repair that fails is counted here again, and so is a repair shed at the cap on "
+            "concurrent repairs: a shed is a capacity signal, not a fault, and is counted "
+            "separately on yuzu_server_guardian_repairs_shed_total with a 'repair shed' warning "
+            "in the server log (a shed writes no 'census upsert failed' line). >0 means the census "
+            "may be stale; the server log line 'census upsert failed' names the agent "
+            "and rule of a failed census write, and the order step logs 'agent order step failed' "
+            "with the agent and event (a statement timeout, SQLSTATE 57014, under database stress "
+            "is one cause). "
             "A write refused because the rule is not defined on this "
             "server (the census foreign key, SQLSTATE 23503) is a normal "
             "outcome and is not counted; a failure to retire the evidence of "
@@ -4394,7 +4399,9 @@ public:
             "its evidence already retired; rejected is a write "
             "refused because the "
             "rule is gone (not a fault); failed is a fault that leaves pending "
-            "evidence, except for source batch, whose failure rolls back the whole batch "
+            "evidence (a repair shed at the cap on concurrent repairs also counts here, as a "
+            "capacity signal and not a fault; see yuzu_server_guardian_repairs_shed_total), "
+            "except for source batch, whose failure rolls back the whole batch "
             "(this count is not rolled back; see "
             "..._census_proj_failures_total); a failed per-agent emit-order step is "
             "also counted failed (on a first delivery the census write is then "
@@ -4406,6 +4413,21 @@ public:
             "projection returns, before the transaction commits. Resets on server "
             "restart.",
             "counter");
+        metrics_.describe(detail::kGuardianRepairsShedMetric,
+                          "Redelivery repairs of pending census evidence that the server refused "
+                          "because the cap on concurrent repairs (4 per process) was full. A shed "
+                          "is a capacity signal, not a fault: the event stays stored with pending "
+                          "evidence, nothing is written, and the repair is not retried by the "
+                          "server. The agent does not resend an event it was acknowledged for, so "
+                          "a shed event is stranded until a later applying verdict for its agent "
+                          "and rule, a rule delete, or a decommission (or an agent lifecycle "
+                          "journal replay, when that journal is active). A shed is also counted "
+                          "as outcome=failed on yuzu_server_guardian_census_projection_total and "
+                          "on yuzu_server_guardian_census_proj_failures_total, and logs a "
+                          "'repair shed' warning once per episode and then every 100th. Resets on "
+                          "server restart.",
+                          "counter");
+        detail::preseed_guardian_repairs_shed_metric(metrics_);
         metrics_.describe(detail::kGuardianEventsRejectedMetric,
                           "Guardian events refused at the ingest boundary before reaching the "
                           "store, by reason. empty_rule_id: the event carried no rule id, so it "
@@ -4464,7 +4486,8 @@ public:
                           "Guardian events stored with pending census evidence: their census "
                           "write, or the per-agent emit-order step before it, failed and no "
                           "redelivery has retired it (a Repair refused as a regression against "
-                          "an unpaired census row keeps it pending). Not updated while "
+                          "an unpaired census row, or a repair shed at the cap on concurrent "
+                          "repairs, keeps it pending). Not updated while "
                           "the store cannot answer. A sustained non-zero value means census "
                           "verdicts are waiting on an agent redelivery that may never come "
                           "(the stranded classes are listed in docs/clock-guarded-retention.md).",
