@@ -38,7 +38,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -551,11 +553,13 @@ TEST_CASE("revocation source validation: a wildcard bind expands to every local 
     auto disabled = rs::make_system_egress_env({"", "10.9.9.9:1"});
     REQUIRE(disabled.local_addresses(std::chrono::seconds(5)).has_value());
     CHECK(*disabled.local_addresses(std::chrono::seconds(5)) == std::vector<std::string>{"10.9.9.9"});
-    // A listen host that does not resolve makes the set unknown: nullopt, never "fewer". The
-    // lookup is injected, so no DNS runs.
+    // A listen host that does not resolve makes the set unknown (an error), never "fewer". The
+    // lookup is injected, so no DNS runs. A lookup that was not busy is kUnavailable.
     auto unresolvable = rs::make_system_egress_env(
         {"listener.test:1"}, {}, [](const std::string&) { return net::ResolveResult{}; });
-    CHECK_FALSE(unresolvable.local_addresses(std::chrono::seconds(5)).has_value());
+    const auto unknown = unresolvable.local_addresses(std::chrono::seconds(5));
+    REQUIRE_FALSE(unknown.has_value());
+    CHECK(unknown.error() == rs::EgressEnv::OwnAddressesError::kUnavailable);
     // A listen host that resolves contributes exactly the addresses the lookup returned.
     auto resolvable = rs::make_system_egress_env({"listener.test:1"}, {}, [](const std::string&) {
         net::ResolveResult r;
@@ -1505,6 +1509,78 @@ TEST_CASE("revocation source: own addresses that cannot be determined fail regis
     CHECK(fx.store.list()->empty());
 }
 
+TEST_CASE("revocation source: a listen-host lookup refused for pool capacity counts dns_busy",
+          "[revocation_source][pg]") {
+    // The listen-host lookup runs in the injected pool. A pool at a cap of 0 refuses every lookup
+    // as busy without starting it, so the lookup function must never run.
+    auto lookup_runs = std::make_shared<std::atomic<int>>(0);
+    const net::LookupFn lookup = [lookup_runs](const std::string&) {
+        ++*lookup_runs;
+        net::ResolveResult r;
+        r.status = net::ResolveStatus::kOk;
+        r.addresses = {"192.0.2.44"};
+        return r;
+    };
+    auto full = std::make_shared<net::ResolverPool>(0);
+    // The environment's own-address function is the production one; only its resolver pool and
+    // lookup are injected. Everything else (the DNS table, the counter) is the fake's.
+    std::vector<std::string> degrades;
+    auto env = rstest::fake_env(rstest::default_dns(), {.degrades = &degrades});
+    env.local_addresses =
+        rs::make_system_egress_env({"listener.test:1"}, {}, lookup, full).local_addresses;
+    // The environment itself reports the cause.
+    const auto direct = rs::make_system_egress_env({"listener.test:1"}, {}, lookup, full)
+                            .local_addresses(std::chrono::seconds(5));
+    REQUIRE_FALSE(direct.has_value());
+    CHECK(direct.error() == rs::EgressEnv::OwnAddressesError::kBusy);
+    CHECK(lookup_runs->load() == 0);
+
+    Fx fx(std::move(env));
+    fx.admin(false);
+    for (const char* url : {"http://crl.example.com/a.crl", "http://93.184.216.34/a.crl"}) {
+        INFO(url);
+        auto b = rstest::valid_body();
+        b["crl_urls"] = json::array({rstest::url_entry(url, {"public"})});
+        auto r = fx.rest_post(b);
+        // The same refusal as every other retryable cause: a 503 with the same retry hint, and
+        // nothing registered. Only the counter's reason says the pool was at its cap.
+        REQUIRE(r->status == 503);
+        CHECK(data_of(*r)["error"]["retry_after_ms"] == 5000);
+        CHECK(data_of(*r)["error"]["message"] ==
+              "this server's own addresses could not be determined; retry");
+    }
+    CHECK(fx.store.list()->empty());
+    CHECK(degrades == std::vector<std::string>{"dns_busy", "dns_busy"});
+    CHECK(lookup_runs->load() == 0);
+    // Over MCP too: a retryable error, nothing registered, one more dns_busy.
+    auto m = fx.h.mcp_call_tool_approved(kRegister, rstest::valid_body("Other CA"));
+    CHECK(mcp_error_code(*m) == yuzu::server::mcp::kInternalError);
+    CHECK(fx.store.list()->empty());
+    CHECK(degrades == std::vector<std::string>{"dns_busy", "dns_busy", "dns_busy"});
+}
+
+TEST_CASE("revocation source: a listen-host lookup that failed for another cause counts "
+          "own_addresses_unavailable",
+          "[revocation_source][pg]") {
+    // A pool with room, and a lookup that answers "no such name": the set is unknown but the
+    // pool was not at its cap, so the reason stays own_addresses_unavailable.
+    auto roomy = std::make_shared<net::ResolverPool>(4);
+    std::vector<std::string> degrades;
+    auto env = rstest::fake_env(rstest::default_dns(), {.degrades = &degrades});
+    env.local_addresses =
+        rs::make_system_egress_env({"listener.test:1"}, {},
+                                   [](const std::string&) { return net::ResolveResult{}; }, roomy)
+            .local_addresses;
+    Fx fx(std::move(env));
+    fx.admin(false);
+    auto b = rstest::valid_body();
+    auto r = fx.rest_post(b);
+    REQUIRE(r->status == 503);
+    CHECK(data_of(*r)["error"]["retry_after_ms"] == 5000);
+    CHECK(fx.store.list()->empty());
+    CHECK(degrades == std::vector<std::string>{"own_addresses_unavailable"});
+}
+
 TEST_CASE("revocation source: a name lookup that times out is a retryable 503, the budget is shared",
           "[revocation_source][pg]") {
     std::vector<std::string> degrades;
@@ -1518,6 +1594,33 @@ TEST_CASE("revocation source: a name lookup that times out is a retryable 503, t
     CHECK(data_of(*r)["error"]["retry_after_ms"] == 5000);
     CHECK(degrades == std::vector<std::string>{"dns_unavailable"});
     CHECK(fx.store.list()->empty());
+}
+
+TEST_CASE("revocation source: a name lookup refused because the pool is at its cap counts dns_busy",
+          "[revocation_source][pg]") {
+    // The reason string is what the sample alert YuzuCrlSourceResolverBusy selects on, so a typo or
+    // a reorder of the mapping from the resolver's busy status must turn a case red.
+    std::vector<std::string> degrades;
+    Fx fx(rstest::fake_env(rstest::default_dns(), {.dns_busy = {"busy.example.com"}, .degrades = &degrades}));
+    fx.admin(false);
+    auto b = rstest::valid_body();
+    b["crl_urls"] = json::array({rstest::url_entry("http://busy.example.com/a.crl", {"public"})});
+    auto r = fx.rest_post(b);
+    REQUIRE(r->status == 503);
+    CHECK(data_of(*r)["error"]["retry_after_ms"] == 5000);
+    CHECK(degrades == std::vector<std::string>{"dns_busy"});
+    CHECK(fx.store.list()->empty());
+    // Over MCP too: a retryable error, nothing registered, counted once more.
+    auto bm = rstest::valid_body("Other CA");
+    bm["crl_urls"] = json::array({rstest::url_entry("http://busy.example.com/a.crl", {"public"})});
+    auto m = fx.h.mcp_call_tool_approved(kRegister, bm);
+    CHECK(mcp_error_code(*m) == yuzu::server::mcp::kInternalError);
+    CHECK(fx.store.list()->empty());
+    CHECK(degrades == std::vector<std::string>{"dns_busy", "dns_busy"});
+    // Control: a host not in the busy set still registers, with no further count.
+    auto ok = fx.rest_post(rstest::valid_body("Third CA"));
+    CHECK(ok->status == 201);
+    CHECK(degrades.size() == 2);
 }
 
 TEST_CASE("revocation source: the own-address set is computed once per request",
