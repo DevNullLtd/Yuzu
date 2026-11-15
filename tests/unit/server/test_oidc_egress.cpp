@@ -1988,6 +1988,201 @@ TEST_CASE("OIDC resolver memory: a case with no admission passed sees no memory"
     }
 }
 
+// ── Per-name limit (resolver_host_admission.hpp) ─────────────────────────────────────────────
+
+namespace {
+
+net::HostLookupAdmission::Limits name_limits(std::size_t per_name,
+                                             std::chrono::seconds ttl = std::chrono::seconds(3)) {
+    net::HostLookupAdmission::Limits limits;
+    limits.per_name_in_flight = per_name;
+    limits.refusal_ttl = ttl;
+    return limits;
+}
+
+} // namespace
+
+TEST_CASE("OIDC resolver limit: a name at its limit is refused at once without taking a slot, "
+          "another name is not",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    auto adm = clock.make(name_limits(2));
+    auto pool = std::make_shared<net::ResolverPool>(8);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+    VetThread first(st->gate, "x.a.test", 10000);
+    VetThread second(st->gate, "x.a.test", 10000);
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 2; }));
+    CHECK(adm->in_flight_for("x.a.test") == 2);
+    CHECK(pool->in_flight.load() == 2);
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto refused = vet_name("x.a.test", 10000);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error() == kBusyReason);
+    CHECK(elapsed < std::chrono::milliseconds(2000));
+    CHECK(st->gate->entered.load() == 2); // no third lookup was started
+    CHECK(pool->in_flight.load() == 2);   // and no slot was taken
+    CHECK(busy_count(pool) == 1);         // counted once, as busy
+    CHECK(adm->refusal_entries() == 0);   // a refusal by the limit is not remembered
+
+    const auto other = vet_name("y.test"); // another name still has the pool
+    REQUIRE(other.has_value());
+
+    first.finish(); // one shared gate: opens it for both
+    second.finish();
+    REQUIRE(wait_for([&] { return adm->in_flight_for("x.a.test") == 0; }));
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    CHECK(adm->hosts_in_flight() == 0);
+    const auto again = vet_name("x.a.test"); // the gate is open: the lookup answers
+    CHECK(again.has_value());
+    CHECK(wait_for([&] { return adm->hosts_in_flight() == 0; }));
+}
+
+TEST_CASE("OIDC resolver limit: a lookup whose caller timed out still counts against its name "
+          "until the resolver returns",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    // A zero refusal TTL isolates the limit: a timeout arms nothing that lasts.
+    auto adm = clock.make(name_limits(1, std::chrono::seconds(0)));
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    GateOpener opener(st->gate);
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+
+    const auto timed_out = vet_name("slow.a.test", 1000); // the one inherent 1 s wait
+    REQUIRE_FALSE(timed_out.has_value());
+    CHECK(timed_out.error() == kUnresolved);
+    REQUIRE(wait_for([&] { return st->gate->entered.load() == 1; }));
+    CHECK(adm->in_flight_for("slow.a.test") == 1); // the caller left; the lookup did not
+
+    const auto again = vet_name("slow.a.test", 1000);
+    REQUIRE_FALSE(again.has_value());
+    CHECK(again.error() == kBusyReason);
+    CHECK(st->gate->entered.load() == 1);
+
+    st->gate->release();
+    REQUIRE(wait_for([&] { return adm->in_flight_for("slow.a.test") == 0; }));
+    REQUIRE(wait_for([&] { return pool->in_flight.load() == 0; }));
+    CHECK(vet_name("slow.a.test").has_value());
+    CHECK(wait_for([&] { return adm->hosts_in_flight() == 0; }));
+}
+
+TEST_CASE("OIDC resolver limit: the count is released when the lookup throws and when the pool "
+          "refuses it",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    auto adm = clock.make(name_limits(1));
+
+    SECTION("a lookup that throws") {
+        auto pool = std::make_shared<net::ResolverPool>(4);
+        BoundedLookupGuard guard(
+            [](const std::string&) -> net::ResolveResult { throw std::runtime_error("boom"); },
+            pool, adm);
+        const auto pins = vet_name("throws.test");
+        REQUIRE_FALSE(pins.has_value());
+        CHECK(pins.error() == kUnresolved);
+        CHECK(wait_for([&] { return adm->in_flight_for("throws.test") == 0; }));
+        CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+    }
+    SECTION("a pool that has no slot") {
+        auto pool = std::make_shared<net::ResolverPool>(0);
+        auto st = std::make_shared<LookupState>();
+        BoundedLookupGuard guard(make_lookup(st), pool, adm);
+        const auto pins = vet_name("nopool.test");
+        REQUIRE_FALSE(pins.has_value());
+        CHECK(pins.error() == kBusyReason);
+        CHECK(adm->in_flight_for("nopool.test") == 0); // released at once: the lookup never ran
+        CHECK(adm->hosts_in_flight() == 0);
+        CHECK(st->others.load() == 0);
+    }
+}
+
+TEST_CASE("OIDC resolver limit: the NAT64 probe obeys the per-name limit",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit][oidc_nat64]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    auto adm = clock.make(name_limits(1));
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->probe_mode.store(kProbeBlock);
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+    VetThread holder(st->gate, kLiteralTarget, 10000); // its probe blocks and holds the name
+    REQUIRE(wait_for([&] { return st->probes.load() == 1; }));
+    CHECK(adm->in_flight_for("ipv4only.arpa") == 1);
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    (void)vet_name(kLiteralTarget); // its probe is refused: classified without it
+    cap.stop();
+    CHECK(st->probes.load() == 1);
+    CHECK(busy_count(pool) == 1);
+    CHECK(cap.text().find("the NAT64 prefix lookup (ipv4only.arpa) was not started") !=
+          std::string::npos);
+    holder.finish();
+    CHECK(wait_for([&] { return adm->hosts_in_flight() == 0; }));
+}
+
+TEST_CASE("OIDC resolver limit: the warning names the limit, is written once per interval and "
+          "names no pool",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    auto adm = clock.make(name_limits(1));
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+    auto held = adm->admit("busy.test"); // one lookup outstanding for the name
+    REQUIRE(held.verdict == net::HostLookupAdmission::Verdict::kAdmitted);
+
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    for (int i = 0; i < 3; ++i) {
+        const auto refused = vet_name("busy.test");
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error() == kBusyReason);
+    }
+    cap.stop();
+    int lines = 0;
+    const std::string needle =
+        "was not started: 1 lookups for this name are already outstanding";
+    for (auto at = cap.text().find(needle); at != std::string::npos;
+         at = cap.text().find(needle, at + needle.size()))
+        ++lines;
+    CHECK(lines == 1);
+    CHECK(cap.text().find("lookup pool") == std::string::npos);
+    CHECK(busy_count(pool) == 3);
+    CHECK(pool->in_flight.load() == 0);
+    CHECK(st->others.load() == 0);
+}
+
+TEST_CASE("OIDC resolver limit: discovery refused by the limit is not remembered by the 30 s "
+          "window",
+          "[oidc][oidc_egress][oidc_resolver][oidc_name_limit][oidc_discovery]") {
+    Nat64CacheReset cache;
+    AdmissionClock clock;
+    auto adm = clock.make(name_limits(1));
+    auto pool = std::make_shared<net::ResolverPool>(4);
+    auto st = std::make_shared<LookupState>();
+    st->other_status = net::ResolveStatus::kNotFound;
+    BoundedLookupGuard guard(make_lookup(st), pool, adm);
+    OidcProvider provider(resolver_cfg("https://idp.test"));
+    provider.set_discovery_negative_cache_for_test(5000); // never waited out
+
+    {
+        auto held = adm->admit("idp.test");
+        REQUIRE(held.verdict == net::HostLookupAdmission::Verdict::kAdmitted);
+        CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+        CHECK(st->others.load() == 0); // refused by the limit: no lookup was performed
+    }
+    // The count is free again: the very next attempt looks the name up (no window was armed).
+    CHECK(auth_flow_error(provider) == OidcProvider::kDiscoveryUnavailable);
+    CHECK(st->others.load() == 1);
+    CHECK(wait_for([&] { return pool->in_flight.load() == 0; }));
+}
+
 #ifndef YUZU_OIDC_MOCK_IDP_TSAN // uses MockIdp, which the TSan configuration excludes
 TEST_CASE("OIDC resolver: an issuer mismatch arms the discovery window (characterisation)",
           "[oidc][oidc_egress][oidc_resolver][oidc_discovery]") {

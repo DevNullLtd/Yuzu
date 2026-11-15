@@ -926,7 +926,8 @@ constexpr const char* kEgressRefusedReason = OidcProvider::kEgressRefused;
 constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleartextPublicRefused;
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
 // The lookup was refused because the pool was full, no worker could be created or the name was
-// refused or timed out within the last 3 s (POSIX only).
+// refused or timed out within the last 3 s, or the name already had 8 lookups outstanding (POSIX
+// only).
 // Nothing was learned about the name, so callers must not remember it as a failure.
 constexpr const char* kEgressLookupBusyReason = "the host name lookup was not started";
 
@@ -974,9 +975,10 @@ const std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
 }
 
 #ifndef _WIN32
-// The refusal memory in front of the POSIX name lookup (resolver_host_admission.hpp). A leaked
-// function-local static, like the pool above: a request thread can reach it while statics are being
-// destroyed at exit. Not used on Windows, whose lookup is `resolve_host_addresses`.
+// The admission in front of the POSIX name lookup: the per-name limit and the refusal memory
+// (resolver_host_admission.hpp). A leaked function-local static, like the pool above: a request
+// thread can reach it while statics are being destroyed at exit. Not used on Windows, whose lookup
+// is `resolve_host_addresses`.
 const std::shared_ptr<net::HostLookupAdmission>& oidc_lookup_admission_ref() {
     static const std::shared_ptr<net::HostLookupAdmission>& a =
         *new std::shared_ptr<net::HostLookupAdmission>(net::HostLookupAdmission::create());
@@ -984,9 +986,10 @@ const std::shared_ptr<net::HostLookupAdmission>& oidc_lookup_admission_ref() {
 }
 #endif
 
-// The pool-full warning, the NAT64 "not started" warning and the warning for a lookup refused
-// before the pool (a name refused or timed out moments ago) are written at most once per 60 s each
-// (one key each); later ones in the window go to debug. The lookups counter carries every
+// The pool-full warning, the NAT64 "not started" warning and the two warnings for a lookup refused
+// before the pool (a name refused or timed out moments ago; a name at its limit of outstanding
+// lookups) are written at most once per 60 s each (one key each, four in all, the throttle's whole
+// budget); later ones in the window go to debug. The lookups counter carries every
 // occurrence, and for a host lookup so does the failing request's own error. The timeout warning is
 // not throttled. A leaked function-local static, with the same precedent and reason as the pool
 // above and `detail::process_pool()` in bounded_resolver.hpp: a request thread can log through it
@@ -997,7 +1000,7 @@ RefusalLogThrottle& oidc_resolver_log_throttle() {
 }
 
 // The test hook (OidcProvider::set_bounded_lookup_for_test): empty in production, which means the
-// system lookup, the OIDC pool and the process-wide refusal memory.
+// system lookup, the OIDC pool and the process-wide admission.
 struct BoundedLookupHook {
     std::mutex mu;
     net::LookupFn lookup;
@@ -1129,25 +1132,49 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // Whether a lookup consults, and feeds, the refusal memory. The NAT64 probe bypasses it.
 enum class LookupMemory { kUse, kBypass };
 
-// The throttled warning for a lookup refused before the pool was asked. The key is fixed, never
+// The throttled warning for a lookup refused before the pool was asked: a name refused or timed out
+// moments ago, or a name already at its limit of outstanding lookups. The keys are fixed, never
 // derived from the host, so the throttle's key set stays bounded.
-void log_lookup_refused_by_memory(const std::string& host, net::HostLookupAdmission::Verdict v) {
-    const char* const key = "oidc_lookup_refused_recent";
+void log_lookup_refused_before_pool(const std::string& host,
+                                    net::HostLookupAdmission::Verdict verdict,
+                                    const net::HostLookupAdmission::Limits& limits) {
+    using Verdict = net::HostLookupAdmission::Verdict;
+    const char* key = "oidc_lookup_refused_recent";
+    std::string cause;
+    switch (verdict) {
+    case Verdict::kRefusedNameLimit:
+        key = "oidc_lookup_refused_name_limit";
+        cause = std::to_string(limits.per_name_in_flight) +
+                " lookups for this name are already outstanding";
+        break;
+    case Verdict::kRefusedTableFull:
+        key = "oidc_lookup_refused_name_limit";
+        cause = "lookups for " + std::to_string(limits.max_names_in_flight) +
+                " names are already outstanding";
+        break;
+    case Verdict::kRefusedRecent:
+        cause = "a lookup for this name was refused or timed out in the last " +
+                std::to_string(std::chrono::duration_cast<std::chrono::seconds>(limits.refusal_ttl)
+                                   .count()) +
+                " s";
+        break;
+    case Verdict::kAdmitted:
+    case Verdict::kRefusedError:
+        cause = "the admission check did not complete";
+        break;
+    }
     spdlog::log(oidc_resolver_log_throttle().should_warn(key) ? spdlog::level::warn
                                                               : spdlog::level::debug,
                 "OIDC egress: the name lookup for '{}' was not started: {} (this warning is "
                 "written at most once per 60 s; "
                 "yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} has the full count)",
-                ::yuzu::log_key_token(host),
-                v == net::HostLookupAdmission::Verdict::kRefusedRecent
-                    ? "a lookup for this name was refused or timed out in the last 3 s"
-                    : "the admission check did not complete");
+                ::yuzu::log_key_token(host), cause);
 }
 
 // Reports why a lookup failed (kBusy: nothing was started). kOk with no parsable address is
-// kNotFound. A lookup the refusal memory refuses is kBusy and is counted once, as busy, in the
-// pool's outcomes (`bounded_resolve` counts every lookup it runs, so the two never both count one
-// call).
+// kNotFound. A lookup that admission refuses (the name's limit, or the refusal memory) is kBusy and
+// is counted once, as busy, in the pool's outcomes, and takes no slot (`bounded_resolve` counts
+// every lookup it runs, so the two never both count one call).
 net::ResolveStatus resolve_host_addresses_status(const std::string& host, int timeout_sec,
                                                  std::vector<ResolvedAddress>& out,
                                                  LookupMemory memory = LookupMemory::kUse) {
@@ -1160,18 +1187,27 @@ net::ResolveStatus resolve_host_addresses_status(const std::string& host, int ti
         pool = bounded_lookup_hook().pool;
         admission = bounded_lookup_hook().admission;
     }
-    // A test driving the seam (a lookup or a pool installed) gets no refusal memory unless it
-    // passed one; with the hook empty the process-wide instance is used.
+    // A test driving the seam (a lookup or a pool installed) gets no admission unless it passed
+    // one; with the hook empty the process-wide instance is used.
     if (!admission && !lookup && !pool)
         admission = oidc_lookup_admission_ref();
     if (!pool)
         pool = oidc_resolver_pool_ref();
     const int pool_cap = pool->cap;
     if (admission) {
-        const auto verdict = admission->admit(host, memory == LookupMemory::kUse);
-        if (verdict != net::HostLookupAdmission::Verdict::kAdmitted) {
+        auto admitted = admission->admit(host, memory == LookupMemory::kUse);
+        if (admitted.verdict != net::HostLookupAdmission::Verdict::kAdmitted) {
             pool->note_outcome(net::ResolveStatus::kBusy);
-            log_lookup_refused_by_memory(host, verdict);
+            log_lookup_refused_before_pool(host, admitted.verdict, admission->limits());
+            return net::ResolveStatus::kBusy;
+        }
+        // The lookup holds the name's count until it returns, even if this caller stops waiting.
+        try {
+            lookup = net::hold_lease_during(std::move(lookup), std::move(admitted.lease));
+        } catch (...) {
+            pool->note_outcome(net::ResolveStatus::kBusy);
+            log_lookup_refused_before_pool(host, net::HostLookupAdmission::Verdict::kRefusedError,
+                                           admission->limits());
             return net::ResolveStatus::kBusy;
         }
     }
@@ -2697,9 +2733,9 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             spdlog::error("OidcProvider: discovery failed for issuer {}: {}",
                           ::yuzu::log_key_token(config_.issuer),
                           ::yuzu::log_key_token(doc.error()));
-            // A refusal because the lookup pool was full, no worker could be created or the name
-            // was refused or timed out moments ago learned nothing about the issuer: retried next
-            // attempt, not remembered. Matched by equality
+            // A refusal because the lookup pool was full, no worker could be created, the name
+            // was refused or timed out moments ago or the name already had 8 lookups outstanding
+            // learned nothing about the issuer: retried next attempt, not remembered. Matched by equality
             // with the one text http_get_bounded composes, so IdP-controlled text cannot match.
             const std::string busy_error =
                 std::string("request failed: ") + kEgressLookupBusyReason;

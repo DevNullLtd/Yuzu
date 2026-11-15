@@ -21,6 +21,7 @@
 #include <fstream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -62,6 +63,22 @@ std::shared_ptr<HostLookupAdmission> make(FakeClock& clock, std::size_t max_entr
     return HostLookupAdmission::create(limits, clock.fn());
 }
 
+std::shared_ptr<HostLookupAdmission> make_limited(FakeClock& clock, std::size_t per_name,
+                                                  std::size_t max_names = 64) {
+    HostLookupAdmission::Limits limits;
+    limits.per_name_in_flight = per_name;
+    limits.max_names_in_flight = max_names;
+    return HostLookupAdmission::create(limits, clock.fn());
+}
+
+/// Admits `host` and requires it to be admitted, returning the lease.
+HostLookupAdmission::Lease take(HostLookupAdmission& adm, std::string_view host) {
+    auto admitted = adm.admit(host);
+    REQUIRE(admitted.verdict == Verdict::kAdmitted);
+    REQUIRE(static_cast<bool>(admitted.lease));
+    return std::move(admitted.lease);
+}
+
 } // namespace
 
 TEST_CASE("HostLookupAdmission: the defaults are the documented limits",
@@ -69,20 +86,24 @@ TEST_CASE("HostLookupAdmission: the defaults are the documented limits",
     const HostLookupAdmission::Limits limits;
     CHECK(limits.refusal_ttl == seconds(3));
     CHECK(limits.max_refusal_entries == 32);
+    CHECK(limits.per_name_in_flight == 8);
+    CHECK(limits.max_names_in_flight == 64);
     CHECK(yuzu::server::net::kLookupRefusalTtl == seconds(3));
     CHECK(yuzu::server::net::kLookupRefusalMaxNames == 32);
+    CHECK(yuzu::server::net::kLookupPerNameLimit == 8);
+    CHECK(yuzu::server::net::kLookupMaxNames == 64);
 }
 
 TEST_CASE("HostLookupAdmission: a name is admitted until a lookup for it was refused or timed out",
           "[resolver_host_admission]") {
     FakeClock clock;
     auto adm = make(clock);
-    CHECK(adm->admit("idp.example") == Verdict::kAdmitted);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kAdmitted);
     CHECK(adm->refusal_entries() == 0); // admitting arms nothing
 
     adm->note_outcome("idp.example", ResolveStatus::kBusy);
-    CHECK(adm->admit("idp.example") == Verdict::kRefusedRecent);
-    CHECK(adm->admit("other.example") == Verdict::kAdmitted); // another name is unaffected
+    CHECK(adm->admit("idp.example").verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("other.example").verdict == Verdict::kAdmitted); // another name is unaffected
 }
 
 TEST_CASE("HostLookupAdmission: names that differ only by case or one trailing dot share an entry",
@@ -91,15 +112,15 @@ TEST_CASE("HostLookupAdmission: names that differ only by case or one trailing d
     auto adm = make(clock);
     adm->note_outcome("Idp.Example.", ResolveStatus::kTimeout);
     CHECK(adm->refusal_entries() == 1);
-    CHECK(adm->admit("idp.example") == Verdict::kRefusedRecent);
-    CHECK(adm->admit("IDP.EXAMPLE") == Verdict::kRefusedRecent);
-    CHECK(adm->admit("idp.example.") == Verdict::kRefusedRecent);
-    CHECK(adm->admit("idp.example2") == Verdict::kAdmitted);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("IDP.EXAMPLE").verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("idp.example.").verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("idp.example2").verdict == Verdict::kAdmitted);
 
     // Exactly one trailing dot is removed: "a.." and "a" are different names.
     adm->note_outcome("a..", ResolveStatus::kBusy);
-    CHECK(adm->admit("a..") == Verdict::kRefusedRecent);
-    CHECK(adm->admit("a") == Verdict::kAdmitted);
+    CHECK(adm->admit("a..").verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("a").verdict == Verdict::kAdmitted);
 }
 
 TEST_CASE("HostLookupAdmission: a name that cannot be keyed is never remembered and never refused",
@@ -117,12 +138,12 @@ TEST_CASE("HostLookupAdmission: a name that cannot be keyed is never remembered 
         adm->note_outcome(host, ResolveStatus::kBusy);
         adm->note_outcome(host, ResolveStatus::kTimeout);
         CHECK(adm->refusal_entries() == 0);
-        CHECK(adm->admit(host) == Verdict::kAdmitted);
+        CHECK(adm->admit(host).verdict == Verdict::kAdmitted);
     }
     // 253 bytes is the longest name that is keyed.
     const std::string longest(253, 'a');
     adm->note_outcome(longest, ResolveStatus::kBusy);
-    CHECK(adm->admit(longest) == Verdict::kRefusedRecent);
+    CHECK(adm->admit(longest).verdict == Verdict::kRefusedRecent);
 }
 
 TEST_CASE("HostLookupAdmission: the refusal ends at the TTL and its entry is dropped",
@@ -131,9 +152,9 @@ TEST_CASE("HostLookupAdmission: the refusal ends at the TTL and its entry is dro
     auto adm = make(clock);
     adm->note_outcome("idp.example", ResolveStatus::kBusy);
     clock.advance(seconds(3) - std::chrono::nanoseconds(1));
-    CHECK(adm->admit("idp.example") == Verdict::kRefusedRecent);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kRefusedRecent);
     clock.advance(std::chrono::nanoseconds(1)); // exactly the TTL
-    CHECK(adm->admit("idp.example") == Verdict::kAdmitted);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kAdmitted);
     CHECK(adm->refusal_entries() == 0);
 }
 
@@ -144,10 +165,10 @@ TEST_CASE("HostLookupAdmission: a refusal served from memory does not extend the
     adm->note_outcome("idp.example", ResolveStatus::kBusy);
     for (int i = 0; i < 5; ++i) {
         clock.advance(std::chrono::milliseconds(500));
-        CHECK(adm->admit("idp.example") == Verdict::kRefusedRecent); // t0 + 0.5 s ... 2.5 s
+        CHECK(adm->admit("idp.example").verdict == Verdict::kRefusedRecent); // t0 + 0.5 s ... 2.5 s
     }
     clock.advance(std::chrono::milliseconds(500)); // t0 + 3 s
-    CHECK(adm->admit("idp.example") == Verdict::kAdmitted);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kAdmitted);
 }
 
 TEST_CASE("HostLookupAdmission: only a busy or timed out lookup arms a name; an answer never does",
@@ -160,19 +181,19 @@ TEST_CASE("HostLookupAdmission: only a busy or timed out lookup arms a name; an 
     adm->note_outcome("a.example", ResolveStatus::kOk);
     adm->note_outcome("a.example", ResolveStatus::kCount);
     CHECK(adm->refusal_entries() == 0);
-    CHECK(adm->admit("a.example") == Verdict::kAdmitted);
+    CHECK(adm->admit("a.example").verdict == Verdict::kAdmitted);
 
     adm->note_outcome("b.example", ResolveStatus::kTimeout);
-    CHECK(adm->admit("b.example") == Verdict::kRefusedRecent);
+    CHECK(adm->admit("b.example").verdict == Verdict::kRefusedRecent);
     adm->note_outcome("c.example", ResolveStatus::kBusy);
-    CHECK(adm->admit("c.example") == Verdict::kRefusedRecent);
+    CHECK(adm->admit("c.example").verdict == Verdict::kRefusedRecent);
 
     // Not found and temporary leave an armed name as it is; ok removes it.
     adm->note_outcome("b.example", ResolveStatus::kNotFound);
     adm->note_outcome("b.example", ResolveStatus::kTemporary);
-    CHECK(adm->admit("b.example") == Verdict::kRefusedRecent);
+    CHECK(adm->admit("b.example").verdict == Verdict::kRefusedRecent);
     adm->note_outcome("b.example", ResolveStatus::kOk);
-    CHECK(adm->admit("b.example") == Verdict::kAdmitted);
+    CHECK(adm->admit("b.example").verdict == Verdict::kAdmitted);
     CHECK(adm->refusal_entries() == 1); // c.example only
 }
 
@@ -184,9 +205,9 @@ TEST_CASE("HostLookupAdmission: a lookup that ran and ended busy again re-arms t
     clock.advance(seconds(2));
     adm->note_outcome("idp.example", ResolveStatus::kTimeout); // a lookup that bypassed the memory
     clock.advance(seconds(2));                                 // t0 + 4 s: past the first expiry
-    CHECK(adm->admit("idp.example") == Verdict::kRefusedRecent);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kRefusedRecent);
     clock.advance(seconds(1)); // t0 + 5 s: the second expiry
-    CHECK(adm->admit("idp.example") == Verdict::kAdmitted);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kAdmitted);
 }
 
 TEST_CASE("HostLookupAdmission: a lookup that bypasses the memory is admitted for an armed name",
@@ -194,8 +215,8 @@ TEST_CASE("HostLookupAdmission: a lookup that bypasses the memory is admitted fo
     FakeClock clock;
     auto adm = make(clock);
     adm->note_outcome("ipv4only.arpa", ResolveStatus::kBusy);
-    CHECK(adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/true) == Verdict::kRefusedRecent);
-    CHECK(adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false) == Verdict::kAdmitted);
+    CHECK(adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/true).verdict == Verdict::kRefusedRecent);
+    CHECK(adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false).verdict == Verdict::kAdmitted);
     CHECK(adm->refusal_entries() == 1); // bypassing neither reads nor changes the entry
 }
 
@@ -212,11 +233,11 @@ TEST_CASE("HostLookupAdmission: the memory is bounded; expired entries go before
             CHECK(adm->refusal_entries() <= 3);
         }
         CHECK(adm->refusal_entries() == 3);
-        CHECK(adm->admit("n1.example") == Verdict::kAdmitted); // the two earliest are gone
-        CHECK(adm->admit("n2.example") == Verdict::kAdmitted);
-        CHECK(adm->admit("n3.example") == Verdict::kRefusedRecent);
-        CHECK(adm->admit("n4.example") == Verdict::kRefusedRecent);
-        CHECK(adm->admit("n5.example") == Verdict::kRefusedRecent);
+        CHECK(adm->admit("n1.example").verdict == Verdict::kAdmitted); // the two earliest are gone
+        CHECK(adm->admit("n2.example").verdict == Verdict::kAdmitted);
+        CHECK(adm->admit("n3.example").verdict == Verdict::kRefusedRecent);
+        CHECK(adm->admit("n4.example").verdict == Verdict::kRefusedRecent);
+        CHECK(adm->admit("n5.example").verdict == Verdict::kRefusedRecent);
     }
     SECTION("every expired entry is dropped before a live one is evicted") {
         adm->note_outcome("old.example", ResolveStatus::kBusy);
@@ -228,18 +249,18 @@ TEST_CASE("HostLookupAdmission: the memory is bounded; expired entries go before
         clock.advance(std::chrono::milliseconds(400)); // t0 + 3.5 s: old and mid have expired
         adm->note_outcome("fourth.example", ResolveStatus::kBusy); // the table is at its cap
         CHECK(adm->refusal_entries() == 2);                        // new and fourth only
-        CHECK(adm->admit("old.example") == Verdict::kAdmitted);
-        CHECK(adm->admit("mid.example") == Verdict::kAdmitted);
-        CHECK(adm->admit("new.example") == Verdict::kRefusedRecent);
-        CHECK(adm->admit("fourth.example") == Verdict::kRefusedRecent);
+        CHECK(adm->admit("old.example").verdict == Verdict::kAdmitted);
+        CHECK(adm->admit("mid.example").verdict == Verdict::kAdmitted);
+        CHECK(adm->admit("new.example").verdict == Verdict::kRefusedRecent);
+        CHECK(adm->admit("fourth.example").verdict == Verdict::kRefusedRecent);
     }
     SECTION("re-arming a name already in the table needs no room") {
         for (const char* name : {"a.example", "b.example", "c.example"})
             adm->note_outcome(name, ResolveStatus::kBusy);
         adm->note_outcome("a.example", ResolveStatus::kTimeout);
         CHECK(adm->refusal_entries() == 3);
-        CHECK(adm->admit("b.example") == Verdict::kRefusedRecent);
-        CHECK(adm->admit("c.example") == Verdict::kRefusedRecent);
+        CHECK(adm->admit("b.example").verdict == Verdict::kRefusedRecent);
+        CHECK(adm->admit("c.example").verdict == Verdict::kRefusedRecent);
     }
 }
 
@@ -272,6 +293,289 @@ TEST_CASE("HostLookupAdmission: concurrent arming and admission keeps the table 
     CHECK(adm->refusal_entries() <= 8);
 }
 
+TEST_CASE("HostLookupAdmission: at most 8 lookups for one name are outstanding at once",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = HostLookupAdmission::create({}, clock.fn());
+    std::vector<HostLookupAdmission::Lease> leases;
+    for (std::size_t i = 0; i < 8; ++i)
+        leases.push_back(take(*adm, "idp.example"));
+    CHECK(adm->in_flight_for("idp.example") == 8);
+
+    auto refused = adm->admit("idp.example");
+    CHECK(refused.verdict == Verdict::kRefusedNameLimit);
+    CHECK_FALSE(static_cast<bool>(refused.lease));
+    CHECK(adm->in_flight_for("idp.example") == 8); // a refusal takes no count
+    CHECK(adm->refusal_entries() == 0);            // and is not remembered
+}
+
+TEST_CASE("HostLookupAdmission: the per-name limit counts per name, frees on release and erases "
+          "the entry at zero",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, /*per_name=*/4);
+    std::vector<HostLookupAdmission::Lease> leases;
+    for (int i = 0; i < 4; ++i)
+        leases.push_back(take(*adm, "a.example"));
+    CHECK(adm->admit("a.example").verdict == Verdict::kRefusedNameLimit);
+    CHECK(adm->admit("b.example").verdict == Verdict::kAdmitted); // another name is unaffected
+    CHECK(adm->hosts_in_flight() == 1); // that admission's temporary lease is already released
+
+    leases.pop_back(); // one lookup returned
+    CHECK(adm->in_flight_for("a.example") == 3);
+    leases.push_back(take(*adm, "a.example")); // so one more is admitted
+    CHECK(adm->admit("a.example").verdict == Verdict::kRefusedNameLimit);
+
+    leases.clear();
+    CHECK(adm->in_flight_for("a.example") == 0);
+    CHECK(adm->hosts_in_flight() == 0); // the table holds only names with a lookup outstanding
+}
+
+TEST_CASE("HostLookupAdmission: names that differ only by case or one trailing dot share a limit",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 3);
+    auto one = take(*adm, "Idp.Example.");
+    auto two = take(*adm, "idp.example");
+    auto three = take(*adm, "IDP.EXAMPLE");
+    CHECK(adm->in_flight_for("idp.example.") == 3);
+    CHECK(adm->admit("idp.example").verdict == Verdict::kRefusedNameLimit);
+    CHECK(adm->hosts_in_flight() == 1);
+}
+
+TEST_CASE("HostLookupAdmission: names that cannot be keyed share ONE limit and cannot bypass it",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 3);
+    const std::vector<std::string> unkeyable = {"",
+                                                std::string(254, 'a'),
+                                                std::string("a\x01" "b"),
+                                                "a b",
+                                                std::string("a\0b", 3),
+                                                "."};
+    std::vector<HostLookupAdmission::Lease> leases;
+    for (std::size_t i = 0; i < 3; ++i)
+        leases.push_back(take(*adm, unkeyable[i]));
+    // Every other spelling that cannot be keyed is on the same count.
+    for (const auto& host : unkeyable) {
+        CAPTURE(host.size());
+        CHECK(adm->admit(host).verdict == Verdict::kRefusedNameLimit);
+    }
+    CHECK(adm->hosts_in_flight() == 1);
+    CHECK(adm->in_flight_for("") == 3);
+    // A real name is a different key.
+    CHECK(adm->admit("real.example").verdict == Verdict::kAdmitted);
+    // Never remembered, so never refused from memory either.
+    adm->note_outcome("", ResolveStatus::kBusy);
+    CHECK(adm->refusal_entries() == 0);
+}
+
+TEST_CASE("HostLookupAdmission: at most 64 names have a lookup outstanding; a new name beyond is "
+          "refused, never untracked",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, /*per_name=*/2, /*max_names=*/2);
+    auto a = take(*adm, "a.example");
+    auto b = take(*adm, "b.example");
+    auto third = adm->admit("c.example");
+    CHECK(third.verdict == Verdict::kRefusedTableFull);
+    CHECK_FALSE(static_cast<bool>(third.lease));
+    CHECK(adm->hosts_in_flight() == 2);
+    // A name already in the table still admits up to its own limit.
+    auto a2 = take(*adm, "a.example");
+    CHECK(adm->admit("a.example").verdict == Verdict::kRefusedNameLimit);
+    // Freeing every lookup of one name admits the new one.
+    b.release();
+    auto c = take(*adm, "c.example");
+    CHECK(adm->hosts_in_flight() == 2);
+    // The unkeyable sentinel needs a table slot too, and is refused when none is free.
+    CHECK(adm->admit("").verdict == Verdict::kRefusedTableFull);
+}
+
+TEST_CASE("HostLookupAdmission: a refusal from memory takes no count, and a refusal by the limit "
+          "is not remembered",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 1);
+    adm->note_outcome("armed.example", ResolveStatus::kBusy);
+    auto recent = adm->admit("armed.example");
+    CHECK(recent.verdict == Verdict::kRefusedRecent);
+    CHECK(adm->in_flight_for("armed.example") == 0);
+    CHECK(adm->hosts_in_flight() == 0);
+
+    auto held = take(*adm, "full.example");
+    CHECK(adm->admit("full.example").verdict == Verdict::kRefusedNameLimit);
+    held.release();
+    CHECK(adm->admit("full.example").verdict == Verdict::kAdmitted); // not Recent: nothing armed
+    CHECK(adm->refusal_entries() == 1);                             // armed.example only
+}
+
+TEST_CASE("HostLookupAdmission: a lookup that skips the memory still obeys the per-name limit",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 1);
+    adm->note_outcome("ipv4only.arpa", ResolveStatus::kBusy);
+    auto first = adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false);
+    CHECK(first.verdict == Verdict::kAdmitted); // an armed name does not stop it
+    auto second = adm->admit("ipv4only.arpa", /*consult_refusal_memory=*/false);
+    CHECK(second.verdict == Verdict::kRefusedNameLimit);
+}
+
+TEST_CASE("HostLookupAdmission::Lease: one release per admission, whatever is done to it",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 4);
+
+    SECTION("a default lease does nothing") {
+        HostLookupAdmission::Lease none;
+        CHECK_FALSE(static_cast<bool>(none));
+        none.release();
+        CHECK(adm->hosts_in_flight() == 0);
+    }
+    SECTION("release is idempotent") {
+        auto lease = take(*adm, "a.example");
+        CHECK(adm->in_flight_for("a.example") == 1);
+        lease.release();
+        lease.release();
+        CHECK(adm->in_flight_for("a.example") == 0);
+        // A second lease on the same name is not reduced by the first one's repeated release.
+        auto other = take(*adm, "a.example");
+        auto again = take(*adm, "a.example");
+        again.release();
+        again.release();
+        CHECK(adm->in_flight_for("a.example") == 1);
+    }
+    SECTION("a moved lease leaves exactly one release") {
+        auto lease = take(*adm, "a.example");
+        HostLookupAdmission::Lease moved(std::move(lease));
+        CHECK_FALSE(static_cast<bool>(lease)); // NOLINT(bugprone-use-after-move)
+        lease.release();
+        CHECK(adm->in_flight_for("a.example") == 1);
+        moved.release();
+        CHECK(adm->in_flight_for("a.example") == 0);
+    }
+    SECTION("move assignment releases the count the target held") {
+        auto first = take(*adm, "a.example");
+        auto second = take(*adm, "b.example");
+        first = std::move(second);
+        CHECK(adm->in_flight_for("a.example") == 0);
+        CHECK(adm->in_flight_for("b.example") == 1);
+    }
+    SECTION("the destructor releases") {
+        {
+            auto lease = take(*adm, "a.example");
+            CHECK(adm->in_flight_for("a.example") == 1);
+        }
+        CHECK(adm->in_flight_for("a.example") == 0);
+    }
+}
+
+TEST_CASE("HostLookupAdmission::Lease: a lease keeps the admission alive and can outlive its "
+          "handle",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 2);
+    auto lease = take(*adm, "a.example");
+    adm.reset(); // the lease is the only owner now
+    lease.release();
+    SUCCEED("released after the last external handle was dropped");
+}
+
+TEST_CASE("hold_lease_during: the worker releases when the lookup returns, throws, or never runs",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, 4);
+    const auto ok = [](const std::string&) {
+        return yuzu::server::net::ResolveResult{ResolveStatus::kOk, {"93.184.216.34"}};
+    };
+
+    SECTION("returns: held during the lookup, released before the call returns") {
+        std::size_t seen_inside = 99;
+        auto fn = yuzu::server::net::hold_lease_during(
+            [&](const std::string& host) {
+                seen_inside = adm->in_flight_for(host);
+                return ok(host);
+            },
+            take(*adm, "a.example"));
+        CHECK(adm->in_flight_for("a.example") == 1); // admitted, lookup not yet called
+        const auto result = fn("a.example");
+        CHECK(result.status == ResolveStatus::kOk);
+        CHECK(seen_inside == 1);
+        CHECK(adm->in_flight_for("a.example") == 0); // fn is still alive: released by the call
+    }
+    SECTION("throws: the exception propagates and the count is released") {
+        auto fn = yuzu::server::net::hold_lease_during(
+            [](const std::string&) -> yuzu::server::net::ResolveResult {
+                throw std::runtime_error("resolver failed");
+            },
+            take(*adm, "a.example"));
+        CHECK_THROWS_AS(fn("a.example"), std::runtime_error);
+        CHECK(adm->in_flight_for("a.example") == 0);
+    }
+    SECTION("never run: destroying the wrapper releases the count") {
+        {
+            auto fn = yuzu::server::net::hold_lease_during(ok, take(*adm, "a.example"));
+            CHECK(adm->in_flight_for("a.example") == 1);
+        }
+        CHECK(adm->in_flight_for("a.example") == 0);
+    }
+    SECTION("copies: the count stays until the last copy is gone") {
+        auto fn = yuzu::server::net::hold_lease_during(ok, take(*adm, "a.example"));
+        auto copy = fn;
+        fn = nullptr;
+        CHECK(adm->in_flight_for("a.example") == 1);
+        copy = nullptr;
+        CHECK(adm->in_flight_for("a.example") == 0);
+    }
+    SECTION("running one copy releases once; a second run does not release again") {
+        auto first = take(*adm, "a.example");
+        auto second = take(*adm, "a.example");
+        auto fn = yuzu::server::net::hold_lease_during(ok, std::move(first));
+        (void)fn("a.example");
+        (void)fn("a.example");
+        CHECK(adm->in_flight_for("a.example") == 1); // only `second` remains
+    }
+}
+
+TEST_CASE("HostLookupAdmission: concurrent admission never holds more than the limit and ends "
+          "empty",
+          "[resolver_host_admission]") {
+    FakeClock clock;
+    auto adm = make_limited(clock, /*per_name=*/3, /*max_names=*/8);
+    constexpr int kNames = 3;
+    std::atomic<int> held[kNames]{};
+    std::atomic<int> max_held[kNames]{};
+    std::atomic<bool> go{false};
+
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 8; ++t)
+        threads.emplace_back([&, t] {
+            while (!go.load()) {
+            }
+            for (int i = 0; i < 2000; ++i) {
+                const int n = (t + i) % kNames;
+                auto admitted = adm->admit("n" + std::to_string(n) + ".example");
+                if (admitted.verdict != Verdict::kAdmitted)
+                    continue;
+                const int now_held = held[n].fetch_add(1) + 1;
+                int prev = max_held[n].load();
+                while (now_held > prev && !max_held[n].compare_exchange_weak(prev, now_held)) {
+                }
+                held[n].fetch_sub(1);
+                admitted.lease.release();
+            }
+        });
+    go.store(true);
+    for (auto& th : threads)
+        th.join();
+    for (int n = 0; n < kNames; ++n) {
+        CAPTURE(n);
+        CHECK(max_held[n].load() <= 3);
+        CHECK(max_held[n].load() >= 1);
+    }
+    CHECK(adm->hosts_in_flight() == 0);
+}
+
 TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check runs before the "
           "lookup, only a lookup that ran feeds the memory, and a refusal is counted once",
           "[resolver_host_admission][wiring][lexical]") {
@@ -283,7 +587,12 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
     REQUIRE(admit != std::string::npos);
     REQUIRE(resolve != std::string::npos);
     REQUIRE(feed != std::string::npos);
-    CHECK(admit < resolve);
+    // The lease wrapper is installed between the check and the lookup.
+    const auto wrap = flat.find("net::hold_lease_during(std::move(lookup),std::move(admitted.lease))");
+    REQUIRE(wrap != std::string::npos);
+    CHECK(count_occurrences(flat, "hold_lease_during(") == 1);
+    CHECK(admit < wrap);
+    CHECK(wrap < resolve);
     CHECK(resolve < feed);
     CHECK(count_occurrences(flat, "admission->admit(") == 1);
     CHECK(count_occurrences(flat, "admission->note_outcome(") == 1);
@@ -291,13 +600,18 @@ TEST_CASE("OIDC lookup admission wiring (LEXICAL pin, not behaviour): the check 
     CHECK(count_occurrences(flat, "if(admission&&memory==LookupMemory::kUse)admission->note_outcome(") == 1);
     // A refusal made before the pool is counted once, as busy, by the adapter (the pool counts
     // only the lookups it ran).
-    CHECK(count_occurrences(flat, "pool->note_outcome(net::ResolveStatus::kBusy);") == 1);
+    CHECK(count_occurrences(flat, "pool->note_outcome(net::ResolveStatus::kBusy);") == 2);
     // Only the NAT64 probe bypasses the memory.
     CHECK(count_occurrences(flat, "LookupMemory::kBypass") == 1);
     CHECK(count_occurrences(flat, "resolve_host_addresses_status(") == 3); // definition + two callers
     // The warnings share one throttle with a small key budget.
     CHECK(count_occurrences(flat, "RefusalLogThrottle(std::chrono::seconds(60),4)") == 1);
     CHECK(count_occurrences(flat, "should_warn(") <= 4);
+    // Four fixed keys in all: the two pool warnings and the two refusals before the pool.
+    CHECK(count_occurrences(flat, "\"oidc_lookup_busy\"") == 1);
+    CHECK(count_occurrences(flat, "\"oidc_nat64_probe_busy\"") == 1);
+    CHECK(count_occurrences(flat, "\"oidc_lookup_refused_recent\"") == 1);
+    CHECK(count_occurrences(flat, "\"oidc_lookup_refused_name_limit\"") == 2);
 }
 
 namespace {
@@ -321,6 +635,9 @@ TEST_CASE("OIDC lookup admission limits (LEXICAL pin, not behaviour): the docume
     const std::string names =
         std::to_string(yuzu::server::net::kLookupRefusalMaxNames) + " names";
     const std::string window = "refused or timed out in the last " + ttl;
+    const std::string per_name =
+        std::to_string(yuzu::server::net::kLookupPerNameLimit) + " lookups for the same name";
+    const std::string max_names = std::to_string(yuzu::server::net::kLookupMaxNames) + " names";
 
     for (const char* doc : {"docs/user-manual/authentication.md", "docs/user-manual/metrics.md",
                             "docs/user-manual/upgrading.md"}) {
@@ -329,9 +646,11 @@ TEST_CASE("OIDC lookup admission limits (LEXICAL pin, not behaviour): the docume
         REQUIRE_FALSE(text.empty());
         CHECK(text.find(names) != std::string::npos);
         CHECK(text.find(ttl) != std::string::npos);
+        CHECK(text.find(per_name) != std::string::npos);
+        CHECK(text.find(max_names) != std::string::npos);
     }
     for (const char* doc : {"docs/user-manual/authentication.md", "docs/user-manual/metrics.md",
-                            "server/core/src/oidc_provider.cpp"}) {
+                            }) {
         CAPTURE(doc);
         const std::string text = read_repo_file(doc);
         REQUIRE_FALSE(text.empty());
@@ -341,7 +660,7 @@ TEST_CASE("OIDC lookup admission limits (LEXICAL pin, not behaviour): the docume
     const std::string help = read_repo_file("server/core/src/resolver_pool_metrics.hpp");
     CHECK(help.find("the last " + ttl) != std::string::npos);
     const std::string alerts = read_repo_file("docs/prometheus/yuzu-alerts.yml");
-    CHECK(alerts.find("in the last " +
+    CHECK(alerts.find("the last " +
                       std::to_string(yuzu::server::net::kLookupRefusalTtl.count()) + " seconds") !=
           std::string::npos);
 }

@@ -363,9 +363,9 @@ public:
     /// adapter passes to `net::bounded_resolve` (bounded_resolver.hpp), BELOW
     /// `set_resolver_for_test`, so a test can block a lookup behind a latch, fill a small pool or
     /// fail a lookup without DNS. An empty `lookup` and a null `pool` restore the system lookup and
-    /// the OIDC pool. `admission` is the refusal memory the adapter consults: a test that installs
-    /// a lookup or a pool and passes none gets no refusal memory, so only a test that asks for it
-    /// sees it. Process-wide: a test must restore it. Same source-scan pin.
+    /// the OIDC pool. `admission` is the per-name limit and refusal memory the adapter consults: a
+    /// test that installs a lookup or a pool and passes none gets no admission, so only a test that
+    /// asks for it sees it. Process-wide: a test must restore it. Same source-scan pin.
     using BoundedLookupForTest = std::function<net::ResolveResult(const std::string& host)>;
     static void set_bounded_lookup_for_test(
         BoundedLookupForTest lookup, std::shared_ptr<net::ResolverPool> pool,

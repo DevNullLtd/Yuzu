@@ -2,10 +2,25 @@
 
 /// @file resolver_host_admission.hpp
 /// Admission in front of the OIDC name lookup (`resolve_host_addresses_status` in
-/// `oidc_provider.cpp`, POSIX builds): a short memory of names whose lookup was refused or timed
-/// out. Pure decision code: one mutex, no I/O, no logging, an injectable monotonic clock, no
-/// thread. `bounded_resolver.hpp` is not touched, so the process pool used by CRL source
-/// registration is not affected.
+/// `oidc_provider.cpp`, POSIX builds): a limit on the lookups outstanding for one name, and a short
+/// memory of names whose lookup was refused or timed out. Pure decision code: one mutex, no I/O,
+/// no logging, an injectable monotonic clock, no thread. `bounded_resolver.hpp` is not touched, so
+/// the process pool used by CRL source registration is not affected.
+///
+/// PER-NAME LIMIT. At most `kLookupPerNameLimit` (8) lookups for one name are outstanding at once,
+/// and at most `kLookupMaxNames` (64) distinct names have one. A lookup beyond either is refused
+/// without being started. A name is counted from `admit` until its lookup RETURNS, so a lookup
+/// whose caller stopped waiting at the time bound still counts against its name:
+///  - the count is held by a `Lease`, which the WORKER releases (`hold_lease_during` wraps the
+///    lookup function), exactly once, on every path: the lookup returns, throws, is refused by the
+///    pool, or its thread cannot be created;
+///  - a name's table entry is erased when its count returns to 0, so the table holds only names
+///    with a lookup outstanding;
+///  - a name that cannot be keyed (empty, longer than 253 bytes, a control byte) shares ONE
+///    sentinel key and so one limit like any other name: failing to key it never means it is
+///    untracked;
+///  - a refusal by the limit is not remembered: only a lookup that was actually run arms the
+///    refusal memory below.
 ///
 /// REFUSAL MEMORY. A name whose lookup ended `kBusy` or `kTimeout` is refused again, without
 /// starting a lookup, for `kLookupRefusalTtl` (3 s). The memory holds at most
@@ -17,11 +32,12 @@
 ///    after the lookup that armed it, however often the name is asked for meanwhile.
 ///  - `kOk` removes the entry. `kNotFound` and `kTemporary` are never remembered.
 ///  - A success is never cached: nothing here returns an address.
-///  - A name that cannot be keyed (empty, longer than 253 bytes, a control byte) is never
-///    remembered and never refused from memory.
+///  - A name that cannot be keyed is never remembered and never refused from memory (it is still
+///    limited, above).
 ///
 /// The caller treats a refusal like any other refused lookup: the same `kBusy` status and the
-/// same reason text as a full pool, so no caller learns a new failure kind.
+/// same reason text as a full pool, so no caller learns a new failure kind. Nothing here returns an
+/// address, so a refusal can never become a success.
 
 #include "bounded_resolver.hpp"
 
@@ -37,26 +53,79 @@
 
 namespace yuzu::server::net {
 
+/// The most lookups outstanding for one name at once.
+inline constexpr std::size_t kLookupPerNameLimit = 8;
+/// The most distinct names with a lookup outstanding at once.
+inline constexpr std::size_t kLookupMaxNames = 64;
 /// How long a name whose lookup was refused or timed out is refused again.
 inline constexpr std::chrono::seconds kLookupRefusalTtl{3};
 /// The most names the refusal memory holds at once.
 inline constexpr std::size_t kLookupRefusalMaxNames = 32;
 
-class HostLookupAdmission {
+class HostLookupAdmission : public std::enable_shared_from_this<HostLookupAdmission> {
 public:
     using Clock = std::chrono::steady_clock;
     /// Must not call back into this object.
     using NowFn = std::function<Clock::time_point()>;
 
     struct Limits {
+        std::size_t per_name_in_flight{kLookupPerNameLimit};
+        std::size_t max_names_in_flight{kLookupMaxNames};
         Clock::duration refusal_ttl{kLookupRefusalTtl};
         std::size_t max_refusal_entries{kLookupRefusalMaxNames};
     };
 
     enum class Verdict : std::uint8_t {
         kAdmitted,
-        kRefusedRecent, ///< the name's lookup was refused or timed out within the TTL
-        kRefusedError   ///< the check itself failed: refused, never admitted
+        kRefusedRecent,    ///< the name's lookup was refused or timed out within the TTL
+        kRefusedNameLimit, ///< the name already has `per_name_in_flight` lookups outstanding
+        kRefusedTableFull, ///< `max_names_in_flight` other names have a lookup outstanding
+        kRefusedError      ///< the check itself failed: refused, never admitted
+    };
+
+    /// One lookup's count against its name. Move-only; releases on destruction, and `release()` is
+    /// idempotent. It keeps the admission object alive, so a worker that outlives the call (or a
+    /// test object) can still release.
+    class Lease {
+    public:
+        Lease() noexcept = default;
+        Lease(Lease&& other) noexcept
+            : owner_(std::move(other.owner_)), key_(std::move(other.key_)), active_(other.active_) {
+            other.active_ = false;
+        }
+        Lease& operator=(Lease&& other) noexcept {
+            if (this != &other) {
+                release();
+                owner_ = std::move(other.owner_);
+                key_ = std::move(other.key_);
+                active_ = other.active_;
+                other.active_ = false;
+            }
+            return *this;
+        }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        ~Lease() { release(); }
+
+        void release() noexcept {
+            if (!active_)
+                return;
+            active_ = false;
+            const auto owner = std::move(owner_);
+            owner->release_key(key_);
+        }
+        explicit operator bool() const noexcept { return active_; }
+
+    private:
+        friend class HostLookupAdmission;
+        std::shared_ptr<HostLookupAdmission> owner_;
+        std::string key_;
+        bool active_{false}; ///< set only after the name's count was incremented
+    };
+
+    struct Admission {
+        Verdict verdict{Verdict::kRefusedError};
+        Lease lease; ///< holds a count only when `verdict == kAdmitted`
     };
 
     [[nodiscard]] static std::shared_ptr<HostLookupAdmission> create(Limits limits,
@@ -69,26 +138,36 @@ public:
         return create(Limits{});
     }
 
-    /// Whether a lookup for `host` may be started. `consult_refusal_memory = false` skips the
-    /// memory check (the NAT64 probe).
-    [[nodiscard]] Verdict admit(std::string_view host, bool consult_refusal_memory = true) noexcept {
+    /// Whether a lookup for `host` may be started. On `kAdmitted` the lease holds one count for the
+    /// name until it is released. `consult_refusal_memory = false` skips the memory check (the
+    /// NAT64 probe); the per-name limit always applies.
+    [[nodiscard]] Admission admit(std::string_view host,
+                                  bool consult_refusal_memory = true) noexcept {
         try {
-            if (!consult_refusal_memory)
-                return Verdict::kAdmitted;
             const std::string key = normalise_key(host);
-            if (key == unkeyed_name())
-                return Verdict::kAdmitted;
             const auto now = now_();
             std::lock_guard lock(mu_);
-            const auto it = refused_until_.find(key);
-            if (it == refused_until_.end())
-                return Verdict::kAdmitted;
-            if (now < it->second)
-                return Verdict::kRefusedRecent; // the entry is left as it is: no extension
-            refused_until_.erase(it);
-            return Verdict::kAdmitted;
+            if (consult_refusal_memory && key != unkeyed_name()) {
+                if (const auto it = refused_until_.find(key); it != refused_until_.end()) {
+                    if (now < it->second)
+                        return {Verdict::kRefusedRecent, {}}; // the entry is left as it is
+                    refused_until_.erase(it);
+                }
+            }
+            const auto counted = in_flight_.find(key);
+            const std::size_t count = counted == in_flight_.end() ? 0 : counted->second;
+            if (count >= limits_.per_name_in_flight)
+                return {Verdict::kRefusedNameLimit, {}};
+            if (count == 0 && in_flight_.size() >= limits_.max_names_in_flight)
+                return {Verdict::kRefusedTableFull, {}};
+            Lease lease; // everything that can throw happens before the count moves
+            lease.owner_ = shared_from_this();
+            lease.key_ = key;
+            ++in_flight_[key];
+            lease.active_ = true;
+            return {Verdict::kAdmitted, std::move(lease)};
         } catch (...) {
-            return Verdict::kRefusedError;
+            return {Verdict::kRefusedError, {}};
         }
     }
 
@@ -123,6 +202,22 @@ public:
         std::lock_guard lock(mu_);
         return refused_until_.size();
     }
+
+    /// Lookups outstanding for `host` (counted from admission until the lookup returns).
+    [[nodiscard]] std::size_t in_flight_for(std::string_view host) const {
+        const std::string key = normalise_key(host);
+        std::lock_guard lock(mu_);
+        const auto it = in_flight_.find(key);
+        return it == in_flight_.end() ? 0 : it->second;
+    }
+
+    /// Distinct names with a lookup outstanding.
+    [[nodiscard]] std::size_t hosts_in_flight() const {
+        std::lock_guard lock(mu_);
+        return in_flight_.size();
+    }
+
+    [[nodiscard]] const Limits& limits() const noexcept { return limits_; }
 
 private:
     HostLookupAdmission(Limits limits, NowFn now) : limits_(limits), now_(std::move(now)) {}
@@ -168,10 +263,43 @@ private:
         }
     }
 
+    /// Called by `Lease::release`. A failing mutex lock terminates, as for any std lock guard.
+    void release_key(const std::string& key) noexcept {
+        std::lock_guard lock(mu_);
+        const auto it = in_flight_.find(key);
+        if (it == in_flight_.end())
+            return;
+        if (it->second <= 1)
+            in_flight_.erase(it); // the table holds only names with a lookup outstanding
+        else
+            --it->second;
+    }
+
     mutable std::mutex mu_;
     const Limits limits_;
     const NowFn now_;
+    std::unordered_map<std::string, std::size_t> in_flight_;
     std::unordered_map<std::string, Clock::time_point> refused_until_;
 };
+
+/// Wraps `inner` (empty means the system lookup) so the lookup holds `lease` for its whole life and
+/// the WORKER releases it:
+///  - explicitly at the end of the wrapper body, through a local object whose destructor also runs
+///    when `inner` throws;
+///  - and by the destructor of the last copy of the returned function, which covers a wrapper that
+///    never runs (the pool refused it, or its thread could not be created).
+/// The caller must not keep another copy of the lease: it would release early, at the caller's
+/// time bound, and not when the lookup returns.
+[[nodiscard]] inline LookupFn hold_lease_during(LookupFn inner,
+                                                HostLookupAdmission::Lease lease) {
+    auto held = std::make_shared<HostLookupAdmission::Lease>(std::move(lease));
+    return [inner = std::move(inner), held](const std::string& host) -> ResolveResult {
+        struct Release {
+            HostLookupAdmission::Lease& lease;
+            ~Release() { lease.release(); }
+        } done{*held};
+        return inner ? inner(host) : detail::system_lookup(host);
+    };
+}
 
 } // namespace yuzu::server::net
