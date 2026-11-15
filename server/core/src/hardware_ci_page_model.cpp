@@ -149,6 +149,8 @@ std::string encode_cursor(const Position& at, std::string_view fp) {
 }
 
 std::expected<Position, CursorError> decode_cursor(std::string_view token, std::string_view fp) {
+    // Defence in depth: it bounds the work done on hostile oversized input. For a valid token it
+    // is unreachable by result, because the longest id (256 bytes) encodes to far fewer bytes.
     if (token.size() > kCursorMaxBytes)
         return std::unexpected(CursorError::kMalformed);
     const auto parts = split_colon(token);

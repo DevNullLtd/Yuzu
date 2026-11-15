@@ -121,8 +121,9 @@ struct Page {
 enum class ReadError { kDegraded, kCursorMalformed, kCursorFilterMismatch, kScopeTooWide };
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the
-/// same text on REST and MCP (it names the global-read way out and carries no count). `kDegraded` has no caller-input message (it is a 503); it yields
-/// the generic unavailable text.
+/// same text on REST and MCP (it names the global-read way out and carries no count).
+/// `kDegraded` has no caller-input message (it is a 503); it yields the generic unavailable
+/// text.
 [[nodiscard]] std::string_view read_error_message(ReadError e);
 
 /// The A4 `remediation` hint for a `kScopeTooWide` refusal, the same text on REST and MCP: a

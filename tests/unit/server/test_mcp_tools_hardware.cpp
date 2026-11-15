@@ -1736,6 +1736,8 @@ TEST_CASE("mcp list_hardware_ci_records: a scope of 10001 ids and no agent_id is
           "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit");
     CHECK(r["error"]["data"]["remediation"] == "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope");
     CHECK(r["error"]["data"]["retry_after_ms"].is_null()); // terminal: nothing to wait for
+    // The control for the dropped-row test below: both rows persisted here, so the flag is absent.
+    CHECK_FALSE(r["error"]["data"].contains("audit_persisted"));
     CHECK(t.ci_store.reads == 0);
     CHECK(r.dump().find("in-a") == std::string::npos);
     REQUIRE(t.domain_rows.size() == 1);

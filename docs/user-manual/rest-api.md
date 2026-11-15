@@ -586,7 +586,7 @@ The Hardware list: the device roster (identity fields as for `/devices`) plus de
 |---|---|
 | `200` | The roster was read. `ci_degraded` / `tags_degraded` are `true` when the CI or tag store could not be read, so those columns are blank rather than genuinely absent. At most the 100,000 most recently seen endpoints within the 30-day window are served, with no truncation signal yet. While `tags_degraded` is `true`, a `tag` filter (or a tag match in `q`) sees no tags and answers an empty list. |
 | `400` | Unrecognised `sort`, `os` or `status` token, or an invalid `tag` key. |
-| `403` | Caller lacks `Inventory:Read`. |
+| `403` | Caller lacks `Inventory:Read`, or the caller is a service-scoped token while RBAC enforcement is off (message `service-scoped tokens require RBAC to be enabled`; the body names no `permission`, because granting `Inventory:Read` does not admit such a token), or a service-scoped token whose `ITServiceOwner` ceiling lacks `Inventory:Read`. |
 | `503` | Route misconfigured (roster provider unwired), the device roster could not be read (`retry_after_ms` set), the audit row could not be persisted, or the authorization store is unavailable (`retry_after_ms` 5000). A failed roster read is never a `200` with an empty list. |
 
 **Audit:** `inventory.devices`; `result=success` on a served page, `result=failure` (detail `hardware roster read failed`) when the roster could not be read. A persist failure on the success row fails the request closed with `503`.
@@ -609,7 +609,7 @@ One device's CI record: identity, device-CI blob, the per-section hardware recor
 |---|---|
 | `200` | The record. A degraded CI store alongside a degraded roster is still a `200` carrying `identity_state` and `ci_state` as `degraded`. |
 | `400` | Device id longer than 256 bytes or containing a byte below `0x20`. Checked after the `Inventory:Read` check and before the scope check. Registration applies the same 256-byte limit and refuses an id with a byte below `0x20` (through its enrollment check), so any id that agent registration accepts passes and a registered device is not affected. |
-| `403` | Caller lacks `Inventory:Read`. |
+| `403` | Caller lacks `Inventory:Read`, or the caller is a service-scoped token while RBAC enforcement is off (message `service-scoped tokens require RBAC to be enabled`; the body names no `permission`, because granting `Inventory:Read` does not admit such a token), or a service-scoped token whose `ITServiceOwner` ceiling lacks `Inventory:Read`. |
 | `404` | Not found, or outside the caller's fleet-read scope (indistinguishable by design). |
 | `503` | Route misconfigured, audit row not persisted, the authorization store unavailable (`retry_after_ms` 5000), or the device roster could not be read (`retry_after_ms` set) and the device was not otherwise found (CI record readable-and-absent, no software, no tags), or the record's hardware sections could not be read after the record itself was read (message `hardware sections unavailable`, `retry_after_ms` 5000; a failure at or before the record read is a `200` with `ci: null` instead). The roster case is never a `404`, and a failed sections read is never a `200` with an empty sections list (an empty list with `sections_state` `absent` is a different answer: nothing is stored). |
 
@@ -654,12 +654,12 @@ An example `200` body for a page of one device (the `ci` object is shortened her
         "agent_id": "pc-0042",
         "blob_version": 2,
         "ci": {
+          "first_seen": 1762300000,
+          "last_seen": 1762690000,
           "manufacturer": "Example Corp",
           "model": "Example 5440",
-          "serial": "SN0042",
           "ram_bytes": 17179869184,
-          "first_seen": 1762300000,
-          "last_seen": 1762690000
+          "serial": "SN0042"
         },
         "content_hash": "9f2c4a1e7b6d3085c1a94e27d0b83f5a6c7e1d92b4a08f3e5d6c7b8a9f0e1d2c",
         "hostname": "pc-0042.example.test"
@@ -682,7 +682,7 @@ Rows are in ascending `agent_id` order. There is no server-side "changed since" 
   "error": {
     "code": 400,
     "message": "the caller's scope covers more than 10000 devices and no agent_id was given; a credential with global read has no such limit",
-    "correlation_id": "0d4f6c1e-0000-0000-0000-000000000000",
+    "correlation_id": "req-18f2a1c3d-2a",
     "retry_after_ms": null,
     "remediation": "use a credential with global read, pass agent_id, or ask an administrator to narrow the caller's scope"
   },
@@ -696,32 +696,37 @@ The limit is judged on every page, against the caller's scope at that moment. A 
 |---|---|
 | `200` | A page. |
 | `400` | `limit` is not an integer; `agent_id` is over 256 bytes or carries a byte below `0x20`; `agent_id` or `cursor` is not valid UTF-8 or carries a NUL (`invalid parameter encoding`); `cursor` is malformed, over 2,048 bytes or was issued for a different `agent_id` (message `invalid cursor; restart from the first page`); or the caller's scope covers more than 10,000 devices and no agent_id was given (above). The scope refusal writes a best-effort `denied` audit row, so this one `400` can also carry `Sec-Audit-Failed: true` when that row did not persist; nothing is served on that path, so the `400` stands. |
-| `403` | Caller lacks `Inventory:Read`. |
-| `429` | The server's general per-source-address rate limit was exceeded (default 100 requests per second per source address with a burst of 100, `--rate-limit`; see [server-admin.md](server-admin.md)). The answer carries `Retry-After: 1` and `retry_after_ms` 1000. Wait and retry the same cursor. |
+| `403` | Caller lacks `Inventory:Read`, or the caller is a service-scoped token while RBAC enforcement is off (message `service-scoped tokens require RBAC to be enabled`; the body names no `permission`, because granting `Inventory:Read` does not admit such a token), or a service-scoped token whose `ITServiceOwner` ceiling lacks `Inventory:Read`. |
+| `429` | The server's general per-source-address rate limit was exceeded (default 100 requests per second per source address with a burst of 100, `--rate-limit`; see [server-admin.md](server-admin.md)). The answer carries `Retry-After: 1` and `retry_after_ms` 1000. Wait and retry the same cursor. An engine principal is also held to its own per-principal limits, `--principal-rate-limit` (default 20 requests per second) and `--principal-max-concurrency` (default 16 requests in flight), which answer `429` as well; see [server-admin.md](server-admin.md). |
 | `503` | The CI provider is unwired, the CI store could not be read (`retry_after_ms` 5000), the authorization store is unavailable (`retry_after_ms` 5000), or the audit row for the page could not be persisted (the page is withheld; the response carries `Sec-Audit-Failed: true` and `retry_after_ms` 5000). A failed store read is never a `200` with an empty page. |
 
 On a `503`, wait `retry_after_ms` and retry the SAME cursor; do not restart the walk. A `503` that carries `Sec-Audit-Failed: true` means the audit store is unavailable: the answer carries `retry_after_ms` 5000, so retry the same cursor after that delay, and escalate to an operator if it persists. Do not retry a `503` forever. As client guidance (the server does not enforce it), give up and raise an alert after 5 consecutive `503` answers on the same cursor.
 
-**Credentials.** Use a dedicated API token whose principal holds only `Inventory:Read`. Do not use a service-scoped token for the bulk pull: it is confined, and a confined scope over 10,000 devices is refused without an `agent_id`. With RBAC enforcement off (the default) every authenticated non-service principal reads the whole fleet and confinement does not exist.
+**Credentials.** Use a dedicated API token whose principal holds only `Inventory:Read`. Do not use a service-scoped token for the bulk pull. While RBAC enforcement is off (the default) a service-scoped token is refused with `403` (`service-scoped tokens require RBAC to be enabled`), and every other authenticated principal reads the whole fleet, because confinement exists only when RBAC enforcement is on. With RBAC enforcement on, a service-scoped token is confined to its tag set and capped by the authority of the `ITServiceOwner` role, and any other principal is confined to its own scope; a confined scope over 10,000 devices is refused without an `agent_id`.
 
 **Example.** Following `next_cursor` until it is empty (`$YUZU_URL` and `$YUZU_TOKEN` are placeholders):
 
 ```bash
+set -euo pipefail
 cursor=""
 while :; do
   page=$(curl -sSf -H "Authorization: Bearer $YUZU_TOKEN" \
     --get "$YUZU_URL/api/v1/hardware/ci" \
     --data-urlencode "limit=1000" --data-urlencode "cursor=$cursor") \
     || { echo "page failed (cursor=$cursor)" >&2; exit 1; }
-  jq -c '.data.devices[] | {agent_id, hash: .content_hash, serial: .ci.serial}' <<<"$page"
-  cursor=$(jq -r '.data.next_cursor // empty' <<<"$page")
+  prev=$cursor
+  cursor=$(jq -er '.data.next_cursor | strings' <<<"$page") \
+    || { echo "page body has no next_cursor" >&2; exit 1; }
+  jq -c '.data.devices | if type == "array" then .[] | {agent_id, hash: .content_hash, serial: .ci.serial} else error("not an array") end' <<<"$page" \
+    || { echo "page body has no devices array" >&2; exit 1; }
   [ -z "$cursor" ] && break
+  [ "$cursor" = "$prev" ] && { echo "cursor did not advance" >&2; exit 1; }
 done
 ```
 
-The loop exits non-zero on any non-2xx answer (`curl -f`, with `-S` so the HTTP error is printed). Production code must honour `retry_after_ms` and retry the SAME cursor rather than stop. Never retire or delete configuration items on the basis of a walk that did not reach an empty `next_cursor`; a partial walk proves nothing about the devices it did not reach.
+The loop exits non-zero on any non-2xx answer (`curl -f`, with `-S` so the HTTP error is printed), and also on a `200` whose body is not a page: a body without a string `next_cursor` or without a `devices` array (an intercepting proxy's error page, a truncated body), or a `next_cursor` equal to the cursor just sent. Production code must honour `retry_after_ms` and retry the SAME cursor rather than stop. Never retire or delete configuration items on the basis of a walk that did not reach an empty `next_cursor`; a partial walk proves nothing about the devices it did not reach.
 
-**Audit:** `inventory.devices.ci`, one row per served page, written after the read and fail-closed: serial, system UUID, MAC and the chassis and board serials are personal data, so a page whose audit row does not persist is not served. The detail is `hardware CI records (REST): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>`; it never lists device ids. The target is `Inventory`/`fleet`, or `Agent`/`<agent_id>` when `agent_id` was given. A failed store read writes the same verb with `result=failure`. A named `agent_id` outside the caller's scope writes ONE `result=denied` row (detail `hardware CI records (REST) state=agent_id outside the caller's scope`, target `Agent`/`<agent_id>`) and the answer is the same empty page as for a device with no record; a scope over 10,000 devices with no `agent_id` writes one `result=denied` row (detail `hardware CI records (REST) state=scope too wide`). The `denied` row of the scope refusal is best effort (nothing is served on that path), so a row that does not persist marks the `400` `Sec-Audit-Failed: true` and the `400` stands; the `denied` row of a named out-of-scope `agent_id` is fail-closed like a served page. A request refused for a malformed parameter or cursor writes no row, because nothing was served. Field-level detail is in [audit-log.md](audit-log.md).
+**Audit:** `inventory.devices.ci`, one row per served page, written after the read and fail-closed: serial, system UUID, MAC and the chassis and board serials are personal data, so a page whose audit row does not persist is not served. The detail is `hardware CI records (REST): rows=<n>[ page=continuation] scope=<fleet|authority_scoped>`; it never lists device ids. The target is `Inventory`/`fleet`, or `Agent`/`<agent_id>` when `agent_id` was given. A failed store read writes the same verb with `result=failure`. A named `agent_id` outside the caller's scope writes ONE `result=denied` row (detail `hardware CI records (REST) state=agent_id outside the caller's scope`, target `Agent`/`<agent_id>`) and the answer is the same empty page as for a device with no record; a scope over 10,000 devices with no `agent_id` writes one `result=denied` row (detail `hardware CI records (REST) state=scope too wide`). Two kinds of row are fail-closed: the `success` row of a served page and the `denied` row of a named out-of-scope `agent_id` (if either does not persist, nothing is served). Two are best effort, because nothing is served on those paths and the answer is an error either way: the `denied` row of the scope refusal and the `failure` rows. A best-effort row that does not persist can mark the response `Sec-Audit-Failed: true`, and the error stands. A request refused for a malformed parameter or cursor writes no row, because nothing was served. Field-level detail is in [audit-log.md](audit-log.md).
 
 ---
 
