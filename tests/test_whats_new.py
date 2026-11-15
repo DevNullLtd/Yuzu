@@ -1970,7 +1970,7 @@ class FragmentEdgeCases(GitCase):
 
     def test_a_changelog_heading_without_a_closing_bracket_cannot_swallow_the_next_line(self):
         repo = FakeRepo(files={("HEAD", "CHANGELOG.md"): "## [1\n## [2.0.0] - 2026-11-01\n"})
-        self.assertEqual(WN.released_version(repo, "HEAD"), {"latest released CHANGELOG section": "2.0.0"})
+        self.assertEqual(WN.released_version(repo, "HEAD"), {WN.RELEASED_KEY: "2.0.0"})
 
     def test_repository_text_in_every_version_field_cannot_start_a_line_of_its_own(self):
         forged = "2\nVersion bumps\n  none of the tracked versions changed\nChangelog entries added (0)"
@@ -2328,6 +2328,20 @@ class MarkerAmbiguity(GitCase):
         repo, old = self.base()
         self.release_into(repo, "- **Shipped thing.**\n\n## [1.0.0] - 2026-09-01\n\n- **Other.**\n", old)
         self.assertIn("- **Shipped thing.**  [released]\n", self.ok(repo, "--since", old))
+
+    def test_two_long_versions_that_share_a_prefix_are_still_a_bump(self):
+        prefix = "1.3.0-" + "p" * 40
+        repo = self.init()
+        self.put(repo, "CHANGELOG.md", f"# Changelog\n\n## [{prefix}-AAA]\n\n- **A.**\n")
+        old = self.commit(repo, "old")
+        self.put(repo, "CHANGELOG.md", f"# Changelog\n\n## [{prefix}-BBB]\n\n- **B.**\n")
+        self.commit(repo, "new")
+        out = self.ok(repo, "--since", old)
+        self.assertNotIn("none of the tracked versions changed", out)
+        line = [ln for ln in out.splitlines() if "latest released CHANGELOG section" in ln]
+        self.assertEqual(len(line), 1)
+        self.assertIn("->", line[0])
+        self.assertIn("...", line[0])
 
     def test_the_latest_released_section_line_is_cut_too(self):
         repo, old = self.base()

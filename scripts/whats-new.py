@@ -434,10 +434,13 @@ def plugin_abi(repo: Repo, ref: str) -> dict[str, str]:
     return {f"plugin ABI ({n})": v for n, v in re.findall(r"#define\s+(YUZU_PLUGIN_ABI_VERSION(?:_MIN)?)\s+(\d+)", text)}
 
 
+RELEASED_KEY = "latest released CHANGELOG section"
+
+
 def released_version(repo: Repo, ref: str) -> dict[str, str]:
     text = repo.show(ref, "CHANGELOG.md") or ""
     m = re.search(r"^## \[(\d[^\]\n]*)\]", text, re.M)
-    return {"latest released CHANGELOG section": cut_version(m.group(1))} if m else {}
+    return {RELEASED_KEY: m.group(1)} if m else {}
 
 
 def _vcpkg_deps(deps: object, where: str, out: dict[str, str]) -> None:
@@ -511,13 +514,15 @@ def version_changes(repo: Repo, old: str, new: str) -> list[str]:
             b, a = before.get(key), after.get(key)
             if b == a:
                 continue
+            # A version heading is repository text of any length: compared whole, cut only for display.
+            show = cut_version if key == RELEASED_KEY else one
             key = one(key)
             if b is None:
-                lines.append(f"  + {key}: {one(a)}  (new)")
+                lines.append(f"  + {key}: {show(a)}  (new)")
             elif a is None:
-                lines.append(f"  - {key}: {one(b)}  (removed)")
+                lines.append(f"  - {key}: {show(b)}  (removed)")
             else:
-                lines.append(f"  ~ {key}: {one(b)} -> {one(a)}")
+                lines.append(f"  ~ {key}: {show(b)} -> {show(a)}")
     return lines
 
 
