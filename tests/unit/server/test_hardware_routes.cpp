@@ -2688,6 +2688,8 @@ TEST_CASE(
     CHECK(h.metrics
               .counter("yuzu_hardware_section_integrity_total", {{"reason", "row_count_mismatch"}})
               .value() == 0.0);
+}
+
 // ───────────────────────── GET /api/v1/hardware/ci: the bulk keyset page ──────────────────
 
 namespace {
@@ -2715,7 +2717,7 @@ TEST_CASE("route: GET /api/v1/hardware/ci is the bulk page, not the record of a 
     auto bulk = h.sink.Get("/api/v1/hardware/ci");
     REQUIRE(bulk);
     REQUIRE(bulk->status == 200);
-    CHECK(h.ci_with_sections.empty()); // the per-id composition was not asked
+    CHECK(h.ci_reads.empty()); // the per-id composition was not asked
     const auto body = nlohmann::json::parse(bulk->body);
     CHECK(body["data"].contains("next_cursor"));
     CHECK(body["meta"]["api_version"] == "v1");
@@ -2723,7 +2725,7 @@ TEST_CASE("route: GET /api/v1/hardware/ci is the bulk page, not the record of a 
     // The per-id route still answers its own ids.
     auto one = h.sink.Get("/api/v1/hardware/agent-1");
     REQUIRE(one);
-    CHECK(h.ci_with_sections.size() == 1);
+    CHECK(h.ci_reads.size() == 1);
 }
 
 // Kills: (a) registering the bulk route after `GET /api/v1/hardware/{id}` (the bulk URL would be
@@ -2736,13 +2738,13 @@ TEST_CASE("route: GET /api/v1/hardware/ci never reaches the per-id handler; ?age
     auto bulk = h.sink.Get("/api/v1/hardware/ci");
     REQUIRE(bulk);
     REQUIRE(bulk->status == 200);
-    CHECK(h.ci_with_sections.empty()); // the per-id handler (ci_detail_fn) was never called
+    CHECK(h.ci_reads.empty()); // the per-id handler (ci_detail_fn) was never called
     CHECK(ci_page_ids(nlohmann::json::parse(bulk->body)) == std::vector<std::string>{"agent-1", "ci"});
 
     auto named = h.sink.Get("/api/v1/hardware/ci?agent_id=ci");
     REQUIRE(named);
     REQUIRE(named->status == 200);
-    CHECK(h.ci_with_sections.empty());
+    CHECK(h.ci_reads.empty());
     CHECK(ci_page_ids(nlohmann::json::parse(named->body)) == std::vector<std::string>{"ci"});
     CHECK(h.audit_full.back() == "inventory.devices.ci|success|Agent|ci");
 }

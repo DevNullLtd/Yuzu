@@ -1634,6 +1634,8 @@ TEST_CASE("mcp hardware twins: an out-of-scope read does not fetch the record or
     REQUIRE(t.ci_reads.size() == 1);
     CHECK(t.ci_reads[0] == CiRead::WithSections);
     CHECK(integrity(t, "row_count_mismatch") == 1.0);
+}
+
 // ───────────────────── list_hardware_ci_records: the bulk keyset twin ─────────────────────
 // The MCP twin of GET /api/v1/hardware/ci. It is a separate tool, not a mode of
 // list_hardware_ci: that tool is roster-driven with offset paging and one output schema, and
