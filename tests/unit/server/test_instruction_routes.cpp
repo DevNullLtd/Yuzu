@@ -31,6 +31,7 @@
 /// over source text would be.
 
 #include "instruction_param_schema.hpp"
+#include "instruction_definition_model.hpp" // json_exceeds_value_budget
 #include "instruction_referrers.hpp"
 #include "instruction_routes.hpp"
 #include "instruction_schema_test_util.hpp"
@@ -1889,6 +1890,45 @@ TEST_CASE("instruction_routes: a long referrer list is cut in the toast and comp
     REQUIRE(toast.size() > 3);
     CHECK(toast.substr(toast.size() - 3) == "...");
     CHECK(full.rfind(toast.substr(0, toast.size() - 3), 0) == 0);
+}
+
+// UP-4. The legacy import refuses a body of more than kMaxDefinitionJsonValues structural values
+// (the parse tree of `[],[],...` is hundreds of times the body). stamp_import_creator leaves such a
+// body unparsed and the store answers 400. Turns red if either check is removed: the body is then
+// parsed (the memory the budget exists to save) or accepted into the store's parse.
+TEST_CASE("instruction_routes: the legacy import refuses a body over the value budget with a 400",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    std::string hostile = R"({"a":[)";
+    for (int i = 0; i < 60'000; ++i)
+        hostile += "[],";
+    hostile += "[]]}";
+    auto r = h.sink.Post("/api/instructions/import", hostile);
+    REQUIRE(r);
+    CHECK(r->status == 400);
+    CHECK(r->body.find("too many values") != std::string::npos);
+}
+
+TEST_CASE("json_exceeds_value_budget counts structure outside string literals",
+          "[instruction_routes]") {
+    using yuzu::server::json_exceeds_value_budget;
+    CHECK_FALSE(json_exceeds_value_budget(R"({"a":[1,2,3]})", 100)); // '{' '[' and 2 commas
+    CHECK(json_exceeds_value_budget("[1,2,3,4]", 3));                 // '[' and 3 commas
+    CHECK_FALSE(json_exceeds_value_budget("[1,2,3,4]", 4));
+    // Brackets, braces and commas inside a string literal are not structure, an escaped quote does
+    // not end the string.
+    CHECK_FALSE(json_exceeds_value_budget(R"(["[,{,,,,,"])", 1));
+    CHECK_FALSE(json_exceeds_value_budget(R"(["a\"[[[[,,,"])", 1));
+    std::string hostile = "[";
+    for (int i = 0; i < 150'000; ++i)
+        hostile += "[],";
+    hostile += "[]]";
+    CHECK(json_exceeds_value_budget(hostile));
+    CHECK_FALSE(json_exceeds_value_budget(""));
 }
 
 // M2-1 fail closed. A failing or unwired lookup is never "no referrers": 503, nothing deleted, an

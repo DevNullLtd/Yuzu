@@ -137,6 +137,10 @@ std::optional<json> parse_object_body(const httplib::Request& req, httplib::Resp
         fail(res, 400, "request body nests too deeply");
         return std::nullopt;
     }
+    if (json_exceeds_value_budget(req.body)) {
+        fail(res, 400, "request body holds too many values");
+        return std::nullopt;
+    }
     auto body = json::parse(req.body, nullptr, /*allow_exceptions=*/false);
     if (body.is_discarded()) {
         fail(res, 400, "request body is not valid JSON");

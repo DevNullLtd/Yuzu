@@ -1236,6 +1236,13 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
             "instruction-import request body nests too deeply (flatten to at most {} levels)",
             mcp::kMcpMaxJsonDepth));
 
+    // The same for breadth: a body of millions of tiny values builds a tree hundreds of times its
+    // own size (see kMaxDefinitionJsonValues), and the legacy, v1 and MCP imports all land here.
+    if (json_exceeds_value_budget(json_str))
+        return std::unexpected(std::format(
+            "instruction-import request body holds too many values (at most {})",
+            kMaxDefinitionJsonValues));
+
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded())
         return std::unexpected("invalid JSON");

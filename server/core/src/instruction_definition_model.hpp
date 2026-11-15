@@ -108,6 +108,17 @@ inline constexpr std::size_t kMaxDefinitionDescriptionLen = 512;        ///< `de
 /// longest is about 4.9 KB) and an export of one must stay importable.
 inline constexpr std::size_t kMaxDefinitionImportDescriptionLen = 16 * 1024;
 inline constexpr std::size_t kMaxDefinitionInstructionSetIdLen = 128;   ///< `instruction_set_id`, 0..128
+/// The most structural values (`[`, `{` and `,` outside a string literal) a definition request or
+/// import body may hold. nlohmann::json builds roughly 30 to 100 bytes per value, so a 16 MiB body
+/// of `[],[],...` (about 5.6 million values) became a 258 to 429 MiB tree per request, and a few
+/// concurrent ones exhausted the memory of the server. A definition is a few hundred values; the
+/// largest bundled one is far below this.
+inline constexpr std::size_t kMaxDefinitionJsonValues = 100'000;
+/// True when `body` holds more than `max_values` structural values. A raw-text scan that runs
+/// BEFORE any parse (so the tree it protects against is never built) and skips string literals
+/// and their escapes, like `mcp::json_exceeds_depth`; it does not validate the JSON.
+[[nodiscard]] bool json_exceeds_value_budget(std::string_view body,
+                                             std::size_t max_values = kMaxDefinitionJsonValues) noexcept;
 /// The `type` values the store's create accepts (`validate_and_prepare`); `update_definition` does
 /// not re-check it, so the twins' PUT does here.
 [[nodiscard]] constexpr bool is_valid_definition_type(std::string_view t) noexcept {

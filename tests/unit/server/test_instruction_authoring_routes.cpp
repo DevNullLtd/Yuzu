@@ -1734,6 +1734,32 @@ TEST_CASE("DELETE /api/v1/instructions/{id}: a control byte in the id is refused
     CHECK(h.audits.empty());
 }
 
+// UP-4: a body of many tiny values builds a parse tree hundreds of times its own size, so the v1
+// routes refuse one by value count BEFORE parsing. Turns red if parse_object_body stops checking
+// the budget (a 200 KB body is then parsed and answered by the store, not with this 400 text).
+TEST_CASE("POST /api/v1/instructions/import: a body of more than the value budget is refused 400 "
+          "before it is parsed",
+          "[pg][server][instruction_authoring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authoring_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    std::string hostile = R"({"a":[)";
+    for (int i = 0; i < 60'000; ++i)
+        hostile += "[],";
+    hostile += "[]]}";
+    auto refused = h.sink.Post("/api/v1/instructions/import", hostile);
+    REQUIRE(refused);
+    CHECK(refused->status == 400);
+    CHECK(refused->body.find("too many values") != std::string::npos);
+
+    // The store's own import refuses it the same way when a caller reaches it directly.
+    auto direct = w.store.import_definition_json(hostile);
+    REQUIRE_FALSE(direct.has_value());
+    CHECK(direct.error().find("too many values") != std::string::npos);
+}
+
 TEST_CASE("POST /api/v1/instructions/import: unsigned is refused by default; accepted only when "
           "the operator opted out; the refusal is audited denied",
           "[pg][server][instruction_authoring]") {
