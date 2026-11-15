@@ -4250,9 +4250,10 @@ test('Echo mapdrive hive-mount pin wiring lexical gate (#5291)',
 )
 
 # firewall containment regression (privilege model step 6): the guards of
-# scripts/test/instructions_firewall_containment.py -- SSH refusal, the console flag, the
-# install-agent-user.sh --check precondition. No network and no firewall change; the live
-# apply/release needs a UAT stack on a local host.
+# scripts/test/instructions_firewall_containment.py -- the refusals (SSH, console flag, limit,
+# agent, host binding, login), the status/answer parsing and the whole apply/release flow against a
+# recording fake. No network and no firewall change; the live apply/release needs a UAT stack on a
+# local host.
 test('Firewall containment regression guards (privilege model step 6)',
   _python3_test,
   args: [files('test_firewall_containment_ceremony.py')],
