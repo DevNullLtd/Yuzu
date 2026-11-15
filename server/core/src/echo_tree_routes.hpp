@@ -94,8 +94,9 @@ class HttpRouteSink;
 /// and stamps `online=true` unconditionally, so in production every row this
 /// builder actually sees is online — `online` is honest per-row but the list is
 /// NOT offline-inclusive today despite the builder's own online-agnostic contract.
-/// Wiring a genuinely offline-inclusive producer (the pattern at
-/// `server.cpp:20057-20091`, `OfflineEndpointStore::query_stale_within`) is a
+/// Wiring a genuinely offline-inclusive producer (the pattern in
+/// `build_hw_roster`, server.cpp: `OfflineEndpointStore::query_stale_within`, which returns a
+/// capped roster with a `truncated` flag, #5712) is a
 /// tracked follow-up, not done in this fix round.
 std::string echo_process_tree_frame_json(const std::vector<DeviceRow>& devices);
 

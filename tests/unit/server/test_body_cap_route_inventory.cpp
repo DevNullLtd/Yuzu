@@ -343,6 +343,16 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/scope/estimate)body_cap_path", "Trigger body: small JSON (scope estimate params) -- not a YAML-authoring route."},
     {"POST", R"body_cap_path(/api/instructions/([^/]+)/execute)body_cap_path", "Trigger body: small JSON (instruction execution args) -- not a YAML-authoring route."},
     {"POST", R"body_cap_path(/api/v1/instructions/([^/]+)/execute)body_cap_path", "v1 twin of the route above (instruction_execute_routes.cpp): small JSON (targeting + params); the MCP twin bounds params at 32 keys x 64 KiB and agent_ids at 10000, so the 4 MiB default is already above every honest body."},
+    // instruction_authoring_routes.cpp (#2146 batch C): the v1 authoring twins. Reviewed, NOT given a
+    // kBodyCapTable class: every body is bounded by a limit at or below the 4 MiB default.
+    {"POST", R"body_cap_path(/api/v1/instructions)body_cap_path", "v1 twin of POST /api/instructions: one InstructionDefinition JSON body (scalar fields only; the strict builder refuses parameter_schema, result_schema and yaml_source), well under 4 MiB."},
+    {"PUT", R"body_cap_path(/api/v1/instructions/([^/]+))body_cap_path", "v1 twin of PUT /api/instructions/{id}: partial scalar-field JSON body plus expected_updated_at."},
+    {"DELETE", R"body_cap_path(/api/v1/instructions/([^/]+))body_cap_path", "v1 twin of DELETE /api/instructions/{id}: id from the URL only; the handler reads no body."},
+    {"POST", R"body_cap_path(/api/v1/instructions/import)body_cap_path", "v1 twin of the 16 MiB instruction_import route, deliberately at the 4 MiB catch-all (owner ruling, #2146 batch C): the MCP import_definition twin is capped at 4 MiB by the MCP transport (kMcpMaxRequestBodyBytes), so the two twins share one bound; the legacy route keeps 16 MiB. yaml_source is itself capped at 1 MiB by the store, responseTemplates as a string at 256 KiB."},
+    {"POST", R"body_cap_path(/api/v1/instructions/yaml)body_cap_path", "v1 JSON twin of POST /api/instructions/yaml: {yaml_source, id?, updated_at?}; yaml_source is refused over 1 MiB by validate_yaml_source, so 4 MiB leaves room for JSON escaping (the legacy form route has its own 3149824-byte instruction_yaml class for percent-encoding)."},
+    {"POST", R"body_cap_path(/api/v1/instructions/validate-yaml)body_cap_path", "v1 JSON twin of POST /api/instructions/validate-yaml: {yaml_source}; same 1 MiB check as the yaml route, at the 4 MiB default."},
+    {"POST", R"body_cap_path(/api/v1/instruction-sets)body_cap_path", "v1 twin of POST /api/instruction-sets: name (<=128) and description (<=512) only."},
+    {"DELETE", R"body_cap_path(/api/v1/instruction-sets/([^/]+))body_cap_path", "v1 twin of DELETE /api/instruction-sets/{id}: id from the URL only; the handler reads no body."},
 
     // ── Newly visible after the F1-F3 scan-coverage fix (#2407 follow-up,
     // 2026-08-07): 68 routes went from invisible to this scan to resolving

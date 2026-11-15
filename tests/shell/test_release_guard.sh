@@ -176,7 +176,8 @@ run_guard notfound v0.14.1 ""
 check "unset ref type -> refused (exit 1)" 1 "$rc"
 check "unset ref type -> gh never called" "" "$(cat "$TMP/args")"
 
-for t in main v1.2.3-foo v1.2 1.2.3 v1.2.3-rc v1.2.3-rc1-extra; do
+# v12345.0.0 / v0.15.10000 / v1.2.3-rc12345: fields wider than the 4 digits scripts/build-agent-bundle.sh accepts (#7529)
+for t in main v1.2.3-foo v1.2 1.2.3 v1.2.3-rc v1.2.3-rc1-extra v12345.0.0 v0.15.10000 v1.2.3-rc12345; do
   run_guard notfound "$t"
   check "tag '$t' is not a release tag -> refused (exit 1)" 1 "$rc"
   check "tag '$t' -> gh never called" "" "$(cat "$TMP/args")"

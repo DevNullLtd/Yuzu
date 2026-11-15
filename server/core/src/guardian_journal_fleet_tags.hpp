@@ -134,8 +134,9 @@ inline constexpr GuardianJournalMetric kGuardianJournalMetrics[] = {
      "this family; neither increase() nor bare > 0 is sound over a fleet sum"},
     {"yuzu.guardian_journal_field_rejected", "yuzu_fleet_guardian_journal_field_rejected",
      "Fleet sum of records kept out of the journal by a field that failed validation "
-     "(embedded NUL, oversized, or non-UTF-8). A LOSS channel, and a malformed-input "
-     "signal - a sustained climb means something upstream is producing garbage"},
+     "(embedded NUL, oversized, or non-UTF-8) or by an empty rule id. A LOSS channel, and a "
+     "malformed-input signal - a sustained climb means something upstream is producing "
+     "garbage"},
     {"yuzu.guardian_journal_clock_rejected", "yuzu_fleet_guardian_journal_clock_rejected",
      "Fleet sum of records kept out of the journal by a skewed clock (timestamp <= 0). A "
      "LOSS channel; also the fleet's clock-health canary, since a journal timestamp that "
