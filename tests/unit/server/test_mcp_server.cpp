@@ -54098,3 +54098,212 @@ TEST_CASE("MCP execute_instruction bridge: a scope-confined dispatcher gets no p
         CHECK(result["agents_failure"] == 1);
     }
 }
+
+// ── #7817 - the same scenario through a REAL RbacStore and the REAL require_fleet_read ──
+//
+// The ExecutionOwnerRig wires one production-shaped AuthRoutes (real RbacStore, management-group
+// store, API-token store and AuditStore) as the session source for authentication, permission
+// and fleet-read, so nothing about the gate is faked here. Three principals, each holding a
+// GLOBAL Execution:Execute grant:
+//   bob   Execution:Read only through a management group holding {a1}  (the #7817 case)
+//   mina  GLOBAL Execution:Read                                        (control: unchanged)
+//   dan   no Execution:Read at all                                     (deny-all, one denial row)
+// What stays faked: the dispatch callback (it returns `sent = 2` without reaching an agent) and
+// the agents' answers, which the test writes into the real tracker itself.
+TEST_CASE("MCP execute_instruction bridge: a REAL RbacStore mixed grant is projected, an unrestricted Read is not (#7817)",
+          "[pg][mcp][integration][execute][bridge][7817][owner_rig]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    REQUIRE(r.rbac.create_role({"Executor7817", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"Executor7817", "Execution", "Execute", "allow"}).has_value());
+    for (const char* user : {"bob", "mina", "dan"})
+        REQUIRE(r.rbac.assign_role({"user", user, "Executor7817"}).has_value());
+
+    yuzu::server::ExecutionEventBus bus;
+    r.tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    mcp::McpSessionRegistry sessions{mcp::McpSessionRegistry::Config{}, {}, &metrics};
+    mcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    r.wire_mcp(ts); // the real auth, permission and fleet-read hooks, and the rig's tracker
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.start_with_dispatch(
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-7817-real"};
+        },
+        "operator");
+    ts.mcp.set_stream_bridge(&bridge);
+
+    const auto bob_tok = r.mint("bob", {}, "operator");
+    const auto mina_tok = r.mint("mina", {}, "operator");
+    const auto dan_tok = r.mint("dan", {}, "operator");
+
+    // What the REAL gate resolves for each, before any dispatch: the scenario is what it claims.
+    {
+        const auto bob = r.fleet_scope(OwnerRig::bearer(bob_tok));
+        REQUIRE(bob.admitted);
+        REQUIRE(bob.agents.has_value());
+        CHECK(*bob.agents == std::vector<std::string>{"a1"});
+        const auto mina = r.fleet_scope(OwnerRig::bearer(mina_tok));
+        REQUIRE(mina.admitted);
+        CHECK_FALSE(mina.agents.has_value()); // unfiltered
+        const auto dan = r.fleet_scope(OwnerRig::bearer(dan_tok));
+        CHECK_FALSE(dan.admitted);
+        CHECK(dan.status == 403);
+    }
+    // The probe above wrote dan's denial row; the dispatch below must add exactly one more.
+    const auto denial_rows_before = r.audit("auth.fleet_read_required").size();
+
+    struct SessionHandle {
+        std::string sid;
+        std::shared_ptr<mcp::McpStreamState> stream;
+        std::string principal;
+    };
+    const auto session_for = [&](const std::string& token) {
+        auto sess = r.session_of_token(token);
+        REQUIRE(sess.has_value());
+        auto binding = mcp::binding_for(*sess);
+        auto minted = sessions.mint(binding);
+        REQUIRE(minted.ok);
+        auto stream = sessions.stream_for(minted.session_id, binding);
+        REQUIRE(stream != nullptr);
+        return SessionHandle{minted.session_id, std::move(stream), binding.principal};
+    };
+    const auto exec_body = [](int id) {
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"},"_meta":{"progressToken":"tok-1"}}})";
+    };
+    const auto exec_of = [](const std::string& body) {
+        auto j = nlohmann::json::parse(body);
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        return text["execution_id"].get<std::string>();
+    };
+    // One success and one failure answer: the terminal is "completed" with counts 1 and 1.
+    const auto finish = [&](const std::string& exec_id) {
+        yuzu::server::AgentExecStatus a1;
+        a1.agent_id = "agent-001";
+        a1.status = "success";
+        r.tracker.update_agent_status(exec_id, a1);
+        yuzu::server::AgentExecStatus a2;
+        a2.agent_id = "agent-002";
+        a2.status = "failure";
+        r.tracker.update_agent_status(exec_id, a2);
+    };
+    struct Outcome {
+        int http_status{0};
+        std::size_t progress_frames{0};
+        std::optional<nlohmann::json> final_result; // streamed only
+    };
+    // GET-only: progress rides the session GET ring; there is no final frame.
+    const auto run_get_only = [&](const std::string& token, int request_id) {
+        const auto h = session_for(token);
+        const auto& sid = h.sid;
+        const auto& stream = h.stream;
+        const auto& principal = h.principal;
+        auto res = ts.call_raw("POST", exec_body(request_id),
+                               {{"Mcp-Session-Id", sid}, {"Authorization", "Bearer " + token}});
+        Outcome out;
+        out.http_status = res->status;
+        REQUIRE(res->status == 200);
+        const auto exec_id = exec_of(res->body);
+        bus.publish(exec_id, "execution-progress", R"({"agents_responded":1,"agents_targeted":2})");
+        finish(exec_id);
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(request_id));
+            return p.has_value() && *p == mcp::McpStreamBridge::Phase::kDone;
+        }));
+        for (const auto& f : bridge_ring(*stream, principal)) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (j.is_object() && j.value("method", "") == "notifications/progress")
+                ++out.progress_frames;
+        }
+        return out;
+    };
+    // Streamed: the response closes (parking the record), the agents answer, the final is pinned.
+    const auto run_streamed = [&](const std::string& token, int request_id) {
+        const auto h = session_for(token);
+        const auto& sid = h.sid;
+        const auto& stream = h.stream;
+        const auto& principal = h.principal;
+        Outcome out;
+        std::string exec_id;
+        // The rig seeds executions dispatched by bob and mina, so find THIS call's execution as
+        // the one that was not there before it.
+        std::unordered_set<std::string> before;
+        for (const auto& e : r.tracker.query_executions({}))
+            before.insert(e.id);
+        {
+            auto res = ts.call_raw("POST", exec_body(request_id),
+                                   {{"Mcp-Session-Id", sid},
+                                    {"Authorization", "Bearer " + token},
+                                    {"Accept", "text/event-stream"}});
+            out.http_status = res->status;
+            REQUIRE(res->status == 200);
+        }
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(request_id));
+            return p.has_value() && *p == mcp::McpStreamBridge::Phase::kRingOnly;
+        }));
+        for (const auto& e : r.tracker.query_executions({}))
+            if (!before.contains(e.id))
+                exec_id = e.id;
+        REQUIRE(!exec_id.empty());
+        finish(exec_id);
+        REQUIRE(bridge_poll([&] { return stream->pinned_count() == 1; }));
+        for (const auto& f : bridge_ring(*stream, principal)) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (!j.is_object())
+                continue;
+            if (j.value("method", "") == "notifications/progress")
+                ++out.progress_frames;
+            if (j.contains("result"))
+                out.final_result = j["result"];
+        }
+        return out;
+    };
+    const auto check_count_free = [](const Outcome& o) {
+        CHECK(o.progress_frames == 0);
+        REQUIRE(o.final_result.has_value());
+        CHECK((*o.final_result)["status"] == "completed");
+        CHECK_FALSE(o.final_result->contains("agents_success"));
+        CHECK_FALSE(o.final_result->contains("agents_failure"));
+        CHECK_FALSE(o.final_result->contains("agents_responded"));
+    };
+
+    SECTION("GET-only: global Execute + scoped Read gets no progress frame") {
+        const auto o = run_get_only(bob_tok, 7001);
+        CHECK(o.progress_frames == 0);
+    }
+    SECTION("streamed: global Execute + scoped Read gets a count-free final and no progress") {
+        check_count_free(run_streamed(bob_tok, 7002));
+    }
+    SECTION("GET-only control: a GLOBAL Execution:Read gets its progress frames") {
+        const auto o = run_get_only(mina_tok, 7003);
+        CHECK(o.progress_frames > 0);
+    }
+    SECTION("streamed control: a GLOBAL Execution:Read's final carries the counts") {
+        const auto o = run_streamed(mina_tok, 7004);
+        CHECK(o.progress_frames > 0);
+        REQUIRE(o.final_result.has_value());
+        CHECK((*o.final_result)["status"] == "completed");
+        CHECK((*o.final_result)["agents_success"] == 1);
+        CHECK((*o.final_result)["agents_failure"] == 1);
+    }
+    SECTION("Execute without any Read: deny-all projection, dispatch still 200, one denial row") {
+        const auto o = run_streamed(dan_tok, 7005);
+        CHECK(o.http_status == 200);
+        check_count_free(o);
+        const auto rows = r.audit("auth.fleet_read_required");
+        CHECK(rows.size() == denial_rows_before + 1);
+        CHECK(rows.back().rfind("denied|", 0) == 0);
+    }
+}
