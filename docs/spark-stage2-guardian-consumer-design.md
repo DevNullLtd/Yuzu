@@ -87,11 +87,12 @@ history:
     (5 s in production) on a detached worker and compares the directory identity (volume serial
     plus `FileIdInfo` file id) with the identity its handle was opened on; a different identity or
     a path that names nothing reports the watch faulted, cancels the stale read and hands the
-    watch to the ordinary retry (up to 30 s). Sampled, Windows only, id-bearing filesystems only.
+    watch to the ordinary retry (a 30 s floor, doubling on repeated failure to a 300 s cap).
+    Sampled, Windows only, verified on local NTFS only.
     **#4676 is NOT resolved by this change** (it is partly addressed: File, local NTFS, sampled);
-    still open there: filesystems that give no file id (a FAT32 volume was observed undetected),
-    SMB and ReFS (untested), an ancestor shelter whose own parent is renamed, a rename away and
-    back between two samples, and the Registry twin (parked, an issue to be filed). The
+    still open there: filesystems that give no file id (reported on one FAT32 volume, author-reported,
+    to go undetected), SMB and ReFS (untested), an ancestor shelter whose own parent is renamed,
+    a rename away and back between two samples, and the Registry twin (parked, tracked as #7836). The
     statement below that a rename of the PARENT is refused while the handle is open rests on the
     2026-09-21 probe (three runs); the File code comment that a handle follows its directory when
     "an ancestor" is renamed is NOT backed by any run and has been reworded.
@@ -2771,7 +2772,9 @@ Gates, applied at the marked rungs:
   equivalence on scripted scenarios uses tolerance bands **only for observe/debounce
   noise**; enforce-class and dangerous-drift `event_type`s require **zero-tolerance
   exact match** — a tolerance band would let a real enforce divergence pass (UP-10).
-- **Resource:** detection threads drop O(rules) → O(mechanisms); idle CPU,
+- **Resource:** detection threads drop O(rules) → O(mechanisms) (the Windows File mechanism
+  additionally does O(watched directories) periodic identity-verification work since #5719 item 5,
+  one short-lived thread per directory per interval, so its steady-state cost is not O(mechanisms)); idle CPU,
   wakeups/sec, **real OS thread count** (not the `watcher_units` gauge, which is a
   pool count, not `ps -T`, architect N1), and RSS old-vs-new via `/test` perf. This
   headline win is established at **rung 2** (Guardian becomes the consumer,
@@ -3140,7 +3143,8 @@ Each rung is an independently-governed PR on `dev`, run through the full
   re-arm/initial-eval contract is a rung-2 parity assertion (offline-drift-caught,
   no restart re-enforce storm).
 - Resource: `/test` perf shows the O(rules)→O(mechanisms) real-OS-thread drop at
-  rung 2.
+  rung 2 (resident watch threads; the Windows File mechanism's periodic per-directory
+  verification threads since #5719 item 5 are extra and are not O(mechanisms)).
 - Health surface: `yuzu_fleet_spark_*` os-labelled gauges visible in UAT
   `recompute_metrics`; REST `/guaranteed-state/status[/{agent_id}]` and the
   `get_guardian_status` MCP tool return real per-rule health; a
