@@ -741,8 +741,12 @@ if [[ -n "$ADMIN_PASS" ]]; then
         -b "$COOKIE_JAR" -H "Sec-Fetch-Site: cross-site"
     ss_expect_refused "cookie-session guarded HEAD without fetch metadata, Origin or Referer is refused" no_origin_no_referer \
         -b "$COOKIE_JAR"
-    ss_expect_answered "cookie-session guarded HEAD with same-origin fetch metadata reaches the handler" \
+    # An admitted HEAD passes the same-site gate and is then refused by the response policy
+    # (405, Allow: GET) without running the handler, so it never reaches the 400 above.
+    SS_ADMIT_RE='^405$'
+    ss_expect_answered "cookie-session guarded HEAD with same-origin fetch metadata passes the same-site gate and is then refused with 405" \
         -b "$COOKIE_JAR" -H "Sec-Fetch-Site: same-origin"
+    SS_ADMIT_RE='^400$'
 
     # The v1 twin of a guarded read follows the same rule for cookie sessions.
     SS_METHOD="GET"

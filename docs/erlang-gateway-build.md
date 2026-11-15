@@ -18,6 +18,8 @@ bash scripts/check-proto-codegen.sh          # F-3 (#1243): committed *_pb.erl i
 
 `apps/yuzu_gw/test/ct` includes `yuzu_gw_scale_SUITE`, which starts the gateway, a fake server and a load generator as separate nodes and runs 500 simulated agents through seven scenarios (about 1 min of the CT run with the PR #5695 fixes); see `docs/testing/gateway-scale-tests.md` for the 5,000 and 25,000 sizes and the `gate` group.
 
+**Memory per idle agent connection.** The same suite's on-demand `idle_memory` case (not in the default run or CI) measures the gateway's marginal bytes per idle connection over TLS and plaintext, with real-shaped registrations, heartbeats and fleet snapshots, at N = 0 / 1k / 5k / 10k: run `scripts/test/gateway-idle-mem.sh` from the repo root (about 45 minutes). Linux is the platform the per-connection budget is judged on. What it reports, its settings and the ceiling file: `docs/testing/gateway-scale-tests.md`, "Idle memory per connection".
+
 **TLS test legs and `YUZU_REQUIRE_TLS_TESTS`.** The TLS legs of seven modules mint throwaway certificates with the `openssl` CLI in a `0700` directory under `/tmp` or `$TMPDIR`: `yuzu_gw_heartbeat_conn_rpc_tests`, `yuzu_gw_authz_tests`, `yuzu_gw_authz_rpc_tests`, `yuzu_gw_mtls_tests`, `yuzu_grpc_client_tls_tests`, `yuzu_grpc_wire_tests` and `yuzu_grpc_origin_wire_tests`. By default an unavailable or failing `openssl` makes the TLS legs of those modules contribute no tests and print `SKIPPED <module>: openssl certificates unavailable: ...` on the console, so a run without `openssl` can still report all tests passed. Set `YUZU_REQUIRE_TLS_TESTS=1` in the environment to turn that skip into a failing test in all seven (`yuzu_gw_authz_tests:certs_unavailable/2` implements the switch and every module calls it). Use it on any machine that is expected to have `openssl`. It is optional and unset by default; the `linux` job of `ci.yml` sets it, and no other workflow or job does.
 
 **Proto codegen drift (`check-proto-codegen.sh`).** The gateway carries its own gpb-generated `apps/yuzu_gw/src/*_pb.erl` (separate from the server's protoc output). gpb modules are self-contained: change a `.proto` field but forget to regenerate and the gateway silently drops that field in transit (the PR5 enrollment-CSR field-drop bug). The guard regenerates with rebar.config's own pinned `gpb_opts` (read via `file:consult`, so it cannot drift from the build) into a temp dir and byte-diffs against the committed modules. It runs after `rebar3 compile` (needs `_build/gpb`) and is wired into the release workflow's gateway job. gpb is version-pinned (4.21.7) + `target_erlang_version` fixed, so the output is deterministic. To fix a drift failure: regenerate the modules and commit them.
@@ -177,16 +179,22 @@ Erlang/OTP 28.4 or later 28.x is the only supported toolchain for the gateway te
 override (removed in #4800 because it could pass a run with an auto-skipped
 suite), so an OTP 25 run that hits that race fails closed.
 
-**Meson runs the EUnit suite as two shards: `gateway eunit shard A` and
-`gateway eunit shard B`.** Each is `scripts/test_gateway.py gateway eunit
---shard K/2` with its own `REBAR_BASE_DIR` (`gateway/_build_eunit_1`,
-`_build_eunit_2`), a 540s wrapper deadline and a 600s meson timeout. The whole
-suite had outgrown one 540s run on the Windows leg (PR #5695). The partition is
-deterministic and weighted by measured per-module Windows times
-(`scripts/gateway_eunit_shards.py`). A new test module lands in a shard without
-any edit. Between them the two shards run exactly the module set that
-`rebar3 eunit --dir apps/yuzu_gw/test` runs, each module in its own test
-process, as under `--dir`. The shard's module list reaches rebar3 through
+**Meson runs the EUnit suite as three shards: `gateway eunit shard A`, `B`
+and `C`.** Each is `scripts/test_gateway.py gateway eunit --shard K/3` with its
+own `REBAR_BASE_DIR` (`gateway/_build_eunit_1` to `_build_eunit_3`), a 540s
+wrapper deadline and a 600s meson timeout. The whole suite had outgrown one
+540s run on the Windows leg (PR #5695). The partition is deterministic and
+weighted by measured per-module times (`scripts/gateway_eunit_shards.py`). A
+new test module lands in a shard without any edit. A shard runs with cover
+OFF (the config script below forces the test profile's `cover_enabled` to
+false): meck's cover preservation on every mock of a `src/` module made the
+suite take 459s instead of 268s, and nothing reads a shard's cover data. A
+plain `rebar3 eunit --dir apps/yuzu_gw/test` still runs with cover, so it is
+slower than the shards together.
+
+Between them the shards run exactly the module set that `rebar3 eunit --dir
+apps/yuzu_gw/test` runs, each module in its own test process, as under `--dir`.
+The shard's module list reaches rebar3 through
 `gateway/eunit_shard.config.script` (`REBAR_CONFIG`), not through `--module`,
 because `--module m1,m2` runs every listed module in one shared process.
 `tests/test_gateway_eunit_shards.py` pins this. `python3 scripts/test_gateway.py

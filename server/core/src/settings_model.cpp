@@ -4,6 +4,7 @@
 
 #include "settings_model.hpp"
 
+#include "plural.hpp"
 #include "web_utils.hpp"
 
 #include <algorithm>
@@ -282,11 +283,7 @@ namespace {
 std::string days_text(int n) {
     if (n <= 0)
         return "No expiry";
-    return std::to_string(n) + (n == 1 ? " day" : " days");
-}
-
-std::string plural(std::int64_t n, const char* unit) {
-    return std::to_string(n) + " " + unit + (n == 1 ? "" : "s");
+    return plural_count(n, "day", "days");
 }
 
 std::string with_thousands(std::int64_t n) {
@@ -309,13 +306,13 @@ std::string echo_duration_text(std::int64_t seconds) {
     if (seconds < 3600)
         return "Under an hour";
     if (seconds < kDay)
-        return plural(seconds / 3600, "hour");
+        return plural_count(seconds / 3600, "hour", "hours");
     const std::int64_t days = seconds / kDay;
     if (days < 14)
-        return plural(days, "day");
+        return plural_count(days, "day", "days");
     if (days < 60)
-        return days % 7 == 0 ? plural(days / 7, "week") : plural(days, "day");
-    return plural(days / 30, "month");
+        return days % 7 == 0 ? plural_count(days / 7, "week", "weeks") : plural_count(days, "day", "days");
+    return plural_count(days / 30, "month", "months");
 }
 
 namespace {
