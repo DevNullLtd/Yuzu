@@ -50,8 +50,9 @@ inline constexpr ResolverPoolMetricNames kOidcResolverMetrics{
     "POSIX builds",
     "Name lookups made through the OIDC resolver pool, by outcome: ok, not_found (the resolver "
     "answered that the name has no address), temporary (the resolver failed transiently), "
-    "timeout (no answer within the bound), busy (the pool was full or a worker could not be "
-    "started; nothing was started). Mirrored from the pool every 15 s; non-zero only on POSIX "
+    "timeout (no answer within the bound), busy (the lookup was not started: the pool was "
+    "full, a worker could not be started, or a lookup for the name was refused or timed out in "
+    "the last 3 s). Mirrored from the pool every 15 s; non-zero only on POSIX "
     "builds"};
 
 class ResolverPoolPublisher {

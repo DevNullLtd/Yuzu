@@ -37,6 +37,7 @@
 namespace yuzu::server::net {
 struct ResolverPool;
 struct ResolveResult;
+class HostLookupAdmission;
 } // namespace yuzu::server::net
 
 namespace yuzu::server::oidc {
@@ -362,10 +363,13 @@ public:
     /// adapter passes to `net::bounded_resolve` (bounded_resolver.hpp), BELOW
     /// `set_resolver_for_test`, so a test can block a lookup behind a latch, fill a small pool or
     /// fail a lookup without DNS. An empty `lookup` and a null `pool` restore the system lookup and
-    /// the OIDC pool. Process-wide: a test must restore it. Same source-scan pin.
+    /// the OIDC pool. `admission` is the refusal memory the adapter consults: a test that installs
+    /// a lookup or a pool and passes none gets no refusal memory, so only a test that asks for it
+    /// sees it. Process-wide: a test must restore it. Same source-scan pin.
     using BoundedLookupForTest = std::function<net::ResolveResult(const std::string& host)>;
-    static void set_bounded_lookup_for_test(BoundedLookupForTest lookup,
-                                            std::shared_ptr<net::ResolverPool> pool);
+    static void set_bounded_lookup_for_test(
+        BoundedLookupForTest lookup, std::shared_ptr<net::ResolverPool> pool,
+        std::shared_ptr<net::HostLookupAdmission> admission = {});
     /// Test-only seam: replaces the 30 s window during which a failed discovery is not retried
     /// (0 = retry on the next call) and clears any window already running. Same source-scan pin.
     void set_discovery_negative_cache_for_test(int ms);
