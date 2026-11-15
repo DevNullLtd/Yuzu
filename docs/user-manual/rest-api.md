@@ -9000,7 +9000,7 @@ Lists the devices that have reported installed software, with the state of each 
 
 **Permission and scope:** `Inventory:Read` through `require_fleet_read` as the sole gate. Rows are confined to the caller's management groups and service tag on every page; a device outside the scope takes no part in the search or in any count. `devices_omitted` counts devices dropped by the scope post-filter. Every served page is audited as `inventory.software.hosts` (see [audit-log.md](audit-log.md)).
 
-**Query parameters:** `q` (case-insensitive literal substring over hostname and agent id, clamped to 128 bytes; applied to the caller's devices that the device roster holds: seen in the last 30 days, the newest 100,000), `last_synced_before` (a non-negative epoch: keeps devices whose last accepted report is older than that), `limit` (default 100, max 1000), `cursor`. Repeated parameters keep the first value.
+**Query parameters:** `q` (case-insensitive literal substring over hostname and agent id, clamped to 128 bytes; applied to the caller's devices that the device roster holds: seen in the last 30 days, the newest 100,000), `last_synced_before` (an epoch: keeps devices whose last accepted report is older than that; 0 means no cutoff), `limit` (default 100, max 1000), `cursor`. Repeated parameters keep the first value.
 
 **Response (200):**
 
