@@ -87,7 +87,7 @@ history:
     (5 s in production) on a detached worker and compares the directory identity (volume serial
     plus `FileIdInfo` file id) with the identity its handle was opened on; a different identity or
     a path that names nothing reports the watch faulted, cancels the stale read and hands the
-    watch to the ordinary retry (a 30 s floor, doubling on repeated failure to a 300 s cap).
+    watch to the ordinary retry (on the ordinary drain route the first backend retry, 30 s in production, doubling on repeated failure to a 300 s cap; if a pass throws while the lost path drains, recovery uses the 50 ms admission backoff instead, still bounded by the 30 s admission cap).
     Sampled, Windows only, verified on local NTFS only.
     **#4676 is NOT resolved by this change** (it is partly addressed: File, local NTFS, sampled);
     still open there: filesystems that give no file id (reported on one FAT32 volume, author-reported,

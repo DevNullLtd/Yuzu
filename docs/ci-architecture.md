@@ -1306,6 +1306,11 @@ because the self-test's probes go unnamed. It reports and never deletes (a lefto
 tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
 removes it.
 
+Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*` key whose run is no longer in
+progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
+with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
+both follow a registry link and can delete its target.
+
 **Spark Linux Service case (`YUZU_REQUIRE_SPARK_DBUS_TESTS`, #5719 item 5).** The Linux Service case in
 `test_spark_mechanism.cpp` needs a `dbus-daemon` binary on `PATH` (it starts a private one on a per-process salted
 socket and drives a child process against it). Where the daemon is missing, or the socket path is too long for
@@ -1314,11 +1319,6 @@ condition FAILs instead (the same contract as `YUZU_REQUIRE_WINDOWS_REGISTRY_TES
 today and no workflow installs `dbus-daemon`, so whether a leg runs the case depends on its runner image, and where
 the daemon is missing the case skips silently; setting the variable on a leg that is meant to have the daemon is a
 follow-up.
-
-Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*` key whose run is no longer in
-progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
-with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
-both follow a registry link and can delete its target.
 
 **Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
 `YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A

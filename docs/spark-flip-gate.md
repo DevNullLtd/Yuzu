@@ -1801,10 +1801,12 @@ flip, with a red-first test each:
     results never fault and a decided one resets the run, undecidable forever faults after 3 in a row and recovers,
     a DENY-ACL replacement the agent may not open (the real-world twin; the case switches the process's
     SeBackupPrivilege and SeRestorePrivilege off for its duration, because an elevated session bypasses a
-    directory DACL through them), a lost path whose cancelled read never drains is counted once and recovers when it
-    does, `stop()` while that completion is held back is prompt (model-limited: the case swallows the completion with a
+    directory DACL through them), a lost path whose cancelled read never drains (a hook-held completion) is counted once
+    and recovers when it does, `stop()` while that completion is held back is prompt (model-limited: the case swallows
+    the completion with a
     test hook, so by `stop()` no read is outstanding and the 2 s drain wait and the quarantine path are never reached;
-    it does NOT model a read the OS never completes, which is Gate 5 chaos scenario C-1, not run), an OK completion queued on the stale read when the path is found
+    it does NOT model a read the OS never completes, which is a Gate 5 flip-time chaos scenario, a never-completing
+    cancelled read including `stop()`, not run), an OK completion queued on the stale read when the path is found
     lost is drained and never fired, a throw while the lost path's read drains still ends in one Recovered, and
     the retry window is not counted as a slow establishment.
     *Registry: a KNOWN GAP, parked.* The case for the parent of the watched key renamed (`RegRenameKey`) is a hidden
@@ -1821,17 +1823,21 @@ flip, with a red-first test each:
     a sampled check, not continuous) on a detached worker and compares the directory identity (volume serial plus
     `FileIdInfo` file id) with the identity its own handle was opened on. A different identity, or a path that names
     nothing, faults the watch with the reason `file watch parent directory renamed or replaced`, cancels the stale
-    read, and hands the watch to the ordinary retry once the cancelled read's completion has been consumed (a 30 s
-    floor in production: the first backend retry, doubling on repeated failure to a 300 s cap, so the watch stays
-    Faulted at least that long). A check that could not decide (open refused, no id, worker threw) is counted; 3 such
+    read, and hands the watch to the ordinary retry once the cancelled read's completion has been consumed (on the
+    ordinary drain route the first backend retry, 30 s in production, doubling on repeated failure to a 300 s cap; if a
+    pass throws while the lost path drains, recovery uses the 50 ms admission backoff instead, still bounded by the 30 s
+    admission cap). A check that could not decide (open refused, no id, worker threw) is counted; 3 such
     results in a row also fault the watch (`file watch parent directory unverifiable`). That streak counts every
     open error other than not-found (handle or memory exhaustion, `BAD_NETPATH`, `NETNAME_DELETED`, a DACL tightened
     in place, a verification worker that threw), and it is not time-bounded: results separated by refused launches or
-    a long quiet stretch still add up. After the 3rd result (about 10 to 15 s at the 5 s interval) a watch whose handle
-    may still have been working is cancelled and dropped, and is retried after the 30 s floor, backing off to the
-    300 s cap on repeated failure. Excluding resource-exhaustion errors from the streak is tracked as a follow-up
-    (issue number to be inserted at PR time). A directory that stays unverifiable but openable will re-fault about
-    every (3 intervals plus the 30 s retry): bounded, not damped (a follow-up). A lost path whose cancelled read has
+    a long quiet stretch still add up. The 3rd undecided result lands about 10 s after the first one (two further 5 s
+    samples), and a watch whose handle may still have been working is then cancelled and dropped, and is retried on the
+    same route as above (30 s first retry, backing off to the 300 s cap on repeated failure). Excluding
+    resource-exhaustion errors from the streak is FOLLOW-UP-ISSUE-TBD(verify-streak-resource-errors). The shapes this
+    cost statement covers are a herd of N watches that go blind together for up to 300 s under handle or memory pressure
+    (review id UP-G8-3), and an SMB blip longer than the streak whose cancelled read then does not drain (the
+    never-draining case below). A directory that stays unverifiable but openable will re-fault about every (3 intervals
+    plus the 30 s retry): bounded, not damped. A lost path whose cancelled read has
     not drained after 30 s is counted (`path_lost_stuck`) and warned once; there is no escalation.
     **Open residuals of the File fix** (none is claimed as covered): detection is sampled, so a watch can be deaf
     for up to one interval and then stays Faulted until the retry; a rename away and back between two samples is not
@@ -1844,29 +1850,42 @@ flip, with a red-first test each:
     busy a refused verification is retried after 50 ms (counted in `verify_refused`, not a fault); a launch failure
     is retried the same way (counted in `verify_launch_failed`, which counts only launches that were attempted); the
     stuck-drain wait has no deadline-driven recovery, only the observation, so a lost path whose cancelled read never
-    drains stays Faulted with the sweep re-cancelling at 20 Hz (UP-1: observe-only, accepted by owner ruling as a
-    documented residual; a follow-up is to be filed); one not-found sample faults the watch with no hysteresis, and
-    an atomic directory swap that spans a sample can leave a healthy watch Faulted for about 35 s (UP-4); a hung
-    verification costs a standing 20 Hz sweep for as long as it is outstanding, and a `CreateFileW` parked in a
-    verification at agent stop races the F3 hard exit (UP-7); after a resume from suspend or a network drop every
-    watch falls due for verification together, a bunched burst of threads (UP-8); a false "same" on a filesystem
-    that reuses directory ids (exFAT or FAT class) is possible and unmeasured (UP-9); renaming the parent of N
-    watched directories gives N Faulted edges, 2N warns and N probes that all retry at the same instant against the
-    probe lane (UP-10); and every re-fault cycle delivers one resync `Fired` event per key when the watch is
-    re-established.
+    drains stays Faulted with the sweep re-cancelling at 20 Hz (observe-only, accepted by owner ruling as a documented
+    residual, #5719 PR-B review id UP-1; FOLLOW-UP-ISSUE-TBD(never-draining-read)); one not-found sample faults the
+    watch with no hysteresis, and an atomic directory swap that spans a sample can leave a healthy watch Faulted for
+    about 35 s (review id UP-4); a hung verification costs a standing 20 Hz sweep for as long as it is outstanding, and
+    a `CreateFileW` parked in a verification at agent stop races the F3 hard exit (review id UP-7); after a resume from
+    suspend or a network drop every watch falls due for verification together, a bunched burst of threads (review id
+    UP-8); a false "same" on a filesystem that reuses directory ids (exFAT or FAT class) is possible and unmeasured
+    (review id UP-9); renaming the parent of N watched directories gives N Faulted edges, N warns (one per Lost) and N
+    infos (one per drain), and N probes that all retry at the same instant against the probe lane (review id UP-10); a
+    refused verification is retried after a fixed 50 ms with no backoff, so each of N healthy watches re-stages its
+    verification at 20 Hz while the 4-slot lane stays pinned (round 2 review id UP-G8R2-1); and every re-fault cycle
+    delivers one resync `Fired` event per key when the watch is re-established.
     **Before any flip (File), not done here:** (1) the verification-failure signals (`verify_unverifiable`,
     `verify_refused`, `verify_launch_failed`, `path_lost_stuck`) are debug counters visible only to tests; of these
     only `verify_unverifiable` (one warn per run of undecided results) and `path_lost_stuck` (one warn per episode)
     have a log line, and `verify_refused` and `verify_launch_failed` have none. They must be exported before any flip,
     tracked with #7658 (the Spark counter-export follow-up; #7658 now also tracks these File debug counters, a
     comment saying so was posted). (2) The check opens every watched directory every 5 s and runs on a short-lived
-    thread per directory: it can raise object-access audit events (4656/4663 class) on a directory that carries an
-    auditing SACL, adds EDR noise and thread churn, has no cap on the number of directories, and its cost was
+    thread per directory: it can raise object-access audit events (4656 class, a handle request; 4663 only if an audited
+    access operation follows; unmeasured) on a directory that carries an auditing SACL, adds EDR noise and thread churn,
+    has no cap on the number of directories, and its cost was
     measured only up to 200 directories (author-reported, below). There is no knob to turn it off: the sole rollback
     lever is `--spark-disable` (section 6), which is boot-time and restart-required and persists across restarts only
-    on Linux (#3973). A runtime off switch (an agent flag with 0 meaning off) is required before a flip; this
-    verification does not add one (follow-up to be filed). (3) The cost model in precondition (c) predates this verification: the File
+    on Linux (#3973). A runtime off switch is required before a flip and this verification does not add one: it is an
+    agent flag with 0 meaning off, for the Spark File mechanism as a whole and not only this verification, and
+    `--spark-disable` stays the sole current lever (FOLLOW-UP-ISSUE-TBD(runtime-off-switch)). (3) The cost model in
+    precondition (c) predates this verification: the File
     measurements there were taken before it existed and do not include its cost.
+    (4) Gate 5 flip-time chaos scenarios, none run here: a cancelled read that never completes (a blackholed SMB share
+    or a filter driver), including `stop()` with it outstanding; a `CreateFileW` hung inside a verification at `stop()`
+    or `unwatch()` while all 4 verification slots are pinned; a handle or memory-pressure herd of watches going blind
+    together; an in-place DENY ACL applied to a live watch's directory; and a pinned verification lane with N healthy
+    watches (the fixed 50 ms retry in the residuals above). (5) Two test gaps: the DENY-ACL case has not been measured
+    under LOCAL SYSTEM, the identity of the Windows CI runner (`deploy/windows/README.md`), so a red first CI run there
+    would mean the case itself does not hold under that identity (a broken leg), not that the mechanism regressed; and
+    `verify_refused` and `verify_launch_failed` have no test.
     **Runs.** Author-reported (pre-governance, logs not retained): the cancelled read's completion was consumed in
     the same millisecond as detection in the one run whose log was read; the identity read was stable across
     repeated opens on the NTFS temp volume (about 5300 verifications, none unverifiable) and the four File identity
@@ -1874,13 +1893,38 @@ flip, with a red-first test each:
     at a 1 s interval over 30 s was about 0.9 s more process CPU at 50 watched directories (1450 verifications) and
     about 0.95 s more at 200 (3864 verifications), with run-to-run noise about 0.3 s, so an order-of-magnitude
     figure, not a budget; five mutations of the first version, four caught and "restrict the drain branch to aborts"
-    not caught. Governance-round, source tree `bb2d5535cd143aae3365e0f6e8ad6abec167c74f` (the code of the second-round production commit; the rig tree was a `git archive` of its parent with the three changed files copied over and their md5 checked equal to the committed files; round 1 figures from the earlier tree are superseded): Linux debug: `[mechanism]` 62 cases, `[5719]` 43 cases and
-    `[4415prA]` 105 cases all green (the File mechanism is Windows-only, so the new cases do not run there).
-    Windows (MSVC, weecolin, debug-type build without debug info): `[mechanism]` 183 cases, `[5719]`
-    58 cases and `[4415prA]` 105 cases all green, the parked Registry case excluded from all three and
-    red (1 case, 2 assertions) when run explicitly by tag, and absent from `--list-tests` for each of the three agent shard specs and the `~[.]~[tsan-heavy]~[flaky-4086]` reference spec of `tests/meson.build` (the 16 File cases are all in shard B); each of the 16 File cases 20 of 20 green in a loop, and
-    each of the renamed-away, replaced-directory, junction and OK-completion-drain cases (the last one is the case with a fixed 150 ms notification allowance) also 50 of 50 green while one busy-loop process per logical core (16) kept the box saturated (the flake fix; about 5.5 minutes for the 200 runs). Eleven mutations of that tree, M1 to M11 (3 runs of each of the 16 File cases per mutation; M1 to M10 are the ten of the earlier round, re-run, and M11 is new): each caught by at least one case: removing the idle-watch wake clause (13 of the 16 cases red); treating every verification as lost (10 red); comparing existence instead of identity (only the replaced-directory case); restricting the drain branch to aborts (only the OK-completion case, 3 of 3, which closes the gap the first version had); routing detection through the generic backend failure path instead of the path-lost drain (9 red, in a build with assertions on, where the `assert` in `attach_dir_locked` that no handle is installed over a live read may be one of the catchers; a build without assertions was not measured); dropping the undecidable streak to 1 (3 red); never faulting an undecidable watch (2 red); the stuck-drain observation never firing (2 red: the stuck-drain case and the held-back-completion `stop()` case); reverting the grace fix (the retry-window case); not resetting the streak on a decided result (the one-or-two case); and removing the unwind failed-arm grace fix of the second-round production commit (M11: only the throw-while-draining case). The mutated sources were restored and the rig tree rebuilt from the unmutated source after each. The set of cases
-    is not a proof that no other deaf path exists in any mechanism.
+    not caught.
+    Governance round 3, rig bytes: `spark_file.cpp` and `spark_mechanism.hpp` as committed in `4e9a5c3ca1` (the round 3
+    production commit, whole-repo tree `ccd9c27d1055ee4235662aeb63c308bc9af98815`) and `test_spark_mechanism.cpp` as
+    committed in `3ae43cb810` (the round 3 test commit, whole-repo tree `62aae921baa4f36fcf81a7678973d8e43c95658d`). The
+    rig tree was a `git archive` of `040071560b` with those three files copied over, and only those three files were
+    md5-compared with the committed files (equal); the tree hashes name the whole repository at those commits and were
+    not themselves checked on the rig. The later commit `74923f4616` changes one comment in the test file and was not
+    re-run, so the rig bytes are the round 3 production and test commits and nothing else; figures from earlier rounds
+    are superseded. Linux debug: `[mechanism]` 62 cases, `[5719]` 43 cases and `[4415prA]` 105 cases all green (the File
+    mechanism is Windows-only, so the new cases do not run there). Windows (MSVC, weecolin, debug-type build without
+    debug info): `[mechanism]` 183 cases (5377 assertions), `[5719]` 58 cases (1800 assertions) and `[4415prA]` 105
+    cases (3544 assertions) all green, the parked Registry case excluded from all three and red (1 case, 2 assertions)
+    when run explicitly by tag (its absence from `--list-tests` for the three agent shard specs and the reference spec
+    of `tests/meson.build` was checked in round 2 and not re-run); each of the 16 File cases 20 of 20 green in a loop,
+    and each of the
+    throw-while-draining, renamed-away, OK-completion-drain (the case with a fixed 150 ms notification allowance) and
+    retry-window cases also 50 of 50 green while one busy-loop process per logical core (16) kept the box saturated.
+    Twelve mutations of that tree, M1 to M12 (3 runs of each of the 16 File cases per mutation; M1 to M11 are those of
+    the earlier rounds, re-run, and M12 is new): M1 to M11 were each caught by at least one case, with the same cases
+    red as in round 2: removing the idle-watch wake clause (13 of the 16 cases red); treating every verification as lost
+    (10 red); comparing existence instead of identity (only the replaced-directory case); restricting the drain branch
+    to aborts (only the OK-completion case, 3 of 3); routing detection through the generic backend failure path instead
+    of the path-lost drain (9 red, in a build with assertions on, where the `assert` in `attach_dir_locked` that no
+    handle is installed over a live read may be one of the catchers; a build without assertions was not measured);
+    dropping the undecidable streak to 1 (3 red); never faulting an undecidable watch (2 red); the stuck-drain
+    observation never firing (2 red: the stuck-drain case and the held-back-completion `stop()` case); reverting the
+    grace fix (the retry-window case); not resetting the streak on a decided result (the one-or-two case); and removing
+    the unwind failed-arm grace guard (M11: only the throw-while-draining case). M12, removing the new guard on the
+    unwind OK-completion arm's reissue-failure sub-branch, was NOT caught: all 16 cases passed 3 of 3. That guard has no
+    test, because forcing a real-directory ReadDirectoryChangesW failure on that arm needs a seam that does not exist;
+    it mirrors the failed-arm guard that M11 covers. The mutated sources were restored and the rig tree rebuilt from the
+    unmutated source after each. The set of cases is not a proof that no other deaf path exists in any mechanism.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
