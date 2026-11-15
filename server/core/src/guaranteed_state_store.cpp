@@ -1898,7 +1898,8 @@ constexpr const char* kCensusFold =
 // holds it FOR SHARE through this statement), so first deliveries then time out and are stored
 // pending, growing the set. The `+ 0` makes the aggregate argument an expression, not the indexed
 // column, so the index cannot order it and the subquery is a primary-key lookup per seen id.
-// Pinned structurally by the "census plan" test (no backward index scan under the subquery).
+// Pinned structurally by the "census pair order, P-1 plan" test (no backward index scan under
+// the subquery).
 #define YUZU_CENSUS_SEEN_MAX_SEQ_                                                                  \
     "(SELECT max(s.ingest_seq + 0) FROM guaranteed_state_store.guaranteed_state_events s "         \
     "WHERE s.event_id = ANY($8::text[]))"
@@ -2367,16 +2368,20 @@ constexpr const char* kEventSeqIndexName = "idx_gse_ingest_seq";
 // that row FOR SHARE as its first lock and reads the mode from the clock without writing it, all
 // INSIDE `census_upsert` and under the step's lock bound (`repair_step.lock_timeout_ms`, 1 s by
 // default), restored right after the share lock so the pending-row locks, the fold and the upsert
-// keep the connection's own bound. Everything the Repair did to the order table is therefore undone
-// by the ROLLBACK TO of every exit that projects nothing (the event retired concurrently, a
-// failed statement, a missing rule): a blank order row survives only a Repair that touched the
-// census row. A Repair that only retires its own evidence (RefusedNoop) keeps its savepoint,
-// because the retire is inside it: an Ensure that created the row then stays too. A Repair whose
-// lock wait times out, or whose clock read does not answer with exactly one row of a known mode,
-// is Failed with its evidence kept; it never falls back to a default mode. With the step seam off
-// the Repair does none of this and uses the default decision (`unpaired` for 0/0, `current` for a
-// pair). The mode and the retired epoch are bound into every census statement; a
-// refused equal pair counts on the agent's order row only for a first delivery or batch row
+// keep the connection's own LOCK bound. A Repair's statements are, however, all under its
+// `statement_timeout` (`repair_step.statement_timeout_ms`, 2 s by default, P-1), which counts
+// lock waits too: a Repair queued on a pending-event or census row for longer than that is
+// cancelled (57014) and Failed with its evidence kept, as a slow statement is. Everything the
+// Repair did to the order table is therefore undone by the ROLLBACK TO of every exit that projects
+// nothing (the event retired concurrently, a failed statement, a missing rule): a blank order row
+// survives only a Repair that touched the census row. A Repair that only retires its own evidence
+// (RefusedNoop) keeps its savepoint, because the retire is inside it: an Ensure that created the
+// row then stays too. A Repair whose lock wait times out, or whose clock read does not answer with
+// exactly one row of a known mode, is Failed with its evidence kept; it never falls back to a
+// default mode. With the step seam off the Repair does none of this and uses the default decision
+// (`unpaired` for 0/0, `current` for a pair). The mode and the retired epoch are bound into every
+// census statement; a refused equal pair counts on the agent's order row only for a first delivery
+// or batch row
 // (`kAgentOrderCountDuplicate`), never from a Repair. `counted` receives the decision label the
 // upsert returned, only when the write stands (the savepoint released), for the decision metric.
 [[nodiscard]] CensusOutcome
