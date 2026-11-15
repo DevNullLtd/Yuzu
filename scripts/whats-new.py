@@ -681,7 +681,8 @@ def unrecognised_names(repo: Repo, old: str, new: str) -> list[str]:
 class Fragments(dict):
     """{key: body}; `promoted` holds the keys of entries a release moved into CHANGELOG.md, and `released` maps
     each to {first line of a bullet the release carried: the version section it sits under at the end of the
-    range ("" when that is not findable)}. A bullet the release editor dropped is not in it."""
+    range ("" when that is not findable)}. A bullet the release editor dropped, or reworded in the release
+    commit itself, is not in it (the two look alike)."""
 
     def __init__(self) -> None:
         super().__init__()

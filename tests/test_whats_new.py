@@ -2054,6 +2054,69 @@ class VersionsFlagAndMarkers(GitCase):
         self.assertIn("- **Dropped by the editor.**\n", out)
         self.assertIn("- **Reworded later.**  [released]", out)
 
+    def test_every_bullet_of_a_multi_bullet_fragment_the_release_carried_is_marked(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-two.added.md", "- **One.**\n- **Two.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (2, 2 already released)", out)
+        self.assertIn("- **One.**  [released 1.3.0]", out)
+        self.assertIn("- **Two.**  [released 1.3.0]", out)
+
+    def test_a_name_promoted_twice_marks_each_life_with_its_own_release(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **First text.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release 1")
+        self.put(repo, "changelog.d/2-a.fixed.md", "- **Second text.**\n")
+        self.commit(repo, "same name, new change")
+        promote(repo, "1.4.0")
+        self.commit(repo, "release 2")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **First text.**  [released 1.3.0]", out)
+        self.assertIn("- **Second text.**  [released 1.4.0]", out)
+
+    def test_the_same_bullet_in_two_fragments_is_shown_once_per_section(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Shared.**\n- **Only A.**\n")
+        self.put(repo, "changelog.d/3-b.fixed.md", "- **Shared.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertEqual(out.count("- **Shared.**  [released 1.3.0]"), 2)
+        self.assertIn("- **Only A.**  [released 1.3.0]", out)
+
+    def test_a_bullet_with_trailing_spaces_and_a_continuation_line_is_still_marked(self):
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Spaced.**   \n  continued\n- **Plain.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        self.commit(repo, "release")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("Changelog entries added (2, 2 already released)", out)
+
+    def test_a_bullet_reworded_in_the_release_commit_has_no_marker(self):
+        """A documented limit: a cut bullet and one reworded in the release commit cannot be told apart."""
+        repo = self.init()
+        old = self.seed(repo)
+        self.put(repo, "changelog.d/2-a.added.md", "- **Kept.**\n- **Will be reworded.**\n")
+        self.commit(repo, "add")
+        promote(repo)
+        text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.put(repo, "CHANGELOG.md", text.replace("- **Will be reworded.**", "- **Reworded.**"))
+        self.commit(repo, "release with an edit")
+        out = self.ok(repo, "--since", old)
+        self.assertIn("- **Kept.**  [released 1.3.0]", out)
+        self.assertIn("- **Will be reworded.**\n", out)
+
     def test_nothing_is_marked_when_no_release_is_in_the_range(self):
         repo = self.init()
         old = self.seed(repo)

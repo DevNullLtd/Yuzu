@@ -98,7 +98,8 @@ It prints, in this order:
   release inside the range moved into `CHANGELOG.md` ends `[released X.Y.Z]`
   when its first line sits under one `## [X.Y.Z]` heading at `HEAD` (each bullet
   of a multi-bullet fragment is judged by its own first line, so a bullet the
-  release editor cut gets no marker), and
+  release editor cut, or reworded in the release commit itself, gets no marker:
+  the two cannot be told apart), and
   `[released]` when the version cannot be told: the release editorial pass
   reworded the line (the usual cause), the line is under two versions, under
   a column-0 `#` or `##` heading that is not `## [X]`, or before any heading,
