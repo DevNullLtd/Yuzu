@@ -1039,6 +1039,98 @@ TEST_CASE("OfflineEndpointStore find_within: hit, confirmed absence, and the ros
     CHECK(find(stale_ok(store, std::chrono::hours(3)), "fw-out") != nullptr);
 }
 
+// #7566 / #7551: the roster and the point read say which rows are CONNECTED, in the same statement,
+// with the predicate `query_live_ids` and `fleet_state_counts` use. Online/Offline on the Hardware
+// list is derived from this, so a failed or truncated second presence read can no longer turn
+// devices connected to another replica into Offline.
+TEST_CASE("OfflineEndpointStore roster and point reads carry the live flag, on the presence predicate",
+          "[pg][offline][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::int64_t t = now_ms();
+    constexpr auto kTtl = std::chrono::seconds{90};
+    // live: a session id and a fresh last_seen_at (authored by the database in upsert).
+    REQUIRE(store.upsert("lv-live", "host-live", "linux", t, 0, "1.0.0", "x86_64", "sess-live"));
+    // departed gracefully: the session id was cleared (#5678) but the roster row stays.
+    REQUIRE(store.upsert("lv-gone", "host-gone", "linux", t, 0, "1.0.0", "x86_64", "sess-gone"));
+    REQUIRE(store.remove_if_session("lv-gone", "sess-gone"));
+    // never recorded a session id (a first heartbeat that raced session lookup).
+    REQUIRE(store.upsert("lv-blank", "host-blank", "linux", t, 0, "1.0.0", "x86_64"));
+    // had a session id but has not been seen for two hours: outside the presence TTL.
+    REQUIRE(store.upsert("lv-old", "host-old", "linux", t, 0, "1.0.0", "x86_64", "sess-old"));
+    exec_sql(db.dsn(), "UPDATE endpoint_state.endpoints SET last_seen_at = now() - interval '2 hours' "
+                       "WHERE agent_id = 'lv-old'");
+
+    const auto live_of = [](const std::vector<OfflineEndpoint>& roster) {
+        std::set<std::string> out;
+        for (const auto& e : roster)
+            if (e.live)
+                out.insert(e.agent_id);
+        return out;
+    };
+
+    SECTION("with a TTL, exactly the rows a presence read would call live are live") {
+        auto roster = store.query_stale_within(std::chrono::hours(1), kTtl);
+        REQUIRE(roster.has_value());
+        REQUIRE(roster->rows.size() == 4); // the live flag never filters rows out
+        CHECK(live_of(roster->rows) == std::set<std::string>{"lv-live"});
+        // Parity with the presence read itself: the two predicates must never drift apart.
+        std::set<std::string> presence;
+        for (const auto& p : live_ids_ok(store, kTtl))
+            presence.insert(p.agent_id);
+        CHECK(live_of(roster->rows) == presence);
+        // ...and with the third copy of the predicate, the fleet tally (all four rows are inside
+        // its window too, so its live count is the roster's live count).
+        auto tally = store.fleet_state_counts(t, std::chrono::hours(1),
+                                              std::chrono::milliseconds{1000}, kTtl);
+        REQUIRE(tally.has_value());
+        CHECK(tally->live == static_cast<std::int64_t>(live_of(roster->rows).size()));
+        // The row's other columns still map (the live column is appended, not interleaved).
+        const auto* r = find(roster->rows, "lv-live");
+        REQUIRE(r != nullptr);
+        CHECK(r->hostname == "host-live");
+        CHECK(r->agent_version == "1.0.0");
+        CHECK(r->arch == "x86_64");
+        CHECK(r->last_heartbeat_ms == t);
+    }
+    SECTION("without a TTL nothing is asked, so no row claims to be live") {
+        auto roster = store.query_stale_within(std::chrono::hours(1));
+        REQUIRE(roster.has_value());
+        CHECK(live_of(roster->rows).empty());
+        auto zero = store.query_stale_within(std::chrono::hours(1), std::chrono::seconds{0});
+        REQUIRE(zero.has_value());
+        CHECK(live_of(zero->rows).empty());
+    }
+    SECTION("the point read agrees with the roster for every row, and is false when not asked") {
+        for (const char* id : {"lv-live", "lv-gone", "lv-blank", "lv-old"}) {
+            CAPTURE(id);
+            auto one = store.find_within(id, std::chrono::hours(1), kTtl);
+            REQUIRE(one.has_value());
+            REQUIRE(one->has_value());
+            CHECK((*one)->live == (std::string(id) == "lv-live"));
+        }
+        auto asked_nothing = store.find_within("lv-live", std::chrono::hours(1));
+        REQUIRE(asked_nothing.has_value());
+        REQUIRE(asked_nothing->has_value());
+        CHECK_FALSE((*asked_nothing)->live);
+    }
+    SECTION("a live row is still subject to the roster window") {
+        // A tiny window drops a row by heartbeat age even though it is live: live is a column of
+        // the roster, never a way into it.
+        REQUIRE(store.upsert("lv-aged", "h", "linux", t - 3 * 60 * 60 * 1000, 0, "", "", "sess-aged"));
+        auto roster = store.query_stale_within(std::chrono::hours(1), kTtl);
+        REQUIRE(roster.has_value());
+        CHECK(find(roster->rows, "lv-aged") == nullptr);
+        auto one = store.find_within("lv-aged", std::chrono::hours(1), kTtl);
+        REQUIRE(one.has_value());
+        CHECK_FALSE(one->has_value());
+    }
+}
+
 TEST_CASE("OfflineEndpointStore find_within is StoreUnavailable on a store that never opened",
           "[offline][roster_truncated]") {
     PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};

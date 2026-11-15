@@ -219,8 +219,9 @@ next reseed' as a fact your read path can see").
 no REST/MCP/network surface for this method by design" — i.e. `!check_signature` is already,
 today, a sound proxy for "this call originates from the every-boot reseed loop, nowhere else." No
 new flag is introduced for definitions; `import_definition_json_impl` routes to a new private
-seed-aware insert path when `!check_signature`, and to the plain insert path (unchanged, no
-tombstone consultation) when `check_signature` is true (operator signed-import).
+seed-aware insert path when `!check_signature`, and to the plain insert path (no tombstone
+suppression; it reads the tombstone's `last_version` only, for the version floor described under
+Locking) when `check_signature` is true (operator signed-import).
 
 Sets have no signature concept at all — `"trusted"` would misleadingly imply one. A **new** public
 method, `create_set_seed(const InstructionSet&)`, is the seed-aware entry point
@@ -239,13 +240,19 @@ namespace constant `rbac_store.cpp`/`product_pack_store.cpp` already use; the ha
 this store's own key) — as the **first statement**, in an explicit transaction, strictly before
 the statement that checks-and-mutates (embedding it via CTE in the same statement does not work —
 a statement's READ COMMITTED snapshot is fixed before any of its own function calls run,
-`docs/postgres-store-playbook.md` lines 309-329). Four writers take it: the trusted-reseed insert
+`docs/postgres-store-playbook.md` lines 309-329). Four writers take it for their suppression
+semantics: the trusted-reseed insert
 path (checks the tombstone, then inserts), `create_set_seed` (same), `delete_definition` (deletes,
 then stamps the tombstone), `delete_set` (unsets `instruction_set_id` on referencing definitions,
-deletes, then stamps the tombstone) — all four in one transaction each. Plain `create_definition`,
-`update_definition`, `create_set`, and the signed `import_definition_json` path never touch
-`deleted_seed_content` and take **no** lock, matching `ProductPackStore::install`'s identical
-lock-free shape (only `uninstall`/`migrate_from_sqlite` take `kErasureCoordLockSql` there).
+deletes, then stamps the tombstone), all four in one transaction each. Plain `create_definition`
+and the signed `import_definition_json` path (`insert_definition_row` with `is_seed` false) take
+it too, in one lock-then-insert transaction, but only for the version floor: the insert raises
+`updated_at` to at least the tombstone's `last_version + 1`, and a single statement's snapshot
+is taken before it waits on the unique index, so without the lock a create racing a not yet
+committed delete of the same id would land with the OLD token. They never consult the tombstone to
+suppress. `update_definition` and `create_set` touch neither table pair and take **no** lock,
+matching `ProductPackStore::install`'s lock-free shape (only `uninstall`/`migrate_from_sqlite`
+take `kErasureCoordLockSql` there).
 
 A bundled `id` an operator has NOT deleted needs no lock for the insert's own correctness — a
 plain `INSERT ... ON CONFLICT (id) DO NOTHING RETURNING id` is already correctly arbitrated by

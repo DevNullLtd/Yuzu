@@ -2364,7 +2364,7 @@ composed in C++ through an injected reader (`make_route_session_confirmer`), not
 cross-store owner is not needed. The registration that creates a new session rewrites `agent_routes.session_id`
 before the agent is handed it (`register_fresh`, which fails closed on a store error) and leaves the row
 unplaced, so a restarted agent's old list stops matching at that instant: no dependence on a best-effort clear,
-on the new session's first heartbeat, or on the 3 s candidate cache. No row, a tombstone, an expired or unplaced
+on the new session's first heartbeat, or on the candidate cache (3 s, up to `kMaxStaleServe` = 30 s while a refresh is in flight, which is harmless here because the confirmation read is never cached). No row, a tombstone, an expired or unplaced
 row, a different session, a degraded or throwing confirmation read, or no wired reader all fail open (the agent
 is dispatched to and answers for itself): an under-withhold, never a wrong refusal. Two consequences. A
 direct-connect agent has no directory row, so cross-replica `plugin_not_found` applies to gateway-fronted agents

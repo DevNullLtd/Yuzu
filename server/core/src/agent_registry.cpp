@@ -1685,6 +1685,15 @@ std::vector<std::string> AgentRegistry::all_ids() const {
     return ids;
 }
 
+std::vector<std::string> AgentRegistry::local_ids() const {
+    std::lock_guard lock(mu_);
+    std::vector<std::string> ids;
+    ids.reserve(agents_.size());
+    for (const auto& id : agents_ | std::views::keys)
+        ids.push_back(id);
+    return ids;
+}
+
 std::expected<std::size_t, PresenceReadError> AgentRegistry::known_agent_count() const {
     auto presence = live_presence(); // cached, runs OFF mu_ (see all_ids)
     if (!presence)
@@ -2835,11 +2844,9 @@ void pause_between_slices() {
 }
 } // namespace
 
-std::vector<std::optional<std::string_view>>
-AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
-                                       std::chrono::seconds staleness) const {
-    std::vector<std::optional<std::string_view>> out;
-    out.reserve(agent_ids.size());
+template <typename Fn>
+void AgentHealthStore::for_each_snapshot_sliced(std::span<const std::string> agent_ids,
+                                                Fn&& fn) const {
     const auto now = std::chrono::steady_clock::now();
     for (std::size_t base = 0; base < agent_ids.size(); base += kGuardianBackendSlice) {
         if (base != 0)
@@ -2848,11 +2855,39 @@ AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
         std::lock_guard lock(mu_);
         for (std::size_t i = base; i < end; ++i) {
             const auto it = snapshots_.find(agent_ids[i]);
-            out.push_back(it == snapshots_.end()
-                              ? std::nullopt
-                              : guardian_backend_from_snapshot(it->second, now, staleness));
+            fn(it == snapshots_.end() ? nullptr : &it->second, now);
         }
     }
+}
+
+std::vector<std::optional<std::string_view>>
+AgentHealthStore::guardian_backend_for(std::span<const std::string> agent_ids,
+                                       std::chrono::seconds staleness) const {
+    std::vector<std::optional<std::string_view>> out;
+    out.reserve(agent_ids.size());
+    for_each_snapshot_sliced(agent_ids, [&](const AgentHealthSnapshot* snap, auto now) {
+        out.push_back(snap ? guardian_backend_from_snapshot(*snap, now, staleness) : std::nullopt);
+    });
+    return out;
+}
+
+std::vector<DexObserverState>
+AgentHealthStore::dex_observer_for(std::span<const std::string> agent_ids,
+                                   std::chrono::seconds staleness) const {
+    static const std::string kKey{kDexObserverArmedTag};
+    std::vector<DexObserverState> out;
+    out.reserve(agent_ids.size());
+    for_each_snapshot_sliced(agent_ids, [&](const AgentHealthSnapshot* snap, auto now) {
+        DexObserverState st = DexObserverState::NoneReported;
+        if (snap && (now - snap->last_seen) <= staleness) {
+            const auto it = snap->status_tags.find(kKey);
+            if (it != snap->status_tags.end())
+                st = it->second == "1"   ? DexObserverState::Armed
+                     : it->second == "0" ? DexObserverState::Disarmed
+                                         : DexObserverState::NoneReported;
+        }
+        out.push_back(st);
+    });
     return out;
 }
 
@@ -3391,11 +3426,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (!cmd_val.empty())
             add_finite_count(total_commands, cmd_val);
 
-        // DEX signal observer: a Windows agent (DEX enabled) reporting "0" failed to
-        // arm (or a channel went deaf at runtime). The tag is only emitted by such
-        // agents (see agent heartbeat), so absent / other values are correctly not
-        // counted as a fault.
-        if (get("yuzu.dex_observer_armed") == "0")
+        // DEX signal observer: an agent (DEX enabled; Windows, Linux or macOS) reporting "0"
+        // failed to arm (or a channel went deaf at runtime). The tag is only emitted by such
+        // agents (see agent heartbeat), so absent / other values are correctly not counted as a
+        // fault.
+        if (get(std::string(kDexObserverArmedTag)) == "0")
             ++dex_observer_disarmed;
 
         auto dex_val = get("yuzu.dex_observed");

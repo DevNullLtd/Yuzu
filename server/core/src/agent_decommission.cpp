@@ -98,9 +98,10 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                               })
                             : nullptr});
     // The ninth store (#5675): the Guardian compliance census. `deleted` here means the device's
-    // guardian_agent_rule_status rows were erased and its pending census evidence retired in one
-    // transaction. The Guardian event log and the DEX observations are NOT erased (they expire by
-    // retention), so Deleted must not be read as "every Guardian row for the device is gone".
+    // guardian_agent_order row and guardian_agent_rule_status rows were erased and its pending
+    // census evidence retired in one transaction. The Guardian event log and the DEX observations
+    // are NOT erased (they expire by retention), so Deleted must not be read as "every Guardian
+    // row for the device is gone".
     targets_.push_back(
         {"guaranteed_state", stores.guaranteed_state
                                  ? Fn([p = stores.guaranteed_state](std::string_view id) {
