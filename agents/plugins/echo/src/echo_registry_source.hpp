@@ -297,6 +297,10 @@ struct RegistryReader {
     std::function<void()> stop;            // idempotent
     std::shared_ptr<RegistryDirtyTable> dirty; // shared with the watcher
     std::shared_ptr<RegistryEtwBuffer> buffer; // shared with the ETW callback
+    /// Optional observer, null in production: called with the rows of every tick whose fold and
+    /// cursor committed. The roll-up tier keeps no writer pid, attribution detail or source, so a
+    /// test reads what a tick decided here, not from the database.
+    std::function<void(const std::vector<RegistryEvent>&)> committed;
 };
 
 class RegistryCursorSource final : public CursorSource {

@@ -17,8 +17,12 @@
 #include "list_keyset.hpp"
 
 #include <cstdint>
+#include <expected>
+#include <functional>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -43,6 +47,39 @@ struct Workflow {
     int64_t created_at{0};
     int64_t updated_at{0};
 };
+
+// ── Dispatch callback type ───────────────────────────────────────────────────
+// The workflow engine invokes this callback to dispatch a step to agents.
+// Returns a JSON result string on success, or a StepDispatchError on failure.
+// (Relocated from workflow_engine.hpp so the store-free run port, `workflow_run_port.hpp`, can name
+// it without reaching the Postgres-backed engine class; std-only, so the pure-header rule holds.)
+
+/// Why a step dispatch failed. `permanent` means no retry can succeed (a refusal of the caller's
+/// authority, a definition that changed under the run, a spent deadline): the engine records the
+/// step failed and applies its `on_failure` policy at once, with no retry and no retry sleep.
+/// Constructible from a string, meaning TRANSIENT, so a callback that returns
+/// `std::unexpected(std::string)` keeps its meaning (the step is retried `retry_count` times).
+struct StepDispatchError {
+    std::string message;
+    bool permanent{false};
+
+    StepDispatchError() = default;
+    StepDispatchError(std::string m, bool is_permanent = false)
+        : message(std::move(m)), permanent(is_permanent) {}
+    StepDispatchError(const char* m) : message(m) {}
+};
+
+using StepDispatchFn = std::function<std::expected<std::string, StepDispatchError>(
+    const std::string& instruction_id,
+    const std::string& agent_ids_json,
+    const std::string& parameters_json)>;
+
+// ── Condition evaluator callback type ────────────────────────────────────────
+// Evaluates a compliance/CEL expression against result fields.
+// Returns true if the condition is satisfied.
+using ConditionEvalFn = std::function<bool(
+    const std::string& expression,
+    const std::map<std::string, std::string>& result_fields)>;
 
 enum class WorkflowExecutionStatus {
     kPending,
@@ -74,13 +111,26 @@ struct WorkflowExecution {
     std::string id;
     std::string workflow_id;
     std::string status;         // "pending", "running", "completed", "failed", "cancelled"
-    std::string agent_ids_json; // JSON array of target agent IDs
+    // JSON array of the DISTINCT agent IDs the run named, capped, with one trailing marker object on
+    // a truncated copy (`stored_agent_ids_json`); the run itself targets the full list.
+    std::string agent_ids_json;
     int64_t started_at{0};
     int64_t completed_at{0};
     int current_step{0};
 
     // Populated by get_execution()
     std::vector<WorkflowStepResult> step_results;
+};
+
+/// The run a client's idempotency key is bound to (`WorkflowIdempotencyLookupFn`, workflow_run_port.hpp): just
+/// enough to answer a repeat of the call without reading the run's steps. `request_fingerprint`
+/// is the opaque value the claim stored (workflow_execute.hpp computes it).
+struct WorkflowIdempotentRun {
+    std::string execution_id;
+    std::string workflow_id;
+    std::string request_fingerprint;
+    std::string status; // the engine's recorded status: "running", "completed", "failed", ...
+    int64_t started_at{0}; // epoch seconds, as WorkflowExecution::started_at
 };
 
 struct WorkflowQuery {

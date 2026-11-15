@@ -64,9 +64,9 @@ enum class ModuleSignedState : std::uint8_t {
     kRevoked = 4,
 };
 
-/// Stable warehouse token for the `module_live.action` column. These tokens are
-/// the SQL/dashboard vocabulary; they must stay in lockstep with the
-/// `action = '...'` predicates in rollup_sql("module", ...) (echo_schema_registry.cpp).
+/// Stable token for a module event's action. These tokens are the SQL/dashboard
+/// vocabulary; they must stay in lockstep with the action tests in `module_delta`
+/// (echo_fold.hpp), which counts `loaded` and `blocked` and ignores the rest.
 constexpr std::string_view module_action_token(ModuleAction a) noexcept {
     switch (a) {
     case ModuleAction::kLoaded:   return "loaded";

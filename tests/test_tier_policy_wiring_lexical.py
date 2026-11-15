@@ -57,6 +57,53 @@ call site would pass every existing test. This gate closes that:
      there, so a call placed after it keeps the count at one and every unit rig green while
      production answers 500 on both routes.
 
+  7. (#2146 D2a / UP2-10, per-step workflow credential check) The workflow-execute run's credential
+     liveness seams are wired and ASK THE AUTHORITATIVE QUESTION: `wf_deps.revalidate = ` is assigned
+     EXACTLY ONCE as an active line; `mcp_server_->set_workflow_revalidate_fn(` is called EXACTLY ONCE as
+     an active line; the body `return auth_routes_->revalidate_stream(req, principal,
+     yuzu::server::auth::CredentialReadMode::kAuthoritative);` appears EXACTLY TWICE (those two seams'
+     bodies); and the body with `CredentialReadMode::kCached` appears EXACTLY ONCE (the MCP held-open
+     stream pump's `StreamRevalidateFn`, which ticks every few seconds and tolerates the 60 s token
+     cache by design). Every seam is OPTIONAL by construction (an empty one is "no check"), and the
+     mode is a plain argument, so dropping a seam, or flipping a workflow body back to `kCached`,
+     compiles, passes every unit test, and leaves a token revoked on another replica able to finish a
+     workflow run it started; only production wiring can be pinned, here. The counts alone cannot see
+     a SWAP, so each mode is also bound to its seam: the `wf_deps.revalidate` body and the
+     `set_workflow_revalidate_fn` lambda body must each be `kAuthoritative`, and the lambda that follows
+     `stream_budget_.get(),` in the `build_handler` call (the stream pump) must be `kCached`, once each.
+
+  8. (#2146 sec-3/I1/I6, workflow run cap, shutdown drain and audit) The seams of the workflow-execute
+     twins are OPTIONAL by construction (a null `StreamBudget` is "unmetered", an empty `draining`
+     is "never draining", an empty audit sink is "audit off", a `{}` control disables the deadline,
+     the idempotency claim, the stop level and the safety hooks), so dropping or rewriting any of
+     them compiles and passes every unit rig, which wires its own. Pinned as active lines in
+     server.cpp, each EXACTLY ONCE: `wf_deps.stream_budget = stream_budget_.get();` (the one
+     ADR-0034 budget the held-open cap leases from); `wf_deps.draining` and
+     `mcp_server_->set_draining_fn` with the body `draining_ || stop_requested_` (REST and MCP
+     admission refuse a new run once shutdown begins); the run adapter's
+     `return engine->execute(..., control);` (the whole control reaches the
+     engine, never `{}`; `on_admitted` travels inside it, the engine has no positional parameter); `wf_deps.audit_fn` and `wf_deps.persist_audit_fn` (the REST route's audit
+     sinks; an unwired sink is a 503 audit_unavailable for every caller, so a dropped line
+     refuses every workflow run in production); and `workflow_engine_->set_should_stop`
+     with its body (stop wins over draining); and the idempotency pre-check beside the run port
+     (`WorkflowIdempotencyLookupFn`, workflow_run_port.hpp, NOT a `WorkflowApi` method):
+     `return engine->find_execution_by_key(caller.principal, idempotency_key);` (the principal is the
+     authenticated caller's own, never a parameter), `wf_deps.workflow_idempotency_lookup = ...;`
+     and `mcp_server_->set_workflow_idempotency_lookup_fn(...);` with the SAME function the run
+     port's neighbours get (unwired, a keyed call is refused as "engine not available", so a
+     dropped line fails every execute rather than losing replay protection, but only production
+     wiring can show it). The drain loop's own feed is pinned in
+     tests/unit/server/test_shutdown_join_order.cpp.
+
+  9. (#2146, stored agent id copy) `WorkflowRunControl::stored_copy_first` is OPTIONAL by construction
+     (an empty one stores the ids in request order), so deleting the setter compiles and passes every
+     unit rig while a confined creator that names more than the stored cap loses sight of its own
+     run. Pinned as active lines, each EXACTLY ONCE with its body: workflow_execute.cpp's
+     `drive_run` (`control.stored_copy_first = [&req](...) { return authz::in_scope(
+     req.caller.exec_visible, id); };`, shared by REST v1 and MCP) and workflow_routes.cpp's legacy
+     execute handler (`... [&caller] ... caller.exec_visible`). Behaviour is pinned beside the
+     stand-ins in test_workflow_execute_twins.cpp and test_mcp_server.cpp.
+
 Static/text-only, no build required -- a lexical gate, not a semantic one: it cannot see a
 relocation that keeps the same tokens but changes the surrounding control flow, nor a `#if 0` /
 `/* */` block that comments out an entire real site while preserving its exact leading
@@ -91,10 +138,101 @@ CLOSURE_REST = r"[ \t\r\f\v]*authorize_dispatch\);"
 CLOSURE_MCP = r"[ \t\r\f\v]*mcp_server_->set_authorize_dispatch_fn\(authorize_dispatch\);"
 AUDIT_SESSION = r"[ \t\r\f\v]*rest_api_v1_->set_audit_as_session_fn\(auth_routes_->audit_as_session_fn\(\)\);"
 REGISTER_ROUTES = r"[ \t\r\f\v]*rest_api_v1_->register_routes\("
+REVALIDATE_ASSIGN = r"[ \t\r\f\v]*wf_deps\.revalidate = .*"
+_REVAL_HEAD = r"^[ \t]*return auth_routes_->revalidate_stream\(req, principal,\s*yuzu::server::auth::CredentialReadMode::"
+REVALIDATE_BODY_AUTH = _REVAL_HEAD + r"kAuthoritative\);"
+REVALIDATE_BODY_CACHED = _REVAL_HEAD + r"kCached\);"
+REVALIDATE_MCP_SETTER = r"^[ \t]*mcp_server_->set_workflow_revalidate_fn\("
+# The BINDING (g8e-sec-1): which seam asks which question. The counts above cannot see a swap (REST
+# or the MCP workflow seam on kCached, the stream pump on kAuthoritative leaves every count intact),
+# so each mode is also anchored to the head of the seam that owns it. The pump is anchored on the
+# `stream_budget_.get(),` argument that precedes it in the `build_handler` call, so the setter's own
+# lambda (same signature) can never be mistaken for it.
+_REVAL_BODY = r"return auth_routes_->revalidate_stream\(req, principal,\s*yuzu::server::auth::CredentialReadMode::"
+_MCP_LAMBDA = r"\[this\]\(const httplib::Request& req,\s*const std::string& principal\)\s*->\s*mcp::StreamRevalidate\s*\{\s*"
+REVALIDATE_REST_BOUND = r"^[ \t]*wf_deps\.revalidate = \[this\]\([^)]*\)\s*\{\s*" + _REVAL_BODY + r"kAuthoritative\);"
+REVALIDATE_MCP_BOUND = (r"^[ \t]*mcp_server_->set_workflow_revalidate_fn\(\s*" + _MCP_LAMBDA + _REVAL_BODY +
+                        r"kAuthoritative\);")
+REVALIDATE_PUMP_BOUND = r"^[ \t]*stream_budget_\.get\(\),\s*" + _MCP_LAMBDA + _REVAL_BODY + r"kCached\);"
+# Clause 8: multi-line, matched over the whole source with re.M; `^[ \t]*` keeps a `//` copy out.
+_STOP_OR_DRAIN = (r"\{\s*return draining_\.load\(std::memory_order_acquire\) \|\|\s*"
+                  r"stop_requested_\.load\(std::memory_order_acquire\);\s*\}")
+WF_STREAM_BUDGET = r"^[ \t]*wf_deps\.stream_budget = stream_budget_\.get\(\);.*$"
+WF_DRAINING = r"^[ \t]*wf_deps\.draining = \[this\] " + _STOP_OR_DRAIN + r";"
+MCP_DRAINING = r"^[ \t]*mcp_server_->set_draining_fn\(\[this\] " + _STOP_OR_DRAIN + r"\);"
+RUN_ADAPTER = (r"^[ \t]*return engine->execute\(workflow_id, agent_ids, std::move\(dispatch_fn\),\s*"
+               r"std::move\(condition_fn\), control\);")
+IDEMP_LOOKUP = (r"^[ \t]*workflow_idempotency_lookup_fn = \[engine = workflow_engine_\.get\(\)\]\(\s*"
+                r"const yuzu::server::DispatchCaller& caller,\s*"
+                r"const std::string& idempotency_key\) \{\s*"
+                r"return engine->find_execution_by_key\(caller\.principal, idempotency_key\);")
+WF_IDEMP = r"^[ \t]*wf_deps\.workflow_idempotency_lookup = workflow_idempotency_lookup_fn;.*$"
+MCP_IDEMP = (r"^[ \t]*mcp_server_->set_workflow_idempotency_lookup_fn\("
+             r"workflow_idempotency_lookup_fn\);")
+WF_AUDIT_FN = r"^[ \t]*wf_deps\.audit_fn = audit_fn;.*$"
+WF_PERSIST_AUDIT_FN = r"^[ \t]*wf_deps\.persist_audit_fn = audit_fn;.*$"
+WF_EMIT = r"^[ \t]*wf_deps\.emit_event_fn = emit_event_fn;.*$"
+MCP_EMIT = r"^[ \t]*mcp_server_->set_emit_event_fn\(emit_event_fn\);"
+SHOULD_STOP = (r"^[ \t]*workflow_engine_->set_should_stop\(\[this\] \{\s*"
+               r"if \(stop_requested_\.load\(std::memory_order_acquire\)\)\s*"
+               r"return yuzu::server::WorkflowStopLevel::kStop;\s*"
+               r"if \(draining_\.load\(std::memory_order_acquire\)\)\s*"
+               r"return yuzu::server::WorkflowStopLevel::kDraining;\s*"
+               r"return yuzu::server::WorkflowStopLevel::kNone;\s*\}\);")
+
+
+def count_rx(pattern, src):
+    return len(re.findall(pattern, src, re.M))
+
+
+WORKFLOW_PINS = (
+    ("wf_deps.stream_budget", WF_STREAM_BUDGET),
+    ("wf_deps.draining", WF_DRAINING),
+    ("mcp_server_->set_draining_fn", MCP_DRAINING),
+    ("engine->execute", RUN_ADAPTER),
+    ("workflow_idempotency_lookup_fn", IDEMP_LOOKUP),
+    ("wf_deps.workflow_idempotency_lookup", WF_IDEMP),
+    ("set_workflow_idempotency_lookup_fn", MCP_IDEMP),
+    ("wf_deps.audit_fn", WF_AUDIT_FN),
+    ("wf_deps.persist_audit_fn", WF_PERSIST_AUDIT_FN),
+    ("wf_deps.emit_event_fn", WF_EMIT),
+    ("set_emit_event_fn", MCP_EMIT),
+    ("set_should_stop", SHOULD_STOP),
+)
+WORKFLOW_PIN_ADVICE = {
+    "wf_deps.stream_budget": "'wf_deps.stream_budget = stream_budget_.get();' -- a null budget is unmetered, so the "
+                             "workflow run cap and the held-open lease count nothing",
+    "wf_deps.draining": "'wf_deps.draining = [this] { return draining_ || stop_requested_; };' -- an empty one is "
+                        "'never draining', so REST admits runs during shutdown",
+    "mcp_server_->set_draining_fn": "'mcp_server_->set_draining_fn([this] { return draining_ || stop_requested_; });' "
+                                    "-- an unset one is 'never draining', so MCP admits runs during shutdown",
+    "engine->execute": "the run adapter's 'return engine->execute(workflow_id, agent_ids, std::move(dispatch_fn), "
+                       "std::move(condition_fn), control);' -- a '{}' control disables the "
+                       "deadline, the idempotency claim, the stop level and the safety hooks",
+    "workflow_idempotency_lookup_fn": "the idempotency lookup 'return engine->find_execution_by_key(caller.principal, "
+                                      "idempotency_key);' -- the principal must be the authenticated caller's own, "
+                                      "never a supplied parameter",
+    "wf_deps.workflow_idempotency_lookup": "'wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn;' -- "
+                                           "unwired, the REST execute route refuses every keyed call as 'engine not "
+                                           "available'",
+    "set_workflow_idempotency_lookup_fn": "'mcp_server_->set_workflow_idempotency_lookup_fn("
+                                          "workflow_idempotency_lookup_fn);' -- unwired, every MCP execute_workflow "
+                                          "call (all keyed) is refused as 'engine not available'",
+    "wf_deps.audit_fn": "'wf_deps.audit_fn = audit_fn;' -- an unwired sink makes the workflow route answer 503 audit_unavailable",
+    "wf_deps.persist_audit_fn": "'wf_deps.persist_audit_fn = audit_fn;' -- the persisted sink the route prefers; "
+                                "unwired it falls back to the best-effort one",
+    "wf_deps.emit_event_fn": "'wf_deps.emit_event_fn = emit_event_fn;' -- the emitter is optional, so unwired the REST "
+                             "v1 execute twin quietly stops publishing the legacy route's workflow.executed",
+    "set_emit_event_fn": "'mcp_server_->set_emit_event_fn(emit_event_fn);' -- the emitter is optional, so unwired "
+                         "MCP execute_workflow (and the other event-publishing tools) quietly stop publishing "
+                         "the legacy routes' events",
+    "set_should_stop": "'workflow_engine_->set_should_stop([this] {...});' with stop_requested_ -> kStop checked "
+                       "before draining_ -> kDraining -- an unset one means no run ever learns of a shutdown",
+}
 
 
 def problems(src):
-    """One message per violated clause, in clause order (1 to 6); [] when clean."""
+    """One message per violated clause, in clause order (1 to 8); [] when clean."""
     lines = src.split("\n")
     total = sum(1 for ln in lines if CALL in ln)
     designated = sum(1 for ln in lines if re.fullmatch(DESIGNATED, ln))
@@ -106,6 +244,13 @@ def problems(src):
     audit_session = sum(1 for ln in lines if re.fullmatch(AUDIT_SESSION, ln))
     setter_at = [i for i, ln in enumerate(lines) if re.fullmatch(AUDIT_SESSION, ln)]
     register_at = [i for i, ln in enumerate(lines) if re.match(REGISTER_ROUTES, ln)]
+    revalidate_assign = sum(1 for ln in lines if re.fullmatch(REVALIDATE_ASSIGN, ln))
+    revalidate_auth = count_rx(REVALIDATE_BODY_AUTH, src)
+    revalidate_cached = count_rx(REVALIDATE_BODY_CACHED, src)
+    revalidate_setter = count_rx(REVALIDATE_MCP_SETTER, src)
+    revalidate_bound = (count_rx(REVALIDATE_REST_BOUND, src), count_rx(REVALIDATE_MCP_BOUND, src),
+                        count_rx(REVALIDATE_PUMP_BOUND, src))
+    wf_counts = {name: count_rx(pat, src) for name, pat in WORKFLOW_PINS}
     out = []
     if designated != 1:
         out.append("expected exactly 1 designated-init site ('.tier_policy_fn = auth_routes_->gateless_tier_policy_fn(),' "
@@ -146,6 +291,26 @@ def problems(src):
         out.append("'rest_api_v1_->set_audit_as_session_fn(' must be called BEFORE 'rest_api_v1_->register_routes(': "
                    "the writer is captured by value at registration, so a later call leaves it empty and POST and "
                    "DELETE /api/v1/quarantine answer 500.")
+    if ((revalidate_assign, revalidate_auth, revalidate_cached, revalidate_setter) != (1, 2, 1, 1)
+            or revalidate_bound != (1, 1, 1)):
+        out.append("expected 'wf_deps.revalidate = ' assigned exactly once, "
+                   "'mcp_server_->set_workflow_revalidate_fn(' called exactly once, "
+                   "'return auth_routes_->revalidate_stream(req, principal, ...CredentialReadMode::kAuthoritative);' "
+                   "exactly twice (the REST workflow assignment's body and the MCP workflow seam's) and the same "
+                   "with ::kCached exactly once (the MCP stream pump's StreamRevalidateFn) as active lines in "
+                   f"server.cpp; found assignment={revalidate_assign}, setter={revalidate_setter}, "
+                   f"authoritative={revalidate_auth}, cached={revalidate_cached}; bound to its own seam "
+                   f"(REST workflow kAuthoritative, MCP workflow setter kAuthoritative, stream pump kCached): "
+                   f"{revalidate_bound[0]}/{revalidate_bound[1]}/{revalidate_bound[2]}, each expected 1. "
+                   "Every seam is optional and an "
+                   "empty one is 'no check', and the mode is a plain argument, so a dropped seam or a workflow "
+                   "body flipped to kCached compiles and passes every unit rig while a token revoked on another "
+                   "replica finishes the workflow run it started.")
+    for name, _ in WORKFLOW_PINS:
+        if wf_counts[name] != 1:
+            out.append(f"expected {WORKFLOW_PIN_ADVICE[name]} exactly once as an active line in server.cpp; found "
+                       f"{wf_counts[name]}. The seam is optional by construction, so a dropped or rewritten line "
+                       "compiles and passes every unit rig (each wires its own) while production loses the control.")
     return out
 
 
@@ -155,7 +320,65 @@ CRYPTO_LINE = "                               .tier_policy_fn = auth_routes_->ga
 CLOSURE_REST_LINE = "            authorize_dispatch);\n"
 CLOSURE_MCP_LINE = "            mcp_server_->set_authorize_dispatch_fn(authorize_dispatch);\n"
 AUDIT_SESSION_LINE = "        rest_api_v1_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());\n"
+REVALIDATE_ASSIGN_LINE = "        wf_deps.revalidate = [this](const httplib::Request& req, const std::string& principal) {\n"
+REVALIDATE_BODY_LINE = ("            return auth_routes_->revalidate_stream(req, principal,\n"
+                        "                                                   yuzu::server::auth::CredentialReadMode::kAuthoritative);\n")
+# The REST assignment and its body together: the authoritative body appears twice in the file, so the
+# body-only mutations anchor on the one that follows the assignment head.
+REVALIDATE_REST_BLOCK = REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE
+REVALIDATE_MCP_SETTER_LINE = "            mcp_server_->set_workflow_revalidate_fn(\n"
+# The MCP workflow seam's lambda body, and the stream pump's (anchored on the preceding argument),
+# for the swap mutations. Each appears exactly once.
+MCP_SETTER_BODY = ("                    return auth_routes_->revalidate_stream(req, principal,\n"
+                   "                                                           yuzu::server::auth::CredentialReadMode::kAuthoritative);\n"
+                   "                });\n"
+                   "            mcp_server_->set_draining_fn(")
+PUMP_BODY = ("                stream_budget_.get(),\n"
+             "                [this](const httplib::Request& req,\n"
+             "                       const std::string& principal) -> mcp::StreamRevalidate {\n"
+             "                    return auth_routes_->revalidate_stream(req, principal,\n"
+             "                                                           yuzu::server::auth::CredentialReadMode::kCached);\n")
 LAMBDA = "[](const auto&) { return TierPolicy{}; }"
+STREAM_BUDGET_LINE = "        wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface\n"
+WF_DRAINING_HEAD = "        wf_deps.draining = [this] {\n"
+MCP_DRAINING_HEAD = "            mcp_server_->set_draining_fn([this] {\n"
+RUN_ADAPTER_TAIL = "                                       std::move(condition_fn), control);\n"
+IDEMP_LOOKUP_BODY = "                return engine->find_execution_by_key(caller.principal, idempotency_key);\n"
+WF_IDEMP_LINE = ("        wf_deps.workflow_idempotency_lookup = workflow_idempotency_lookup_fn; "
+                 "// and the same lookup\n")
+MCP_IDEMP_LINE = "            mcp_server_->set_workflow_idempotency_lookup_fn(workflow_idempotency_lookup_fn);\n"
+AUDIT_FN_LINE = "        wf_deps.audit_fn = audit_fn;\n"
+PERSIST_AUDIT_FN_LINE = "        wf_deps.persist_audit_fn = audit_fn; // #4990: the drawer's response.forensics.read row\n"
+WF_EMIT_LINE = "        wf_deps.emit_event_fn = emit_event_fn; // the v1 execute twin's workflow.executed\n"
+MCP_EMIT_LINE = "            mcp_server_->set_emit_event_fn(emit_event_fn);\n"
+SHOULD_STOP_HEAD = "                workflow_engine_->set_should_stop([this] {\n"
+SHOULD_STOP_STOP = ("                    if (stop_requested_.load(std::memory_order_acquire))\n"
+                    "                        return yuzu::server::WorkflowStopLevel::kStop;\n")
+SHOULD_STOP_DRAIN = ("                    if (draining_.load(std::memory_order_acquire))\n"
+                     "                        return yuzu::server::WorkflowStopLevel::kDraining;\n")
+
+
+WORKFLOW_EXECUTE_CPP = ROOT / "server" / "core" / "src" / "workflow_execute.cpp"
+WORKFLOW_ROUTES_CPP = ROOT / "server" / "core" / "src" / "workflow_routes.cpp"
+STORED_COPY_DRIVE_RUN = (r"^[ \t]*control\.stored_copy_first = \[&req\]\(const std::string& id\) \{\s*"
+                         r"return authz::in_scope\(req\.caller\.exec_visible, id\);\s*\};")
+STORED_COPY_LEGACY = (r"^[ \t]*control\.stored_copy_first = \[&caller\]\(const std::string& id\) \{\s*"
+                      r"return authz::in_scope\(caller\.exec_visible, id\);\s*\};")
+STORED_COPY_ANY = r"^[ \t]*(?:\w+\.)?stored_copy_first\s*="
+
+
+def stored_copy_problems(execute_src, routes_src):
+    """One message per violated clause 9 pin; [] when clean."""
+    out = []
+    for label, src, pat in (("workflow_execute.cpp (drive_run, REST v1 and MCP)", execute_src, STORED_COPY_DRIVE_RUN),
+                            ("workflow_routes.cpp (legacy execute handler)", routes_src, STORED_COPY_LEGACY)):
+        n = count_rx(pat, src)
+        every = count_rx(STORED_COPY_ANY, src)
+        if n != 1 or every != 1:
+            out.append(f"expected exactly 1 active 'control.stored_copy_first = ...in_scope(<caller>.exec_visible, id)' "
+                       f"assignment in {label}, found {n} well-formed of {every} assignments. Without it a confined "
+                       "creator that names more than the stored cap loses sight of its own run.")
+    return out
 
 
 class TierPolicyWiringLexical(unittest.TestCase):
@@ -170,7 +393,11 @@ class TierPolicyWiringLexical(unittest.TestCase):
 
     def test_mutations_are_caught(self):
         src = self.src
-        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE):
+        for a in (DESIGNATED_LINE, POSITIONAL_LINE, CRYPTO_LINE, CLOSURE_REST_LINE, CLOSURE_MCP_LINE, AUDIT_SESSION_LINE,
+                  REVALIDATE_ASSIGN_LINE, REVALIDATE_REST_BLOCK, REVALIDATE_MCP_SETTER_LINE, MCP_SETTER_BODY, PUMP_BODY, STREAM_BUDGET_LINE, WF_DRAINING_HEAD, MCP_DRAINING_HEAD,
+                  RUN_ADAPTER_TAIL, AUDIT_FN_LINE, PERSIST_AUDIT_FN_LINE, WF_EMIT_LINE, MCP_EMIT_LINE,
+                  SHOULD_STOP_HEAD, SHOULD_STOP_STOP,
+                  SHOULD_STOP_DRAIN):
             n = src.count(a)
             self.assertEqual(n, 1, f"mutation anchor must match exactly once, found {n}; update the constant: {a!r}")
         # (name, mutated source, the clause fragments that must appear; len(p) pins that no other clause fires)
@@ -217,6 +444,147 @@ class TierPolicyWiringLexical(unittest.TestCase):
             ("T13 the writer wired with a hand-rolled lambda instead of the AuthRoutes factory",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->set_audit_as_session_fn([](const auto&...) { return true; });\n", 1),
              ["set_audit_as_session_fn"]),
+            ("T16 the REST workflow revalidate assignment dropped (compiles: the seam is optional)",
+             src.replace(REVALIDATE_ASSIGN_LINE, "        wf_deps.unrelated = [this](const httplib::Request& req, const std::string& principal) {\n", 1),
+             ["wf_deps.revalidate"]),
+            ("T17 the REST workflow revalidate assignment commented out (anchoring proof)",
+             src.replace(REVALIDATE_ASSIGN_LINE, "// " + REVALIDATE_ASSIGN_LINE, 1),
+             ["wf_deps.revalidate"]),
+            ("T18 the REST workflow revalidate body replaced by a constant answer",
+             src.replace(REVALIDATE_REST_BLOCK,
+                         REVALIDATE_ASSIGN_LINE + "            return auth::CredentialCheck::kValid;\n", 1),
+             ["wf_deps.revalidate"]),
+            ("T19 a third authoritative revalidate_stream body appended",
+             src + REVALIDATE_BODY_LINE,
+             ["wf_deps.revalidate"]),
+            ("T19b the REST workflow revalidate body flipped back to the cached read (UP2-10)",
+             src.replace(REVALIDATE_REST_BLOCK,
+                         REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE.replace("kAuthoritative", "kCached"), 1),
+             ["wf_deps.revalidate"]),
+            ("T19e SWAP: the REST workflow body on kCached and the stream pump on kAuthoritative (counts intact)",
+             src.replace(REVALIDATE_REST_BLOCK,
+                         REVALIDATE_ASSIGN_LINE + REVALIDATE_BODY_LINE.replace("kAuthoritative", "kCached"), 1)
+                .replace(PUMP_BODY, PUMP_BODY.replace("kCached", "kAuthoritative"), 1),
+             ["bound to its own seam"]),
+            ("T19f SWAP: the MCP workflow seam on kCached and the stream pump on kAuthoritative (counts intact)",
+             src.replace(MCP_SETTER_BODY, MCP_SETTER_BODY.replace("kAuthoritative", "kCached"), 1)
+                .replace(PUMP_BODY, PUMP_BODY.replace("kCached", "kAuthoritative"), 1),
+             ["bound to its own seam"]),
+            ("T19g the MCP workflow seam alone flipped to the cached read",
+             src.replace(MCP_SETTER_BODY, MCP_SETTER_BODY.replace("kAuthoritative", "kCached"), 1),
+             ["bound to its own seam"]),
+            ("T19h the stream pump alone flipped to the authoritative read",
+             src.replace(PUMP_BODY, PUMP_BODY.replace("kCached", "kAuthoritative"), 1),
+             ["bound to its own seam"]),
+            ("T19c the MCP workflow revalidate seam dropped (compiles: an unset seam is no check)",
+             src.replace(REVALIDATE_MCP_SETTER_LINE, "            mcp_server_->unrelated(\n", 1),
+             ["wf_deps.revalidate"]),
+            ("T19d the MCP workflow revalidate seam commented out (anchoring proof)",
+             src.replace(REVALIDATE_MCP_SETTER_LINE, "// " + REVALIDATE_MCP_SETTER_LINE, 1),
+             ["wf_deps.revalidate"]),
+            ("T20 the workflow stream budget wiring dropped (compiles: a null budget is unmetered)",
+             src.replace(STREAM_BUDGET_LINE, STREAM_BUDGET_LINE.replace("wf_deps.stream_budget", "wf_deps.unrelated"), 1),
+             ["wf_deps.stream_budget"]),
+            ("T21 the workflow stream budget wiring commented out (anchoring proof)",
+             src.replace(STREAM_BUDGET_LINE, "// " + STREAM_BUDGET_LINE, 1),
+             ["wf_deps.stream_budget"]),
+            ("T22 the workflow stream budget wired to nullptr",
+             src.replace(STREAM_BUDGET_LINE, STREAM_BUDGET_LINE.replace("stream_budget_.get()", "nullptr"), 1),
+             ["wf_deps.stream_budget"]),
+            ("T23 a second stream budget assignment appended",
+             src + STREAM_BUDGET_LINE,
+             ["wf_deps.stream_budget"]),
+            ("T24 wf_deps.draining dropped (compiles: an empty one is never draining)",
+             src.replace(WF_DRAINING_HEAD, WF_DRAINING_HEAD.replace("wf_deps.draining", "wf_deps.unrelated"), 1),
+             ["wf_deps.draining"]),
+            ("T25 wf_deps.draining answers only draining_ (stop_requested_ dropped)",
+             src.replace(WF_DRAINING_HEAD + "            return draining_.load(std::memory_order_acquire) ||\n"
+                         "                   stop_requested_.load(std::memory_order_acquire);\n",
+                         WF_DRAINING_HEAD + "            return draining_.load(std::memory_order_acquire);\n", 1),
+             ["wf_deps.draining"]),
+            ("T26 wf_deps.draining always false",
+             src.replace(WF_DRAINING_HEAD, WF_DRAINING_HEAD + "            return false;\n", 1),
+             ["wf_deps.draining"]),
+            ("T27 mcp set_draining_fn dropped (compiles: an unset one is never draining)",
+             src.replace(MCP_DRAINING_HEAD, MCP_DRAINING_HEAD.replace("set_draining_fn", "set_unrelated_fn"), 1),
+             ["set_draining_fn"]),
+            ("T28 mcp set_draining_fn commented out (anchoring proof)",
+             src.replace(MCP_DRAINING_HEAD, "// " + MCP_DRAINING_HEAD, 1),
+             ["set_draining_fn"]),
+            ("T29 mcp set_draining_fn always false",
+             src.replace(MCP_DRAINING_HEAD, MCP_DRAINING_HEAD + "                return false;\n", 1),
+             ["set_draining_fn"]),
+            ("T30 the run adapter passes an empty control instead of `control`",
+             src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace("condition_fn), control", "condition_fn), {}"), 1),
+             ["engine->execute"]),
+            ("T31 the run adapter drops the control argument",
+             src.replace(RUN_ADAPTER_TAIL, RUN_ADAPTER_TAIL.replace(", control);", ");"), 1),
+             ["engine->execute"]),
+            ("T32 the run adapter passes a default-constructed control",
+             src.replace(RUN_ADAPTER_TAIL,
+                         RUN_ADAPTER_TAIL.replace("condition_fn), control", "condition_fn), "
+                                                  "yuzu::server::WorkflowRunControl{}"), 1),
+             ["engine->execute"]),
+            ("T33 the workflow route audit sink dropped (compiles: the route then refuses every run 503)",
+             src.replace(AUDIT_FN_LINE, AUDIT_FN_LINE.replace("wf_deps.audit_fn", "wf_deps.unrelated"), 1),
+             ["wf_deps.audit_fn"]),
+            ("T34 the workflow route persisted audit sink dropped",
+             src.replace(PERSIST_AUDIT_FN_LINE,
+                         PERSIST_AUDIT_FN_LINE.replace("wf_deps.persist_audit_fn", "wf_deps.unrelated"), 1),
+             ["wf_deps.persist_audit_fn"]),
+            ("T35 the workflow route persisted audit sink commented out (anchoring proof)",
+             src.replace(PERSIST_AUDIT_FN_LINE, "// " + PERSIST_AUDIT_FN_LINE, 1),
+             ["wf_deps.persist_audit_fn"]),
+            ("T36 the workflow route audit sink wired to an empty function",
+             src.replace(AUDIT_FN_LINE, AUDIT_FN_LINE.replace("= audit_fn", "= {}"), 1),
+             ["wf_deps.audit_fn"]),
+            ("T37 set_should_stop wiring dropped (compiles: an unset one never learns of a shutdown)",
+             src.replace(SHOULD_STOP_HEAD, SHOULD_STOP_HEAD.replace("set_should_stop", "set_unrelated"), 1),
+             ["set_should_stop"]),
+            ("T38 set_should_stop wiring commented out (anchoring proof)",
+             src.replace(SHOULD_STOP_HEAD, "// " + SHOULD_STOP_HEAD, 1),
+             ["set_should_stop"]),
+            ("T39 set_should_stop checks draining_ before stop_requested_ (stop must win)",
+             src.replace(SHOULD_STOP_STOP + SHOULD_STOP_DRAIN, SHOULD_STOP_DRAIN + SHOULD_STOP_STOP, 1),
+             ["set_should_stop"]),
+            ("T40 set_should_stop maps stop_requested_ to kDraining",
+             src.replace(SHOULD_STOP_STOP, SHOULD_STOP_STOP.replace("kStop", "kDraining"), 1),
+             ["set_should_stop"]),
+            ("T41 the idempotency lookup answers a supplied principal instead of the caller's",
+             src.replace(IDEMP_LOOKUP_BODY, IDEMP_LOOKUP_BODY.replace("caller.principal", "idempotency_key"), 1),
+             ["find_execution_by_key"]),
+            ("T42 the idempotency lookup always answers no run bound (a repeat would dispatch again)",
+             src.replace(IDEMP_LOOKUP_BODY,
+                         "                return std::expected<std::optional<yuzu::server::WorkflowIdempotentRun>, "
+                         "std::string>{std::nullopt};\n", 1),
+             ["find_execution_by_key"]),
+            ("T43 wf_deps.workflow_idempotency_lookup dropped (compiles: unwired is engine not available)",
+             src.replace(WF_IDEMP_LINE, WF_IDEMP_LINE.replace("wf_deps.workflow_idempotency_lookup", "wf_deps.unrelated"), 1),
+             ["wf_deps.workflow_idempotency_lookup"]),
+            ("T44 wf_deps.workflow_idempotency_lookup commented out (anchoring proof)",
+             src.replace(WF_IDEMP_LINE, "// " + WF_IDEMP_LINE, 1),
+             ["wf_deps.workflow_idempotency_lookup"]),
+            ("T45 mcp set_workflow_idempotency_lookup_fn dropped",
+             src.replace(MCP_IDEMP_LINE, MCP_IDEMP_LINE.replace("set_workflow_idempotency_lookup_fn", "set_unrelated_fn"), 1),
+             ["set_workflow_idempotency_lookup_fn"]),
+            ("T46 mcp set_workflow_idempotency_lookup_fn wired to an empty function",
+             src.replace(MCP_IDEMP_LINE, MCP_IDEMP_LINE.replace("(workflow_idempotency_lookup_fn)", "({})"), 1),
+             ["set_workflow_idempotency_lookup_fn"]),
+            ("T47 wf_deps.emit_event_fn dropped (compiles: the emitter is optional)",
+             src.replace(WF_EMIT_LINE, WF_EMIT_LINE.replace("wf_deps.emit_event_fn", "wf_deps.unrelated"), 1),
+             ["wf_deps.emit_event_fn"]),
+            ("T48 wf_deps.emit_event_fn commented out (anchoring proof)",
+             src.replace(WF_EMIT_LINE, "// " + WF_EMIT_LINE, 1),
+             ["wf_deps.emit_event_fn"]),
+            ("T49 wf_deps.emit_event_fn wired to an empty function",
+             src.replace(WF_EMIT_LINE, WF_EMIT_LINE.replace("= emit_event_fn", "= {}"), 1),
+             ["wf_deps.emit_event_fn"]),
+            ("T50 mcp set_emit_event_fn dropped",
+             src.replace(MCP_EMIT_LINE, MCP_EMIT_LINE.replace("set_emit_event_fn", "set_unrelated_fn"), 1),
+             ["set_emit_event_fn"]),
+            ("T51 mcp set_emit_event_fn wired to an empty function",
+             src.replace(MCP_EMIT_LINE, MCP_EMIT_LINE.replace("(emit_event_fn)", "({})"), 1),
+             ["set_emit_event_fn"]),
             ("T11 the writer wired after register_routes (count stays one)",
              src.replace(AUDIT_SESSION_LINE, "        rest_api_v1_->unrelated(\n", 1) + AUDIT_SESSION_LINE,
              ["BEFORE"]),
@@ -229,6 +597,39 @@ class TierPolicyWiringLexical(unittest.TestCase):
                 for frag in present:
                     self.assertIn(frag, joined)
                 self.assertEqual(len(p), len(present))
+
+
+class StoredCopyHookWiringLexical(unittest.TestCase):
+    def setUp(self):
+        self.execute = WORKFLOW_EXECUTE_CPP.read_text(encoding="utf-8")
+        self.routes = WORKFLOW_ROUTES_CPP.read_text(encoding="utf-8")
+
+    def test_source_is_clean(self):
+        p = stored_copy_problems(self.execute, self.routes)
+        for m in p:
+            print(f"\n::error::{TAG}: {m}", file=sys.stderr)
+        self.assertEqual(p, [])
+
+    def test_mutations_are_caught(self):
+        drive = re.search(STORED_COPY_DRIVE_RUN, self.execute, re.M).group(0)
+        legacy = re.search(STORED_COPY_LEGACY, self.routes, re.M).group(0)
+        cases = [
+            ("drive_run setter deleted", self.execute.replace(drive, "", 1), self.routes),
+            ("drive_run setter commented out", self.execute.replace(drive, "// " + drive, 1), self.routes),
+            ("drive_run hook ignores the caller's scope",
+             self.execute.replace(drive, drive.replace("authz::in_scope(req.caller.exec_visible, id)", "false"), 1),
+             self.routes),
+            ("drive_run setter duplicated", self.execute + drive + "\n", self.routes),
+            ("legacy setter deleted", self.execute, self.routes.replace(legacy, "", 1)),
+            ("legacy setter commented out", self.execute, self.routes.replace(legacy, "// " + legacy, 1)),
+            ("legacy hook ignores the caller's scope", self.execute,
+             self.routes.replace(legacy, legacy.replace("authz::in_scope(caller.exec_visible, id)", "true"), 1)),
+        ]
+        for name, execute, routes in cases:
+            with self.subTest(mutation=name):
+                self.assertNotEqual((execute, routes), (self.execute, self.routes), "mutation did not change the source")
+                p = stored_copy_problems(execute, routes)
+                self.assertEqual(len(p), 1, p)
 
 
 if __name__ == "__main__":

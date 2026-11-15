@@ -316,9 +316,23 @@ std::expected<void, std::string> EchoFold::install_fold_schema(EchoDatabase& db)
     return r;
 }
 
+std::expected<std::size_t, std::string>
+EchoFold::fold_body(TransactionHandle& h, const FoldSourceDef& def, const TierAccumulator& acc,
+                    const std::optional<StateWrite>& state,
+                    const std::unordered_map<std::string, int64_t>& cache,
+                    std::unordered_map<std::string, int64_t>& staged) {
+    Interner in(cache, staged); // its statements are finalised before the caller commits
+    const auto n = upsert_tiers(h, def, acc, in);
+    if (!n)
+        return std::unexpected(h.error());
+    if (state && !write_state(h, *state))
+        return std::unexpected(h.error());
+    return *n;
+}
+
 std::expected<FoldResult, std::string>
 EchoFold::fold_rows(EchoDatabase& db, std::string_view source, const TierAccumulator& acc,
-                    const std::optional<StateWrite>& state) {
+                    const std::optional<StateWrite>& state, const ExtraFn& extra) {
     std::lock_guard lock(op_mu_);
     const FoldSourceDef* def = fold_source(source);
     if (!def || def->own_tables)
@@ -331,15 +345,16 @@ EchoFold::fold_rows(EchoDatabase& db, std::string_view source, const TierAccumul
     std::unordered_map<std::string, int64_t> staged;
     std::size_t touched = 0;
     const auto r = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
-        Interner in(cache_, staged);
-        const auto n = upsert_tiers(h, *def, acc, in);
+        const auto n = fold_body(h, *def, acc, state, cache_, staged);
         if (!n)
-            return std::unexpected(h.error());
+            return std::unexpected(n.error());
         touched = *n;
-        if (state && !write_state(h, *state))
-            return std::unexpected(h.error());
         if (acc.rejected() > 0 && !bump_rejected(h, acc.rejected()))
             return std::unexpected(h.error());
+        if (extra) {
+            if (auto x = extra(h); !x)
+                return std::unexpected(std::move(x.error()));
+        }
         return {};
     });
     if (!r)
@@ -347,6 +362,24 @@ EchoFold::fold_rows(EchoDatabase& db, std::string_view source, const TierAccumul
     publish(cache_, staged);
     warn_rejected(source, acc.rejected(), acc.first_rejected_stamp());
     return FoldResult{touched, acc.rejected()};
+}
+
+std::expected<std::size_t, std::string>
+EchoFold::fold_in(TransactionHandle& h, std::string_view source, const TierAccumulator& acc,
+                  const std::optional<StateWrite>& state) {
+    const FoldSourceDef* def = fold_source(source);
+    if (!def || def->own_tables)
+        return std::unexpected(std::format("'{}' is not a fold source", source));
+    if (acc.def().name != def->name)
+        return std::unexpected(std::format("accumulator is for '{}', not '{}'", acc.def().name, source));
+    // An empty cache and a throwaway staging map: nothing learnt in the caller's transaction is
+    // published, so a rollback cannot leave an id the database does not have.
+    static const std::unordered_map<std::string, int64_t> kNoCache;
+    std::unordered_map<std::string, int64_t> staged;
+    auto n = fold_body(h, *def, acc, state, kNoCache, staged);
+    if (n && acc.rejected() > 0 && !bump_rejected(h, acc.rejected()))
+        return std::unexpected(h.error());
+    return n;
 }
 
 std::expected<CursorFoldResult, CursorFoldError>

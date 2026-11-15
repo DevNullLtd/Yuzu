@@ -1,0 +1,1 @@
+- The Settings Engine Principals panel now says so when the audit record of a roster read could not be saved ("An audit record for this read could not be saved. The data shown is still current."), instead of staying silent. The note appears only after a successful read and is kept outside the section that refreshes. (#6749)

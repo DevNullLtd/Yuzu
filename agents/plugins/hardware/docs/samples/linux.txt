@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · bare-metal · 2026-11-03 · euid 1000 · leg-hash 3fa43aa6c9dc
+captured: linux Ubuntu 26.04.1 LTS x86_64 · bare-metal · 2026-11-03 · euid 1000; the drivers_inventory block was captured 2026-11-04 on a vm as euid 0 · leg-hash f7b5dcc7d853
 == action=manufacturer
 manufacturer|CORSAIR
 [result_status] UNDECLARED / UNKNOWN / 
@@ -190,4 +190,26 @@ status|swap|unsupported|linux:planned
 == action=machine_id
 status|machine_id|unsupported|linux:planned
 [result_status] UNAVAILABLE / UNKNOWN / linux:planned
+
+== action=drivers_inventory
+status|drivers_inventory|supported|-
+driver_inv|autofs4|-|-|kernel|module|-|-|-|-
+driver_inv|br_netfilter|-|-|kernel|module|-|-|-|-
+driver_inv|bridge|2.3|-|kernel|module|-|-|-|-
+driver_inv|ip_set|-|-|kernel|module|-|-|-|-
+driver_inv|ip_tables|-|-|kernel|module|-|-|-|-
+driver_inv|llc|-|-|kernel|module|-|-|-|-
+driver_inv|nf_conntrack_netlink|-|-|kernel|module|-|-|-|-
+driver_inv|nft_compat|-|-|kernel|module|-|-|-|-
+driver_inv|sch_fq_codel|-|-|kernel|module|-|-|-|-
+driver_inv|stp|-|-|kernel|module|-|-|-|-
+driver_inv|tun|-|-|kernel|module|-|-|-|-
+driver_inv|xfrm_algo|-|-|kernel|module|-|-|-|-
+driver_inv|xfrm_user|-|-|kernel|module|-|-|-|-
+driver_inv|xt_MASQUERADE|-|-|kernel|module|-|-|-|-
+driver_inv|xt_addrtype|-|-|kernel|module|-|-|-|-
+driver_inv|xt_conntrack|-|-|kernel|module|-|-|-|-
+driver_inv|xt_nat|-|-|kernel|module|-|-|-|-
+driver_inv|xt_set|-|-|kernel|module|-|-|-|-
+[result_status] OK / FULL / 
 

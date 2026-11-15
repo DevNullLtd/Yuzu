@@ -220,7 +220,7 @@ hard-errors if it fails, because content embedding (`embed_content.py`) needs it
 
 > Do not install the hash-pinned `requirements-ci.txt` here: its meson pin needs Python 3.10+, so
 > under Python 3.9 pip refuses it outright. Install the two packages that matter explicitly.
-> (`gcovr` from that file is only for the nightly coverage job.)
+> (`gcovr` from that file is for the nightly coverage job and the local `/test` coverage gate.)
 
 ### The Python 3.9 ceiling
 
@@ -435,7 +435,7 @@ today this is a documented limitation rather than something the setup script can
 ## Out of scope
 
 - **The Erlang gateway.** With no rebar3 on `PATH` the configure step prints `Erlang gateway:
-  skipped` and the C++ build proceeds normally; the `gateway eunit shard A` / `gateway eunit shard B` / `gateway ct` meson tests simply
+  skipped` and the C++ build proceeds normally; the `gateway eunit shard A` / `B` / `C` / `gateway ct` meson tests simply
   never register. With rebar3 but no Erlang/OTP **28.4 or later 28.x** (EPEL's OTP 26 does not
   qualify), configure prints `WARNING: Erlang gateway: SKIPPED.` with every install it inspected.
   Neither `meson setup` nor `scripts/ensure-erlang.sh` downloads an OTP; they only find one.

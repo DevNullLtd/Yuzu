@@ -14,15 +14,20 @@
  */
 
 #include "echo_db.hpp"
+#include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
+#include "echo_usage.hpp"
 
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 #include <yuzu/log_token.hpp> // yuzu::log_key_token: a registry key/value name is attacker-chosen (CWE-117)
+#include <sqlite_quarantine.hpp> // the one no-overwrite quarantine move (#6914), shared with command_dedup
 
+#include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <expected>
 #include <filesystem>
@@ -31,6 +36,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -58,16 +64,23 @@ namespace {
 // the call and restores it from here.
 constexpr int kBusyTimeoutMs = 5000;
 
-int64_t now_epoch_seconds() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
+using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
 using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
+
+// RAII owner of the raw connection while open() builds it (#6698): every error return closes it,
+// and only the success path hands it to the EchoDatabase (release()). Same shape as DbGuard in
+// agents/core/src/command_dedup_store.cpp.
+struct DbCloser {
+    void operator()(sqlite3* d) const {
+        if (d)
+            sqlite3_close(d);
+    }
+};
+using DbGuard = std::unique_ptr<sqlite3, DbCloser>;
 
 // Owning holder for the `char*` sqlite3_exec writes through its last parameter.
 // That string is malloc'd by SQLite and must be released with sqlite3_free.
@@ -210,18 +223,35 @@ constexpr const char* kCreateSchema = R"(
 // failure, so a corrupt DB would read every `<source>_enabled` key as its
 // "true" default and silently re-enable sources an operator deliberately paused
 // for forensic preservation — defeating the #539 retention guard with no
-// telemetry. Returns true only when the check reports the canonical "ok".
-bool integrity_ok(sqlite3* db) noexcept {
+// telemetry.
+//
+// Four answers (#7286). Only an EXPLICIT integrity failure quarantines: a non-"ok" integrity row,
+// or SQLITE_CORRUPT / SQLITE_NOTADB (the sibling store's rule, command_dedup_store.cpp
+// is_corruption_rc). A database another connection holds past the busy timeout is BUSY, and
+// quarantining it would move a healthy file (and the paused-source state in it) out from under its
+// holder. Every other failure to read the file (an I/O error, CANTOPEN, PERM, READONLY, FULL,
+// PROTOCOL, NOMEM) says nothing about the file's health, so it is UNREADABLE: the caller refuses to
+// open and quarantines nothing. Quarantine plus a fresh file is the fail-OPEN side here (a fresh
+// file re-enables every source an operator paused, #559); refusing to open is the fail-closed side,
+// and the next start retries. The rc classifier is `classify_integrity_rc` (echo_db.hpp).
+struct IntegrityResult {
+    IntegrityCheck verdict;
+    int rc; ///< the sqlite rc behind a non-ok verdict (SQLITE_ROW for a non-"ok" integrity row)
+};
+
+IntegrityResult check_integrity(sqlite3* db) noexcept {
     sqlite3_stmt* raw = nullptr;
-    if (sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr) != SQLITE_OK)
-        return false; // can't even read the DB → treat as corrupt
+    const int prc = sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &raw, nullptr);
     StmtPtr stmt(raw);
-    bool ok = false;
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+    if (prc != SQLITE_OK)
+        return {classify_integrity_rc(prc), prc};
+    const int src = sqlite3_step(stmt.get());
+    if (src == SQLITE_ROW) {
         const auto* txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        ok = txt && std::string_view{txt} == "ok";
+        const bool ok = txt && std::string_view{txt} == "ok";
+        return {ok ? IntegrityCheck::ok : IntegrityCheck::corrupt, src};
     }
-    return ok;
+    return {classify_integrity_rc(src), src};
 }
 
 // The integer in an echo_config `schema_version` value; an unparseable one reads as 0.
@@ -233,63 +263,52 @@ int parse_schema_version(const std::string& text) {
     }
 }
 
-// Move a corrupt echo.db (and its -wal/-shm/-journal sidecars, the four files SQLite reads for
-// it) aside to a timestamped `.corrupt-<epoch>` path for forensic review, so open() can
-// re-initialise a fresh, trustworthy database rather than refusing to load Echo entirely.
-// Returns the quarantine path, or std::nullopt if the corrupt main file could
-// NOT be moved aside (read-only mount, locked file on Windows, permissions) —
-// in which case the caller MUST fail closed rather than re-open-and-trust the
-// still-corrupt file (#559 / UP-1). A sidecar that can't be moved is removed
-// instead, so the freshly-created DB can never adopt a stale -wal/-shm/-journal; the
-// caller's post-reopen integrity re-check is the backstop if even that fails.
-// An EMPTY sidecar is removed rather than kept: it holds no evidence.
-std::optional<std::filesystem::path>
-quarantine_corrupt_db(const std::filesystem::path& path) {
-    const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-                           std::chrono::system_clock::now().time_since_epoch())
-                           .count();
-    std::filesystem::path dest = path;
-    dest += std::format(".corrupt-{}", epoch);
-    // Collision-safe naming: `epoch` is only 1-second granular, and the wall
-    // clock can step backward (NTP correction, RTC reset). A second corruption
-    // that resolved to an already-existing `.corrupt-<epoch>` would otherwise
-    // rename ON TOP of the earlier quarantine and silently destroy preserved
-    // forensic evidence. Append a disambiguator so every quarantine is kept.
-    {
-        std::error_code exists_ec;
-        for (int n = 1; n < 10'000 && std::filesystem::exists(dest, exists_ec); ++n) {
-            dest = path;
-            dest += std::format(".corrupt-{}-{}", epoch, n);
+// #1527 — refuse a symlink (every OS) or reparse point (Windows: a junction is not a symlink to
+// std::filesystem on every toolchain) at echo.db or one of its sidecars. SQLite follows a link, so a
+// local user who can plant one in the state directory would steer the agent's database writes (and
+// the quarantine's moves) at a file of their choosing. Fail closed: nothing is opened, moved or
+// secured. A path that is absent is fine (the open creates it). Returns the refusal text.
+std::optional<std::string> refuse_linked_db_files(const std::filesystem::path& db) {
+    namespace fs = std::filesystem;
+    for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
+        fs::path file = db;
+        file += suffix;
+#ifdef _WIN32
+        const std::string name = yuzu::win::from_wide(file.c_str());
+#else
+        const std::string name = file.string();
+#endif
+        std::error_code ec;
+        const auto st = fs::symlink_status(file, ec);
+        if (st.type() == fs::file_type::not_found)
+            continue;
+        if (ec) {
+            return std::format("cannot examine {} ({}); echo.db was not opened", name,
+                               ec.message());
+        }
+        bool linked = fs::is_symlink(st);
+#ifdef _WIN32
+        if (!linked) {
+            const DWORD attrs = ::GetFileAttributesW(file.c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                const DWORD err = ::GetLastError();
+                if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+                    continue;
+                return std::format("cannot read the attributes of {} (error {}); echo.db was not "
+                                   "opened",
+                                   name, err);
+            }
+            linked = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        }
+#endif
+        if (linked) {
+            return std::format("{} is a symbolic link or reparse point, and echo.db was not "
+                               "opened: remove it so the agent can create a regular file, then "
+                               "restart the agent",
+                               name);
         }
     }
-    std::error_code ec;
-    std::filesystem::rename(path, dest, ec);
-    if (ec)
-        return std::nullopt; // could not move the corrupt DB aside — fail closed
-    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
-        std::filesystem::path side = path;
-        side += suffix;
-        std::error_code ec2;
-        if (std::filesystem::exists(side, ec2)) {
-            // A zero-length sidecar holds nothing to preserve (the Windows open() pre-creates both,
-            // protected): drop it, so one corruption leaves one quarantine file, not three.
-            std::error_code size_ec;
-            if (std::filesystem::file_size(side, size_ec) == 0) {
-                std::filesystem::remove(side, ec2);
-                continue;
-            }
-            std::filesystem::path side_dest = dest;
-            side_dest += suffix;
-            std::filesystem::rename(side, side_dest, ec2);
-            if (ec2) {
-                // Couldn't preserve the sidecar — remove it so the fresh DB
-                // can't replay a stale WAL belonging to the quarantined file.
-                std::error_code ec3;
-                std::filesystem::remove(side, ec3);
-            }
-        }
-    }
-    return dest;
+    return std::nullopt;
 }
 
 /// Execute a multi-statement DDL batch inside ONE transaction.
@@ -394,10 +413,11 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // do (explicit SIDs, not the Owner Rights alias "OW": execution_artifacts_win.cpp stores that one
 // literally). It runs before each sqlite3_open_v2 and once at the end of open():
 //  - a missing file is CREATED here with the protected DACL (no inheritance window; SQLite
-//    then creates nothing, and a 0-byte echo.db is a valid empty database);
+//    then creates nothing on an existing database, and a 0-byte echo.db is a valid empty
+//    database);
 //  - an existing file is re-secured in place (an upgraded echo.db on its first open);
 //  - the end pass exists because, on a FRESH (0-page) database, SQLite deletes the pre-created
-//    -wal and recreates it with the inherited ACL on the first write.
+//    -wal and -journal and recreates each with the inherited ACL on the first write.
 // -journal is on the list because SQLite replays a HOT rollback journal found beside the
 // database BEFORE it looks at the WAL, as the agent: a journal planted by a local user would
 // otherwise rewrite echo_config (the #559 class). An empty journal is inert, so the one created
@@ -414,9 +434,24 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 // through a READ_CONTROL-only handle and gets the same two tests; if it passes it keeps its
 // ACL, logged. SQLite's own GENERIC_READ includes READ_CONTROL, so a file we cannot look at
 // that way SQLite cannot open either. FILE_FLAG_OPEN_REPARSE_POINT examines a planted symlink
-// as the link, never its target. Lock-out: a later run under a different non-admin account
-// cannot open echo.db. An account switch is not undone by `icacls /reset` (it rewrites the DACL,
-// never the owner): the open fails until the new account holds an ACE for the files (the open
+// as the link, never its target. RESIDUAL (#1527): both this pass and refuse_linked_db_files
+// judge the directory ENTRY, and SQLite's Windows VFS ignores SQLITE_OPEN_NOFOLLOW (CreateFileW
+// follows a reparse point), so a link swapped into the entry between the last check and SQLite's
+// own CreateFileW is followed. SQLite opens by path, so binding the check to the handle is a VFS
+// redesign, not taken here. What bounds it, from this code (the DIRECTORY is not restricted
+// here, or by the packaged install, beyond what ProgramData grants by inheritance; see
+// docs/agent-privilege-model.md): (i) a planter can only use a FREE name, since a local user holds
+// no DELETE on the four protected files and no delete-child right on the directory; (ii) an
+// entry found at a free name is examined as the planter's own (refuse_linked_db_files, and the
+// owner test above through FILE_FLAG_OPEN_REPARSE_POINT) and refused or re-created; (iii) a file
+// symlink needs SeCreateSymbolicLinkPrivilege or Developer Mode, while a hard link needs neither
+// and is caught only by (ii), so inside window (iv) it is not caught; (iv) the free-name windows
+// that nothing examines before an open are SQLite's own delete-and-recreate of echo.db-wal and
+// echo.db-journal on a 0-page database (the first open of a fresh file and the reopen after a
+// quarantine), which only the end-of-open pass catches afterwards. The POSIX opens are closed by
+// SQLite's own O_NOFOLLOW (SQLITE_OPEN_NOFOLLOW). Lock-out: a later run under a different
+// non-admin account cannot open echo.db. An account switch is not undone by `icacls /reset` (it
+// rewrites the DACL, never the owner): the open fails until the new account holds an ACE for the files (the open
 // asks FILE_READ_ATTRIBUTES, which owning a file does not grant) and, when the former owner is
 // neither SYSTEM nor Administrators, until it owns them too, since the owner test refuses them
 // first. A former owner of SYSTEM or Administrators passes the owner test, so no owner is named:
@@ -425,6 +460,10 @@ int exec_ddl_batch(sqlite3* db, const char* ddl, char** err_msg) {
 
 using LocalPtr = std::unique_ptr<void, decltype(&::LocalFree)>;
 using HandlePtr = std::unique_ptr<void, decltype(&::CloseHandle)>;
+
+constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+constexpr SECURITY_INFORMATION kDaclInfo =
+    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
 
 class EchoDbDacl {
 public:
@@ -487,6 +526,39 @@ private:
     bool ok_ = false;
 };
 
+// Delete a planted sidecar THROUGH a handle opened for DELETE (#6362): POSIX semantics unlink the
+// name at once even while another process holds the file open, and the read-only attribute does
+// not stop it. A plain DeleteFileW fails (sharing violation / access denied) for exactly those two
+// shapes, which is how a planted read-only or held-open sidecar would refuse the open. The handle
+// is opened no-follow, so a link is deleted as the link. Returns ERROR_SUCCESS, or the Win32 error.
+// An OS without FileDispositionInfoEx (before Windows 10 1809) answers ERROR_INVALID_PARAMETER or
+// ERROR_NOT_SUPPORTED, and the old call is tried instead.
+//
+// The struct and constants are declared here rather than taken from winbase.h/winnt.h, whose
+// definitions sit behind an NTDDI_VERSION guard this build does not set: FileDispositionInfoEx is
+// FILE_INFO_BY_HANDLE_CLASS 21, and the flags are FILE_DISPOSITION_FLAG_DELETE (0x1),
+// _POSIX_SEMANTICS (0x2) and _IGNORE_READONLY_ATTRIBUTE (0x10).
+DWORD delete_planted_file(const std::filesystem::path& file) {
+    struct DispositionInfoEx {
+        DWORD Flags;
+    };
+    constexpr auto kFileDispositionInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(21);
+    constexpr DWORD kDispositionFlags = 0x1 | 0x2 | 0x10;
+    HANDLE raw = ::CreateFileW(file.c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+                               kShareAll, nullptr, OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (raw != INVALID_HANDLE_VALUE) {
+        const HandlePtr h{raw, ::CloseHandle};
+        DispositionInfoEx info{kDispositionFlags};
+        if (::SetFileInformationByHandle(h.get(), kFileDispositionInfoEx, &info, sizeof(info)))
+            return ERROR_SUCCESS;
+        const DWORD err = ::GetLastError();
+        if (err != ERROR_INVALID_PARAMETER && err != ERROR_NOT_SUPPORTED)
+            return err;
+    }
+    return ::DeleteFileW(file.c_str()) ? ERROR_SUCCESS : ::GetLastError();
+}
+
 // Creates or re-secures echo.db, echo.db-wal, -shm and -journal (see the block comment above).
 // Returns a refusal message when a planted file must stop the open, else nullopt.
 std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
@@ -497,7 +569,6 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
     // access, so share arbitration never weighs the open: no holder's share mode can refuse it.
     constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES;
     constexpr DWORD kLookOnly = READ_CONTROL | FILE_READ_ATTRIBUTES; // no WRITE_DAC
-    constexpr DWORD kShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     constexpr DWORD kFlags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT;
     const yuzu::win::EchoDbOwnerProbe& probe = dacl.owner_probe();
     for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
@@ -559,9 +630,9 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
             if (suffix[0] == '\0')
                 return std::format("echo.db at {} {}, and was not opened: {}", name, why, remedy);
             h.reset(); // release our handle before deleting; a link loses only OUR name
-            if (!::DeleteFileW(file.c_str())) {
+            if (const DWORD del_err = delete_planted_file(file); del_err != ERROR_SUCCESS) {
                 return std::format("{} {}, and could not be removed (error {}): {}", name, why,
-                                   ::GetLastError(), remedy);
+                                   del_err, remedy);
             }
             raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, dacl.sa(), CREATE_NEW, kFlags,
                                 nullptr);
@@ -583,8 +654,6 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
         }
         // Owner read failed (no ACL on this filesystem) or the owner is ours: re-secure in
         // place. Best-effort -- availability of a diagnostics DB over confidentiality.
-        constexpr SECURITY_INFORMATION kDaclInfo =
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
         if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr,
                                                nullptr, dacl.acl(), nullptr);
             rc != ERROR_SUCCESS) {
@@ -595,9 +664,80 @@ std::optional<std::string> secure_echo_db_files(const std::filesystem::path& db,
     }
     return std::nullopt;
 }
+
+// A sidecar that quarantine_corrupt_db could not rename was COPIED into the quarantine set
+// (agents/shared/sqlite_quarantine.hpp), and a copy is created with the directory's inherited ACL,
+// which can let Users read a corrupt database's WAL (process, network and registry capture) while
+// the live files are protected. Re-apply the protected DACL to each sidecar that exists beside the
+// quarantined file, by handle and without following a link, opened as secure_echo_db_files opens
+// the live names and judged by the same two tests first: the pass runs for every OCCUPIED derived
+// name, and a local user who predicts the quarantine name (the current epoch second) can squat
+// `<claimed>-wal` ahead of time with a hard link, which shares its target's security descriptor,
+// so applying the DACL to it would rewrite the TARGET's. A name with a foreign owner or a second
+// link is therefore left alone and logged (the live sidecar that could not take that name was
+// removed by the quarantine: the first recorded limit in sqlite_quarantine.hpp, the squatted-sidecar name). A renamed sidecar
+// keeps its DACL, so for it this repeats what it has. Not secure_echo_db_files itself: its
+// OPEN_ALWAYS would create empty sidecars beside the evidence.
+// Best effort and logged, the same availability-over-confidentiality posture as the live files.
+void secure_quarantined_sidecars(const std::filesystem::path& quarantined,
+                                 const EchoDbDacl& dacl) {
+    if (!dacl.ok())
+        return; // open() warned once, when it built the DACL
+    constexpr DWORD kAccess = READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES; // link count
+    const yuzu::win::EchoDbOwnerProbe& probe = dacl.owner_probe();
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
+        std::filesystem::path file = quarantined;
+        file += suffix;
+        const std::string name = yuzu::win::from_wide(file.c_str());
+        HANDLE raw = ::CreateFileW(file.c_str(), kAccess, kShareAll, nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (raw == INVALID_HANDLE_VALUE) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) {
+                spdlog::warn("EchoDatabase: could not open quarantined {} to secure it (error {}); "
+                             "it keeps its current ACL",
+                             name, err);
+            }
+            continue; // no such sidecar in this quarantine set
+        }
+        const HandlePtr h{raw, ::CloseHandle};
+        // Positive evidence only, as for the live names: a failed owner read is no evidence.
+        DWORD owner_rc = ERROR_SUCCESS;
+        std::optional<std::string> why = probe.foreign_owner(h.get(), &owner_rc);
+        if (!why)
+            why = yuzu::win::EchoDbOwnerProbe::extra_links(h.get());
+        if (owner_rc != ERROR_SUCCESS) {
+            spdlog::warn("EchoDatabase: could not read the owner of quarantined {} (error {}); the "
+                         "owner test is skipped for it",
+                         name, owner_rc);
+        }
+        if (why) {
+            spdlog::warn("EchoDatabase: quarantined {} {} and is not Echo's; it keeps its current "
+                         "ACL",
+                         name, *why);
+            continue;
+        }
+        if (const DWORD rc = ::SetSecurityInfo(h.get(), SE_FILE_OBJECT, kDaclInfo, nullptr, nullptr,
+                                               dacl.acl(), nullptr);
+            rc != ERROR_SUCCESS) {
+            spdlog::warn("EchoDatabase: could not apply the owner-only DACL to quarantined {} "
+                         "(error {}); it keeps its current ACL",
+                         name, rc);
+        }
+    }
+}
 #endif // _WIN32
 
 } // namespace
+
+IntegrityCheck classify_integrity_rc(int rc) noexcept {
+    const int primary = rc & 0xff; // an extended code (SQLITE_BUSY_SNAPSHOT, ...) keeps it in the low byte
+    if (primary == SQLITE_BUSY || primary == SQLITE_LOCKED)
+        return IntegrityCheck::busy;
+    if (primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB)
+        return IntegrityCheck::corrupt;
+    return IntegrityCheck::unreadable;
+}
 
 // ── Construction / destruction ───────────────────────────────────────────────
 
@@ -615,7 +755,10 @@ EchoDatabase::~EchoDatabase() {
 }
 
 EchoDatabase::EchoDatabase(EchoDatabase&& other) noexcept
-    : db_{other.db_.load()}, query_db_{other.query_db_}, quarantined_at_{other.quarantined_at_} {
+    : db_{other.db_.load()},
+      query_db_{other.query_db_},
+      quarantined_at_{other.quarantined_at_},
+      fold_{std::move(other.fold_)} {
     other.quarantined_at_.reset();
     other.db_ = nullptr;
     other.query_db_ = nullptr;
@@ -630,6 +773,7 @@ EchoDatabase& EchoDatabase::operator=(EchoDatabase&& other) noexcept {
         db_ = other.db_.load();
         query_db_ = other.query_db_;
         quarantined_at_ = other.quarantined_at_;
+        fold_ = std::move(other.fold_);
         other.quarantined_at_.reset();
         other.db_ = nullptr;
         other.query_db_ = nullptr;
@@ -672,7 +816,7 @@ std::expected<bool, std::string> rename_pending(sqlite3* db, const char* from, c
     return !*have_to;
 }
 
-// Schema v9 (upgrade window, removed with the legacy-name shims): a database written before the
+// Schema v9 (kept while a pre-rename database can still exist): a database written before the
 // rename holds tar_state / tar_config / tar_cursor. Rename whichever of them exist, atomically, in
 // one transaction. Skipped when echo_config already exists (a fresh or already-renamed file).
 // An error return makes the caller refuse the open.
@@ -717,6 +861,11 @@ std::expected<void, std::string> rename_legacy_tables(sqlite3* db) {
 } // namespace
 
 std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesystem::path& path) {
+    return open(path, OpenSeams{});
+}
+
+std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesystem::path& path,
+                                                           const OpenSeams& seams) {
     // Ensure parent directory exists
     std::error_code ec;
     auto parent = path.parent_path();
@@ -728,7 +877,7 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         }
     }
 
-    // Upgrade window (removed with the legacy-name shims): agent core adopts a legacy tar.db as
+    // Pre-rename install (kept while a tar.db can still exist): agent core adopts a legacy tar.db as
     // echo.db at boot, before any plugin initialises (adopt_legacy_echo_db). If echo.db is absent
     // and an unadopted tar.db sits beside it, creating a fresh echo.db here would boot the agent
     // with default config and re-enable operator-paused sources (the #559 class). Fail closed.
@@ -742,6 +891,10 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
                         (path.parent_path() / "tar.db").string()));
     }
 
+    // #1527 — a link at echo.db or a sidecar is refused before anything touches the paths.
+    if (auto refusal = refuse_linked_db_files(path))
+        return std::unexpected(*refusal);
+
     // #1567 — set when this open quarantined a corrupt file; persisted into the
     // fresh DB's echo_config once it is fully initialised (see end of open()).
     std::optional<int64_t> quarantined_at;
@@ -752,33 +905,113 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // refuse a planted file (foreign owner or extra hard link); see the DACL block above.
     EchoDbDacl dacl;
     if (!dacl.ok()) {
+        // Without the DACL there is no token user to compare owners against, so the foreign-owner
+        // and hard-link checks on echo.db and its sidecars are skipped as well.
         spdlog::warn("EchoDatabase: owner-only DACL not built (error {}); echo.db keeps the "
-                     "directory's inherited ACL",
+                     "directory's inherited ACL, and the owner and hard-link checks are skipped",
                      dacl.build_error());
     }
     if (auto refusal = secure_echo_db_files(path, dacl))
         return std::unexpected(*refusal);
 #endif
 
-    sqlite3* raw_db = nullptr;
-    int rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
-        if (raw_db)
-            sqlite3_close(raw_db);
-        return std::unexpected(std::format("failed to open echo.db: {}", err));
+    // The name SQLite is given. SQLITE_OPEN_NOFOLLOW (SQLite 3.31+) refuses a link in ANY
+    // component of it, and the open(2) of echo.db and its sidecars is O_NOFOLLOW, so a link
+    // swapped in after refuse_linked_db_files is refused. A data directory legitimately sits
+    // behind a link on macOS (/var -> /private/var), so the DIRECTORY is resolved once here and
+    // only a link at the final name trips the flag; a directory component swapped after this
+    // point is outside the model (the attacker would own the data directory's parent). The
+    // Windows VFS ignores the flag, so the path is passed as given there (see the DACL block).
+#ifdef _WIN32
+    const std::string open_name = path.string();
+#else
+    std::error_code cec;
+    const auto resolved_dir =
+        std::filesystem::canonical(std::filesystem::absolute(path).parent_path(), cec);
+    if (cec) {
+        return std::unexpected(std::format("cannot resolve the directory of {}: {}",
+                                           path.string(), cec.message()));
     }
+    const std::string open_name = (resolved_dir / path.filename()).string();
+#endif
+
+    // Open the main connection, give it its busy timeout at once (so the integrity check below
+    // waits for a holder instead of reading "locked" as corrupt, #7286) and hand it to the guard.
+    // SQLite returns a handle even when the open fails; the guard closes it either way.
+    DbGuard guard;
+    const auto open_main = [&]() -> std::expected<void, std::string> {
+        if (seams.before_sqlite_open)
+            seams.before_sqlite_open(); // the link-swap test's fault point
+        sqlite3* opened = nullptr;
+        const int orc = sqlite3_open_v2(open_name.c_str(), &opened,
+                                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                            SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
+                                        nullptr);
+        guard.reset(opened);
+        if (orc != SQLITE_OK)
+            return std::unexpected(opened ? sqlite3_errmsg(opened) : "unknown error");
+        sqlite3_busy_timeout(opened, kBusyTimeoutMs);
+        return {};
+    };
+    if (auto opened = open_main(); !opened)
+        return std::unexpected(std::format("failed to open echo.db: {}", opened.error()));
+    // The identity of the file SQLite just opened, read at the name right after the open (not
+    // after the integrity check, which can run for seconds and wait the busy timeout): the
+    // quarantine below moves only this inode, so a link or a different file put at the name while
+    // the check runs is refused and nothing is moved (#1527). The gap between the open and this
+    // read is a recorded residual of the binding (sqlite_quarantine.hpp, BINDING, which records
+    // the others: the drop of the original by name, and a planted hard link).
+    const auto judged = yuzu::shared::sqlite_quarantine::file_identity(path);
+#ifndef _WIN32
+    // An lstat that fails on a path SQLite just opened by that path means the name changed under
+    // us: refuse like every other unknown here (the next start retries) rather than let the claim
+    // bind to whatever is at the name when it is taken. Windows reads no identity (nullopt always).
+    if (!judged) {
+        return std::unexpected(std::format(
+            "echo.db could not be checked (its identity could not be read after the open): not "
+            "quarantined and not opened; retried on the next start: {}",
+            path.string()));
+    }
+#endif
+    if (seams.before_integrity_check)
+        seams.before_integrity_check(); // the swap-during-check test's fault point
 
     // #559 — corruption self-test BEFORE we trust the DB. A fresh/empty file
     // passes trivially; an existing corrupt one is quarantined aside and a clean
     // DB is re-opened in its place, so the agent never silently serves garbage
     // config (which would re-enable operator-paused sources, compounding #539).
-    if (!integrity_ok(raw_db)) {
-        sqlite3_close(raw_db);
-        raw_db = nullptr;
-        auto quarantined = quarantine_corrupt_db(path);
+    const auto checked = check_integrity(guard.get());
+    switch (checked.verdict) {
+    case IntegrityCheck::ok:
+        break;
+    case IntegrityCheck::unreadable:
+        // Not corruption (I/O, permission, space, a WAL protocol fault): refuse and let the next
+        // start retry; quarantine nothing. Rationale: check_integrity's comment (#7286).
+        return std::unexpected(std::format(
+            "echo.db could not be checked (sqlite rc {}): not quarantined and not opened; "
+            "retried on the next start: {}",
+            checked.rc, path.string()));
+    case IntegrityCheck::busy:
+        // Another connection holds the file past the busy timeout. That says nothing about its
+        // health, so quarantine nothing (a quarantine would move a healthy file away from its
+        // holder) and refuse to open: Echo fails closed rather than trusting a file it could not
+        // check, and the next start retries (#7286).
+        return std::unexpected(std::format(
+            "echo.db is busy (another connection holds it for more than {} ms): not quarantined "
+            "and not opened; it is retried on the next start: {}",
+            kBusyTimeoutMs, path.string()));
+    case IntegrityCheck::corrupt: {
+        // `judged` (read right after the open above) binds the move to the file the verdict was
+        // taken on: a link swapped in or a fresh file another process put at the name since is
+        // left alone and the open fails closed (#1527).
+        guard.reset();
+        // One clock read: the persisted epoch is the one in the on-disk quarantine name.
+        const std::int64_t epoch = now_epoch_seconds();
+        const auto quarantine = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(
+            path, epoch, seams.quarantine_ops, judged);
+        for (const auto& note : quarantine.notes)
+            spdlog::warn("EchoDatabase: {}", note);
+        const auto& quarantined = quarantine.dest;
         if (!quarantined) {
             // FAIL CLOSED (UP-1): the corrupt DB could not be moved aside, so we
             // must NOT re-open and trust it — doing so would silently serve the
@@ -786,43 +1019,52 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
             // re-enable sources an operator paused for forensic preservation,
             // the exact failure #559 guards against. Refuse to open; the
             // operator must clear the underlying fault (read-only mount, locked
-            // file, permissions) and restart.
+            // file, permissions, a filesystem without hard links) and restart.
             return std::unexpected(std::format(
                 "echo.db failed integrity_check and could not be quarantined "
                 "(corrupt and unmovable): {}",
                 path.string()));
         }
-        quarantined_at = now_epoch_seconds();
+        quarantined_at = epoch;
         quarantined_file = quarantined->filename().string();
         spdlog::error("ECHO: echo.db failed PRAGMA integrity_check (echo.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
 #ifdef _WIN32
+        // A sidecar that had to be copied (not renamed) took the directory's ACL: protect it again.
+        secure_quarantined_sidecars(*quarantined, dacl);
+#endif
+        if (seams.after_quarantine)
+            seams.after_quarantine(); // the link-swap test's fault point
+        // The quarantine left the names free for a moment: a link planted at one of them now
+        // would be followed by the reopen, so the #1527 refusal runs again right before it.
+        if (auto refusal = refuse_linked_db_files(path))
+            return std::unexpected(*refusal);
+#ifdef _WIN32
         // The quarantine rename left no echo.db: pre-create it (and any sidecar) protected again.
         if (auto refusal = secure_echo_db_files(path, dacl))
             return std::unexpected(*refusal);
 #endif
-        rc = sqlite3_open_v2(path.string().c_str(), &raw_db,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-        if (rc != SQLITE_OK) {
-            std::string err = raw_db ? sqlite3_errmsg(raw_db) : "unknown error";
-            if (raw_db)
-                sqlite3_close(raw_db);
+        if (auto reopened = open_main(); !reopened) {
             return std::unexpected(
-                std::format("failed to re-open echo.db after quarantine: {}", err));
+                std::format("failed to re-open echo.db after quarantine: {}", reopened.error()));
         }
         // Backstop (UP-2): the freshly-created DB must itself be clean — this
         // also catches the case where a -wal/-shm sidecar belonging to the
         // quarantined file could neither be moved nor removed and was adopted by
-        // the new file. If even the fresh DB is corrupt, fail closed.
-        if (!integrity_ok(raw_db)) {
-            sqlite3_close(raw_db);
+        // the new file. If even the fresh DB is not clean (or is busy), fail closed.
+        if (const auto rechecked = check_integrity(guard.get());
+            rechecked.verdict != IntegrityCheck::ok) {
             return std::unexpected(std::format(
-                "echo.db re-initialised after quarantine still fails integrity_check: {}",
-                path.string()));
+                "echo.db re-initialised after quarantine still fails integrity_check (sqlite rc "
+                "{}): {}",
+                rechecked.rc, path.string()));
         }
+        break;
     }
+    }
+    sqlite3* raw_db = guard.get();
+    int rc = SQLITE_OK;
 
     // Incremental auto_vacuum, BEFORE journal_mode=WAL: SQLite fixes the mode when the first
     // table is created, and the WAL switch writes page 1 of an empty file. On a database that
@@ -840,13 +1082,9 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to enable WAL mode: {}", err));
     }
     sqlite3_free(err_msg);
-
-    // Busy timeout for concurrent access
-    sqlite3_busy_timeout(raw_db, kBusyTimeoutMs);
 
     // Secure delete -- zeroes deleted content; required for security
     err_msg = nullptr;
@@ -854,7 +1092,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to enable secure_delete: {}", err));
     }
     sqlite3_free(err_msg);
@@ -872,7 +1109,6 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // schema below, which would otherwise create empty echo_* tables beside the populated tar_*
     // ones and boot the agent with default config. Failure is fail-closed for the same reason.
     if (auto renamed = rename_legacy_tables(raw_db); !renamed) {
-        sqlite3_close(raw_db);
         return std::unexpected(
             std::format("failed to rename legacy tar_* tables: {}", renamed.error()));
     }
@@ -884,27 +1120,11 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     if (rc != SQLITE_OK) {
         std::string err = err_msg ? err_msg : "unknown error";
         sqlite3_free(err_msg);
-        sqlite3_close(raw_db);
         return std::unexpected(std::format("failed to create Echo schema: {}", err));
     }
 
-    // Set default retention if not already configured
-    {
-        const char* check_sql = "SELECT value FROM echo_config WHERE key = 'retention_days'";
-        sqlite3_stmt* raw_stmt = nullptr;
-        rc = sqlite3_prepare_v2(raw_db, check_sql, -1, &raw_stmt, nullptr);
-        if (rc == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) != SQLITE_ROW) {
-                // No retention_days configured -- set default
-                const char* insert_sql =
-                    "INSERT INTO echo_config (key, value) VALUES ('retention_days', '7')";
-                sqlite3_exec(raw_db, insert_sql, nullptr, nullptr, nullptr);
-            }
-        }
-    }
-
-    auto db = EchoDatabase{raw_db};
+    auto db = EchoDatabase{guard.release()};
+    db.fold_ = std::make_unique<EchoFold>();
 
     // Ensure every registry-declared warehouse table exists on EVERY open —
     // the DDL is IF-NOT-EXISTS-idempotent, and gating it on schema_version<2
@@ -994,7 +1214,15 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         sqlite3_exec(raw_db, "SAVEPOINT v4_migration", nullptr, nullptr, nullptr);
         bool ok = true;
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
-            if (has_version_col(tbl))
+            // A database created by v10 or later has no such table (the roll-up views replaced
+            // it), and this step runs for it on its way up the ladder: nothing to alter.
+            const auto present = table_exists(raw_db, tbl);
+            if (!present) {
+                spdlog::error("EchoDatabase: v4 table probe failed: {}", present.error());
+                ok = false;
+                break;
+            }
+            if (!*present || has_version_col(tbl))
                 continue;
             const auto alter =
                 std::format("ALTER TABLE {} ADD COLUMN version TEXT NOT NULL DEFAULT ''", tbl);
@@ -1157,7 +1385,13 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         sqlite3_exec(raw_db, "SAVEPOINT v7_migration", nullptr, nullptr, nullptr);
         bool ok = true;
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
-            if (has_is_kthread_col(tbl))
+            const auto present = table_exists(raw_db, tbl); // absent on a database created by v10+
+            if (!present) {
+                spdlog::error("EchoDatabase: v7 table probe failed: {}", present.error());
+                ok = false;
+                break;
+            }
+            if (!*present || has_is_kthread_col(tbl))
                 continue;
             const auto alter =
                 std::format("ALTER TABLE {} ADD COLUMN is_kthread INTEGER NOT NULL DEFAULT 0", tbl);
@@ -1276,6 +1510,34 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         spdlog::info("EchoDatabase: migrated to schema version 9 (tables renamed)");
     }
 
+    // Schema v10: the roll-up flip. The retired raw `<src>_live` tables and the old summary
+    // tiers move into the roll-up tables in ONE transaction (or, on a database with none of
+    // them, the roll-up schema is simply installed). The step runs HERE, before the query
+    // connection exists, so no reader pins the WAL while it checkpoints. A failure leaves the
+    // retired tables intact; open() refuses and the next open retries from v9 -- Echo is
+    // offline until it succeeds, which an operator sees in the agent log and `echo status`.
+    if (const int version = db.schema_version(); version < 10) {
+        // An earlier step that failed rolled itself back and is retried on the next open. The
+        // roll-up step must not run past it: it would take the version to 10 and the step that
+        // failed would never be retried (each is gated on its own version).
+        if (version < 9)
+            return std::unexpected(std::format("schema v{}: an earlier migration step did not finish "
+                                               "(see the log); the roll-up step waits for it and the "
+                                               "next open retries both",
+                                               version));
+        if (auto migrated = migrate_to_v10(db, path, seams); !migrated)
+            return std::unexpected(std::format("v10 roll-up migration failed (the schema stays at "
+                                               "v9; the retired tables are intact): {}",
+                                               migrated.error()));
+    }
+    // B3 (#6889 review): never publish a connection that is inside a transaction. Writes on it
+    // would be reported durable and discarded at close. `db` owns raw_db, so returning closes it.
+    if (sqlite3_get_autocommit(raw_db) == 0) {
+        return std::unexpected(
+            std::string{"echo.db is inside an open transaction after the schema steps; refusing "
+                        "to open on a wedged connection"});
+    }
+
 #ifndef _WIN32
     // Owner-only (0600) on the db and its WAL sidecars, as command_dedup_store does
     // (security-hardening.md "chmod 600 *.db"): the packaged state directory is not a
@@ -1283,12 +1545,16 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // capture source. Best-effort per file (-wal/-shm/-journal may not exist yet); a chmod
     // failure never fails an otherwise-healthy open. SQLite derives later sidecar modes from
     // the db file. POSIX mode bits only; Windows applies a protected DACL in the #else arm.
+    // `nofollow`: the link check ran at the start of open(), so a link swapped in since must not
+    // have its target chmod'ed (a regular file is unaffected).
     for (const char* suffix : {"", "-wal", "-shm", "-journal"}) {
         std::error_code pec;
         std::filesystem::permissions(path.string() + suffix,
                                      std::filesystem::perms::owner_read |
                                          std::filesystem::perms::owner_write,
-                                     std::filesystem::perm_options::replace, pec);
+                                     std::filesystem::perm_options::replace |
+                                         std::filesystem::perm_options::nofollow,
+                                     pec);
     }
 #else
     // The pre-open pass created or re-secured the four files, but on a FRESH (0-page)
@@ -1306,9 +1572,13 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
     // can't be opened we continue without it; execute_user_query then fails
     // closed.
     {
+        if (seams.before_sqlite_open)
+            seams.before_sqlite_open(); // the link-swap test's fault point
         sqlite3* ro = nullptr;
-        int rrc = sqlite3_open_v2(path.string().c_str(), &ro,
-                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nullptr);
+        int rrc = sqlite3_open_v2(open_name.c_str(), &ro,
+                                  SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX |
+                                      SQLITE_OPEN_NOFOLLOW,
+                                  nullptr);
         if (rrc == SQLITE_OK) {
             sqlite3_busy_timeout(ro, kBusyTimeoutMs);
             sqlite3_db_config(ro, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 0, nullptr);
@@ -1355,31 +1625,27 @@ EchoStats EchoDatabase::stats() {
     if (!db_)
         return s;
 
-    // Build the per-source live-table fragments once, data-driven over the
-    // capture-source registry — so a newly-registered source (perf, procperf,
-    // netqual, module, …) is counted automatically instead of being silently
-    // omitted by a hand-maintained four-table list. Source names come from the
-    // registry, a compile-time allowlist, so the concatenation carries no
-    // injection risk; every live tier has a `ts` column, and an empty table
-    // contributes COUNT 0 / NULL MIN/MAX, so including them is harmless.
+    // Data-driven over the roll-up declarations, so a newly-declared source is counted
+    // automatically instead of being silently omitted by a hand-maintained list. A source
+    // counts through its FINEST physical tier (the one that holds every event once); its bucket
+    // column stands in for a timestamp, so the range is in hour-start steps. Source and table
+    // names come from the declaration, a compile-time allowlist, so the concatenation carries
+    // no injection risk; an empty table contributes COUNT 0 / NULL MIN/MAX.
     std::string count_expr;
     std::string min_union;
     std::string max_union;
-    bool first = true;
-    for (const auto& src : capture_sources()) {
-        std::string live = std::string(src.name) + "_live";
-        if (!first) {
-            count_expr += " + ";
-            min_union += " UNION ALL ";
-            max_union += " UNION ALL ";
-        }
-        count_expr += "(SELECT COUNT(*) FROM " + live + ")";
-        min_union += "SELECT MIN(ts) AS m FROM " + live;
-        max_union += "SELECT MAX(ts) AS m FROM " + live;
-        first = false;
+    for (const auto& def : fold_sources()) {
+        if (def.own_tables)
+            continue;
+        const std::string table = physical_table_name(def.name, def.tiers.front());
+        const std::string col{ts_column_for_suffix(def.tiers.front())};
+        const bool first = count_expr.empty();
+        count_expr += (first ? "" : " + ") + std::format("(SELECT COUNT(*) FROM {})", table);
+        min_union += (first ? "" : " UNION ALL ") + std::format("SELECT MIN({}) AS m FROM {}", col, table);
+        max_union += (first ? "" : " UNION ALL ") + std::format("SELECT MAX({}) AS m FROM {}", col, table);
     }
 
-    // Aggregate record count across all live tables
+    // Aggregate record count across the finest tiers
     {
         std::string sql = "SELECT " + count_expr;
         sqlite3_stmt* raw_stmt = nullptr;
@@ -1390,7 +1656,7 @@ EchoStats EchoDatabase::stats() {
         }
     }
 
-    // Oldest timestamp across all live tables
+    // Oldest bucket across the finest tiers
     {
         std::string sql = "SELECT MIN(m) FROM (" + min_union + ")";
         sqlite3_stmt* raw_stmt = nullptr;
@@ -1401,7 +1667,7 @@ EchoStats EchoDatabase::stats() {
         }
     }
 
-    // Newest timestamp
+    // Newest bucket
     {
         std::string sql = "SELECT MAX(m) FROM (" + max_union + ")";
         sqlite3_stmt* raw_stmt = nullptr;
@@ -1416,25 +1682,6 @@ EchoStats EchoDatabase::stats() {
     {
         const StorageBytes sb = storage_bytes_locked();
         s.db_size_bytes = sb.data_bytes() + sb.wal_bytes;
-    }
-
-    // Retention days from config
-    {
-        const char* sql = "SELECT value FROM echo_config WHERE key = 'retention_days'";
-        sqlite3_stmt* raw_stmt = nullptr;
-        if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) == SQLITE_OK) {
-            StmtPtr stmt(raw_stmt);
-            if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-                auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-                if (text) {
-                    try {
-                        s.retention_days = std::stoi(text);
-                    } catch (...) {
-                        s.retention_days = 7;
-                    }
-                }
-            }
-        }
     }
 
     return s;
@@ -1598,501 +1845,63 @@ EchoDatabase::get_cursor(const std::string& source) {
 
 namespace {
 
-// Shared body for insert_power_events_and_cursor / insert_removable_events_and_cursor:
-// BEGIN IMMEDIATE, run `insert_events` (which prepares+steps its own INSERT OR
-// IGNORE statement against db), INSERT OR REPLACE the cursor row for `source`,
-// COMMIT -- all under the caller's mu_, all as one transaction (echo_cursor.hpp
-// rule 6). On ANY failure the whole batch is rolled back so events and cursor
-// commit or fail together (echo_db.hpp:458-477 documents why per-call-locked
-// execute_sql cannot give this guarantee, and why BEGIN IMMEDIATE rather than
-// bare BEGIN — IMMEDIATE takes the write lock up front so a concurrent writer
-// on this same connection cannot interleave between the events and the cursor
-// write).
-template <class InsertEventsFn>
-bool insert_events_and_cursor_locked(sqlite3* db, const char* log_prefix,
-                                     const std::string& source, const std::string& cursor_json,
-                                     InsertEventsFn&& insert_events) {
-    char* err_msg = nullptr;
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("{} BEGIN IMMEDIATE: {}", log_prefix, err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
+using Cursor = EchoDatabase::CursorInsertError;
 
-    if (!std::forward<InsertEventsFn>(insert_events)(db, log_prefix)) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
+Cursor to_cursor_error(CursorFoldError::Kind k) {
+    switch (k) {
+    case CursorFoldError::Kind::KeyCollision:
+        return Cursor::KeyCollision;
+    case CursorFoldError::Kind::Misuse:
+        return Cursor::Misuse;
+    case CursorFoldError::Kind::Transient:
+        break;
     }
+    return Cursor::Transient;
+}
 
-    const char* cursor_sql = R"(
-        INSERT INTO echo_cursor (source, cursor_json, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(source) DO UPDATE SET cursor_json = excluded.cursor_json,
-                                          updated_at = excluded.updated_at
-    )";
-    sqlite3_stmt* raw_stmt = nullptr;
-    if (sqlite3_prepare_v2(db, cursor_sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("{} cursor prepare: {}", log_prefix, sqlite3_errmsg(db));
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
+// A cursor source's wrapper: derive the contributions, fold them through the replay ring and
+// commit the cursor (and any baselines) in the same transaction. A declaration typo in a delta
+// throws; it is a permanent programming error, never a retry.
+template <class Events, class Delta>
+std::expected<void, Cursor> fold_cursor(EchoFold* fold, EchoDatabase& db, std::string_view source,
+                                        const Events& events, Delta delta,
+                                        const std::string& cursor_json,
+                                        const std::vector<StateWrite>& baselines) {
+    if (!fold)
+        return std::unexpected(Cursor::Transient);
+    try {
+        const auto r = fold->fold_cursor_rows(db, source, delta(events), cursor_json, baselines);
+        if (!r) {
+            if (r.error().kind != CursorFoldError::Kind::KeyCollision)
+                spdlog::error("EchoDatabase: {} fold failed: {}", source, r.error().text);
+            return std::unexpected(to_cursor_error(r.error().kind));
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("EchoDatabase: {} fold threw: {}", source, e.what());
+        return std::unexpected(Cursor::Misuse);
     }
-    StmtPtr cursor_stmt(raw_stmt);
-    sqlite3_bind_text(cursor_stmt.get(), 1, source.c_str(), static_cast<int>(source.size()),
-                      SQLITE_STATIC);
-    sqlite3_bind_text(cursor_stmt.get(), 2, cursor_json.c_str(),
-                      static_cast<int>(cursor_json.size()), SQLITE_STATIC);
-    sqlite3_bind_int64(cursor_stmt.get(), 3, now_epoch_seconds());
-    if (sqlite3_step(cursor_stmt.get()) != SQLITE_DONE) {
-        spdlog::error("{} cursor step: {}", log_prefix, sqlite3_errmsg(db));
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    cursor_stmt.reset();
-
-    err_msg = nullptr;
-    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("{} commit: {}", log_prefix, err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
+    return {};
 }
 
 } // namespace
 
-std::expected<void, EchoDatabase::CursorInsertError> EchoDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
-                                                 const std::string& cursor_json) {
-    // A blank record_key is silently catastrophic: the UNIQUE index makes
-    // INSERT OR IGNORE drop every event after the first, and the call still
-    // reports success -- forensic loss indistinguishable from an empty tick.
-    // Refuse instead, so a collector that fails to derive a key is a loud bug.
-    for (const auto& ev : events) {
-        if (ev.record_key.empty()) {
-            spdlog::error("EchoDatabase::insert_power_events_and_cursor: refusing a batch with an "
-                          "empty record_key -- the dedupe index would discard all but "
-                          "the first event and report success");
-            return std::unexpected(CursorInsertError::KeyCollision);
-        }
-        // A key containing a NUL is NOT caught by empty() but binds as
-        // zero-length TEXT, so "\0a" and "\0b" collapse to one row -- the same
-        // silent discard the guard above exists to prevent, wearing a
-        // non-empty key. Fixed-width USB string descriptors and EvtRender
-        // buffers are both realistic sources of one.
-        if (ev.record_key.find('\0') != std::string::npos) {
-            spdlog::error("EchoDatabase::insert_power_events_and_cursor: refusing a batch whose "
-                          "record_key contains a NUL -- it is non-empty but binds as "
-                          "zero-length, collapsing distinct keys onto one row");
-            return std::unexpected(CursorInsertError::KeyCollision);
-        }
-    }
-
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return std::unexpected(CursorInsertError::Transient);
-
-    // Set by the events lambda when it refuses a batch on a payload mismatch.
-    // That refusal is PERMANENT -- the same batch is re-derived and re-refused
-    // every tick -- so it must not reach the caller as an ordinary failure.
-    bool collided = false;
-    const bool ok = insert_events_and_cursor_locked(
-        db_, "insert_power_events_and_cursor", "power", cursor_json,
-        [&events, &collided](sqlite3* db, const char* log_prefix) {
-            if (events.empty())
-                return true;
-            const char* sql = R"(
-                INSERT OR IGNORE INTO power_live (ts, snapshot_id, action, detail, record_key)
-                VALUES (?, ?, ?, ?, ?) RETURNING record_key
-            )";
-            sqlite3_stmt* raw_stmt = nullptr;
-            if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-                spdlog::error("{} events prepare: {}", log_prefix, sqlite3_errmsg(db));
-                return false;
-            }
-            StmtPtr stmt(raw_stmt);
-            // Collision check, paid ONLY when a row is actually ignored.
-            // INSERT OR IGNORE cannot tell a legitimate replay (the same OS
-            // record re-offered after a failed commit) from a COLLISION (two
-            // different OS records that derived the same key). Both look like
-            // success, and on a collision the cursor advances past an event
-            // that was silently discarded -- forensic loss reported as a clean
-            // tick. A non-empty key does not establish identity; only the
-            // stored payload does.
-            const char* dup_sql = R"(
-                SELECT ts, snapshot_id, action, detail FROM power_live WHERE record_key = ?
-            )";
-            sqlite3_stmt* raw_dup = nullptr;
-            if (sqlite3_prepare_v2(db, dup_sql, -1, &raw_dup, nullptr) != SQLITE_OK) {
-                spdlog::error("{} dup-check prepare: {}", log_prefix, sqlite3_errmsg(db));
-                return false;
-            }
-            StmtPtr dup(raw_dup);
-            for (const auto& ev : events) {
-                sqlite3_reset(stmt.get());
-                sqlite3_clear_bindings(stmt.get());
-                sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-                sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), static_cast<int>(ev.action.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 4, ev.detail.c_str(), static_cast<int>(ev.detail.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 5, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
-                // RETURNING, not sqlite3_changes(): this connection is opened
-                // SQLITE_OPEN_FULLMUTEX and shared, and FULLMUTEX serialises
-                // individual calls, NOT the step->changes PAIR. Reading
-                // db->nChange afterwards is a data race whose wrong answer would
-                // make this check miss a real collision or refuse a valid batch
-                // (routed-concerns "SQLite sqlite3_changes()" row, issue #1033).
-                // RETURNING folds the answer into the statement: a returned row
-                // means this INSERT actually inserted.
-                const int step_rc = sqlite3_step(stmt.get());
-                if (step_rc == SQLITE_ROW)
-                    continue; // inserted -- the ordinary path, no extra work
-                if (step_rc != SQLITE_DONE) {
-                    spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
-                    return false;
-                }
-                // SQLITE_DONE with no row == the INSERT was IGNORED.
-                sqlite3_reset(dup.get());
-                sqlite3_clear_bindings(dup.get());
-                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
-                if (sqlite3_step(dup.get()) != SQLITE_ROW) {
-                    spdlog::error("{} dup-check: record_key '{}' was ignored but no stored row "
-                                  "could be read back", log_prefix, ev.record_key);
-                    return false;
-                }
-                // Length from sqlite3_column_bytes, NOT strlen. Constructing a
-                // string_view from the char* alone stops at an embedded NUL, so
-                // a stored "head\0tail" would compare equal to "head" -- and
-                // unequal to the value actually re-offered on a replay, which
-                // refuses the event as a collision on every later tick. The
-                // bind side has the same trap and is fixed the same way.
-                auto col = [&](int i) {
-                    const auto* t =
-                       reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
-                    if (t == nullptr)
-                        return std::string_view{};
-                    return std::string_view{t, static_cast<std::size_t>(
-                                                  sqlite3_column_bytes(dup.get(), i))};
-                };
-                // Compare only what actually identifies the OS RECORD.
-                // `snapshot_id` is collection metadata -- which tick gathered
-                // it -- and it is freshly minted every tick, so including it
-                // would turn every legitimate retry into a "collision" and
-                // wedge the source permanently. `ts` is identity for a real
-                // transition, but for a capture_gap it is merely "when we
-                // noticed"; a gap's identity lives entirely in its record_key,
-                // which encodes the window bounds. So ts participates for
-                // everything EXCEPT a gap.
-                const bool is_gap = ev.action == "capture_gap";
-                if ((is_gap || sqlite3_column_int64(dup.get(), 0) == ev.ts) &&
-                    col(2) == ev.action && col(3) == ev.detail)
-                    continue; // an exact replay -- the intended dedupe
-                spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
-                              "event, so accepting this batch would advance the cursor past an "
-                              "event that was never stored -- failing the transaction instead",
-                              log_prefix, ev.record_key);
-                collided = true;
-                return false;
-            }
-            return true;
-        });
-    if (ok)
-        return {};
-    return std::unexpected(collided ? CursorInsertError::KeyCollision
-                                    : CursorInsertError::Transient);
+std::expected<void, EchoDatabase::CursorInsertError>
+EchoDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
+                                             const std::string& cursor_json) {
+    return fold_cursor(fold_.get(), *this, "power", events, power_delta, cursor_json, {});
 }
 
-std::expected<void, EchoDatabase::CursorInsertError> EchoDatabase::insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
-                                                      const std::string& cursor_json) {
-    // A blank record_key is silently catastrophic: the UNIQUE index makes
-    // INSERT OR IGNORE drop every event after the first, and the call still
-    // reports success -- forensic loss indistinguishable from an empty tick.
-    // Refuse instead, so a collector that fails to derive a key is a loud bug.
-    for (const auto& ev : events) {
-        if (ev.record_key.empty()) {
-            spdlog::error("EchoDatabase::insert_removable_events_and_cursor: refusing a batch with an "
-                          "empty record_key -- the dedupe index would discard all but "
-                          "the first event and report success");
-            return std::unexpected(CursorInsertError::KeyCollision);
-        }
-        // A key containing a NUL is NOT caught by empty() but binds as
-        // zero-length TEXT, so "\0a" and "\0b" collapse to one row -- the same
-        // silent discard the guard above exists to prevent, wearing a
-        // non-empty key. Fixed-width USB string descriptors and EvtRender
-        // buffers are both realistic sources of one.
-        if (ev.record_key.find('\0') != std::string::npos) {
-            spdlog::error("EchoDatabase::insert_removable_events_and_cursor: refusing a batch whose "
-                          "record_key contains a NUL -- it is non-empty but binds as "
-                          "zero-length, collapsing distinct keys onto one row");
-            return std::unexpected(CursorInsertError::KeyCollision);
-        }
-    }
-
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return std::unexpected(CursorInsertError::Transient);
-
-    // See the power twin.
-    bool collided = false;
-    const bool ok = insert_events_and_cursor_locked(
-        db_, "insert_removable_events_and_cursor", "removable", cursor_json,
-        [&events, &collided](sqlite3* db, const char* log_prefix) {
-            if (events.empty())
-                return true;
-            const char* sql = R"(
-                INSERT OR IGNORE INTO removable_live
-                    (ts, snapshot_id, action, device_key, vendor, product, serial, bus,
-                     volume, size_bytes, image_path, pid, evidence, record_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING record_key
-            )";
-            sqlite3_stmt* raw_stmt = nullptr;
-            if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-                spdlog::error("{} events prepare: {}", log_prefix, sqlite3_errmsg(db));
-                return false;
-            }
-            StmtPtr stmt(raw_stmt);
-            const char* dup_sql = R"(
-                SELECT ts, snapshot_id, action, device_key, vendor, product, serial, bus,
-                       volume, size_bytes, image_path, pid, evidence
-                  FROM removable_live WHERE record_key = ?
-            )";
-            sqlite3_stmt* raw_dup = nullptr;
-            if (sqlite3_prepare_v2(db, dup_sql, -1, &raw_dup, nullptr) != SQLITE_OK) {
-                spdlog::error("{} dup-check prepare: {}", log_prefix, sqlite3_errmsg(db));
-                return false;
-            }
-            StmtPtr dup(raw_dup);
-            for (const auto& ev : events) {
-                sqlite3_reset(stmt.get());
-                sqlite3_clear_bindings(stmt.get());
-                sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-                sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), static_cast<int>(ev.action.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 4, ev.device_key.c_str(), static_cast<int>(ev.device_key.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 5, ev.vendor.c_str(), static_cast<int>(ev.vendor.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 6, ev.product.c_str(), static_cast<int>(ev.product.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 7, ev.serial.c_str(), static_cast<int>(ev.serial.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 8, ev.bus.c_str(), static_cast<int>(ev.bus.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 9, ev.volume.c_str(), static_cast<int>(ev.volume.size()), SQLITE_STATIC);
-                sqlite3_bind_int64(stmt.get(), 10, ev.size_bytes);
-                sqlite3_bind_text(stmt.get(), 11, ev.image_path.c_str(), static_cast<int>(ev.image_path.size()), SQLITE_STATIC);
-                sqlite3_bind_int64(stmt.get(), 12, ev.pid);
-                sqlite3_bind_text(stmt.get(), 13, ev.evidence.c_str(), static_cast<int>(ev.evidence.size()), SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 14, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
-                // Same as the power twin. RETURNING, not sqlite3_changes(): this connection is opened
-                // SQLITE_OPEN_FULLMUTEX and shared, and FULLMUTEX serialises
-                // individual calls, NOT the step->changes PAIR. Reading
-                // db->nChange afterwards is a data race whose wrong answer would
-                // make this check miss a real collision or refuse a valid batch
-                // (routed-concerns "SQLite sqlite3_changes()" row, issue #1033).
-                // RETURNING folds the answer into the statement: a returned row
-                // means this INSERT actually inserted.
-                const int step_rc = sqlite3_step(stmt.get());
-                if (step_rc == SQLITE_ROW)
-                    continue; // inserted -- the ordinary path, no extra work
-                if (step_rc != SQLITE_DONE) {
-                    spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
-                    return false;
-                }
-                // SQLITE_DONE with no row == the INSERT was IGNORED.
-                sqlite3_reset(dup.get());
-                sqlite3_clear_bindings(dup.get());
-                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
-                if (sqlite3_step(dup.get()) != SQLITE_ROW) {
-                    spdlog::error("{} dup-check: record_key '{}' was ignored but no stored row "
-                                  "could be read back", log_prefix, ev.record_key);
-                    return false;
-                }
-                // Length from sqlite3_column_bytes, NOT strlen. Constructing a
-                // string_view from the char* alone stops at an embedded NUL, so
-                // a stored "head\0tail" would compare equal to "head" -- and
-                // unequal to the value actually re-offered on a replay, which
-                // refuses the event as a collision on every later tick. The
-                // bind side has the same trap and is fixed the same way.
-                auto col = [&](int i) {
-                    const auto* t =
-                       reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
-                    if (t == nullptr)
-                        return std::string_view{};
-                    return std::string_view{t, static_cast<std::size_t>(
-                                                  sqlite3_column_bytes(dup.get(), i))};
-                };
-                // Same rule as the power twin: snapshot_id is per-tick
-                // collection metadata and never participates, and ts is
-                // identity for a real attach/detach but only "when we noticed"
-                // for a capture_gap. present_at_baseline joins that second
-                // group too (PR #4023 review round 2, blocker #2):
-                // removable_baseline_record_key() already keys ONLY on
-                // device_key, deliberately excluding ts, because a CursorLost
-                // re-baseline re-emits the identical baseline row with a
-                // fresh wall-clock ts -- if ts still participated here that
-                // re-emission would collide against the original row on every
-                // retry forever, permanently wedging the source on a
-                // corrupted-cursor recovery path that exists specifically to
-                // UN-wedge it.
-                const bool ts_is_not_identity =
-                    ev.action == "capture_gap" || ev.action == "present_at_baseline";
-                if ((ts_is_not_identity || sqlite3_column_int64(dup.get(), 0) == ev.ts) &&
-                    col(2) == ev.action && col(3) == ev.device_key && col(4) == ev.vendor &&
-                    col(5) == ev.product && col(6) == ev.serial && col(7) == ev.bus &&
-                    col(8) == ev.volume && sqlite3_column_int64(dup.get(), 9) == ev.size_bytes &&
-                    col(10) == ev.image_path && sqlite3_column_int64(dup.get(), 11) == ev.pid &&
-                    col(12) == ev.evidence)
-                    continue; // an exact replay -- the intended dedupe
-                spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
-                              "event, so accepting this batch would advance the cursor past an "
-                              "event that was never stored -- failing the transaction instead",
-                              log_prefix, ev.record_key);
-                collided = true;
-                return false;
-            }
-            return true;
-        });
-    if (ok)
-        return {};
-    return std::unexpected(collided ? CursorInsertError::KeyCollision
-                                    : CursorInsertError::Transient);
+std::expected<void, EchoDatabase::CursorInsertError>
+EchoDatabase::insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
+                                                 const std::string& cursor_json) {
+    return fold_cursor(fold_.get(), *this, "removable", events, removable_delta, cursor_json, {});
 }
 
 std::expected<void, EchoDatabase::CursorInsertError> EchoDatabase::insert_registry_events_and_cursor(
     const std::vector<RegistryEvent>& events, const std::string& cursor_json,
     const std::vector<StateWrite>& baseline_writes) {
-    // Same refusal as the power/removable twins: a blank or NUL-bearing key would
-    // collapse distinct rows under INSERT OR IGNORE and still report success.
-    for (const auto& ev : events) {
-        if (ev.record_key.empty() || ev.record_key.find('\0') != std::string::npos) {
-            spdlog::error("EchoDatabase::insert_registry_events_and_cursor: refusing a batch with an "
-                          "empty or NUL-bearing record_key -- the dedupe index would discard rows "
-                          "and report success");
-            return std::unexpected(CursorInsertError::KeyCollision);
-        }
-    }
-
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return std::unexpected(CursorInsertError::Transient);
-
-    bool collided = false;
-    const bool ok = insert_events_and_cursor_locked(
-        db_, "insert_registry_events_and_cursor", "registry", cursor_json,
-        [&events, &baseline_writes, &collided](sqlite3* db, const char* log_prefix) {
-            if (!events.empty()) {
-                const char* sql = R"(
-                    INSERT OR IGNORE INTO registry_live
-                        (ts, snapshot_id, hive, key_path, value_name, action, data_type, data,
-                         data_size, data_truncated, prev_data_type, prev_data, prev_data_size,
-                         prev_data_truncated, actor_pid, actor_image, source, observed_at,
-                         detail, record_key)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING record_key
-                )";
-                sqlite3_stmt* raw_stmt = nullptr;
-                if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-                    spdlog::error("{} events prepare: {}", log_prefix, sqlite3_errmsg(db));
-                    return false;
-                }
-                StmtPtr stmt(raw_stmt);
-                const char* dup_sql = R"(
-                    SELECT action, hive, key_path, value_name, data_type, data, data_size,
-                           prev_data_type, prev_data, prev_data_size, observed_at
-                      FROM registry_live WHERE record_key = ?
-                )";
-                sqlite3_stmt* raw_dup = nullptr;
-                if (sqlite3_prepare_v2(db, dup_sql, -1, &raw_dup, nullptr) != SQLITE_OK) {
-                    spdlog::error("{} dup-check prepare: {}", log_prefix, sqlite3_errmsg(db));
-                    return false;
-                }
-                StmtPtr dup(raw_dup);
-                const auto bind_text = [](sqlite3_stmt* s, int i, const std::string& v) {
-                    sqlite3_bind_text(s, i, v.c_str(), static_cast<int>(v.size()), SQLITE_STATIC);
-                };
-                for (const auto& ev : events) {
-                    sqlite3_reset(stmt.get());
-                    sqlite3_clear_bindings(stmt.get());
-                    sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-                    sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-                    bind_text(stmt.get(), 3, ev.hive);
-                    bind_text(stmt.get(), 4, ev.key_path);
-                    bind_text(stmt.get(), 5, ev.value_name);
-                    bind_text(stmt.get(), 6, ev.action);
-                    bind_text(stmt.get(), 7, ev.data_type);
-                    bind_text(stmt.get(), 8, ev.data);
-                    sqlite3_bind_int64(stmt.get(), 9, ev.data_size);
-                    sqlite3_bind_int(stmt.get(), 10, ev.data_truncated);
-                    bind_text(stmt.get(), 11, ev.prev_data_type);
-                    bind_text(stmt.get(), 12, ev.prev_data);
-                    sqlite3_bind_int64(stmt.get(), 13, ev.prev_data_size);
-                    sqlite3_bind_int(stmt.get(), 14, ev.prev_data_truncated);
-                    sqlite3_bind_int64(stmt.get(), 15, ev.actor_pid);
-                    bind_text(stmt.get(), 16, ev.actor_image);
-                    bind_text(stmt.get(), 17, ev.source);
-                    sqlite3_bind_int64(stmt.get(), 18, ev.observed_at);
-                    bind_text(stmt.get(), 19, ev.detail);
-                    bind_text(stmt.get(), 20, ev.record_key);
-                    // RETURNING, not sqlite3_changes(): see the power twin (#1033).
-                    const int step_rc = sqlite3_step(stmt.get());
-                    if (step_rc == SQLITE_ROW)
-                        continue; // inserted
-                    if (step_rc != SQLITE_DONE) {
-                        spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
-                        return false;
-                    }
-                    // Ignored: a legitimate replay, or a collision. Only the stored
-                    // IDENTITY (what changed) can tell them apart -- never the actor
-                    // or detail columns, which are not identity and must not wedge
-                    // the source on a permanent KeyCollision (the key is attribution-
-                    // independent: see registry_diff_record_key).
-                    sqlite3_reset(dup.get());
-                    sqlite3_clear_bindings(dup.get());
-                    bind_text(dup.get(), 1, ev.record_key);
-                    if (sqlite3_step(dup.get()) != SQLITE_ROW) {
-                        spdlog::error("{} dup-check: record_key '{}' was ignored but no stored "
-                                      "row could be read back", log_prefix,
-                                      yuzu::log_key_token(ev.record_key));
-                        return false;
-                    }
-                    auto col = [&](int i) {
-                        const auto* t =
-                           reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
-                        if (t == nullptr)
-                            return std::string_view{};
-                        return std::string_view{
-                           t, static_cast<std::size_t>(sqlite3_column_bytes(dup.get(), i))};
-                    };
-                    const bool is_gap = ev.action == "capture_gap";
-                    // A gap's identity lives entirely in its record_key (and the fact
-                    // it IS a gap); its time and text are "when we noticed".
-                    if (col(0) == ev.action &&
-                        (is_gap ||
-                         (col(1) == ev.hive && col(2) == ev.key_path && col(3) == ev.value_name &&
-                          col(4) == ev.data_type && col(5) == ev.data &&
-                          sqlite3_column_int64(dup.get(), 6) == ev.data_size &&
-                          col(7) == ev.prev_data_type && col(8) == ev.prev_data &&
-                          sqlite3_column_int64(dup.get(), 9) == ev.prev_data_size &&
-                          sqlite3_column_int64(dup.get(), 10) == ev.observed_at)))
-                        continue; // an exact replay -- the intended dedupe
-                    spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
-                                  "change, so accepting this batch would advance the cursor past "
-                                  "one that was never stored -- failing the transaction instead",
-                                  log_prefix, yuzu::log_key_token(ev.record_key));
-                    collided = true;
-                    return false;
-                }
-            }
-            // The per-root baselines commit with the rows they explain (same
-            // transaction, same lock).
-            for (const auto& w : baseline_writes) {
-                if (!upsert_state_locked(db, w.collector, w.json)) {
-                    spdlog::error("{} baseline write failed for '{}'", log_prefix, w.collector);
-                    return false;
-                }
-            }
-            return true;
-        });
-    if (ok)
-        return {};
-    return std::unexpected(collided ? CursorInsertError::KeyCollision
-                                    : CursorInsertError::Transient);
+    return fold_cursor(fold_.get(), *this, "registry", events, registry_delta, cursor_json,
+                       baseline_writes);
 }
 
 // ── Config management ────────────────────────────────────────────────────────
@@ -2217,9 +2026,12 @@ bool EchoDatabase::create_warehouse_tables() {
     return true;
 }
 
-std::expected<int, std::string> EchoDatabase::purge_source(const std::string& source) {
-    // Resolve the source's tier tables from the schema registry — never hardcode.
-    // Table names are <name>_<suffix> (same construction as stats()/DDL).
+std::expected<EchoDatabase::PurgeResult, std::string>
+EchoDatabase::purge_source(const std::string& source,
+                           std::chrono::steady_clock::duration dictionary_deadline) {
+    // Resolve the source's tables from the schema registry -- never hardcode. A roll-up tier
+    // name (`process_hourly`) is a VIEW; the rows live in its `_r` table. The tables the roll-up
+    // does not own (netqual_boot, usage_live, usage_daily) are named as they are.
     const CaptureSourceDef* def = nullptr;
     for (const auto& s : capture_sources()) {
         if (s.name == source) {
@@ -2230,982 +2042,321 @@ std::expected<int, std::string> EchoDatabase::purge_source(const std::string& so
     if (!def)
         return std::unexpected("unknown source: " + source);
 
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return std::unexpected(std::string("database not open"));
-
-    char* err_msg = nullptr;
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        std::string e = err_msg ? err_msg : "unknown";
-        sqlite3_free(err_msg);
-        return std::unexpected("BEGIN failed: " + e);
-    }
-
-    int total = 0;
+    std::vector<std::string> tables;
     for (const auto& g : def->granularities) {
-        const std::string table = std::string(def->name) + "_" + std::string(g.suffix);
-        const std::string sql = "DELETE FROM " + table;
-        if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
-            std::string e = err_msg ? err_msg : "unknown";
-            sqlite3_free(err_msg);
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return std::unexpected("purge failed on " + table + ": " + e);
-        }
-        // Safe under mu_: it serialises every access to db_, so no concurrent
-        // step() can race this changes() read (the #1033 hazard needs a shared,
-        // concurrently-used handle). O(1) vs stepping RETURNING rows on a bulk
-        // delete.
-        total += sqlite3_changes(db_);
+        const std::string name = std::string(def->name) + "_" + std::string(g.suffix);
+        tables.push_back(is_fold_view(name) ? name + "_r" : name);
     }
+    // usage_daily_user (Wave 7 PR7.2b) has no tier of its own in the registry -- its shape
+    // (PRIMARY KEY(day_ts, exe_key, user), no `id` column; see this file's v6 migration) does not
+    // fit the generic per-tier layout -- so the granularity walk never reaches it and an
+    // operator-initiated `echo.purge_source usage` would otherwise leave every username behind
+    // (docs/echo-dashboard.md §3.4's purge promise). It must never resurrect on re-enable: the
+    // lifecycle's PendingBaseline gate (echo_usage.cpp) always requires a fresh baseline first.
+    if (source == "usage")
+        tables.push_back("usage_daily_user");
 
-    // usage_daily_user (Wave 7 PR7.2b) has no tier of its own in the schema
-    // registry -- its shape (PRIMARY KEY(day_ts, exe_key, user), no `id`
-    // column; see this file's v6 migration) does not fit the generic
-    // per-tier layout the loop above walks, so the granularity walk above
-    // never reaches it and an operator-initiated `echo.purge_source usage`
-    // would otherwise leave every username behind (docs/echo-dashboard.md
-    // §3.4's purge promise). Purge it here, in the SAME transaction as the
-    // registered "usage" tiers above, so it erases atomically with
-    // everything else -- and it must never resurrect on re-enable: the
-    // lifecycle's PendingBaseline gate (echo_usage.cpp) always requires a
-    // fresh baseline before the next fold, which never reads usage_daily_
-    // user at all.
-    if (source == "usage") {
-        if (sqlite3_exec(db_, "DELETE FROM usage_daily_user", nullptr, nullptr, &err_msg) !=
-            SQLITE_OK) {
-            std::string e = err_msg ? err_msg : "unknown";
-            sqlite3_free(err_msg);
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return std::unexpected("purge failed on usage_daily_user: " + e);
-        }
-        total += sqlite3_changes(db_);
-    }
-
-    // registry (PR11.8): registry_live is not the only place the source keeps
-    // captured content. Each root's BASELINE (`registry:<root>` echo_state rows)
-    // holds each value's type, size and hash (an older build also kept a rendered prefix),
-    // and the CURSOR row holds the rendered new value of changes still waiting for their
-    // attribution to settle. Erase them all in THIS
-    // transaction, or a purge that the operator expects to be permanent leaves the very
-    // values it removed. The cursor erase also means the next collect is a fresh
-    // Baseline (zero rows), never a diff against a baseline that no longer exists.
-    // Bookkeeping rows are not counted in `total`.
+    // registry (PR11.8): the source keeps captured content beyond its tiers. Each root's BASELINE
+    // (`registry:<root>` echo_state rows) holds each value's type, size and hash, and the CURSOR
+    // row holds the rendered new value of changes still waiting for their attribution to settle.
+    // Erase them in THIS transaction too, or a purge the operator expects to be permanent leaves
+    // the very values it removed. The cursor erase also means the next collect is a fresh
+    // Baseline (zero rows), never a diff against a baseline that no longer exists. A cursor
+    // source's replay ring goes as well: a ring entry for a key whose rows are gone would make a
+    // re-offered record a silent no-op. Bookkeeping rows are not counted in `total`.
+    std::vector<std::string> bookkeeping;
     if (source == "registry") {
-        for (const char* sql : {"DELETE FROM echo_cursor WHERE source = 'registry'",
-                                "DELETE FROM echo_state WHERE collector LIKE 'registry:%'"}) {
-            if (sqlite3_exec(db_, sql, nullptr, nullptr, &err_msg) != SQLITE_OK) {
-                std::string e = err_msg ? err_msg : "unknown";
-                sqlite3_free(err_msg);
-                sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-                return std::unexpected("purge failed on registry bookkeeping: " + e);
+        bookkeeping.push_back("DELETE FROM echo_cursor WHERE source = 'registry'");
+        bookkeeping.push_back("DELETE FROM echo_state WHERE collector LIKE 'registry:%'");
+    }
+    if (const FoldSourceDef* fold = fold_source(source); fold && fold->cursor_source)
+        bookkeeping.push_back(std::format("DELETE FROM {} WHERE source = '{}'", kSeenTable, source));
+    // The identities of the historical mappings already folded (fold_mapdrive_events).
+    if (source == "mapdrive")
+        bookkeeping.push_back(
+            std::format("DELETE FROM {} WHERE source = '{}'", kSeenTable, kMapdriveHistoricalSource));
+
+    int64_t total = 0;
+    const auto purged = checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        for (const auto& table : tables) {
+            // Counted first, in the same transaction: a RETURNING row per deleted row of a large
+            // table would cost more than the delete.
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(h.raw(), std::format("SELECT COUNT(*) FROM {}", table).c_str(), -1,
+                                   &raw, nullptr) != SQLITE_OK) {
+                h.fail(std::format("purge failed on {}: {}", table, sqlite3_errmsg(h.raw())));
+                return std::unexpected(h.error());
             }
+            {
+                StmtPtr count(raw);
+                if (sqlite3_step(count.get()) != SQLITE_ROW) {
+                    h.fail(std::format("purge failed on {}: {}", table, sqlite3_errmsg(h.raw())));
+                    return std::unexpected(h.error());
+                }
+                total += sqlite3_column_int64(count.get(), 0);
+            }
+            if (!h.exec("DELETE FROM " + table))
+                return std::unexpected(std::format("purge failed on {}: {}", table, h.error()));
+        }
+        for (const auto& sql : bookkeeping)
+            if (!h.exec(sql))
+                return std::unexpected("purge failed on bookkeeping: " + h.error());
+        return {};
+    });
+    if (!purged)
+        return std::unexpected(purged.error());
+
+    // The strings only this source's rows referenced (process names, users, DNS names, key paths)
+    // are forensic data too: sweep the dictionary now rather than leave them to the weekly pass.
+    // Operator-initiated and rare, so it gets a long deadline. If it still runs out or fails,
+    // the result SAYS so and the starved counter moves (cmp-3): the action's audit row must not
+    // record a complete erasure while the purged strings are still on disk. The weekly sweep
+    // finishes the job.
+    PurgeResult out{static_cast<int>(total), false};
+    if (fold_) {
+        const auto swept = fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline);
+        if (!swept) {
+            out.dictionary_pending = true;
+            spdlog::warn("purge_source({}): the dictionary sweep failed ({}); the purged strings "
+                         "stay until the weekly sweep",
+                         source, swept.error());
+        } else if (swept->deadline_hit) {
+            out.dictionary_pending = true;
+            spdlog::warn("purge_source({}): the dictionary sweep ran out of time; the purged strings "
+                         "stay until the weekly sweep",
+                         source);
+        }
+        if (out.dictionary_pending) {
+            int64_t starved = 0;
+            const auto text = get_config("dict_gc_starved_total", "0");
+            const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), starved);
+            if (ec != std::errc{} || p != text.data() + text.size())
+                starved = 0;
+            (void)set_config("dict_gc_starved_total", std::to_string(starved + 1));
         }
     }
 
-    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        std::string e = err_msg ? err_msg : "unknown";
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return std::unexpected("COMMIT failed: " + e);
-    }
-
-    // Forensic-erasure completion: secure_delete=ON (open path) zeroes the
-    // deleted rows in the MAIN-db pages, but under journal_mode=WAL the pre-delete
-    // page images (still bearing the purged data) linger in the -wal file until a
-    // checkpoint truncates it. For a "permanent / cannot be undone" purge that is
-    // a real residue window — and the operator often purges to reclaim disk, which
-    // a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint here so
-    // the erasure is complete and the WAL is reclaimed at return. Best-effort: the
-    // DELETE already committed, so a checkpoint that can't fully complete (e.g. a
-    // lingering reader) is logged, not fatal — the residue clears at the next one.
-    if (int wrc = sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr,
-                                            nullptr);
-        wrc != SQLITE_OK) {
-        spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) returned {} — purged data may "
+    // Forensic-erasure completion: secure_delete=ON (open path) zeroes the deleted rows in the
+    // MAIN-db pages, but under journal_mode=WAL the pre-delete page images (still bearing the
+    // purged data) linger in the -wal file until a checkpoint truncates it. For a "permanent /
+    // cannot be undone" purge that is a real residue window -- and the operator often purges to
+    // reclaim disk, which a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint
+    // here so the erasure is complete and the WAL is reclaimed at return. Best-effort: the DELETE
+    // already committed, so a checkpoint that can't fully complete (e.g. a lingering reader) is
+    // logged, not fatal -- the residue clears at the next one.
+    if (checkpoint(CheckpointMode::kTruncate) != CheckpointResult::kOk) {
+        spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) did not complete -- purged data may "
                      "persist in the WAL until the next checkpoint",
-                     source, wrc);
-    }
-    return total;
-}
-
-// ── Typed inserts ───────────────────────────────────────────────────────────
-
-bool EchoDatabase::insert_process_events(const std::vector<ProcessEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_process_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO process_live (ts, snapshot_id, action, pid, ppid, name, cmdline, user)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_process_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt.get(), 4, static_cast<int>(ev.pid));
-        sqlite3_bind_int(stmt.get(), 5, static_cast<int>(ev.ppid));
-        sqlite3_bind_text(stmt.get(), 6, ev.name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 7, ev.cmdline.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 8, ev.user.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_process_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_process_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
-}
-
-bool EchoDatabase::insert_network_events(const std::vector<NetworkEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_network_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO tcp_live (ts, snapshot_id, action, proto, local_addr, local_port,
-                              remote_addr, remote_host, remote_port, state, pid, process_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_network_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.proto.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.local_addr.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt.get(), 6, ev.local_port);
-        sqlite3_bind_text(stmt.get(), 7, ev.remote_addr.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 8, ev.remote_host.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt.get(), 9, ev.remote_port);
-        sqlite3_bind_text(stmt.get(), 10, ev.state.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt.get(), 11, static_cast<int>(ev.pid));
-        sqlite3_bind_text(stmt.get(), 12, ev.process_name.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_network_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_network_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
-}
-
-std::expected<std::vector<NetworkEvent>, std::string>
-EchoDatabase::query_recent_tcp_connections(int64_t since_ts) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return std::unexpected{"database not open"};
-
-    // Group by 5-tuple+pid; surface the most recent observation per group.
-    // Filter to ESTABLISHED — LISTEN/TIME_WAIT/CLOSE_WAIT/etc. are not
-    // "this box talks to that box" edges and would pollute the viz.
-    // remote_host (reverse-DNS) is taken from the latest row in the group
-    // via a correlated subquery; if two rows in the same group resolved
-    // differently, we accept the newest.
-    const char* sql = R"(
-        SELECT proto, local_addr, local_port, remote_addr, remote_port, pid,
-               MAX(process_name) AS process_name,
-               MAX(remote_host)  AS remote_host,
-               MAX(state)        AS state,
-               MAX(ts)           AS ts
-        FROM tcp_live
-        WHERE ts >= ?
-          AND state = 'ESTABLISHED'
-        GROUP BY proto, local_addr, local_port, remote_addr, remote_port, pid
-        ORDER BY ts DESC
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK)
-        return std::unexpected{std::string{"prepare: "} + sqlite3_errmsg(db_)};
-    StmtPtr stmt(raw_stmt);
-
-    sqlite3_bind_int64(stmt.get(), 1, since_ts);
-
-    std::vector<NetworkEvent> out;
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        NetworkEvent ev;
-        auto col_text = [&](int i) -> std::string {
-            const unsigned char* p = sqlite3_column_text(stmt.get(), i);
-            return p ? std::string{reinterpret_cast<const char*>(p)} : std::string{};
-        };
-        ev.proto = col_text(0);
-        ev.local_addr = col_text(1);
-        ev.local_port = sqlite3_column_int(stmt.get(), 2);
-        ev.remote_addr = col_text(3);
-        ev.remote_port = sqlite3_column_int(stmt.get(), 4);
-        ev.pid = static_cast<uint32_t>(sqlite3_column_int(stmt.get(), 5));
-        ev.process_name = col_text(6);
-        ev.remote_host = col_text(7);
-        ev.state = col_text(8);
-        ev.ts = sqlite3_column_int64(stmt.get(), 9);
-        out.push_back(std::move(ev));
+                     source);
     }
     return out;
 }
 
-bool EchoDatabase::insert_service_events(const std::vector<ServiceEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
+// ── Roll-up folds ───────────────────────────────────────────────────────────
+
+namespace {
+
+// Derive `source`'s tiers from a batch with `fill` and fold them in ONE transaction. With nothing
+// to fold and no baseline to write there is nothing to do (and no transaction). A declaration typo
+// in a delta throws std::invalid_argument; it is logged and reported as a failed fold, never
+// allowed to unwind into a collector.
+template <class Fill>
+bool fold_batch(EchoDatabase& db, EchoFold* fold, std::string_view source, bool no_events,
+                const std::optional<StateWrite>& state, Fill&& fill,
+                const EchoFold::ExtraFn& extra = {}) {
+    if (no_events && !state)
+        return true;
+    if (!fold)
         return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_service_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO service_live (ts, snapshot_id, action, name, display_name, status,
-                                  prev_status, startup_type, prev_startup_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_service_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.display_name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 6, ev.status.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 7, ev.prev_status.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 8, ev.startup_type.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 9, ev.prev_startup_type.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_service_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    try {
+        const FoldSourceDef* def = fold_source(source);
+        if (!def) {
+            spdlog::error("EchoDatabase: fold of unknown source '{}'", source);
             return false;
         }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_service_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
-}
-
-bool EchoDatabase::insert_user_events(const std::vector<UserEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_user_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO user_live (ts, snapshot_id, action, user, domain, logon_type, session_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_user_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.user.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.domain.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 6, ev.logon_type.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 7, ev.session_id.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_user_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        TierAccumulator acc(*def);
+        fill(acc);
+        const auto r = fold->fold_rows(db, source, acc, state, extra);
+        if (!r) {
+            spdlog::error("EchoDatabase: fold_{} failed: {}", source, r.error());
             return false;
         }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::error("EchoDatabase: fold_{} failed: {}", source, e.what());
         return false;
     }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_user_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
 }
 
-bool EchoDatabase::insert_software_events(const std::vector<SoftwareEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
+} // namespace
 
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_software_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO software_live (ts, snapshot_id, action, name, version, prev_version,
-                                   publisher, install_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_software_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.version.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 6, ev.prev_version.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 7, ev.publisher.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 8, ev.install_date.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_software_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_software_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
-}
-
-bool EchoDatabase::insert_arp_events(const std::vector<ArpEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_arp_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO arp_live (ts, snapshot_id, action, interface, ip_address, mac_address, entry_type)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_arp_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.iface.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.ip_address.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 6, ev.mac_address.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 7, ev.entry_type.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_arp_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_arp_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
-}
-
-bool EchoDatabase::insert_dns_events(const std::vector<DnsEvent>& events,
-                                       const std::optional<StateWrite>& state) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_dns_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO dns_live (ts, snapshot_id, action, name, record_type, data, ttl_remaining_s, source)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_dns_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.name.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.record_type.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 6, ev.data.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt.get(), 7, ev.ttl_remaining_s);
-        sqlite3_bind_text(stmt.get(), 8, ev.source.c_str(), -1, SQLITE_STATIC);
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_dns_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_dns_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
-}
-
-bool EchoDatabase::insert_mapdrive_events(const std::vector<MapDriveEvent>& events,
+bool EchoDatabase::fold_process_events(const std::vector<ProcessEvent>& events,
                                        const std::optional<StateWrite>& state,
-                                       bool skip_known_historical) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-    if (events.empty())
-        return !state || upsert_state_locked(db_, state->collector, state->json);
-
-    char* err_msg = nullptr;
-    int rc_begin = sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg);
-    if (rc_begin != SQLITE_OK) {
-        spdlog::error("insert_mapdrive_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
+                                       std::optional<int64_t> usage_now) {
+    // The usage fold rides in the same transaction (EchoFold::fold_rows' `extra`): a failure of
+    // either rolls both back, and the caller re-offers the same events to both.
+    EchoFold::ExtraFn usage_fold;
+    if (!events.empty()) {
+        const int64_t now = usage_now.value_or(now_epoch_seconds());
+        usage_fold = [&events, now](TransactionHandle& h) {
+            return usage::usage_fold_in(h, now, events);
+        };
     }
-    sqlite3_free(err_msg);
-
-    // skip_known_historical (the bounded per-profile retry's own call): an INSERT...SELECT whose
-    // WHERE NOT EXISTS subquery is scoped to origin='historical' rows sharing this event's mapping
-    // identity. mapdrive_live is append-only -- nothing ever UPDATEs it -- so a row already
-    // recorded keeps its first-recorded ts regardless of what this retry's own (always later or
-    // equal) ts carries; the plain VALUES form is unchanged for the live-diff path, which never
-    // wants this dedup (a live event is action-tagged, never origin='historical').
-    const char* sql = skip_known_historical ? R"(
-        INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (
-            SELECT 1 FROM mapdrive_live WHERE origin = 'historical'
-                AND direction = ? AND local_mount = ? AND remote_path = ? AND remote_host = ? AND username = ?
-        )
-    )" : R"(
-        INSERT INTO mapdrive_live (ts, snapshot_id, action, direction, local_mount, remote_path, remote_host, username, provider, origin)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_mapdrive_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& ev : events) {
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, ev.ts);
-        sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, ev.direction.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 5, ev.local_mount.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 6, ev.remote_path.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 7, ev.remote_host.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 8, ev.username.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 9, ev.provider.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 10, ev.origin.c_str(), -1, SQLITE_STATIC);
-        if (skip_known_historical) {
-            sqlite3_bind_text(stmt.get(), 11, ev.direction.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt.get(), 12, ev.local_mount.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt.get(), 13, ev.remote_path.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt.get(), 14, ev.remote_host.c_str(), -1, SQLITE_STATIC);
-            sqlite3_bind_text(stmt.get(), 15, ev.username.c_str(), -1, SQLITE_STATIC);
-        }
-
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_mapdrive_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-    }
-
-    if (state && !upsert_state_locked(db_, state->collector, state->json)) {
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-
-    err_msg = nullptr;
-    rc = sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("insert_mapdrive_events commit: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    return true;
+    return fold_batch(*this, fold_.get(), "process", events.empty(), state,
+                      [&](TierAccumulator& acc) { process_delta(events, acc); }, usage_fold);
 }
 
-bool EchoDatabase::insert_perf_sample(const PerfRow& row) {
-    std::lock_guard lock(mu_);
-    if (!db_)
-        return false;
-
-    // Single row per sample interval — no transaction wrapper needed (one
-    // statement is already atomic; one fsync per 30 s is the WAL cost).
-    const char* sql = R"(
-        INSERT INTO perf_live (ts, snapshot_id, cpu_pct, mem_used_pct, commit_pct,
-                               disk_read_bps, disk_write_bps, disk_read_lat_us,
-                               disk_write_lat_us, net_rx_bps, net_tx_bps)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-
-    sqlite3_stmt* raw_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("insert_perf_sample prepare: {}", sqlite3_errmsg(db_));
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    sqlite3_bind_int64(stmt.get(), 1, row.ts);
-    sqlite3_bind_int64(stmt.get(), 2, row.snapshot_id);
-    sqlite3_bind_double(stmt.get(), 3, row.cpu_pct);
-    sqlite3_bind_double(stmt.get(), 4, row.mem_used_pct);
-    sqlite3_bind_double(stmt.get(), 5, row.commit_pct);
-    sqlite3_bind_int64(stmt.get(), 6, row.disk_read_bps);
-    sqlite3_bind_int64(stmt.get(), 7, row.disk_write_bps);
-    sqlite3_bind_int64(stmt.get(), 8, row.disk_read_lat_us);
-    sqlite3_bind_int64(stmt.get(), 9, row.disk_write_lat_us);
-    sqlite3_bind_int64(stmt.get(), 10, row.net_rx_bps);
-    sqlite3_bind_int64(stmt.get(), 11, row.net_tx_bps);
-
-    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-        spdlog::error("insert_perf_sample step: {}", sqlite3_errmsg(db_));
-        return false;
-    }
-    return true;
+bool EchoDatabase::fold_network_events(const std::vector<NetworkEvent>& events,
+                                       const std::optional<StateWrite>& state) {
+    return fold_batch(*this, fold_.get(), "tcp", events.empty(), state,
+                      [&](TierAccumulator& acc) { tcp_delta(events, acc); });
 }
 
-bool EchoDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows) {
-    std::lock_guard lock(mu_);
-    if (!db_ || rows.empty())
-        return rows.empty();
-
-    // <= 2*kProcTopN rows per tick — one transaction, one fsync per 30 s.
-    char* err_msg = nullptr;
-    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_proc_perf_samples BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes,
-            is_kthread)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-    sqlite3_stmt* raw_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("insert_proc_perf_samples prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& r : rows) {
-        sqlite3_bind_int64(stmt.get(), 1, r.ts);
-        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, r.name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 4, r.version.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt.get(), 5, r.instances);
-        sqlite3_bind_double(stmt.get(), 6, r.cpu_pct);
-        sqlite3_bind_int64(stmt.get(), 7, r.ws_bytes);
-        sqlite3_bind_int(stmt.get(), 8, r.is_kthread ? 1 : 0);
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_proc_perf_samples step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-    }
-
-    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_proc_perf_samples COMMIT: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    sqlite3_free(err_msg);
-    return true;
+bool EchoDatabase::fold_service_events(const std::vector<ServiceEvent>& events,
+                                       const std::optional<StateWrite>& state) {
+    return fold_batch(*this, fold_.get(), "service", events.empty(), state,
+                      [&](TierAccumulator& acc) { service_delta(events, acc); });
 }
 
-bool EchoDatabase::insert_module_events(const std::vector<ModuleRow>& rows) {
-    std::lock_guard lock(mu_);
-    if (!db_ || rows.empty())
-        return rows.empty();
-
-    // One transaction per drain batch — one fsync regardless of batch size.
-    char* err_msg = nullptr;
-    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_module_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO module_live (ts, snapshot_id, action, pid, process_name,
-                                 module_name, module_dir, signed_state, signer, is_kernel)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-    sqlite3_stmt* raw_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("insert_module_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& r : rows) {
-        sqlite3_bind_int64(stmt.get(), 1, r.ts);
-        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, r.action.c_str(), -1, SQLITE_TRANSIENT);
-        // pid is uint32; bind as int64 so a high pid never wraps negative.
-        sqlite3_bind_int64(stmt.get(), 4, static_cast<int64_t>(r.pid));
-        sqlite3_bind_text(stmt.get(), 5, r.process_name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 6, r.module_name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 7, r.module_dir.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 8, r.signed_state.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 9, r.signer.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(stmt.get(), 10, r.is_kernel ? 1 : 0);
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_module_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-    }
-
-    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_module_events COMMIT: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    sqlite3_free(err_msg);
-    return true;
+bool EchoDatabase::fold_user_events(const std::vector<UserEvent>& events,
+                                    const std::optional<StateWrite>& state) {
+    return fold_batch(*this, fold_.get(), "user", events.empty(), state,
+                      [&](TierAccumulator& acc) { user_delta(events, acc); });
 }
 
-bool EchoDatabase::insert_netqual_samples(const std::vector<NetQualRow>& rows) {
-    std::lock_guard lock(mu_);
-    if (!db_ || rows.empty())
-        return rows.empty();
-
-    // <= top-N connections per tick (collector cap) — one transaction per tick.
-    char* err_msg = nullptr;
-    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_netqual_samples BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
-
-    const char* sql = R"(
-        INSERT INTO netqual_live
-            (ts, snapshot_id, proto, remote_bucket, process_name,
-             rtt_us, rtt_var_us, lost, retrans, segs_out, ca_state)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-    sqlite3_stmt* raw_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("insert_netqual_samples prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& r : rows) {
-        sqlite3_bind_int64(stmt.get(), 1, r.ts);
-        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, r.proto.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 4, r.remote_bucket.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 5, r.process_name.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt.get(), 6, r.rtt_us);
-        sqlite3_bind_int64(stmt.get(), 7, r.rtt_var_us);
-        sqlite3_bind_int64(stmt.get(), 8, r.lost);
-        sqlite3_bind_int64(stmt.get(), 9, r.retrans);
-        sqlite3_bind_int64(stmt.get(), 10, r.segs_out);
-        sqlite3_bind_int64(stmt.get(), 11, r.ca_state);
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_netqual_samples step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
-        }
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
-    }
-
-    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_netqual_samples COMMIT: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    sqlite3_free(err_msg);
-    return true;
+bool EchoDatabase::fold_software_events(const std::vector<SoftwareEvent>& events,
+                                        const std::optional<StateWrite>& state) {
+    return fold_batch(*this, fold_.get(), "software", events.empty(), state,
+                      [&](TierAccumulator& acc) { software_delta(events, acc); });
 }
 
-bool EchoDatabase::insert_netconn_events(const std::vector<NetConnRow>& rows) {
-    std::lock_guard lock(mu_);
-    if (!db_ || rows.empty())
-        return rows.empty();
+bool EchoDatabase::fold_arp_events(const std::vector<ArpEvent>& events,
+                                   const std::optional<StateWrite>& state) {
+    return fold_batch(*this, fold_.get(), "arp", events.empty(), state,
+                      [&](TierAccumulator& acc) { arp_delta(events, acc); });
+}
 
-    char* err_msg = nullptr;
-    if (sqlite3_exec(db_, "BEGIN TRANSACTION", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_netconn_events BEGIN: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return false;
-    }
-    sqlite3_free(err_msg);
+bool EchoDatabase::fold_dns_events(const std::vector<DnsEvent>& events,
+                                   const std::optional<StateWrite>& state) {
+    return fold_batch(*this, fold_.get(), "dns", events.empty(), state,
+                      [&](TierAccumulator& acc) { dns_delta(events, acc); });
+}
 
-    const char* sql = R"(
-        INSERT INTO netconn_live
-            (ts, snapshot_id, action, channel, category, capability,
-             iface_kind, reason_code)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    )";
-    sqlite3_stmt* raw_stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
-        spdlog::error("insert_netconn_events prepare: {}", sqlite3_errmsg(db_));
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    StmtPtr stmt(raw_stmt);
-
-    for (const auto& r : rows) {
-        sqlite3_bind_int64(stmt.get(), 1, r.ts);
-        sqlite3_bind_int64(stmt.get(), 2, r.snapshot_id);
-        sqlite3_bind_text(stmt.get(), 3, r.action.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 4, r.channel.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 5, r.category.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 6, r.capability.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 7, r.iface_kind.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt.get(), 8, r.reason_code);
-        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-            spdlog::error("insert_netconn_events step: {}", sqlite3_errmsg(db_));
-            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-            return false;
+bool EchoDatabase::fold_mapdrive_events(const std::vector<MapDriveEvent>& events,
+                                        const std::optional<StateWrite>& state,
+                                        bool skip_known_historical) {
+    // A `historical` event is a one-time backfill of a mapping the host already had, and its count
+    // is ADDITIVE: folding the same mapping twice counts it twice. The raw store stopped that by
+    // asking "does a historical row of this identity exist?"; there is no raw row now, so the
+    // identity of every historical mapping folded is remembered, as a hash of (direction,
+    // local_mount, remote_path, remote_host, username) -- the username is personal data and never
+    // stored in the clear -- in the replay ring's table, in the SAME transaction as its count.
+    // Under skip_known_historical (the bounded per-profile retry's own call) a mapping already
+    // remembered is skipped, and so is a repeat inside the batch.
+    std::vector<MapDriveEvent> fold_these;
+    std::vector<std::string> new_keys;
+    {
+        std::unordered_set<std::string> known;
+        std::vector<std::string> keyed(events.size()); // empty for a non-historical event
+        std::string in_list;
+        int n_keys = 0;
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            if (events[i].origin != "historical")
+                continue;
+            const auto& e = events[i];
+            keyed[i] = identity_hex({e.direction, e.local_mount, e.remote_path, e.remote_host, e.username});
+            in_list += (n_keys++ ? ",'" : "'") + keyed[i] + "'"; // hex digits only: safe to interpolate
         }
-        sqlite3_reset(stmt.get());
-        sqlite3_clear_bindings(stmt.get());
+        if (skip_known_historical && n_keys > 0) {
+            const auto rows = execute_query(
+                std::format("SELECT record_key FROM {} WHERE source = '{}' AND record_key IN ({})",
+                            kSeenTable, kMapdriveHistoricalSource, in_list),
+                n_keys + 1);
+            if (!rows) {
+                spdlog::error("EchoDatabase: fold_mapdrive_events: the known-mapping lookup failed: {}",
+                              rows.error());
+                return false;
+            }
+            for (const auto& r : rows->rows)
+                known.insert(r.at(0));
+        }
+        std::unordered_set<std::string> in_batch;
+        for (std::size_t i = 0; i < events.size(); ++i) {
+            if (events[i].origin != "historical") {
+                fold_these.push_back(events[i]);
+                continue;
+            }
+            const bool repeat = !in_batch.insert(keyed[i]).second;
+            if (skip_known_historical && (repeat || known.contains(keyed[i])))
+                continue;
+            fold_these.push_back(events[i]);
+            if (!repeat)
+                new_keys.push_back(keyed[i]);
+        }
     }
 
-    if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
-        spdlog::error("insert_netconn_events COMMIT: {}", err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
+    EchoFold::ExtraFn remember;
+    if (!new_keys.empty()) {
+        remember = [&new_keys, skip_known_historical](TransactionHandle& h) -> std::expected<void, std::string> {
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(h.raw(),
+                                   std::format("INSERT INTO {} (source, record_key, digest, seq) "
+                                               "VALUES ('{}', ?, 0, 0) ON CONFLICT DO NOTHING "
+                                               "RETURNING record_key",
+                                               kSeenTable, kMapdriveHistoricalSource)
+                                       .c_str(),
+                                   -1, &raw, nullptr) != SQLITE_OK) {
+                h.fail(std::string("prepare failed: ") + sqlite3_errmsg(h.raw()));
+                return std::unexpected(h.error());
+            }
+            StmtPtr stmt(raw); // finalised on every exit, before the caller commits
+            for (const auto& key : new_keys) {
+                // Back to ready (drops the previous pass's RETURNING row); the one parameter is rebound.
+                sqlite3_reset(stmt.get());
+                sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_STATIC);
+                const int rc = sqlite3_step(stmt.get());
+                if (rc == SQLITE_DONE) { // already remembered
+                    if (skip_known_historical) { // ... between the lookup and the fold: do not count it twice
+                        h.fail("a historical mapping was recorded between the lookup and the fold");
+                        return std::unexpected(h.error());
+                    }
+                    continue;
+                }
+                if (rc != SQLITE_ROW) {
+                    h.fail(std::string("step failed: ") + sqlite3_errmsg(h.raw()));
+                    return std::unexpected(h.error());
+                }
+            }
+            return {};
+        };
     }
-    sqlite3_free(err_msg);
-    return true;
+    return fold_batch(*this, fold_.get(), "mapdrive", fold_these.empty(), state,
+                      [&](TierAccumulator& acc) { mapdrive_delta(fold_these, acc); }, remember);
+}
+
+bool EchoDatabase::fold_perf_sample(const PerfRow& row) {
+    return fold_batch(*this, fold_.get(), "perf", false, std::nullopt,
+                      [&](TierAccumulator& acc) { perf_delta(std::vector<PerfRow>{row}, acc); });
+}
+
+bool EchoDatabase::fold_proc_perf_samples(const std::vector<ProcPerfRow>& rows) {
+    return fold_batch(*this, fold_.get(), "procperf", rows.empty(), std::nullopt,
+                      [&](TierAccumulator& acc) { procperf_delta(rows, acc); });
+}
+
+bool EchoDatabase::fold_netqual_samples(const std::vector<NetQualRow>& rows) {
+    return fold_batch(*this, fold_.get(), "netqual", rows.empty(), std::nullopt,
+                      [&](TierAccumulator& acc) { netqual_delta(rows, acc); });
+}
+
+bool EchoDatabase::fold_netconn_events(const std::vector<NetConnRow>& rows) {
+    return fold_batch(*this, fold_.get(), "netconn", rows.empty(), std::nullopt,
+                      [&](TierAccumulator& acc) { netconn_delta(rows, acc); });
+}
+
+bool EchoDatabase::fold_module_events(const std::vector<ModuleRow>& rows) {
+    return fold_batch(*this, fold_.get(), "module", rows.empty(), std::nullopt,
+                      [&](TierAccumulator& acc) { module_delta(rows, acc); });
 }
 
 bool EchoDatabase::insert_netqual_boot_row(const NetQualBootRow& row) {
@@ -3643,14 +2794,31 @@ StorageBytes EchoDatabase::storage_bytes_locked() {
         }
     }
 
-    // The WAL file lives beside the main file; sqlite3_db_filename names the main file only.
+    // The WAL file lives beside the main file; sqlite3_db_filename names the main file only. An
+    // unreadable log is a failed measurement, not an empty one (B6): `ok` goes false.
     if (const char* main_file = sqlite3_db_filename(db_, "main"); main_file && *main_file) {
-        std::error_code ec;
-        const auto size = std::filesystem::file_size(std::string(main_file) + "-wal", ec);
-        if (!ec)
-            out.wal_bytes = static_cast<int64_t>(size);
+        if (const auto wal = wal_file_bytes(main_file))
+            out.wal_bytes = *wal;
+        else
+            out.ok = false;
     }
     return out;
+}
+
+std::optional<int64_t> wal_file_bytes(const std::filesystem::path& main_file) {
+    const std::filesystem::path wal{main_file.string() + "-wal"};
+    std::error_code ec;
+    // Only a regular file has a size: file_size() of a directory succeeds on Windows (it is an
+    // error on POSIX), and a log that is not a file must fail the measurement, never read as 0.
+    const auto type = std::filesystem::status(wal, ec).type();
+    if (type == std::filesystem::file_type::not_found)
+        return 0;
+    if (ec || type != std::filesystem::file_type::regular)
+        return std::nullopt;
+    const auto size = std::filesystem::file_size(wal, ec);
+    if (ec)
+        return std::nullopt;
+    return static_cast<int64_t>(size);
 }
 
 std::expected<int64_t, std::string> EchoDatabase::delete_counted(const std::string& sql,
@@ -3764,10 +2932,26 @@ void EchoDatabase::rollback_open_transaction() noexcept {
         if (!db || sqlite3_get_autocommit(db) != 0)
             return;
         const int rc = sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        // Ask, never assume (the same rule checked_transaction applies): a ROLLBACK that reports an
+        // error may mean SQLite already ended the transaction, or that the connection is stuck
+        // inside one. A stuck connection would report every later write durable and lose it at
+        // close, so it is closed -- every method then fails closed through its `if (!db_)` test.
+        if (sqlite3_get_autocommit(db) == 0) {
+            spdlog::error("EchoDatabase: ROLLBACK after an exception failed (rc={}) and the "
+                          "connection is STILL in a transaction. Closing the Echo database: further "
+                          "writes would be reported as durable and then lost. Echo storage is "
+                          "offline on this endpoint until the agent restarts.",
+                          rc);
+            sqlite3_close_v2(db);
+            db_ = nullptr;
+            return;
+        }
         if (rc == SQLITE_OK)
             spdlog::warn("EchoDatabase: rolled back a transaction left open by an exception");
         else
-            spdlog::warn("EchoDatabase: ROLLBACK after an exception failed (rc={})", rc);
+            spdlog::warn("EchoDatabase: ROLLBACK after an exception reported rc={} but the "
+                         "transaction had ended",
+                         rc);
     } catch (...) {
         // noexcept containment: a failed lock or log must not escape the catch handler.
     }

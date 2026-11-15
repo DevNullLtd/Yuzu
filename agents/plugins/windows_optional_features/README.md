@@ -23,7 +23,7 @@ flowchart LR
   EX --> SLOT["Windows leg: resolve the DismApi.dll exports, then acquire the agent-core DISM slot"]
   SLOT -->|"acquired"| WIN["17 second bounded worker: DismInitialize, DismOpenSession, DismGetFeatures or DismGetFeatureInfo, DismCloseSession, DismShutdown"]
   SLOT -->|"exports missing, busy or abandoned"| SENT["sentinel row, status UNAVAILABLE or CONSTRAINED"]
-  WIN --> ROWS["feature rows, status UNDECLARED on success, else a sentinel row with UNAVAILABLE, CONSTRAINED or PERMISSION_DENIED"]
+  WIN --> ROWS["feature rows, status OK with completeness FULL on success, else a sentinel row with UNAVAILABLE, CONSTRAINED or PERMISSION_DENIED"]
   EX --> MAC["macOS leg: no OS call"]
   EX --> LIN["Linux leg: no OS call"]
   MAC & LIN --> UNS["unsupported row, status UNAVAILABLE"]
@@ -156,7 +156,7 @@ A failed or constrained read still exits 0 (only an invalid parameter or an unha
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` (agent-derived `OK`) | — | — | a clean `list`/`info` read — the DISM call succeeded and the feature row(s) were written |
+| `OK` | FULL | — | a clean `list`/`info` read — the DISM call succeeded and the feature row(s) were written. The installed-software sync reads this declaration: an answer that declares no completeness is not trusted as complete. The sample capture below predates it and shows `UNDECLARED / UNKNOWN`; it is refreshed at the next Windows recapture |
 | `UNAVAILABLE` | PARTIAL | `windows:dism:api_unavailable` | `DismApi.dll` or one of its eight required exports could not be resolved from `System32` |
 | `UNAVAILABLE` | PARTIAL | `linux:dism:unsupported`, `macos:dism:unsupported` | Linux/macOS: DISM has no equivalent on this platform |
 | `UNAVAILABLE` | FULL | `windows:dism:feature_not_found` | `info`: the named feature does not exist (`DismGetFeatureInfo` returns `DISMAPI_E_UNKNOWN_FEATURE`) |

@@ -1694,6 +1694,27 @@ std::string read_server_cpp() {
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
+// Position of the first occurrence of `needle` that does not continue an identifier on its left
+// (`my_evaluate_body_cap(` is not `evaluate_body_cap(`); npos when there is none.
+std::size_t find_token(const std::string& hay, std::string_view needle, std::size_t from = 0) {
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_';
+    };
+    for (auto at = hay.find(needle, from); at != std::string::npos; at = hay.find(needle, at + 1))
+        if (at == 0 || !is_ident(hay[at - 1]))
+            return at;
+    return std::string::npos;
+}
+
+std::size_t count_token(const std::string& hay, std::string_view needle) {
+    std::size_t n = 0;
+    for (auto at = find_token(hay, needle); at != std::string::npos;
+         at = find_token(hay, needle, at + 1))
+        ++n;
+    return n;
+}
+
 std::size_t count_of(const std::string& hay, std::string_view needle) {
     std::size_t n = 0;
     for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
@@ -1737,6 +1758,7 @@ TEST_CASE("wiring: server.cpp clears the pass stash at the pre-routing top and p
     const auto quota_reset = src.rfind("detail::tls_quota_slot().reset();", clear);
     REQUIRE(quota_reset != std::string::npos);
     CHECK(clear - quota_reset < 1200);
+
     // The stage is called from the install, not from anywhere else, and the install precedes the
     // first route registered on the web server: the sink reads the stage at registration time.
     CHECK(pre_request < stage);
@@ -1907,7 +1929,8 @@ std::string read_file(const std::filesystem::path& path) {
 
 } // namespace
 
-TEST_CASE("wiring: server.cpp owns the post-read stage registration through a scope guard",
+TEST_CASE("wiring: server.cpp closes an unread framed body in the post-routing handler and owns "
+          "the stage registration through a scope guard",
           "[stepup][wiring][lexical]") {
     // Run over comment- and literal-stripped text: a mention in a comment or a string cannot
     // count as the call.
@@ -1915,23 +1938,101 @@ TEST_CASE("wiring: server.cpp owns the post-read stage registration through a sc
     const auto stripped = strip_comments_and_literals(raw);
     REQUIRE(stripped.clean);
     const std::string& src = stripped.text;
+    constexpr std::string_view kClose = "close_if_unread_framed_body(req, res);";
     constexpr std::string_view kAdopt = "post_read_stage_ = ScopedPostReadStage(*web_server_);";
     constexpr std::string_view kReset = "post_read_stage_.reset();";
     constexpr std::string_view kInstall = "PostReadStageRegistry::instance().install(";
+    REQUIRE(count_of(src, kClose) == 1);
     REQUIRE(count_of(src, kAdopt) == 1);
     REQUIRE(count_of(src, kReset) == 1);
 
+    const auto post_routing = src.find("web_server_->set_post_routing_handler(");
+    const auto close = src.find(kClose);
     const auto install = src.find(kInstall);
     const auto adopt = src.find(kAdopt);
     const auto first_route = src.find("auth_routes_->register_routes(*web_server_);");
+    REQUIRE(post_routing != std::string::npos);
     REQUIRE(install != std::string::npos);
     REQUIRE(first_route != std::string::npos);
+    // The call sits in the POST-ROUTING handler (httplib runs it for every response, including a
+    // pre-routing `Handled` one), after the security headers are applied and before the next
+    // statement group (CORS), and not in an `if` of its own: the text between the headers call
+    // and the helper call is only whitespace.
+    CHECK(post_routing < close);
+    const auto headers_call = std::string_view("security_headers.apply(res);");
+    const auto headers = src.find(headers_call, post_routing);
+    REQUIRE(headers != std::string::npos);
+    CHECK(headers < close);
+    const auto between = src.substr(headers + headers_call.size(), close - (headers + headers_call.size()));
+    CHECK(between.find_first_not_of(" \t\r\n") == std::string::npos);
+    // The next statement after the call is the CORS block, still inside the handler: a call
+    // moved into a later lambda or behind a condition changes this anchor.
+    // (the stripped text blanks the literal, so the anchor is the call with an empty string)
+    const auto cors = src.find("if (req.path.starts_with(\"\")) {", close);
+    REQUIRE(cors != std::string::npos);
+    CHECK(src.substr(close + kClose.size(), cors - (close + kClose.size()))
+              .find_first_not_of(" \t\r\n") == std::string::npos);
+    CHECK(close > install);
     // The guard adopts the registration right after the install and before the first route.
     CHECK(install < adopt);
     CHECK(adopt < first_route);
     // No hand-paired forget of the web server's stage survives apart from the construction-time
     // one that clears a reused address before the install.
     CHECK(count_of(src, "PostReadStageRegistry::instance().forget(web_server_.get());") == 1);
+    // One post-routing handler: a second registration would replace this one (httplib keeps a
+    // single hook), so the close rule above would silently stop running.
+    CHECK(count_of(src, "web_server_->set_post_routing_handler(") == 1);
+}
+
+// The body-cap decision's header-derived arguments, in their own case so a failure here does not
+// read as a close-rule failure above.
+TEST_CASE("wiring: server.cpp feeds the body-cap decision the header values httplib acts on",
+          "[stepup][wiring][lexical]") {
+    const std::string raw = read_server_cpp();
+    const auto stripped = strip_comments_and_literals(raw);
+    REQUIRE(stripped.clean);
+    const std::string& src = stripped.text;
+    // The Transfer-Encoding argument of the body-cap decision comes from
+    // `transfer_encoding_for_body_cap`, not a raw first-line header read (an empty first line
+    // hides a later `chunked`). It must be the argument of the one `evaluate_body_cap` call inside
+    // `enforce_pre_auth_body_cap`.
+    // The same holds for every header-derived argument: Content-Length, Transfer-Encoding and
+    // Content-Encoding are each read the way httplib reads them, in the order the signature takes
+    // them, back to back. One `evaluate_body_cap` call, so a second gate site cannot read them raw.
+    constexpr std::string_view kClArg = "content_length_for_body_cap(req),";
+    constexpr std::string_view kTeArg = "transfer_encoding_for_body_cap(req),";
+    constexpr std::string_view kCeArg = "content_encoding_for_body_cap(req),";
+    REQUIRE(count_token(src, "evaluate_body_cap(") == 1);
+    REQUIRE(count_token(src, kTeArg) == 1);
+    REQUIRE(count_token(src, kCeArg) == 1);
+    const auto enforce_def = src.find("auto enforce_pre_auth_body_cap = [&]()");
+    const auto evaluate = find_token(src, "evaluate_body_cap(");
+    const auto te_arg = find_token(src, kTeArg);
+    const auto ce_arg = find_token(src, kCeArg);
+    const auto cl_arg = src.rfind(kClArg, te_arg);
+    REQUIRE(enforce_def != std::string::npos);
+    REQUIRE(evaluate != std::string::npos);
+    REQUIRE(cl_arg != std::string::npos);
+    CHECK(enforce_def < evaluate);
+    CHECK(evaluate < cl_arg);
+    // Adjacent: only whitespace between one argument and the next.
+    const auto only_space = [&](std::size_t from, std::size_t to) {
+        return from <= to &&
+               src.find_first_not_of(" \t\r\n", from) >= to;
+    };
+    CHECK(only_space(cl_arg + kClArg.size(), te_arg));
+    CHECK(only_space(te_arg + kTeArg.size(), ce_arg));
+    // ... and inside that call's argument list, not a later statement.
+    CHECK(ce_arg < src.find(';', evaluate));
+    // The whole argument list, whitespace aside: the method and path, the presence accessor and the
+    // chunked-framing argument (`is_chunked_for_body_cap`, httplib's own decision) are pinned
+    // too, so none can be swapped or replaced by another expression.
+    std::string call = src.substr(evaluate, src.find(';', evaluate) - evaluate);
+    std::erase_if(call, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
+    CHECK(call == "evaluate_body_cap(req.method,req.path,has_content_length_for_body_cap(req),"
+                  "content_length_for_body_cap(req),transfer_encoding_for_body_cap(req),"
+                  "content_encoding_for_body_cap(req),"
+                  "is_chunked_for_body_cap(req))");
 }
 
 // A `std::logic_error` out of start_web_server() must become a startup failure, not an exception

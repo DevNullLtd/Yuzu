@@ -39,6 +39,9 @@ namespace yuzu::echo {
 
 inline constexpr std::string_view kDictTable = "echo_dict";
 inline constexpr std::string_view kSeenTable = "echo_fold_seen";
+/// The `source` under which echo_fold_seen remembers, as hashes, the historical mapped-drive
+/// mappings already folded (a retried enumeration must not count one twice).
+inline constexpr std::string_view kMapdriveHistoricalSource = "mapdrive_historical";
 
 /// One capture source's roll-up declaration. `columns` excludes the bucket
 /// column: it is derived from the tier by ts_column_for_suffix() and leads every
@@ -87,9 +90,36 @@ struct FoldSourceDef {
 /// column content.
 [[nodiscard]] bool is_fold_row_table(std::string_view name);
 
-/// The 16 `<src>_live` names: the raw-row tables that roll-up does not keep,
-/// listed so a `$X_Live` read can be answered by an empty view instead of an
-/// error. `usage_live` is excluded: usage keeps its own tables.
-[[nodiscard]] std::vector<std::string> legacy_live_shim_names();
+/// One column of a retired raw `<src>_live` table.
+struct LegacyColumn {
+    std::string_view name;
+    std::string_view sql_type; ///< INTEGER | REAL | TEXT
+};
+
+/// The columns of the retired raw table `<source>_live` (after its `id`), in the order the
+/// raw store declared them. The v10 migration decodes the raw rows through this list; nothing
+/// else reads it. Empty for a source that never had a raw table (usage keeps its own, unchanged).
+[[nodiscard]] std::vector<LegacyColumn> legacy_live_columns(std::string_view source);
+
+/// Roll one source's rows up from tier `from` into tier `to` ("hourly" -> "daily" or "daily" ->
+/// "monthly"): every row of `<src>_<from>_r` whose bucket is at or above `?1` is UPSERTed into
+/// `<src>_<to>_r` at its coarser bucket, one row at a time in (bucket, id) order, under exactly the
+/// merge rules `tier_upsert_sql` applies to a fold (sum, max, min, last-by-guard). The key
+/// columns are copied as stored (a dictionary id is shared by every tier). Used once, by the v10
+/// migration, to finish the roll-ups the retired aggregator had not yet performed. Empty when
+/// the source lacks either tier, or `from`/`to` is not a supported step.
+[[nodiscard]] std::string fold_tier_from_tier_sql(std::string_view source, std::string_view from,
+                                                  std::string_view to);
+
+/// The `DO UPDATE SET` body of a tier UPSERT: one assignment per merged measure, joined by commas,
+/// in declaration order. Every right-hand side sees the stored row, so a last-by-guard
+/// measure compares against the OLD guard value. Shared by `tier_upsert_sql` (a fold) and
+/// `fold_tier_from_tier_sql` (the v10 migration), so the two merge identically.
+[[nodiscard]] std::string fold_upsert_assignments(const FoldSourceDef& def);
+
+/// The measure a generated `*_avg` column averages: the `*_sum` column named in its expression.
+/// The v10 migration converts a retired average back to a sum (`avg * samples`) through it.
+/// Empty for a column that is not a generated average.
+[[nodiscard]] std::string_view avg_sum_column(const ColumnDef& generated);
 
 } // namespace yuzu::echo

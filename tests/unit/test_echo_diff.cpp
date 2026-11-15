@@ -384,6 +384,36 @@ TEST_CASE("Echo diff: empty user snapshots produce no events", "[echo][diff][use
     CHECK(events.empty());
 }
 
+TEST_CASE("Echo user events: a session that detaches is a disconnect and never a logout",
+          "[echo][diff][user]") {
+    UserSession active;
+    active.user = "alice";
+    active.domain = "CORP";
+    active.logon_type = "interactive";
+    active.session_id = "2";
+    auto detached = active;
+    detached.disconnected = true; // logged on, but the session is detached (WTSDisconnected)
+
+    SECTION("a session present in both polls that turns disconnected emits one disconnect") {
+        const auto ev = compute_user_events({active}, {detached}, 1000, 1);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "disconnect");
+        CHECK(ev[0].user == "alice");
+        CHECK(ev[0].session_id == "2");
+    }
+    SECTION("a session that was already disconnected emits nothing") {
+        CHECK(compute_user_events({detached}, {detached}, 1000, 1).empty());
+    }
+    SECTION("a session that reconnects emits nothing") {
+        CHECK(compute_user_events({detached}, {active}, 1000, 1).empty());
+    }
+    SECTION("a session that vanishes is a logout") {
+        const auto ev = compute_user_events({active}, {}, 1000, 1);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "logout");
+    }
+}
+
 // =============================================================================
 // Redaction tests
 // =============================================================================
@@ -865,6 +895,65 @@ TEST_CASE("Echo tcp events: the closing-state rule matrix", "[echo][diff][networ
             CHECK(tcp_state_is_closing(s));
         for (const char* s : {"ESTABLISHED", "LISTEN", "SYN_SENT", "SYN_RECV", ""})
             CHECK_FALSE(tcp_state_is_closing(s));
+    }
+}
+
+TEST_CASE("Echo tcp events: an attempt that never reached ESTABLISHED ends as failed",
+          "[echo][diff][network][tcp]") {
+    HourlySeenSet seen;
+    const auto syn = tcp_conn(5100, "203.0.113.9", 443, "SYN_SENT", 10, "curl");
+    auto est = syn;
+    est.state = "ESTABLISHED";
+
+    SECTION("a SYN_SENT socket that vanishes next poll is failed") {
+        const auto ev = net_events({syn}, {}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "failed");
+    }
+    SECTION("a SYN_SENT socket that turns to a closing state is failed") {
+        auto closing = syn;
+        closing.state = "TIME_WAIT";
+        const auto ev = net_events({syn}, {closing}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "failed");
+    }
+    SECTION("an ESTABLISHED socket that vanishes is disconnected") {
+        const auto ev = net_events({est}, {}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "disconnected");
+    }
+    SECTION("an ESTABLISHED socket that turns to a closing state is disconnected") {
+        auto closing = est;
+        closing.state = "FIN_WAIT1";
+        const auto ev = net_events({est}, {closing}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "disconnected");
+    }
+    SECTION("a SYN_SENT socket that completes the handshake emits nothing; its later end is disconnected") {
+        CHECK(net_events({syn}, {est}, 1000, seen).empty());
+        const auto ev = net_events({est}, {}, 1060, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "disconnected");
+    }
+}
+
+TEST_CASE("Echo tcp events: a listening socket opens and closes but never connects",
+          "[echo][diff][network][tcp]") {
+    HourlySeenSet seen;
+    const auto listening = tcp_conn(8080, "0.0.0.0", 0, "LISTEN", 20, "nginx");
+
+    SECTION("a LISTEN row appearing is listen_open") {
+        const auto ev = net_events({}, {listening}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "listen_open");
+    }
+    SECTION("a LISTEN row that persists emits nothing") {
+        CHECK(net_events({listening}, {listening}, 1000, seen).empty());
+    }
+    SECTION("a LISTEN row vanishing is listen_close") {
+        const auto ev = net_events({listening}, {}, 1000, seen);
+        REQUIRE(ev.size() == 1);
+        CHECK(ev[0].action == "listen_close");
     }
 }
 

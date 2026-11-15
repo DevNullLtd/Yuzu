@@ -6,8 +6,7 @@
  * entry-point declarations, and (c) the two result-emission helpers every
  * leg calls, so no leg picks a status/completeness pairing by hand.
  *
- * Shipped legs: Linux (dotnet, jvm, python); macOS and Windows ship `python` only -- their dotnet
- * and jvm are PLANNED placeholders that emit `status|<action>|unsupported|<macos|windows>:planned`.
+ * Shipped legs: dotnet, jvm and python on Linux, macOS and Windows.
  */
 #pragma once
 

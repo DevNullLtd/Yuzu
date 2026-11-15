@@ -46,11 +46,16 @@ public:
         std::function<std::optional<yuzu::server::GuardianAgentStatusRollup>(const std::string&)>;
     using RuleStatusFn = std::function<std::optional<std::vector<yuzu::server::GuardianRuleAgentStatusRow>>(
         const std::string&)>;
-    using DeviceGuardsFn = std::function<std::optional<std::vector<yuzu::server::GuardianDeviceGuardRow>>(
-        const std::string&)>;
+    // The trailing GuardianReadFault* is the #7217 degrade-kind out-parameter. The double sets it
+    // to kNone before calling the function, so a function that degrades and wants the timeout
+    // arm must set *fault itself; one that returns nullopt without touching it reports kNone,
+    // which a production implementation never does (it always names the kind).
+    using DeviceGuardsFn = std::function<std::optional<yuzu::server::GuardianDeviceGuardsReport>(
+        const std::string&, yuzu::server::GuardianReadFault*)>;
     using DeviceComplianceFn =
         std::function<std::optional<yuzu::server::GuardianDeviceComplianceRollup>(
-            const std::string&, const std::string&, bool*, bool*)>;
+            const std::string&, const std::string&, bool*, bool*,
+            yuzu::server::GuardianReadFault*)>;
     using ListEventsFn = std::function<std::vector<yuzu::server::GuaranteedStateEventRow>(
         const yuzu::server::GuaranteedStateEventQuery&)>;
 
@@ -100,22 +105,43 @@ public:
         return rule_status_fn_(rule_id);
     }
 
-    [[nodiscard]] std::optional<std::vector<yuzu::server::GuardianDeviceGuardRow>>
-    device_guards(const std::string& agent_id) const override {
-        if (!device_guards_fn_)
+    [[nodiscard]] std::optional<yuzu::server::GuardianDeviceGuardsReport>
+    device_guards(const std::string& agent_id,
+                  yuzu::server::GuardianReadFault* fault) const override {
+        if (fault)
+            *fault = yuzu::server::GuardianReadFault::kNone;
+        if (!device_guards_fn_) {
+            if (fault)
+                *fault = yuzu::server::GuardianReadFault::kTransient;
             return std::nullopt;
-        return device_guards_fn_(agent_id);
+        }
+        // The function receives a never-null pointer even when the caller passed none.
+        yuzu::server::GuardianReadFault local = yuzu::server::GuardianReadFault::kNone;
+        auto out = device_guards_fn_(agent_id, &local);
+        if (fault)
+            *fault = local;
+        return out;
     }
 
     [[nodiscard]] std::optional<yuzu::server::GuardianDeviceComplianceRollup>
     device_compliance(const std::string& baseline_name, const std::string& agent_id,
-                      bool* store_degraded, bool* pii_access_began) const override {
+                      bool* store_degraded, bool* pii_access_began,
+                      yuzu::server::GuardianReadFault* fault) const override {
+        if (fault)
+            *fault = yuzu::server::GuardianReadFault::kNone;
         if (!device_compliance_fn_) {
             *store_degraded = true;
             *pii_access_began = false;
+            if (fault)
+                *fault = yuzu::server::GuardianReadFault::kTransient;
             return std::nullopt;
         }
-        return device_compliance_fn_(baseline_name, agent_id, store_degraded, pii_access_began);
+        yuzu::server::GuardianReadFault local = yuzu::server::GuardianReadFault::kNone;
+        auto out = device_compliance_fn_(baseline_name, agent_id, store_degraded, pii_access_began,
+                                         &local);
+        if (fault)
+            *fault = local;
+        return out;
     }
 
     [[nodiscard]] std::vector<yuzu::server::GuaranteedStateEventRow>

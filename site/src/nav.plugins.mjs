@@ -67,6 +67,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/tags/README', slug: 'plugins/tags', title: 'tags' },
   { file: 'agents/plugins/update_source_trust/README', slug: 'plugins/update_source_trust', title: 'update_source_trust' },
   { file: 'agents/plugins/users/README', slug: 'plugins/users', title: 'users' },
+  { file: 'agents/plugins/virtualization/README', slug: 'plugins/virtualization', title: 'virtualization' },
   { file: 'agents/plugins/vuln_scan/README', slug: 'plugins/vuln_scan', title: 'vuln_scan' },
   { file: 'agents/plugins/wifi/README', slug: 'plugins/wifi', title: 'wifi' },
   { file: 'agents/plugins/windows_optional_features/README', slug: 'plugins/windows_optional_features', title: 'windows_optional_features' },

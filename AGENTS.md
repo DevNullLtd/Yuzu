@@ -220,7 +220,7 @@ Per-package rationale — OpenSSL required on every platform including Windows, 
 
 ## CI architecture
 
-Three tiers: Tier 1 PR fast-path (`ci.yml`, <10 min), Tier 2 push to dev/main (full matrix), Tier 3
+Three tiers: Tier 1 PR fast-path (`ci.yml`, <10 min), Tier 2 push to main (full matrix) / dev (debug legs; release legs run daily via `release-legs-daily.yml`), Tier 3
 nightly (sanitizers + coverage; failure auto-opens `nightly-broken` and **no merge to main while it
 is open**). `workflow_dispatch`/cron fire only once the workflow file is on `main`. Full reference:
 `docs/ci-architecture.md`; `build-ci` owns the matrix, `cross-platform` the Windows/macOS specifics.

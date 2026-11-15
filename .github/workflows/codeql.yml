@@ -42,6 +42,10 @@ name: "CodeQL"
 #     + build_tests=true + languages c-cpp,actions, and the workflow
 #     matrixed across Linux + Windows runners to close the #ifdef _WIN32
 #     gap that a Linux-only analysis physically cannot reach.
+#   ADR-0035 ladder step 1: the Windows row is configured agent-only
+#     (since step 3 by the server option's auto default), so it analyses
+#     the agent only; server code
+#     (Linux-only under ADR-0035) is CodeQL-scanned on the Linux row only.
 #   2026-10-21 → 2026-11-02: the dev→main promotion (first-party .cpp/.cc files 1157 → 1437)
 #     pushed both legs past the 90-min ceiling; scheduled runs were
 #     cancelled daily from 2026-10-22. Timeout raised to 180 — see the
@@ -54,6 +58,8 @@ name: "CodeQL"
 #     handling — not style noise like it would be for JS/Python)
 #   - languages: c-cpp,actions on Linux; c-cpp only on Windows (no need
 #     to double-scan the same .github/workflows/*.yml)
+#   - Windows row: agent code only (no server off Linux, ADR-0035);
+#     server code is scanned on the Linux row only
 #   - -Dbuild_tests=true so the CodeQL tracer observes tests/unit/*.cpp
 #   - Dedicated per-OS build dirs (build-linux-codeql/ + build-windows-codeql/)
 #     isolated from operator's interactive builds and from
@@ -144,7 +150,7 @@ permissions:
   contents: read
 
 env:
-  VCPKG_COMMIT: "4b77da7fed37817f124936239197833469f1b9a8"
+  VCPKG_COMMIT: "9eec002df1cd109f8f104cd966a763daf9751489"
   VCPKG_BINARY_SOURCES: "default"
   CCACHE_MAXSIZE: "500M"
   CCACHE_COMPRESS: "true"
@@ -168,13 +174,13 @@ jobs:
           persist-credentials: false
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: actions
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           # Distinct category from the nightly Linux leg's actions scan so
           # the two analysis series don't overwrite each other's alerts.
@@ -240,6 +246,8 @@ jobs:
             runner: [self-hosted, Linux, X64, yuzu-bigtam-linux]
             triplet: x64-linux
             vcpkg_bin: vcpkg
+            # Full manifest (server + tests): the Linux row analyses the server.
+            vcpkg_features: ""
             build_dir: build-linux-codeql
             category: "/language:c-cpp-linux"
             languages: "c-cpp,actions"
@@ -260,6 +268,9 @@ jobs:
             runner: [self-hosted, Windows, X64, yuzu-weetam-windows]
             triplet: x64-windows
             vcpkg_bin: vcpkg.exe
+            # Agent-only profile (ADR-0035 step 3), the same as ci.yml's and
+            # nightly.yml's Windows legs (each runner keeps its own tree).
+            vcpkg_features: "--x-no-default-features --x-feature=tests"
             build_dir: build-windows-codeql
             category: "/language:c-cpp-windows"
             # c-cpp only — no need to double-scan the same
@@ -422,7 +433,7 @@ jobs:
           mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           "$GITHUB_WORKSPACE/vcpkg/${{ matrix.vcpkg_bin }}" install \
             --triplet ${{ matrix.triplet }} \
-            --x-manifest-root="$GITHUB_WORKSPACE"
+            --x-manifest-root="$GITHUB_WORKSPACE" ${{ matrix.vcpkg_features }}
 
       # Install Erlang/OTP + rebar3 for the gateway custom_target. The
       # meson `gateway` custom_target is scheduled when rebar3 is found AND
@@ -459,7 +470,7 @@ jobs:
           rebar3-version: '3.24'
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.languages }}
           # The leading `+` means "augment the default suite" (applies
@@ -527,6 +538,9 @@ jobs:
           # Note: the gateway custom_target may fail on Windows if
           # rebar3/erl aren't installed on the runner; meson will skip
           # it via the `if command -v rebar3` guard inside meson.build.
+          # Agent only (ADR-0035): the `server` option defaults to auto, which
+          # is off on a Windows target, so this row analyses the agent's
+          # Windows code only; server code is analysed by the Linux row.
           meson setup ${{ matrix.build_dir }} \
             --buildtype=debug \
             -Dcpp_std=vc++latest \
@@ -566,7 +580,7 @@ jobs:
         # reliably suppress findings whose location is a transitively-
         # included header in compiled C/C++. The `output` directory
         # holds the raw SARIF for post-processing.
-        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: "${{ matrix.category }}"
           output: codeql-sarif
@@ -622,7 +636,7 @@ jobs:
           done
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: codeql-sarif
           category: "${{ matrix.category }}"

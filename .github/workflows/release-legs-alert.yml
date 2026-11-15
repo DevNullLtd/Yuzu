@@ -1,0 +1,78 @@
+name: Release legs (alert)
+
+# Failure signal for the daily release-legs dispatch on dev
+# (docs/ci-architecture.md, Tier 2b). The dispatched CI run is started by
+# github-actions[bot], which emails nobody, so this workflow opens (or comments
+# on) a `release-legs-broken` issue when a direct CI dispatch on dev fails, and
+# closes it when a later one is green.
+#
+# Why a separate workflow and not jobs inside ci.yml: ci.yml is also called as
+# a reusable workflow by trusted-fork-ci.yml, whose token ceiling is read-only.
+# GitHub checks a called workflow's per-job permissions against the caller at
+# load time, before any `if:`, so an `issues: write` job in ci.yml would fail
+# every trusted-fork run at startup. This workflow holds the write permission
+# instead, and `workflow_run` sees only CI runs, never the trusted-fork caller's.
+#
+# Scope: CI runs whose event is workflow_dispatch, on dev only. A trusted-fork
+# run is a run of trusted-fork-ci.yml, not of CI, so it never reaches here. The
+# decision (open / comment / close / nothing) and the issue text live in ONE
+# place, scripts/ci/release-legs-issue.sh, which release-legs-daily.yml also
+# runs every day in `reconcile` mode as a backstop: a listener run that was
+# dropped, failed, or never fired is still reported within a day.
+#
+# LIVE ONLY FROM `main`: like `schedule:`, a `workflow_run` trigger is read
+# from the default branch, so this goes live with release-legs-daily.yml.
+
+on:
+  # workflow_run is safe HERE: this workflow never checks out or executes
+  # anything from the triggering run (it checks out the default branch's own
+  # script); it reads run metadata through the API (ids/SHA validated, every
+  # value passed via env, never interpolated into a script), the trigger is filtered to the protected `dev` branch, and only
+  # CI runs whose event is workflow_dispatch (dev/main-only by ci.yml's
+  # trusted_inputs) act. Same trigger as pre-release.yml.
+  workflow_run:  # zizmor: ignore[dangerous-triggers]
+    workflows: ["CI"]
+    types: [completed]
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  alert-or-close:
+    name: "Open or close release-legs-broken"
+    # Every conclusion but cancelled/skipped acts (a startup_failure included);
+    # the script decides open/comment/close.
+    if: github.event.workflow_run.event == 'workflow_dispatch' && github.event.workflow_run.conclusion != 'cancelled' && github.event.workflow_run.conclusion != 'skipped'
+    # Job-level, not workflow-level: a workflow-level group is entered BEFORE
+    # the job `if:`, so every dev push completion (skipped here) would queue in
+    # it, and GitHub's one-pending-per-group rule could evict a pending dispatch
+    # completion. At job level only acting jobs serialise, with the daily
+    # reconcile and alert jobs (same group), so two writers never both open an
+    # issue. A pending member can still be replaced by a newer one when three
+    # arrive at once (accepted residual): a dropped listener job is covered by
+    # the next reconcile; a dropped daily `alert` job is not, so that day's
+    # workflow failure stays visible only as a red run in the Actions tab.
+    concurrency:
+      group: release-legs-alert
+      cancel-in-progress: false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read    # read the CI run and its job list
+      contents: read   # check out the default branch's script
+      issues: write    # open/comment/close the release-legs-broken issue
+    steps:
+      # The DEFAULT branch's copy of the script (workflow_run runs there), never
+      # anything from the triggering run.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts/ci/release-legs-issue.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Open, update or close the release-legs-broken issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: bash scripts/ci/release-legs-issue.sh event "$RUN_ID"

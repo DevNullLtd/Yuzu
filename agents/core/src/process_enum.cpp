@@ -8,6 +8,8 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#include <wire_utf8.hpp> // yuzu::shared::utf8_scalar_len: the cap must not split a scalar
+
 #include <charconv>
 #include <cstdint>
 #include <iterator>
@@ -149,12 +151,32 @@ namespace detail {
 std::string read_proc_bytes(std::istream& in) noexcept {
     std::string out;
     try {
-        for (std::istreambuf_iterator<char> it(in), end; it != end; ++it)
+        for (std::istreambuf_iterator<char> it(in), end; it != end && out.size() < kProcReadCap;
+             ++it)
             out.push_back(*it);
     } catch (...) {
         // Keep what was read before the failure (see the declaration).
     }
+    if (out.size() == kProcReadCap)
+        trim_incomplete_utf8_tail(out);
     return out;
+}
+
+void trim_incomplete_utf8_tail(std::string& s) noexcept {
+    // A UTF-8 scalar is at most 4 bytes, so only the last 3 can be an unfinished one. Walk back
+    // over continuation bytes to the lead byte; a lead whose sequence does not complete inside
+    // `s` is cut off with its continuations. ASCII or a complete scalar at the end: untouched.
+    for (std::size_t k = 1; k <= 3 && k <= s.size(); ++k) {
+        const std::size_t i = s.size() - k;
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80)
+            return;
+        if ((c & 0xC0u) == 0x80u)
+            continue; // continuation byte: keep walking back to its lead
+        if (yuzu::shared::utf8_scalar_len(s, i) == 0)
+            s.resize(i);
+        return;
+    }
 }
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -195,7 +217,9 @@ void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept {
                     pi.user = uid_to_username(static_cast<uid_t>(*uid));
                 got_uid = true;
             }
-            // No early exit: the whole file is read so later fields stay reachable.
+            // No early exit (#6895, kept on purpose): the whole file is read so later fields stay
+            // reachable; /proc/<pid>/status is kernel-generated and about a kilobyte, so stopping
+            // after Uid: would save nothing measurable.
         }
     } catch (...) {
         // A failed read or an allocation failure keeps whatever parsed so far.

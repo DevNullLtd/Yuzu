@@ -92,17 +92,15 @@
 ///                                        parsed body requests enabled=true
 ///                                        — H-01; owner-scoped — M-01)
 ///
-/// AUDIT ASYMMETRY (preserved verbatim, not a defect introduced by this
-/// move): GET is unaudited (pure read). POST create audits ONLY success
-/// (`schedule.create`) — its own body/parameter-validation 400s and the
-/// store-level `create_schedule` failure are both unaudited. DELETE audits
-/// only an actual deletion (`schedule.delete`, `success`) — a
-/// nonexistent-or-wrong-owner id (`delete_schedule` returns false) is NOT
-/// audited. POST enable audits only an actual state change
-/// (`schedule.enable`/`schedule.disable`, `success`) — a no-op
-/// (`set_enabled` returns false) is NOT audited. This is the pre-existing
-/// server.cpp behaviour, copied as-is; it is not this extraction's place to
-/// change it.
+/// AUDIT BEHAVIOUR: GET is unaudited (pure read). Each write route audits an
+/// actual state change as `success` (`schedule.create`, `schedule.delete`,
+/// `schedule.enable`/`schedule.disable`) and only then answers 2xx. A path id
+/// containing a NUL, control or DEL byte is refused with 400 and a `denied`
+/// row (`invalid_schedule_id`). A store failure answers 503 with a `failure`
+/// row (`store_error`). A nonexistent-or-wrong-owner id stays unaudited and
+/// answers 404 for enable/disable and 200 `{"deleted":false}` for delete, so
+/// ids cannot be probed across owners. A body or parameter-validation 400 on
+/// create stays unaudited.
 ///
 /// SERVICE-SCOPED TOKEN NOTE (guardian-confinement-2298, retired dead
 /// code): server.cpp's inline routes used to carry an explicit

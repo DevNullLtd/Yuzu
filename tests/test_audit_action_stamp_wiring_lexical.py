@@ -129,6 +129,9 @@ HOOK_HEAD = "audit_registry_frame(agent_id, resp, "
 HOOK_ARGS = ("plugin", "prov.plugin")
 HOOK_CALL_RE = re.compile(r"audit_registry_frame\(agent_id, resp, (.*?)\)(?=&&|;)")
 NOTIFY = "notify_exec_tracker(resp.command_id(), agent_id, resp, prov);"
+# The two terminal-frame sites also tell the tracker whether the response row was stored, so a
+# hook may be followed by either spelling of the call (the notification still follows the hook).
+NOTIFY_FORMS = (NOTIFY, "notify_exec_tracker(resp.command_id(), agent_id, resp, prov, response_dropped);")
 PLUGIN_ALIAS = "const std::string& plugin = prov.plugin;"
 PROV_DECL = "const ResponseProvenance prov = resolve_response_provenance(resp.command_id()"
 FLAG_DECL = "bool audit_failed_signalled = false;"
@@ -157,19 +160,21 @@ READ_LOOP = "while (stream->Read(&resp))"
 BOUNDARY = r"(?:^|[;{}] ?)"  # normalise() drops a space that sits before a `(`
 
 
-def subscribe_form(arg):
+def subscribe_form(arg, notify=NOTIFY):
     return normalise(
         f"if (!{HOOK_HEAD}{arg}) && !audit_failed_signalled) {{ signal_grpc_audit_failed(context);"
-        f" audit_failed_signalled = true; }} {NOTIFY}"
+        f" audit_failed_signalled = true; }} {notify}"
     )
 
 
-def gateway_form(arg):
-    return normalise(f"(void){HOOK_HEAD}{arg}); {NOTIFY}")
+def gateway_form(arg, notify=NOTIFY):
+    return normalise(f"(void){HOOK_HEAD}{arg}); {notify}")
 
 
 def count_forms(t, make):
-    return sum(len(re.findall(BOUNDARY + re.escape(make(a)), t)) for a in HOOK_ARGS)
+    return sum(
+        len(re.findall(BOUNDARY + re.escape(make(a, n)), t)) for a in HOOK_ARGS for n in NOTIFY_FORMS
+    )
 
 
 def last_decl(before, type_re, name):
@@ -415,13 +420,13 @@ SERVER_MUTATIONS = [
     # a Subscribe hook moved after the notification
     (
         r"(if \(!audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\) && !audit_failed_signalled\) \{[^}]*\})"
-        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);)",
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov(?:, response_dropped)?\);)",
         r"\3\2\1",
     ),
     # a gateway hook moved after the notification
     (
         r"(\(void\)audit_registry_frame\(agent_id, resp, (?:prov\.)?plugin\);)"
-        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);)",
+        r"(\s*(?://[^\n]*\n\s*)*)(notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov(?:, response_dropped)?\);)",
         r"\3\2\1",
     ),
     # a gateway hook deleted
@@ -499,11 +504,11 @@ SERVER_MUTATIONS = [
     ),
     # the notification loses the provenance (the old three-argument form)
     (
-        r"notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov\);\s*\n\s*std::string status_str",
+        r"notify_exec_tracker\(resp\.command_id\(\), agent_id, resp, prov(?:, response_dropped)?\);\s*\n\s*std::string status_str",
         "notify_exec_tracker(resp.command_id(), agent_id, resp);\n\n        std::string status_str",
     ),
     # a fifth output-storing site appears
-    (r"response_store_->store\(sr\);", "response_store_->store(sr);\nresponse_store_->store(sr);"),
+    (r"response_store_->store\(sr\)", "response_store_->store(sr);\nresponse_store_->store(sr)"),
     # the hook reads the raw store instead of the weak one
     (r"registry_audit_store_\.lock\(\)", "std::shared_ptr<AuditStore>(audit_store_, [](AuditStore*) {})"),
     # the rows are charged without the overflow key: agents past the exact table share ONE allowance

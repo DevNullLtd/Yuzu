@@ -130,6 +130,21 @@ std::string resolve_cid(const Request& rq) {
                                      : rq.correlation_id;
 }
 
+/// The ONE dispatch-denied refusal, for both authorize runs (the pre-row dry run and the post-write
+/// re-run): counts the denial and carries the denial, plugin and action the renderers dereference
+/// unconditionally for kDispatchDenied. The audit row stays at each site (its result word
+/// differs: `denied` before the `requested` row, `failure` after it) and reads `reason` from here.
+Refusal dispatch_denied_refusal(const Ports& ports, const InstructionDefinition& def,
+                                const detail::DispatchDenial& denial) {
+    std::string reason(detail::to_string(denial.reason));
+    bump(ports, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
+    Refusal r = make_refusal(RefusalKind::kDispatchDenied, std::move(reason), {});
+    r.denial = denial;
+    r.plugin = def.plugin;
+    r.action = def.action;
+    return r;
+}
+
 } // namespace
 
 std::string effect_binding(std::string_view plugin, std::string_view action,
@@ -259,17 +274,12 @@ PrepareOutcome prepare_impl(Ctx& c) {
     }
     if (auto decision = ports.authorize(rq.caller, def.plugin, def.action); !decision) {
         const auto& denial = decision.error();
-        const std::string reason(detail::to_string(denial.reason));
+        Refusal r = dispatch_denied_refusal(ports, def, denial);
         spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", ident_pair(def),
-                     reason, denial.securable.empty() ? "(none)" : denial.securable,
+                     r.reason, denial.securable.empty() ? "(none)" : denial.securable,
                      rq.caller.principal.empty() ? "(anonymous)"
                                                  : ::yuzu::log_token(rq.caller.principal));
-        bump(ports, "yuzu_server_dispatch_denied_total", {{"reason", reason}});
-        c.audit("denied", "reason=" + reason + " definition=" + def_token);
-        Refusal r = make_refusal(RefusalKind::kDispatchDenied, reason, {});
-        r.denial = denial;
-        r.plugin = def.plugin;
-        r.action = def.action;
+        c.audit("denied", "reason=" + r.reason + " definition=" + def_token);
         return refuse(c, std::move(r));
     }
 
@@ -538,6 +548,10 @@ namespace {
 
 std::string zero_reach_text(ZeroReachCause cause, const ConfinedDispatchOutcome& o) {
     switch (cause) {
+    case ZeroReachCause::Denied:
+        return std::format("the dispatch chokepoint refused this command ({}): dispatch was withheld, "
+                           "not attempted, and no agent was reached",
+                           o.denied ? detail::to_string(o.denied->reason) : std::string_view{"unknown"});
     case ZeroReachCause::InvalidScope:
         return "invalid scope: " + o.scope_parse_error.value_or("(unparsed)");
     case ZeroReachCause::ContainmentUnreadable:
@@ -634,6 +648,13 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                        c.audit_dropped};
     }
 
+    if (!p.readmit) { // before the row: an unwired recheck is a defect, never "no gate"
+        return Outcome{make_refusal(RefusalKind::kMisconfigured, "readmit_unconfigured",
+                                    "dispatch re-admission not configured",
+                                    std::string(kMisconfiguredRemediation)),
+                       c.audit_dropped};
+    }
+
     // 7. Audit BEFORE the side effect, fail closed (house v1 dispatch pattern).
     if (!c.audit_required(
             "requested",
@@ -689,6 +710,66 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
                          def_token);
     }
 
+    // 8b. #7110: the surface's own writes are done (the requested row and the execution row); a
+    //     grant, a JIT elevation or a visible set can move while either is written, so decide
+    //     again here. Not re-decided: the chokepoint's own provenance-record write, see
+    //     docs/user-manual/rest-api.md 'Refused after the audit row'.
+    std::optional<DispatchCaller> readmitted;
+    std::optional<detail::DispatchDenial> denial;
+    bool recheck_threw = false;
+    try {
+        readmitted = p.readmit();
+        if (readmitted)
+            if (auto decision = p.authorize(*readmitted, def.plugin, def.action); !decision)
+                denial = decision.error();
+    } catch (...) { // fail closed: a throwing recheck (or authorizer) is a withdrawn permission
+        readmitted = std::nullopt;
+        recheck_threw = true;
+        // Told apart from a real revoke in the log and the audit row (`gate=exception`): the
+        // caller's 403 is the same, the operator's diagnosis is not (a store fault, not a grant).
+        spdlog::error("instruction execute: the post-row recheck threw for '{}' execution_id={}; "
+                      "refused as permission_revoked",
+                      def_token, execution_id);
+    }
+    // Both refusals close the rows alike: a `failure` outcome, the execution cancelled.
+    const auto refuse_after_rows = [&](Refusal r, const std::string& detail) {
+        c.audit("failure", detail + " execution_id=" + execution_id);
+        cancel_row(c, execution_id);
+        return Outcome{std::move(r), c.audit_dropped};
+    };
+    if (!readmitted)
+        return refuse_after_rows(
+            make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
+                         "permission revoked after the request was recorded",
+                         "this request was not dispatched; the permission it needs was withdrawn "
+                         "while it was being recorded, and retrying will not help until it is "
+                         "granted again"),
+            std::string("reason=permission_revoked") + (recheck_threw ? " gate=exception" : "") +
+                " definition=" + def_token);
+    const DispatchCaller& caller = *readmitted; // the fresh caller is the one dispatched
+    if (denial) {
+        Refusal r = dispatch_denied_refusal(p, def, *denial);
+        const std::string detail = "reason=" + r.reason + " definition=" + def_token;
+        return refuse_after_rows(std::move(r), detail);
+    }
+    // The definition's OWN approval_mode, decided again on the fresh caller. Step 6 admitted a
+    // `role-gated` definition on the entry caller's administrator standing, and that standing (a
+    // JIT elevation) can lapse while the rows are written; the pair re-decision above does not
+    // cover it, because an ExecuteGate::None pair asks nothing of the caller's admin bit. The rows
+    // exist, so this is a refusal that closes them, never a pending approval (a ticket minted here
+    // would stand beside a `requested` row that was never dispatched). Only the admin bit decides
+    // `role-gated` (no ticket or provenance clears step 6), so the recheck reads nothing else.
+    if (definition_needs_approval(def.approval_mode, caller.principal_is_admin)) {
+        return refuse_after_rows(
+            make_refusal(RefusalKind::kPermissionRevoked, "permission_revoked",
+                         "the administrator standing this definition's approval mode requires "
+                         "lapsed after the request was recorded",
+                         "this request was not dispatched and no approval was queued; re-call to "
+                         "request approval, or elevate again and re-call"),
+            "reason=permission_revoked gate=approval_mode mode=" +
+                ::yuzu::log_token(def.approval_mode) + " definition=" + def_token);
+    }
+
     // OMITTED agent_ids + OMITTED scope is a deliberate broadcast and is NAMED, never inferred
     // from "both happen to be empty" (the shape check guarantees that arriving here empty means
     // the caller omitted both).
@@ -731,7 +812,7 @@ Outcome dispatch_stage(Ctx& c, Plan plan) {
     try {
         const SendProgressScope send_scope(progress);
         o = p.dispatch(def.plugin, def.action, plan.agent_ids, dispatch_scope, plan.params,
-                       execution_id, rq.caller, def.id, def.concurrency_mode);
+                       execution_id, caller, def.id, def.concurrency_mode);
     } catch (const std::exception& e) {
         spdlog::error("instruction execute: dispatch failed for '{}': {}", def_token, e.what());
         threw = true;

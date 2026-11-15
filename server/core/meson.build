@@ -696,6 +696,7 @@ yuzu_server_core_lib = static_library(
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
     'src/post_read_stage.cpp', # per-server post-read stage (body cap + step-up) the HttplibRouteSink wraps handlers with
+    'src/http_response_policy.cpp', # HEAD refusal on dynamic routes + measured-quality brotli, composed into HttplibRouteSink::wrap
     'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
     'src/step_up_gate.cpp', # MFA step-up decide/render split + request chokepoint (policy table: src/step_up_policy.hpp)
     'src/mfa_qr.cpp',
@@ -741,12 +742,14 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/instruction_yaml.cpp',
     'src/instruction_definition_model.cpp', # #4029: shared REST v1 + MCP builder
+    'src/instruction_referrers.cpp', # #2146 UP-6: what still references a definition (delete guard)
     'src/execution_tracker.cpp',
     'src/execution_model.cpp',
     'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
     'src/home_panels_render.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
+    'src/pg_collation_recheck.cpp', # hourly repeat of the collation version check (ReplicaSafe)
     'src/command_outbox_store.cpp',
     'src/command_delivery_finalization_owner.cpp', # #4982 round 5: ADR-0012 §3 cross-schema owner
     'src/command_outbox_delivery.cpp',
@@ -820,6 +823,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_tools_hardware.cpp',
     'src/mcp_tools_containment.cpp',
     'src/mcp_tools_crypto.cpp',
+    'src/mcp_tools_dex.cpp',
     'src/mcp_transport.cpp',
     'src/compliance_model.cpp',
     'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
@@ -842,17 +846,21 @@ yuzu_server_core_lib = static_library(
     'src/group_agent_count_preview.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/hardware_section_integrity.cpp', # #7159: section-integrity counter + sampled WARN (the pure model stays metrics-free)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',
     'src/software_normalization_job.cpp',
     'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
+    'src/software_list_model.cpp',
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
     'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
+    'src/revocation_source_store.cpp',   # R1 (slice 2b-1a): registered CRL sources (born-on-PG)
+    'src/revocation_source_service.cpp', # R1: shared REST+MCP validation, egress check, JSON views
     'src/preflight_eval.cpp',
     'src/preflight_run_store.cpp',
     'src/preflight_runner.cpp',
@@ -878,6 +886,8 @@ yuzu_server_core_lib = static_library(
     'src/workflow_model.cpp',
     'src/workflow_execution_list_model.cpp', # shared REST+MCP parser/row builder for the run list
     'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
+    'src/workflow_execute.cpp', # #2146 batch B: the shared workflow-execute sequence (REST v1 + MCP)
+    'src/workflow_execute_routes.cpp', # #2146 batch B: POST /api/v1/workflows/{id}/execute
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
@@ -894,6 +904,7 @@ yuzu_server_core_lib = static_library(
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
+    'src/software_collection_settings_store.cpp',
     'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
@@ -933,6 +944,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/pg_collation_check.cpp', # collation version check, at start and then repeated; logs and exports a gauge, never stops the server
     'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
@@ -1012,6 +1024,7 @@ yuzu_server_routes_lib = static_library(
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_app_perf_ui.cpp',
+    'src/dex_apps_ui.cpp',
     'src/dex_perf_ui.cpp',
     'src/network_routes.cpp',
     'src/network_ui.cpp',
@@ -1020,6 +1033,7 @@ yuzu_server_routes_lib = static_library(
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
+    'src/software_collection_settings_routes.cpp',
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',
@@ -1029,6 +1043,7 @@ yuzu_server_routes_lib = static_library(
     'src/sle_routes.cpp',
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
     'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/revocation_source_routes.cpp',  # R1: /api/v1/crypto/revocation-sources REST twins
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/verify_routes.cpp',
@@ -1075,8 +1090,10 @@ yuzu_server_routes_lib = static_library(
     'src/settings_pki_ui.cpp',
     'src/execution_mutation.cpp', # cancel/rerun REST v1 + MCP twins: one admit-audit-effect sequence
     'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
+    'src/mcp_instruction_authoring.cpp', # MCP twins of the instruction-definition / instruction-set authoring routes (#2146 batch C): store sequences + JSON-RPC rendering
     'src/command_v1_routes.cpp', # POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
     'src/instruction_execute_routes.cpp', # POST /api/v1/instructions/{id}/execute
+    'src/instruction_authoring_routes.cpp', # v1 definition + instruction-set authoring twins (#2146 batch C)
   ),
   include_directories: yuzu_server_core_incs,
   cpp_args: yuzu_server_core_cpp_args,

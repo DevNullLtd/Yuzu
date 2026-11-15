@@ -112,7 +112,7 @@ TEST_CASE("hardware plugin: the four estate actions are SUPPORTED on Windows, PL
     auto plugin = load_plugin();
     if (!plugin) return require_plugin_or_skip();
 
-    CHECK(plugin->descriptor->action_descriptor_count == 12);
+    CHECK(plugin->descriptor->action_descriptor_count == 13);
     for (const char* name : kPlannedActions) {
         INFO("action: " << name);
         const auto* d = find_descriptor(plugin->descriptor, name);
@@ -140,7 +140,7 @@ TEST_CASE("hardware plugin: the four estate actions are SUPPORTED on Windows, PL
     CHECK(mem->macos_leg.support == YUZU_SUPPORT_CONSTRAINED);
 }
 
-TEST_CASE("hardware plugin: the actions list names exactly the twelve actions",
+TEST_CASE("hardware plugin: the actions list names exactly the thirteen actions",
           "[hardware][descriptors]") {
     auto plugin = load_plugin();
     if (!plugin) return require_plugin_or_skip();
@@ -148,8 +148,9 @@ TEST_CASE("hardware plugin: the actions list names exactly the twelve actions",
     std::set<std::string> got;
     for (const char* const* a = plugin->descriptor->actions; a && *a; ++a) got.insert(*a);
     const std::set<std::string> want{"manufacturer", "model",   "bios",      "processors",
-                                     "memory",       "disks",   "drivers",   "system",
-                                     "chassis",      "baseboard", "swap",    "machine_id"};
+                                     "memory",       "disks",   "drivers",   "drivers_inventory",
+                                     "system",       "chassis", "baseboard", "swap",
+                                     "machine_id"};
     CHECK(got == want);
 }
 

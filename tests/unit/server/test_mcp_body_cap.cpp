@@ -35,7 +35,11 @@
  * wire-level, httplib-specific properties (body never read off the socket,
  * sibling surfaces uncapped) — against a REAL `httplib::Server`, which no
  * pure-function test can reach, using these two functions purely as a
- * stand-in decision to drive that wire behaviour. Whether to delete them is
+ * stand-in decision to drive that wire behaviour. The arguments it does share
+ * with production are the header values, taken from `content_length_for_body_cap`,
+ * `transfer_encoding_for_body_cap` and `content_encoding_for_body_cap` (an empty
+ * first line followed by `chunked`, or by an encoding, must not read as "none");
+ * the decision around them is not production's. Whether to delete them is
  * an open question this file's owner cannot resolve alone: doing so would
  * also require removing `test_web_utils.cpp`'s coverage of them, which is
  * outside this file's scope — left as a follow-up rather than done here.
@@ -48,6 +52,7 @@
  */
 
 #include "test_loopback_http.hpp"
+#include "body_cap_httplib.hpp"
 #include "web_utils.hpp"
 
 #include <httplib.h>
@@ -78,8 +83,11 @@
 #  include <unistd.h>
 #endif
 
+using yuzu::server::content_encoding_for_body_cap;
+using yuzu::server::content_length_for_body_cap;
 using yuzu::server::mcp_body_exceeds_cap;
 using yuzu::server::mcp_body_unmeasurable;
+using yuzu::server::transfer_encoding_for_body_cap;
 
 namespace {
 
@@ -123,11 +131,10 @@ struct BodyCapTestServer {
         // wire, not the response taxonomy.
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
-            if (mcp_body_exceeds_cap(req.path, req.get_header_value_u64("Content-Length", 0),
-                                     kTestCap) ||
+            if (mcp_body_exceeds_cap(req.path, content_length_for_body_cap(req), kTestCap) ||
                 mcp_body_unmeasurable(req.path, req.method, req.has_header("Content-Length"),
-                                      req.get_header_value("Transfer-Encoding"),
-                                      req.get_header_value("Content-Encoding"))) {
+                                      transfer_encoding_for_body_cap(req),
+                                      content_encoding_for_body_cap(req))) {
                 res.status = 413;
                 res.set_content(R"({"error":{"code":413,"message":"too large"}})",
                                 "application/json");
@@ -147,15 +154,19 @@ struct BodyCapTestServer {
     }
 
     ~BodyCapTestServer() {
-        // ORDERING IS LOAD-BEARING, and the naive version deadlocks.
-        // httplib's Server::stop() is a NO-OP while is_running_ is false
-        // (httplib.h:10691) - it only shuts the listening socket when the
-        // accept loop has already started. So if this dtor runs while the
-        // listen thread is still starting up (a throw from start(), or a
-        // descheduled thread on a contended CI box), stop() does nothing, the
-        // thread THEN enters the accept loop, and join() blocks forever - a
-        // hung job on a shared 4-agent runner, which is worse than a red test.
-        // wait_until_ready() first guarantees stop() has something to stop.
+        // ORDERING IS DEFENSIVE since 0.59.0; through 0.37.1 it was LOAD-BEARING.
+        // Through 0.37.1 httplib's Server::stop() was a NO-OP while is_running_ was
+        // false - it only shut the listening socket when the accept loop had already
+        // started - so a dtor running while the listen thread was still starting up
+        // (a throw from start(), or a descheduled thread on a contended CI box)
+        // left stop() doing nothing, the thread THEN entered the accept loop, and
+        // join() blocked forever - a hung job on a shared 4-agent runner, which is
+        // worse than a red test. From 0.59.0 stop() releases the listening socket
+        // whether or not the loop is running (httplib.h v0.59.0:13353-13363) and
+        // listen_internal() returns false, marking the server decommissioned, when
+        // the socket is already gone (13984-13992). Keeping wait_until_ready()
+        // first costs nothing and keeps the test correct on any httplib that
+        // regresses to the old shape.
         // GUARD ON joinable() FIRST. wait_until_ready() loops on
         // `!is_running_ && !is_decommissioned`, and BOTH stay false when no
         // listen thread was ever spawned - the std::thread ctor throwing

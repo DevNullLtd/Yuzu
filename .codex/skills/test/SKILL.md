@@ -69,17 +69,18 @@ Initialize each manual orchestration with a `RUN_ID`, `TEST_DIR=/tmp/yuzu-test-$
 Wall-clock order is fixed:
 
 1. Phase 0 preflight: `bash scripts/test/preflight.sh` or `--force-cleanup`.
+1b. Phase 0b tooling (default and full modes only): `bash scripts/test/ensure-puppeteer.sh` (a failure aborts the run) and `bash scripts/test/ensure-gcovr.sh` (a failure aborts a full run; in default mode it is a WARN and Phase 7b measures nothing).
 2. Phase 1 build HEAD: Meson compile, Erlang `rebar3 as prod release`, and docker images except in quick mode.
 3. Phase 2 upgrade test: `bash scripts/test/test-upgrade-stack.sh ...`; skipped in quick mode.
 4. Phase 3 OTA: full mode only; may record SKIP if still stubbed.
 5. Phase 7a perf: full mode only, before UAT stack; measure-and-report only.
 6. Phase 4 fresh stack: `bash scripts/start-UAT.sh`; skipped in quick mode.
-7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer records SKIP when `tests/puppeteer/node_modules` is absent.
+7. Phase 5 gates: unit, EUnit, Dialyzer, CT, integration/e2e/synthetic UAT/puppeteer/instructions as applicable. Security E2E runs after the parallel fan-out, alone (its rate-limit probe empties the shared login bucket). Puppeteer and Browser smoke record FAIL (never SKIP) when `tests/puppeteer/node_modules/puppeteer` is absent (step 1b installs it first).
 8. Phase 6 sanitizers: full mode only, dispatched runner.
-9. Phase 7b coverage: full mode only, enforces `tests/coverage-baseline.json`.
+9. Phase 7b coverage: `--full` enforces `tests/coverage-baseline.json`; default mode runs it report-only. Before measuring, `scripts/test/ensure-gcovr.sh` is re-run, and if the pinned gcovr is not usable the gate is not run and a Coverage row is recorded (WARN in default mode, FAIL in `--full`, which enforces the baseline).
 10. Phase 8 teardown and summary.
 
-Phase 1 is mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.
+Phases 0, 0b and 1 are mandatory-blocking. Other phases should normally continue so the operator gets one prioritized report.
 
 ## UAT Lifetime Rule
 

@@ -95,13 +95,22 @@ using StmtPtr = std::unique_ptr<sqlite3_stmt, StmtDeleter>;
 // RAII: ROLLBACK on ANY early return between BEGIN and a successful COMMIT unless disarmed,
 // so a hand-rolled transaction stays balanced against a future added early-return
 // (cpp-safety review). Disarmed only after COMMIT succeeds. Shared by del_keys and
-// rename_plugin.
+// rename_plugin. SQLite rolls a transaction back by itself after some statement errors
+// (SQLITE_FULL, SQLITE_IOERR, SQLITE_NOMEM), and then there is nothing left to roll back, so the
+// explicit ROLLBACK runs only while the connection is still inside the transaction. A ROLLBACK
+// that then fails, or that leaves the connection inside a transaction, is logged: the callers
+// finalize their statements first, so neither is expected, and the line makes the case visible
+// rather than silent (the next BEGIN on the connection would otherwise be the first sign).
 struct TxnGuard {
     sqlite3* db;
     bool committed{false};
     ~TxnGuard() {
-        if (!committed)
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        if (committed || sqlite3_get_autocommit(db) != 0)
+            return;
+        if (sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr) != SQLITE_OK)
+            spdlog::error("KvStore: ROLLBACK failed: {}", sqlite3_errmsg(db));
+        if (sqlite3_get_autocommit(db) == 0)
+            spdlog::error("KvStore: connection still inside a transaction after ROLLBACK");
     }
 };
 
@@ -264,6 +273,40 @@ std::expected<KvStore, KvStoreError> KvStore::open(const std::filesystem::path& 
     if (rc != SQLITE_OK) {
         spdlog::warn("KvStore: WAL mode failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
+    }
+
+    // Durability level (UP-14): set synchronous=FULL explicitly so the level does not depend on
+    // SQLite's compile-time default. If the connection already defaults to FULL (2), as the
+    // measured vcpkg build does, this preserves that setting; otherwise it raises the setting
+    // for every consumer of this connection (plugin KV, the Guardian journal, baselines, the
+    // boot epoch). The Guardian boot-epoch claim refuses to issue an epoch
+    // unless pragma_synchronous() reports FULL or EXTRA. The read-back is a defensive check of
+    // this connection's setting, not proof of media durability: it cannot show that the file
+    // system honours fsync. (Unlike journal_mode, a refused synchronous change is not reported
+    // as SQLITE_OK with the real level; inside a transaction it fails with an error, which
+    // open()'s autocommit connection cannot reach. A build without PRAGMA support returns no
+    // row, so the level reads -1 and the epoch claim reports ReadFailed.) A failure here is
+    // logged and the store is still returned (config drift must not kill an agent); the epoch
+    // claim's own gate then refuses a store that is not FULL.
+    {
+        char* sync_err = nullptr;
+        rc = sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &sync_err);
+        if (rc != SQLITE_OK)
+            spdlog::warn("KvStore: setting synchronous=FULL failed: {}",
+                         sync_err ? sync_err : "unknown");
+        sqlite3_free(sync_err);
+
+        int level = -1;
+        sqlite3_stmt* raw_stmt = nullptr;
+        if (sqlite3_prepare_v2(raw_db, "PRAGMA synchronous", -1, &raw_stmt, nullptr) == SQLITE_OK) {
+            StmtPtr stmt(raw_stmt);
+            if (sqlite3_step(stmt.get()) == SQLITE_ROW)
+                level = sqlite3_column_int(stmt.get(), 0);
+        }
+        if (level < 2)
+            spdlog::warn("KvStore: synchronous=FULL not in effect (got {}); power-loss "
+                         "durability of the journal and the boot epoch is not guaranteed",
+                         level);
     }
 
     // Busy handling for concurrent access (#5604): a handler reading an atomic budget instead of
@@ -782,9 +825,48 @@ int KvStore::del_keys(std::string_view plugin, const std::vector<std::string>& k
 }
 
 bool KvStore::rename_plugin(std::string_view from, std::string_view to) {
+    // A misuse guard, before any lock is taken. `from == to` would copy nothing (the INSERT is
+    // a no-op onto itself) and then delete every row; a name starting with `__` (a superset of
+    // kReservedPluginNames: the Guardian baselines, epoch and journal, the sync state) is an
+    // agent-owned namespace that a rename must never move or overwrite. The only caller passes
+    // the literals tar and echo; this keeps a future caller from emptying a namespace. The
+    // names are not echoed: a future caller may pass an untrusted one (CWE-117).
+    if (from.empty() || to.empty() || from == to || from.starts_with("__") ||
+        to.starts_with("__")) {
+        spdlog::error("KvStore::rename_plugin refused: an empty, identical or `__`-prefixed name");
+        return false;
+    }
+
     CallLock lock(mu_);
     if (!db_)
         return false;
+
+    // Steady state, every boot after the first: nothing is stored under `from`. A read needs no
+    // write lock (in WAL mode a read does not wait for a writer), so look first and return
+    // without BEGIN; otherwise even the zero-row INSERT/DELETE below waits out a write
+    // transaction another process holds, up to the busy budget. A row written under `from`
+    // after this read is moved by the next call.
+    {
+        sqlite3_stmt* raw_probe = nullptr;
+        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM kv_store WHERE plugin = ?1 LIMIT 1", -1,
+                               &raw_probe, nullptr) != SQLITE_OK) {
+            spdlog::error("KvStore::rename_plugin probe prepare failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        StmtPtr probe(raw_probe);
+        if (sqlite3_bind_text(probe.get(), 1, from.data(), static_cast<int>(from.size()),
+                              SQLITE_STATIC) != SQLITE_OK) {
+            spdlog::error("KvStore::rename_plugin probe bind failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+        const int probe_rc = sqlite3_step(probe.get());
+        if (probe_rc == SQLITE_DONE)
+            return true; // nothing to move
+        if (probe_rc != SQLITE_ROW) {
+            spdlog::error("KvStore::rename_plugin probe step failed: {}", sqlite3_errmsg(db_));
+            return false;
+        }
+    } // the probe statement is finalized here, before BEGIN
 
     if (sqlite3_exec(db_, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
         spdlog::error("KvStore::rename_plugin BEGIN failed: {}", sqlite3_errmsg(db_));

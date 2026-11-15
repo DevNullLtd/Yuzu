@@ -1336,7 +1336,7 @@ check_mgmt_auth_config() ->
     end.
 
 %% @doc Fail-closed guard (#6016 PR 4b): resolve the CA revocation list source
-%% (`mgmt_crl_source', `mgmt_crl_grace_s', `mgmt_crl_refresh_ms') and publish it for
+%% (`mgmt_crl_source', `mgmt_crl_grace_s', `mgmt_crl_refresh_ms', `mgmt_crl_max_validity_s') and publish it for
 %% yuzu_gw_authz and yuzu_gw_mgmt_crl_source. A malformed source, an `http://' URL, a
 %% missing `cacertfile' override, a url source with no CA to trust and a value out of
 %% range each refuse the boot: none falls back silently. An ABSENT source is not
@@ -1349,6 +1349,13 @@ check_mgmt_crl_source() ->
         {ok, none} ->
             ok = yuzu_gw_mgmt_crl_source:publish_policy(none),
             #{mode := Mode} = yuzu_gw_mgmt_identity:current(),
+            case application:get_env(yuzu_gw, mgmt_crl_max_validity_s) of
+                {ok, _} ->
+                    logger:notice("{yuzu_gw, mgmt_crl_max_validity_s} is set but mgmt_crl_source is "
+                                "not: no CRL is read, so the key has no effect.");
+                undefined ->
+                    ok
+            end,
             case guarded_mgmt_listener() andalso Mode =/= pin of
                 true ->
                     logger:warning(
@@ -1376,8 +1383,12 @@ check_mgmt_crl_source() ->
                 _ ->
                     ok
             end,
-            logger:info("Management CRL source: ~s; grace ~bs; refresh ~bms",
-                        [describe_crl_source(Source), Grace, Refresh]),
+            logger:info("Management CRL source: ~s; grace ~bs; refresh ~bms; maximum validity ~s",
+                        [describe_crl_source(Source), Grace, Refresh,
+                         case maps:find(max_validity_s, Policy) of
+                             {ok, M} -> io_lib:format("~bs", [M]);
+                             error -> "not bounded"
+                         end]),
             ok;
         {error, Defects} ->
             logger:critical(
@@ -1386,7 +1397,8 @@ check_mgmt_crl_source() ->
               "{url, Url, #{cacertfile => Path}} or {file, Path} (https only; no userinfo; "
               "the cacertfile must exist, and a url source needs one, or a management "
               "listener cacertfile to default to); mgmt_crl_grace_s an integer from 0 to "
-              "604800; mgmt_crl_refresh_ms an integer from 1000 to 3600000. See "
+              "604800; mgmt_crl_refresh_ms an integer from 1000 to 3600000; "
+              "mgmt_crl_max_validity_s unset or an integer from 3600 to 31536000. See "
               "docs/user-manual/gateway.md.", [Defects]),
             {error, bad_mgmt_crl_source}
     end.

@@ -141,10 +141,11 @@ static_assert(kDedupPresenceIndex < kNDedupAgentCountMetrics,
 /// Capacity signal: the agent's cached row count (in-flight + terminal) in its dedup store.
 /// Rolled up as the fleet MAX (a sum of row counts is meaningless; the question is "how close
 /// is the fullest store to its bound"), hence the `_max` suffix. ABSENT, not 0, when no agent
-/// reported a valid value. Compare against kMaxDedupRows (20000, in agents/core
-/// command_dedup_store.hpp; not restated as a constant here, same no-upward-edge rule, and
-/// pinned to the HELP text by tests/test_dedup_fleet_tags_lexical.py) plus one prune interval
-/// (512).
+/// reported a valid value. Compare against kMaxDedupRows (20000: `kAgentDedupRingRows` in
+/// common/include/yuzu/command_replay_horizon.hpp, which agents/core command_dedup_store.hpp
+/// defines kMaxDedupRows from (#3678); not restated as a constant here, same no-upward-edge
+/// rule, and pinned to the HELP text by tests/test_dedup_fleet_tags_lexical.py) plus one prune
+/// interval (512).
 inline constexpr const char* kDedupRowsTag = "yuzu.dedup_rows";
 inline constexpr const char* kDedupRowsMaxGauge = "yuzu_fleet_dedup_rows_max";
 inline constexpr const char* kDedupRowsMaxHelp =

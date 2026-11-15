@@ -57,6 +57,7 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_emit_seq.hpp"             // GuardianEmitSeqSource (UP-14)
 #include "guardian_legacy_sink_executor.hpp" // LegacySendOutcome, legacy_sink_executor_for_test()'s type
 
 #include "test_helpers.hpp"
@@ -131,13 +132,15 @@ struct LegacySinkFixture {
     /// path, routed-concerns.md Spark row) — a test can pass true to prove
     /// legacy_sink_kick()'s gap-repair path runs regardless of the flip, which is the
     /// whole reason it does not share journal_maintenance_tick()'s prefer_spark_ gate.
+    /// `boot_epoch` (UP-14): 0 (default) is the unordered engine every case here used before
+    /// the wire pair existed; a nonzero value makes the executor stamp (boot_epoch, emit_seq).
     explicit LegacySinkFixture(std::size_t legacy_sink_max_events_for_test = 0,
-                               bool prefer_spark = false) {
+                               bool prefer_spark = false, std::uint64_t boot_epoch = 0) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
-        engine =
-            std::make_unique<GuardianEngine>(kv.get(), "agent-legacy-sink-test", prefer_spark);
+        engine = std::make_unique<GuardianEngine>(kv.get(), "agent-legacy-sink-test", prefer_spark,
+                                                  boot_epoch);
         if (legacy_sink_max_events_for_test != 0)
             engine->set_legacy_sink_max_events_for_test(legacy_sink_max_events_for_test);
         REQUIRE(engine->start_local().has_value());
@@ -271,6 +274,13 @@ public:
         return event_ids_;
     }
 
+    /// Full copies of the delivered events, in the same arrival order (UP-14: the
+    /// emit-pair assertions need boot_epoch / emit_seq / timestamp, not just identity).
+    std::vector<gpb::GuaranteedStateEvent> events() const {
+        std::lock_guard lk(mu_);
+        return events_;
+    }
+
 private:
     yuzu::agent::LegacySendOutcome on_event(const gpb::GuaranteedStateEvent& ev) {
         std::unique_lock lk(mu_);
@@ -279,6 +289,7 @@ private:
         cv_.wait(lk, [this] { return released_; }); // the hazard stand-in: parks here
         order_.emplace_back(ev.rule_id(), ev.event_type());
         event_ids_.push_back(ev.event_id());
+        events_.push_back(ev);
         return yuzu::agent::LegacySendOutcome::Sent;
     }
 
@@ -288,7 +299,52 @@ private:
     std::size_t entered_{0};
     std::vector<std::pair<std::string, std::string>> order_;
     std::vector<std::string> event_ids_;
+    std::vector<gpb::GuaranteedStateEvent> events_;
 };
+
+/// UP-14: an always-Sent EventSink that records full copies of what the executor
+/// delivered. Captures `this`, so the engine's executor workers must be physically
+/// retired (retire_or_abort below) before this object destructs.
+class RecordingSink {
+public:
+    yuzu::agent::GuardianEngine::EventSink sink() {
+        return [this](const gpb::GuaranteedStateEvent& ev) {
+            std::lock_guard lk(mu_);
+            events_.push_back(ev);
+            return yuzu::agent::LegacySendOutcome::Sent;
+        };
+    }
+
+    std::vector<gpb::GuaranteedStateEvent> events() const {
+        std::lock_guard lk(mu_);
+        return events_;
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::vector<gpb::GuaranteedStateEvent> events_;
+};
+
+/// RecordingSink analogue of require_legacy_sink_retired(): an always-Sent sink has no
+/// latch to release, so this only waits for the worker(s) to retire, and aborts the whole
+/// process (rather than unwind into a captured-this use-after-free) if they do not.
+void retire_or_abort(GuardianEngine& engine, const char* what) {
+    if (!engine.retire_legacy_sink_workers_for_test(std::chrono::seconds{30})) {
+        spdlog::critical("legacy_sink cleanup: '{}' - executor worker(s) did not retire "
+                         "within 30s - aborting rather than letting scope unwind into a "
+                         "captured-this use-after-free",
+                         what);
+        std::abort();
+    }
+}
+
+yuzu::agent::GuardDrift emit_pair_drift(const std::string& rule_id) {
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = rule_id;
+    d.rule_name = rule_id;
+    return d;
+}
 
 /// Cleanup used by every case below (plan hygiene rules 2/3/6): idempotently
 /// release the blocking sink's latch, then REQUIRE the legacy-sink executor's
@@ -438,6 +494,45 @@ TEST_CASE("legacy_sink_dropped_unwired(): 0 until a sink is wired, then incremen
     CHECK(f.engine->legacy_sink_dropped_unwired() == 2);
 
     f.engine->stop();
+}
+
+// ── #5690: the census orders by the event stamp, so the stamp keeps its sub-second part ────
+
+TEST_CASE("an emitted guard event carries a millisecond-resolution timestamp and not whole seconds "
+          "(#5690)",
+          "[guardian][engine][legacy_sink]") {
+    LegacySinkFixture f;
+    std::mutex cap_mu;
+    std::vector<gpb::GuaranteedStateEvent> captured;
+    f.engine->set_event_sink([&](const gpb::GuaranteedStateEvent& ev) {
+        std::lock_guard lk(cap_mu);
+        captured.push_back(ev);
+        return yuzu::agent::LegacySendOutcome::Sent;
+    });
+    const auto before_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    yuzu::agent::GuardDrift d;
+    d.guard_type = "file";
+    d.rule_id = "stamp-rule";
+    d.rule_name = "stamp-rule";
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, d);
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    const auto after_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::system_clock::now().time_since_epoch())
+                              .count();
+    {
+        std::lock_guard lk(cap_mu);
+        REQUIRE(captured.size() == 1);
+        const auto& ts = captured[0].timestamp();
+        CHECK(ts.nanos() >= 0);
+        CHECK(ts.nanos() < 1'000'000'000);
+        CHECK(ts.nanos() % 1'000'000 == 0); // millisecond-resolution source
+        const std::int64_t stamp_ms = ts.seconds() * 1000 + ts.nanos() / 1'000'000;
+        CHECK(stamp_ms >= before_ms);
+        CHECK(stamp_ms <= after_ms);
+    }
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
 }
 
 // ── CH-1 L1 (cross-platform): the detached send stalls, never the emitter ───
@@ -887,17 +982,16 @@ TEST_CASE("#4783 gap: legacy_sink_kick() stamps a still-open gap's repair with "
     // record entirely (nothing left to read afterward).
     auto gaps = f.engine->legacy_sink_executor_for_test().gapped_rules_needing_repair(10);
     REQUIRE(gaps.size() == 1);
-    const auto last_lost_secs = std::chrono::duration_cast<std::chrono::seconds>(
-                                    gaps[0].second.last_lost.time_since_epoch())
-                                    .count();
+    const auto last_lost_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  gaps[0].second.last_lost.time_since_epoch())
+                                  .count();
+    const auto last_lost_secs = last_lost_ns / 1'000'000'000;
 
     blocking.release();
     REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
     REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
 
-    // Timestamps here are second-granular (GuaranteedStateEvent.timestamp is a
-    // google.protobuf.Timestamp with only `seconds` ever set - see
-    // emit_guard_event()). Without letting real wall-clock time move into a
+    // Without letting real wall-clock time move into a
     // LATER second than last_lost, a kick() firing immediately after the loss
     // would stamp the same second whether it used `now` or `last_lost`, and the
     // assertion below would not actually discriminate between the fix and the
@@ -928,6 +1022,10 @@ TEST_CASE("#4783 gap: legacy_sink_kick() stamps a still-open gap's repair with "
         // which by construction (the sleep above) is in a strictly LATER second.
         CHECK(captured[0].timestamp().seconds() == last_lost_secs);
         CHECK(captured[0].timestamp().seconds() < now_at_kick_secs);
+        // The sub-second part of last_lost travels too, floored to the millisecond scale of a live
+        // event (the census orders by it, #5690).
+        CHECK(captured[0].timestamp().nanos() ==
+              (last_lost_ns % 1'000'000'000) / 1'000'000 * 1'000'000); // floored to ms
     }
 
     REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
@@ -1791,4 +1889,171 @@ TEST_CASE("#4783 Gate 8: legacy_sink_kick() and stop() still both persist correc
         CHECK(rule_ids == std::vector<std::string>{"gapped-rule-a", "gapped-rule-b"});
         engine.stop();
     }
+}
+
+// ── UP-14: the wire (boot_epoch, emit_seq) pair on the live legacy path ─────────────────
+// prefer_spark_ is false in production, so this executor is the live census writer: the pair
+// has to be stamped here, at the admission point that decides queue order.
+
+namespace {
+constexpr std::uint64_t kUp14Epoch = 1'790'000'123ULL;
+} // namespace
+
+TEST_CASE("UP-14: an errored event whose clock stepped back still gets the HIGHER emit_seq - "
+          "the pair orders correctly while the timestamps invert",
+          "[guardian][engine][legacy_sink][emit_seq]") {
+    RecordingSink rec;
+    LegacySinkFixture f{/*legacy_sink_max_events_for_test=*/0, /*prefer_spark=*/false, kUp14Epoch};
+    yuzu::test::ScopeExit cleanup([&] { retire_or_abort(*f.engine, "UP-14 red cleanup"); });
+    f.engine->set_event_sink(rec.sink());
+    CHECK(f.engine->boot_epoch() == kUp14Epoch);
+
+    // Compliant at wall time T ...
+    auto compliant = emit_pair_drift("rule-A");
+    compliant.compliant = true;
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, compliant);
+    // ... then an errored (guard.unhealthy) verdict emitted AFTER it, but stamped 10 s
+    // EARLIER by a backward clock step. This is the census-corrupting shape.
+    auto errored = emit_pair_drift("rule-A");
+    errored.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    errored.health_detail = "channel dead";
+    yuzu::agent::guardian_emit_drift_for_test(
+        *f.engine, errored, std::chrono::system_clock::now() - std::chrono::seconds{10});
+
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    const auto evs = rec.events();
+    REQUIRE(evs.size() == 2);
+    REQUIRE(evs[0].event_type() == "guard.compliant");
+    REQUIRE(evs[1].event_type() == "guard.unhealthy");
+
+    // The timestamps invert: the newer verdict looks older ...
+    CHECK(evs[1].timestamp().seconds() < evs[0].timestamp().seconds());
+    // ... and the pair, (engine epoch, admission-order seq), orders them correctly.
+    CHECK(evs[0].boot_epoch() == kUp14Epoch);
+    CHECK(evs[1].boot_epoch() == kUp14Epoch);
+    CHECK(evs[0].emit_seq() > 0);
+    CHECK(evs[1].emit_seq() == evs[0].emit_seq() + 1);
+}
+
+TEST_CASE("UP-14: a gap repair carries a FRESH, higher emit_seq than the verdict delivered "
+          "before the loss, and the gap's last_lost timestamp",
+          "[guardian][engine][legacy_sink][chaos][emit_seq]") {
+    BlockingSink blocking;
+    LegacySinkFixture f{/*legacy_sink_max_events_for_test=*/1, /*prefer_spark=*/false, kUp14Epoch};
+    yuzu::test::ScopeExit cleanup(
+        [&] { require_legacy_sink_retired(*f.engine, blocking, "UP-14 gap repair cleanup"); });
+    f.engine->set_event_sink(blocking.sink());
+
+    // E1: the verdict for the soon-to-be gapped rule goes in flight (parked in the sink).
+    auto e1 = emit_pair_drift("gapped-rule");
+    e1.compliant = true;
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, e1);
+    REQUIRE(
+        yuzu::test::spin_until([&] { return blocking.entered() >= 1; }, std::chrono::seconds{30}));
+    // Another rule occupies the sole queue slot, so E2 below is REFUSED.
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, emit_pair_drift("rule-2"));
+    REQUIRE(f.engine->legacy_sink_executor_for_test().pending_count_for_test() == 1);
+    // E2: errored, refused for capacity -> the sticky gap opens for "gapped-rule".
+    auto e2 = emit_pair_drift("gapped-rule");
+    e2.health = yuzu::agent::GuardDrift::Health::Unhealthy;
+    yuzu::agent::guardian_emit_drift_for_test(*f.engine, e2);
+    REQUIRE(f.engine->legacy_sink_gap_rules() == 1);
+
+    // Read last_lost BEFORE the repair erases the gap (the repair's timestamp must equal it;
+    // last_lost is the wall clock at loss time, so it cannot be chosen by the test).
+    auto gaps = f.engine->legacy_sink_executor_for_test().gapped_rules_needing_repair(10);
+    REQUIRE(gaps.size() == 1);
+    const auto last_lost_secs = std::chrono::duration_cast<std::chrono::seconds>(
+                                    gaps[0].second.last_lost.time_since_epoch())
+                                    .count();
+
+    // E1 and rule-2 deliver; E1's seq is OLDER than the loss, so it does not erase the gap.
+    blocking.release();
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(f.engine->retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+    const auto delivered = blocking.events();
+    REQUIRE(delivered.size() == 2);
+    REQUIRE(delivered[0].rule_id() == "gapped-rule");
+    const std::uint64_t e1_seq = delivered[0].emit_seq();
+    const std::uint64_t newest_delivered_seq = delivered[1].emit_seq();
+    CHECK(e1_seq > 0);
+    REQUIRE(f.engine->legacy_sink_gap_rules() == 1); // no delivery between loss and kick
+
+    RecordingSink rec;
+    yuzu::test::ScopeExit cleanup_rec([&] { retire_or_abort(*f.engine, "UP-14 repair sink"); });
+    f.engine->set_event_sink(rec.sink());
+    f.engine->legacy_sink_kick();
+    REQUIRE(f.engine->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    const auto repairs = rec.events();
+    REQUIRE(repairs.size() == 1);
+    CHECK(repairs[0].rule_id() == "gapped-rule");
+    CHECK(repairs[0].event_type() == "guard.unhealthy");
+    CHECK(repairs[0].timestamp().seconds() == last_lost_secs);
+    CHECK(repairs[0].boot_epoch() == kUp14Epoch);
+    CHECK(repairs[0].emit_seq() > e1_seq);
+    CHECK(repairs[0].emit_seq() > newest_delivered_seq);
+}
+
+TEST_CASE("UP-14: an engine with boot_epoch 0 (the 2- and 3-argument constructors) puts "
+          "0/0 on the wire while the internal sequence still advances",
+          "[guardian][engine][legacy_sink][emit_seq]") {
+    RecordingSink rec;
+    // 2-argument form: the signature every pre-UP-14 caller uses.
+    GuardianEngine two_arg(nullptr, "agent-2arg");
+    // 3-argument form.
+    GuardianEngine three_arg(nullptr, "agent-3arg", /*prefer_spark=*/false);
+    yuzu::test::ScopeExit cleanup([&] {
+        retire_or_abort(two_arg, "UP-14 epoch-0 2-arg cleanup");
+        retire_or_abort(three_arg, "UP-14 epoch-0 3-arg cleanup");
+    });
+    two_arg.set_event_sink(rec.sink());
+    three_arg.set_event_sink(rec.sink());
+    CHECK(two_arg.boot_epoch() == 0);
+    CHECK(three_arg.boot_epoch() == 0);
+
+    for (auto* e : {&two_arg, &three_arg}) {
+        yuzu::agent::guardian_emit_drift_for_test(*e, emit_pair_drift("rule-A"));
+        yuzu::agent::guardian_emit_drift_for_test(*e, emit_pair_drift("rule-A"));
+        REQUIRE(e->flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    }
+
+    const auto evs = rec.events();
+    REQUIRE(evs.size() == 4);
+    for (const auto& ev : evs) {
+        CHECK(ev.boot_epoch() == 0);
+        CHECK(ev.emit_seq() == 0);
+    }
+    // The value is still drawn (only the wire is gated), so the internal keys keep working.
+    CHECK(two_arg.emit_seq_source_for_test()->last.load() == 2);
+    CHECK(three_arg.emit_seq_source_for_test()->last.load() == 2);
+}
+
+TEST_CASE("UP-14: set_legacy_sink_max_events_for_test() rebuilds the executor WITH the "
+          "engine's emit source - same epoch, and the sequence continues",
+          "[guardian][engine][legacy_sink][emit_seq]") {
+    RecordingSink rec;
+    GuardianEngine engine(nullptr, "agent-seam", /*prefer_spark=*/false, kUp14Epoch);
+    yuzu::test::ScopeExit cleanup([&] { retire_or_abort(engine, "UP-14 seam cleanup"); });
+    engine.set_event_sink(rec.sink());
+    const auto source_before = engine.emit_seq_source_for_test();
+    REQUIRE(source_before);
+
+    yuzu::agent::guardian_emit_drift_for_test(engine, emit_pair_drift("rule-A"));
+    REQUIRE(engine.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+    REQUIRE(engine.retire_legacy_sink_workers_for_test(std::chrono::seconds{5}));
+
+    // The seam replaces the executor (MUST precede start_local(); never reached here).
+    engine.set_legacy_sink_max_events_for_test(64);
+    CHECK(engine.emit_seq_source_for_test() == source_before); // the engine's source is kept
+
+    yuzu::agent::guardian_emit_drift_for_test(engine, emit_pair_drift("rule-A"));
+    REQUIRE(engine.flush_legacy_sink_for_test(std::chrono::seconds{5}));
+
+    const auto evs = rec.events();
+    REQUIRE(evs.size() == 2);
+    CHECK(evs[0].boot_epoch() == kUp14Epoch);
+    CHECK(evs[1].boot_epoch() == kUp14Epoch);
+    CHECK(evs[0].emit_seq() > 0);
+    CHECK(evs[1].emit_seq() == evs[0].emit_seq() + 1); // continues, does not restart at 1
 }

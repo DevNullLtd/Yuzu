@@ -38,18 +38,24 @@
  * `nullptr`, i.e. unconditionally).
  */
 
+#include "body_cap_policy.hpp" // the request-size row the score-policy text restates
 #include "content_etag.hpp"
 #include "crypto_library_model.hpp"
 #include "device_token_store.hpp"
 #include "dex_read_model.hpp" // the scope tokens and the basis/coverage the builder can emit
 #include "dex_score_policy_json.hpp" // the serializer the DexScorePolicyDocument schema mirrors
 #include "dex_score_policy_writer.hpp" // dex_score_policy_in_force_json: the data envelope's keys
+#include "guaranteed_state_store.hpp" // kUnrepresentedPendingIdCap: the cap the maxItems literals mirror
+#include "guardian_backend_fleet_tags.hpp" // #2240: the closed backend token table the device enum mirrors
 #include "license_store.hpp"
+#include "openapi_body_check.hpp"
 #include "openapi_spec_access.hpp"
 #include "rest_api_v1.hpp"
+#include "result_set_model.hpp"
 #include "settings_model.hpp"
 #include "software_catalog_rules.hpp" // kEcosystemFamilies: the published ecosystem vocabulary
 #include "software_deployment_store.hpp"
+#include "software_list_model.hpp" // component_row_json: the serialiser the components row schema mirrors
 #include "pg/pg_pool.hpp" // an unparseable-conninfo pool backs the unopened stand-in stores
 #include "test_route_sink.hpp"
 
@@ -62,6 +68,7 @@
 #include <cctype>
 #include <cstddef>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <optional>
@@ -202,7 +209,8 @@ bool ref_resolves(const json& spec, const std::string& ref) {
 }
 
 json param(const json& op, const char* name) {
-    // value(), not operator[]: on a const json a missing key asserts and aborts the whole shard.
+    // value(), not operator[]: on a const json a missing key asserts (undefined behaviour in an
+    // NDEBUG build) instead of failing the test.
     for (const auto& p : op.value("parameters", json::array()))
         if (p.value("name", "") == name)
             return p;
@@ -373,6 +381,21 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "server state") != std::string::npos);
 }
 
+TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
+          "[openapi]") {
+    // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits
+    // additionalProperties:false would tell a generated client the opposite.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& schemas = spec["components"]["schemas"];
+    for (const char* name : {"InstructionsDefinitionCreateRequest", "InstructionSetCreateRequest"}) {
+        INFO(name);
+        REQUIRE(schemas.contains(name));
+        REQUIRE(schemas[name].contains("additionalProperties"));
+        CHECK(schemas[name]["additionalProperties"] == false);
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",
           "[openapi][app_usage]") {
     const auto& spec_json = yuzu::server::openapi_spec_json();
@@ -521,6 +544,17 @@ TEST_CASE("openapi_spec_json(): POST /instructions/{id}/execute documents the au
     const std::string d503 = rsp["503"].value("description", "");
     CHECK(d503.find("pending-approval count unreadable") != std::string::npos);
     CHECK(d503.find("retry_after_ms 5000") != std::string::npos);
+    // The permission-class refusals (#7110, #7114) answer 403, so the 403 text names them and the
+    // 503 text (fleet-state facts) does not.
+    REQUIRE(rsp.contains("403"));
+    const std::string d403 = rsp["403"].value("description", "");
+    CHECK(d403.find("permission_revoked") != std::string::npos);
+    CHECK(d403.find("dispatch_denied") != std::string::npos);
+    // Every chokepoint token the route maps to 403, and the approval-mode arm of permission_revoked.
+    CHECK(d403.find("anonymous_operator") != std::string::npos);
+    CHECK(d403.find("role-gated") != std::string::npos);
+    CHECK(d503.find("permission_revoked") == std::string::npos);
+    CHECK(d503.find("dispatch_denied") == std::string::npos);
     const std::string d500 = rsp["500"].value("description", "");
     CHECK(d500.find("dispatch_unconfigured") != std::string::npos);
     CHECK(d500.find("dispatch_exception") != std::string::npos);
@@ -561,6 +595,11 @@ TEST_CASE("openapi_spec_json(): POST /commands documents the dispatch_exception 
     CHECK(d500.find("lower bound") != std::string::npos);
     CHECK(d500.find("only when the write succeeds") != std::string::npos);
     CHECK(d500.find("cancel_execution") != std::string::npos);
+    // The 403 text names the two post-row refusals the top description states (#7110, #7114).
+    REQUIRE(rsp.contains("403"));
+    const std::string d403 = rsp["403"].value("description", "");
+    CHECK(d403.find("permission_revoked") != std::string::npos);
+    CHECK(d403.find("dispatch_denied") != std::string::npos);
 }
 
 TEST_CASE("openapi_spec_json(): POST /hardware/sync documents the fan-out request and every refusal",
@@ -1103,6 +1142,34 @@ TEST_CASE("openapi_spec_json(): every ecosystem parameter and the pipe-list are 
     CHECK(built.capacity() - built.size() < built.size() / 2);
 }
 
+TEST_CASE("openapi_spec_json(): the components lookup row is typed and its keys are exactly component_row_json's",
+          "[openapi][software]") {
+    const json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/inventory/software/components"));
+    const auto& data = spec["paths"]["/inventory/software/components"]["get"]["responses"]["200"]
+                           ["content"]["application/json"]["schema"]["properties"]["data"];
+    const auto& item = data["properties"]["components"]["items"];
+    REQUIRE(item.contains("properties")); // an untyped {"type":"object"} row would fail here
+    std::set<std::string> documented;
+    for (const auto& [k, v] : item["properties"].items())
+        documented.insert(k);
+    std::set<std::string> required;
+    for (const auto& k : item["required"])
+        required.insert(k.get<std::string>());
+    std::set<std::string> served;
+    // Bound to a local: a range-for over .items() of a temporary dangles before C++23 (P2718R0).
+    const json served_row = yuzu::server::software_list::component_row_json(
+        yuzu::server::SoftwareComponentRow{}, {});
+    for (const auto& [k, v] : served_row.items())
+        served.insert(k);
+    CHECK(documented == served);
+    CHECK(required == served); // the serialiser emits every key on every row
+    CHECK(item["properties"]["status"]["enum"] == json::array({"current", "unconfirmed", "disabled"}));
+    CHECK(item["properties"]["hostname"]["nullable"] == true);
+    CHECK(item["properties"]["last_seen"]["nullable"] == true);
+}
+
 TEST_CASE("expand_ecosystem_tokens(): the output is allocated once at its final size",
           "[openapi][software][ecosystem]") {
     // The function rest_api_v1.cpp builds the spec with (it uses this one through a
@@ -1571,8 +1638,8 @@ TEST_CASE("GET /api/v1/openapi.json: a strong ETag per form and 304 on a matchin
     }
 
     SECTION("a field sent on several lines is read as one comma-joined list (RFC 9110 5.3)") {
-        // The occurrences are added in whatever order the underlying unordered multimap keeps,
-        // so each case gives the same answer whichever line is read first.
+        // The occurrences are added in wire order (httplib keeps them in an insertion-ordered
+        // multimap), so each case gives the same answer whichever line is read first.
         const std::string stale = "\"0000000000000000\"";
         struct Case {
             std::string first;
@@ -1796,6 +1863,38 @@ const std::string& document_text(bool with_guides) {
 
 const char* form_name(bool with_guides) { return with_guides ? "with guides" : "default"; }
 
+/// The member names of a JSON object.
+std::set<std::string> keys_of(const json& obj) {
+    std::set<std::string> out;
+    for (auto it = obj.begin(); it != obj.end(); ++it)
+        out.insert(it.key());
+    return out;
+}
+
+/// The elements of a JSON array of strings.
+std::set<std::string> set_of(const json& arr) {
+    std::set<std::string> out;
+    for (const auto& k : arr)
+        out.insert(k.get<std::string>());
+    return out;
+}
+
+/// The node at the end of a chain of object keys, or nullptr when any step is missing or its
+/// parent is not an object. Lets a pin report a missing node with CHECK and move on to the next
+/// row, where a chain of `.at()` would throw and abandon the rest of the test case.
+const json* find_at(const json& root, std::initializer_list<const char*> keys) {
+    const json* node = &root;
+    for (const char* key : keys) {
+        if (!node->is_object())
+            return nullptr;
+        const auto it = node->find(key);
+        if (it == node->end())
+            return nullptr;
+        node = &*it;
+    }
+    return node;
+}
+
 /// The node a `$ref` names, or the node itself when it is not a reference.
 json resolve_ref(const json& spec, const json& node) {
     if (!node.is_object() || !node.contains("$ref"))
@@ -1844,7 +1943,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"5d12cce46b2c8920\"";
+    static const std::string kOperationIdChecksum = "\"1a09f63aebc10a4a\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2055,6 +2154,9 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
           "[openapi][structure][envelope]") {
     const std::set<std::string> kList = {"data", "pagination", "meta"};
     const std::set<std::string> kOne = {"data", "meta"};
+    // Not in this table: the plugin-config value, secret, kill-switch and DELETE responses (pinned
+    // by the plugin-config test case further down), GET /plugin-config (a list, not pinned by
+    // either), and the upload agent routes, whose 200 bodies are bare objects with no envelope.
     // Each key list was read from the named handler, not from the schema:
     //  inventory/tables: JObj of plugin, agent_count, last_collected, through list_json.
     //  rules list: rule_to_jobj (14 fields) through list_json.
@@ -2089,7 +2191,7 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
         {"/guaranteed-state/rules/{rule_id}/status",
          kList,
          true,
-         {"agent_id", "state", "updated_at"},
+         {"agent_id", "state", "updated_at", "order_uncertain", "projection_pending"},
          true,
          "",
          {}},
@@ -2106,21 +2208,24 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
         {"/guaranteed-state/agents/{agent_id}/rules",
          kOne,
          false,
-         {"agent_id", "guards", "total_guards"},
+         {"agent_id", "guards", "total_guards", "unrepresented_pending_guards",
+          "unrepresented_pending_rule_ids", "ordering"},
          true,
          "guards",
-         {"rule_id", "name", "state", "updated_at"}},
+         {"rule_id", "name", "state", "updated_at", "order_uncertain", "projection_pending"}},
         {"/guaranteed-state/status",
          kOne,
          false,
-         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         {"total_rules", "compliant_rules", "drifted_rules", "errored_rules", "uncertain_rules",
+          "unordered_agents", "unordered_agent_ids", "note"},
          false,
          "",
          {}},
         {"/guaranteed-state/status/{agent_id}",
          kOne,
          false,
-         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules", "note"},
+         {"agent_id", "total_rules", "compliant_rules", "drifted_rules", "errored_rules",
+          "uncertain_rules", "note"},
          false,
          "",
          {}},
@@ -2128,10 +2233,12 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          kOne,
          false,
          {"baseline", "deployed", "assessable", "agent_id", "total_guards", "snapshot_total",
-          "compliant", "drifted", "errored", "pending", "last_updated", "guards"},
+          "compliant", "drifted", "errored", "pending", "uncertain_guards",
+          "unrepresented_pending_guards", "unrepresented_pending_rule_ids", "last_updated",
+          "guards"},
          true,
          "guards",
-         {"rule_id", "name", "status", "updated_at"}},
+         {"rule_id", "name", "status", "updated_at", "order_uncertain", "projection_pending"}},
     };
 
     // The properties a response can carry: writeOnly ones are input-only and never in a response.
@@ -2196,17 +2303,187 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
     }
 }
 
+// #7217: the per-device reads declare the unrepresented-pending summary with its bounds and the two
+// per-guard flags. Neither schema declares a `required` list for its data object (the pin above
+// checks the key sets), so what is pinned here is each new property's type and bounds.
+TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are typed and bounded",
+          "[openapi][guardian][ordering]") {
+    for (const bool with_guides : {false, true}) {
+        const json spec = json::parse(document_text(with_guides));
+        INFO("form: " << form_name(with_guides));
+
+        const auto check_summary = [&](const json& data) {
+            REQUIRE(data.contains("properties"));
+            const json& props = data["properties"];
+            REQUIRE(props.contains("unrepresented_pending_guards"));
+            CHECK(props["unrepresented_pending_guards"].value("type", "") == "integer");
+            CHECK(props["unrepresented_pending_guards"].value("minimum", -1) == 0);
+            REQUIRE(props.contains("unrepresented_pending_rule_ids"));
+            const json& ids = props["unrepresented_pending_rule_ids"];
+            CHECK(ids.value("type", "") == "array");
+            // The served literal is bound to the store's cap: a change to one without the other fails here.
+            CHECK(ids.value("maxItems", std::size_t{0}) == yuzu::server::kUnrepresentedPendingIdCap);
+            CHECK(ids.value("uniqueItems", false));
+            REQUIRE(ids.contains("items"));
+            CHECK(ids["items"].value("type", "") == "string");
+        };
+        const auto check_flags = [&](const json& guard_items) {
+            REQUIRE(guard_items.contains("properties"));
+            for (const char* k : {"order_uncertain", "projection_pending"}) {
+                INFO("guard flag: " << k);
+                REQUIRE(guard_items["properties"].contains(k));
+                CHECK(guard_items["properties"][k].value("type", "") == "boolean");
+            }
+        };
+
+        // device-compliance: the shared component.
+        const json& cget = spec["paths"].at("/guaranteed-state/device-compliance").at("get");
+        const json cdata = resolve_ref(spec, cget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        check_summary(cdata);
+        REQUIRE(cdata["properties"].contains("uncertain_guards"));
+        CHECK(cdata["properties"]["uncertain_guards"].value("type", "") == "integer");
+        CHECK(cdata["properties"]["uncertain_guards"].value("minimum", -1) == 0);
+        check_flags(cdata["properties"].at("guards").at("items"));
+        // The old caveat that disclaimed these fields is gone from the route text.
+        const std::string cdesc = cget.value("description", "");
+        CHECK(cdesc.find("do not report ordering uncertainty") == std::string::npos);
+        CHECK(cdesc.find("unrepresented_pending_guards") != std::string::npos);
+        // A5 machine metadata (#7217 gate 8, CA-7): the consumer rule lives on the `assessable`
+        // property, and the per-agent status route points at the per-device reads.
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "Never render a clean state") != std::string::npos);
+        CHECK(cdata["properties"].at("assessable").value("description", "").find(
+                  "unrepresented_pending_guards") != std::string::npos);
+        const std::string sdesc =
+            spec["paths"].at("/guaranteed-state/status/{agent_id}").at("get").value("description", "");
+        CHECK(sdesc.find("reads all-zero here") != std::string::npos);
+        CHECK(sdesc.find("unrepresented_pending_guards") != std::string::npos);
+        const std::string fdesc =
+            spec["paths"].at("/guaranteed-state/status").at("get").value("description", "");
+        CHECK(fdesc.find("counts only pairs that have a census row") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/agents/{agent_id}/rules") != std::string::npos);
+        CHECK(fdesc.find("/api/v1/guaranteed-state/device-compliance") != std::string::npos);
+
+        // all-guards: the inline schema.
+        const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
+        const json gdata = resolve_ref(spec, gget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        check_summary(gdata);
+        check_flags(gdata["properties"].at("guards").at("items"));
+        CHECK(gget.value("description", "").find("unrepresented_pending_guards") !=
+              std::string::npos);
+        // The 200 description names the new keys, not only the old three.
+        const std::string g200 = gget.at("responses").at("200").value("description", "");
+        CHECK(g200.find("unrepresented_pending_guards") != std::string::npos);
+        CHECK(g200.find("unrepresented_pending_rule_ids") != std::string::npos);
+        // The pending-evidence statement timeout is documented as NOT retryable on both routes, with
+        // the metric that counts it; the ordinary degrade keeps its retryable text.
+        for (const json* route : {&cget, &gget}) {
+            const std::string r503 = route->at("responses").at("503").value("description", "");
+            INFO(r503);
+            CHECK(r503.find("NOT") != std::string::npos);
+            CHECK(r503.find("retry_after_ms is null") != std::string::npos);
+            CHECK(r503.find("guardian_census_device") != std::string::npos);
+            CHECK(r503.find("statement_timeout") != std::string::npos);
+            CHECK(route->value("description", "").find("ascending byte order") !=
+                  std::string::npos);
+        }
+    }
+}
+
+// UP-14 server PR A5a: the stored per-agent ordering state. The key sets are pinned above; this
+// pins each new property's type, nullability and bound, and that the description says the pair is
+// stored and counted, not yet compared.
+TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bounded and described",
+          "[openapi][guardian][ordering][pair]") {
+    for (const bool with_guides : {false, true}) {
+        const json spec = json::parse(document_text(with_guides));
+        INFO("form: " << form_name(with_guides));
+
+        // Fleet rollup.
+        const json& sget = spec["paths"].at("/guaranteed-state/status").at("get");
+        const json sdata = resolve_ref(spec, sget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        const json& sprops = sdata.at("properties");
+        REQUIRE(sprops.contains("unordered_agents"));
+        CHECK(sprops["unordered_agents"].value("type", "") == "integer");
+        CHECK(sprops["unordered_agents"].value("minimum", -1) == 0);
+        REQUIRE(sprops.contains("unordered_agent_ids"));
+        const json& ids = sprops["unordered_agent_ids"];
+        CHECK(ids.value("type", "") == "array");
+        // The served literal is bound to the store's cap: a change to one without the other fails here.
+        CHECK(ids.value("maxItems", std::size_t{0}) == yuzu::server::kUnorderedAgentIdCap);
+        CHECK(ids.value("uniqueItems", false));
+        REQUIRE(ids.contains("items"));
+        CHECK(ids["items"].value("type", "") == "string");
+        const std::string sdesc = sget.value("description", "");
+        CHECK(sdesc.find("unordered_agents") != std::string::npos);
+        CHECK(sdesc.find("not yet compared") != std::string::npos);
+
+        // Per-device all-guards read.
+        const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
+        const json gdata = resolve_ref(spec, gget.at("responses")
+                                                 .at("200")
+                                                 .at("content")
+                                                 .at("application/json")
+                                                 .at("schema")["properties"]
+                                                 .at("data"));
+        REQUIRE(gdata["properties"].contains("ordering"));
+        const json ord = resolve_ref(spec, gdata["properties"]["ordering"]);
+        CHECK(ord.value("nullable", false)); // null when the agent has no order row
+        CHECK(ord.value("type", "") == "object");
+        REQUIRE(ord.contains("properties"));
+        const std::set<std::string> expect{"epoch",          "emit_seq_hwm",    "epoch_recv_ns",
+                                           "retired_epoch",  "unpaired_recv_ns", "currently_unordered",
+                                           "unpaired_events", "unpaired_held",   "pair_regressions",
+                                           "pair_stragglers", "pair_recoveries", "pair_duplicates",
+                                           "retired_events"};
+        CHECK(key_set(ord["properties"]) == expect);
+        REQUIRE(ord.contains("required"));
+        CHECK(std::set<std::string>(ord["required"].begin(), ord["required"].end()) == expect);
+        const json& p = ord["properties"];
+        CHECK(p["currently_unordered"].value("type", "") == "boolean");
+        for (const char* k : {"epoch", "emit_seq_hwm", "epoch_recv_ns", "retired_epoch",
+                              "unpaired_recv_ns"}) {
+            INFO("nullable column: " << k);
+            CHECK(p[k].value("type", "") == "integer");
+            CHECK(p[k].value("nullable", false));
+        }
+        for (const char* k : {"unpaired_events", "unpaired_held", "pair_regressions",
+                              "pair_stragglers", "pair_recoveries", "pair_duplicates",
+                              "retired_events"}) {
+            INFO("counter: " << k);
+            CHECK(p[k].value("type", "") == "integer");
+            CHECK(p[k].value("minimum", -1) == 0);
+            CHECK_FALSE(p[k].value("nullable", false));
+        }
+        const std::string gdesc = gget.value("description", "");
+        CHECK(gdesc.find("ordering") != std::string::npos);
+        CHECK(gdesc.find("not yet compared") != std::string::npos);
+        CHECK(p["pair_duplicates"].value("description", "").find("0 until") != std::string::npos);
+        const std::string g200 = gget.at("responses").at("200").value("description", "");
+        CHECK(g200.find("ordering") != std::string::npos);
+    }
+}
+
 TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the response builder",
           "[openapi][retention][echo]") {
     json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
     REQUIRE_FALSE(spec.is_discarded());
     const json& schema = spec.at("components").at("schemas").at("SettingsDataRetention");
-    const auto keys_of = [](const json& obj) {
-        std::set<std::string> out;
-        for (auto it = obj.begin(); it != obj.end(); ++it)
-            out.insert(it.key());
-        return out;
-    };
 
     Config cfg;
     const json real = yuzu::server::settings_model::build_data_retention_settings(cfg);
@@ -2217,18 +2494,14 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     REQUIRE(real["echo"].contains("tiers"));
     REQUIRE_FALSE(real["echo"]["tiers"].empty());
 
-    const auto set_of = [](const json& arr) {
-        std::set<std::string> out;
-        for (const auto& k : arr)
-            out.insert(k.get<std::string>());
-        return out;
-    };
     // The JSON type a value has, as the OpenAPI `type` keyword spells it.
     const auto type_of = [](const json& v) -> std::string {
         if (v.is_number_integer())
             return "integer";
         if (v.is_string())
             return "string";
+        if (v.is_boolean())
+            return "boolean";
         if (v.is_object())
             return "object";
         if (v.is_array())
@@ -2280,6 +2553,11 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     CHECK(echo.at("properties").at("tick_seconds").value("type", "") ==
           type_of(real["echo"]["tick_seconds"]));
     CHECK_FALSE(echo.at("properties").at("tick_seconds").value("nullable", false));
+    // The byte budget is published once at the echo level, as the agent's default.
+    REQUIRE(real["echo"].contains("db_budget_bytes"));
+    CHECK(echo.at("properties").at("db_budget_bytes").value("type", "") ==
+          type_of(real["echo"]["db_budget_bytes"]));
+    CHECK_FALSE(echo.at("properties").at("db_budget_bytes").value("nullable", false));
 
     // Every real tier: the declared keys, the declared types, and a null depth exactly on rows
     // tiers (so `nullable` is needed and is not decoration).
@@ -2322,6 +2600,10 @@ TEST_CASE("openapi_spec_json(): the SettingsDataRetention schema matches the res
     }
     CHECK(saw_rows);
     CHECK(saw_seconds);
+    // Every row says whether the byte budget can shorten it.
+    const json& budget_dep = item.at("properties").at("budget_dependent");
+    CHECK(budget_dep.value("type", "") == "boolean");
+    CHECK_FALSE(budget_dep.value("nullable", false));
     const json& depth = item.at("properties").at("guaranteed_depth_seconds");
     CHECK(depth.value("type", "") == "integer");
     CHECK(depth.value("nullable", false));
@@ -2353,7 +2635,85 @@ TEST_CASE("openapi_spec_json(): the data-retention operation documents the Echo 
     CHECK(ok.find("echo: {tick_seconds, tiers") != std::string::npos);
 }
 
-TEST_CASE("openapi documents: the response status set of the ten hand-checked operations matches "
+TEST_CASE("openapi_spec_json(): the ResultSet schema declares what result_set_json emits",
+          "[openapi][result_set][agents_failed]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& schema = spec.at("components").at("schemas").at("ResultSet");
+    const json real = yuzu::server::result_set_json(yuzu::server::ResultSet{});
+
+    std::set<std::string> emitted;
+    for (auto it = real.begin(); it != real.end(); ++it)
+        emitted.insert(it.key());
+    std::set<std::string> declared;
+    for (auto it = schema.at("properties").begin(); it != schema.at("properties").end(); ++it)
+        declared.insert(it.key());
+    std::set<std::string> required;
+    for (const auto& k : schema.at("required"))
+        required.insert(k.get<std::string>());
+    CHECK(declared == emitted);
+    CHECK(required == emitted);
+
+    // The failure signal: a count and a flag derived from it.
+    CHECK(schema.at("properties").at("agents_failed").value("type", "") == "integer");
+    CHECK(schema.at("properties").at("partial").value("type", "") == "boolean");
+    CHECK(real.at("agents_failed").get<long long>() == 0);
+    CHECK_FALSE(real.at("partial").get<bool>());
+    yuzu::server::ResultSet failed;
+    failed.agents_failed = 2;
+    const json partial = yuzu::server::result_set_json(failed);
+    CHECK(partial.at("agents_failed").get<long long>() == 2);
+    CHECK(partial.at("partial").get<bool>());
+}
+
+TEST_CASE("result_set_json: partial reads both counters and agents_unanswered is emitted",
+          "[result_set][agents_unanswered]") {
+    using yuzu::server::result_set_json;
+    using yuzu::server::ResultSet;
+
+    SECTION("complete: both counters zero") {
+        const json j = result_set_json(ResultSet{});
+        CHECK(j.at("agents_failed").get<long long>() == 0);
+        CHECK(j.at("agents_unanswered").get<long long>() == 0);
+        CHECK_FALSE(j.at("partial").get<bool>());
+    }
+    SECTION("failed only") {
+        ResultSet r;
+        r.agents_failed = 2;
+        const json j = result_set_json(r);
+        CHECK(j.at("agents_failed").get<long long>() == 2);
+        CHECK(j.at("agents_unanswered").get<long long>() == 0);
+        CHECK(j.at("partial").get<bool>());
+    }
+    SECTION("unanswered only") {
+        ResultSet r;
+        r.agents_unanswered = 3;
+        const json j = result_set_json(r);
+        CHECK(j.at("agents_failed").get<long long>() == 0);
+        CHECK(j.at("agents_unanswered").get<long long>() == 3);
+        CHECK(j.at("partial").get<bool>());
+    }
+    SECTION("both") {
+        ResultSet r;
+        r.agents_failed = 1;
+        r.agents_unanswered = 1;
+        CHECK(result_set_json(r).at("partial").get<bool>());
+    }
+}
+
+TEST_CASE("openapi_spec_json(): the re-eval and from-echo-query routes document the stale-source refusal",
+          "[openapi][result_set][stale_source]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    for (const char* path : {"/result-sets/{id}/re-eval", "/result-sets/from-echo-query"}) {
+        INFO(path);
+        const json& bad = spec.at("paths").at(path).at("post").at("responses").at("400");
+        CHECK(bad.at("description").get<std::string>().find("RESULT_SET_REEVAL_STALE_SOURCE") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("openapi documents: the response status set of the hand-checked operations matches "
           "what their handlers return",
           "[openapi][structure][responses]") {
     // Pins WHICH statuses the document declares per route, not their wording. Each expected set
@@ -2401,18 +2761,541 @@ TEST_CASE("openapi documents: the response status set of the ten hand-checked op
         // and 403 (perm_fn_ PluginSigning:Read); 500 (bundle on disk unreadable); 503 (audit
         // unavailable, runtime config store unavailable, bundle changed while serving).
         {"/v2/agent/plugin-policy", "get", {"200", "401", "403", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/([^/]+)): 200; 400 (JSON body, missing
+        // value, parse_plugin_key, value and actor grammar); 413 (parse_json_object_body over
+        // kMaxBodyBytes); 500 (set_config WriteFailed); 503 (store not open, Unavailable, attempt
+        // audit unavailable). 401 (auth_fn) and 403 (perm_fn) are the auth layer, which the
+        // plugin-config rows leave undeclared.
+        {"/plugin-config/{plugin}/{key}", "put", {"200", "400", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/([^/]+)/secret): the same shape as the
+        // plain PUT; 503 also covers SecretUnavailable (encrypt failed).
+        {"/plugin-config/{plugin}/{key}/secret", "put", {"200", "400", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)): 200; 400 (the existence
+        // pre-check get_config answers InvalidInput for a bad plugin/key); 404 (pre-check
+        // NotFound, or a concurrent delete); 500 (delete_config WriteFailed); 503 (store not
+        // open, Unavailable, attempt audit unavailable). 403 (perm_fn) is left undeclared.
+        {"/plugin-config/{plugin}/{key}", "delete", {"200", "400", "404", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Delete(.../([^/]+)/([^/]+)/secret): 200; 400
+        // (parse_plugin_key); 404 (delete_secret NotFound, after the attempted audit row); 500
+        // (delete_secret WriteFailed); 503 (store not open, Unavailable, attempt audit
+        // unavailable). 403 (perm_fn) is left undeclared.
+        {"/plugin-config/{plugin}/{key}/secret", "delete", {"200", "400", "404", "500", "503"}},
+        // file_retrieval_routes.cpp register_chunk(): 200; 400 (Content-Range, body length, and
+        // the TLS gate, require_tls kTlsRequired); 401 (session_unknown); 409
+        // (offset_mismatch, session_terminal); 410 (expired); 413 (chunk_too_large,
+        // size_exceeded); 500 (open or write failed); 503 (store null or unavailable,
+        // advance_offset error).
+        {"/uploads/{upload_id}/chunk",
+         "put",
+         {"200", "400", "401", "409", "410", "413", "500", "503"}},
+        // plugin_config_routes.cpp, sink.Get("/api/v1/plugin-config"): 200; 400 (list_config
+        // InvalidInput for a plugin filter that is not a valid identifier); 403 (list_read_fn
+        // admitted a management-group-confined grant, refused by design, so it is declared); 503
+        // (list_read_fn unwired or degraded, store not open, Unavailable). A 401 from the gate is
+        // left undeclared.
+        {"/plugin-config", "get", {"200", "400", "403", "503"}},
+        // plugin_config_routes.cpp, sink.Get(.../([^/]+)/kill-switch): 200; 400 (get_kill_switch
+        // InvalidInput, and a present-but-empty os); 503 (store not open, Unavailable). A missing
+        // row reads as enabled=true, so there is no 404. 401 and 403 (perm_fn) are left
+        // undeclared.
+        {"/plugin-config/{plugin}/kill-switch", "get", {"200", "400", "503"}},
+        // plugin_config_routes.cpp, sink.Put(.../([^/]+)/kill-switch): 200; 400 (JSON body,
+        // enabled, reason, scope and actor grammar); 413 (parse_json_object_body over
+        // kMaxBodyBytes); 500 (set_kill_switch WriteFailed); 503 (store not open, Unavailable,
+        // attempt audit unavailable). 401 and 403 are left undeclared.
+        {"/plugin-config/{plugin}/kill-switch", "put", {"200", "400", "413", "500", "503"}},
+        // file_retrieval_routes.cpp register_status(): 200 (open or terminal session); 400 (TLS
+        // gate); 401 (session_unknown); 410 (expired); 503 (store null or unavailable). A
+        // terminal session answers 200, so there is no 409.
+        {"/uploads/{upload_id}", "get", {"200", "400", "401", "410", "503"}},
+        // file_retrieval_routes.cpp register_cancel(): 204; 400 (TLS gate); 401; 409
+        // (session_terminal, including a lost cancel race); 410 (expired); 503 (store null or
+        // unavailable, cancel_session error).
+        {"/uploads/{upload_id}", "delete", {"204", "400", "401", "409", "410", "503"}},
+        // file_retrieval_routes.cpp register_commit(): 200; 400 (TLS gate, sha256 missing); 401;
+        // 409 (session_terminal); 410 (expired); 422 (hash_mismatch); 500 (blob cannot be read
+        // back to verify); 503 (store null or unavailable, cancel_session or commit_session
+        // error).
+        {"/uploads/{upload_id}/commit",
+         "post",
+         {"200", "400", "401", "409", "410", "422", "500", "503"}},
+        // register_routes(): sink.Put("/api/v1/dex/score-policy") through score_policy_write:
+        // 200; 400 (apply_dex_score_policy Invalid, IfMatchMalformed); 401 (authenticate_for_
+        // session_audit); 403 (perm_fn, cross-site cookie write); 409 (Stale); 428
+        // (IfMatchMissing); 503 (WriterBusy, StoreUnavailable, OutcomeUnknown,
+        // AuditUnavailable). 411, 413 and 415 come from the pre-routing cap (kBodyCapTable,
+        // dex_score_policy: 320 KiB, requires_measurable, any method): 411 for a request that
+        // cannot be sized in advance, 413 over the cap, 415 for a Content-Encoding other than
+        // identity (evaluate_body_cap answers it first, on every class). 429 comes from two
+        // pre-routing gates with no per-path exemption, so it is server-wide: the per-source-IP
+        // rate limiter (api_rate_limiter_, write_rate_limited_response) and, for an engine
+        // principal, the per-principal quota gate (apply_engine_quota_gate in server.cpp's
+        // pre-routing handler).
+        {"/dex/score-policy",
+         "put",
+         {"200", "400", "401", "403", "409", "411", "413", "415", "428", "429", "503"}},
+        // sink.Delete("/api/v1/dex/score-policy"): the same handler and gates; the body is
+        // ignored, but the any-method cap row still applies, so 411, 413 and 415 are reachable,
+        // and the quota gate is the same.
+        {"/dex/score-policy",
+         "delete",
+         {"200", "400", "401", "403", "409", "411", "413", "415", "428", "429", "503"}},
+        // config_routes.cpp, sink.Get("/api/v1/config"): 200; 401 and 403 (perm_fn, which also
+        // refuses a service-scoped token); 503 (build_config_view ViewFault).
+        {"/config", "get", {"200", "401", "403", "503"}},
+        // config_routes.cpp handle_put(v1): 200; 400 (RouteOwned key, body depth, JSON, missing
+        // or non-scalar value, validate_value, unknown key, a Rejected write); 401 (perm_fn,
+        // auth_fn, step-up challenge); 403 (perm_fn including the service-scoped refusal,
+        // cross-site write, write_refusal Denied, step-up SAML or engine); 413 (kBodyCapTable
+        // "config", 16 KiB; requires_measurable is off, so there is no 411); 503 (store not
+        // ready, StoreFault, attempted audit row, step-up store).
+        {"/config/{key}", "put", {"200", "400", "401", "403", "413", "503"}},
     };
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
         const json spec = json::parse(document_text(with_guides));
         for (const auto& row : rows) {
             INFO(row.method << " " << row.path);
-            REQUIRE(spec["paths"].contains(row.path));
-            REQUIRE(spec["paths"][row.path].contains(row.method));
+            // CHECK, not REQUIRE: a missing route must report itself and let the remaining rows
+            // and the second document form still run.
+            const bool has_path = spec.at("paths").contains(row.path);
+            CHECK(has_path);
+            if (!has_path)
+                continue;
+            const bool has_method = spec.at("paths").at(row.path).contains(row.method);
+            CHECK(has_method);
+            if (!has_method)
+                continue;
+            const json* responses = find_at(spec, {"paths", row.path, row.method, "responses"});
+            CHECK(responses != nullptr);
+            if (responses == nullptr)
+                continue;
+            CHECK(responses->is_object());
+            if (!responses->is_object())
+                continue;
             std::set<std::string> declared;
-            for (const auto& [code, response] : spec["paths"][row.path][row.method]["responses"].items())
+            for (const auto& [code, response] : responses->items())
                 declared.insert(code);
             CHECK(declared == row.statuses);
         }
+    }
+}
+
+TEST_CASE("openapi documents: the /config and /dex/score-policy error responses are typed and the "
+          "audit header is declared where the handler sets it",
+          "[openapi][structure][responses]") {
+    const std::string kEnvelope = "#/components/schemas/A4ErrorEnvelope";
+    struct Op {
+        const char* path;
+        const char* method;
+    };
+    const std::vector<Op> ops = {{"/config", "get"},
+                                 {"/config/{key}", "put"},
+                                 {"/dex/score-policy", "get"},
+                                 {"/dex/score-policy", "put"},
+                                 {"/dex/score-policy", "delete"}};
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& o : ops) {
+            INFO(o.method << " " << o.path);
+            const json* responses = find_at(spec, {"paths", o.path, o.method, "responses"});
+            REQUIRE(responses != nullptr);
+            for (const auto& [code, response] : responses->items()) {
+                INFO("status " << code);
+                if (code[0] != '4' && code[0] != '5')
+                    continue;
+                const json* ref = find_at(response, {"content", "application/json", "schema", "$ref"});
+                REQUIRE(ref != nullptr);
+                CHECK(*ref == kEnvelope);
+            }
+        }
+        // config_routes.cpp handle_put: emit_behavioral_audit sets Sec-Audit-Failed on the
+        // attempted row (the 503) and on the outcome row (the 200, with audit_persisted false).
+        for (const char* code : {"200", "503"}) {
+            INFO("PUT /config/{key} " << code);
+            const json* header = find_at(spec, {"paths", "/config/{key}", "put", "responses", code,
+                                                "headers", "Sec-Audit-Failed", "schema", "enum"});
+            REQUIRE(header != nullptr);
+            CHECK(*header == json::array({"true"}));
+        }
+        // handle_put refuses a service-scoped token on every key: the description says so, not
+        // only under the administrator-only keys.
+        const json* desc = find_at(spec, {"paths", "/config/{key}", "put", "description"});
+        REQUIRE(desc != nullptr);
+        CHECK(desc->get<std::string>().find("refused with a 403 on every key") != std::string::npos);
+        // The step-up wording: mfa_step_up_required is false on the SAML and engine 403s, and the
+        // envelope description says every step-up refusal carries a remediation bar two defensive
+        // fault paths.
+        CHECK(desc->get<std::string>().find(
+                  "adds mfa_step_up_required to meta (false on the 403)") != std::string::npos);
+        const json* envelope_desc =
+            find_at(spec, {"components", "schemas", "A4ErrorEnvelope", "description"});
+        REQUIRE(envelope_desc != nullptr);
+        CHECK(envelope_desc->get<std::string>().find("with a remediation, but never "
+                                                     "retry_after_ms (two defensive fault paths "
+                                                     "differ") != std::string::npos);
+
+        // The score-policy PUT and DELETE word the retry rule, the audit refusal (5000), the busy
+        // writer (2000) and the replay of an applied write in their own responses; the behaviour
+        // is pinned at the writer and route level, and these phrases pin that the served text
+        // keeps saying it, each in the response that carries it.
+        const auto response_text = [&](const char* method, const char* code) {
+            const json* d = find_at(spec, {"paths", "/dex/score-policy", method, "responses", code,
+                                           "description"});
+            REQUIRE(d != nullptr);
+            return d->get<std::string>();
+        };
+        for (const char* method : {"put", "delete"}) {
+            INFO("score-policy " << method << " response wording");
+            CHECK(response_text(method, "409")
+                      .find("is answered here too, unless the stored policy is again at the "
+                            "revision you sent") != std::string::npos);
+            CHECK(response_text(method, "415").find("Content-Encoding other than identity") !=
+                  std::string::npos);
+            CHECK(response_text(method, "429").find("Server-wide, not specific to this route") !=
+                  std::string::npos);
+            CHECK(response_text(method, "429").find("per-principal quota") != std::string::npos);
+            CHECK(response_text(method, "429").find("refused before routing, so nothing was "
+                                                    "changed") != std::string::npos);
+            CHECK(response_text(method, "429").find("a suggested wait before retrying") !=
+                  std::string::npos);
+            const json* retry_after = find_at(spec, {"paths", "/dex/score-policy", method,
+                                                     "responses", "429", "headers", "Retry-After",
+                                                     "schema", "type"});
+            REQUIRE(retry_after != nullptr);
+            CHECK(*retry_after == "integer");
+            const std::string r503 = response_text(method, "503");
+            CHECK(r503.find("another score policy write in this process is still running "
+                            "(retry_after_ms 2000)") != std::string::npos);
+            CHECK(r503.find("the audit store refused the row so nothing was changed "
+                            "(retry_after_ms 5000, Sec-Audit-Failed: true)") != std::string::npos);
+            CHECK(r503.find("retry with the old If-Match answers 409") != std::string::npos);
+        }
+        // The writer's audit hook sets Sec-Audit-Failed on the 200 (outcome row missing) and the
+        // 503 (attempted row refused) of the PUT and the DELETE; the read declares none.
+        for (const char* method : {"put", "delete"}) {
+            for (const char* code : {"200", "503"}) {
+                INFO("score-policy " << method << " " << code << " header");
+                const json* header = find_at(spec, {"paths", "/dex/score-policy", method,
+                                                    "responses", code, "headers",
+                                                    "Sec-Audit-Failed", "schema", "enum"});
+                REQUIRE(header != nullptr);
+                CHECK(*header == json::array({"true"}));
+            }
+        }
+        // The read declares its ETag header and no Sec-Audit-Failed (it writes no audit row).
+        REQUIRE(find_at(spec, {"paths", "/dex/score-policy", "get", "responses", "200", "headers",
+                               "ETag"}) != nullptr);
+        CHECK(find_at(spec, {"paths", "/dex/score-policy", "get", "responses", "200", "headers",
+                             "Sec-Audit-Failed"}) == nullptr);
+        // The denied row is best effort: said once, in the PUT description.
+        const json* put_desc = find_at(spec, {"paths", "/dex/score-policy", "put", "description"});
+        REQUIRE(put_desc != nullptr);
+        CHECK(put_desc->get<std::string>().find("so a denied row is best effort") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("openapi_spec_json(): DevicesListRow carries a nullable guardian_backend pinned to the token table",
+          "[openapi][devices][guardian_backend]") {
+    // #2240. OpenAPI 3.0.3 has no `type: [string, null]`: a nullable enum needs BOTH
+    // `nullable: true` and `null` among the enum values. The enum is compared against the
+    // server's own closed token table, so a fifth token is a red test here, not a client that
+    // silently rejects it.
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const auto& row = spec["components"]["schemas"]["DevicesListRow"];
+    REQUIRE(row["properties"].contains("guardian_backend"));
+    const auto& prop = row["properties"]["guardian_backend"];
+    CHECK(prop["type"] == "string");
+    CHECK(prop["nullable"] == true);
+
+    json expected = json::array();
+    for (const char* t : yuzu::server::detail::kGuardianBackendTokens)
+        expected.push_back(t);
+    expected.push_back(nullptr);
+    CHECK(prop["enum"] == expected);
+
+    // The key is always present in the response, so it is a required property.
+    bool required = false;
+    for (const auto& r : row["required"])
+        required = required || r == "guardian_backend";
+    CHECK(required);
+
+    // The detail schema inherits the row via allOf, so it carries the field too.
+    CHECK(spec["components"]["schemas"]["DevicesDetail"].dump().find("DevicesListRow") !=
+          std::string::npos);
+
+    // The prose that used to say "5 fields" must not.
+    const auto desc = spec["paths"]["/devices"]["get"]["description"].get<std::string>();
+    CHECK(desc.find("5 fields") == std::string::npos);
+    CHECK(desc.find("guardian_backend") != std::string::npos);
+}
+
+TEST_CASE("openapi documents: the plugin-config success responses reference the {data, meta} "
+          "envelope schemas the handlers return",
+          "[openapi][structure][responses]") {
+    // plugin_config_routes.cpp answers GET/PUT of a value as {data: <entry>, meta}, the secret
+    // PUT as {data: <metadata>, meta}, GET/PUT of a kill switch as {data: <switch>, meta}, and
+    // both DELETEs as {deleted: true, meta} (no data wrapper). Each row names the operation, the
+    // schema its 200 must reference, and that schema's required members. The schema's property
+    // keys must equal its required members exactly, on purpose: a new optional top-level member is
+    // an envelope change a client should be told about, so it has to update this table. The 200
+    // description must also state the envelope, because a generated client reads that text.
+    struct Row {
+        const char* path;
+        const char* method;
+        const char* schema;
+        std::set<std::string> required;
+    };
+    const std::vector<Row> rows = {
+        {"/plugin-config/{plugin}/{key}", "get", "PluginConfigEntryResponse", {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}", "put", "PluginConfigEntryResponse", {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}/secret", "put", "PluginConfigSecretMetaResponse",
+         {"data", "meta"}},
+        {"/plugin-config/{plugin}/{key}", "delete", "PluginConfigDeleteResponse",
+         {"deleted", "meta"}},
+        {"/plugin-config/{plugin}/{key}/secret", "delete", "PluginConfigDeleteResponse",
+         {"deleted", "meta"}},
+        {"/plugin-config/{plugin}/kill-switch", "get", "PluginConfigKillSwitchResponse",
+         {"data", "meta"}},
+        {"/plugin-config/{plugin}/kill-switch", "put", "PluginConfigKillSwitchResponse",
+         {"data", "meta"}},
+    };
+    for (const bool with_guides : {false, true}) {
+        INFO("form: " << form_name(with_guides));
+        const json spec = json::parse(document_text(with_guides));
+        for (const auto& row : rows) {
+            INFO(row.method << " " << row.path);
+            const json* ok = find_at(spec, {"paths", row.path, row.method, "responses", "200"});
+            CHECK(ok != nullptr);
+            if (ok == nullptr)
+                continue;
+            const json* ref_node = find_at(*ok, {"content", "application/json", "schema", "$ref"});
+            CHECK((ref_node != nullptr && ref_node->is_string()));
+            if (ref_node != nullptr && ref_node->is_string())
+                CHECK(ref_node->get<std::string>() ==
+                      std::string("#/components/schemas/") + row.schema);
+            const json* description = find_at(*ok, {"description"});
+            CHECK((description != nullptr && description->is_string()));
+            if (description != nullptr && description->is_string())
+                CHECK(description->get<std::string>().find("meta: {api_version}") !=
+                      std::string::npos);
+            const json* required = find_at(spec, {"components", "schemas", row.schema, "required"});
+            const json* properties =
+                find_at(spec, {"components", "schemas", row.schema, "properties"});
+            CHECK((required != nullptr && required->is_array()));
+            CHECK((properties != nullptr && properties->is_object()));
+            if (required != nullptr && required->is_array())
+                CHECK(set_of(*required) == row.required);
+            if (properties != nullptr && properties->is_object())
+                CHECK(keys_of(*properties) == row.required);
+        }
+    }
+}
+
+// #6500 item 7: the value-level body checker (openapi_body_check.hpp) that the /config and
+// /dex/score-policy route tests use is itself pinned here, on hand-made bodies against the real
+// served schemas, so a checker that quietly stopped catching a kind of disagreement fails here
+// instead of turning those route tests into false greens.
+TEST_CASE("openapi body checker: a conforming body passes and each kind of disagreement is caught",
+          "[openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::parse(openapi_spec_json());
+    const json set_schema = oa::ok_response_schema(spec, "/config/{key}", "put");
+    const json policy_schema = oa::ok_response_schema(spec, "/dex/score-policy", "get");
+    REQUIRE(set_schema.is_object());
+    REQUIRE(policy_schema.is_object());
+
+    const json good_set = {{"data", {{"key", "log_level"}, {"value", "debug"}, {"applied", true},
+                                     {"effect", "immediate"}}},
+                           {"meta", {{"api_version", "v1"}}}};
+    CHECK(oa::body_violations(spec, set_schema, good_set).empty());
+    const auto mutated = [&](const std::function<void(json&)>& f) {
+        json b = good_set;
+        f(b);
+        return oa::body_violations(spec, set_schema, b);
+    };
+    const auto mentions = [](const std::vector<std::string>& v, const std::string& needle) {
+        return std::any_of(v.begin(), v.end(), [&](const std::string& m) {
+            return m.find(needle) != std::string::npos;
+        });
+    };
+
+    // A wrong JSON type: a string where a boolean is declared, a number where a string is.
+    CHECK(mentions(mutated([](json& b) { b["data"]["applied"] = "true"; }), "$.data.applied"));
+    CHECK(mentions(mutated([](json& b) { b["data"]["key"] = 7; }), "$.data.key"));
+    // A required member missing.
+    CHECK(mentions(mutated([](json& b) { b["data"].erase("effect"); }), "'effect' is missing"));
+    CHECK(mentions(mutated([](json& b) { b.erase("meta"); }), "'meta' is missing"));
+    // An undeclared member, in the data object and in the referenced meta.
+    CHECK(mentions(mutated([](json& b) { b["data"]["extra"] = 1; }), "$.data.extra"));
+    CHECK(mentions(mutated([](json& b) { b["meta"]["extra"] = 1; }), "$.meta.extra"));
+    // A value outside the declared enum.
+    CHECK(mentions(mutated([](json& b) { b["data"]["effect"] = "later"; }), "enum"));
+    // A whole number is an integer; a fraction is not.
+    json doc = {{"data", {{"document", {{"version", 1.5}}}, {"revision", "default"},
+                          {"source", "default"}}},
+                {"meta", {{"api_version", "v1"}}}};
+    CHECK(mentions(oa::body_violations(spec, policy_schema, doc), "$.data.document.version"));
+    doc["data"]["document"]["version"] = 1;
+    CHECK(oa::body_violations(spec, policy_schema, doc).empty());
+    // Recursion through allOf -> $ref -> array items: an override with an unknown key.
+    doc["data"]["document"]["overrides"] = json::array({{{"image", "a.exe"}, {"bogus", 1}}});
+    CHECK(mentions(oa::body_violations(spec, policy_schema, doc),
+                   "$.data.document.overrides[0].bogus"));
+    // The coverage helpers agree with the schema's own spelling.
+    const auto declared = oa::declared_member_paths(spec, policy_schema);
+    CHECK(declared.contains("$.data.document.overrides[].model.per_device_event_cap"));
+    CHECK(declared.contains("$.data.dry_run"));
+    CHECK(oa::seen_member_paths(doc).contains("$.data.document.overrides[].image"));
+    // A schema keyword the checker does not model is reported, never skipped.
+    CHECK(mentions(oa::body_violations(spec, json{{"not", json::object()}}, json::object()),
+                   "not modelled"));
+}
+
+// The other direction of the check: a member every real body carries but the schema does not list
+// as `required`. It is the only guard on a `required` entry dropped from the served text, so it is
+// proven here to find a gap, to stay quiet when there is none, and to ignore a member some body
+// lacks.
+TEST_CASE("openapi body checker: always_present_not_required finds a required entry dropped from the schema",
+          "[openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::parse(openapi_spec_json());
+
+    // Hand-made schema: `a` required, `b` declared but not.
+    const json schema = {{"type", "object"},
+                         {"required", json::array({"a"})},
+                         {"properties", {{"a", {{"type", "string"}}}, {"b", {{"type", "string"}}}}}};
+    const json both = {{"a", "x"}, {"b", "y"}};
+    CHECK(oa::always_present_not_required(spec, schema, {both, both}, "$") ==
+          std::set<std::string>{"b"});
+    // A body without `b` shows it is optional: no gap.
+    CHECK(oa::always_present_not_required(spec, schema, {both, json{{"a", "x"}}}, "$").empty());
+    // Declaring it required closes the gap.
+    json tightened = schema;
+    tightened["required"] = json::array({"a", "b"});
+    CHECK(oa::always_present_not_required(spec, tightened, {both}, "$").empty());
+    // A path the schema does not declare is reported, not skipped.
+    CHECK(oa::always_present_not_required(spec, schema, {both}, "$.nope") ==
+          std::set<std::string>{"<path not declared: $.nope>"});
+
+    // The real case the route tests rely on: dropping `required: [data, meta]` from the served
+    // DexScorePolicyData is invisible to a conforming body and is found only here.
+    const json policy_schema = oa::ok_response_schema(spec, "/dex/score-policy", "get");
+    REQUIRE(policy_schema.is_object());
+    const json real = {{"data", {{"document", json::object()}, {"revision", "default"},
+                                 {"source", "default"}}},
+                       {"meta", {{"api_version", "v1"}}}};
+    CHECK(oa::always_present_not_required(spec, policy_schema, {real}, "$").empty());
+    json dropped = spec;
+    REQUIRE(dropped["components"]["schemas"]["DexScorePolicyData"].contains("required"));
+    dropped["components"]["schemas"]["DexScorePolicyData"].erase("required");
+    CHECK(oa::always_present_not_required(dropped, policy_schema, {real}, "$") ==
+          std::set<std::string>{"data", "meta"});
+}
+
+// The other kinds of disagreement the value checker is trusted to catch, each on a hand-made
+// schema so the test does not depend on what the served document happens to declare today.
+TEST_CASE("openapi body checker: bounds, nullable, oneOf and additionalProperties are enforced",
+          "[openapi][value]") {
+    namespace oa = yuzu::test::openapi;
+    const json spec = json::object();
+    const auto bad = [&](const json& schema, const json& body) {
+        return !oa::body_violations(spec, schema, body).empty();
+    };
+
+    const json bounded = {{"type", "integer"}, {"minimum", 1}, {"maximum", 3}};
+    CHECK_FALSE(bad(bounded, 2));
+    CHECK(bad(bounded, 0));
+    CHECK(bad(bounded, 4));
+    CHECK(bad(bounded, 2.5)); // a fraction is not an integer
+
+    const json lengths = {{"type", "string"}, {"minLength", 2}, {"maxLength", 3}};
+    CHECK_FALSE(bad(lengths, "ab"));
+    CHECK(bad(lengths, "a"));
+    CHECK(bad(lengths, "abcd"));
+
+    const json items = {{"type", "array"}, {"minItems", 1}, {"maxItems", 2},
+                        {"items", {{"type", "string"}}}};
+    CHECK_FALSE(bad(items, json::array({"a"})));
+    CHECK(bad(items, json::array()));
+    CHECK(bad(items, json::array({"a", "b", "c"})));
+    CHECK(bad(items, json::array({"a", 1}))); // an element of the wrong type
+
+    const json plain = {{"type", "string"}};
+    json nullable = plain;
+    nullable["nullable"] = true;
+    CHECK_FALSE(bad(nullable, json()));
+    CHECK(bad(plain, json()));
+
+    const json one_of = {{"oneOf", json::array({{{"type", "string"}}, {{"type", "integer"}}})}};
+    CHECK_FALSE(bad(one_of, "x"));
+    CHECK_FALSE(bad(one_of, 1));
+    CHECK(bad(one_of, true));
+    // Known limit: oneOf is checked as at-least-one, so a value matching two alternatives passes.
+    // Flip this to CHECK when the checker enforces exactly one.
+    const json overlapping = {{"oneOf", json::array({{{"type", "integer"}}, {{"type", "number"}}})}};
+    CHECK_FALSE(bad(overlapping, 1));
+
+    const json closed = {{"type", "object"}, {"properties", {{"a", {{"type", "string"}}}}}};
+    CHECK_FALSE(bad(closed, json{{"a", "x"}}));
+    CHECK(bad(closed, json{{"a", "x"}, {"b", 1}}));
+    json open = closed;
+    open["additionalProperties"] = true;
+    CHECK_FALSE(bad(open, json{{"a", "x"}, {"b", 1}}));
+    json typed_extra = closed;
+    typed_extra["additionalProperties"] = {{"type", "integer"}};
+    CHECK_FALSE(bad(typed_extra, json{{"a", "x"}, {"b", 1}}));
+    CHECK(bad(typed_extra, json{{"a", "x"}, {"b", "no"}}));
+}
+
+// The score-policy request-size text is a hand copy of the body-cap row and of the policy limit.
+// Pin it, so changing either without the served document fails here instead of leaving the
+// integrator-facing figure wrong.
+TEST_CASE("openapi documents: the score-policy request-size text matches the body-cap row and the policy limit",
+          "[openapi][structure][responses]") {
+    const json spec = json::parse(openapi_spec_json());
+    const auto cap = resolve_body_cap("PUT", "/api/v1/dex/score-policy");
+    CHECK(resolve_body_cap("DELETE", "/api/v1/dex/score-policy").max_body_bytes ==
+          cap.max_body_bytes);
+    // 411 is declared below only while an unmeasurable body is refused.
+    REQUIRE(cap.requires_measurable);
+    REQUIRE(cap.max_body_bytes % 1024 == 0);
+    REQUIRE(kDexScorePolicyMaxBytes % 1024 == 0);
+    const std::string cap_text = std::to_string(cap.max_body_bytes / 1024) + " KiB";
+    const std::string limit_text = std::to_string(kDexScorePolicyMaxBytes / 1024) + " KiB";
+
+    const auto response_text = [&](const char* method, const char* status) -> std::string {
+        const json* node = find_at(spec, {"paths", "/dex/score-policy", method, "responses",
+                                          status, "description"});
+        return node != nullptr && node->is_string() ? node->get<std::string>() : std::string{};
+    };
+
+    const json* put_description = find_at(spec, {"paths", "/dex/score-policy", "put", "description"});
+    REQUIRE((put_description != nullptr && put_description->is_string()));
+    const std::string put = put_description->get<std::string>();
+    CHECK(put.find("at most " + limit_text) != std::string::npos);
+    CHECK(put.find("up to " + cap_text) != std::string::npos);
+    for (const char* method : {"put", "delete"}) {
+        INFO(method);
+        CHECK(response_text(method, "413").find(cap_text) != std::string::npos);
+        CHECK_FALSE(response_text(method, "411").empty());
+    }
+
+    // Every figure written as `N KiB` in the request-size texts must be one of the two limits, so a
+    // stale figure in the PUT 400 text or in a 413 text fails here. A figure in another unit or
+    // spelling (`1 MiB`, `320KiB`) is not seen.
+    const json* put_400 =
+        find_at(spec, {"paths", "/dex/score-policy", "put", "responses", "400", "description"});
+    REQUIRE((put_400 != nullptr && put_400->is_string()));
+    const std::set<std::string> allowed{limit_text, cap_text};
+    const std::regex figure("[0-9]+ KiB");
+    for (const std::string& text : {put, put_400->get<std::string>(), response_text("put", "413"),
+                                    response_text("delete", "413")}) {
+        INFO(text);
+        for (std::sregex_iterator it(text.begin(), text.end(), figure), end; it != end; ++it)
+            CHECK(allowed.contains(it->str()));
     }
 }

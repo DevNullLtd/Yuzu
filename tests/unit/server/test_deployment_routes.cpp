@@ -876,3 +876,90 @@ TEST_CASE("deployment routes: the deploy results script reveals the empty notice
     CHECK(h.find("e.style.display=vis?'none':'block'") != std::string::npos);
     CHECK(h.find("vis?'none':''") == std::string::npos);
 }
+
+// A run id that is not valid is refused at the create route: the answer is "not found" and
+// nothing is created or dispatched.
+TEST_CASE("deployment routes: POST run with an invalid run id is refused, nothing is created or "
+          "dispatched",
+          "[pg][deployment][routes][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(depdb, deprun_routes_tpl);
+    YUZU_REQUIRE_PG_DB_TPL(predb, preflight_routes_tpl);
+    PgPool dep_pool{{.conninfo = depdb.dsn(), .size = 4}};
+    PgPool pre_pool{{.conninfo = predb.dsn(), .size = 4}};
+    DeploymentRunStore deploy_store(dep_pool);
+    PreflightRunStore preflight_store(pre_pool);
+    REQUIRE(deploy_store.is_open());
+    REQUIRE(preflight_store.is_open());
+
+    const auto t = now_ms();
+    const std::string run_id = "run-invalid-1";
+    auto run = make_run(run_id, "alice", t);
+    run.go = 1;
+    REQUIRE(preflight_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+    const std::string dep_id = "dep-invalid-1";
+    REQUIRE(deploy_store.create_deployment(make_dep(dep_id, run_id, "alice", t), {tgt("agent-1")}));
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "agent-1";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&,
+                                  const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        ++dispatched;
+        return {.sent = 1, .command_id = "cmd-1"};
+    };
+    auto poll = [](const std::string&) {
+        return std::unordered_map<std::string, deployment::AgentResponse>{};
+    };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+
+    DeploymentRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, okAuth, okPerm, devices, dispatch, poll, audit, &preflight_store,
+                           &deploy_store);
+
+    const std::string cfg = "&url=https%3A%2F%2Frepo.lan%2Fpkg.msi&filename=pkg.msi&sha256=" +
+                            std::string(64, 'a');
+    auto res = sink.Post("/fragments/auto/deploy/run?run=" + run_id + "%00junk" + cfg, "",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->body.find("Pre-flight run not found") != std::string::npos);
+    CHECK(dispatched == 0);
+    CHECK(audit_log.empty()); // no create, no resume, nothing
+
+    // The existing run's deployment is untouched and no second one was minted.
+    auto still_running = deploy_store.find_running_for_run(run_id, "alice");
+    REQUIRE(still_running.has_value());
+    CHECK(*still_running == dep_id);
+
+    auto dep_after = deploy_store.get_deployment(dep_id, "alice");
+    REQUIRE(dep_after.has_value());
+    CHECK(dep_after->status == "running");
+    CHECK(dep_after->source_run_id == run_id);
+
+    auto devices_after = deploy_store.get_devices(dep_id);
+    REQUIRE(devices_after.size() == 1);
+    CHECK(devices_after[0].agent_id == "agent-1");
+    CHECK(devices_after[0].step == "pending");
+
+    auto listing = deploy_store.list_deployments_checked("alice", /*is_admin=*/false, 10);
+    REQUIRE(listing.has_value());
+    CHECK(listing->rows.size() == 1);
+}

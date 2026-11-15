@@ -11,6 +11,7 @@
 #include "guardian_arm_ack.hpp" // rung 9c PR-5e (#4221): ledger-level insertion-gate regression
 #include "guardian_convergence_scheduler.hpp" // up-5 (#4221): scheduler integration test
 #include "guardian_lifecycle_journal.hpp"
+#include "guardian_spark_send.hpp" // guardian_outbox_entry_to_event (UP-14 wire-pair checks)
 
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/spark.hpp>
@@ -523,13 +524,15 @@ OutboxEntry lc_entry(const std::string& rule, const std::string& eid, const std:
 struct PageRig {
     yuzu::test::TempDbFile db{"yuzu_test_page-"};
     std::unique_ptr<KvStore> kv;
+    std::shared_ptr<FakeReader> reader{std::make_shared<FakeReader>()};
+    std::shared_ptr<FakeBackend> backend{std::make_shared<FakeBackend>()};
     std::shared_ptr<GuardianSparkRuntime> rt;
     std::unique_ptr<GuardianLifecycleJournal> journal;
-    PageRig() {
+    explicit PageRig(GuardianSparkRuntime::Config cfg = {}) {
         auto r = KvStore::open(db.path);
         REQUIRE(r.has_value());
         kv = std::make_unique<KvStore>(std::move(*r));
-        rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+        rt = make_rt(reader, backend, cfg);
         journal = std::make_unique<GuardianLifecycleJournal>(kv.get());
     }
     // Persist one record as its own batch (a distinct persist call → a distinct batch key).
@@ -1006,6 +1009,8 @@ TEST_CASE("#3972: a replay page is stamped above any live seq, and stamps overwr
     auto p2 = lc_entry("old2", "p2");
     p1.seq = 1; // a hand-set seq must not survive paging
     p2.seq = 1;
+    p1.boot_epoch = 99; // ... nor a hand-set epoch (a paged entry never carries one, UP-14)
+    p2.boot_epoch = 99;
     REQUIRE(rt->try_page_batch({std::move(p1), std::move(p2)}).added == 2);
 
     const auto got = drain_everything(*rt);
@@ -1017,6 +1022,9 @@ TEST_CASE("#3972: a replay page is stamped above any live seq, and stamps overwr
     REQUIRE(paged.size() == 2);
     CHECK(paged[0] > *live_verdict);
     CHECK(paged[1] > paged[0]); // monotonic within the page
+    for (const auto& e : got)
+        if (e.event_id == "p1" || e.event_id == "p2")
+            CHECK(e.boot_epoch == 0);
 }
 
 TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
@@ -1025,17 +1033,32 @@ TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
     // entry is never held and never blocks. A production enqueue path that forgets to stamp
     // would silently exempt its entries from the ordering guarantee, so each of the five
     // sites is exercised here and every entry it produces is checked.
+    //
+    // UP-14: the runtime draws from an injected NONZERO-epoch source, so the same five sites
+    // also prove the wire pair: every live site carries boot_epoch == kEpoch and the wire event
+    // built from it carries (kEpoch, seq); the replay-page site carries seq > 0 (the hold key
+    // is always drawn) but boot_epoch == 0, so its wire event carries NO pair.
+    constexpr std::uint64_t kEpoch = 1'790'000'123ULL;
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
-    auto rt = make_rt(r, b);
+    GuardianSparkRuntime::Config cfg;
+    cfg.emit_seq_source = std::make_shared<GuardianEmitSeqSource>(kEpoch);
+    auto rt = make_rt(r, b, cfg);
     const auto key = spark_key(file_spec("/a"));
+    const auto check_live = [&](const OutboxEntry& e) {
+        CHECK(e.seq > 0);
+        CHECK(e.boot_epoch == kEpoch);
+        const auto ev = guardian_outbox_entry_to_event(e, "linux");
+        CHECK(ev.boot_epoch() == kEpoch);
+        CHECK(ev.emit_seq() == e.seq);
+    };
 
     SECTION("armed (enqueue_lifecycle_locked, arm branch)") {
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
         const auto got = drain_everything(*rt);
         REQUIRE(got.size() == 1);
         CHECK(got[0].lifecycle_kind == "armed");
-        CHECK(got[0].seq > 0);
+        check_live(got[0]);
     }
     SECTION("disarmed (enqueue_lifecycle_locked, disarm branch)") {
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
@@ -1044,7 +1067,7 @@ TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
         const auto got = drain_everything(*rt);
         REQUIRE(got.size() == 1);
         CHECK(got[0].lifecycle_kind == "disarmed");
-        CHECK(got[0].seq > 0);
+        check_live(got[0]);
     }
     SECTION("verdict, health and recovery pair (evaluate_key enqueue_all)") {
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
@@ -1054,14 +1077,14 @@ TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
         auto got = drain_everything(*rt);
         REQUIRE(got.size() == 1);
         CHECK(got[0].domain == OutboxDomain::Health);
-        CHECK(got[0].seq > 0);
+        check_live(got[0]);
 
         r->file = read_known(FileSnapshot{.exists = false}); // recovery to a drift: pair
         rt->evaluate_key(key, EvalReason::Event);
         got = drain_everything(*rt);
         REQUIRE(got.size() == 2);
         for (const auto& e : got)
-            CHECK(e.seq > 0);
+            check_live(e);
         CHECK(got[0].seq < got[1].seq); // the pair is stamped in vector order
     }
     SECTION("subscription fault health (on_subscription_faulted enqueue_all)") {
@@ -1075,7 +1098,7 @@ TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
         const auto got = drain_everything(*rt);
         REQUIRE(got.size() == 1);
         CHECK(got[0].domain == OutboxDomain::Health);
-        CHECK(got[0].seq > 0);
+        check_live(got[0]);
     }
     SECTION("errored (on_subscription_lost -> detach -> lifecycle)") {
         REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
@@ -1085,14 +1108,19 @@ TEST_CASE("#3972 tripwire: every production enqueue path yields seq > 0",
         const auto got = drain_everything(*rt);
         REQUIRE_FALSE(got.empty());
         for (const auto& e : got)
-            CHECK(e.seq > 0);
+            check_live(e);
     }
     SECTION("replay page (try_page_batch)") {
         REQUIRE(rt->try_page_batch({lc_entry("old1", "p1"), lc_entry("old2", "p2")}).added == 2);
         const auto got = drain_everything(*rt);
         REQUIRE(got.size() == 2);
-        for (const auto& e : got)
-            CHECK(e.seq > 0);
+        for (const auto& e : got) {
+            CHECK(e.seq > 0);         // the hold key is drawn even though nothing goes on the wire
+            CHECK(e.boot_epoch == 0); // the page-time seq must not label a prior-boot event
+            const auto ev = guardian_outbox_entry_to_event(e, "linux");
+            CHECK(ev.emit_seq() == 0);
+            CHECK(ev.boot_epoch() == 0);
+        }
     }
 }
 
@@ -4740,6 +4768,19 @@ TEST_CASE("page_into_window replays an \"errored\" record without quarantining i
     CHECK(lc[0].event_id == "e-r1");
 }
 
+TEST_CASE("page_into_window quarantines a persisted row with an empty rule_id instead of replaying it",
+          "[spark][runtime][journal]") {
+    // persist() trusts that mint-time validation ran; a hand-edited or corrupt-but-parseable
+    // row can still carry rule_id:"". The server refuses such an event at ingest, so replay
+    // quarantines it (counted) rather than putting it on the wire.
+    PageRig rig;
+    rig.persist("");
+    auto stats = rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000);
+    CHECK(stats.records_paged == 0);
+    CHECK(rig.journal->quarantined() == 1);
+    CHECK(drain_lifecycle(*rig.rt).empty());
+}
+
 TEST_CASE("page_into_window does not re-page a windowed entry (skips entries already windowed)",
           "[spark][runtime][journal]") {
     PageRig rig;
@@ -5631,6 +5672,207 @@ TEST_CASE("persist back-fills provenance onto the live window entry (M3)",
     auto sent_m3 = rig.kv->list_entries(kJournalNamespace, kSentKeyPrefix);
     REQUIRE(sent_m3.has_value());
     CHECK(sent_m3->size() == 1);
+}
+
+// ── UP-14: the wire (boot_epoch, emit_seq) pair on Spark entries ──────────────────────────
+// The replay discriminator is the PAGE-TIME stamp (boot_epoch 0), never journal_batch_key:
+// backfill_batch_provenance sets the key on LIVE window entries too, so a key-based gate
+// would silently send a persisted live verdict with no ordering pair.
+
+namespace {
+constexpr std::uint64_t kUp14Epoch = 1'790'000'456ULL;
+GuardianSparkRuntime::Config up14_cfg(std::shared_ptr<GuardianEmitSeqSource> src) {
+    GuardianSparkRuntime::Config cfg;
+    cfg.emit_seq_source = std::move(src);
+    return cfg;
+}
+} // namespace
+
+TEST_CASE("UP-14: a live guard.errored entry keeps its pair after backfill_batch_provenance",
+          "[spark][runtime][journal][emit_seq]") {
+    PageRig rig{up14_cfg(std::make_shared<GuardianEmitSeqSource>(kUp14Epoch))};
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    (void)drain_lifecycle(*rig.rt); // the armed entry is out of the way
+    rig.backend->set_health_for_test(rig.backend->armed_ids().front(), SubscriptionHealth::Dead);
+    rig.rt->revalidate_subscriptions(); // live guard.errored (+ disarmed) lifecycle entries
+
+    auto pending = rig.rt->snapshot_pending().records;
+    REQUIRE_FALSE(pending.empty());
+    std::vector<PersistedBatch> batches;
+    REQUIRE(rig.journal->persist(pending, &batches, kJournalPersistUnbounded,
+                                 kJournalPersistUnbounded) > 0);
+    REQUIRE_FALSE(batches.empty());
+    for (const auto& b : batches)
+        rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
+
+    const auto got = drain_lifecycle(*rig.rt);
+    REQUIRE_FALSE(got.empty());
+    bool saw_errored = false;
+    for (const auto& e : got) {
+        // The persisted live entry now carries the batch key: a key-based replay gate would
+        // zero its pair here. It is live, so it must keep (kUp14Epoch, seq).
+        CHECK_FALSE(e.journal_batch_key.empty());
+        CHECK(e.seq > 0);
+        CHECK(e.boot_epoch == kUp14Epoch);
+        const auto ev = guardian_outbox_entry_to_event(e, "linux");
+        CHECK(ev.boot_epoch() == kUp14Epoch);
+        CHECK(ev.emit_seq() == e.seq);
+        saw_errored = saw_errored || e.lifecycle_kind == "errored";
+    }
+    CHECK(saw_errored);
+}
+
+TEST_CASE("UP-14: Retain, then backfill, then Sent sends an identical nonzero pair both times",
+          "[spark][runtime][journal][emit_seq]") {
+    PageRig rig{up14_cfg(std::make_shared<GuardianEmitSeqSource>(kUp14Epoch))};
+    REQUIRE(rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+
+    // Attempt 1: the stream is down, the head is retained.
+    std::vector<OutboxEntry> attempts;
+    rig.rt->drain([&](const OutboxEntry& e) {
+        attempts.push_back(e);
+        return SendResult::Retain;
+    });
+    REQUIRE(attempts.size() == 1);
+    CHECK(attempts[0].journal_batch_key.empty());
+
+    // The batch is persisted and back-filled while the entry sits in the window.
+    auto pending = rig.rt->snapshot_pending().records;
+    REQUIRE(pending.size() == 1);
+    std::vector<PersistedBatch> batches;
+    REQUIRE(rig.journal->persist(pending, &batches, kJournalPersistUnbounded,
+                                 kJournalPersistUnbounded) == 1);
+    for (const auto& b : batches)
+        rig.rt->backfill_batch_provenance(b.key, b.event_ids, b.event_ids.back());
+
+    // Attempt 2: the stream is back; the same head is re-copied, now carrying the key.
+    rig.rt->drain([&](const OutboxEntry& e) {
+        attempts.push_back(e);
+        return SendResult::Sent;
+    });
+    REQUIRE(attempts.size() == 2);
+    CHECK_FALSE(attempts[1].journal_batch_key.empty());
+    for (const auto& e : attempts) {
+        CHECK(e.seq > 0);
+        CHECK(e.boot_epoch == kUp14Epoch);
+    }
+    CHECK(attempts[1].seq == attempts[0].seq);
+    CHECK(attempts[1].boot_epoch == attempts[0].boot_epoch);
+    const auto ev1 = guardian_outbox_entry_to_event(attempts[0], "linux");
+    const auto ev2 = guardian_outbox_entry_to_event(attempts[1], "linux");
+    CHECK(ev1.boot_epoch() == kUp14Epoch);
+    CHECK(ev2.boot_epoch() == kUp14Epoch);
+    CHECK(ev1.emit_seq() == attempts[0].seq);
+    CHECK(ev2.emit_seq() == ev1.emit_seq());
+}
+
+TEST_CASE("UP-14: real journal paging (page_into_window) sends 0/0 even with a claimed epoch",
+          "[spark][runtime][journal][emit_seq]") {
+    PageRig rig{up14_cfg(std::make_shared<GuardianEmitSeqSource>(kUp14Epoch))};
+    rig.persist("r1");
+    CHECK(rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000).records_paged == 1);
+
+    const auto got = drain_lifecycle(*rig.rt);
+    REQUIRE(got.size() == 1);
+    CHECK_FALSE(got[0].journal_batch_key.empty());
+    CHECK(got[0].seq > 0); // the hold key is always drawn
+    CHECK(got[0].boot_epoch == 0);
+    const auto ev = guardian_outbox_entry_to_event(got[0], "linux");
+    CHECK(ev.boot_epoch() == 0);
+    CHECK(ev.emit_seq() == 0);
+}
+
+TEST_CASE("UP-14: a same-boot replay of an already-sent live record is 0/0",
+          "[spark][runtime][journal][emit_seq]") {
+    GuardianSparkRuntime::Config cfg =
+        up14_cfg(std::make_shared<GuardianEmitSeqSource>(kUp14Epoch));
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), cfg);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    const auto live = drain_lifecycle(*rt);
+    REQUIRE(live.size() == 1);
+    CHECK(live[0].boot_epoch == kUp14Epoch);
+
+    // The same record is later re-offered from the journal within the SAME boot.
+    auto again = OutboxEntry::lifecycle("r1", live[0].generation, live[0].event_id,
+                                        live[0].enqueued_ns, "armed", "file", "n");
+    REQUIRE(rt->try_page_batch({std::move(again)}).added == 1);
+    const auto replayed = drain_lifecycle(*rt);
+    REQUIRE(replayed.size() == 1);
+    CHECK(replayed[0].event_id == live[0].event_id);
+    CHECK(replayed[0].seq > live[0].seq);
+    CHECK(replayed[0].boot_epoch == 0);
+    const auto ev = guardian_outbox_entry_to_event(replayed[0], "linux");
+    CHECK(ev.boot_epoch() == 0);
+    CHECK(ev.emit_seq() == 0);
+}
+
+TEST_CASE("UP-14: a coalesce keeps list position, takes the newer seq, keeps the epoch",
+          "[spark][runtime][outbox][emit_seq]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, up14_cfg(std::make_shared<GuardianEmitSeqSource>(kUp14Epoch)));
+    const auto key_a = spark_key(file_spec("/a"));
+    const auto key_b = spark_key(file_spec("/b"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2", /*present=*/true), true);
+    REQUIRE(drain_lifecycle(*rt).size() == 2);
+
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key_a, EvalReason::Initial);
+    rt->evaluate_key(key_b, EvalReason::Initial);
+    const auto first_seq = rt->outbox_front_seq();
+    REQUIRE(first_seq.has_value());
+
+    r->file = read_known(FileSnapshot{.exists = false});
+    rt->evaluate_key(key_a, EvalReason::Event); // coalesces over r1's queued verdict
+    REQUIRE(rt->outbox_size() == 2);
+
+    const auto got = drain_everything(*rt);
+    REQUIRE(got.size() == 2);
+    CHECK(got[0].rule_id == "r1"); // position kept
+    CHECK(got[0].seq > *first_seq);
+    CHECK(got[0].seq > got[1].seq);
+    CHECK(got[0].boot_epoch == kUp14Epoch);
+    CHECK(got[1].boot_epoch == kUp14Epoch);
+}
+
+TEST_CASE("UP-14: two runtimes on one source draw unique increasing values",
+          "[spark][runtime][emit_seq]") {
+    auto src = std::make_shared<GuardianEmitSeqSource>(kUp14Epoch);
+    auto rt1 =
+        make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), up14_cfg(src));
+    auto rt2 =
+        make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>(), up14_cfg(src));
+    std::vector<std::uint64_t> seqs;
+    for (int i = 0; i < 3; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        const auto spec = file_spec("/" + rid);
+        REQUIRE(rt1->attach_rule(rid, spec, file_exists_rule(rid), true));
+        REQUIRE(rt2->attach_rule(rid, spec, file_exists_rule(rid), true));
+    }
+    for (auto* rt : {rt1.get(), rt2.get()})
+        for (const auto& e : drain_lifecycle(*rt)) {
+            CHECK(e.boot_epoch == kUp14Epoch);
+            seqs.push_back(e.seq);
+        }
+    REQUIRE(seqs.size() == 6);
+    std::sort(seqs.begin(), seqs.end());
+    CHECK(std::adjacent_find(seqs.begin(), seqs.end()) == seqs.end()); // all unique
+    CHECK(seqs.front() == 1);
+    CHECK(seqs.back() == 6); // exactly the six draws, no gaps: one shared sequence
+}
+
+TEST_CASE("UP-14: a runtime with no injected source self-allocates, stamps seq, sends 0/0",
+          "[spark][runtime][emit_seq]") {
+    auto rt = make_rt(std::make_shared<FakeReader>(), std::make_shared<FakeBackend>());
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    const auto got = drain_everything(*rt);
+    REQUIRE(got.size() == 1);
+    CHECK(got[0].seq > 0); // the hold key still works
+    CHECK(got[0].boot_epoch == 0);
+    const auto ev = guardian_outbox_entry_to_event(got[0], "linux");
+    CHECK(ev.boot_epoch() == 0);
+    CHECK(ev.emit_seq() == 0);
 }
 
 TEST_CASE("a hostile rule_name is rejected from the journal but never crashes the arm (QE-2)",

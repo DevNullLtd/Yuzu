@@ -48,7 +48,7 @@ struct EcosystemFamily {
 
 /// Row order is the published order of the OpenAPI and MCP ecosystem enums; a mid-table insert
 /// shifts positions, so say so in the changelog.
-inline constexpr std::array<EcosystemFamily, 14> kEcosystemFamilies{{
+inline constexpr std::array<EcosystemFamily, 20> kEcosystemFamilies{{
     {"windows", "windows"},
     {"optional_feature", "windows"},
     {"msi", "windows"},
@@ -63,6 +63,12 @@ inline constexpr std::array<EcosystemFamily, 14> kEcosystemFamilies{{
     {"flatpak", "linux"},
     {"python", "other"},
     {"ibm_mq", "other"},  // middleware (SAM.2): no OS family -- the product runs on several
+    {"dotnet", "other"},
+    {"jvm", "other"},
+    {"chocolatey", "windows"}, // pkg_inventory Windows legs
+    {"winget", "windows"},
+    {"appx", "windows"},
+    {"kernel_module", "linux"}, // hardware.drivers_inventory (Linux loaded kernel modules)
 }};
 
 /// The table is non-empty, every ecosystem is `[a-z_]+` and every family `[a-z]+` (so none is
@@ -111,26 +117,29 @@ struct VocabEntry {
 };
 
 /// Row order is the order the Kind chips render. A new kind is one row here.
-inline constexpr std::array<VocabEntry, 4> kSoftwareKinds{{
+inline constexpr std::array<VocabEntry, 5> kSoftwareKinds{{
     {"app", "app",
      "applications (Windows and macOS apps, Homebrew casks, store apps, runtimes and middleware)"},
     {"pkg", "pkg",
      "packages: macOS pkgutil receipts, Homebrew formulae, snap and flatpak runtimes, MSI products"},
     {"package", "package", "OS packages (rpm, deb, apk, pacman)"},
     {"feat", "feat", "Windows optional features"},
+    {"driver", "driver", "device drivers (Windows PnP signed drivers, Linux loaded kernel modules)"},
 }};
 
 /// One row per collector source, in the collector's kInventoryActions order
 /// (agents/core/src/sync_source_installed_software.cpp); the vocabulary test compares the ordered
 /// lists. A new source is one row here.
-inline constexpr std::array<VocabEntry, 8> kSoftwareSources{{
+inline constexpr std::array<VocabEntry, 11> kSoftwareSources{{
     {"installed_apps.list_inventory", "installed_apps.list_inventory",
      "Windows Uninstall registry, Linux dpkg/rpm/pacman/apk, macOS applications and installer "
      "receipts"},
-    {"pkg_inventory.managers", "pkg_inventory.managers", "The Homebrew presence row (macOS)"},
-    {"pkg_inventory.packages", "pkg_inventory.packages", "Homebrew formulae and casks (macOS)"},
+    {"pkg_inventory.managers", "pkg_inventory.managers",
+     "Manager presence rows (Homebrew on macOS; Chocolatey and winget on Windows)"},
+    {"pkg_inventory.packages", "pkg_inventory.packages",
+     "Homebrew formulae and casks (macOS); Chocolatey packages (Windows)"},
     {"pkg_inventory.store_packages", "pkg_inventory.store_packages",
-     "Active snaps and flatpaks (Linux)"},
+     "Active snaps and flatpaks (Linux); Appx and MSIX packages (Windows)"},
     {"windows_optional_features.list", "windows_optional_features.list",
      "Windows optional features (state in the version column)"},
     {"msi_packages.list_inventory", "msi_packages.list_inventory",
@@ -139,6 +148,14 @@ inline constexpr std::array<VocabEntry, 8> kSoftwareSources{{
      "Python interpreters at the standard machine-wide locations (Windows, macOS, Linux)"},
     {"middleware.ibm_mq", "middleware.ibm_mq",
      "Registered IBM MQ installations, from installer metadata (Linux)"},
+    {"runtimes.dotnet", "runtimes.dotnet",
+     ".NET runtimes, SDKs and Framework at the standard machine-wide locations (Windows, macOS, "
+     "Linux)"},
+    {"runtimes.jvm", "runtimes.jvm",
+     "Java runtimes and development kits at the standard machine-wide locations (Windows, macOS, "
+     "Linux)"},
+    {"hardware.drivers_inventory", "hardware.drivers_inventory",
+     "Windows PnP signed drivers (WMI); Linux loaded kernel modules"},
 }};
 
 /// Non-empty, every value `[a-z_.]+` (the chips splice it into attributes and URLs), non-empty

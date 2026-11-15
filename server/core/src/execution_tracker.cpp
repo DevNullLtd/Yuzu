@@ -607,6 +607,19 @@ const std::vector<pg::PgMigration>& migrations() {
          "UPDATE concurrency_claims SET definition_id = replace(definition_id, "
          "'crossplatform.tar.', 'crossplatform.echo.') WHERE definition_id LIKE 'crossplatform.tar.%';"
          "UPDATE command_execution SET plugin = 'echo' WHERE plugin = 'tar';"},
+        // v9 (#3678): the fleet-wide dispatch sequence. `record_command_dispatch` advances it once
+        // per dispatch call (one command_id = at most one agent dedup-ring slot), and the WS-3
+        // command outbox compares it against the value stamped on a row at first send to bound a
+        // redrive (see command_replay_horizon.hpp). DDL only, no table rewrite, instant.
+        {9, "CREATE SEQUENCE IF NOT EXISTS dispatch_seq;"},
+        // v10: whether any frame of the agent's answer was NOT kept by the response store (a
+        // failed write, or a cap refusal of a non-terminal frame). The tracker counts an agent as
+        // responded once its terminal status row is written, but the response rows are separate
+        // writes that can fail; this flag is written in the SAME upsert as the status and is
+        // sticky, so a result-set fill can tell a counted answer that is missing stored output. Constant default: metadata-only ADD COLUMN, no rewrite.
+        {10,
+         "ALTER TABLE agent_exec_status ADD COLUMN IF NOT EXISTS response_dropped BOOLEAN NOT NULL "
+         "DEFAULT false;"},
     };
     return kMigrations;
 }
@@ -1010,6 +1023,24 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
     return s;
 }
 
+std::optional<int64_t> ExecutionTracker::count_response_dropped(const std::string& execution_id) const {
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    // No index on the flag: the result-set fill pass is the only caller and asks only once the
+    // execution is terminal or timed out, and the scan is bounded by the execution's own rows.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*) FROM execution_tracker.agent_exec_status "
+        "WHERE execution_id = $1 AND response_dropped",
+        std::vector<std::string>{execution_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::nullopt;
+    return to_i64(col(res.get(), 0, 0));
+}
+
 std::optional<std::vector<AgentExecStatus>>
 ExecutionTracker::get_agent_statuses_checked(
     const std::string& execution_id,
@@ -1306,8 +1337,8 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             conn,
             "INSERT INTO execution_tracker.agent_exec_status "
             "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
-            " exit_code, error_detail, plugin_result_status) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
+            " exit_code, error_detail, plugin_result_status, response_dropped) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::boolean) "
             "ON CONFLICT (execution_id, agent_id) DO UPDATE SET "
             // Terminal status is STICKY (CHAOS-TTL-1 keepalive hardening,
             // #3784): a stale 'running' write arriving AFTER a real terminal
@@ -1335,16 +1366,25 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             "                                ('success','failure','timeout','rejected') "
             "                                AND excluded.status = 'running' "
             "                             THEN agent_exec_status.plugin_result_status "
-            "                             ELSE excluded.plugin_result_status END "
+            "                             ELSE excluded.plugin_result_status END, "
+            // STICKY for every status: once a frame of this agent's answer was not kept, no
+            // later write (terminal, running or a redelivery) clears it, because a later stored
+            // frame cannot restore the lost one. Written in this same upsert as the status.
+            "  response_dropped=(agent_exec_status.response_dropped OR excluded.response_dropped) "
             "RETURNING status, exit_code, completed_at, error_detail, plugin_result_status",
             std::vector<std::string>{
                 execution_id, s.agent_id, s.status,
                 std::to_string(s.dispatched_at > 0 ? s.dispatched_at : now),
                 std::to_string(s.first_response_at > 0 ? s.first_response_at : now),
                 std::to_string(s.completed_at), std::to_string(s.exit_code), s.error_detail,
-                std::to_string(s.plugin_result_status)});
-        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+                std::to_string(s.plugin_result_status), s.response_dropped ? "true" : "false"});
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
+            // Keep the reason visible: a refused statement is otherwise only a bare `false` here.
+            if (res.status() != PGRES_TUPLES_OK)
+                spdlog::warn("ExecutionTracker: agent status upsert failed: {}",
+                             PQresultErrorMessage(res.get()));
             return false;
+        }
 
         // The ACTUALLY-PERSISTED status (#3784 UP-2): captured unconditionally
         // because the caller uses it to gate concurrency-claim release/renewal,
@@ -1393,10 +1433,10 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
     return persisted_status;
 }
 
-void ExecutionTracker::update_agent_status(const std::string& execution_id,
+bool ExecutionTracker::update_agent_status(const std::string& execution_id,
                                            const AgentExecStatus& s) {
     if (!open_)
-        return;
+        return false;
 
     // Retry once on failure, same rationale as refresh_counts's
     // own retry (governance adversarial review, PR review 2026-08-31,
@@ -1414,7 +1454,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
                       "execution_id={} agent_id={} — this agent's status is NOT recorded and "
                       "will not be reconciled (agents do not re-send)",
                       execution_id, s.agent_id);
-        return;
+        return false;
     }
 
     // Per-device concurrency claim release (ADR-1007): the same terminal set
@@ -1473,6 +1513,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     // preserving the documented client-visible event ordering
     // (executions-history ladder PR 3 publisher invariant).
     refresh_counts(execution_id);
+    return true;
 }
 
 bool ExecutionTracker::set_agents_targeted(const std::string& execution_id, int agents_targeted) {
@@ -2754,11 +2795,17 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
     // session_store's DB-clock-authority precedent (#3715).
     //
     // ON CONFLICT: the PLUGIN is deliberately NOT updated (first writer wins; see the declaration).
+    //
+    // #3678: the same statement advances `dispatch_seq` (no extra round trip on this synchronous
+    // pre-RPC path). It is consumed on a conflicting re-record too, which only over-counts: a
+    // larger sequence makes the outbox redelivery horizon trip earlier, never later. The explicit
+    // `WHERE true` is the documented disambiguation of INSERT ... SELECT ... FROM ... ON CONFLICT.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO execution_tracker.command_execution "
         "(command_id, plugin, execution_id, created_at) "
-        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "SELECT $1::text, $2::text, $3::text, extract(epoch FROM now())::bigint "
+        "FROM (SELECT nextval('execution_tracker.dispatch_seq')) AS seq WHERE true "
         "ON CONFLICT (command_id) DO UPDATE SET "
         "execution_id = CASE WHEN EXCLUDED.execution_id = '' "
         "THEN execution_tracker.command_execution.execution_id ELSE EXCLUDED.execution_id END, "
@@ -2776,6 +2823,29 @@ bool ExecutionTracker::record_command_dispatch(const std::string& command_id,
         return false;
     }
     return true;
+}
+
+std::optional<DispatchPosition> ExecutionTracker::current_dispatch_position() const {
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    // last_value is the most recently issued value; before the first nextval() it reads 1 with
+    // is_called = false, which is "none issued" = 0.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT CASE WHEN is_called THEN last_value ELSE 0 END "
+        "FROM execution_tracker.dispatch_seq",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    const auto parsed = parse_reap_i64(col_str(res.get(), 0, 0));
+    if (!parsed || *parsed < 0)
+        return std::nullopt;
+    // The two terms are returned SEPARATELY (dispatch_position.hpp): summing them gave a number
+    // that only made sense inside the process that produced it.
+    return DispatchPosition{*parsed, unrecorded_dispatches_.load(std::memory_order_relaxed)};
 }
 
 std::optional<CommandRecord>

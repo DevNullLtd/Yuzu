@@ -618,6 +618,8 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
             throw IncompleteCaptureError("Echo registry: event/cursor commit failed");
         }
         rb.active = false; // committed: the dirty flags stay consumed
+        if (reader_.committed)
+            reader_.committed(rows);
 
         // Only now may the transient state move (a failed commit re-derives all of it: the
         // dirty flags above, the buffer, the loss counters and the totals stay untouched).

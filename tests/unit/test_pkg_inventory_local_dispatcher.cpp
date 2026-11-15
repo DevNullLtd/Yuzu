@@ -13,8 +13,9 @@
  * What is pinned per host (host-independent shape first, then per-OS):
  *  - every action returns rc 0 and emits a `status|<action>|<level>|<tokens>`
  *    row FIRST (4 fields), then only rows of the action's own kinds;
- *  - manager rows have 7 fields; package rows have 5 (Homebrew) or 9 (snap and
- *    flatpak) fields (escape-aware split);
+ *  - manager rows have 7 fields; package rows have 5 (Homebrew; Windows
+ *    chocolatey) or 9 (snap and flatpak; Windows appx) fields (escape-aware
+ *    split);
  *  - Linux `packages`: exactly `status|packages|unsupported|linux:owned_by_installed_apps`,
  *    ZERO `package|` rows, UNAVAILABLE/PARTIAL typed status (Linux never
  *    enumerates a package; installed_apps owns the roster). MUTATION: if the
@@ -24,8 +25,8 @@
  *    `package|flatpak|` rows with their fixed field counts;
  *  - macOS `store_packages`: exactly `status|store_packages|unsupported|
  *    macos:owned_by_installed_apps`, zero rows (installed_apps owns the list);
- *  - Windows: both actions exactly `status|<action>|unsupported|windows:planned`
- *    and nothing else (the legs are declared planned);
+ *  - Windows: status first (supported or constrained, read from the real host),
+ *    then only `manager|` / `package|` rows;
  *  - macOS: two tiers read from the real host: when /opt/homebrew/Cellar is a
  *    directory `managers` yields >=1 `manager|homebrew|` row, and when it also
  *    holds a well-named version directory `packages` yields >=1
@@ -220,11 +221,19 @@ TEST_CASE("pkg_inventory plugin: status row first, then only well-formed rows of
                 REQUIRE(f.size() >= 2);
                 if (std::string_view{action} == "packages") {
                     REQUIRE(f.size() == 5);
+#if defined(_WIN32)
+                    CHECK(f[1] == "chocolatey"); // Windows packages = Chocolatey; Homebrew is macOS
+#else
                     CHECK(f[1] == "homebrew");
+#endif
                 } else {
                     CHECK(std::string_view{action} == "store_packages");
                     REQUIRE(f.size() == 9);
+#if defined(_WIN32)
+                    CHECK(f[1] == "appx"); // Windows store_packages = the Appx roster
+#else
                     CHECK((f[1] == "snap" || f[1] == "flatpak"));
+#endif
                 }
             } else {
                 FAIL("unexpected row kind after the status row: " << f[0]);
@@ -278,15 +287,22 @@ TEST_CASE("pkg_inventory plugin: per-OS leg contract on this host", "[pkg_invent
     using namespace yuzu::pkg_inventory;
 
 #if defined(_WIN32)
-    // Both Windows legs are declared planned: the status row and nothing else.
-    for (const char* action : kActions) {
+    // Windows legs are real reads of this host (HKLM Appx roster, Chocolatey lib
+    // listing): content is host-specific, so only the shape is asserted. Status row
+    // first (supported or constrained), then only the action's own row kind.
+    // Not run on this authoring host (macOS): correct by reading, CI's MSVC leg runs it.
+    for (const auto [action, prefix] :
+         {std::pair{"managers", "manager|"}, std::pair{"packages", "package|"},
+          std::pair{"store_packages", "package|"}}) {
         INFO("action: " << action);
         const auto result = dispatcher.run(plugin->descriptor, action);
+        CHECK(result.rc == 0);
         const auto rows = captured_rows(result.captured);
-        REQUIRE(rows.size() == 1);
-        CHECK(rows[0] == std::string{"status|"} + action + "|unsupported|" +
-                             std::string{kTokenWindowsPlanned});
-        CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+        REQUIRE_FALSE(rows.empty());
+        CHECK((starts_with(rows[0], std::string{"status|"} + action + "|supported|") ||
+               starts_with(rows[0], std::string{"status|"} + action + "|constrained|")));
+        for (std::size_t i = 1; i < rows.size(); ++i)
+            CHECK(starts_with(rows[i], prefix));
     }
 #elif defined(__linux__)
     // `packages` is UNSUPPORTED by construction: installed_apps owns the Linux
@@ -407,7 +423,7 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all nine legs and the 
     REQUIRE(plugin->descriptor->action_descriptors != nullptr);
 
     // The declared support per leg is what the code implements TODAY (macOS Homebrew and
-    // the Linux managers + store_packages legs wired; the Windows legs planned; Linux
+    // the Linux managers + store_packages legs wired; the Windows legs wired; Linux
     // packages and macOS store_packages unsupported by design). Landing a leg without flipping its descriptor, or the reverse, fails
     // here; the capability-matrix gate compares the doc to the descriptor, not the
     // descriptor to behaviour.
@@ -416,9 +432,9 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all nine legs and the 
         YuzuSupportLevel linux_leg, macos_leg, windows_leg;
     };
     const Expected expected[] = {
-        {"managers", YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
-        {"packages", YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_PLANNED},
-        {"store_packages", YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_PLANNED},
+        {"managers", YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_SUPPORTED},
+        {"packages", YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_SUPPORTED},
+        {"store_packages", YUZU_SUPPORT_SUPPORTED, YUZU_SUPPORT_UNSUPPORTED, YUZU_SUPPORT_SUPPORTED},
     };
     yuzu::agent::LocalDispatcher dispatcher;
     for (std::size_t i = 0; i < plugin->descriptor->action_descriptor_count; ++i) {
@@ -455,7 +471,7 @@ TEST_CASE("pkg_inventory plugin: ABI4 descriptors declare all nine legs and the 
         REQUIRE_FALSE(rows.empty());
         const auto status = split_fields_escape_aware(rows[0]);
         REQUIRE(status.size() == 4);
-        if (host_support == YUZU_SUPPORT_PLANNED || host_support == YUZU_SUPPORT_UNSUPPORTED)
+        if (host_support == YUZU_SUPPORT_UNSUPPORTED)
             CHECK(status[2] == "unsupported");
         else
             CHECK((status[2] == "supported" || status[2] == "constrained"));

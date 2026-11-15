@@ -42,7 +42,7 @@ Plus one diagnostic-only CI workflow added at the tail end:
 1b20f6f ci: one-shot workflow_dispatch to validate Instructions gate on Shulgi
 ```
 
-Adds `.github/workflows/instructions-windows-validate.yml`. **Currently unusable** — GitHub requires `workflow_dispatch` workflow files to live on the default branch (`main`), but we work off `dev`/feature branches and don't PR direct to main. Two options on resume:
+Adds `.github/workflows/instructions-windows-validate.yml`. *(2026-11-10: the workflow was deleted by ADR-0035 ladder step 1.)* **Currently unusable** — GitHub requires `workflow_dispatch` workflow files to live on the default branch (`main`), but we work off `dev`/feature branches and don't PR direct to main. Two options on resume:
 - **Delete the workflow** — it's dead weight if we never restore Tailscale before merging through `dev` → `main` (which would land it via the normal flow anyway).
 - **Keep it** as a backup plan for a future session where Tailscale is also blocked.
 

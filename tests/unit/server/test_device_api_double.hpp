@@ -44,10 +44,17 @@ public:
     /// reaching the API). Mirrors FakeDeviceApi.lookup_calls on the REST side.
     mutable int lookup_calls = 0;
 
+    /// #2240: when true, lookup_device answers kDegraded (a tag-store outage on the detail
+    /// read), so the get_agent_details degrade branch is reachable. Mirrors
+    /// FakeDeviceApi.degrade on the REST side (test_rest_devices.cpp).
+    mutable bool degrade = false;
+
     [[nodiscard]] std::expected<std::optional<yuzu::server::DeviceDetail>,
                                 yuzu::server::DeviceReadError>
     lookup_device(const std::string& agent_id) const override {
         ++lookup_calls;
+        if (degrade)
+            return std::unexpected(yuzu::server::DeviceReadError::kDegraded);
         if (fn_) {
             for (const auto& a : fn_()) {
                 if (a.value("agent_id", "") != agent_id) continue;
@@ -60,13 +67,17 @@ public:
 
 private:
     static yuzu::server::DeviceListRow row_from(const nlohmann::json& a) {
-        return yuzu::server::DeviceListRow{
+        yuzu::server::DeviceListRow row{
             .agent_id = a.value("agent_id", ""),
             .hostname = a.value("hostname", ""),
             .os = a.value("os", ""),
             .arch = a.value("arch", ""),
             .agent_version = a.value("agent_version", ""),
         };
+        // #2240: an optional string fixture key. Absent or JSON null reads as not reported.
+        if (const auto it = a.find("guardian_backend"); it != a.end() && it->is_string())
+            row.guardian_backend = it->get<std::string>();
+        return row;
     }
 
     Fn fn_;

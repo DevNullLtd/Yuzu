@@ -233,6 +233,13 @@ struct Ports {
     std::function<std::expected<CommandCapability, detail::DispatchDenial>(
         const DispatchCaller&, std::string_view, std::string_view)>
         authorize;
+    /// #7110: the post-write recheck. Called ONCE, after the `requested` audit row AND the execution
+    /// row (the core's last own writes) and before the dispatch: the surface re-decides its OWN route
+    /// permission and re-derives the caller (see instruction_execute.cpp 8b). Returns the freshly
+    /// derived caller, which is the one dispatched; `nullopt` = the surface's permission was
+    /// withdrawn (`kPermissionRevoked`, the execution row cancelled, nothing dispatched). Unset ->
+    /// `Misconfigured` (fail closed, never "no gate"), refused BEFORE the `requested` row.
+    std::function<std::optional<DispatchCaller>()> readmit;
     /// `ApprovalManager::submit(def, user, scope, "", kInstruction, plugin, action)`. Unset means
     /// there is no approval manager: a non-auto definition then answers `ApprovalUnavailable`.
     std::function<std::expected<std::string, ApprovalSubmitError>(
@@ -273,6 +280,9 @@ enum class RefusalKind : std::uint8_t {
     kClassifierUnavailable,///< 503: the destructive-targeting classifier is not wired
     kMisconfigured,        ///< 500: a required port is unwired (a server defect: NO retry hint, ever)
     kAuditUnavailable,     ///< 503 + Sec-Audit-Failed: nothing was dispatched without durable evidence
+    kPermissionRevoked,    ///< 403: the surface's own permission was withdrawn after the core's own writes
+                           ///< (`Ports::readmit` returned nullopt); the execution row is cancelled; NO `denial`,
+                           ///< permanent
     kDispatchFailed,       ///< 500: the dispatch threw (any exception type); the execution row (if any) is left
                            ///< `running` (NOT cancelled: agents may hold the command), a `failure` audit row is
                            ///< written, and NO retry is advertised (agents may have been sent it)
@@ -424,8 +434,9 @@ inline constexpr std::size_t kAuditDefinitionIdMax = 128;
 
 /// The step-0 predicate: the id holds a control byte OR is not well-formed UTF-8. Such an id is
 /// refused (`invalid_definition_id`, 400 / -32602) before ANY store read. One predicate, used by
-/// the shared core (and the REST route's audit target cleaning) only, so REST and MCP cannot
-/// drift. A valid multibyte id (U+00E9, CJK, ...) is NOT malformed and goes to the lookup.
+/// the shared core, the REST route's audit target cleaning and the workflow twins' id check
+/// (`check_workflow_id`, workflow_execute.hpp), so REST and MCP cannot drift.
+/// A valid multibyte id (U+00E9, CJK, ...) is NOT malformed and goes to the lookup.
 [[nodiscard]] inline bool definition_id_is_malformed(std::string_view id) noexcept {
     return definition_id_has_control_byte(id) || definition_id_is_invalid_utf8(id);
 }

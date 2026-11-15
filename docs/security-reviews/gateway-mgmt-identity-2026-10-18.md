@@ -142,11 +142,20 @@ not be enabled there. A pin is immune to both.
    issued: a peer of the new root gets `revocation_unknown` from it, because the loaded CRL is bound
    to the keys that signed it and not to a name. The gateway also loads only a CA's complete base
    CRL (a delta, scoped or indirect CRL, or one with an unprocessable critical extension, is refused
-   `malformed`; ADR 2004 "What counts as a complete list"); a CA that publishes deltas alongside
+   `unsupported`, which was `malformed` until #7070; ADR 2004 "What counts as a complete list"); a CA that publishes deltas alongside
    its base CRL has those deltas ignored, which is a residual of using such a CA with this control. A
    gateway with no source still needs the pinned file replaced (within one interval) or the
    deny-list edited (at a gateway restart); an operator who needs fast withdrawal without a CRL
    source can keep a pin in `identity` mode and replace the pinned file.
+   Added by #7070 and #7067 (ADR 2004, Update of 2026-11-05): the watcher now remembers a refusal decided
+   by the bytes alone, a cache on a security decision path, keyed by the hash of the bytes, the hash of the
+   verification certificates and the `mgmt_crl_max_validity_s` in force, for one hour, and never for
+   `future_dated`, `replay` or a fetch failure, so it can pin a refusal for at most an hour and cannot change
+   what a CRL admits. The reference configuration now ships `mgmt_crl_max_validity_s` 691200 (8 days): a
+   server that publishes 7-day CRLs backdated 300 s sits under that bound by one day minus
+   300 s, so such a feed is admitted; a feed wider than 8 days is
+   refused `validity_too_long` and, with no CRL held, fails the plane closed. The residuals this adds are
+   listed, unapproved, in the ADR 2004 Update.
 3. **The deny-list names serials, not keys.** A compromised server **key** is withdrawn by denying
    every serial issued over it (the server's `superseded` re-issue means there may be two), or by
    re-keying the set. The server refuses to re-certify a key it has seen revoked for any other reason

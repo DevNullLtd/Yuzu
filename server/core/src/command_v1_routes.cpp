@@ -59,6 +59,19 @@ void count_target_rejected(yuzu::MetricsRegistry* metrics, std::string_view reas
     }
 }
 
+/// A chokepoint refusal, counted by its closed reason token. Shared by the admission dry run and
+/// the post-write repeat of it, so both report one series.
+void count_dispatch_denied(yuzu::MetricsRegistry* metrics, std::string_view reason) {
+    if (metrics == nullptr)
+        return;
+    try {
+        metrics->counter("yuzu_server_dispatch_denied_total", {{"reason", std::string(reason)}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+        // observability must never fail the request
+    }
+}
+
 void count_bookkeeping_failed(yuzu::MetricsRegistry* metrics, const char* op) {
     if (metrics == nullptr)
         return;
@@ -260,7 +273,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
 
     // The caller: identity AND the real principal_is_admin / exec_visible (service-scoped and
     // engine principals included). approval_provenance stays None: REST has no ticket flow.
-    const DispatchCaller caller = d.derive_caller_fn(session);
+    DispatchCaller caller = d.derive_caller_fn(session); // re-derived after the last write below
 
     // The dispatch chokepoint's dry run (classify + authorize + kill switch), so a denial is a
     // discriminated refusal rather than an ambiguous zero-reach.
@@ -288,14 +301,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                                "cannot be redeemed yet (#6064)";
         spdlog::warn("dispatch denied: {} reason={} securable={} caller={}", what, reason,
                      audit_token(denial.securable), audit_token(session.username));
-        if (d.metrics != nullptr) {
-            try {
-                d.metrics
-                    ->counter("yuzu_server_dispatch_denied_total", {{"reason", std::string(reason)}})
-                    .increment();
-            } catch (...) { // NOLINT(bugprone-empty-catch)
-            }
-        }
+        count_dispatch_denied(d.metrics, reason);
         // No `.permission`: a chokepoint denial (approval, identity, kill switch) is not cured by
         // granting one securable, so the field would claim a false self-remediation.
         refuse(status, reason, text.message, text.remediation);
@@ -366,12 +372,84 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
     const auto cancel_execution = [&] {
         if (execution_id.empty() || !d.execution.mark_cancelled)
             return;
-        if (!d.execution.mark_cancelled(execution_id, session.username)) {
+        bool ok = false;
+        try {
+            ok = d.execution.mark_cancelled(execution_id, session.username);
+        } catch (...) { // a throwing cancel is a failed cancel: the refusal still answers
+            ok = false;
+        }
+        if (!ok) {
             spdlog::error("POST /api/v1/commands: mark_cancelled failed for execution_id={}",
                           execution_id);
             count_bookkeeping_failed(d.metrics, "mark_cancelled");
         }
     };
+
+    // #7110: the route's own writes are done (the requested row and the execution row); a grant, a
+    // JIT elevation or a visible set can move while either is written, so decide again here.
+    // Not re-decided: the chokepoint's own provenance-record write, see
+    // docs/user-manual/rest-api.md 'Refused after the audit row'.
+    {
+        const auto revoked = [&](std::string_view how) {
+            (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "failure",
+                                                "command", "",
+                                                "reason=permission_revoked " + std::string(how) +
+                                                    " " + what + " correlation_id=" + cid +
+                                                    " execution_id=" + audit_token(execution_id));
+            cancel_execution();
+            res.status = 403;
+            res.set_content(
+                error_body(res, 403, "permission revoked after the request was recorded",
+                           "permission_revoked",
+                           {.remediation = "this request was not dispatched; the permission it "
+                                           "needs was withdrawn while it was being recorded"}),
+                "application/json");
+        };
+        // The credentials resolve again to the same principal, and the caller is derived from THAT
+        // resolution: the role and the admin bit are session snapshots (a JIT elevation that lapsed
+        // during the writes is gone from the fresh one).
+        //
+        // `withdrawn` names the gate that refused; empty = admitted. The rechecks read stores (the
+        // session, the RBAC and management-group views), so one can throw: that is a withdrawn
+        // permission too (the deny-on-degrade mapping of `require_permission`, ADR-0041), refused
+        // here with the failure row and the cancel, never an escape that leaves the `requested`
+        // row and the execution row without an outcome.
+        std::string withdrawn;
+        try {
+            const auto fresh = d.auth_fn(req, res);
+            if (!fresh || fresh->username != session.username) {
+                withdrawn = "gate=session";
+            } else if (!d.perm_fn(req, res, "Execution", "Execute")) {
+                // With RBAC off the dry run admits every human principal, so a JIT elevation
+                // that lapsed during the writes is caught only by the route's own gate.
+                withdrawn = "gate=route";
+            } else if (gate.verdict == DestructiveTargetingVerdict::Targeted && gate.capability &&
+                       !d.perm_fn(req, res, std::string(gate.capability->securable),
+                                  std::string(authz::to_string(gate.capability->operation)))) {
+                withdrawn = "gate=securable";
+            } else {
+                caller = d.derive_caller_fn(*fresh);
+                if (const auto again = d.authorize_dispatch_fn(caller, plugin, action); !again) {
+                    const std::string_view reason = detail::to_string(again.error().reason);
+                    // A chokepoint refusal is counted as the admission dry run counts it.
+                    count_dispatch_denied(d.metrics, reason);
+                    withdrawn = std::string("gate=dispatch dispatch_reason=") + std::string(reason);
+                }
+            }
+        } catch (const std::exception& e) {
+            spdlog::error("POST /api/v1/commands: post-write admission recheck failed: {}",
+                          e.what());
+            withdrawn = "gate=exception";
+        } catch (...) {
+            spdlog::error("POST /api/v1/commands: post-write admission recheck failed: unknown "
+                          "exception");
+            withdrawn = "gate=exception";
+        }
+        if (!withdrawn.empty()) {
+            revoked(withdrawn);
+            return;
+        }
+    }
 
     // Built BEFORE the dispatch (execution_mutation.cpp's `threw_detail` pattern): a second
     // bad_alloc while building them after the throw must not escape without a `failure` row. The
@@ -624,6 +702,16 @@ ZeroReachReply zero_reach_reply(ZeroReachCause cause, std::string_view scope_err
     if (zero_reach_retryable(cause))
         r.retry_after_ms = kRetryAfterMs;
     switch (cause) {
+    case ZeroReachCause::Denied:
+        // #7114: the chokepoint refused the pair before targeting (the admission dry run passed, so
+        // this is a race: the caller's grant or the action's gate moved between the two). A
+        // permission-class refusal, never "unreachable".
+        r.status = 403;
+        r.message = "No agents reached: the dispatch chokepoint refused this command for the "
+                    "caller. This is an authorization denial, not unreachability.";
+        r.remediation = "check the caller's permission and the action's execute gate; retrying "
+                        "alone will not help";
+        break;
     case ZeroReachCause::InvalidScope:
         r.status = 400;
         r.message = "No agents reached: the scope expression could not be parsed (" +

@@ -358,9 +358,7 @@ TEST_CASE("risk-filter: a boot seed does not consume the slot of a later load",
         r.signer = e.signer;
         rows.push_back(std::move(r));
     }
-    REQUIRE(db.insert_module_events(rows));
-    // The hour of the rows has closed by `now`.
-    (void)run_aggregation(db, 1'700'000'000 + 7200);
+    REQUIRE(db.fold_module_events(rows));
     auto q = db.execute_query("SELECT module_name, load_count FROM module_hourly");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 1);
@@ -737,9 +735,9 @@ TEST_CASE("Windows module drain: a WOF-compressed image is not refused and still
 }
 #endif // _WIN32
 
-// ── insert_module_events round-trip (the typed DB write path) ───────────────
+// ── fold_module_events round-trip (the typed DB write path) ─────────────────
 
-TEST_CASE("insert_module_events round-trips every column into module_live",
+TEST_CASE("fold_module_events folds every identity column into module_hourly",
           "[echo][module][store]") {
     yuzu::test::TempDbFile tmp{std::string_view{"echo-module-insert-"}};
     auto opened = EchoDatabase::open(tmp.path);
@@ -773,28 +771,33 @@ TEST_CASE("insert_module_events round-trips every column into module_live",
     driver.is_kernel = true;
     rows.push_back(driver);
 
-    REQUIRE(db.insert_module_events(rows));
+    REQUIRE(db.fold_module_events(rows));
 
+    // A roll-up keeps what identifies a load (module, signer, signing verdict, kernel marker,
+    // directory, owning process name) and counts it; the pid, the raw action and the snapshot id
+    // are not stored.
     auto q = db.execute_query(
-        "SELECT action, pid, process_name, module_name, module_dir, signed_state, "
-        "signer, is_kernel FROM module_live ORDER BY ts");
+        "SELECT module_name, module_dir, signed_state, signer, is_kernel, process_name, "
+        "load_count, blocked_count FROM module_hourly ORDER BY module_name");
     REQUIRE(q.has_value());
     REQUIRE(q->rows.size() == 2);
 
-    // Row 0 — the unsigned user-space load.
-    CHECK(q->rows[0][0] == "loaded");
-    CHECK(q->rows[0][1] == "4321");
-    CHECK(q->rows[0][3] == "version.dll");
-    CHECK(q->rows[0][5] == "unsigned");
-    CHECK(q->rows[0][7] == "0");
+    // Row 0 — the revoked kernel driver (the BYOVD signal).
+    CHECK(q->rows[0][0] == "bad.sys");
+    CHECK(q->rows[0][2] == "revoked");
+    CHECK(q->rows[0][3] == "Sketchy LLC");
+    CHECK(q->rows[0][4] == "1");
+    CHECK(q->rows[0][5] == "");
+    CHECK(q->rows[0][6] == "1");
 
-    // Row 1 — the revoked kernel driver (the BYOVD signal).
-    CHECK(q->rows[1][1] == "4");
-    CHECK(q->rows[1][3] == "bad.sys");
-    CHECK(q->rows[1][5] == "revoked");
-    CHECK(q->rows[1][6] == "Sketchy LLC");
-    CHECK(q->rows[1][7] == "1");
+    // Row 1 — the unsigned user-space load.
+    CHECK(q->rows[1][0] == "version.dll");
+    CHECK(q->rows[1][1] == R"(C:\App)");
+    CHECK(q->rows[1][2] == "unsigned");
+    CHECK(q->rows[1][4] == "0");
+    CHECK(q->rows[1][5] == "app.exe");
+    CHECK(q->rows[1][6] == "1");
 
     // Empty batch is a successful no-op.
-    CHECK(db.insert_module_events({}));
+    CHECK(db.fold_module_events({}));
 }

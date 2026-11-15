@@ -376,3 +376,112 @@ TEST_CASE("POST /api/policies: policy.create audit records an empty group list a
     INFO("detail = " << a.detail);
     CHECK(a.detail == "scope=ostype____\"linux\" groups=0");
 }
+
+// ── Identifier handling: an invalid id is refused ─────────────────────────────────────────────
+//
+// The id in these routes is a path capture. An id that is not valid is refused as a whole:
+// no policy is deleted, enabled or disabled, and no success audit row is written.
+
+namespace {
+
+std::string make_policy(PolicyStore& store) {
+    auto frag = store.create_fragment(kFragmentYaml);
+    REQUIRE(frag);
+    auto policy = store.create_policy(R"(
+apiVersion: yuzu.io/v1alpha1
+kind: Policy
+displayName: Id Handling Policy
+description: A test policy
+fragment: )" + *frag + R"(
+scope: "tags.env == 'production'"
+)");
+    REQUIRE(policy);
+    return *policy;
+}
+
+} // namespace
+
+TEST_CASE("DELETE /api/policies/:id: an invalid id deletes nothing and audits no success",
+          "[pg][compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string pid = make_policy(store);
+
+    PolicyAdminHarness h{&store};
+    auto res = h.sink.Delete("/api/policies/" + pid + std::string("\0junk", 5));
+    REQUIRE(res);
+    // Nothing matched, so the route answers a plain "not deleted": status 200, deleted=false.
+    CHECK(res->status == 200);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("deleted"));
+    CHECK(body["deleted"] == false);
+    {
+        auto still = store.get_policy(pid);
+        REQUIRE(still.has_value());
+        CHECK(still->has_value());
+    }
+    CHECK(h.audit_calls.empty());
+    CHECK(h.emitted_events.empty());
+}
+
+TEST_CASE("POST /api/policies/:id/disable|enable: an invalid id changes nothing",
+          "[pg][compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string pid = make_policy(store);
+    const auto before = store.get_policy(pid);
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+
+    PolicyAdminHarness h{&store};
+    const std::string bad = pid + std::string("\0junk", 5);
+    auto dis = h.sink.Post("/api/policies/" + bad + "/disable", "");
+    REQUIRE(dis);
+    // The store refuses the value, which the route reports as a store fault (503) with the
+    // store's fixed message, never as success.
+    CHECK(dis->status == 503);
+    {
+        const auto body = nlohmann::json::parse(dis->body);
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["message"] == "failed to disable policy");
+    }
+    auto ena = h.sink.Post("/api/policies/" + bad + "/enable", "");
+    REQUIRE(ena);
+    CHECK(ena->status == 503);
+    {
+        const auto body = nlohmann::json::parse(ena->body);
+        CHECK(body["error"]["code"] == 503);
+        CHECK(body["error"]["message"] == "failed to enable policy");
+    }
+
+    const auto after = store.get_policy(pid);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->enabled == (*before)->enabled);
+    CHECK(h.audit_calls.empty());
+    CHECK(h.emitted_events.empty());
+}
+
+TEST_CASE("POST /api/policies/:id/disable|enable: an unknown clean id answers 400 policy not found",
+          "[pg][compliance][admin][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+
+    PolicyAdminHarness h{&store};
+    for (const char* verb : {"disable", "enable"}) {
+        INFO("verb=" << verb);
+        auto res = h.sink.Post(std::string("/api/policies/yuzu_test_no_such_policy/") + verb, "");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto body = nlohmann::json::parse(res->body);
+        CHECK(body["error"] == "policy not found");
+    }
+    CHECK(h.audit_calls.empty());
+    CHECK(h.emitted_events.empty());
+}

@@ -617,12 +617,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `GET /api/v1/inventory/software?format=csv|json` has no MCP tool: an
        agent pages the same rows through the cursor on `query_installed_software`,
        and a bulk file is a human/automation convenience. **Revisit by
-       2026-11-07.**
+       2026-11-07** (lapsed; absorbed by the 2026-11-09 SAM-17 entry below, whose
+       revisit date now governs).
      - **The raw route's `q`, `kind`, `ecosystem` and `source` filters are
        REST-only (`#5699`).** `query_installed_software` takes `name`,
        `agent_id`, `version`, `limit` and `cursor` only; the parity ledger row
        stays `twinned` on the paged shape and the gap is recorded in
-       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07.**
+       `docs/api-parity-ledger.md`. **Revisit by 2026-11-07** (lapsed; absorbed
+       by the 2026-11-09 SAM-17 entry below, whose revisit date now governs).
      - **The exception relaxes no control.** The fleet view is gated on a
        global `Inventory:Read` (the per-device view is admitted in scope),
        denies service-scoped tokens on the catalogue fleet view (the raw route
@@ -941,6 +943,38 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `STRICT_EXCEPTION_PINS`; like the 2026-10-22 API-parity ledger reconcile entry this is a session
      statement by the ADR owner, not a signed decision.
 
+   - **2026-11-06 - DEX Scoring tab (`GET /fragments/dex/scoring`, `POST
+     /api/settings/dex-scoring/{save,preview,reset}`, AP-3.12).** Four
+     dashboard routes that edit the score policy, recorded because one
+     behaviour of the tab has no headless twin.
+     - **A UI over the REST pair.** `GET` reads, `save` writes (`PUT`),
+       `preview` is `PUT ?dry_run=true` and `reset` is `DELETE`
+       `/api/v1/dex/score-policy`. The tab calls the same write function
+       (`apply_dex_score_policy`), gates writes on the REST grant
+       `Infrastructure:Write` plus `GuaranteedState:Read` (Read is not
+       view-only: every answer carries application names), gates viewing on
+       `GuaranteedState:Read`, and writes the same audit rows, so it is a view
+       over the API and not a second authority. Each route has a
+       `planned:#6087` row in `scripts/ci/api-parity/dex.json` naming its REST
+       twin; the rows flip to twinned when the twins land.
+     - **The one capability with no headless twin: the tier-change diff.** The
+       preview lists which of the top applications would change tier. A REST
+       dry run answers only the validated document and revision, so the diff
+       exists on the dashboard alone; it is computed by scoring the Apps model
+       under the current and the proposed policy, not by a second scorer.
+       This is a recorded exception to Decision 1, not a permanent one: the
+       headless tier-change diff is to join the scope of the twins tracked as
+       **#6087**; **revisit by 2027-01-31**.
+     - **The exception relaxes no control.** The preview stores nothing and
+       writes one `dex.score_policy.validate` row; every refusal, the
+       fail-closed audit and the same-site gate are those of the REST routes.
+     - Wire reference: `docs/user-manual/dex.md`, "Scoring"; audit rows:
+       `docs/user-manual/audit-log.md`.
+     - Recorded by the change author; ADR-owner acceptance pending.
+     - Note, 2026-11-09: the four ledger rows were flipped to `twinned` by the
+       2026-11-09 entry. The tier-change diff did NOT join the twins and
+       remains the open exception on #6087 (revisit by 2027-01-31).
+
    - **2026-11-02 - DEX score policy model parameters on the REST route (#6087).**
      REST-only, still no MCP twin: the `GET`, `PUT` and `DELETE
      /api/v1/dex/score-policy` contract widened (a version 2 document with a
@@ -949,14 +983,21 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      confidence level; typed as `DexScorePolicyDocument` in `openapi_spec()`),
      while the #6087 twins have not landed, so the 2026-10-23 exception now
      covers a larger surface.
+     - **Retired 2026-11-09.** The #6087 twins (`get_dex_score_policy`,
+       `set_dex_score_policy`, `reset_dex_score_policy`) take the version 2
+       document and the one write function, as this entry anticipated; the
+       entry below records their posture. The text that follows is kept as the
+       record of the interval.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as **#6087**; **revisit by 2027-01-31**. When the twins land they take
        the same document shape and the one write function
        (`apply_dex_score_policy`), so there is no second validator; both this entry
        and the 2026-10-23 one retire when the #6087 twins merge, and both are
-       then amended. No ledger row is added, as for the
+       then amended. No ledger row is added for the REST routes, as for the
        2026-10-23 entry: the parity ledger admits an `exception:` row for a
-       `/api/v1` route but does not require one.
+       `/api/v1` route but does not require one. The four dashboard routes
+       over them carry ledger rows (`planned:#6087` under the 2026-11-06 entry,
+       flipped to `twinned` by the 2026-11-09 entry).
      - **The exception relaxes no control.** Same gates, `If-Match`, audit-first
        and fail-closed audit, A4 envelope, and discovery in `openapi_spec()` and
        `/api/v1/discover/routes`; the new parameters are validated by the same
@@ -977,6 +1018,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      Decision 1's both-surfaces requirement, recorded rather than fixed in the
      same change because the REST routes and the one write function behind
      them ship first and the MCP twins follow over that function.
+     - **Retired 2026-11-09.** The three twins landed under #6087 (see the
+       2026-11-09 entry); this exception no longer stands. The text that
+       follows is kept as the record of the interval.
      - **No MCP twin - tracked follow-up, not a permanent exception.** The
        three twins are tracked as **#6087**; **revisit by 2027-01-31**. Until
        they land, this row stands as the open exception for these routes, and
@@ -1110,14 +1154,28 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      the instruction ids `crossplatform.tar.*`, the result-set matcher kind
      `tar_rows_ge` and the agent plugin name `tar`. Replacement names substitute
      `echo` for `tar` (`/api/v1/echo/...`, `*_echo_*`, `yuzu_echo_*`, `echo.*`,
-     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only retained
-     compatibility is the upgrade-window plugin-name shim (the server accepts an
-     agent that still reports `tar` and writes that name on the wire to it),
-     removed with the other legacy-name shims. Rationale: the feature is renamed
+     `crossplatform.echo.*`, `echo_rows_ge`, plugin `echo`). The only
+     compatibility retained at the time was an upgrade-window plugin-name shim
+     (the server accepted an agent that still reported `tar` and wrote that name
+     on the wire to it); it has since been removed. Rationale: the feature is renamed
      outright, so a retained alias would keep the old name alive in every
      surface; the migration guide (`docs/user-manual/upgrading.md`) lists the
      old and new names. The ledger records the retirement because the policy
      requires it.
+   - **2026-11-10 - the Echo retention-paused row count is renamed from
+     `live_rows` to `hourly_rows` with no deprecation window.**
+     `docs/api-versioning-policy.md` treats a response-field rename as a Breaking
+     change that keeps the old name for a window; this rename retires `live_rows`
+     outside that cycle, by the owner's ruling of 2026-11-10: a hard cut, no
+     alias, the same ruling as the 2026-10-28 Echo rename above. Scope: the
+     `rows[].live_rows` field of `GET /api/v1/echo/retention-paused` and of the MCP
+     tool `list_echo_retention_paused` (one shared builder), their OpenAPI and MCP
+     output schemas. The replacement is `hourly_rows`, the count of rows in the
+     source's hourly roll-up tier. Rationale: Echo keeps roll-up tiers only, so
+     the old name now describes a table that does not exist, and a retained
+     alias would keep it alive; this ships as a fresh deployment, so no existing
+     client is carried across. The migration guide
+     (`docs/user-manual/upgrading.md`) names the change. No calendar revisit.
    - **2026-10-31 - gate parity (check 6) pins one more known mismatch for
      `POST /api/v1/commands` and `execute_instruction`.** Owner ruling: the
      gate-parity table `GATE_PARITY_KNOWN_MISMATCHES` gains the entry
@@ -1175,6 +1233,61 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      ruling is recorded in the governance ledger fragment
      `governance.d/2146-batch-b-dispatch-core.DbkUcG.jsonl`, adjudicated by the
      repository owner.
+   - **2026-11-03 - `GET /api/v1/rbac/enforcement` and `get_rbac_enforcement`:
+     the machine twins of the enforcement fragment, session-only, and one
+     `GATE_PARITY_NO_GATE_ALLOWED` entry (#6033). Ruled by the ADR owner in the
+     authoring session; like the entries above it is a session statement, not a
+     signed decision.** Four parts.
+     First, `get.fragments-access-enforcement` flips from `twinned-rest-only`
+     to `twinned` (untwinned 206 to 205, counting the #4041 and twin batch B steps already in the baseline; the live pin is in
+     `scripts/ci/check-api-parity.py`). Both twins return
+     `{enabled, unconfirmed, administrator}` (the MCP tool adds
+     `audit_persisted`): `enabled` and `unconfirmed` are this replica's cached
+     enforcement view and whether it could be re-confirmed, and
+     `administrator` (`may`, `may_not`, `unconfirmed`) is the advisory
+     administration hint on the caller's own surface, decided from durable
+     grant rows or the local account role (the cached view only selects which
+     applies); it is neither forced nor hidden when the view is unconfirmed.
+     While the cached value is a stale off (`enabled:false` with
+     `unconfirmed:true`), an account with no Administrator grant row reads
+     `administrator:"unconfirmed"`, because the predicate cannot tell a missing
+     grant from a stale view. While it is a stale on (`enabled:true` with
+     `unconfirmed:true`), the same account reads `administrator:"may_not"`,
+     because enforcement is on and a missing grant row is a confirmed absence.
+     Second, the REST route is
+     session-only: it calls `auth_fn`, refuses a service-scoped token, and
+     holds no `perm_fn` gate. The ground is parity with its HTML fragment and
+     with `GET /api/v1/me`, both session-only; a
+     `perm_fn(Infrastructure, Read)` gate would make the machine twin stricter
+     than the fragment and invent an authority the route does not have. The
+     RBAC store is the data the route reads, not its gate. The gate-parity check
+     therefore reads it as a route with no gate call it can read, and one
+     entry, `("GET", "/api/v1/rbac/enforcement", "get_rbac_enforcement")`, is
+     added to `GATE_PARITY_NO_GATE_ALLOWED` (`GATE_PARITY_NO_GATE_MAX` rises
+     from 13 to 14). The tool's `Infrastructure:Read` row drives MCP tier
+     classification and the default-denied service-scope class only; it is
+     never classified under `kServiceScopeGlobalSafe`. Third, the rejected
+     alternative: gating the route on `perm_fn(Infrastructure, Read)`. It was
+     rejected for the reason above. Fourth, the residuals, stated plainly:
+     (a) REST and MCP differ for an MCP-tier token. On REST it gets a 200 with
+     `administrator:"may_not"` (the predicate denies it structurally on the REST
+     surface), meaning "this credential cannot administer RBAC through REST";
+     on MCP the tier ladder governs it, and a readonly-tier administrator reads
+     `may` and is still refused by `set_rbac_enforcement`.
+     (b) The view is cached per replica: a replica that never observed an enable
+     can read `enabled:false, unconfirmed:false` while another replica
+     enforces, bounded by the stale-serve window (#2703).
+     (c) The REST route is not RBAC-gated, the same class as `GET /api/v1/me`
+     and `POST /api/v1/rbac/check`. #6432 tracks only the `get_me`
+     service-scope asymmetry over MCP (`exception:#6432 revisit:2026-11-30`);
+     it does not cover retiring the two session-only `NO_GATE` entries (this
+     route and `GET /api/v1/me`). That retire-or-make-permanent decision is
+     tracked by #6984 (revisit 2026-11-30), which relates to #6432.
+     (d) "Audit every read" means every read on a deployment with a wired audit
+     sink: REST fails closed on an audit-write failure (503 with
+     `Sec-Audit-Failed`, body never sent), MCP reports `audit_persisted:false`,
+     and an empty audit callback is audit-off. The null or closed RBAC store 503
+     and a bare 401 write no audit row, matching the PUT and the fragment.
 
    - **2026-11-02 - the `list_agents` exception (#4041) is resolved for every
      caller except a service-scoped token.** The 2026-10-23 entry above recorded
@@ -1247,6 +1360,393 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        with `503`, never an empty `200`. The A4 envelope and the OpenAPI entries
        hold for all five. Wire reference: `docs/user-manual/rest-api.md`,
        "Software normalisation curation".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-05 - the `Workflow:Execute` residual of the 2026-10-30 entry is
+     closed.** That entry accepted that no MCP tool mapped to the pair, so a
+     supervised token had no ticket path to run a workflow. The MCP tool
+     `execute_workflow` and its REST twin `POST /api/v1/workflows/{id}/execute` now
+     exist, sharing one sequence in `server/core/src/workflow_execute.{hpp,cpp}`. A
+     supervised token calls the tool, receives an approval ticket (`-32006`), and
+     repeats the same call with the `approval_id` after an administrator approves;
+     the ticket binds the workflow id, the agent ids and the ordered step effects.
+     The tool requires an `idempotency_key` (the REST twin accepts an optional
+     `Idempotency-Key` header), because the call is synchronous and a lost response
+     must not become a second full send. The operator tier stays denied by
+     `tier_allows()`, and the legacy `POST /api/workflows/{id}/execute` still refuses
+     a supervised token with `403`. A run holds one HTTP worker, so it leases the
+     shared held-open budget (`StreamBudget`, at most 2 per principal) and has a 60
+     second deadline. The 2026-10-30 entry is left as written; this entry supersedes
+     its residual sentence only.
+     - **Known residuals of this change (recorded by the change author; ADR-owner
+       acceptance pending, except the confined-reader visibility consequence of the
+       stored agent id cap in residual 13, which the owner accepted on 2026-11-06).**
+       Each was checked against the code at the commit that wrote this paragraph.
+       The per-step credential check no longer carries the token-cache lag it once did (it
+       reads the token and engine rows from Postgres, see residual 3); #4766 (token
+       revocation and expiry without the durable-generation discipline sessions have) stays
+       open for the other callers of the token cache and for expiry on the replica's clock,
+       and `AuthRoutes::revalidate_stream` cites #2447, the separate stream grace-clock
+       point. No issue is filed for the rest yet (file each and update its line with the
+       number). The date is the latest the residual is re-read, not a promise it is fixed
+       by then.
+       1. *Write-ahead command id (revisit by 2026-12-15).* A step's command id is
+          stored after the send, by a write that can be dropped, so a step recorded
+          `pending` or `skipped` may still have been sent. The docs tell the reader
+          to check the audit and response stores. Closing it means recording the
+          intended command id before the send.
+       2. *Orphan runs (revisit by 2026-12-15).* Nothing sweeps a run left
+          `running` (a crashed process, a final write that failed twice, an
+          unconfirmed claim COMMIT); its idempotency key stays bound. The runbook is
+          `docs/user-manual/server-admin.md` "A workflow run left `running`". A sweep
+          must close the row and decide the key's fate on purpose.
+       3. *Caller authority is a snapshot (revisit by 2026-12-15).* The run
+          re-checks that the credential is live before each step but does not
+          re-derive the `DispatchCaller` (D2b): an administrator elevation that
+          expires, or a device-group narrowing, during the run is bounded only by the
+          60 s deadline. The liveness check for an API-token caller (and an engine
+          token's backing principal) reads the durable row at every step boundary, so a
+          revoke committed by any replica is seen at the next boundary; the step already
+          sent is not recalled, a cookie session is decided by the durable session
+          generation (polled at most once per second while the session store answers; a
+          replica whose poll is failing keeps trusting its cached sessions for up to
+          30 s, then fails closed), and token expiry is judged on the replica's clock.
+       4. *No per-surface ceiling (revisit by 2026-12-15).* The workflow run leases
+          from the one shared budget, 2 per principal, so 64 principals can hold all
+          128 default slots for up to 60 s and every new stream or run is refused
+          meanwhile. The caps and the `yuzu_server_workflow_runs_in_flight` gauge are
+          per server process. ADR-0034 Decision 3 prefers utilisation to per-surface
+          counters; the gauge is a diagnostic share of that utilisation, and
+          `YuzuHeldOpenUtilisationHigh` alerts on the total.
+       5. *Zero-reach is final for the key (revisit by 2027-01-15).* A run that
+          reaches no device (for example every target is quarantined) answers with
+          no retry hint, and with a key the key is bound to that failed run, so
+          running again after the cause clears needs a new key (on MCP, a new
+          approval).
+       6. *`foreach` (revisit by 2027-01-15).* A step expands over the previous
+          step's result, which is the dispatch acknowledgement (command id, agents
+          reached) and not device output, so it sends one item today.
+       7. *Unkeyed calls (revisit by 2027-01-15).* The key is required only on MCP.
+          The REST route takes it as an optional header and the legacy route takes
+          none, so a lost response retried blind sends every step again; the cap and
+          the 60 s bound still apply.
+       8. *The legacy route has fewer controls (revisit by 2027-01-15).* No approval
+          ticket or step-effect binding, no per-step credential re-check, no refusal
+          of a workflow whose retry sleeps exceed 60 s, no `requested` audit row, and
+          a run stopped at the deadline is recorded `result=success` with the stop in
+          the detail only. It answers `202` `status: running` after such a stop.
+       9. *Audit coverage (revisit by 2027-01-15).* A cap or drain refusal writes no
+          audit row (the counter is its record). Each terminal idempotent replay
+          writes one `success` row and replays are not capped, because they take no
+          slot. An unwired audit sink fails closed on REST (503 `audit_unavailable`)
+          but not on MCP, where the call proceeds and writes no row; on MCP, an
+          unknown argument and a missing or empty `workflow_id` also write no row.
+       10. *Stored attempt number (revisit by 2027-01-15).* The engine writes a
+           step's `attempt` after a failed attempt only, so a step retried to
+           success shows its last failed attempt's number.
+       11. *Shutdown (revisit by 2026-12-15).* The drain waits at most 30 s for
+           runs; a run still going then is stopped between attempts and closed
+           `failed` (the caller is told `interrupted`), and a send already in flight
+           is not interrupted. A run whose final write cannot be made before the
+           process exits stays `running` (residual 2).
+       12. *Unconfirmed claim COMMIT (revisit by 2026-12-15).* When a claim COMMIT
+           fails and Postgres cannot say whether it committed, the call fails but a
+           `running` row for a run that was never dispatched may exist, with its key
+           bound (and, on MCP, its ticket spent), until residual 2's runbook or a
+           sweep clears it.
+       13. *Run records are kept without limit (revisit by 2027-01-15).* No prune
+           exists for `workflow_executions` (see `docs/clock-guarded-retention.md`),
+           so the account name, the key and the agent list (the distinct ids, at most
+           1,000 of them and at most 131,072 bytes of JSON text per run, each id at most
+           256 bytes: a list that does not fit stores the ids that fit and a marker with
+           the count of distinct ids and a digest, `stored_agent_ids_json`) stay for the
+           life of the database, and a deleted-and-recreated username inherits the old
+           account's keys. The table now has a size gauge
+           (`yuzu_server_workflow_executions_rows`, `_bytes`) and a growth alert
+           (`YuzuWorkflowExecutionsTableLarge`, above 100,000 rows for 30 minutes); the
+           rows are still never pruned.
+
+           *Owner-accepted: confined-reader visibility (owner decision 2026-11-06,
+           "accept and record").* For a run naming more than 1,000 distinct agent ids
+           (or whose ids exceed the 131,072-byte stored budget), a CONFINED reader's
+           scoped visibility of the run depends on the stored ids. The ids in the
+           creator's own dispatch scope (`Execution:Execute` visibility) are stored first,
+           then the rest in the order named. The creator keeps seeing its run exactly
+           while at least one stored id lies in the scope its reads are checked against
+           (`Workflow:Read`). That is guaranteed when the run names at least one device
+           inside its `Execution:Execute` scope and that scope lies WITHIN its
+           `Workflow:Read` scope: the first stored id is then inside both. Overlap is not
+           enough. When the `Execution:Execute` scope reaches devices the `Workflow:Read`
+           scope does not, the creator can lose sight of its own run: a global
+           `Execution:Execute` grant with a group-scoped `Workflow:Read` makes every
+           named id "first", so the ids are stored in request order, and the creator
+           loses the run when none of its group's devices is among those stored (the two
+           scopes overlap here, and the run is still lost). Starting a run
+           needs a global `Workflow:Execute`, which of the seeded roles only
+           `Administrator` holds, so a confined creator is a custom role with that grant
+           plus a scoped one (for example an `Operator` assignment on a group). Another confined reader whose devices fall past the cap
+           does not see the run in its scoped list or detail reads. Unconfined readers
+           and the audit log still see it, and the check fails closed (a malformed or
+           empty column is invisible to a confined reader). The trigger is distinct ids
+           beyond the cap: duplicates do not consume it, and an id that names no device
+           does; an id over 256 bytes or holding a NUL byte is counted in the total and
+           never stored, so it consumes nothing. The run is still dispatched to every id
+           it named.
+       14. *Dedupe memory on the legacy execute route (revisit by 2027-01-15).*
+           `stored_agent_ids_json` holds a set of the distinct ids while it works. The
+           legacy `POST /api/workflows/{id}/execute` checks no id count, so a request
+           near its 16 MiB body cap (the reachable ceiling is about 2.5 million distinct
+           ids of at most 4 bytes) costs about 154 MiB of transient memory in that set
+           and the distinct list (the set is freed before the digest is built, the list
+           when the helper returns). The digest's JSON copy of the list, which already
+           existed, coexists with the list, so the helper's peak is about 250 MiB
+           (measured on a release build with glibc: 247 MiB above the input list at
+           2,510,443 distinct ids of 1 to 4 bytes; a list of duplicates peaks at 33 MiB
+           or less). The handler's own parse of the body peaks higher before the helper
+           runs (about 290 MiB for that list and about 450 MiB for 4.19 million one-byte
+           duplicates, measured on a copy of the parse lines). The v1 route and MCP are capped at 10,000 ids and
+           are not affected. The body cap bounds it; an id-count cap on the legacy route
+           would remove it.
+       15. *Pool brownout wait at a step boundary (revisit by 2026-12-15).* The credential
+           check reads the token and engine rows from the primary, and (unlike the
+           held-open stream's cached read) is not covered by the engine liveness cache's
+           failure backoff. The wait depends on how the database fails (measured, a test
+           harness calling the production store functions). When every pooled connection
+           is in use, a read waits at most 0.5 s (the pool's saturated fast-fail), so one
+           boundary is about 4 s (up to three reads per attempt, two attempts, 1 s
+           between). When the database accepts connections but never answers and no
+           connection is idle, the first read of each attempt waits the 10 s connect
+           timeout and the rest of that attempt fails fast, so one boundary is about 21 s.
+           A read on a connection already leased to a database that stopped answering
+           while its host still acknowledges packets (a paused or frozen server) did not
+           return within 150 s in the test: no pool timeout bounds it, and the 60 s run
+           deadline is tested only between attempts, so such a run is not stopped at
+           60 s. The run still fails closed whenever a read returns
+           (`credential_indeterminate`), and is capped at 2 per principal. A packet-drop
+           failure (no acknowledgement) was not measured; the 10 s TCP user timeout
+           should end it (inferred).
+
+   - **2026-11-05 - per-group software collection settings (REST only; the MCP
+     twin is a recorded exception).** The four routes
+     `GET /api/v1/inventory/software/collection-settings`,
+     `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
+     `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
+     no MCP tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
+       as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
+       2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
+       **3.7c**) are separate rows, each its own change. The twin takes the same
+       store and the same pure validator and resolver
+       (`collection_settings_resolve.hpp`), so there is no second validator. This
+       entry retires when the twin merges. No parity-ledger row is added: v1
+       routes are held to the OpenAPI check (`docs/api-parity-ledger.md`).
+     - **What an MCP-only caller can and cannot reach.** The documents and the
+       per-device effective settings are not reachable over MCP; the OpenAPI
+       document is readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Settings are managed by fleet
+       administrators: writes need the global `ManagementGroup:Write` grant
+       (the administrator role while RBAC enforcement is off, the default),
+       checked again immediately ahead of the write; reads take the same
+       `ManagementGroup:Read` gate as the other management-group routes,
+       which admits any signed-in session while RBAC enforcement is off; the
+       device route needs `Inventory:Read` scoped to the device. This build
+       has no group-scoped delegation. Each write is audited with a
+       `requested` row stored ahead of the write (an audit row that cannot be
+       stored is a `503` and nothing is written) and an outcome row. A degraded
+       store read answers `503`, never an empty `200`; an RBAC read that cannot
+       be completed is a `503` on the per-group read and the write, and the
+       shared deny-on-degrade `403` on the list and the device route. The A4 envelope and the OpenAPI
+       entries hold for all four. Wire reference: `docs/user-manual/rest-api.md`,
+       "Software collection settings".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-09 - the software lookup read surface (SAM-17; REST only, the MCP
+     twin is a recorded exception).** `GET /api/v1/inventory/software` gains eight
+     lookup fields (`hostname`, `last_seen`, `status`, `last_confirmed_at`,
+     `install_type`, `install_scope`, `install_location`, `instance_key`), the
+     `match`, `version_min`, `version_max` and `status` filters and a `totals`
+     block, and the new route `GET /api/v1/inventory/software/components` serves
+     the component inventory the same way. None of this is reachable over MCP:
+     `query_installed_software` keeps its 14 fields and five arguments, and the
+     components route has no tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked as
+       delivery row **SAM-21** of the software estate roadmap (the MCP twin of
+       the lookup fields, filters, totals and the components route); the
+       tracking issue is **#7396**. **Revisit by
+       2026-12-31.** The twin takes the same pure model (`software_list_model.hpp`:
+       one parser, one totals rule, one status derivation, one version-range
+       resolver) and the same store reads, so no second copy of any rule is
+       created. This entry retires when the twin merges. It also absorbs the
+       2026-10-07 entry's `#5699` field/filter asymmetry on the raw pair, whose
+       revisit date (2026-11-07) has passed: the widened gap is this entry's, with
+       this entry's date. No parity-ledger row is added: v1 routes are held to the
+       OpenAPI check, and `docs/api-parity-ledger.md` points here.
+     - **What an MCP-only caller can and cannot reach.** The 14-field rows of
+       `query_installed_software` (name, agent_id, version, limit, cursor), scoped
+       by the same `require_fleet_read` gate; not the lookup fields, the status or
+       range filters, any `totals` figure, or any component row. The OpenAPI
+       document is readable as the `yuzu://openapi` resource.
+     - **The exception relaxes no control.** Both routes gate SOLELY on
+       `require_fleet_read` (`Inventory:Read`, admit-then-filter, ADR-0017) with the
+       composed management-group and service scope pushed into every page read
+       and into the version-range read; `totals` is served only to an unfiltered
+       caller for an exact name (ADR-0017 Update 2026-11-09), never to a confined
+       one; every served call is audited (`inventory.software.query|export`,
+       `inventory.components.view|export`, continuation pages tagged); a
+       degraded store, facts, totals or version read is an audited `503` with the
+       A4 envelope and `retry_after_ms`, never an empty `200`; both operations are
+       in `paths` with typed responses. Wire reference:
+       `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
+       "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-14 - the software lookup gains purl and `vers:` ranges (SAM-43;
+     REST only, the MCP twin is a recorded exception).** Rows of
+     `GET /api/v1/inventory/software` gain a `purl` field (the canonical Package
+     URL, `null` when the row has none) and the CSV export a 23rd column; the
+     route gains a `purl` filter (byte equality on the stored value); and both
+     lookup routes (`GET /api/v1/inventory/software` and
+     `GET /api/v1/inventory/software/components`) gain a `vers` filter (a
+     `vers:<scheme>/...` range resolved by the same evaluator as `version_min`
+     and `version_max`). None of this is reachable over MCP:
+     `query_installed_software` keeps its 14 fields and five arguments, and the
+     components route has no tool.
+     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked by
+       issue **#7749**, which rides with the SAM-17 twin (#7396, delivery row
+       SAM-21): the twin takes the same pure model (`software_list_model.hpp`,
+       `vers_range.hpp`), so no second copy of any rule is created. **Revisit by
+       2026-12-31.** This entry retires when the twin merges. The parity ledger
+       (`docs/api-parity-ledger.md`, "Known asymmetry on purl and vers") points
+       here.
+     - **The exception relaxes no control.** Both routes keep the SAM-17
+       posture: `require_fleet_read` (`Inventory:Read`) as the sole gate, the
+       composed management-group and service scope pushed into every page read
+       and into the version-range read, the `purl` filter ANDed with that scope,
+       every served call audited with the new filters in its target, and a
+       malformed `vers` or `purl` a `400` in the A4 envelope. Wire reference:
+       `docs/user-manual/rest-api.md`, "GET /api/v1/inventory/software" and
+       "GET /api/v1/inventory/software/components".
+     - Recorded by the change author; ADR-owner acceptance pending.
+   - **2026-11-09 - MCP twins of the DEX score policy routes (#6087):
+     `get_dex_score_policy`, `set_dex_score_policy`, `reset_dex_score_policy`.**
+     This entry retires the 2026-10-23 and 2026-11-02 #6087 exceptions above.
+     The three tools are registry records in `server/core/src/mcp_tools_dex.cpp`
+     over the one write function `apply_dex_score_policy`, reached through a
+     single forwarding closure on `ToolDeps`: no second validator, no second
+     `If-Match` parser, no second audit-row shape. The pure argument, status and
+     payload logic is `dex_score_policy_mcp.hpp`.
+     - **Posture.** `get_dex_score_policy` is `GuaranteedState:Read`, readable
+       at every MCP tier, and writes no domain audit row (as for the REST `GET`).
+       `set_dex_score_policy` is `Infrastructure:Write` and
+       `reset_dex_score_policy` is the distinct operation
+       `Infrastructure:Delete`; both are supervised-tier only (`tier_allows`
+       refuses `Write` and `Delete` below it), `destructiveHint` true,
+       idempotent. Both handlers repeat the loud `tier_allows` plus `perm_fn`
+       pair (never `probe_permission`) and then require `GuaranteedState:Read`
+       as a second loud gate, because the answer carries application names; the
+       REST `PUT` and `DELETE` require only `Infrastructure:Write`. That REST
+       gap is recorded here, not changed.
+     - **Reset needs an approval ticket; set does not.** Registering reset as
+       `Infrastructure:Delete` puts it under the existing generic supervised
+       rule (`operation == "Delete"`, `mcp_policy.hpp`), the mechanism
+       `delete_plugin_config` and `delete_result_set` already use and the
+       `ApiToken:Rotate` precedent for "a distinct operation, never a
+       tool-local exception". `set` is `Infrastructure:Write` with no ticket,
+       like `set_runtime_config` and the REST `PUT`. MCP is therefore stricter
+       than the REST `DELETE`: a principal that holds `Infrastructure:Write`
+       but not `Infrastructure:Delete` under RBAC can reset over REST but not
+       over MCP. That is deliberate; it is the price of using the one core
+       approval primitive. **The ticket gates this MCP tool, not the
+       capability:** the same supervised token can `DELETE
+       /api/v1/dex/score-policy` over REST with `Infrastructure:Write` alone
+       and no ticket, and `set_dex_score_policy` can store any valid document
+       (the shipped defaults included) without one. Fencing REST `DELETE` or
+       `set` is a REST-surface decision for a separate change; this one is
+       REST-equal on purpose. The reset tool's `if_match` is also bounded by
+       its input schema (`default` or 16 lower-case hex digits), so a missing
+       or malformed value is refused before any ticket is created or consumed,
+       and only a refusal or failure after approval (a stale revision, a writer,
+       store or audit failure, an unresolved caller, or the handler's own
+       permission gate) spends one.
+     - **A failure after approval spends the ticket.** The generic gate
+       consumes the ticket before the handler runs, so a retryable writer,
+       store or audit failure on reset burns it, and a repeat with the same
+       `approval_id` answers "approval already used". The tool description,
+       the retryable-error remediation and `docs/user-manual/mcp.md` say so:
+       call `get_dex_score_policy`, compare its `revision` with the one the
+       error names, then submit a new request without `approval_id`. The gate
+       is not changed here.
+     - **No `deny_mcp_token_session`.** The REST routes admit MCP-tier tokens
+       (a plain `perm_fn`), and the twins exist to serve them; fencing them
+       would make the twin unreachable by its audience. A service-scoped token
+       is refused at the generic C8 gate (`ServiceScopeClass::denied`).
+     - **Audit.** `apply_dex_score_policy` writes the `attempted` row itself
+       before it touches the store and fails closed when that row is refused;
+       the MCP handlers additionally refuse an unwired session resolver or
+       session-bound audit writer and an unresolvable caller (stricter than
+       REST, which treats an empty sink as audit-off). `apply` discards the
+       result of every later row, so the per-request hook records whether any
+       row was dropped and the answer reports `audit_persisted:false`
+       (success) or the A4 audit flag (error); REST reaches the same signal
+       through `Sec-Audit-Failed`. A result-level flag on the write result, so
+       both surfaces share one signal, is a core follow-up on #6087, not part
+       of this change.
+     - **Attribution is session-bound, as on REST.** A write resolves the
+       caller's session once (`ToolDeps::session_fn`) and stamps every
+       `dex.score_policy.*` row and the stored `updated_by` from it through the
+       session-bound writer (`ToolDeps::audit_as_session_fn`, the
+       `AuthRoutes::audit_as_session_fn()` the REST routes use, #6065 PR-Q), so
+       a credential that lapses mid-request cannot leave a row naming no one
+       while the write proceeds. The sibling registry write tools keep the
+       per-row pattern (`ToolDeps::audit_fn` resolves the caller for each row);
+       session-bound domain audit for every MCP write tool is a separate core
+       change (issue to be filed on the owner's word). Residual, declared and
+       disclosed (acceptance pending): the generic `mcp.<tool>` row is written by the MCP
+       dispatcher (`mcp_audit` in `mcp_server.cpp`), outside this tool, and
+       still resolves the caller per row; binding it is a core MCP change.
+     - **`mcp_tool_deps.hpp` admission criterion amended.** The write-capable
+       closure criterion admitted only a pure forward of the REST twin's `*Api`
+       method with the handler writing `attempted` before the call. The score
+       policy closure forwards the REST twin's shared audit-first function,
+       which writes `attempted` itself and fails closed on it, with the sink
+       injected per request and the handler refusing without one. The banner
+       now admits both shapes and states the pre-mutation-row guarantee for
+       each; the dex closure is the second shape, not literally the first.
+     - **Still open on #6087.** The headless tier-change diff (a preview twin)
+       needs a REST and core precursor and then its own MCP change; the preview
+       POST's ledger row is flipped to twinned onto the dry-run `set_dex_score_policy`
+       (its validation half); the tier-change diff it adds has no headless twin and
+       stays the exception recorded in the 2026-11-06 entry. `prior_document`
+       on reset audit rows is a core audit-row change, deferred as a follow-up.
+       Revisit by 2027-01-31; the follow-ups are #7377 (`prior_document`), #7378 (result-level audit flag), #7379 (headless tier-change preview), #7380 (session-bound audit for every MCP write tool), #7381 (`ConsumePrecondition`) and #7382 (config-read bypass).
+       The audit-detail size cap (#6619, a core change) is tracked separately. The REST registration lambdas hold no
+       readable gate call (the `perm_fn` sits in the shared
+       `score_policy_write` lambda), so gate parity (check 6) cannot compare
+       the two REST rows to their twins: they are named in
+       `GATE_PARITY_NO_GATE_ALLOWED` and `GATE_PARITY_NO_GATE_MAX` rises by two
+       (14 to 16) by this ruling. A REST refactor that inlines the gate is the
+       alternative and is not taken here (this change is MCP only).
+     - **Owner decisions pending ADR-owner acceptance (shown at the push
+       gate).**
+       1. The reset ticket gates the MCP tool, not the capability: REST
+          `DELETE` needs `Infrastructure:Write` only and no ticket, and set can
+          store any valid document.
+       2. `GATE_PARITY_NO_GATE_MAX` is raised from 14 to 16 for the `PUT` and
+          `DELETE` score-policy rows.
+       3. The dashboard preview POST's ledger row is twinned onto the dry-run
+          `set_dex_score_policy`, while its tier-change diff has no headless
+          twin (the alternative is `planned:#6087` and 205 untwinned).
+       4. The generic `mcp.<tool>` audit row is resolved per row by the
+          dispatcher (a core MCP change); sibling registry write tools keep the
+          per-row pattern.
+       Follow-ups: `prior_document` on reset audit rows (#7377), a result-level
+       audit flag (#7378), the headless tier-change diff (#7379),
+       session-bound domain audit for every MCP write tool (#7380),
+       audit-detail volume (#6619), `ConsumePrecondition` for an audit or store
+       outage (#7381), and the config-read bypass of `GuaranteedState:Read`
+       (#7382).
+     - Wire reference: `docs/user-manual/mcp.md` (tools 213 to 215),
+       `docs/user-manual/rest-api.md` "GET / PUT / DELETE
+       /api/v1/dex/score-policy"; audit rows: `docs/user-manual/audit-log.md`
+       (verbs unchanged).
      - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)

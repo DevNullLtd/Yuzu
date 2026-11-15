@@ -213,10 +213,9 @@ and by the `/swagger` page as well as by people:
   then the path (without the `/api/v1` base) in PascalCase, with each path parameter written as
   `By` plus its name. `GET /hardware/{id}` is `getHardwareById`, `POST /hardware/{id}/sync` is
   `postHardwareByIdSync`, `DELETE /upload-grants/{grant_id}` is `deleteUploadGrantsByGrantId`. A
-  new operation follows the same rule. Two tests in `tests/unit/server/test_openapi_spec_completeness.cpp`
-  check uniqueness: `openapi_spec_json(): every operation has a unique and well-formed operationId`
-  (which also checks presence and shape) and `openapi documents: every operation has a unique
-  operationId in both forms`.
+  new operation follows the same rule. One test in `tests/unit/server/test_openapi_spec_completeness.cpp`
+  checks presence, shape and uniqueness, in both forms of the document, and pins the whole set:
+  `openapi documents: every operation has a unique, well-formed and pinned operationId in both forms`.
 - **Group guides.** Prose for a group lives in the guide of the matching top-level `tags` entry
   under `x-yuzu-guide`, not inside an operation. `GET /api/v1/openapi.json` leaves the guides out
   and `?guides=true` includes them; the MCP resource `yuzu://openapi` and the discover tools serve
@@ -228,6 +227,59 @@ and by the `/swagger` page as well as by people:
   `unavailable` field on that row. A route that is registered must not carry it. When a store
   becomes wired in `server.cpp`, remove its markers in the same change:
   `tests/test_unavailable_store_wiring.py` fails if they disagree.
+
+**Checklist for a new operation.** Steps 1 to 5 are checked by the server unit-test binary, so a
+step skipped is found only after a full build, and not all at once: a missing `operationId` stops
+the id test before it reports the checksum, which appears on the next run. Do all six before the
+first build. The document is the template literal, not generated, so nothing below is done for you.
+
+1. **Path item.** Add the entry, and declare its tag in the top-level `tags` list. A registered
+   `/api/v1` route with no `paths` entry fails `RestApiV1::register_routes vs openapi_spec_json():
+   every registered /api/v1 route has a matching OpenAPI paths entry`, and a tag that is not
+   declared fails `openapi documents: every tag an operation uses is declared in the tag list`.
+2. **`operationId`.** Give it one by the rule above. It must match `^[a-z][A-Za-z0-9]*$` and be
+   unique. The id test stops at the first operation that has none, so it does not get as far as
+   the checksum (step 5) until every operation has an id.
+3. **Typed success response.** At least one `2xx` response must carry `content`, and a media type
+   under it must carry a `schema` (a `$ref` counts). The test `openapi documents: all but two
+   operations declare a typed success response` compares the set of operations without one to its
+   `kUntyped` list, which holds the two that answer `204` with no body
+   (`delete /upload-grants/{grant_id}` and `delete /uploads/{upload_id}`). Add a name to that list
+   only for another operation that answers with no body, never to skip the schema. The comparison
+   is for equality, so whoever gives a listed operation a body schema removes its name in the same
+   change. A schema is checked against its handler only for the routes in the `ResponsePin` table
+   in the same file, so write the schema from the handler, and add a row if the shape is easy to
+   get wrong.
+4. **Served text.** Every string in the document, in both forms, is checked by `openapi documents:
+   no text cites an issue, an ADR, a build wave or the review process`. Describe behaviour, not
+   where it came from: no `#1234` or `Issue 12`, ADR or SOC 2 references, `§` section marks,
+   source file names such as `x.cpp`, `Class::member` or `name()` identifiers, `snake_case_fn`
+   helper names, or gate and wave labels. A `summary` is held to a stricter list, which also
+   rejects a bare `Gate` or `ADR`. The regular expressions are in that test case.
+5. **Checksum.** The same id test as step 2 compares a hash of every `operationId method path`
+   to `kOperationIdChecksum`, so adding any operation changes it. Run the test: its failure prints
+   `sorted operationId pairs hash to "<hex>"`. Copy the value, quotes included, into
+   `kOperationIdChecksum`. It is `content_etag` (FNV-1a 64, `content_etag.hpp`) over the lines
+   `<id> <method> <path>`, one per operation with a lower-case method and the path without
+   `/api/v1`, sorted by id, each ending in a newline. A rename must also be stated in the
+   `operationId` note of `docs/user-manual/upgrading.md` and the changelog fragment, because it
+   changes generated clients.
+6. **Literal size.** MSVC rejects one string token over 16,380 bytes, and only the Windows leg
+   compiles it. `tests/test_openapi_literal_segments.py` (meson `docs` suite, no build, run it with
+   `python3 tests/test_openapi_literal_segments.py`) fails any raw-string piece of 15,000 bytes or
+   more. When a piece nears that, split it at the end of a line after a comma or closing brace:
+   close it with `)json"` and open the next piece with `R"json(` on the following line. A
+   clean merge of `dev` into your branch can push a piece over the ceiling without a conflict, so
+   run the script again after every merge.
+
+One command checks steps 2, 3, 5 and 6 without a build (step 4, the wording rules, still needs the
+C++ tests after a build): `python3 -I tests/test_openapi_operation_authoring.py` (meson `docs`
+suite). The C++ cases carry the `[openapi]` tag and are in the `server` suite:
+`meson test -C build-linux --suite server`, or run `build-linux/tests/yuzu_server_tests "[openapi]"`
+alone. The script reads the served document and the constants out of
+`test_openapi_spec_completeness.cpp`, checks the `operationId` shape and uniqueness, the typed
+success response, the checksum pin and the segment ceiling in one run, and prints the checksum to
+paste into `kOperationIdChecksum`. It does not replace the C++ tests after the build.
 
 **The `ecosystem` tokens.** Three placeholders in the literal are expanded once, on first use, by
 `expand_ecosystem_tokens()`: `"@@ECOSYSTEM_ENUM@@"` (the software routes),
@@ -391,7 +443,7 @@ forwards to the `CryptoApi` instance `CryptoRoutes` serves, `crypto_access_fn`, 
 re-resolves the caller's username from the request because the registry path carries no session), so a
 twin reuses the route's composition instead of re-deriving it from a store. `ctx.deps` is `nullptr` when unwired and each closure
 may be empty: a handler checks both and answers an internal error, never an empty result. A tool that
-needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writer `audit_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`: a pure forward of the REST twin's own `*Api` method, the gate stays central, the handler audits "attempted" first and refuses to run without a sink) still belongs on the legacy path, and a lexical
+needs a store, `AgentRegistry` or a write-capable callable (other than the audit-row writers `audit_fn` / `audit_as_session_fn` and a closure meeting the criterion in `mcp_tool_deps.hpp`, which admits two shapes and keeps the gate central in both: (i) a pure forward of the REST twin's own `*Api` method, with the handler writing "attempted" before the call and refusing to run without a sink; (ii) a pure forward of the REST twin's shared audit-first apply function, with the audit sink injected per request and the handler refusing to call the closure without one; a write tool that wants REST-parity attribution binds its DOMAIN audit rows through `ToolDeps::session_fn` plus `audit_as_session_fn` (see `writer_identity` in `mcp_tools_dex.cpp`), while the older registry write tools still use the per-row `audit_fn` pattern) still belongs on the legacy path, and a lexical
 test fails an `mcp_tools_*.cpp` that includes a `*_store.hpp`, `agent_registry.hpp`, `mcp_server.hpp`,
 `auth_db*` or `pg/` header. Tools are compiled in-tree with no runtime or plugin registration, and a fork adding a domain file must edit
 `registered_tool_records()` itself. **Served order:** `tools/list` lists the merged legacy and registry
@@ -439,7 +491,7 @@ function, `requires_approval(mcp_tier, securable_type, operation)` (in `mcp_poli
 own doc comment, "AFTER `tier_allows()` returns true." **It is not derived from anything else — it
 is its own hard-coded, exact-match `(securable_type, operation)` list** (supervised tier:
 `Execution:Execute`, any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`,
-`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; operator
+`UserManagement:Write`, `ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`, `RevocationSource:Write`; operator
 tier: `Tag:Delete` only; read the supervised branch of `requires_approval()` in `mcp_policy.hpp`
 for the current list, which this paragraph can fall behind). A pair that is destructive in the
 everyday sense but **absent** from this list runs un-approved at supervised tier, full stop: there
@@ -955,7 +1007,7 @@ Next, the decision §3's "fifth registration point"
 calls out explicitly: `SoftwareDeployment:Execute` is **not** in `requires_approval()`'s hard-coded
 supervised-tier list today (verified; the list at the time of writing is `Execution:Execute`,
 any `Delete`, `Policy:Write`, `Security:Write`, `Security:Execute`, `UserManagement:Write`,
-`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`; read the supervised branch of
+`ManagementGroup:Write`, `Workflow:Execute`, `ApiToken:Write`, `RevocationSource:Write`; read the supervised branch of
 `requires_approval()` in `mcp_policy.hpp` for the current one). Starting a deployment pushes a package to live
 endpoints — REST gates the equivalent action behind an MFA step-up (`step_up_fn`,
 `rest_api_v1.cpp:9053`) precisely because it is consequential. The twin PR's job is to make that

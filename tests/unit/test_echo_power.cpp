@@ -1071,7 +1071,7 @@ TEST_CASE("build_subscription_tick_events: pending-gap, subscription-corrupt, re
 
 // ── EchoDatabase-level idempotence: INSERT OR IGNORE actually dedupes ────────
 
-TEST_CASE("EchoDatabase power_live: inserting the same record_key twice yields exactly "
+TEST_CASE("EchoDatabase power: folding the same record_key twice yields exactly "
           "one row",
           "[echo_power][db]") {
     auto t = make_test_db();
@@ -1085,7 +1085,7 @@ TEST_CASE("EchoDatabase power_live: inserting the same record_key twice yields e
     REQUIRE(t.db.insert_power_events_and_cursor({ev}, R"({"v":1})"));
     REQUIRE(t.db.insert_power_events_and_cursor({ev}, R"({"v":1})")); // retried batch, same key
 
-    auto res = t.db.execute_query("SELECT COUNT(*) FROM power_live");
+    auto res = t.db.execute_query("SELECT COALESCE(SUM(event_count), 0) FROM power_hourly");
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
     CHECK(res->rows[0][0] == "1");
@@ -1285,7 +1285,7 @@ TEST_CASE("mac_power_collect_impl: full-fixture (REAL, ~42-line noisy document) 
     CHECK(second.events_emitted == 0);
     CHECK_FALSE(first.new_cursor_json.empty());
 
-    auto res = t.db.execute_query("SELECT COUNT(*) FROM power_live");
+    auto res = t.db.execute_query("SELECT COALESCE(SUM(event_count), 0) FROM power_hourly");
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
     // Zero real transitions in this document (both real entries are
@@ -1325,7 +1325,7 @@ TEST_CASE("MacPowerCursorSource: on_enabled_changed(true) forces exactly one cap
     CHECK(reenabled.outcome == CursorOutcome::CursorLost);
     CHECK(reenabled.events_emitted == 1);
 
-    auto res = t.db.execute_query("SELECT action FROM power_live");
+    auto res = t.db.execute_query("SELECT action FROM power_hourly");
     REQUIRE(res.has_value());
     // Only the capture_gap from the re-enable tick -- the baseline tick
     // itself stored zero events (both P-007 lines are same-state seeds), so
