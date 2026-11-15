@@ -322,9 +322,10 @@ public:
         agent_step_enabled_.store(enabled, std::memory_order_relaxed);
     }
 
-    /// The agent order step's own `lock_timeout`, in milliseconds. It bounds EACH lock wait in the
-    /// step (Ensure, DECIDE, and the one re-run after a concurrent delete), so a step can hold its
-    /// pooled connection for the sum of its waits. See the Timeouts paragraph on `agent_order_step`.
+    /// The agent order step's own `lock_timeout` and `statement_timeout`, in milliseconds. The lock
+    /// bound is per lock wait, the statement bound is the whole of each statement (Ensure, DECIDE,
+    /// and the one re-run after a concurrent delete), so a step can hold its pooled connection for
+    /// the sum of its statements. See the Timeouts paragraph on `agent_order_step`.
     static constexpr int kAgentStepLockTimeoutMs = 1000;
 
     /// Test seam: the `lock_timeout` the agent order step applies, in milliseconds (default
@@ -357,9 +358,9 @@ public:
     /// held across a Repair's statements). A Repair holds a pooled connection for the sum of its
     /// statements (up to the order step's lock bound, the clock read and five census statements
     /// under the 2 s statement bound), and the pool (16 connections) is shared with auth and audit,
-    /// so an unbounded storm of Repairs, which a gateway reconnect replays at up to 50 in flight per
-    /// node, would starve them: the measured cost of 50 Repairs parked behind one row lock was 16
-    /// failed acquires in 18 at the audit store's 500 ms bound, and 0 in 8. At the cap, a Repair
+    /// so an unbounded storm of Repairs, which a gateway reconnect replays at up to 50 in flight
+    /// per node, would starve them: the measured cost of 50 Repairs parked behind one row lock was
+    /// 16 failed acquires in 18 at the audit store's 500 ms bound, and 0 in 8. At the cap, a Repair
     /// that finds it full is SHED: the event stays pending and untouched, the transaction is rolled
     /// back and the lease returned at once (see `insert_event_classified`). Repairs only: a first
     /// delivery or a batch row is never refused by it.
@@ -777,9 +778,11 @@ private:
     std::atomic<int> agent_step_lock_timeout_ms_{kAgentStepLockTimeoutMs}; // test seam, 1000 in production
     std::atomic<int> repair_statement_timeout_ms_{kRepairStatementTimeoutMs};   // test seam, 2000
     std::atomic<int> repair_max_concurrent_{kRepairMaxConcurrent};              // test seam, 4
-    std::atomic<int> repairs_in_flight_{0};     // Repairs holding an admission (the cap's count)
-    std::atomic<uint64_t> repairs_shed_{0};     // Repairs refused at the cap (also the log sampler's count)
-    std::atomic<int64_t> repair_shed_last_ts_{0}; // the log sampler's last-shed time
+    // The Repair cap: Repairs holding an admission, Repairs refused at it (also the shed log
+    // sampler's count), and the sampler's last-shed time.
+    std::atomic<int> repairs_in_flight_{0};
+    std::atomic<uint64_t> repairs_shed_{0};
+    std::atomic<int64_t> repair_shed_last_ts_{0};
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production

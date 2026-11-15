@@ -2752,25 +2752,30 @@ struct AgentStepResult {
 // counter (it may Ensure the row and share-lock it, inside its census savepoint; see
 // `project_rule_status`).
 //
-// Timeouts: the step sets its own `lock_timeout` (`kAgentStepLockTimeoutMs`, 1 s by default) and
-// leaves the statement timeout to the connection's pool option (30 s by default). The bound applies
-// to EACH lock wait, and the step can wait more than once: Ensure, DECIDE, and the one re-run of
-// both after a concurrent delete of the agent's row. A pooled connection can therefore be held for
-// the sum of those waits, not for one bound. The agent row is the one lock every first delivery of
-// an agent queues on, and a waiter holds a pool lease for the whole wait, so a row held for the
-// pool's default 10 s `lock_timeout` (a long fold, a stalled commit, an operator session idle in a
-// transaction) would pin one lease per waiting delivery and starve every other store that shares
-// the pool. A waiter whose wait reaches the step's bound takes the failed-step path below (SQLSTATE
-// 55P03: the event is stored pending and the census write is skipped), the same cost at a fraction
-// of the lease time. The `SET LOCAL` value is absolute: it does not take the smaller of its own and
-// the connection's value, so a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the
-// step. The bound is set under the step's savepoint and restored before the success RELEASE:
+// Timeouts: the step sets its own `lock_timeout` (`kAgentStepLockTimeoutMs`, 1 s by default) and,
+// to the same value, its own `statement_timeout`; the connection's pool options are 10 s and 30 s.
+// `lock_timeout` is PER LOCK WAIT, and a wait is not a promise of a 1 s total: a FOR SHARE locker
+// (a Repair) does not queue behind a waiting FOR UPDATE, so a rolling chain of overlapping
+// Repair share locks on one agent can keep the step's FOR UPDATE waiting past the bound
+// (measured on PG 17: waits of 4 s and 8 s under a 1 s `lock_timeout`). The statement
+// timeout counts the WHOLE statement, waits included, so each statement of the step (Ensure,
+// DECIDE) ends at 1 s with 57014 however the lock wait is fed. The step can still run more than
+// one statement, Ensure, DECIDE, and the one re-run of both after a concurrent delete of the
+// agent's row, so a pooled connection can be held for the sum of those bounds, not for one. The
+// agent row is the one lock every first delivery of an agent queues on, and a waiter holds a pool
+// lease for the whole wait, so a row held for the pool's default 10 s `lock_timeout` (a long fold,
+// a stalled commit, an operator session idle in a transaction) would pin one lease per waiting
+// delivery and starve every other store that shares the pool. A statement that reaches either
+// bound takes the failed-step path below (SQLSTATE 55P03 or 57014: the event is stored pending
+// and the census write is skipped), the same cost at a fraction of the lease time. Both `SET
+// LOCAL` values are absolute: neither takes the smaller of its own and the connection's value, so
+// a pool or DSN `lock_timeout` or `statement_timeout` below 1 s is loosened to 1 s for the step.
+// The bounds are set under the step's savepoint and restored before the success RELEASE:
 // ROLLBACK TO reverts a SET LOCAL, RELEASE does not, so without the restore the census upsert and
-// the fold that follow in the same transaction would run under the step's bound instead of the
+// the fold that follow in the same transaction would run under the step's bounds instead of the
 // connection's own. `TO DEFAULT` restores the connection's session reset value: the pool's startup
-// option `-c lock_timeout` (10 s by default), or a `options=` value in the DSN, or else the
-// role, database or server setting. A statement timeout below a lock wait ends the statement with
-// 57014 instead. All of these take the same path as any other error here.
+// options `-c lock_timeout` (10 s by default) and `-c statement_timeout` (30 s by default), or an
+// `options=` value in the DSN, or else the role, database or server setting.
 //
 // `pair` is the validated wire pair (0/0 = unpaired). The step returns the decided mode and the
 // retired epoch, parsed into the closed `PairMode` set INSIDE the step, before the savepoint is
@@ -2789,7 +2794,8 @@ agent_order_step(PGconn* conn,
     // The cleanup below is written out, not a scope guard, for the reason stated at the Repair's
     // statement bound in `project_rule_status`: `pg::PgTxn` owns the connection state (an exception
     // unwinds to its ROLLBACK), and every other exit is control flow that must return Failed or
-    // Abandoned. The exits: a rows==1 success restores `lock_timeout TO DEFAULT` then RELEASEs; a
+    // Abandoned. The exits: a rows==1 success restores `lock_timeout` and `statement_timeout TO
+    // DEFAULT` then RELEASEs; a
     // failure ROLLBACKs TO the savepoint (undoing the SET LOCAL) then RELEASEs; a failed control
     // statement returns Abandoned and the caller's PgTxn rolls the transaction back.
     // A failed SET LOCAL is a failed savepoint control statement: the transaction is abandoned.
@@ -2982,8 +2988,8 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                     // census write, no order write).
                     //
                     // What the ingest answers on a miss is the same as for a Failed Repair:
-                    // `Redelivered`. There is no backpressure to give: the direct Subscribe loop and
-                    // ForwardGuardianMessage both discard the outcome (the RPC is acknowledged
+                    // `Redelivered`. There is no backpressure to give: the direct Subscribe loop
+                    // and ForwardGuardianMessage both discard the outcome (the RPC is acknowledged
                     // unconditionally, `ingest_guardian_response` returns void), so an `Error`
                     // would reach no agent either, and it would count on
                     // `events_ingest_errors_total`, whose alert reads a sustained rate as a broken
@@ -2991,8 +2997,8 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                     // stops resending; a later journal replay, or a later applied verdict for the
                     // pair, is what clears it). It counts as a failed Repair on the existing
                     // series, and logs a sampled WARN.
-                    RepairAdmission admission(repairs_in_flight_,
-                                              repair_max_concurrent_.load(std::memory_order_relaxed));
+                    RepairAdmission admission(
+                        repairs_in_flight_, repair_max_concurrent_.load(std::memory_order_relaxed));
                     if (!admission.admitted()) {
                         census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
                         count_projection(metrics_, ProjectionSource::Repair, CensusOutcome::Failed);
