@@ -562,7 +562,15 @@ struct KeyBinding {
 /// EXCEPT that a retired watch (removing=true, moved into retiring_) is owned
 /// by whichever code eventually reaps it (run()'s own drop_watch(), or
 /// stop()'s reap loop) — touched only for its OS handles from that point on.
+/// A never-reused watch identity. The test-control completion stash names a watch by this,
+/// never by address: an address can be freed and reused, an id cannot.
+inline std::uint64_t next_watch_id() noexcept {
+    static std::atomic<std::uint64_t> counter{0};
+    return counter.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 struct DirWatch {
+    const std::uint64_t id{next_watch_id()}; ///< stash identity only (see next_watch_id)
     DirHandle handle;               ///< CreateFileW(FILE_LIST_DIRECTORY, OVERLAPPED), IOCP-associated
     OVERLAPPED ov{};                ///< distinct per dir — the IOCP key back to this struct
     alignas(DWORD) std::byte buf[32 * 1024]; ///< FILE_NOTIFY_INFORMATION landing buffer
@@ -1326,6 +1334,8 @@ public:
                           leaked);
             quarantined_.fetch_add(leaked, std::memory_order_relaxed);
         }
+        suppressed_.clear(); // test-seam stash: ids only, nothing was ever posted to the IOCP
+        replay_.clear();
         dirs_.clear();
         ancestors_.clear();
         retiring_gauge_.fetch_sub(retiring_.size(), std::memory_order_relaxed);
@@ -1420,14 +1430,13 @@ public:
             suppressed_.reserve(8);
             replay_.reserve(8);
         }
-        if (c.release_suppressed_completions && iocp_) {
-            // Hand every stashed completion back to the worker, which restores its
-            // original `ok`/`bytes` when it dequeues the re-posted packet.
-            for (const auto& e : suppressed_) {
+        if (c.release_suppressed_completions) {
+            // Hand every stashed completion back. Nothing is posted to the IOCP and no
+            // pointer is kept: run() synthesizes each completion from this owned state
+            // (the nudge below wakes it) and drops one whose watch is gone, so a release
+            // is safe at any time, including after an unwatch or a stop.
+            for (const auto& e : suppressed_)
                 replay_.push_back(e);
-                ::PostQueuedCompletionStatus(iocp_.get(), e.bytes, reinterpret_cast<ULONG_PTR>(e.w),
-                                             &e.w->ov);
-            }
             suppressed_.clear();
         }
         if (iocp_)
@@ -3828,6 +3837,19 @@ private:
         return false;
     }
 
+    /// Test seam only (the completion stash), under mu_: the armed watch with this id, or null.
+    /// A watch already retired to retiring_ is deliberately not found: its read is cancelled and
+    /// owned by the drain, so a handed-back completion for it is dropped, never replayed.
+    DirWatch* find_watch_by_id_locked(std::uint64_t id) const {
+        for (const auto& [k, slot] : dirs_)
+            if (slot && slot->id == id)
+                return slot.get();
+        for (const auto& [k, slot] : ancestors_)
+            if (slot && slot->id == id)
+                return slot.get();
+        return nullptr;
+    }
+
     void drop_watch(DirWatch* w) {
         for (auto it = dirs_.begin(); it != dirs_.end(); ++it)
             if (it->second.get() == w) {
@@ -3850,7 +3872,7 @@ private:
     void run() {
         std::unique_lock lk(mu_);
         while (!stop_.load(std::memory_order_acquire)) {
-            const DWORD timeout_ms = wait_timeout_locked(Clock::now());
+            const DWORD timeout_ms = replay_.empty() ? wait_timeout_locked(Clock::now()) : 0;
             lk.unlock();
             DWORD bytes = 0;
             ULONG_PTR ckey = 0;
@@ -3859,6 +3881,19 @@ private:
                 ::GetQueuedCompletionStatus(iocp_.get(), &bytes, &ckey, &ov, timeout_ms);
             lk.lock();
 
+            // Test seam: a released stash entry becomes the completion of the watch it
+            // names, when that watch is still armed. An entry whose watch is gone is dropped.
+            StashedCompletion rep{};
+            bool replayed = false;
+            while (ov == nullptr && !replayed && !replay_.empty()) {
+                rep = replay_.front();
+                replay_.erase(replay_.begin());
+                if (DirWatch* rw = find_watch_by_id_locked(rep.id)) {
+                    ckey = reinterpret_cast<ULONG_PTR>(rw);
+                    ov = &rw->ov;
+                    replayed = true;
+                }
+            }
             const bool real_completion = (ov != nullptr);
             if (real_completion) {
                 // Consume it BEFORE checking stop_, regardless of whether we
@@ -3872,20 +3907,15 @@ private:
                 if (notify_fail_hook_ && notify_fail_hook_(w->dir))
                     gqcs_ok = FALSE; // test seam: override the kernel's own result; see
                                      // FileMechanismTestControls::notify_fail_hook's doc comment
-                bool replayed = false;
-                for (auto it = replay_.begin(); it != replay_.end(); ++it)
-                    if (it->w == w) { // a stashed completion handed back: restore what it carried
-                        gqcs_ok = it->ok;
-                        bytes = it->bytes;
-                        replay_.erase(it);
-                        replayed = true;
-                        break;
-                    }
+                if (replayed) { // a stashed completion handed back: restore what it carried
+                    gqcs_ok = rep.ok;
+                    bytes = rep.bytes;
+                }
                 if (!replayed && completion_suppress_hook_ && !w->removing &&
                     !stop_.load(std::memory_order_acquire) &&
                     suppressed_.size() < suppressed_.capacity() &&
                     completion_suppress_hook_(w->dir, gqcs_ok != FALSE, bytes)) {
-                    suppressed_.push_back({w, gqcs_ok, bytes}); // test seam: swallow this completion
+                    suppressed_.push_back({w->id, gqcs_ok, bytes}); // test seam: swallow this completion
                     continue;
                 }
                 if (stop_.load(std::memory_order_acquire)) {
@@ -4135,8 +4165,10 @@ private:
     /// Test seam, read by detached verify workers with no lock (hence a shared_ptr, set under mu_).
     std::shared_ptr<const std::function<DWORD(std::wstring_view)>> verify_hook_;
     /// Test seam, only under mu_: a dequeued completion the hook swallowed, and one handed back.
+    /// It names its watch by `id`, never by address (see next_watch_id), so an entry can outlive
+    /// its watch without anything dereferencing it; stop() clears both vectors.
     struct StashedCompletion {
-        DirWatch* w;
+        std::uint64_t id;
         BOOL ok;
         DWORD bytes;
     };

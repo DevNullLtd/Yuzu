@@ -6,7 +6,8 @@
  *
  * Interval / Startup / Disk are timer-driven and serviced by the SparkEngine's
  * wheel (spark_engine.cpp). File / Registry / Service are EVENT-driven: they do
- * not sit on the wheel — a kernel notification, not a deadline, is the trigger.
+ * not sit on the wheel — a kernel notification, not a deadline, is the trigger,
+ * with one Windows File exception stated below.
  * Each such type is serviced by one `ISparkMechanism` that multiplexes EVERY
  * armed spark of its type onto O(mechanism) OS resources — one IOCP + thread
  * for file changes, one TP_WAIT pool for registry changes, one sd-bus
@@ -15,7 +16,10 @@
  * the resident watch resources: since #5719 item 5 the Windows File mechanism
  * ALSO does O(watched directories) periodic work (one short-lived detached
  * identity-verification thread per watched directory per path_verify_interval),
- * so its steady-state CPU and thread-creation cost is not O(mechanism).
+ * so its steady-state CPU and thread-creation cost is not O(mechanism). That
+ * verification is deadline-driven, not notification-driven: each watched
+ * directory is sampled on its own 5 s schedule (path_verify_interval), run by the
+ * File mechanism itself and NOT coalesced onto the SparkEngine's timer wheel.
  *
  * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
  * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test
@@ -618,13 +622,20 @@ struct FileMechanismTestControls {
     /// Hand swallowed completions back with release_suppressed_completions. Null
     /// clears it (swallowed ones stay). It runs inside run() but outside run()'s
     /// try, so it must NEVER throw (a throw ends the process): a test-only seam.
-    /// The stash of swallowed completions holds RAW DirWatch pointers: releasing
-    /// after the watch was unwatched or the mechanism stopped is a use-after-free,
-    /// so a test must release BEFORE it disarms.
+    /// It is consulted only for a completion that is NOT itself a handed-back one,
+    /// whose watch is not being removed, while the mechanism is not stopping, and
+    /// only while fewer than 8 completions are stashed (the stash is sized once, so
+    /// the worker never allocates): a ninth swallow does not happen, the ninth
+    /// completion is processed normally. The stash names a watch by a never-reused
+    /// id, never by address, and nothing is posted to the IOCP, so releasing after
+    /// the watch was unwatched or after stop() is safe: an entry whose watch is gone
+    /// is dropped and nothing is dereferenced. stop() discards the stash.
     std::function<bool(std::wstring_view dir, bool ok, unsigned long bytes)> completion_suppress_hook;
-    /// One-shot: re-post every completion the suppress hook swallowed so the worker
-    /// processes it with its original result and byte count. Release before the
-    /// watch is disarmed (see completion_suppress_hook).
+    /// One-shot: hand every swallowed completion back so the worker processes it
+    /// with its original result and byte count, in the order swallowed, when its
+    /// watch is still armed. Safe at any time (see completion_suppress_hook). A
+    /// completion handed back for a watch that has since been retired to the drain
+    /// list is dropped, not replayed.
     bool release_suppressed_completions{false};
 };
 
