@@ -1864,7 +1864,8 @@ flip, with a red-first test each:
     auditing SACL, adds EDR noise and thread churn, has no cap on the number of directories, and its cost was
     measured only up to 200 directories (author-reported, below). There is no knob to turn it off: the sole rollback
     lever is `--spark-disable` (section 6), which is boot-time and restart-required and persists across restarts only
-    on Linux (#3973); this verification adds no runtime switch and none is promised here. (3) The cost model in precondition (c) predates this verification: the File
+    on Linux (#3973). A runtime off switch (an agent flag with 0 meaning off) is required before a flip; this
+    verification does not add one (follow-up to be filed). (3) The cost model in precondition (c) predates this verification: the File
     measurements there were taken before it existed and do not include its cost.
     **Runs.** Author-reported (pre-governance, logs not retained): the cancelled read's completion was consumed in
     the same millisecond as detection in the one run whose log was read; the identity read was stable across
