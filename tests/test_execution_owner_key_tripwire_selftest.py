@@ -10,7 +10,9 @@ string-typed `execution_visible(...)`, a string overload, a mutation request tha
 raw-username guard replaced by a check on the key, a public string constructor on the key, the entry
 refusal deleted from each list gate, a second caller of `require_list_read_unchecked`, a second
 definition of the shared predicate, responder or key factory, a second `ListAuthority`
-construction, and the MCP `list_executions` local fail-closed deleted or weakened. It also requires the unmutated tree to pass, a comment or string literal holding the
+construction, the MCP `list_executions` local fail-closed deleted or weakened, and (CHECK 9) the
+MCP stream bridge's confined projection deleted, commented out, un-wired from the record's scope or
+left without its kDrop return, and the production `bridge->reserve(` dropping the dispatcher's scope. It also requires the unmutated tree to pass, a comment or string literal holding the
 same text NOT to trip, and every frozen entry to be load-bearing (a stale entry fails). Stdlib only.
 """
 from __future__ import annotations
@@ -428,6 +430,50 @@ def main() -> int:
               mutate(files, "server.cpp", "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);",
                      "authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);\n"
                      "        authz::seed_service_scope_unrestricted_refusal_metrics(metrics_);"), "CHECK 8")
+
+    # ---- CHECK 9: the MCP stream bridge is a projected bus consumer (#7817) ------------------
+    classify_call = "classify_execution_event_for_scope(ev, rec->fleet_read_scope)"
+    must_fail("the bridge classifier call deleted", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", classify_call, "ExecutionEventVerdict::kPass"), "CHECK 9")
+    must_fail("the bridge classifier call only commented out", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", "switch (" + classify_call + ")",
+                     "// switch (" + classify_call + ")\n            switch (ExecutionEventVerdict::kPass)"),
+              "CHECK 9")
+    must_fail("the bridge classifier handed a different scope", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", classify_call,
+                     "classify_execution_event_for_scope(ev, authz::VisibleSet{})"), "CHECK 9")
+    must_fail("the bridge classifier called a second time", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
+                     "bool sanitize_terminal = false;\n            (void)" + classify_call + ";"), "CHECK 9")
+    must_fail("the listener no longer returns on kDrop", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", "case ExecutionEventVerdict::kDrop:\n                return;",
+                     "case ExecutionEventVerdict::kDrop:\n                break;"), "CHECK 9")
+    must_fail("a sanitize call removed from the bridge", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", "? sanitize_execution_event_for_scope(ev).data",
+                     "? ev.data"), "CHECK 9")
+    must_fail("the pressure visitor sanitize removed", t.check_bridge_projection,
+              mutate(files, "mcp_stream_bridge.cpp", "? sanitize_execution_event_for_scope(*ev).data",
+                     "? ev->data"), "CHECK 9")
+    must_fail("a classifier name only in a comment", t.check_bridge_projection,
+              {**files, S + "mcp_stream_bridge.cpp": "".join(
+                  l for l in files[S + "mcp_stream_bridge.cpp"].splitlines(True)
+                  if "execution_event_scope.hpp" not in l and "classify_execution_event_for_scope(ev" not in l
+                  and "sanitize_execution_event_for_scope" not in l) +
+                  "// classify_execution_event_for_scope( sanitize_execution_event_for_scope(\n"}, "CHECK 9")
+    must_fail("the production reserve() dropped the scope", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp", "std::move(bridge_fleet_scope));", ");", count=1), "CHECK 9")
+    must_fail("the production reserve() passes a different scope", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp", "std::move(bridge_fleet_scope));",
+                     "std::nullopt);"), "CHECK 9")
+    must_fail("the dispatcher scope starts unrestricted, not deny-all", t.check_bridge_projection,
+              mutate(files, "mcp_server.cpp", "bridge_fleet_scope =\n                            yuzu::server::authz::deny_all();",
+                     "bridge_fleet_scope = std::nullopt;"), "CHECK 9")
+    expect(t.check_bridge_projection(files) == [], "the real tree must pass CHECK 9")
+    # A comment or string holding the same text must NOT satisfy or trip the check.
+    commented = mutate(files, "mcp_stream_bridge.cpp", "bool sanitize_terminal = false;",
+                       "// classify_execution_event_for_scope(ev, rec->fleet_read_scope)\n"
+                       "            bool sanitize_terminal = false;")
+    expect(t.check_bridge_projection(commented) == [], "a comment repeating the classifier call must NOT trip CHECK 9")
 
     # ---- the frozen lists are load-bearing: a stale entry fails ------------------------------
     for name, table, key, value in (

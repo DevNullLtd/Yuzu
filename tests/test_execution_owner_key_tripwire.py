@@ -62,6 +62,14 @@ CHECK 8 (gates). In `AuthRoutes::require_fleet_read` and `AuthRoutes::require_li
   `InvariantViolated` straight after its refusal, and the `require_list_read` wrapper refuses an admit
   that carries no session, un-admits the gate and drops its scope.
 
+CHECK 9 (the MCP stream bridge is a projected bus consumer, #7817). `McpStreamBridge::make_listener`
+  in mcp_stream_bridge.cpp calls `classify_execution_event_for_scope(ev, rec->fleet_read_scope)` and
+  `sanitize_execution_event_for_scope(` appears exactly twice in that file (the listener's terminal and
+  the pressure visitor's buffered terminal), each name exactly where expected; the production
+  `bridge->reserve(` in mcp_server.cpp passes a sixth argument, `std::move(bridge_fleet_scope)`, whose
+  local is initialised from `deny_all()` (an unresolved scope is the MOST confined, never nullopt).
+  The docs/executions-history-ladder.md rule that a NEW bus consumer needs its own tripwire is met here.
+
 Every frozen entry must still match something (a stale entry fails), so the lists cannot rot.
 
 LIMITS, stated plainly. A `.owner` reached through a pointer-to-member, a structured binding or a
@@ -100,6 +108,8 @@ MUTATION_CPP = _SRC + "execution_mutation.cpp"
 GATES_CPP = _SRC + "authz_gates.cpp"
 AUTH_ROUTES_CPP = _SRC + "auth_routes.cpp"
 SERVER_CPP = _SRC + "server.cpp"
+BRIDGE_CPP = _SRC + "mcp_stream_bridge.cpp"
+MCP_SERVER_CPP = _SRC + "mcp_server.cpp"
 
 _SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
 
@@ -1267,6 +1277,76 @@ def check_gates(files: dict[str, str]) -> list[str]:
     return errs
 
 
+# --- CHECK 9 ------------------------------------------------------------------------------------
+
+_CLASSIFY = "classify_execution_event_for_scope"
+_SANITIZE = "sanitize_execution_event_for_scope"
+
+
+def _call_idxs(masked: str, name: str) -> list[int]:
+    return [m.start() for m in re.finditer(r"(?<![\w:])" + name + r"\s*\(", masked)]
+
+
+def check_bridge_projection(files: dict[str, str]) -> list[str]:
+    errs: list[str] = []
+    if BRIDGE_CPP not in files:
+        return [f"CHECK 9: {BRIDGE_CPP} not found"]
+    sc = scan(files[BRIDGE_CPP])
+    classify = _call_idxs(sc.masked, _CLASSIFY)
+    sanitize = _call_idxs(sc.masked, _SANITIZE)
+    if len(classify) != 1:
+        errs.append(f"CHECK 9: {BRIDGE_CPP} must call {_CLASSIFY}( exactly once (the listener), "
+                    f"found {len(classify)}")
+    if len(sanitize) != 2:
+        errs.append(f"CHECK 9: {BRIDGE_CPP} must call {_SANITIZE}( exactly twice (the listener's "
+                    f"terminal and the pressure visitor's buffered terminal), found {len(sanitize)}")
+
+    # The classifier call sits inside McpStreamBridge::make_listener and takes the record's scope.
+    defs = [m.end() for m in re.finditer(r"McpStreamBridge::make_listener\s*\(", sc.masked)]
+    if len(defs) != 1:
+        errs.append(f"CHECK 9: McpStreamBridge::make_listener must be defined exactly once in "
+                    f"{BRIDGE_CPP}, found {len(defs)}")
+    else:
+        close_paren = _balanced(sc.masked, defs[0] - 1)
+        body_open = sc.masked.find("{", close_paren)
+        body_close = _balanced(sc.masked, body_open, "{", "}") if body_open >= 0 else len(sc.masked)
+        if not any(body_open < i < body_close for i in classify):
+            errs.append(f"CHECK 9: the {_CLASSIFY}( call in {BRIDGE_CPP} must be inside "
+                        f"McpStreamBridge::make_listener")
+        for i in classify:
+            open_idx = sc.masked.index("(", i)
+            args = _split_args(sc.masked, sc.code, open_idx, _balanced(sc.masked, open_idx))
+            if args != ["ev", "rec->fleet_read_scope"]:
+                errs.append(f"CHECK 9: {_CLASSIFY}( in {BRIDGE_CPP} must be called with "
+                            f"(ev, rec->fleet_read_scope), found ({', '.join(args)})")
+        # A kDrop verdict must return before anything is latched.
+        lis = sc.masked[body_open:body_close]
+        m = re.search(r"case\s+ExecutionEventVerdict::kDrop\s*:\s*return\s*;", lis)
+        if not m:
+            errs.append(f"CHECK 9: the listener's {_CLASSIFY} switch must `return` on kDrop")
+
+    # The production reserve() call hands the dispatcher's scope to the record.
+    if MCP_SERVER_CPP not in files:
+        return errs + [f"CHECK 9: {MCP_SERVER_CPP} not found"]
+    ms = scan(files[MCP_SERVER_CPP])
+    reserves = [m.end() - 1 for m in re.finditer(r"\bbridge->reserve\s*\(", ms.masked)]
+    if len(reserves) != 1:
+        errs.append(f"CHECK 9: {MCP_SERVER_CPP} must call bridge->reserve( exactly once, "
+                    f"found {len(reserves)}")
+    for o in reserves:
+        args = _split_args(ms.masked, ms.code, o, _balanced(ms.masked, o))
+        if len(args) != 6 or args[5] != "std::move(bridge_fleet_scope)":
+            errs.append(f"CHECK 9: bridge->reserve( in {MCP_SERVER_CPP} must pass the dispatcher's "
+                        f"scope as its sixth argument, `std::move(bridge_fleet_scope)`; found "
+                        f"{len(args)} argument(s)")
+    decls = re.findall(r"yuzu::server::authz::VisibleSet\s+bridge_fleet_scope\s*=\s*"
+                       r"yuzu::server::authz::deny_all\s*\(\s*\)\s*;", ms.masked)
+    if len(decls) != 1:
+        errs.append(f"CHECK 9: bridge_fleet_scope in {MCP_SERVER_CPP} must be declared exactly once, "
+                    f"initialised from deny_all() (fail closed), found {len(decls)}")
+    return errs
+
+
 # --- driver -------------------------------------------------------------------------------------
 
 CHECKS = (
@@ -1278,6 +1358,7 @@ CHECKS = (
     ("CHECK 6 raw-username guards", check_guards),
     ("CHECK 7 owner key type", check_owner_key_type),
     ("CHECK 8 gates", check_gates),
+    ("CHECK 9 bridge projection", check_bridge_projection),
 )
 
 
