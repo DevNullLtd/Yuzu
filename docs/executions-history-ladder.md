@@ -698,7 +698,7 @@ sites, the normalised scope store in `reserve()`, the handler's derivation
 arms, and the frozen set of files that hold the bridge).
 **A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
 
-**Limit (b): withheld-event counts are inferable.** Bus ids are per-execution counters (one per event, for all agents) sent raw, so a confined subscriber can infer how many events were withheld from gaps in the ids, the sanitized terminal frame's id and the replay-gap `missing_to`; no content or attribution leaks. A dense per-connection id would break `Last-Event-ID` resume; an opaque resumable cursor is tracked as a follow-up.
+**Limit (b): withheld-event counts are inferable.** Bus ids are per-execution counters (one per event, for all agents) sent raw, so a confined subscriber can infer how many events were withheld from gaps in the ids, the sanitized terminal frame's id and the replay-gap `missing_to`; no content or attribution leaks. A dense per-connection id would break `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
 
 **Bridge as a projected consumer (#7817).** `McpStreamBridge` relays `execution-progress` counts and the terminal event to the session that armed it, and it applies the same projection as the REST and dashboard consumers: its listener calls `classify_execution_event_for_scope` against the DISPATCHING session's fleet-read scope. `execute_instruction` derives that scope from the `Execution:Read` gate (`fleet_read_fn_`, the gate `get_execution_status` uses), hands it to `McpStreamBridge::reserve`, and the record keeps whether it was confined, immutable, like the listener it feeds. One bus and one taxonomy: no bridge-specific event type or format was added. The cases:
 
