@@ -69,6 +69,8 @@ ChangesReader fake_reader(std::vector<SoftwareChangeRow> all) {
 } // namespace
 
 TEST_CASE("changes params: defaults, settle bound, validation", "[software][changes]") {
+    // The documented settle window (rest-api.md, inventory.md, ADR-0016) is 60 seconds.
+    STATIC_REQUIRE(kSettleSecs == 60);
     auto r = parse_changes_params(params({}), 10000);
     REQUIRE(r);
     CHECK(r->query.stable_before == 10000 - kSettleSecs);
@@ -238,6 +240,38 @@ TEST_CASE("changes paging: caller confinement reaches the reader", "[software][c
     REQUIRE(page);
     CHECK(page->target_denied);
     CHECK(page->rows.empty());
+}
+
+TEST_CASE("changes paging: a named device outside a wide scope gets one empty page, unread",
+          "[software][changes]") {
+    std::unordered_set<std::string> ids; // one more than the push-down bound
+    for (std::size_t i = 0; i <= swc::kScopePushdownMaxIds; ++i)
+        ids.insert("in" + std::to_string(i));
+    const VisibleSet scope = ids;
+    int reads = 0;
+    const auto inner =
+        fake_reader({change(1, 100, "in0"), change(2, 200, "out"), change(3, 300, "out")});
+    const ChangesReader counting = [&](const ChangesQuery& q) {
+        ++reads;
+        return inner(q);
+    };
+    // A device with settled rows, one with none and an unknown id answer identically, unread.
+    for (const char* named : {"out", "out-no-rows", "no-such-device"}) {
+        INFO(named);
+        auto rq = parse_changes_params(params({{"agent_id", named}}), 10000);
+        REQUIRE(rq);
+        const auto page = read_changes_page(counting, *rq, scope);
+        REQUIRE(page);
+        CHECK(page->rows.empty());
+        CHECK(page->devices_omitted == 0);
+        CHECK(page->next_cursor.empty());
+        CHECK(page->target_denied);
+    }
+    CHECK(reads == 0);
+    auto in = parse_changes_params(params({{"agent_id", "in0"}}), 10000);
+    REQUIRE(in);
+    CHECK(read_changes_page(counting, *in, scope)->rows.size() == 1); // inside the scope: read
+    CHECK(reads == 1);
 }
 
 TEST_CASE("changes JSON shape", "[software][changes]") {
