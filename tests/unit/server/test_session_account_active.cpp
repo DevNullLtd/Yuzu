@@ -932,10 +932,12 @@ TEST_CASE("reactivation of an ENROLLED account: a bound MFA proof does not survi
     CHECK(after->factor_gen != bound_gen);
     CHECK(a.read_durable_mfa_proof(old_token, "alice").source ==
           yuzu::server::auth::DurableMfaProof::Source::kAbsent);
+    check_stays_refused(a, old_token); // the reactivating replica itself
     check_stays_refused(b, old_token);
     check_stays_refused(cold, old_token);
 
-    // A sign-in after the reactivation inherits no proof.
+    // A sign-in after the reactivation inherits no proof (a proof-less mint stays proof-less;
+    // the surviving-row case is the assertions above).
     const auto fresh = a.create_local_session_for_test("alice", Role::user, false);
     REQUIRE_FALSE(fresh.empty());
     const auto fresh_seen = b.validate_session(fresh);
