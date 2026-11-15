@@ -22,6 +22,7 @@ enum class PairMode {
     CurrentStraggler,  // the live epoch, a sequence not above the mark, clock fresh
     CurrentRebase,     // a stale clock re-based by this event (first delivery only)
     RefusedRegression, // a lower epoch while the clock is fresh
+    ImplausibleHeld,   // UP-9: a pair the ingest boundary withheld as implausible; ALWAYS held
 };
 
 /// The label the order step's SQL returns for a mode, and the label a log line uses.
@@ -41,13 +42,16 @@ enum class PairMode {
         return "current_rebase";
     case PairMode::RefusedRegression:
         return "refused_regression";
+    case PairMode::ImplausibleHeld:
+        return "implausible_held";
     }
     return "";
 }
 
-/// Parse the text the step's SQL returned. `nullopt` for anything outside the closed set (an
-/// empty string, a differently cased label, a label from a later version): the caller fails the
-/// step, it never substitutes a mode.
+/// Parse the text the step's SQL returned. `nullopt` for anything outside the SQL's closed set (an
+/// empty string, a differently cased label, a label from a later version, and `implausible_held`
+/// itself: that mode is set by the store from the ingest boundary's flag and the SQL never returns
+/// it): the caller fails the step, it never substitutes a mode.
 [[nodiscard]] constexpr std::optional<PairMode> parse_pair_mode(std::string_view s) noexcept {
     for (const PairMode m :
          {PairMode::Unpaired, PairMode::UnpairedHeld, PairMode::RefusedRetired, PairMode::Current,

@@ -2,6 +2,7 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 #include "guardian_generation_raise.hpp" // kMaxPolicyGenerationTarget
+#include "guardian_ingest.hpp"           // detail::kPairValueLimit, the one pair-range constant
 #include "guardian_pair_mode.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
@@ -1618,8 +1619,10 @@ bool census_bearing(const GuaranteedStateEventRow& row) {
 // The emit-order pair (schema v5) as the store writes it: both set and each in [1, 2^62), else
 // unpaired (0/0 here; NULL/NULL in the columns). Re-validated at every write and on every read
 // back from the events table, so a direct caller or a damaged row can never store or project a
-// half pair. The ingest boundary applies the same bounds (`pair_from_wire`); this is the store's
-// own copy of the rule, not a second source of it.
+// half pair. The range is the ingest boundary's (`detail::kPairValueLimit`, one constant shared
+// with `pair_from_wire`). The store does NOT apply the plausibility bound (`kEmitSeqCeiling`,
+// `kEpochSkewSeconds`): that bound needs the receipt time, a Repair has none, and a pair already
+// stored was judged once at its first delivery; a direct caller can still store any pair in range.
 struct CensusPair {
     std::int64_t boot_epoch{0};
     std::int64_t emit_seq{0};
@@ -1627,7 +1630,7 @@ struct CensusPair {
 
 CensusPair census_pair(std::optional<std::int64_t> boot_epoch,
                        std::optional<std::int64_t> emit_seq) noexcept {
-    constexpr std::int64_t kPairLimit = std::int64_t{1} << 62;
+    constexpr auto kPairLimit = static_cast<std::int64_t>(detail::kPairValueLimit);
     if (boot_epoch && emit_seq && *boot_epoch >= 1 && *boot_epoch < kPairLimit && *emit_seq >= 1 &&
         *emit_seq < kPairLimit)
         return {*boot_epoch, *emit_seq};
@@ -1657,6 +1660,8 @@ enum class CensusOutcome {
     RefusedFlagged, // a row was touched but the event did not become the verdict (flag raised)
     RefusedNoop,    // zero rows: the event is dominated and nothing changed
     PendingRetired, // repair only: the event's pending evidence was retired concurrently
+    Held,           // first delivery: the order step decided `implausible_held`; the event is
+                    // stored with pending evidence and the census is not touched
     Rejected,       // the rule is gone (the census foreign key, 23503); definitive, not a fault
     Failed,         // any other statement error; savepoint rolled back and released; the event is
                     // left with pending evidence (a first delivery records it now, a repair has
@@ -1674,6 +1679,8 @@ const char* census_outcome_label(CensusOutcome o) {
         return "refused_noop";
     case CensusOutcome::PendingRetired:
         return "pending_retired";
+    case CensusOutcome::Held:
+        return "held";
     case CensusOutcome::Rejected:
         return "rejected";
     case CensusOutcome::Failed:
@@ -2600,12 +2607,18 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
         // failed census write still leaves the agent's pair clock having seen the event. A failed
         // step (rolled back to its own savepoint) stores the event pending, exactly as a failed
         // census write does, and the census write is skipped: it has no decided mode to follow.
-        const AgentStepResult step =
+        AgentStepResult step =
             agent_step_enabled_.load(std::memory_order_relaxed)
                 ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair,
                                    agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
                 : AgentStepResult{AgentStepOutcome::Decided,
                                   default_pair_decision(wire_pair.boot_epoch != 0)};
+        // UP-9: a pair the ingest boundary withheld as implausible is ALWAYS held, whatever the
+        // clock says (and with the step seam off as well: the hold needs no clock). The step ran
+        // as for an unpaired event (the pair is unset), so the agent's clock and counters saw it
+        // as one; only the mode is overridden here, because the step's SQL cannot know the flag.
+        if (step.outcome == AgentStepOutcome::Decided && row.pair_implausible)
+            step.decision.mode = PairMode::ImplausibleHeld;
         // An abandoned step is counted as the census write's own Abandoned outcome is: it aborts
         // the transaction and is also an ingest error.
         if (step.outcome == AgentStepOutcome::Abandoned) {
@@ -2630,6 +2643,26 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
             }
             census_proj_failures_.fetch_add(1, std::memory_order_relaxed);
             count_projection(metrics_, ProjectionSource::FirstDelivery, CensusOutcome::Failed);
+        } else if (step.decision.mode == PairMode::ImplausibleHeld) {
+            // Held: stored with pending evidence, no census write. The event is not a failure, so
+            // `census_proj_failures_` does not move; a Repair (a redelivery) reads the stored
+            // unpaired event and judges it as one.
+            pg::PgResult mark =
+                pg::exec_params(conn, kCensusMarkPending, std::vector<std::string>{row.event_id});
+            if (mark.status() != PGRES_COMMAND_OK) {
+                count_projection(metrics_, ProjectionSource::FirstDelivery,
+                                 CensusOutcome::Abandoned);
+                spdlog::error("GuaranteedStateStore: could not record the pending evidence of a "
+                              "held event, the event is not stored event_id={} agent_id={} "
+                              "rule_id={}: {}",
+                              log_id_token(row.event_id), log_id_token(row.agent_id),
+                              log_id_token(row.rule_id),
+                              ::yuzu::log_key_token(PQresultErrorMessage(mark.get())));
+                return op_error(std::string("held event pending evidence failed: ") +
+                                    PQerrorMessage(conn),
+                                kReasonQueryError);
+            }
+            count_projection(metrics_, ProjectionSource::FirstDelivery, CensusOutcome::Held);
         } else {
             const CensusOutcome projected = project_rule_status(
                 conn, census_proj_failures_, census_lock_barrier_, row,
@@ -2745,12 +2778,14 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
             // The agent step, as in insert_event_classified. The batch has no pending evidence
             // to fall back on, so a failed step (a second missing row included) aborts and rolls
             // back the whole batch and the caller re-issues it.
-            const AgentStepResult step =
+            AgentStepResult step =
                 agent_step_enabled_.load(std::memory_order_relaxed)
                     ? agent_order_step(conn, agent_step_gap_hook_, row, wire_pair,
                                        agent_step_lock_timeout_ms_.load(std::memory_order_relaxed))
                     : AgentStepResult{AgentStepOutcome::Decided,
                                       default_pair_decision(wire_pair.boot_epoch != 0)};
+            if (step.outcome == AgentStepOutcome::Decided && row.pair_implausible)
+                step.decision.mode = PairMode::ImplausibleHeld;
             if (step.outcome == AgentStepOutcome::Abandoned) {
                 count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Abandoned);
                 return std::unexpected(std::string("agent order savepoint failed: ") +
@@ -2761,6 +2796,17 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                 count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Failed);
                 return std::unexpected("agent order step failed for event_id '" + row.event_id +
                                        "'; batch rolled back");
+            }
+            // The batch has no pending evidence to hold an event with, so it cannot honour a hold:
+            // an implausible pair aborts and rolls back the whole batch, like any other
+            // projection it cannot complete (the caller re-issues the batch without the event).
+            // The mode is plumbing for the batch otherwise: it does not sort its rows, and the
+            // census statements do not read the mode yet.
+            if (step.decision.mode == PairMode::ImplausibleHeld) {
+                count_projection(metrics_, ProjectionSource::Batch, CensusOutcome::Held);
+                return std::unexpected("event_id '" + row.event_id +
+                                       "' carries an implausible emit-order pair, which a batch "
+                                       "cannot hold; batch rolled back");
             }
             const CensusOutcome projected = project_rule_status(
                 conn, census_proj_failures_, census_lock_barrier_, row,

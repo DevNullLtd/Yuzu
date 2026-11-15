@@ -4383,26 +4383,31 @@ public:
             "outcome and is not counted; a failure to retire the evidence of "
             "such an event is an ingest error.",
             "counter");
-        metrics_.describe("yuzu_server_guardian_census_projection_total",
-                          "Compliance-census projections by source (first_delivery, repair, "
-                          "batch) and outcome (applied, refused_flagged, refused_noop, "
-                          "pending_retired, rejected, failed, abandoned). A refused outcome means "
-                          "the event was dominated by the stored verdict; refused_flagged also "
-                          "marks the pair order_uncertain. pending_retired is a repair that found "
-                          "its evidence already retired; rejected is a write refused because the "
-                          "rule is gone (not a fault); failed is a fault that leaves pending "
-                          "evidence, except for source batch, whose failure rolls back the whole batch "
-                          "(this count is not rolled back; see "
-                          "..._census_proj_failures_total); a failed per-agent emit-order step is "
-                          "also counted failed (on a first delivery the census write is then "
-                          "skipped); abandoned aborted the "
-                          "transaction (counted again as an ingest error); it includes a failed "
-                          "control statement of the emit-order step's savepoint and, on a first "
-                          "delivery, a failed write of the pending evidence after a failed order "
-                          "step. Counted when the "
-                          "projection returns, before the transaction commits. Resets on server "
-                          "restart.",
-                          "counter");
+        metrics_.describe(
+            "yuzu_server_guardian_census_projection_total",
+            "Compliance-census projections by source (first_delivery, repair, "
+            "batch) and outcome (applied, refused_flagged, refused_noop, "
+            "pending_retired, held, rejected, failed, abandoned). A refused outcome "
+            "means "
+            "the event was dominated by the stored verdict; refused_flagged also "
+            "marks the pair order_uncertain. pending_retired is a repair that found "
+            "its evidence already retired; held is a first delivery whose emit-order "
+            "pair was implausible: it is stored with pending evidence and the "
+            "census is not touched (a batch aborts instead); rejected is a write "
+            "refused because the "
+            "rule is gone (not a fault); failed is a fault that leaves pending "
+            "evidence, except for source batch, whose failure rolls back the whole batch "
+            "(this count is not rolled back; see "
+            "..._census_proj_failures_total); a failed per-agent emit-order step is "
+            "also counted failed (on a first delivery the census write is then "
+            "skipped); abandoned aborted the "
+            "transaction (counted again as an ingest error); it includes a failed "
+            "control statement of the emit-order step's savepoint and, on a first "
+            "delivery, a failed write of the pending evidence after a failed order "
+            "step. Counted when the "
+            "projection returns, before the transaction commits. Resets on server "
+            "restart.",
+            "counter");
         metrics_.describe(detail::kGuardianEventsRejectedMetric,
                           "Guardian events refused at the ingest boundary before reaching the "
                           "store, by reason. empty_rule_id: the event carried no rule id, so it "
@@ -4410,23 +4415,30 @@ public:
                           "server restart.",
                           "counter");
         for (const char* source : {"first_delivery", "repair", "batch"})
-            for (const char* outcome : {"applied", "refused_flagged", "refused_noop",
-                                        "pending_retired", "rejected", "failed", "abandoned"})
+            for (const char* outcome :
+                 {"applied", "refused_flagged", "refused_noop", "pending_retired", "held",
+                  "rejected", "failed", "abandoned"})
                 metrics_.counter("yuzu_server_guardian_census_projection_total",
                                  {{"source", source}, {"outcome", outcome}});
         metrics_.counter(detail::kGuardianEventsRejectedMetric, {{"reason", "empty_rule_id"}});
         metrics_.describe(detail::kGuardianPairRejectedMetric,
                           "Guardian events whose emit-order pair (boot_epoch, emit_seq) was "
                           "withheld at ingest, by reason. half_set: exactly one of the two was "
-                          "set. out_of_range: a set pair had a value of 2^62 or more. The event "
-                          "is still stored, unpaired, and its verdict decision is unaffected (the "
-                          "census row's stored pair becomes NULL when that unpaired verdict is applied); "
-                          "this is not a refusal. "
+                          "set. out_of_range: a set pair had a value of 2^62 or more. "
+                          "implausible: a set pair in range whose emit_seq was 2^40 or more or "
+                          "whose boot_epoch was more than ten years past the receipt time. The "
+                          "event is still stored, unpaired; it is not a refusal. A half_set or "
+                          "out_of_range event is judged as an unpaired one; an implausible event "
+                          "is held: stored with pending census evidence and never applied to the "
+                          "census at first delivery (the census row's stored pair becomes NULL "
+                          "only when an unpaired verdict is applied). "
                           "Counted once per withheld pair: a redelivery of the same event does "
                           "not count again. Resets on server restart.",
                           "counter");
         for (const char* reason : detail::kGuardianPairRejectReasons)
             metrics_.counter(detail::kGuardianPairRejectedMetric, {{"reason", reason}});
+        metrics_.counter(detail::kGuardianPairRejectedMetric,
+                         {{"reason", detail::kGuardianPairRejectImplausible}});
         metrics_.describe("yuzu_server_guardian_census_pending_events",
                           "Guardian events stored with pending census evidence: their census "
                           "write, or the per-agent emit-order step before it, failed and no "

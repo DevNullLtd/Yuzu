@@ -1,5 +1,6 @@
 #include "guardian_ingest.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -273,23 +274,36 @@ std::optional<std::int64_t> agent_stamp_ns(bool has_timestamp, std::int64_t seco
 
 WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq) noexcept {
     // Exclusive upper bound: below 2^62 the BIGINT sign bit is unreachable.
-    constexpr std::uint64_t kPairLimit = std::uint64_t{1} << 62;
     if (boot_epoch == 0 && emit_seq == 0)
         return {};
     if (boot_epoch == 0 || emit_seq == 0)
         return {.reject = PairReject::HalfSet};
-    if (boot_epoch >= kPairLimit || emit_seq >= kPairLimit)
+    if (boot_epoch >= kPairValueLimit || emit_seq >= kPairValueLimit)
         return {.reject = PairReject::OutOfRange};
     return {.paired = true,
             .boot_epoch = static_cast<std::int64_t>(boot_epoch),
             .emit_seq = static_cast<std::int64_t>(emit_seq)};
 }
 
-std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,
-                                          std::uint64_t emit_seq) {
+WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq,
+                        std::int64_t receipt_unix_s) noexcept {
+    const WirePair structural = pair_from_wire(boot_epoch, emit_seq);
+    if (!structural.paired)
+        return structural;
+    // Both halves are below 2^62 here, so the signed comparisons are exact. A receipt before 1970
+    // (a broken server clock) leaves the epoch bound at its own skew, never below it.
+    const std::int64_t epoch_ceiling =
+        std::max<std::int64_t>(receipt_unix_s, 0) + kEpochSkewSeconds;
+    if (emit_seq >= kEmitSeqCeiling || structural.boot_epoch > epoch_ceiling)
+        return {.reject = PairReject::Implausible};
+    return structural;
+}
+
+namespace {
+std::optional<PairReject> apply_validated_pair(GuaranteedStateEventRow& row, const WirePair& wire) {
     row.boot_epoch.reset();
     row.emit_seq.reset();
-    const WirePair wire = pair_from_wire(boot_epoch, emit_seq);
+    row.pair_implausible = wire.reject == PairReject::Implausible;
     if (wire.paired) {
         row.boot_epoch = wire.boot_epoch;
         row.emit_seq = wire.emit_seq;
@@ -298,6 +312,17 @@ std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uin
     if (wire.reject == PairReject::None)
         return std::nullopt; // 0/0: an unpaired sender, not a rejection
     return wire.reject;
+}
+} // namespace
+
+std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,
+                                          std::uint64_t emit_seq) {
+    return apply_validated_pair(row, pair_from_wire(boot_epoch, emit_seq));
+}
+
+std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row, std::uint64_t boot_epoch,
+                                          std::uint64_t emit_seq, std::int64_t receipt_unix_s) {
+    return apply_validated_pair(row, pair_from_wire(boot_epoch, emit_seq, receipt_unix_s));
 }
 
 void report_pair_reject(PairReject reject, const GuaranteedStateEventRow& row,
@@ -388,7 +413,7 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
         // Applied now, reported only after the store accepts the event (below): a redelivery of
         // the same event must not count or warn again.
         const std::optional<PairReject> pair_reject =
-            apply_wire_pair(ev_row, ev.boot_epoch(), ev.emit_seq());
+            apply_wire_pair(ev_row, ev.boot_epoch(), ev.emit_seq(), recv_wall_ns / 1'000'000'000);
         // Enrich severity from the rule store (contract decision 4) — the agent
         // isn't pushed severity. Fall back to the event's own value, then
         // "unknown" for an already-deleted rule.
