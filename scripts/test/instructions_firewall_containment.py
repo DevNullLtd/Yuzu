@@ -133,7 +133,8 @@ class Client:
         self.base, self.timeout = base.rstrip("/"), timeout
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookiejar.CookieJar()))
 
-    def login(self, user: str, password: str) -> None:
+    def login(self, user: str, password: str):
+        """Log in and return the `/api/agents` payload that proved the session."""
         body = urllib.parse.urlencode({"username": user, "password": password}).encode()
         req = urllib.request.Request(f"{self.base}/login", data=body,
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
@@ -141,11 +142,13 @@ class Client:
             self.opener.open(req, timeout=self.timeout).close()
             # A rejected login can still answer 200/302 (the login page), so the session is proven by an
             # authenticated read, never by the status of the form POST.
-            self.get_json("/api/agents")
-        except (OSError, ValueError) as e:  # URLError/HTTPError are OSError; a login page is not JSON
+            agents = self.get_json("/api/agents")
+        except (OSError, ValueError, http.client.HTTPException) as e:  # URLError/HTTPError are OSError; a login
+            # page is not JSON; a truncated body is an IncompleteRead
             why = (" (the session is valid but this user cannot read /api/agents: it needs Infrastructure:Read)"
                    if getattr(e, "code", None) == 403 else "")
             raise LoginError(f"login failed: {e}{why}") from e
+        return agents
 
     def get_json(self, path: str):
         with self.opener.open(urllib.request.Request(self.base + path), timeout=self.timeout) as r:
@@ -290,7 +293,9 @@ def release_and_confirm(client: Client, agent_id: str) -> tuple[bool, bool]:
     require an explicit `inactive` answer, re-reading the status a few times (a slow apply can still be
     finishing). Returns (confirmed, proven): `confirmed` is the host reading `inactive`; `proven` is that a
     release command of this run succeeded and undid something (see `release_proven`). A lost poll or a
-    transport error is one lost read, never the end of the release. No `inactive` read is exit 3."""
+    transport error is one lost read, never the end of the release. An `inactive` read ends the attempts only
+    once a release of this run is proven (or the attempts are used up); before that the release is dispatched
+    again, because an apply whose answer was lost can still land. No `inactive` read is exit 3."""
     proven = False
     for attempt in range(RELEASE_ATTEMPTS):
         try:
@@ -301,7 +306,12 @@ def release_and_confirm(client: Client, agent_id: str) -> tuple[bool, bool]:
             time.sleep(2)
             try:
                 if status_token(client, agent_id) == "inactive":
-                    return True, proven
+                    if proven or attempt == RELEASE_ATTEMPTS - 1:
+                        return True, proven
+                    # `inactive` with no release of this run proven: the release was refused (`busy` while an
+                    # apply was still in flight) or its answer was lost, and that apply can still land. Release
+                    # again rather than trust a read taken before it did.
+                    break
             except Exception as e:  # noqa: BLE001
                 say(f"status read failed: {e}", file=sys.stderr)
     return False, proven
@@ -379,7 +389,8 @@ def main(argv=None) -> int:
         return EXIT_PRECONDITION
     if args.apply_containment and args.ttl_seconds < MIN_TTL_S:
         say(f"refused: --ttl-seconds must be at least {MIN_TTL_S}: a shorter limit could end the containment "
-              "before the release confirmation finishes, and none (0 or negative) would leave a SIGKILL or a "
+              "before the first release confirmation finishes (a release that has to be retried can still outlast "
+              "it: the limit is the backstop for that tail), and none (0 or negative) would leave a SIGKILL or a "
               "power loss with nothing to end it", file=sys.stderr)
         return EXIT_PRECONDITION
     if args.apply_containment and not args.agent_id:
@@ -397,9 +408,8 @@ def main(argv=None) -> int:
     base = args.dashboard.rstrip("/")
     client = Client(base)
     try:
-        client.login(args.user, args.password)
+        agents = client.login(args.user, args.password)
         agent_id = args.agent_id
-        agents = client.get_json("/api/agents")
         agents = agents.get("agents", agents) if isinstance(agents, dict) else agents
         if args.apply_containment and not agent_is_this_host(agents, agent_id, this_host_names(), this_host_os()):
             reg = [a.get("hostname") for a in agents or [] if isinstance(a, dict) and a.get("agent_id") == agent_id]

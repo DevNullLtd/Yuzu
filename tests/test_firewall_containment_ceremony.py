@@ -281,7 +281,7 @@ class Flow(unittest.TestCase):
         self.params = {}
         if client is None:
             client = mock.MagicMock()
-            client.get_json.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local", "os": "linux"}]}
+            client.get_json.return_value = client.login.return_value = {"agents": [{"agent_id": "a", "hostname": "Box.local", "os": "linux"}]}
 
         def fake(_client, _agent, action, params):
             calls.append(action)
@@ -417,14 +417,14 @@ class Flow(unittest.TestCase):
         for agents in ([], [{"agent_id": "a"}, {"agent_id": "b"}]):
             with self.subTest(n=len(agents)):
                 client = mock.MagicMock()
-                client.get_json.return_value = {"agents": agents}
+                client.get_json.return_value = client.login.return_value = {"agents": agents}
                 rc, calls = self.run_main({}, apply=False, agent=False, client=client)
                 self.assertEqual(rc, fc.EXIT_PRECONDITION)
                 self.assertEqual(calls, [])
 
     def test_a_lone_registered_agent_is_picked_by_the_probe_only(self):
         client = mock.MagicMock()
-        client.get_json.return_value = {"agents": [{"agent_id": "a"}]}
+        client.get_json.return_value = client.login.return_value = {"agents": [{"agent_id": "a"}]}
         rc, calls = self.run_main({"quarantine_status": [row("inactive")]}, apply=False, agent=False, client=client)
         self.assertEqual(rc, fc.EXIT_OK)
         self.assertEqual(calls, ["quarantine_status"])
@@ -441,7 +441,7 @@ class Flow(unittest.TestCase):
                        [{"agent_id": "a", "hostname": ""}], []):
             with self.subTest(agents=agents):
                 client = mock.MagicMock()
-                client.get_json.return_value = {"agents": agents}
+                client.get_json.return_value = client.login.return_value = {"agents": agents}
                 rc, calls = self.run_main({}, client=client)
                 self.assertEqual(rc, fc.EXIT_PRECONDITION)
                 self.assertEqual(calls, [])
@@ -478,12 +478,15 @@ class Flow(unittest.TestCase):
 
     def test_a_refused_release_followed_by_inactive_is_not_a_pass(self):
         # the apply is still in flight, the release is refused `busy`, yet a later status read says inactive
-        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                                   "quarantine": [{}], "release": [BUSY]})
+        # An unproven `inactive` is not trusted: the release is dispatched again (the apply can still land),
+        # and the run ends 'release unproven' only once the attempts are used up.
+        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("inactive")] * fc.RELEASE_ATTEMPTS,
+                                   "quarantine": [{}], "release": [BUSY] * fc.RELEASE_ATTEMPTS})
         self.assertEqual(rc, fc.EXIT_FAIL)
-        self.assertEqual(calls[-2:], ["release", "quarantine_status"])
-        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * fc.RELEASE_READS,
-                               "quarantine": [{}], "release": [BUSY]})
+        self.assertEqual(calls.count("release"), fc.RELEASE_ATTEMPTS)
+        self.assertEqual(calls[-1], "quarantine_status")
+        rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("active")] * (fc.RELEASE_READS * fc.RELEASE_ATTEMPTS),
+                               "quarantine": [{}], "release": [BUSY] * fc.RELEASE_ATTEMPTS})
         self.assertEqual(rc, fc.EXIT_RELEASE_FAILED)  # an unconfirmed release is still exit 3
 
     def test_a_containment_this_run_did_not_apply_is_never_released(self):
@@ -545,9 +548,9 @@ class Flow(unittest.TestCase):
                                                      "output": "status|inactive\nnote|no_state_record=1"}]})):
             err = io.StringIO()
             with contextlib.redirect_stderr(err):
-                rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("inactive"), row("inactive")],
+                rc, _ = self.run_main({"quarantine_status": [row("inactive")] * (2 + fc.RELEASE_ATTEMPTS),
                                        "quarantine": [lambda _c, a=answer: signal.raise_signal(signal.SIGTERM) or a],
-                                       "release": [release]})
+                                       "release": [release] * fc.RELEASE_ATTEMPTS})
             self.assertEqual(rc, fc.EXIT_FAIL)
             self.assertIn(f"interrupted by signal {int(signal.SIGTERM)}", err.getvalue())
 
@@ -555,9 +558,35 @@ class Flow(unittest.TestCase):
         for note in ("no_state_record=1", "state_unreadable=1"):
             with self.subTest(note=note):
                 noop = {"responses": [{"agent_id": "a", "status": 1, "output": f"status|inactive\nnote|{note}"}]}
-                rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
-                                       "quarantine": [{}], "release": [noop]})
+                rc, _ = self.run_main({"quarantine_status": [row("inactive"), row("active")] + [row("inactive")] * fc.RELEASE_ATTEMPTS,
+                                       "quarantine": [{}], "release": [noop] * fc.RELEASE_ATTEMPTS})
                 self.assertEqual(rc, fc.EXIT_FAIL)  # the time limit (or someone else) released it, not this run
+
+    def test_an_apply_that_lands_after_a_refused_release_is_released_by_the_retry(self):
+        # apply answer lost; release #1 refused `busy` and the host still reads inactive; the apply then
+        # lands, so release #2 undoes it: the run passes only because the retry ran
+        rc, calls = self.run_main({"quarantine_status": [row("inactive"), row("inactive"), row("inactive"),
+                                                         row("inactive")],
+                                   "quarantine": [{}], "release": [BUSY, REL]})
+        self.assertEqual(rc, fc.EXIT_FAIL)  # ok is False (never read active), but the second release ran
+        self.assertEqual(calls.count("release"), 2)
+
+    def test_a_truncated_agents_payload_at_login_is_exit_2(self):
+        client = mock.MagicMock()
+        client.login.side_effect = fc.LoginError("login failed: IncompleteRead")
+        rc, _ = self.run_main({}, client=client)
+        self.assertEqual(rc, fc.EXIT_PRECONDITION)
+        c = fc.Client("http://127.0.0.1:9")
+        with mock.patch.object(c.opener, "open", return_value=mock.MagicMock()), \
+                mock.patch.object(c, "get_json", side_effect=fc.http.client.IncompleteRead(b"x")):
+            with self.assertRaises(fc.LoginError):
+                c.login("a", "b")
+
+    def test_the_short_limit_text_says_the_limit_is_the_backstop_for_the_retry_tail(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.run_main({}, extra=["--ttl-seconds", "60"])
+        self.assertIn("backstop", err.getvalue())
 
     def test_a_proven_release_stays_proven_across_a_later_refused_attempt(self):
         # attempt 1 worked but the host still read active; attempt 2 was refused (nothing left to release);
@@ -590,7 +619,7 @@ class Flow(unittest.TestCase):
 
     def test_the_binding_gets_this_machines_os_and_names(self):
         client = mock.MagicMock()
-        client.get_json.return_value = {"agents": [{"agent_id": "a", "hostname": "box", "os": "linux"}]}
+        client.get_json.return_value = client.login.return_value = {"agents": [{"agent_id": "a", "hostname": "box", "os": "linux"}]}
         with mock.patch.object(fc, "agent_is_this_host", wraps=fc.agent_is_this_host) as bound:
             self.run_main({"quarantine_status": [row("inactive"), row("active"), row("inactive")],
                            "quarantine": [{}], "release": [REL]}, client=client)
