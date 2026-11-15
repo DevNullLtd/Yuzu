@@ -1049,6 +1049,27 @@ TEST_CASE("guardian ingest: a rejected pair does not refuse the event (UP-14 D5)
     ingest("p-implausible", 7, yuzu::server::detail::kEmitSeqCeiling);
     CHECK(pair_rejected_count(metrics, "implausible") == 1);
     CHECK(pending() == "0");
+
+    // The epoch half of the bound, through the ingest boundary, in the receipt's own UNITS: the
+    // boundary hands `pair_from_wire` its receipt in whole Unix seconds (not the nanoseconds it
+    // captures), so an epoch past receipt + ten years is dropped and one just inside it is kept.
+    // An hour of margin each side covers the seconds between this clock read and the ingest's own.
+    const auto now_s =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count());
+    const auto skew = static_cast<std::uint64_t>(yuzu::server::detail::kEpochSkewSeconds);
+    ingest("p-epoch-future", now_s + skew + 3600, 5);
+    CHECK(pair_rejected_count(metrics, "implausible") == 2);
+    CHECK(event_pair("p-epoch-future") == "-/-");
+    CHECK(pending() == "0");
+    ingest("p-epoch-future", now_s + skew + 3600, 5); // a redelivery does not count again
+    CHECK(pair_rejected_count(metrics, "implausible") == 2);
+    // Just inside the bound: an accepted pair, stored as sent.
+    ingest("p-epoch-edge", now_s + skew - 3600, 5);
+    CHECK(pair_rejected_count(metrics, "implausible") == 2);
+    CHECK(event_pair("p-epoch-edge") == std::to_string(now_s + skew - 3600) + "/5");
+    CHECK(pending() == "0");
 }
 
 // ── UP-14 PR B B2: the absolute plausibility bound (UP-9) and the closed pair mode ────────────
