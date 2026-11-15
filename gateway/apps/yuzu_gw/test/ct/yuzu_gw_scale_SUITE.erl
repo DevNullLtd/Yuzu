@@ -684,7 +684,6 @@ unacknowledged(Config) ->
             settle => Settle},
     finish(unacknowledged, Config, R).
 
-%% The breaker's transitions so far, read from the gateway's own counter.
 %%%===================================================================
 %%% Idle memory per connection (on demand; not in all/0)
 %%%===================================================================
@@ -738,6 +737,9 @@ idle_memory(Config) ->
                config => (maps:without([transports], Opts))#{
                            transports => Transports, heartbeat_tags => map_size(Tags),
                            heartbeat_encoded_bytes => HbBytes,
+                           %% snapshot_bytes is the size asked for; the
+                           %% generated document is only about that size.
+                           snapshot_actual_bytes => byte_size(Snapshot),
                            register_request_bytes => RegBytes,
                            register_plugins => length(Plugins)},
                runs => Runs},
@@ -753,13 +755,20 @@ idle_memory(Config) ->
                                             [{T, idle_headline(R)} || #{transport := T} = R <- Runs])),
     Unsteady = [{T, N} || #{transport := T, points := Ps} <- Runs,
                           #{n := N, steady := false} <- Ps, N > 0],
-    case [C || #{ok := false} = C <- maps:get(checks, Ceil, [])] of
-        [] when Unsteady =:= [] -> ok;
+    %% A point whose agents lost connections or heartbeats while it was
+    %% measured is not a measurement of the idle workload either.
+    Faulty = [{T, N, F} || #{transport := T, points := Ps} <- Runs,
+                           #{n := N, workload_faults := F} <- Ps, map_size(F) > 0],
+    %% A provisional ceiling is recorded and printed, never gated (see the
+    %% ceiling file).
+    case [C || #{ok := false, provisional := false} = C <- maps:get(checks, Ceil, [])] of
+        [] when Unsteady =:= [], Faulty =:= [] -> ok;
         Over ->
             %% A point that never settled is not a measurement of the steady
             %% state: recorded like a ceiling breach.
-            Msg = lists:flatten(io_lib:format("idle_memory over its ceiling: ~0p; not steady: ~0p",
-                                              [Over, Unsteady])),
+            Msg = lists:flatten(io_lib:format("idle_memory over its ceiling: ~0p; not steady: ~0p; "
+                                              "workload faults while measured: ~0p",
+                                              [Over, Unsteady, Faulty])),
             case mode(Config) of
                 gate -> ct:fail(Msg);
                 report -> {comment, Msg ++ " (report mode: recorded, not failed)"}
@@ -774,21 +783,28 @@ idle_memory(Config) ->
 idle_budget(#{runs := Runs}) ->
     Lim = env_int("YUZU_GW_IDLEMEM_BUDGET_KIB", 64) * 1024,
     [begin
-         #{n := N, per_conn := Pc} = lists:last(Points),
+         #{n := N, per_conn := Pc} = Last = lists:last(Points),
          A = maps:get(all_in, Pc, null),
          #{transport => T, n => N, all_in => A, os_anon => maps:get(os_anon, Pc, null),
            kernel => maps:get(socket_kernel, Pc, null),
+           kernel_sources => maps:get(kernel_sources, Last, #{}),
            kernel_host => maps:get(socket_kernel_host, Pc, null), limit => Lim,
            ok => case A of null -> null; _ -> A =< Lim end}
      end || #{transport := T, points := Points} <- Runs, Points =/= [], lists:last(Points) =/= #{}].
 
 idle_opts() ->
     Hb = env_int("YUZU_GW_SCALE_HB_MS", 30000),
-    #{transports => [list_to_atom(T)
-                     || T <- string:lexemes(env_str("YUZU_GW_IDLEMEM_TRANSPORTS", "tls,plain"), ",")],
+    Every = env_int("YUZU_GW_IDLEMEM_SNAPSHOT_EVERY", 1),
+    Every >= 1 orelse ct:fail("idle_memory: YUZU_GW_IDLEMEM_SNAPSHOT_EVERY must be at least 1 "
+                              "(use YUZU_GW_IDLEMEM_SNAPSHOT_BYTES=0 for no snapshot), got ~b",
+                              [Every]),
+    List = fun(Name, Default) ->
+                   [string:trim(X) || X <- string:lexemes(env_str(Name, Default), ","),
+                                      string:trim(X) =/= ""]
+           end,
+    #{transports => [list_to_atom(T) || T <- List("YUZU_GW_IDLEMEM_TRANSPORTS", "tls,plain")],
       sweep => lists:usort([0 | [list_to_integer(X)
-                                 || X <- string:lexemes(env_str("YUZU_GW_IDLEMEM_SWEEP",
-                                                                "0,1000,5000,10000"), ",")]]),
+                                 || X <- List("YUZU_GW_IDLEMEM_SWEEP", "0,1000,5000,10000")]]),
       hb_ms => Hb,
       rate => env_int("YUZU_GW_IDLEMEM_RATE", 500),
       settle_ms => env_int("YUZU_GW_IDLEMEM_SETTLE_MS", 2 * Hb),
@@ -797,7 +813,7 @@ idle_opts() ->
       window_ms => env_int("YUZU_GW_IDLEMEM_WINDOW_MS", 4 * Hb),
       sample_ms => env_int("YUZU_GW_IDLEMEM_SAMPLE_MS", 5000),
       snapshot_bytes => env_int("YUZU_GW_IDLEMEM_SNAPSHOT_BYTES", 150000),
-      snapshot_every => env_int("YUZU_GW_IDLEMEM_SNAPSHOT_EVERY", 1),
+      snapshot_every => Every,
       tags => env_int("YUZU_GW_IDLEMEM_TAGS", 1) =:= 1,
       roles_k => env_int("YUZU_GW_IDLEMEM_ROLES_K", 20)}.
 
@@ -836,7 +852,7 @@ idle_run(Transport, Opts, Pki, Plugins, Tags, Snapshot, Config) ->
             end,
     Ets = gw_call(C, ?PROBE, top_ets, [15]),
     ok = gw_call(C, ?PROBE, gc_all, []),
-    AfterGc = idle_flat(gw_call(C, ?PROBE, idle_sample, [Ports])),
+    AfterGc = idle_flat(idle_sample(C, Ports)),
     Fleet = load_call(C, counters, []),
     stop_tracked(),
     Base = maps:get(mean, hd(Points)),
@@ -866,6 +882,7 @@ idle_assert_transport(_C, _T) -> ok.
 %% settle, then sample until steady; M(N) is the mean of the last window.
 idle_point(C, Opts, Ports, Prev, N) ->
     T0 = erlang:system_time(millisecond),
+    Faults0 = load_call(C, counters, []),
     Reg = case N - Prev of
               0 -> #{};
               Add ->
@@ -878,6 +895,14 @@ idle_point(C, Opts, Ports, Prev, N) ->
     #{window := Samples, steady := Steady, settled_ms := SettledMs, trace := Trace} =
         idle_steady(C, Ports, Opts),
     Flat = [idle_flat(S) || S <- Samples],
+    Faults1 = load_call(C, counters, []),
+    %% Faults the load generator counted from the start of this point to the
+    %% end of its sampling; any of them means agents were not idle-and-live
+    %% throughout (judged in idle_memory/1 like an unsteady point).
+    Faults = maps:from_list(
+               [{K, D} || K <- [heartbeats_failed, heartbeats_not_found, connections_lost,
+                                subscribe_ended],
+                          D <- [maps:get(K, Faults1, 0) - maps:get(K, Faults0, 0)], D > 0]),
     Registered = gw_call(C, yuzu_gw_registry, agent_count, []),
     #{live := Live} = load_call(C, status, []),
     ct:pal("idle_memory point N=~b: ~b registered at the gateway, ~b live at the load generator",
@@ -890,14 +915,29 @@ idle_point(C, Opts, Ports, Prev, N) ->
                 [N, Registered, Live]),
     #{n => N, registration => Reg, gateway_registered => Registered, loadgen_live => Live,
       steady => Steady, settled_ms => SettledMs, trace => Trace,
-      samples => Flat, mean => mean_map(Flat),
+      samples => Flat, mean => mean_map(Flat), workload_faults => Faults,
+      kernel_sources => kernel_sources(lists:last(Samples)),
       heartbeat_buffer => maps:get(heartbeat_buffer, lists:last(Samples))}.
+
+%% Where a sample's kernel figure came from (idle_flat/1 keeps numbers only,
+%% so these markers would otherwise never reach the JSON): `source' is ss,
+%% netstat or none (with `source_error'), `slab_source' proc, sudo or none.
+kernel_sources(#{sockets := Sk}) ->
+    maps:with([source, source_error, slab_source], Sk).
+
+%% One sample: the gateway node's own memory, read inside it, plus the kernel
+%% socket memory of its agent listeners, read from this node (the same host):
+%% a host-wide read parsed here, so its text never becomes garbage in the
+%% node being measured.
+idle_sample(C, Ports) ->
+    S = gw_call(C, ?PROBE, idle_sample, []),
+    S#{sockets => ?PROBE:socket_memory(Ports)}.
 
 %% Sample every sample_ms until the memory is steady: the mean of the last
 %% window_ms of samples (four heartbeat intervals by default, so whole
 %% collection cycles are averaged) is within steady_tol_pct of the mean of the
-%% window before it, for beam_total
-%% and for os_anon; or until settle_max_ms has passed since the fleet was
+%% window before it, for beam_total,
+%% os_anon and (where there is a kernel figure) all_in; or until settle_max_ms has passed since the fleet was
 %% complete (then steady is false and the last window is reported anyway).
 %% A point is never judged on a window that is still climbing: the
 %% heartbeat path's dead snapshot copies accumulate for several heartbeats
@@ -912,7 +952,7 @@ idle_steady(C, Ports, Opts) ->
     idle_steady(C, Ports, W, Ms, Tol, T0 + max(0, Max - Min), T0, []).
 
 idle_steady(C, Ports, W, Ms, Tol, Deadline, T0, Acc0) ->
-    S = gw_call(C, ?PROBE, idle_sample, [Ports]),
+    S = idle_sample(C, Ports),
     Now = erlang:monotonic_time(millisecond),
     Acc = [{Now - T0, S} | Acc0],
     Done = fun(Steady) ->
@@ -944,7 +984,7 @@ window_steady(Acc, W, Tol) ->
                           {_, P} when P == 0 -> true;
                           {L, P} -> abs(L - P) / P * 100 =< Tol
                       end
-              end, [beam_total, os_anon]).
+              end, [beam_total, os_anon, all_in]).
 
 %% One sample as flat numbers: beam_<category>, process_count, port_count,
 %% os_rss, os_anon (Linux: RssAnon from /proc/self/status, not smaps_rollup's
@@ -1072,7 +1112,7 @@ idle_listener_tls(ktls, Pki) ->
     %% The kTLS agent listener (branch perf/gateway-idle-mem-ktls): the shipped
     %% one-way options with the handshake in OpenSSL and the record layer in
     %% the kernel. A gateway without the option refuses the listener; the case
-    %% also checks the listener's transport (idle_assert_ktls/2).
+    %% also checks the listener's transport (idle_assert_transport/2).
     (idle_listener_tls(tls, Pki))#{ktls => true};
 idle_listener_tls(tls, #{server_cert := C, server_key := K, client_cacerts := Ca}) ->
     #{certfile => C, keyfile => K, cacertfile => Ca,
@@ -1178,19 +1218,24 @@ host_memory() ->
 %% headline numbers at the largest N of the sweep (only for a sweep whose
 %% largest N is at least the entry's min_n). A ceiling may only go down: lower
 %% it in the change that makes the gateway cheaper. A run on an OS or transport
-%% with no entry checks nothing.
+%% with no entry checks nothing. A metric listed in an entry's `provisional'
+%% is checked and printed but never fails the case, even with
+%% YUZU_GW_SCALE_GATE=1.
 idle_ceiling_check(Config, #{runs := Runs}) ->
     File = filename:join(?config(data_dir, Config), "idle_mem_ceiling.eterm"),
+    %% A missing or malformed file is a broken checkout, never "no entry".
     Entries = case file:consult(File) of
-                  {ok, [{ceilings, E}]} -> E;
-                  _ -> []
+                  {ok, [{ceilings, E}]} when is_list(E) -> E;
+                  Other -> ct:fail("idle_memory: cannot read the ceiling file ~s: ~0p",
+                                   [File, Other])
               end,
     {_, OsName} = os:type(),
     Checks = [#{transport => T, metric => Metric, n => N, measured => Measured,
-                ceiling => Ceiling, ok => Measured =< Ceiling}
+                ceiling => Ceiling, ok => Measured =< Ceiling,
+                provisional => lists:member(Metric, maps:get(provisional, Entry, []))}
               || #{transport := T, points := Points} <- Runs,
                  #{n := N, per_conn := PerConn} <- [lists:last(Points)],
-                 {{Os, T1}, #{min_n := MinN, per_conn := Ceilings}} <- Entries,
+                 {{Os, T1}, #{min_n := MinN, per_conn := Ceilings} = Entry} <- Entries,
                  Os =:= OsName, T1 =:= T, N >= MinN,
                  {Metric, Ceiling} <- maps:to_list(Ceilings),
                  Measured <- [maps:get(Metric, PerConn, undefined)],
@@ -1210,7 +1255,8 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
              "every ~b ms) agree within ~b% (at most ~b ms); the last window's mean is reported~n",
              [Run, maps:get(kernel, Host), maps:get(arch, Host), maps:get(otp_version, Host),
               maps:get(schedulers, Host), maps:get(hb_ms, Cfg), maps:get(heartbeat_tags, Cfg),
-              maps:get(snapshot_bytes, Cfg), maps:get(snapshot_every, Cfg),
+              maps:get(snapshot_actual_bytes, Cfg, maps:get(snapshot_bytes, Cfg)),
+              maps:get(snapshot_every, Cfg),
               maps:get(register_request_bytes, Cfg), maps:get(register_plugins, Cfg),
               maps:get(settle_ms, Cfg), maps:get(window_ms, Cfg), maps:get(sample_ms, Cfg),
               maps:get(steady_tol_pct, Cfg), maps:get(settle_max_ms, Cfg)]),
@@ -1244,9 +1290,13 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
                                              #{process_count := Pn} -> integer_to_list(Pn);
                                              _ -> "-"
                                          end,
-                                         KiB(maps:get(socket_kernel, Pc,
-                                                      maps:get(socket_allocated, Pc,
-                                                               maps:get(socket_queued, Pc, undefined)))),
+                                         %% The gateway's kernel figure only when
+                                         %% complete; macOS has queued bytes only.
+                                         KiB(case P of
+                                                 #{kernel_sources := #{source := netstat}} ->
+                                                     maps:get(socket_queued, Pc, undefined);
+                                                 _ -> maps:get(socket_kernel, Pc, undefined)
+                                             end),
                                          KiB(maps:get(socket_kernel_host, Pc, undefined)),
                                          KiB(maps:get(all_in, Pc, undefined))])
                       end || #{n := N, mean := M} = P <- Points]]
@@ -1275,16 +1325,26 @@ idle_summary(#{run := Run, host := Host, config := Cfg, runs := Runs, ceiling :=
     CeilLines = case maps:get(checks, Ceil) of
                     [] -> io_lib:format("ceiling: no entry for ~p in ~s~n",
                                         [maps:get(os, Ceil), maps:get(file, Ceil)]);
-                    Cs -> [io_lib:format("ceiling ~p ~p: ~b B/conn measured, ceiling ~b: ~s~n",
-                                         [T, M, V, C, case Ok of true -> "ok"; false -> "OVER" end])
-                           || #{transport := T, metric := M, measured := V, ceiling := C, ok := Ok} <- Cs]
+                    Cs -> [io_lib:format("ceiling ~p ~p: ~b B/conn measured, ceiling ~b: ~s~s~n",
+                                         [T, M, V, C, case Ok of true -> "ok"; false -> "OVER" end,
+                                          case Prov of true -> " (provisional, not gated)";
+                                                       false -> "" end])
+                           || #{transport := T, metric := M, measured := V, ceiling := C, ok := Ok,
+                                provisional := Prov} <- Cs]
                 end,
     Budget = [io_lib:format("budget ~p N=~b: all-in ~s KiB/agent (anon ~s + kernel ~s) against "
                             "~b KiB: ~s~n",
                             [T, N, KiB(A), KiB(An), KiB(Kn), Lim div 1024,
-                             case Ok of true -> "PASS"; false -> "FAIL"; null -> "no kernel figure" end])
+                             case Ok of
+                                 true -> "PASS";
+                                 false -> "FAIL";
+                                 null -> io_lib:format("no kernel figure (sockets: ~p, slab: ~p)",
+                                                       [maps:get(source, Src, none),
+                                                        maps:get(slab_source, Src, none)])
+                             end])
               || #{transport := T, n := N, all_in := A, os_anon := An, kernel := Kn,
-                   limit := Lim, ok := Ok} <- maps:get(budget, Result, [])],
+                   limit := Lim, ok := Ok} = Bu <- maps:get(budget, Result, []),
+                 Src <- [maps:get(kernel_sources, Bu, #{})]],
     lists:flatten([Head, [Table(R) || R <- Runs], [Roles(R) || R <- Runs], [Gc(R) || R <- Runs],
                    CeilLines, Budget]).
 
@@ -1295,6 +1355,7 @@ env_str(Name, Default) ->
         V -> V
     end.
 
+%% The breaker's transitions so far, read from the gateway's own counter.
 breaker_transitions(Config) ->
     maps:from_list([{S, gw_call(Config, prometheus_counter, value,
                                 [yuzu_gw_upstream_circuit_transitions_total, [atom_to_binary(S)]])}
@@ -1750,8 +1811,8 @@ start_gateway(#{log := Log, fds := Fds, upstream_port := UpPort, n := N,
                 agent_port := AgentPort, agent6_port := Agent6Port, mgmt_port := MgmtPort} = Spec) ->
     %% The production VM flags: config/vm.args.src itself, less the node name
     %% and cookie, read at each start so the gateway measured here cannot run
-    %% with flags the release does not ship (until 2026-10-27 this was a copied
-    %% list that missed the allocator flags added to vm.args.src).
+    %% with flags the release does not ship (until 2026-10-27 this was a
+    %% hand-copied list, which could drift from the file).
     Args = vm_args(),
     {ok, Peer} = ?PEER:start(gateway, #{fds => Fds, log => Log, args => Args}),
     track(gateway, Peer),

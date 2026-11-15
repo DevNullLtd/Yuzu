@@ -103,8 +103,19 @@ def idle_memory(data):
             pc = p.get("per_conn", {})
             lines.append("    N=%-6s %s" % (p["n"], "  ".join("%s %s" % (k, kib(pc.get(m))) for k, m in keys)))
     for c in data.get("ceiling", {}).get("checks", []):
-        lines.append("  ceiling %s %s: %s B measured, ceiling %s: %s"
-                     % (c["transport"], c["metric"], c["measured"], c["ceiling"], "ok" if c["ok"] else "OVER"))
+        lines.append("  ceiling %s %s: %s B measured, ceiling %s: %s%s"
+                     % (c["transport"], c["metric"], c["measured"], c["ceiling"], "ok" if c["ok"] else "OVER",
+                        " (provisional, not gated)" if c.get("provisional") else ""))
+    for b in data.get("budget", []):
+        if b.get("ok") is None:
+            src = b.get("kernel_sources", {})
+            verdict = "no kernel figure (sockets: %s, slab: %s)" % (src.get("source", "none"),
+                                                                    src.get("slab_source", "none"))
+        else:
+            verdict = "PASS" if b["ok"] else "FAIL"
+        lines.append("  budget %s N=%s: all-in %s KiB/agent (anon %s + kernel %s) against %s KiB: %s"
+                     % (b["transport"], b["n"], kib(b.get("all_in")), kib(b.get("os_anon")),
+                        kib(b.get("kernel")), b["limit"] // 1024, verdict))
     return "\n".join(lines)
 
 

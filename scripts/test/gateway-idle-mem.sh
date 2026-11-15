@@ -21,9 +21,10 @@
 #   YUZU_GW_SCALE_GATE=1                      fail on a per-conn ceiling breach
 #
 # The kernel part (socket buffers from ss, slab from /proc/slabinfo) needs
-# /proc/slabinfo readable: as root, or with passwordless `sudo -n cat`.
-# Without it only the socket buffers are counted and the summary's kernel
-# column understates (slab_source = none in the JSON).
+# ss installed and /proc/slabinfo readable: as root, or with passwordless
+# `sudo -n cat`. Without either there is no kernel figure and no all-in: the
+# summary's budget line says "no kernel figure" and names what was missing
+# (each point's kernel_sources in the JSON).
 #
 # A full default run takes about 45 minutes: each point waits for a steady
 # state. Linux is the platform the 8 KiB goal is judged on; macOS numbers are

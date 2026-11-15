@@ -272,12 +272,19 @@ and registered at the gateway (a point where they are not fails the case: the
 harness is broken, the number would mean nothing), waits the minimum settle
 period, then samples every 5 s until the memory is steady: until the mean of
 the last window (four heartbeat intervals) is within 2% of the mean of the
-window before it, for both BEAM total and OS anonymous memory. M(N) is the mean
+window before it, for BEAM total, OS anonymous memory and (when there is a
+kernel figure) `all_in`. M(N) is the mean
 of that last window (trimmed: the lowest and highest tenth of its samples
 dropped, so a one-sample dip of the anonymous memory does not move it). A
 point still moving at the cap (twenty heartbeat
 intervals) is reported as not steady, and fails the case under
-`YUZU_GW_SCALE_GATE=1`.
+`YUZU_GW_SCALE_GATE=1`. So does a point during which the load generator
+counted a failed heartbeat, a `NOT_FOUND` heartbeat, a lost connection or an
+ended `Subscribe` (from the start of the point to the end of its sampling;
+`workload_faults` in the JSON): its agents were not all idle and live while it
+was measured. Heartbeat-buffer drops are recorded (`hb_buffer_bytes` and the
+drop counters) but not judged: with large snapshots at 10,000 agents the
+buffer is expected to fill and evict, a fixed cost.
 
 Why a mean over a long window. Every heartbeat leaves its snapshot's dead
 copies (refc binaries) in the Cowboy connection process and, on TLS, the ssl
@@ -301,8 +308,9 @@ Each simulated agent:
   verifying the gateway and sending SNI; `mtls` is the documented move to
   mutual TLS (`verify_peer`, `fail_if_no_peer_cert false`) with a client
   certificate; `ktls` is `tls` with `ktls => true` (the kernel-TLS agent
-  listener of branch `perf/gateway-idle-mem-ktls`; the case fails unless the
-  listener really runs `yuzu_gw_ktls_transport`); `plain` is plaintext, for
+  listener of branch `perf/gateway-idle-mem-ktls`, not on `dev`; the case
+  fails unless the listener really runs `yuzu_gw_ktls_transport`, so on `dev`
+  a `ktls` run always fails); `plain` is plaintext, for
   comparison. The management listener and the upstream hop stay plaintext;
 - registers with the 69-plugin `RegisterRequest` (about 9 KB encoded, as for
   every case);
@@ -325,9 +333,19 @@ not a constant. The header documents 50 to 500 KB for realistic hosts and about
 (`docs/user-manual/gateway.md`); this schema over a developer macOS host's
 tables on 2026-10-26 (836 processes, 43 sockets) gives 150,178 bytes, which is
 the default size. The proto comment's "5 to 20 KB" is not what the agent sends.
-The case builds a schema-shaped document of the chosen size.
+The case builds a schema-shaped document of about the chosen size: it adds
+rows until the document reaches it, so it overshoots, and the 150000 default
+gives a 180,946-byte document. The summary prints the generated size; the JSON
+holds both (`snapshot_bytes`, asked for, and `snapshot_actual_bytes`). Every
+figure below quoted as a "150000 B" or "150 KB" snapshot was taken with that
+180,946-byte document.
 
-Each sample, taken inside the gateway node (`yuzu_gw_scale_probe:idle_sample/1`):
+Each sample: the gateway's own memory, read inside the gateway node
+(`yuzu_gw_scale_probe:idle_sample/0`), and the kernel figures, read by the test
+node on the same host (`yuzu_gw_scale_probe:socket_memory/1`; they are
+host-wide reads, and parsing their text, about 1.3 MB at 10,000 agents, inside
+the gateway would add garbage to the memory being measured; until 2026-11-15
+they were read inside the gateway node):
 
 - `erlang:memory()` by category (`beam_total`, `beam_processes`,
   `beam_binary`, `beam_ets`, `beam_system`, `beam_code`, ...), the process and
@@ -344,9 +362,8 @@ Each sample, taken inside the gateway node (`yuzu_gw_scale_probe:idle_sample/1`)
     the sum of the `skmem` allocations; `socket_queued`; `socket_limits`, the
     autotuned buffer sizes) and the host-wide TCP memory of
     `/proc/net/sockstat` (`socket_host_tcp_mem`, every socket on the host);
-  - slab, from `/proc/slabinfo` (read directly, or with `sudo -n cat`; with
-    neither, `socket_slab_source` is `none` and only the buffers are
-    counted), as objects in use (`active_objs * objsize`) in four groups:
+  - slab, from `/proc/slabinfo` (read directly, or with `sudo -n cat`), as
+    objects in use (`active_objs * objsize`) in four groups:
     `socket_slab_pair` (TCP, TCPv6, sock_inode_cache, filp, dentry,
     eventpoll_epi, eventpoll_pwq, lsm_inode_cache, lsm_file_cache: one object
     per socket at each end of a connection), `socket_slab_kmalloc`
@@ -364,14 +381,25 @@ Each sample, taken inside the gateway node (`yuzu_gw_scale_probe:idle_sample/1`)
     by the client's small kmalloc share. `socket_kernel_host` counts every
     group whole plus `socket_host_tcp_mem`: both ends, an upper bound. Both
     are host-wide reads: anything else allocating in these caches between
-    `M(0)` and `M(N)` shows up, so run on a host otherwise idle;
+    `M(0)` and `M(N)` shows up, so run on a host otherwise idle. Neither is
+    ever a partial sum: with no readable slabinfo, or no `ss` (not installed,
+    or exiting non-zero), there is no `socket_kernel` and no `all_in`, and
+    with no `/proc/net/sockstat` no `socket_kernel_host`. Each point's
+    `kernel_sources` says what was read (`source`: `ss`, `netstat` or `none`,
+    with `source_error`; `slab_source`: `proc`, `sudo` or `none`). An
+    unprivileged run without passwordless `sudo -n cat` therefore has no
+    kernel figure;
   - `all_in` = `os_anon + socket_kernel`, the figure the per-agent budget
-    check judges (ADR-0074 D14: 64 KiB per idle agent, all-in). At the
+    check judges (ADR-0074 D14, proposed in PR #6703: 64 KiB per idle agent,
+    all-in). At the
     largest N of each transport the summary prints `budget ... PASS/FAIL`
     against `YUZU_GW_IDLEMEM_BUDGET_KIB`, and the JSON holds it as `budget`.
-    It is reported, never failed.
+    It is reported, never failed. With no kernel figure it prints
+    `no kernel figure (sockets: ..., slab: ...)` instead of PASS or FAIL.
 
-  On macOS the queued bytes only;
+  On macOS: `netstat`'s receive and send queue bytes only (`socket_queued`,
+  shown in the summary's kernel column), so no `socket_kernel` and no
+  `all_in`;
 - the heartbeat buffer's size (`hb_buffer_bytes`) and drop counters. The
   buffer is bounded (64 MiB by default) and flushes at most about 24 MiB a
   second, so with large snapshots at 10,000 agents it fills and evicts
@@ -413,8 +441,8 @@ Settings (all optional):
 | `YUZU_GW_IDLEMEM_STEADY_TOL_PCT` | 2 | how closely they must agree, in percent |
 | `YUZU_GW_IDLEMEM_SETTLE_MAX_MS` | twenty heartbeat intervals | the cap; a point still moving then is reported not steady |
 | `YUZU_GW_IDLEMEM_SAMPLE_MS` | 5000 | between samples |
-| `YUZU_GW_IDLEMEM_SNAPSHOT_BYTES` | 150000 | fleet snapshot size; 0 = no snapshot |
-| `YUZU_GW_IDLEMEM_SNAPSHOT_EVERY` | 1 | attach the snapshot to every Nth heartbeat |
+| `YUZU_GW_IDLEMEM_SNAPSHOT_BYTES` | 150000 | fleet snapshot size asked for (the document generated is somewhat larger, 180,946 B for the default); 0 = no snapshot |
+| `YUZU_GW_IDLEMEM_SNAPSHOT_EVERY` | 1 | attach the snapshot to every Nth heartbeat; at least 1 |
 | `YUZU_GW_IDLEMEM_TAGS` | 1 | 0 = heartbeats without status tags |
 | `YUZU_GW_IDLEMEM_ROLES_K` | 20 | agents averaged for the per-role footprint |
 
@@ -430,21 +458,23 @@ Limits:
   what is linear.
 - macOS's `os_anon` is the physical footprint, not Linux's `Anonymous`, and
   its socket figure is queued bytes only. Judge on Linux.
-- The allocator flags decide most of `os_anon`. Until 2026-10-27 the gateway
-  node ran with a copied list of VM flags that lacked the allocator flags
-  `vm.args.src` gained in the Phase 1b change (`+MHas ageffcbf +MHsbct 8
-  +MBsbct 16 +Muacful de +Mumadtn true`); it now reads `vm.args.src` itself. On
-  Rocky Linux 9 at 3,000 TLS agents with empty snapshots, the copied list gave
-  about 218 KiB of `os_anon` per connection and the release's flags about
-  89 KiB, with BEAM memory unchanged (about 43 KiB), so `os_anon` figures taken
-  with the harness before that date overstate the release's.
-- Until 2026-10-27 Linux `os_anon` was `smaps_rollup`'s `Anonymous`. With the
-  release's allocator flags, which map and unmap carriers every heartbeat, a
-  rollup read can miss mappings: on Rocky Linux 9 (kernel 5.14) at 3,000
-  agents single reads fell as far as 63% below `RssAnon` in the same sample,
-  so the window mean ran low and three identical runs spread over up to
-  20 KiB per connection (`RssAnon`: up to 11 KiB). `os_anon` is now
-  `RssAnon`; the rollup figure stays in the samples as `os_smaps_anon`.
+- `os_anon` depends on the VM's allocator flags, which decide how much
+  memory the allocators keep mapped; `erlang:memory()` counts allocated
+  blocks and moves much less. The gateway node runs with the flags of
+  `config/vm.args.src` in the tree being measured: since 2026-10-27 it reads
+  that file itself (before, it ran a hand-copied list). On `dev` the two
+  differ only by `+SDcpu 0:0`, so that change does not move figures measured
+  from `dev`; record the commit with any `os_anon` figure, because a change to
+  `vm.args.src` moves it.
+- Until 2026-10-27 Linux `os_anon` was `smaps_rollup`'s `Anonymous`, which
+  walks the mappings; under allocator flags that map and unmap carriers
+  often, a read can miss some. On Rocky Linux 9 (kernel 5.14) at 3,000 agents,
+  with an experimental allocator flag set that is not in `dev`'s
+  `vm.args.src`, single reads fell as far as 63% below `RssAnon` in the same
+  sample, so the window mean ran low and three identical runs spread over up
+  to 20 KiB per connection (`RssAnon`: up to 11 KiB). `os_anon` is now
+  `RssAnon`, the kernel's own counter; the rollup figure stays in the samples
+  as `os_smaps_anon`.
 
 ### The ceiling (ratchet)
 
@@ -459,6 +489,19 @@ below for why).
 
 The checked-in ceilings are the Linux results below plus 15% headroom. The
 headroom is a guess: run-to-run variance has not been measured yet.
+
+The `os_anon` ceilings are **provisional**: listed in the entry's
+`provisional`, checked and printed (`OVER (provisional, not gated)`) but never
+failing the case, even with `YUZU_GW_SCALE_GATE=1`. Their source run
+(2026-10-26) predates both 2026-10-27 harness changes above (`vm.args.src`
+read directly, `os_anon` from `RssAnon`), and the first TLS run on the current
+harness, `dev` `dfdffa4c0` on 2026-10-29 at N = 10,000, measured 1,095.4 KiB
+of `os_anon` per connection, over the TLS ceiling of 1,063,000 B
+(1,038.1 KiB). One run is not a ceiling, so they stay a record until
+re-derived from repeated runs on the current harness; that re-derivation (and
+removing `provisional`) is a reviewed change, after which `os_anon` ratchets
+like the rest. `beam_total` stays gated: the same 2026-10-29 run measured
+829.0 KiB, under its ceiling and in line with the source run's 825.7 KiB.
 
 ### Idle memory results (2026-10-26)
 
@@ -505,7 +548,7 @@ What the numbers mean:
   the ssl connection supervisor.
 - The heartbeat buffer is a fixed cost of up to 64 MiB, spread over N.
 
-Why CI does not run it: a default run takes about 45 minutes and needs about
+Why CI does not run it (no workflow runs the `idle_memory` case): a default run takes about 45 minutes and needs about
 20000 file descriptors. The CI hosts are shared by four runner agents, and
 variance has not yet been measured there, so a gate would be a flake source.
 The intended gate is a weekly Linux job running `YUZU_GW_IDLEMEM_SWEEP=0,10000`
@@ -513,7 +556,11 @@ with `YUZU_GW_SCALE_GATE=1`. It waits until the coefficient of variation over
 five runs on the CI host is known, and the headroom is then set from it. A
 lint against `origin/dev` would refuse any change that raises a ceiling.
 
-### The CI check's heartbeat shape and threshold
+### The intended CI check's heartbeat shape and threshold
+
+No CI workflow runs this check yet; this is its intended shape. ADR-0073
+(liveness-only heartbeat, PR #6704) and ADR-0074 (gateway transport security
+and topology, PR #6703) are proposed and not yet in the tree.
 
 The CI check (owner decision, 2026-10-29) measures the ADR-0073 heartbeat:
 liveness only, no fleet snapshot, i.e. `YUZU_GW_IDLEMEM_SNAPSHOT_BYTES=0`. It
@@ -526,8 +573,9 @@ Consequence: until ADR-0073's heartbeat ships, the check does not measure the
 heartbeat a shipped agent sends. Today's agent with the TAR plugin attaches a
 fleet snapshot to about every heartbeat (the harness default of 150000 B), and
 that costs more per agent: on one Linux host, 2026-10-29, the kTLS branch
-measured 60.4 KiB all-in at 5,000 agents with the 150000 B snapshot against
-38.4 KiB without it. Run the default (snapshot) setting as well when the
+(`perf/gateway-idle-mem-ktls`, not on `dev`, which also carries other memory
+changes, so these figures cannot be reproduced from `dev`) measured 60.4 KiB
+all-in at 5,000 agents with the 150000 B snapshot against 38.4 KiB without it. Run the default (snapshot) setting as well when the
 shipped heartbeat's cost is the question.
 
 ## Results on 29a8e655b (before the fixes)

@@ -19,7 +19,7 @@
 -export([start/1, stop/0, report/0, reset_hwm/0, sched_mark/0, sched_report/0,
          memory/0, mailboxes/0, singletons/0, footprint/1]).
 %% Idle memory per connection (the idle_memory case of yuzu_gw_scale_SUITE).
--export([idle_sample/1, os_memory/0, socket_memory/1, roles/1, top_ets/1,
+-export([idle_sample/0, os_memory/0, socket_memory/1, roles/1, top_ets/1,
          heartbeat_buffer/0, gc_all/0]).
 %% Crash and supervisor reports logged in this node (planned_stop counts them).
 -export([count_crash_reports/0, crash_reports/0]).
@@ -354,16 +354,18 @@ refc_bytes(P) ->
     end.
 
 %% @doc One idle-memory sample of this node: erlang:memory/0 by category,
-%% process and port counts, the OS view of this process (os_memory/0), the
-%% kernel socket memory of the given listener ports (socket_memory/1), and
-%% the heartbeat buffer's size (heartbeat_buffer/0).
--spec idle_sample([inet:port_number()]) -> map().
-idle_sample(Ports) ->
+%% process and port counts, the OS view of this process (os_memory/0) and
+%% the heartbeat buffer's size (heartbeat_buffer/0). The kernel socket memory
+%% (socket_memory/1) is NOT read here: it is a host-wide read whose output
+%% (about 1.3 MB of `ss' and slabinfo text at 10,000 agents) would be parsed
+%% as garbage inside the node being measured, so the caller reads it from its
+%% own node on the same host.
+-spec idle_sample() -> map().
+idle_sample() ->
     #{beam => maps:from_list(erlang:memory()),
       process_count => erlang:system_info(process_count),
       port_count => erlang:system_info(port_count),
       os => os_memory(),
-      sockets => socket_memory(Ports),
       heartbeat_buffer => heartbeat_buffer(),
       ms => erlang:system_time(millisecond)}.
 
@@ -371,10 +373,11 @@ idle_sample(Ports) ->
 %% Linux: /proc/self/status (RssAnon = the kernel's count of the process's
 %% anonymous resident pages, which is the budget's "OS anon"; RssFile, VmHWM)
 %% and /proc/self/smaps_rollup (rss, pss, smaps_anon = its Anonymous). The
-%% rollup is not the budget figure: it walks the mappings, and under the
-%% release's allocator flags (carriers mapped and unmapped every heartbeat) a
-%% read can miss some. On Rocky 9 (kernel 5.14) at 3,000 agents single reads
-%% fell as far as 63% below the RssAnon read in the same sample (2026-10-27),
+%% rollup is not the budget figure: it walks the mappings, and under
+%% allocator flags that map and unmap carriers often a read can miss some. On
+%% Rocky 9 (kernel 5.14) at 3,000 agents, with an experimental flag set not in
+%% dev's vm.args.src, single reads fell as far as 63% below the RssAnon read
+%% in the same sample (2026-10-27),
 %% consistent with the walk dropping mmap_lock while a writer waits. macOS: `ps' RSS and `footprint' (the physical
 %% footprint: dirty anonymous plus compressed pages, the nearest macOS has to
 %% Linux's anonymous RSS). Elsewhere, or when a read fails: what was read.
@@ -451,12 +454,6 @@ socket_memory(Ports) ->
     end.
 
 linux_sockets(Ports) ->
-    Filter = string:join(["sport = :" ++ integer_to_list(P) || P <- Ports], " or "),
-    Out = os:cmd(ss_path() ++ " -tmnH state established '( " ++ Filter ++ " )' 2>/dev/null"),
-    Mems = [parse_skmem(M) || {match, [M]} <- [re:run(L, "skmem:\\(([^)]*)\\)",
-                                                     [{capture, all_but_first, list}])
-                                              || L <- string:split(Out, "\n", all)]],
-    Sum = fun(Keys) -> lists:sum([maps:get(K, M, 0) || M <- Mems, K <- Keys]) end,
     Host = case file:read_file("/proc/net/sockstat") of
                {ok, B} ->
                    case re:run(B, "TCP: .* mem ([0-9]+)", [{capture, all_but_first, list}]) of
@@ -465,16 +462,45 @@ linux_sockets(Ports) ->
                    end;
                _ -> null
            end,
-    Allocated = Sum([r, t, f, w, o, bl, d]),
-    Socks = #{source => ss, sockets => length(Mems),
-              allocated => Allocated, queued => Sum([r, t]),
-              limits => Sum([rb, tb]), host_tcp_mem => Host},
-    maps:merge(Socks, kernel_memory(Allocated, Host)).
+    Socks = case ss_sockets(Ports) of
+                {ok, Mems} ->
+                    Sum = fun(Keys) -> lists:sum([maps:get(K, M, 0) || M <- Mems, K <- Keys]) end,
+                    #{source => ss, sockets => length(Mems),
+                      allocated => Sum([r, t, f, w, o, bl, d]), queued => Sum([r, t]),
+                      limits => Sum([rb, tb])};
+                {error, Why} ->
+                    %% No socket figure at all, never a zero one: a missing or
+                    %% failing ss would otherwise read as 0 bytes per socket.
+                    #{source => none, source_error => Why}
+            end,
+    maps:merge(Socks#{host_tcp_mem => Host},
+               kernel_memory(maps:get(allocated, Socks, undefined), Host)).
+
+%% `ss -tmnH' for the established sockets on these local ports, as one skmem
+%% map per socket. {error, Why} when ss is not installed or exits non-zero
+%% (an empty listing from a successful run is zero sockets, a real answer).
+ss_sockets(Ports) ->
+    case ss_path() of
+        false -> {error, ss_not_found};
+        Ss ->
+            Filter = string:join(["sport = :" ++ integer_to_list(P) || P <- Ports], " or "),
+            Out = os:cmd(Ss ++ " -tmnH state established '( " ++ Filter ++ " )' 2>/dev/null;"
+                         " echo \"yuzu_ss_exit=$?\""),
+            Lines = string:split(Out, "\n", all),
+            case [L || "yuzu_ss_exit=" ++ _ = L <- Lines] of
+                ["yuzu_ss_exit=0" | _] ->
+                    {ok, [parse_skmem(M)
+                          || {match, [M]} <- [re:run(L, "skmem:\\(([^)]*)\\)",
+                                                     [{capture, all_but_first, list}])
+                                              || L <- Lines]]};
+                _ -> {error, ss_failed}
+            end
+    end.
 
 %% @doc The kernel's per-connection memory beyond the socket buffers: slab.
 %% Read from /proc/slabinfo (root only on most hosts, so `sudo -n cat' is
-%% tried when the plain read is refused; with neither, only the socket
-%% buffers are reported and `slab_source' says so). A group's figure is
+%% tried when the plain read is refused; with neither, `slab_source' is
+%% `none' and there is no `kernel' figure at all). A group's figure is
 %% active_objs * objsize summed over its caches: the objects in use. The
 %% pages a cache holds (num_slabs * pagesperslab * page size) are not used for
 %% the groups, because a cache with free space in its existing slabs absorbs
@@ -505,7 +531,11 @@ linux_sockets(Ports) ->
 %% memory: both ends of every connection on the host, an upper bound. Both
 %% are host-wide reads, so anything else on the host that allocates in these
 %% caches between M(0) and M(N) shows up; `slab_total' (every cache) is kept
-%% to make that visible.
+%% to make that visible. Each is reported only when every part of it was
+%% read: no `kernel' without both slab and ss (`source' = ss), no
+%% `kernel_host' without slab and /proc/net/sockstat. A partial figure is
+%% never summed, so the budget check prints "no kernel figure" instead of a
+%% PASS on anon alone; `source' and `slab_source' say which part is missing.
 kernel_memory(Allocated, HostTcp) ->
     case slabinfo() of
         {Source, Rows} ->
@@ -518,13 +548,23 @@ kernel_memory(Allocated, HostTcp) ->
             Net = G(fun(N) -> lists:prefix("skbuff_", N) orelse lists:prefix("request_sock_TCP", N)
                                   orelse lists:prefix("tw_sock_TCP", N)
                                   orelse lists:member(N, ["tcp_bind_bucket", "inet_peer_cache"]) end),
-            HostTcpB = case HostTcp of null -> 0; _ -> HostTcp end,
-            #{slab_source => Source, slab_pair => Pair, slab_kmalloc => Kmalloc,
-              slab_conntrack => Ct, slab_net => Net, slab_total => lists:sum([P || {_, _, P} <- Rows]),
-              kernel => Pair div 2 + Kmalloc + Ct + Net + Allocated,
-              kernel_host => Pair + Kmalloc + Ct + Net + HostTcpB};
+            Slab = #{slab_source => Source, slab_pair => Pair, slab_kmalloc => Kmalloc,
+                     slab_conntrack => Ct, slab_net => Net,
+                     slab_total => lists:sum([P || {_, _, P} <- Rows])},
+            Gw = case Allocated of
+                     undefined -> #{};
+                     _ -> #{kernel => Pair div 2 + Kmalloc + Ct + Net + Allocated}
+                 end,
+            Hst = case HostTcp of
+                      null -> #{};
+                      _ -> #{kernel_host => Pair + Kmalloc + Ct + Net + HostTcp}
+                  end,
+            maps:merge(Slab, maps:merge(Gw, Hst));
         none ->
-            #{slab_source => none, kernel => Allocated}
+            %% Without slab there is no kernel figure: the socket buffers alone
+            %% (`allocated') are about 5 B per idle socket, and reporting them
+            %% as `kernel' would print a budget PASS on anon alone.
+            #{slab_source => none}
     end.
 
 slabinfo() ->
@@ -563,7 +603,7 @@ page_size() ->
 ss_path() ->
     case [P || P <- ["/usr/sbin/ss", "/sbin/ss", "/usr/bin/ss", "/bin/ss"], filelib:is_regular(P)] of
         [P | _] -> P;
-        [] -> case os:find_executable("ss") of false -> "ss"; P -> P end
+        [] -> os:find_executable("ss")
     end.
 
 %% "r0,rb131072,t0,tb87040,f0,w0,o0,bl0,d0"
