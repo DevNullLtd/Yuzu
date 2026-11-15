@@ -17,6 +17,7 @@
                             // scratch registry keys (#2012/#3840 D-value measurement)
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -15739,6 +15740,8 @@ TEST_CASE("File spark (real mechanism): a parent directory renamed away faults t
     { std::ofstream(tree.file) << "recreated"; }
     expect_fire_after_repair(*raw, engine, got, *sub, spec, tree.file);
     expect_verified_stable_after_recovery(*raw, engine);
+    // One genuine rename, never a flap: no damping applied.
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_flaps) == 0);
     engine.disarm(*sub);
     engine.stop();
 }
@@ -16197,17 +16200,18 @@ private:
 /// other hooks (completion, suppress, pass) run on the owner thread, which stop() joins; they
 /// follow the same rule so the rule has no exceptions to remember.
 struct VerifyHookState {
-    std::atomic<int> forced{0}; ///< verifications still to fail with ERROR_ACCESS_DENIED
+    std::atomic<int> forced{0}; ///< verifications still to fail with `err`
+    std::atomic<unsigned long> err{ERROR_ACCESS_DENIED}; ///< the error a forced verification returns
 };
-/// A verify_hook that fails the next `st->forced` verifications with ERROR_ACCESS_DENIED
-/// (undecidable) and lets every later one run the real check.
+/// A verify_hook that fails the next `st->forced` verifications with `st->err` (default
+/// ERROR_ACCESS_DENIED, undecidable) and lets every later one run the real check.
 std::function<unsigned long(std::wstring_view)>
 forced_verify_hook(std::shared_ptr<VerifyHookState> st) {
     return [st = std::move(st)](std::wstring_view) -> unsigned long {
         int n = st->forced.load(std::memory_order_acquire);
         while (n > 0 && !st->forced.compare_exchange_weak(n, n - 1, std::memory_order_acq_rel)) {
         }
-        return n > 0 ? ERROR_ACCESS_DENIED : 0;
+        return n > 0 ? st->err.load(std::memory_order_acquire) : 0;
     };
 }
 
@@ -16364,6 +16368,54 @@ TEST_CASE("File spark (real mechanism): a watch whose verification stays undecid
     CHECK(count_kind(got, key, SparkEventKind::Recovered) == 1);
     CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) ==
           kUnverifiableStreak);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a network path that stops answering is undecided, "
+          "not decided lost, and faults the watch after the streak (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    // Option A maps ONLY file-not-found / path-not-found to Lost; every other open error is
+    // "could not decide", so the three network errors take the same 3-result streak as
+    // ERROR_ACCESS_DENIED. Pins the docs: a share that stops answering is reported faulted,
+    // never left Healthy-deaf, and never as a decided loss (verify_lost stays 0).
+    const auto err = static_cast<unsigned long>(
+        GENERATE(ERROR_BAD_NETPATH, ERROR_NETNAME_DELETED, ERROR_BAD_NET_NAME));
+    INFO("forced open error " << err);
+    DeafWatchTree tree("network_error");
+    auto hook_state = std::make_shared<VerifyHookState>();
+    hook_state->err.store(err, std::memory_order_release);
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        auto ctl = identity_controls(30ms);
+        ctl.verify_hook = forced_verify_hook(hook_state);
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+
+    hook_state->forced.store(static_cast<int>(kUnverifiableStreak), std::memory_order_release);
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 1; },
+                       kDeafBound));
+    CHECK(first_detail(got, key, SparkEventKind::Faulted) == kReasonUndecidable);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_unverifiable) ==
+          kUnverifiableStreak);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 0);
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Recovered) >= 1; },
+                       kDeafBound));
+    expect_verified_stable_after_recovery(*raw, engine);
+    CHECK(count_kind(got, key, SparkEventKind::Faulted) == 1);
     engine.disarm(*sub);
     engine.stop();
 }
@@ -16766,6 +16818,269 @@ TEST_CASE("File spark (real mechanism): a lost path's retry window is not counte
     CHECK(raw->stats().slow_op_total == slow0);
     engine.disarm(*sub2);
     engine.disarm(*sub);
+    engine.stop();
+}
+
+namespace {
+/// The wall-clock stamp of the n-th (1-based) `kind` event for `key`.
+std::chrono::system_clock::time_point nth_event_at(Collector& got, const std::string& key,
+                                                   SparkEventKind kind, std::size_t n) {
+    std::lock_guard lk(got.mu);
+    for (const auto& ev : got.events)
+        if (ev.key == key && ev.kind == kind && --n == 0)
+            return ev.at;
+    return {};
+}
+
+/// Controls for the damping cases: a short verify interval and a 200 ms retry base, so the
+/// doubled retry (base * 2^flaps) is measurable in well under a second per cycle.
+FileMechanismTestControls damping_controls(std::shared_ptr<VerifyHookState> st) {
+    auto ctl = identity_controls(50ms);
+    ctl.backend_retry_base = 200ms;
+    ctl.verify_hook = forced_verify_hook(std::move(st));
+    return ctl;
+}
+} // namespace
+
+TEST_CASE("File spark (real mechanism): consecutive loss episodes with no decided verify "
+          "between them back off (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    // Damping is verdict-agnostic: a healthy directory whose verification always reports
+    // path-not-found is lost again right after every re-establishment, with no Same between.
+    DeafWatchTree tree("damping_flap");
+    auto hook_state = std::make_shared<VerifyHookState>();
+    hook_state->err.store(ERROR_PATH_NOT_FOUND, std::memory_order_release);
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    REQUIRE(set_file_test_controls_for_test(*raw, damping_controls(hook_state)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+
+    hook_state->forced.store(1'000'000, std::memory_order_release);
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Faulted) >= 3; },
+                       kDeafBound));
+    // Two of the three losses followed a re-establishment with no decided verify: flaps.
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_flaps) == 2);
+    hook_state->forced.store(0, std::memory_order_release); // let the third episode recover
+    REQUIRE(eventually([&] { return count_kind(got, key, SparkEventKind::Recovered) >= 3; },
+                       kDeafBound));
+
+    // Lower bounds only (the real gap also holds the drain and scheduling): the Faulted ->
+    // Recovered gap of episode n is at least 0.8 x base x 2^(n-1). Episode 1 is the ordinary
+    // 200 ms; a mutant that resets the seed at commit would make every gap ~200 ms.
+    for (std::size_t n = 2; n <= 3; ++n) {
+        const auto gap = nth_event_at(got, key, SparkEventKind::Recovered, n) -
+                         nth_event_at(got, key, SparkEventKind::Faulted, n);
+        const auto floor_ms = std::chrono::milliseconds(200 * (1 << (n - 1)) * 8 / 10);
+        INFO("episode " << n << " gap ms "
+                        << std::chrono::duration_cast<std::chrono::milliseconds>(gap).count());
+        CHECK(gap >= floor_ms);
+    }
+    expect_verified_stable_after_recovery(*raw, engine);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_flaps) == 2);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a decided verify between loss episodes is not a flap "
+          "(#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    DeafWatchTree tree("damping_decided");
+    auto hook_state = std::make_shared<VerifyHookState>();
+    hook_state->err.store(ERROR_PATH_NOT_FOUND, std::memory_order_release);
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    REQUIRE(set_file_test_controls_for_test(*raw, damping_controls(hook_state)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    const auto spec = file_spec(tree.file.string());
+    const std::string key = spark_key(spec);
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    engine.start();
+    REQUIRE(eventually(
+        [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+
+    for (std::size_t episode = 1; episode <= 2; ++episode) {
+        const auto same0 = verify_counter(*raw, &FileMechanismDebugCounters::verify_same);
+        hook_state->forced.store(1, std::memory_order_release); // exactly one lost verdict
+        REQUIRE(eventually(
+            [&] { return count_kind(got, key, SparkEventKind::Faulted) >= episode; }, kDeafBound));
+        REQUIRE(eventually(
+            [&] { return count_kind(got, key, SparkEventKind::Recovered) >= episode; }, kDeafBound));
+        // A decided verify after the re-establishment ends any flap run before the next loss.
+        REQUIRE(eventually(
+            [&] { return verify_counter(*raw, &FileMechanismDebugCounters::verify_same) >= same0 + 2; },
+            kDeafBound));
+    }
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::path_lost_flaps) == 0);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_lost) == 2);
+    expect_verified_stable_after_recovery(*raw, engine);
+    engine.disarm(*sub);
+    engine.stop();
+}
+
+namespace {
+/// Shared between the lane case and its hook (the rule of VerifyHookState: by value, never by
+/// reference). The hook parks each verification until a permit is given or release_all.
+struct LaneHookState {
+    std::atomic<int> permits{0};
+    std::atomic<bool> release_all{false};
+    std::atomic<int> inside{0};
+    std::atomic<int> max_inside{0};
+    std::atomic<int> arrived{0};
+    std::mutex mu;
+    std::vector<std::wstring> order; ///< verified directory, in arrival order (bounded)
+};
+
+std::function<unsigned long(std::wstring_view)> lane_hook(std::shared_ptr<LaneHookState> st) {
+    return [st = std::move(st)](std::wstring_view dir) -> unsigned long {
+        const int now_in = st->inside.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int m = st->max_inside.load(std::memory_order_acquire);
+        while (now_in > m && !st->max_inside.compare_exchange_weak(m, now_in, std::memory_order_acq_rel)) {
+        }
+        {
+            std::lock_guard lk(st->mu);
+            if (st->order.size() < 64)
+                st->order.emplace_back(dir);
+        }
+        st->arrived.fetch_add(1, std::memory_order_acq_rel);
+        for (;;) {
+            if (st->release_all.load(std::memory_order_acquire))
+                break;
+            int p = st->permits.load(std::memory_order_acquire);
+            if (p > 0 && st->permits.compare_exchange_weak(p, p - 1, std::memory_order_acq_rel))
+                break;
+            std::this_thread::sleep_for(1ms);
+        }
+        st->inside.fetch_sub(1, std::memory_order_acq_rel);
+        return 0; // then the real check runs: a healthy directory, Same
+    };
+}
+
+/// Releases every parked lane worker and waits (bounded) for them to leave the hook, on every
+/// exit path. Declare it AFTER the state it names and BEFORE the engine is stopped by unwinding.
+struct LaneParkGuard {
+    std::shared_ptr<LaneHookState> st;
+    ~LaneParkGuard() {
+        st->release_all.store(true, std::memory_order_release);
+        const auto until = std::chrono::steady_clock::now() + 5s;
+        while (st->inside.load(std::memory_order_acquire) != 0 &&
+               std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(1ms);
+    }
+};
+
+std::wstring lower_ws(std::wstring_view v) {
+    std::wstring r(v);
+    for (auto& ch : r)
+        ch = static_cast<wchar_t>(::towlower(ch));
+    return r;
+}
+} // namespace
+
+TEST_CASE("File spark (real mechanism): a saturated verification lane serves watches "
+          "least-recently-verified first, never refuses, and signals starvation (#5719 item 5)",
+          "[spark][mechanism][windows][5719]") {
+    constexpr std::size_t kDirs = 10;
+    constexpr std::size_t kLane = 4; // kVerifyLaneCap
+    std::vector<std::unique_ptr<DeafWatchTree>> trees; // outlive the engine
+    for (std::size_t i = 0; i < kDirs; ++i)
+        trees.push_back(std::make_unique<DeafWatchTree>(("lane" + std::to_string(i)).c_str()));
+    auto st = std::make_shared<LaneHookState>();
+    Collector got;
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    auto make_ctl = [&](std::chrono::milliseconds interval) {
+        auto ctl = identity_controls(interval);
+        ctl.verify_hook = lane_hook(st);
+        return ctl;
+    };
+    REQUIRE(set_file_test_controls_for_test(*raw, make_ctl(3'600'000ms)));
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    LaneParkGuard park_guard{st}; // after the state; runs before the engine unwinds
+    engine.start();
+    // Armed one at a time, each waited to Notification: distinct commit times, hence distinct
+    // verified_at, in arm order.
+    for (std::size_t i = 0; i < kDirs; ++i) {
+        auto sub = engine.arm(*c, file_spec(trees[i]->file.string()));
+        REQUIRE(sub.has_value());
+        REQUIRE(eventually(
+            [&] { return deaf_coverage(engine, *sub) == SparkCoverage::Notification; }, kDeafBound));
+    }
+    std::this_thread::sleep_for(150ms); // every watch is older than the interval set next
+    // A controls call without a hook clears it, so the hook is passed again.
+    REQUIRE(set_file_test_controls_for_test(*raw, make_ctl(100ms)));
+
+    // All ten are due together; the lane takes exactly four and pins.
+    REQUIRE(eventually([&] { return st->inside.load() == static_cast<int>(kLane); }, kDeafBound));
+    const auto index_of = [&](const std::wstring& dir) {
+        const std::wstring d = lower_ws(dir);
+        for (std::size_t i = 0; i < kDirs; ++i)
+            if (d.find(lower_ws(trees[i]->root.filename().wstring())) != std::wstring::npos)
+                return static_cast<int>(i);
+        return -1;
+    };
+    {
+        std::lock_guard lk(st->mu);
+        REQUIRE(st->order.size() == kLane);
+        std::set<int> first;
+        for (const auto& d : st->order)
+            first.insert(index_of(d));
+        // The first four ARE the four least recently verified (their order within the four is a
+        // thread race, so a set).
+        CHECK(first == std::set<int>{0, 1, 2, 3});
+    }
+
+    // Starvation: the six waiting watches pass 3 x 100 ms unlaunched. Counted once each, and
+    // the lane never refuses (a full lane is a queue, not a refusal).
+    REQUIRE(eventually(
+        [&] { return verify_counter(*raw, &FileMechanismDebugCounters::verify_starved) >= 6; },
+        kDeafBound));
+    // The sweep must not spin while the lane is pinned: it wakes on its 20 ms cadence (the OS
+    // timer rounds that up; 16 passes per 500 ms measured on the Windows rig, 25 would be the
+    // ideal). The bound is 100 (4x the ideal, generous under a busy runner); a sweep that wakes
+    // at zero timeout runs thousands.
+    const auto passes0 = verify_counter(*raw, &FileMechanismDebugCounters::sweep_passes);
+    std::this_thread::sleep_for(500ms);
+    const auto passes = verify_counter(*raw, &FileMechanismDebugCounters::sweep_passes) - passes0;
+    INFO("sweep passes in 500 ms with a pinned lane: " << passes);
+    CHECK(passes <= 100);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_starved) == kDirs - kLane);
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_refused) == 0);
+    CHECK(st->max_inside.load() <= static_cast<int>(kLane));
+
+    // One permit at a time: arrivals 5..10 are exactly dirs 5..10, in arm order.
+    for (std::size_t k = 0; k < kDirs - kLane; ++k) {
+        const int before = st->arrived.load();
+        st->permits.fetch_add(1, std::memory_order_acq_rel);
+        REQUIRE(eventually([&] { return st->arrived.load() >= before + 1; }, kDeafBound));
+    }
+    {
+        std::lock_guard lk(st->mu);
+        REQUIRE(st->order.size() >= kDirs);
+        for (std::size_t k = kLane; k < kDirs; ++k)
+            CHECK(index_of(st->order[k]) == static_cast<int>(k));
+    }
+    CHECK(verify_counter(*raw, &FileMechanismDebugCounters::verify_refused) == 0);
+    CHECK(st->max_inside.load() <= static_cast<int>(kLane));
+    st->release_all.store(true, std::memory_order_release);
     engine.stop();
 }
 
