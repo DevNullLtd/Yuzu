@@ -687,8 +687,8 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
   SQL must therefore be byte-identical across processes and deployments: never interpolate a
   config value, environment variable, timestamp or random value into it (a deterministic
   generator over fixed text is fine). That includes a constant the runtime SQL also uses when a
-  migration is built from it: `kV4ShapeCheck` (`guaranteed_state_store.cpp`, concatenated into
-  v4's text and also executed by `ordering_schema_defect`) and `kDbNowEpochSql`
+  migration is built from it: `kV4ShapeCheck` and `kV5ShapeCheck` (`guaranteed_state_store.cpp`,
+  concatenated into v4's and v5's text and also executed by `ordering_schema_defect`) and `kDbNowEpochSql`
   (`approval_manager.cpp`, concatenated into v2's text and also used by runtime queries) are part
   of the hashed migration text, so tightening one for a runtime reason makes every database at
   that version refuse to boot. This detects accidental or procedural drift, not
