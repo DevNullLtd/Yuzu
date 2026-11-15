@@ -19,15 +19,16 @@
 ///  - a name that cannot be keyed (empty, longer than 253 bytes, a control byte) shares ONE
 ///    sentinel key and so one limit like any other name: failing to key it never means it is
 ///    untracked;
-///  - a refusal by the limit is not remembered: only a lookup that was actually run arms the
-///    refusal memory below.
+///  - a refusal by the limit is not remembered: only a lookup that passed local admission and
+///    reached `bounded_resolve` arms the refusal memory below.
 ///
 /// REFUSAL MEMORY. A name whose lookup ended `kBusy` or `kTimeout` is refused again, without
 /// starting a lookup, for `kLookupRefusalTtl` (3 s). The memory holds at most
 /// `kLookupRefusalMaxNames` (32) names; a new name at the cap replaces the entry that expires
 /// first, and entries already past their expiry go first.
-///  - Only a lookup that was actually run arms the memory (`note_outcome`). A refusal made by this
-///    class never does.
+///  - Only a lookup that passed local admission and reached `bounded_resolve` arms the memory
+///    (`note_outcome`), including a refusal the pool itself returned (`kBusy`, nothing started).
+///    A refusal made by this class never does.
 ///  - A refusal served from memory never changes the entry: the block ends `kLookupRefusalTtl`
 ///    after the lookup that armed it, however often the name is asked for meanwhile.
 ///  - `kOk` removes the entry. `kNotFound` and `kTemporary` are never remembered.
@@ -180,7 +181,8 @@ public:
         }
     }
 
-    /// Feeds the status of a lookup that was actually run, never a refusal made by `admit`.
+    /// Feeds the status of a lookup that passed `admit` and reached `bounded_resolve`, including
+    /// a refusal the pool returned (`kBusy`, nothing started); never a refusal made by `admit`.
     /// `kBusy` and `kTimeout` arm the name (or re-arm it to now + TTL); `kOk` removes the entry;
     /// `kNotFound` and `kTemporary` change nothing.
     void note_outcome(std::string_view host, ResolveStatus status) noexcept {
