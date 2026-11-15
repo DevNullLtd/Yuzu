@@ -650,6 +650,7 @@ TEST_CASE("POST /management-groups/{id}/members: a store fault on the insert ans
           "store_error failure row, never the database text",
           "[pg][rest][mgmt_group][mgmt-audit-first]") {
     AuditFirstHarness h;
+    h.session_gone_after_recheck = true;
     const std::string gid = make_group(h, "add-store-fault");
     drop_mgmt_table(h, "management_group_store.management_group_members");
 
@@ -669,6 +670,9 @@ TEST_CASE("POST /management-groups/{id}/members: a store fault on the insert ans
     CHECK(h.audits[1].result == "failure");
     CHECK(h.audits[1].target_id == gid);
     CHECK(h.audits[1].detail == "store_error agent-1");
+    CHECK(h.audits[1].bound); // not re-resolved: the session is gone by the time of this row
+    CHECK(h.audits[1].principal == "tester");
+    CHECK(h.audits[1].principal == h.audits[0].principal);
     CHECK(h.audit_count(kAdd, "success") == 0);
 }
 
@@ -1452,6 +1456,7 @@ TEST_CASE("POST /management-groups: the success and failure outcome rows are ses
         REQUIRE(h.create_rows() == 2);
         const auto rows = h.rows_of(kCreate);
         CHECK(rows[1].result == "failure");
+        CHECK(rows[1].detail == "name_conflict bound-dup");
         CHECK(rows[1].bound);
         CHECK(rows[1].principal == "tester");
         CHECK(rows[1].principal == rows[0].principal);

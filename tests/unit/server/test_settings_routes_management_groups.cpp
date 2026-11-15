@@ -78,13 +78,15 @@ struct MgmtGroupsHarness {
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    // Declared BEFORE `routes`: the audit callbacks `routes` holds record into it, so it must
+    // outlive them (members are destroyed in reverse order of declaration).
+    std::vector<AuditRow> calls;
     SettingsRoutes routes;
     yuzu::server::test::TestRouteSink sink;
 
     // Failure injection for the audit-first create (#7074), copied from the users harness
     // (test_settings_routes_users.cpp): every call to the bool-returning audit hook lands in
     // `calls`; the two switches make the `attempted` row or the outcome rows unstorable.
-    std::vector<AuditRow> calls;
     bool attempt_audit_ok{true};
     bool outcome_audit_ok{true};
     // The session / the grant disappear once an `attempted` row has been STORED (the audit write

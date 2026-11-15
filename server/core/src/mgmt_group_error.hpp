@@ -7,7 +7,8 @@
 /// update, add member, assign role), so those three cannot drift. The other REST group routes
 /// (update, delete, add and remove member) map store errors on their own and are NOT routed
 /// through it. The create audit token (`create_failure_token`, below) is shared by the same three
-/// create surfaces.
+/// create surfaces. The `detail` of every failure audit row of the create, add-member and
+/// remove-member writes comes from `mgmt_group_failure_detail` (below).
 ///
 /// The store returns `std::expected<..., std::string>`. A fault of the store itself (not open, no
 /// pool connection, a failed query) carries one of the FIXED messages below, always at the START

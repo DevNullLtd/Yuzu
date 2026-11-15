@@ -30348,6 +30348,10 @@ TEST_CASE("MCP add_management_group_member: a store fault on the insert answers 
 
     McpTestServer ts;
     ts.mgmt_store_for_test = &f.store;
+    wire_mg_session_writer(ts);
+    // The credential lapses after the re-check, so a row from the re-resolving writer would name
+    // nobody: the failure row must be session-bound.
+    mg_credential_lapses_after_recheck(ts, "management_group.add_member|attempted");
     ts.start();
     auto res = ts.call(mg_add_body(f.gid, "agent-1"));
     REQUIRE(res);
@@ -30367,6 +30371,9 @@ TEST_CASE("MCP add_management_group_member: a store fault on the insert answers 
                                                       "management_group.add_member|failure"});
     CHECK(mg_add_row_field(ts, ts.audit_details, 1) == "store_error agent-1");
     CHECK(mg_add_row_field(ts, ts.audit_target_ids, 1) == f.gid);
+    CHECK(mg_add_row_field(ts, ts.audit_principals, 1) == "test-user");
+    CHECK(mg_add_row_field(ts, ts.audit_principals, 1) ==
+          mg_add_row_field(ts, ts.audit_principals, 0));
 }
 
 // Add member records whether the agent id is a known device (#6967, #7074): accept and flag, in
@@ -30822,6 +30829,7 @@ TEST_CASE("MCP create_management_group: the success and failure outcome rows are
         REQUIRE(res);
         REQUIRE(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
                                                                "management_group.create|failure"});
+        CHECK(mg_create_row_field(ts, ts.audit_details, 1) == "name_conflict bound-dup");
         CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == "test-user");
     }
 }
@@ -30919,6 +30927,76 @@ TEST_CASE("MCP add_management_group_member: the attempted row is written through
     CHECK(mg_add_row_field(ts, ts.audit_principals, 1) ==
           mg_add_row_field(ts, ts.audit_principals, 0));
     CHECK(f.store.get_members(f.gid).empty());
+}
+
+// ── An outcome row the session-bound writer cannot store ─────────────────────────────────────────
+// The unwired path (the re-resolving writer) is covered above. With the bound writer wired, a row
+// it refuses or throws on must report `audit_persisted:false` and leave the change in place, so
+// these cases fail on a `mg_audit_bound` that reports stored regardless of the writer's answer.
+
+TEST_CASE("MCP create_management_group: a success row the session-bound writer refuses or throws "
+          "on keeps the group and reports audit_persisted:false",
+          "[mcp][pg][management_group][mgmt-audit-first][chaos]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    const bool throws = GENERATE(false, true);
+    INFO("the bound writer throws: " << throws);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    wire_mg_session_writer(ts);
+    if (throws)
+        ts.audit_throw_action_result_ = "management_group.create|success";
+    else
+        ts.audit_fail_action_result_ = "management_group.create|success";
+    ts.start();
+    auto res = ts.call(mg_create_body({{"name", "bound-lost"}}));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE_FALSE(body.contains("error"));
+    const auto payload =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(payload.contains("id"));
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(store.list_groups().size() == 1); // the change stands
+    CHECK(mg_create_rows(ts) == std::vector<std::string>{"management_group.create|attempted",
+                                                         "management_group.create|success"});
+    CHECK(mg_create_row_field(ts, ts.audit_principals, 1) == "test-user"); // via the bound writer
+}
+
+TEST_CASE("MCP add_management_group_member: a success row the session-bound writer refuses or "
+          "throws on keeps the member and reports audit_persisted:false",
+          "[mcp][pg][management_group][mgmt-audit-first][chaos]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    MgAddFixture f(db.dsn());
+    const bool throws = GENERATE(false, true);
+    INFO("the bound writer throws: " << throws);
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &f.store;
+    wire_mg_session_writer(ts);
+    if (throws)
+        ts.audit_throw_action_result_ = "management_group.add_member|success";
+    else
+        ts.audit_fail_action_result_ = "management_group.add_member|success";
+    ts.start();
+    auto res = ts.call(mg_add_body(f.gid, "agent-1"));
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE_FALSE(body.contains("error"));
+    const auto payload =
+        nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["added"] == true);
+    REQUIRE(payload.contains("audit_persisted"));
+    CHECK(payload["audit_persisted"] == false);
+    CHECK(f.store.get_members(f.gid).size() == 1); // the change stands
+    CHECK(mg_add_rows(ts) == std::vector<std::string>{"management_group.add_member|attempted",
+                                                      "management_group.add_member|success"});
+    CHECK(mg_add_row_field(ts, ts.audit_principals, 1) == "test-user"); // via the bound writer
 }
 
 TEST_CASE("MCP create_management_group and add_management_group_member: an attempted row the "
