@@ -118,7 +118,7 @@ constexpr ExpectedResolution kExpected[] = {
     {"POST",   "/api/v1/uploads",                          8u * 1024 * 1024,  true,  "upload_session"},
         // #2146 review: the commit POST's JSON body has its own 4 KiB class; the chunk PUT and the
     // session open keep the 8 MiB upload_session row.
-    {"POST",   "/api/v1/uploads/abc123/commit",           4u * 1024,          false, "upload_commit"},
+    {"POST",   "/api/v1/uploads/abc123/commit",           4u * 1024,          true,  "upload_commit"},
     // body_cap_policy.hpp plugin_config row — the PR1.5 config/secret/
     // kill-switch plane. 256 KiB = the 64 KiB secret-plaintext grammar cap
     // (plugin_config_parsers.hpp) plus JSON framing headroom.
@@ -591,6 +591,7 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_sess
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("PUT", "/api/v1/uploads/abc123/chunk").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/uploads").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/v1/uploads/abc123/commit").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/agent-1/sync").requires_measurable);
     CHECK(resolve_body_cap("POST", "/api/v1/hardware/sync").requires_measurable);
     CHECK(resolve_body_cap("GET", "/api/v1/hardware").requires_measurable);
@@ -1442,6 +1443,14 @@ TEST_CASE("resolve_body_cap: the upload commit POST has its own small class; the
     const auto commit = resolve_body_cap("POST", "/api/v1/uploads/0123abcd/commit");
     CHECK(commit.path_class == "upload_commit");
     CHECK(commit.max_body_bytes == 4u * 1024);
+    // The carve-out keeps the parent row's framing rule: a chunked commit is refused 411 before it
+    // is buffered, exactly as it was when the commit POST resolved to upload_session.
+    CHECK(commit.requires_measurable);
+    const auto chunked = evaluate_body_cap("POST", "/api/v1/uploads/0123abcd/commit", false, 0,
+                                           "chunked", "", true);
+    CHECK(chunked.refuse);
+    CHECK(chunked.status == 411);
+    CHECK(chunked.path_class == "upload_commit");
     CHECK(resolve_body_cap("PUT", "/api/v1/uploads/0123abcd/chunk").path_class == "upload_session");
     CHECK(resolve_body_cap("PUT", "/api/v1/uploads/0123abcd/chunk").max_body_bytes ==
           8u * 1024 * 1024);

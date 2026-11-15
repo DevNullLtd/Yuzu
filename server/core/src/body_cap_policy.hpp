@@ -62,10 +62,11 @@
 /// cap. Chunked request bodies are legal HTTP, and this repo does not
 /// control every client that will ever talk to these routes, so the bit
 /// DEFAULTS OFF and is opted into per class, not per table. It is ON for
-/// six classes: `/mcp/` (that surface's own protocol/client contract already requires
+/// seven classes: `/mcp/` (that surface's own protocol/client contract already requires
 /// `Content-Length` on every framed body - see `web_utils.hpp:577`'s
 /// `mcp_body_unmeasurable` rationale - so refusing an unmeasurable MCP body
-/// costs a conforming client nothing), `upload_session`, `hardware` (the
+/// costs a conforming client nothing), `upload_session`, `upload_commit` (a carve-out of
+/// `upload_session`'s subtree that keeps its framing rule), `hardware` (the
 /// Hardware CI routes carry only a tiny JSON body from the dashboard and API
 /// callers), `dex_score_policy` (one JSON document, capped by its handler),
 /// `dex_score_policy_form` (the DEX Scoring tab's three form POSTs, the same reason) and `commands`
@@ -262,7 +263,11 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // 100 KB, so no value budget is needed (a cap at or below 1 MiB is not scanned). POST only: the
     // chunk PUT keeps the row above. The trailing slash keeps the exact `POST /api/v1/uploads`
     // (session open, headers only) on that row (the longer prefix wins).
-    {"POST", "/api/v1/uploads/", 4u * 1024, false, "upload_commit", kJsonValuesOff},
+    // requires_measurable=true, as on the row above, which this commit POST previously resolved to:
+    // the pre-routing gate refuses a chunked or undeclared body with 411 BEFORE httplib buffers it,
+    // so the carve-out must not weaken that (an unmeasurable body here would otherwise be read in
+    // full, up to httplib's 100 MiB backstop, before the post-read cap refused it).
+    {"POST", "/api/v1/uploads/", 4u * 1024, true, "upload_commit", kJsonValuesOff},
     // /api/v1/plugin-config — the PR1.5 config/secret/kill-switch plane. The
     // store's own grammar caps a config value at 8 KiB and a secret plaintext
     // at 64 KiB (plugin_config_parsers.hpp kMaxConfigValueBytes/
