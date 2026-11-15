@@ -1911,6 +1911,48 @@ TEST_CASE("instruction_routes: the legacy import refuses a body over the value b
     REQUIRE(r);
     CHECK(r->status == 400);
     CHECK(r->body.find("too many values") != std::string::npos);
+
+    // Duplicate keys collapse on parse and dump, so a body that stamp_import_creator PARSED would
+    // fall under the budget and reach the store as a different, tiny document. The store's text
+    // ("(at most 100000)") on this body therefore proves the stamp returned it unparsed.
+    std::string duplicate_keys = R"({"a":1)";
+    for (int i = 0; i < 100'000; ++i)
+        duplicate_keys += R"(,"a":1)";
+    duplicate_keys += "}";
+    auto dup = h.sink.Post("/api/instructions/import", duplicate_keys);
+    REQUIRE(dup);
+    CHECK(dup->status == 400);
+    CHECK(dup->body.find("(at most 100000)") != std::string::npos);
+}
+
+// The legacy create and PUT parse their own body, so each refuses one over the budget with a 400.
+TEST_CASE("instruction_routes: the legacy create and PUT refuse a body over the value budget",
+          "[pg][server][routes][instruction_routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_instr_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+    auto create = h.sink.Post("/api/instructions",
+                              json{{"name", "Budget"},
+                                   {"plugin", "os_info"},
+                                   {"action", "os_name"},
+                                   {"type", "question"}}
+                                  .dump());
+    REQUIRE(create);
+    const auto id = body(create->body)["id"].get<std::string>();
+    std::string hostile = R"({"a":[)";
+    for (int i = 0; i < 60'000; ++i)
+        hostile += "[],";
+    hostile += "[]]}";
+    auto post = h.sink.Post("/api/instructions", hostile);
+    REQUIRE(post);
+    CHECK(post->status == 400);
+    CHECK(post->body.find("too many values") != std::string::npos);
+    auto put = h.sink.Put("/api/instructions/" + id, hostile);
+    REQUIRE(put);
+    CHECK(put->status == 400);
+    CHECK(put->body.find("too many values") != std::string::npos);
 }
 
 TEST_CASE("json_exceeds_value_budget counts structure outside string literals",
@@ -1923,6 +1965,18 @@ TEST_CASE("json_exceeds_value_budget counts structure outside string literals",
     // not end the string.
     CHECK_FALSE(json_exceeds_value_budget(R"(["[,{,,,,,"])", 1));
     CHECK_FALSE(json_exceeds_value_budget(R"(["a\"[[[[,,,"])", 1));
+    // An escaped backslash does not escape the closing quote: `[` and `,` outside the string.
+    CHECK(json_exceeds_value_budget(R"(["\\",1])", 1));
+    // The default budget: exactly kMaxDefinitionJsonValues passes, one more does not.
+    const auto at_budget = [](std::size_t values) {
+        std::string s = "[";
+        for (std::size_t i = 1; i < values; ++i)
+            s += "1,";
+        s += "1]";
+        return s;
+    };
+    CHECK_FALSE(json_exceeds_value_budget(at_budget(yuzu::server::kMaxDefinitionJsonValues)));
+    CHECK(json_exceeds_value_budget(at_budget(yuzu::server::kMaxDefinitionJsonValues + 1)));
     std::string hostile = "[";
     for (int i = 0; i < 150'000; ++i)
         hostile += "[],";

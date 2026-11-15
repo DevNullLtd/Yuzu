@@ -110,9 +110,10 @@ inline constexpr std::size_t kMaxDefinitionImportDescriptionLen = 16 * 1024;
 inline constexpr std::size_t kMaxDefinitionInstructionSetIdLen = 128;   ///< `instruction_set_id`, 0..128
 /// The most structural values (`[`, `{` and `,` outside a string literal) a definition request or
 /// import body may hold. nlohmann::json builds roughly 30 to 100 bytes per value, so a 16 MiB body
-/// of `[],[],...` (about 5.6 million values) became a 258 to 429 MiB tree per request, and a few
-/// concurrent ones exhausted the memory of the server. A definition is a few hundred values; the
-/// largest bundled one is far below this.
+/// of `[],[],...` (about 5.6 million values, 11 million counted characters) became a 258 to 429 MiB
+/// tree per request, and eight concurrent ones were killed for exceeding a 2 GB memory limit.
+/// A request that gains a `created_by` on the way (the legacy import) has one more comma counted.
+/// A definition is a few hundred values; the largest bundled one is far below this.
 inline constexpr std::size_t kMaxDefinitionJsonValues = 100'000;
 /// True when `body` holds more than `max_values` structural values. A raw-text scan that runs
 /// BEFORE any parse (so the tree it protects against is never built) and skips string literals

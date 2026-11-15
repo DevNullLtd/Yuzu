@@ -1738,7 +1738,7 @@ TEST_CASE("DELETE /api/v1/instructions/{id}: a control byte in the id is refused
 // routes refuse one by value count BEFORE parsing. Turns red if parse_object_body stops checking
 // the budget (a 200 KB body is then parsed and answered by the store, not with this 400 text).
 TEST_CASE("POST /api/v1/instructions/import: a body of more than the value budget is refused 400 "
-          "before it is parsed",
+          "with no audit row and no store call",
           "[pg][server][instruction_authoring]") {
     YUZU_REQUIRE_PG_DB_TPL(db, authoring_tpl);
     PgWired w{db.dsn()};
@@ -1753,11 +1753,55 @@ TEST_CASE("POST /api/v1/instructions/import: a body of more than the value budge
     REQUIRE(refused);
     CHECK(refused->status == 400);
     CHECK(refused->body.find("too many values") != std::string::npos);
+    // The route's own text and no audit row: the store was never reached.
+    CHECK(refused->body.find("instruction-import") == std::string::npos);
+    CHECK(h.audits.empty());
+    // Duplicate keys collapse on parse, so only a check on the RAW text refuses this body.
+    std::string duplicate_keys = R"({"a":1)";
+    for (int i = 0; i < 100'000; ++i)
+        duplicate_keys += R"(,"a":1)";
+    duplicate_keys += "}";
+    auto dup = h.sink.Post("/api/v1/instructions/import", duplicate_keys);
+    REQUIRE(dup);
+    CHECK(dup->status == 400);
+    CHECK(dup->body.find("too many values") != std::string::npos);
+    CHECK(h.audits.empty());
 
     // The store's own import refuses it the same way when a caller reaches it directly.
     auto direct = w.store.import_definition_json(hostile);
     REQUIRE_FALSE(direct.has_value());
     CHECK(direct.error().find("too many values") != std::string::npos);
+}
+
+// UP-4 bypass: a JSON-ENCODED STRING field is opaque to the whole-body scan and is re-parsed by the
+// store, so each such field carries its own budget. Uses the trusted import (the signature gate
+// sits before these field checks). Turns red if a field's check is removed (the import then
+// succeeds or fails for another reason).
+TEST_CASE("InstructionStore import: a JSON-encoded string field over the value budget is refused",
+          "[pg][server][instruction_authoring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, authoring_tpl);
+    PgWired w{db.dsn()};
+    std::string hostile = "[";
+    for (int i = 0; i < 60'000; ++i)
+        hostile += "[],";
+    hostile += "[]]";
+    for (const char* field : {"parameter_schema", "result_schema", "visualization_spec",
+                              "response_templates_spec"}) {
+        INFO(field);
+        json envelope{{"id", std::string("authoring.budget.") + field},
+                      {"name", "Budget"},
+                      {"version", "1.0"},
+                      {"type", "question"},
+                      {"plugin", "os_info"},
+                      {"action", "os_name"},
+                      {"yaml_source", kYaml}};
+        envelope[field] = hostile;
+        auto refused = w.store.import_definition_json_trusted(envelope.dump());
+        REQUIRE_FALSE(refused.has_value());
+        CHECK(refused.error().find(field) != std::string::npos);
+        CHECK(refused.error().find("too many values") != std::string::npos);
+        CHECK_FALSE(w.get(std::string("authoring.budget.") + field).has_value());
+    }
 }
 
 TEST_CASE("POST /api/v1/instructions/import: unsigned is refused by default; accepted only when "

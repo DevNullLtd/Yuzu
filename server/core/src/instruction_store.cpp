@@ -1429,9 +1429,21 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                 "instruction-import parameter_schema nests too deeply (flatten to at most {} "
                 "levels)",
                 mcp::kMcpMaxJsonDepth));
+        // The whole-body value budget cannot see inside this string (a string literal's
+        // structure is invisible to that scan by design), and the write-time schema check
+        // parses it, so it carries its own budget.
+        if (json_exceeds_value_budget(def.parameter_schema))
+            return std::unexpected(std::format(
+                "instruction-import parameter_schema holds too many values (at most {})",
+                kMaxDefinitionJsonValues));
     }
-    if (parsed.contains("result_schema"))
+    if (parsed.contains("result_schema")) {
         def.result_schema = parsed.value("result_schema", "{}");
+        if (json_exceeds_value_budget(def.result_schema))
+            return std::unexpected(std::format(
+                "instruction-import result_schema holds too many values (at most {})",
+                kMaxDefinitionJsonValues));
+    }
     if (parsed.contains("approval_mode"))
         def.approval_mode = parsed.value("approval_mode", "auto");
     if (parsed.contains("concurrency_mode"))
@@ -1481,6 +1493,13 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                 "instruction-import visualization_spec nests too deeply (flatten to at most "
                 "{} levels)",
                 mcp::kMcpMaxJsonDepth));
+        }
+        // And its value budget, for the same reason as parameter_schema above: normalize_to_array
+        // re-parses this string.
+        if (v->is_string() && json_exceeds_value_budget(v->get_ref<const std::string&>())) {
+            return std::unexpected(std::format(
+                "instruction-import visualization_spec holds too many values (at most {})",
+                kMaxDefinitionJsonValues));
         }
         def.visualization_spec = normalize_to_array(*v);
     }
@@ -1545,6 +1564,14 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                     "instruction-import response_templates_spec nests too deeply (flatten to "
                     "at most {} levels)",
                     mcp::kMcpMaxJsonDepth));
+            } else if (json_exceeds_value_budget(s)) {
+                // The same for breadth (the string is at most 256 KiB, but a re-parse of that
+                // many tiny values still builds a tree many times the string); same whole-import
+                // refusal as the depth case.
+                return std::unexpected(std::format(
+                    "instruction-import response_templates_spec holds too many values (at most "
+                    "{})",
+                    kMaxDefinitionJsonValues));
             } else {
                 auto inner = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
                 if (inner.is_discarded()) {

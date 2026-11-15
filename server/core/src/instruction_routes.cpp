@@ -20,6 +20,7 @@
 #include <charconv>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -56,9 +57,9 @@ bool refuse_cross_site_write(const Deps& deps, const httplib::Request& req, http
 /// The legacy import body with `created_by` set to the authenticated caller. The document's own
 /// `created_by` is unsigned (the signature covers `yaml_source` only), so a caller could name any
 /// creator in the audit-relevant column; the v1 and MCP twins overwrite it the same way. A body
-/// that is not a depth- and breadth-safe JSON object (nesting and value budget) is returned unchanged: the store then refuses it exactly
-/// as before (same status, same audit row). `username` is empty when no session resolves, as for
-/// the POST create route.
+/// that is not a depth- and breadth-safe JSON object (nesting and value budget) is returned
+/// unchanged: the store then refuses it exactly as before (same status, same audit row).
+/// `username` is empty when no session resolves, as for the POST create route.
 std::string stamp_import_creator(const std::string& body, const std::string& username) {
     if (mcp::json_exceeds_depth(body, mcp::kMcpMaxJsonDepth) || json_exceeds_value_budget(body))
         return body;
@@ -167,6 +168,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         try {
+            if (json_exceeds_value_budget(req.body))
+                throw std::invalid_argument("request body holds too many values");
             auto j = nlohmann::json::parse(req.body);
             InstructionDefinition def;
             // #402 / iter-H1: honor caller-supplied `id` so the
@@ -334,6 +337,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         try {
+            if (json_exceeds_value_budget(req.body))
+                throw std::invalid_argument("request body holds too many values");
             auto j = nlohmann::json::parse(req.body);
 
             // Read existing definition to preserve fields not in the update.
