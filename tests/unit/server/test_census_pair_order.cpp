@@ -2175,3 +2175,59 @@ TEST_CASE("census pair order, B3: a batch row decided as a duplicate counts on t
     CHECK(order_text(db.dsn(), "a") == "5|10|-|0|0|0|1|0|1|0");
     CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate");
 }
+
+TEST_CASE("census pair order, B3: a lower-epoch pending event that commits after a newer verdict "
+          "folds its key, so the next in-order events stay flagged until a key passes it",
+          PAIR_TAGS) {
+    // Writer W's event is of epoch 4 with a high stamp. It is inserted first, parks between the
+    // agent step's Ensure and DECIDE, and is decided against the clock a newer epoch-5 event has
+    // meanwhile advanced: refused as a regression, and its census write fails, so it is stored
+    // pending although it is OLDER by arrival than the epoch-5 verdict. The next events see it as
+    // a pending peer: the fold must raise the mark to its key (a peer of another epoch than the
+    // row, not later by arrival, not higher by pair: only the different-epoch term of the
+    // regime-aware test sees it), so the second event after it, whose stamp is above the first's
+    // but below the pending one's, is NOT clean. Dropping that term leaves it clean.
+    PAIR_FIXTURE();
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("e0", "r1", "a", kCompliant, 1000), 5, 1))
+            .outcome == EventInsertOutcome::Inserted);
+    FailSwitch fail(db.dsn());
+    EventInsertResult res_w;
+    BarrierHold hold;
+    store.set_agent_step_gap_hook_for_test([&](AgentStepGap gap, const std::string&) {
+        if (gap == AgentStepGap::EnsureToDecide)
+            hold.hit();
+    });
+    AgentHookGuard hook_guard(store);
+    WriterThreads writers(store, &hold);
+    writers.start([&] {
+        res_w = store.insert_event_classified(
+            with_pair(stamped("w1", "r1", "a", kDrifted, 9000), 4, 9));
+    });
+    REQUIRE(hold.reached_f.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    REQUIRE(store.insert_event_classified(with_pair(stamped("v1", "r1", "a", kErrored, 1100), 5, 2))
+                .outcome == EventInsertOutcome::Inserted);
+    REQUIRE(verdict(db.dsn(), "a", "r1") == "E - 5/2");
+    fail.on(); // W's census write (a refusal that flags the row) now fails
+    writers.join_all();
+    fail.off();
+    CHECK(res_w.outcome == EventInsertOutcome::Inserted);
+    CHECK(pending_count(db.dsn()) == "1");
+    CHECK(verdict(db.dsn(), "a", "r1") == "E - 5/2"); // W's refusal left no mark on the row
+
+    // X: the fold sees the pending epoch-4 event, flags the row and raises the mark to 9000 s.
+    REQUIRE(store.insert_event_classified(with_pair(stamped("x1", "r1", "a", kDrifted, 1200), 5, 3))
+                .outcome == EventInsertOutcome::Inserted);
+    CHECK(verdict(db.dsn(), "a", "r1") == "D F 5/3");
+    CHECK(pending_count(db.dsn()) == "0");
+    // Y: in order, a stamp above X's and below the pending event's: still flagged.
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("y1", "r1", "a", kCompliant, 1300), 5, 4))
+            .outcome == EventInsertOutcome::Inserted);
+    CHECK(verdict(db.dsn(), "a", "r1") == "C F 5/4");
+    // Z: a stamp past the folded key clears it.
+    REQUIRE(
+        store.insert_event_classified(with_pair(stamped("z1", "r1", "a", kErrored, 10000), 5, 5))
+            .outcome == EventInsertOutcome::Inserted);
+    CHECK(verdict(db.dsn(), "a", "r1") == "E - 5/5");
+}
