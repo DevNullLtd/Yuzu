@@ -17,8 +17,8 @@ plugin", step 6). This script is that regression:
      `active` (`active_unproven` is accepted, with a note, when no --probe-target was given: the plugin
      only calls a containment proven when it could probe a non-loopback target before and after), then ALWAYS dispatch
      `firewall.release` (also on any failure; SIGINT/SIGTERM/SIGHUP are noted and the release still
-     runs; a refused release is dispatched again, up to 3 times) and require the status to read
-     `inactive` again.
+     runs; a release is dispatched again, up to 3 times in all, while the host reads inactive but no release
+     of this run is proven, e.g. after a refused one) and require the status to read `inactive` again.
 
 DO NOT RUN THE CONTAINMENT STEP ON A REMOTE / SSH-ONLY HOST. It briefly blocks all traffic except
 the allow set (loopback plus the agent's control channel). It refuses to run when an SSH session
@@ -28,7 +28,7 @@ long-lived tmux/screen session can drop, so --i-have-console-access is the real 
 URL must be loopback (this host); that checks the URL, not the network path, so it is also a
 precondition that the server and its stores are reachable over loopback while this host is contained
 (a server whose Postgres is published from a Docker network is not: the containment would cut it off
-and the release could not be dispatched, exit 3). --ttl-seconds must be at least 300 (default 600;
+and the release could not be dispatched, exit 3). --ttl-seconds must be at least 300 (default 900;
 0 and negative values are refused in apply mode), so the limit outlasts the release confirmation and
 still ends a containment after a SIGKILL or a power loss. Run it on a local box with a keyboard and a
 screen. The login user needs read access to /api/agents (Infrastructure:Read), which is how a login is
@@ -93,7 +93,7 @@ RELEASE_ATTEMPTS = 3  # a `busy` or otherwise refused release is dispatched agai
 # poll, and a release that has to be retried runs past the floor: the dead-man limit is the backstop for
 # that tail, not a promise it cannot occur. The default leaves headroom over the floor for the tail.
 MIN_TTL_S = 300
-DEFAULT_TTL_S = 600
+DEFAULT_TTL_S = 900  # the floor plus the retried-release tail (about 646 s worst case) with headroom
 # CommandResponse.status (proto/yuzu/agent/v1/agent.proto): only SUCCESS is an answer; RUNNING is an
 # interim row to poll past; FAILURE, TIMEOUT and REJECTED carry no usable status.
 STATUS_RUNNING, STATUS_SUCCESS = 0, 1

@@ -571,6 +571,16 @@ class Flow(unittest.TestCase):
         self.assertEqual(rc, fc.EXIT_FAIL)  # ok is False (never read active), but the second release ran
         self.assertEqual(calls.count("release"), 2)
 
+    def test_login_reads_the_agents_once_and_the_attempts_are_three(self):
+        c = fc.Client("http://127.0.0.1:9")
+        reads = []
+        with mock.patch.object(c.opener, "open", return_value=mock.MagicMock()), \
+                mock.patch.object(c, "get_json", side_effect=lambda p: reads.append(p) or {"agents": []}):
+            self.assertEqual(c.login("a", "b"), {"agents": []})
+        self.assertEqual(reads, ["/api/agents"])
+        self.assertEqual(fc.RELEASE_ATTEMPTS, 3)  # the docstring and the TTL budget both say three
+        self.assertGreaterEqual(fc.DEFAULT_TTL_S, 646)  # the worst case with every attempt used
+
     def test_a_truncated_agents_payload_at_login_is_exit_2(self):
         client = mock.MagicMock()
         client.login.side_effect = fc.LoginError("login failed: IncompleteRead")
