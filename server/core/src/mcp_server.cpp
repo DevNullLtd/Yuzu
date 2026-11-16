@@ -12942,9 +12942,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     {AT::kInt, "limit", 1, 1000},
                     {AT::kString, "cursor", 0, 2048}};
                 static constexpr sra::ArgSpec kEffectiveArgs[] = {{AT::kString, "agent_id", 0, 128}};
+                static constexpr sra::ArgSpec kGroupArgs[] = {{AT::kString, "group_id", 0, 64}};
                 constexpr std::span<const sra::ArgSpec> kNoArgs{}; // the tools that take none
                 auto invalid = [&](std::string_view message) {
                     res.set_content(error_response(id, kInvalidParams, message), "application/json"); // retry-hint-exempt: caller-input rejection
+                };
+                // One success write for every Ok arm below; a read reply's body can be a page, so
+                // it is taken by const reference.
+                auto ok = [&](const nlohmann::json& body) {
+                    res.set_content(
+                        success_response(id, tool_result(software_catalogue::dump_safe(body),
+                                                         kObjectOutputSchema)),
+                        "application/json");
                 };
                 auto unavailable = [&](std::string_view message, std::string_view remediation,
                                        const std::optional<std::int64_t>& retry_ms) {
@@ -12954,6 +12963,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 };
                 // The strict check shared by every tool that takes arguments: an unknown key, a
                 // wrongly typed value or an out-of-range integer is refused where REST clamps.
+                // swc::strict_args_error (the two catalogue tools above) is not reused: it walks a
+                // fixed key list keyed to the catalogue's closed kind / ecosystem vocabulary and
+                // admits unknown keys, where these tools refuse them from a per-tool spec table.
                 auto strict = [&](std::span<const sra::ArgSpec> allowed) {
                     if (const auto bad = sra::strict_args_error(args, allowed)) {
                         invalid(*bad);
@@ -12991,27 +13003,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         return mcp_audit(result, detail_text.empty() ? target
                                                                      : target + "; " + detail_text);
                     };
-                    auto respond = [&](const auto& reply) {
-                        using Reply = std::decay_t<decltype(reply)>;
+                    auto respond = [&](const sra::Reply& reply) {
+                        using Kind = sra::Reply::Kind;
                         switch (reply.kind) {
-                        case Reply::Kind::Ok:
-                            res.set_content(success_response(
-                                                id, tool_result(software_catalogue::dump_safe(
-                                                                    reply.body),
-                                                                kObjectOutputSchema)),
-                                            "application/json");
+                        case Kind::Ok:
+                            ok(reply.body);
                             return;
-                        case Reply::Kind::BadRequest:
-                        case Reply::Kind::NotFound:
+                        case Kind::BadRequest:
+                        case Kind::NotFound:
                             // retry-hint-exempt: caller input, or an unknown / out-of-scope id (the
                             // same answer for both); a retry fails identically
                             res.set_content(error_response(id, kInvalidParams, reply.message),
                                             "application/json");
                             return;
-                        case Reply::Kind::Unavailable:
+                        case Kind::Unavailable:
                             unavailable(reply.message, reply.remediation, reply.retry_after_ms);
-                            return;
-                        default:
                             return;
                         }
                     };
@@ -13049,10 +13055,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             auto body = reply.body;
                             if (!audit_ok)
                                 body["audit_persisted"] = false;
-                            res.set_content(success_response(
-                                                id, tool_result(software_catalogue::dump_safe(body),
-                                                                kObjectOutputSchema)),
-                                            "application/json");
+                            ok(body);
                             return;
                         }
                         unavailable(reply.message, reply.remediation, reply.retry_after_ms);
@@ -13139,15 +13142,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         invalid("group_id must be 1 to 64 lowercase hex characters");
                         return;
                     }
-                    if (!is_write) {
-                        for (const auto& [key, v] : args.items()) {
-                            (void)v;
-                            if (key != "group_id") {
-                                invalid("unknown argument: " + audit_token(key.substr(0, 64)));
-                                return;
-                            }
-                        }
-                    }
+                    if (!is_write && !strict(kGroupArgs))
+                        return;
                 }
                 // The authority: an RBAC read that cannot be completed answers a retryable error,
                 // never a refusal or an admit (REST: 503), and a lapsed session is never recorded
@@ -13199,10 +13195,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool audit_ok = mcp_audit("success", mcp_target);
                     if (!audit_ok || !reply.audit_persisted)
                         body["audit_persisted"] = false;
-                    res.set_content(success_response(
-                                        id, tool_result(software_catalogue::dump_safe(body),
-                                                        kObjectOutputSchema)),
-                                    "application/json");
+                    ok(body);
                     return;
                 }
                 case sca::Reply::Kind::BadRequest:
