@@ -59,6 +59,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -251,16 +252,13 @@ dex_usage_match_plan(const std::vector<std::string>& subjects) {
         exact[static_cast<std::size_t>(r.subject)] += r.exact_devices;
         trunc[static_cast<std::size_t>(r.subject)] += r.trunc_devices;
     }
-    std::map<std::string, std::vector<int>> receivers; // key -> subjects that received rows via it
+    std::map<std::string, std::set<int>> receivers; // key -> subjects that received rows via it
     for (const auto& k : plan) {
         if (k.subject < 0 || static_cast<std::size_t>(k.subject) >= subject_count)
             continue;
         const auto s = static_cast<std::size_t>(k.subject);
-        if (k.trunc ? trunc[s] > 0 : exact[s] > 0) {
-            auto& v = receivers[k.key];
-            if (std::find(v.begin(), v.end(), k.subject) == v.end())
-                v.push_back(k.subject);
-        }
+        if (k.trunc ? trunc[s] > 0 : exact[s] > 0)
+            receivers[k.key].insert(k.subject);
     }
     std::vector<char> out(subject_count, 0);
     for (const auto& [key, subjects] : receivers)
@@ -400,11 +398,10 @@ struct DexUsageDisclosed {
         }
     }
     while (other.devices > 0 && other.devices < floor && !published.empty()) {
-        auto smallest = published.begin();
-        for (auto it = published.begin(); it != published.end(); ++it)
-            if (it->devices < smallest->devices ||
-                (it->devices == smallest->devices && it->label > smallest->label))
-                smallest = it;
+        const auto smallest = std::min_element(
+            published.begin(), published.end(), [](const DexUsageRawCell& a, const DexUsageRawCell& b) {
+                return a.devices != b.devices ? a.devices < b.devices : a.label > b.label;
+            });
         other.devices += smallest->devices;
         other.run_seconds += smallest->run_seconds;
         other.launches += smallest->launches;

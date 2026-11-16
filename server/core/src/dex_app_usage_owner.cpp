@@ -97,25 +97,17 @@ std::int64_t col_i64(PGresult* res, int row, int col) {
     return s == nullptr || s[0] == '\0' ? 0 : static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
 }
 
-// An int[] literal, "{}" when empty.
-std::string int_array(const std::vector<int>& v) {
+// An array literal "{tok,tok,...}" ("{}" when empty) for tokens that need no quoting:
+// integers and t/f. Text never goes through here; it stays on pg::to_text_array,
+// which escapes (trust boundary).
+template <typename Range, typename Token>
+std::string array_literal(const Range& items, Token token) {
     std::string out = "{";
-    for (std::size_t i = 0; i < v.size(); ++i) {
-        if (i != 0)
-            out.push_back(',');
-        out += std::to_string(v[i]);
-    }
-    out.push_back('}');
-    return out;
-}
-
-// A bool[] literal, "{}" when empty.
-std::string bool_array(const std::vector<char>& v) {
-    std::string out = "{";
-    for (std::size_t i = 0; i < v.size(); ++i) {
-        if (i != 0)
-            out.push_back(',');
-        out.push_back(v[i] != 0 ? 't' : 'f');
+    const char* sep = "";
+    for (const auto& item : items) {
+        out += sep;
+        out += token(item);
+        sep = ",";
     }
     out.push_back('}');
     return out;
@@ -146,33 +138,22 @@ std::optional<DexUsageRead> DexAppUsageOwner::read(const DexUsageQuery& q) const
             return std::nullopt;
         }
 
-    std::vector<std::string> ids;
-    std::vector<int> cells;
-    std::vector<char> is_linux;
+    // Views into `q`, which outlives this call.
+    std::vector<std::string_view> ids, key_text;
     ids.reserve(q.devices.size());
-    cells.reserve(q.devices.size());
-    is_linux.reserve(q.devices.size());
-    for (const auto& d : q.devices) {
-        ids.push_back(d.agent_id);
-        cells.push_back(d.cell);
-        is_linux.push_back(d.is_linux ? 1 : 0);
-    }
-    std::vector<int> key_subject;
-    std::vector<std::string> key_text;
-    std::vector<char> key_trunc;
-    for (const auto& k : q.keys) {
-        key_subject.push_back(k.subject);
-        key_text.push_back(k.key);
-        key_trunc.push_back(k.trunc ? 1 : 0);
-    }
+    key_text.reserve(q.keys.size());
+    for (const auto& d : q.devices)
+        ids.emplace_back(d.agent_id);
+    for (const auto& k : q.keys)
+        key_text.emplace_back(k.key);
 
     std::vector<std::optional<std::string>> params{
-        pg::to_text_array(views(ids)),
-        int_array(cells),
-        bool_array(is_linux),
-        int_array(key_subject),
-        pg::to_text_array(views(key_text)),
-        bool_array(key_trunc),
+        pg::to_text_array(ids),
+        array_literal(q.devices, [](const DexUsageDevice& d) { return std::to_string(d.cell); }),
+        array_literal(q.devices, [](const DexUsageDevice& d) { return d.is_linux ? "t" : "f"; }),
+        array_literal(q.keys, [](const DexUsageKey& k) { return std::to_string(k.subject); }),
+        pg::to_text_array(key_text),
+        array_literal(q.keys, [](const DexUsageKey& k) { return k.trunc ? "t" : "f"; }),
         pg::to_text_array(views(q.subjects)),
         q.since_iso,
         q.until_iso,

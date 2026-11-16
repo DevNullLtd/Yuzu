@@ -256,6 +256,20 @@ TEST_CASE("usage disclose at floor 10: a sub-floor cell merges and the smallest 
     check_invariants(d, in, 10);
 }
 
+TEST_CASE("usage disclose at floor 10: equal-sized cells fold the greatest label first",
+          "[dex][usage_model]") {
+    const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Named, "a", 12),
+                                          raw(DexUsageCellKind::Named, "b", 12),
+                                          raw(DexUsageCellKind::Named, "c", 3)};
+    const auto d = dex_usage_disclose(in, 10);
+    REQUIRE(d.cells.size() == 2);
+    CHECK(d.cells[0].label == "a"); // the tie goes to the greater label, so b is the one suppressed
+    CHECK(d.cells[0].devices == 12);
+    CHECK(d.cells[1].kind == DexUsageCellKind::Other);
+    CHECK(d.cells[1].devices == 15); // c's 3 plus b's 12
+    check_invariants(d, in, 10);
+}
+
 TEST_CASE("usage disclose at floor 10: all-small cells become one other", "[dex][usage_model]") {
     const std::vector<DexUsageRawCell> in{raw(DexUsageCellKind::Named, "a", 4),
                                           raw(DexUsageCellKind::Named, "b", 4),
