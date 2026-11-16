@@ -4,6 +4,39 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: a service-scoped credential's execution visibility is limited to its service scope (#5557)
+
+**In short.** Affected: integrations that read executions with a service-scoped API token (one created with `scope_service`). To do: treat not found as "not yet" until an agent in the token's service scope has replied, poll no faster than about once every 5 seconds and stop after a timeout, or read the execution with the credential that dispatched it.
+
+**What changed.**
+
+- **Visibility rule.** A service-scoped API token (one created with `scope_service`) sees an execution only when an agent in its service scope has a status row for it (a row is written when that agent's response arrives), with the counts, per-agent array and error text limited to those agents. Before this change its session carried the account that minted it, and the "the caller dispatched it" rule matched on that account, so the token also saw every execution its minting account had dispatched, including executions on agents outside the service scope (id, definition, status, dispatched-by and timing; the counts were projected). That rule is now removed for a service-scoped token on every execution read surface: `GET /api/v1/executions`, `/{id}` and `/children`, `GET /api/v1/events`, the legacy `/api/executions*` routes, the executions list and detail fragments, `GET /sse/executions/{id}`, and the MCP tools `get_execution_status`, `get_execution_children` and `list_executions` (`summarize_working_set` stays denied to a service-scoped token). An execution the token may not see reads as not found on each surface, the same response an unknown id gets, and a service scope with no tagged agent lists nothing.
+- **MCP `list_executions` widens as well as narrows.** A service-scoped token used to list only the executions its minting account had dispatched (an owner-only filter). It now takes the same admission as `GET /api/v1/executions`: every execution with a status row for an agent in its service scope, whoever dispatched it, with the counts projected to those agents. It therefore newly sees other principals' executions that touched its agents, and stops seeing its minter's executions that did not. A management-group-confined caller that is not service-scoped keeps the owner-only filter on this tool.
+- **What an in-scope execution discloses.** Every execution a service-scoped token can see names the dispatching operator in `dispatched_by`, which can be an account other than the one that minted the token; the REST v1 routes, the dashboard and a management-group-confined caller already behaved this way, and MCP `list_executions` and `get_execution_status` now match them. `rerun_of` (list and detail rows) and `parent_id` (detail) can name an execution the token cannot itself see, because they are copied from the visible row.
+- **Visibility follows the current tag.** The rule is evaluated on each request against the agents currently tagged with the service, not against a snapshot. Retagging an agent into the service makes the executions that agent has already answered visible, including earlier ones, retagging it out hides them again, and a list read and a detail read taken either side of a retag can disagree.
+- **Known limit: an open stream keeps the scope it attached with.** The scope of `GET /api/v1/events` and `GET /sse/executions/{id}` is fixed when the stream attaches. Revoking the token, retagging an agent out of the service scope or switching RBAC enforcement off does not close a stream that is already open. This was already true for every confined caller and is tracked as #7815; to end an open stream now, restart the replica holding it (the event bus is in-process, so a stream lives in the server process that accepted it). The MCP progress bridge's per-call record behaves the same way: it keeps the scope it was reserved with until its execution settles.
+- **Known limit: the number of withheld events is inferable.** Event ids on those two streams are per-execution counters, one per published event, and the raw id reaches the client. A service-scoped token (or a management-group-confined caller) can therefore infer how many events were withheld from an execution it is admitted to, roughly two per status update of an agent outside its scope, from gaps between the ids it receives and the id on the terminal frame, and on `GET /api/v1/events` from the `replay-gap` frame's `missing_to`. No event content and no per-agent attribution is disclosed. The ids cannot be renumbered per connection without breaking `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
+- **Not changed.** The real dispatch attribution (`dispatched_by` on a rerun, the audit rows) and every other caller class (cookie sessions, tokens without a service scope, engine principals) are unchanged. A service-scoped token is still refused at the `Execution:Execute` check of the command, stored-instruction execute, cancel and rerun routes and of MCP `execute_instruction`, so this change affects what it can read and not what it can do. There is no schema change, no new flag and nothing to migrate.
+- **Two list gates refuse a malformed credential.** `require_fleet_read` (every fleet-read route) and `require_list_read` (every list-read rollup route) now refuse a service-scoped engine session with `403` before any store read, and refuse any admit that would have given a service-scoped session unrestricted authority with a non-retryable `500`. Minting already forbids a service-scoped engine token, so no credential the server issues changes behaviour; only a corrupted credential row does, from an unfiltered read to a refusal. The refusals are audited under `auth.fleet_read_required` and `auth.permission_required` and counted in `yuzu_server_authz_service_scope_unrestricted_refused_total{gate,site}` (present at 0 from boot; no alert rule ships for it).
+
+**Who is affected.** Integrations that hold a service-scoped token and read executions: one that expected to see its minting account's executions outside its service scope no longer does, and one that dispatches with a different credential of the same account (a token without `scope_service`) and then polls with the service-scoped token now gets not found (`404` on REST, an error result on the MCP tools) until the first agent in its service scope has responded. MCP `list_executions` callers using a service-scoped token also see other principals' in-scope executions.
+
+**What to do.** Treat not found on an execution you dispatched with another credential as "not yet" until an in-scope agent has replied, or read it with the credential that dispatched it. Bound the poll: every not-found answer to a service-scoped token writes a `denied` audit row (`execution.detail.fetch` for the REST detail route, `execution.read` for the legacy routes and the children routes, `api.v1.events.subscribe`, `execution.live_subscribe`, `execution.detail.view` for the detail fragment, and `mcp.get_execution_status` for the MCP tool), one per request and with no throttle (a throttle is tracked as #7818), so poll no faster than about once every 5 seconds and stop after a timeout. Do not derive the poll interval from a visible execution's 2 s hint (`retry_after_ms` on the MCP `get_execution_status` result of a still running execution): a not-found answer carries none. An execution whose targets are all outside the service scope never becomes visible to the token (no in-scope agent ever has a status row for it), so the poll timeout is what ends such a poll. A SIEM rule on those denied verbs can false-positive on a legitimate poller; exclude the token's principal or alert on a rate rather than on a single row. The minting account's own dispatches no longer reach a service-scoped token, so the earlier advice to mint it from an account that only dispatches inside the service scope no longer applies. Expect the new refusal counter to stay at zero; a non-zero value means a credential row or the server needs investigating. For `site="engine_entry"` (the `403`), find the credential from the audit row's principal, revoke it and create a new one (or revoke and re-create the engine principal), and investigate how the row came to carry a service scope, because minting refuses that combination. The `403` message text still reads `permission denied: <permission>` and so names the pair although no grant of it admits the caller; the body carries no `permission` field, and granting the permission does not help. For `site="postcondition"` (the non-retryable `500`) there is no credential to fix: the server logged a `critical` line and wrote a `failure` audit row for the principal, so capture both and report a defect.
+
+**Rolling upgrade.** The rule is applied per replica, so a replica that has not been upgraded still shows a service-scoped token its minting account's executions, and a client can see the old and the new answer on consecutive requests; finish the roll promptly. An old replica does not expose the new refusal counter, so its series is absent rather than zero: run `up{job=~"<server job regex>"} == 1 unless on(instance) count by (instance) (yuzu_server_authz_service_scope_unrestricted_refused_total)` to find any scraped replica that has not been upgraded (a replica that is down also lacks the series, and `up == 1` does not list it, so check the replica's health separately).
+
+## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
+
+**In short.** Affected: a caller whose `Execution:Read` does not cover the fleet (a management-group-scoped grant, or none), or whose `Execution:Read` check cannot be resolved for that call, when it calls `execute_instruction` with a `_meta.progressToken` on a streaming session. To do: poll `get_execution_status` for the counts it may see. A caller with an unrestricted `Execution:Read` sees the same frames as before.
+
+**What changed.** The MCP stream bridge used to send such a caller fleet-wide `agents_responded`/`agents_targeted` progress notifications and a final result carrying `agents_success` and `agents_failure` for its own dispatch, counts that `GET /api/v1/events` withholds from the same principal. The bridge now applies the same projection: the caller receives no progress notifications, and the final result carries the real `status` (a cancelled or failed execution is reported as such) with neither `agents_success` nor `agents_failure`. An absent count is omitted, not reported as 0. The plain tool result of the dispatch (including `agents_reached`) is unchanged.
+
+**Unresolved scope.** If the `Execution:Read` check cannot be resolved for the request (the gate refuses it, is unwired or throws), the bridge uses this restricted view and the dispatch still succeeds. An unwired gate or a throw writes a server error log line and is not counted by a metric. A caller with `Execution:Execute` but no `Execution:Read` at all writes one `auth.fleet_read_required` denial row per `execute_instruction` call that carries a progress token, streamed or not (see [Audit log](audit-log.md)); that row has no tool or execution correlation, so correlate it by timestamp, principal and source IP.
+
+**What to do.** Poll `get_execution_status` (or read `GET /api/v1/events` with the same credential) for the counts the caller may see. Grant `Execution:Read` without a management-group limit only if the caller should see fleet-wide counts.
+
+**Rolling upgrade.** The projection is applied per replica, so a replica that has not been upgraded still sends the fleet-wide counts to such a caller.
+
 ## Behaviour change: the bulk device-CI read `GET /api/v1/hardware-ci` and a new index on `device_ci`
 
 **What changed.** This release adds `GET /api/v1/hardware-ci`, the bulk device-CI read: one keyset page of the stored CI records of every device (the scalar CI block, the stored `content_hash` and the `blob_version`, no sections), with the MCP twin `list_hardware_ci_records`. It is a new route and changes no existing one: `GET /api/v1/hardware/{id}` still serves a device whose agent id is literally `ci`.
@@ -780,9 +813,9 @@ Not covered by this change, among others: `POST /api/command`, MCP `execute_inst
 
 The `GET` deny runs after the kill switches, the `Origin` check, the protocol-version check and authentication, so those still answer first. It is audited with result `failure`, like every other `mcp.session.reject` denial.
 
-**Who is affected.** Clients that hold a service-scoped token and use the `GET` channel: they can no longer resume or watch a stream. A streamed `POST` from the same token still delivers its progress frames and result inline on its own response, and durable results stay fetchable by `execution_id`. Clients that created a session with one credential and then used a different class with the same user (for example a `supervised` token to create the session and a `readonly` token, a tierless token or a browser cookie to use it) are also affected. Rotating an API token or signing in again with the same login method keeps the same class, so those sessions carry on; a `local`, an `oidc` and a `saml` sign-in are different classes. A client that sends both a session cookie and a Bearer token is classed by the cookie while the cookie is valid, so when the cookie expires it changes class and its next request answers `404`: send one credential per session.
+**Who is affected.** Clients that hold a service-scoped token and use the `GET` channel: they can no longer resume or watch a stream. A streamed `POST` of a tool the token is admitted to still delivers its progress frames and result inline on its own response. `execute_instruction` is not such a tool: its `Execution:Execute` check refuses a service-scoped token. A service-scoped token can read an execution by `execution_id` only once an agent in its service scope has a status row for it (#5557). Clients that created a session with one credential and then used a different class with the same user (for example a `supervised` token to create the session and a `readonly` token, a tierless token or a browser cookie to use it) are also affected. Rotating an API token or signing in again with the same login method keeps the same class, so those sessions carry on; a `local`, an `oidc` and a `saml` sign-in are different classes. A client that sends both a session cookie and a Bearer token is classed by the cookie while the cookie is valid, so when the cookie expires it changes class and its next request answers `404`: send one credential per session.
 
-**What to do.** For a service-scoped integration, use a token without `scope_service` if it needs the `GET` channel, or rely on the streamed `POST` response and `execution_id` polling. A service-scoped integration that needs an event stream can use `GET /api/v1/events?execution_id=...`, which is gated by the fleet-read confinement and admits a service-scoped token when RBAC enforcement is in effect and the token's authority ceiling holds `Execution:Read` (known limit #5557: it also shows executions the token's minter dispatched outside the service scope, with their id, definition, status and timing visible). For a client that sees `404` on a session id it still believes is live, call `initialize` again with the credential it is actually using; an SDK client that follows the MCP specification does this on its own, and it is safe because the original session is not terminated. Alert rules need no change; add `service_scoped` and `credential_mismatch` to any dashboard that breaks `yuzu_mcp_stream_rejects_total` out by `reason`.
+**What to do.** For a service-scoped integration, use a token without `scope_service` if it needs the `GET` channel. A service-scoped token cannot dispatch through `execute_instruction` (the `Execution:Execute` check refuses it), so there is no streamed dispatch for it to rely on; it can poll `GET /api/v1/executions/{execution_id}` for an execution once an agent in its service scope has a status row for it, and before that the call answers `404` (#5557). A service-scoped integration that needs an event stream can use `GET /api/v1/events?execution_id=...`, which is gated by the fleet-read confinement and admits a service-scoped token when RBAC enforcement is in effect and the token's authority ceiling holds `Execution:Read`; it admits the token only once an agent in its service scope has a status row for the execution (#5557). For a client that sees `404` on a session id it still believes is live, call `initialize` again with the credential it is actually using; an SDK client that follows the MCP specification does this on its own, and it is safe because the original session is not terminated. Alert rules need no change; add `service_scoped` and `credential_mismatch` to any dashboard that breaks `yuzu_mcp_stream_rejects_total` out by `reason`.
 
 **Residuals.** Two credentials of one user in the same class are interchangeable on a session. The class does not include JIT admin elevation, which is per-request state: a non-elevated cookie session that obtains an elevated session's id could receive that session's replayed frames. Only cookie sessions can be elevated, and they are refused at `/mcp/v1/` by the tier requirement (#4309, next section), which closes this replay path. The session id (128-bit, returned only in the `initialize` response header) is still bearer-like within its class and should be protected like a credential. Stream liveness is principal-level: the class is checked when the stream attaches and is not re-derived from the live credential afterwards (the per-tick credential recheck compares the principal only, and the per-tick session check compares the class captured at attach). Sessions are in-memory per server replica, so there is no schema change and no change to high availability.
 
@@ -3860,20 +3893,31 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
 
 ## Behaviour change: protective actions exempt from plugin enablement
 
-**What changed.** Five `plugin.action` pairs are now *protective*: the quarantine plugin's
+**What changed.** Nine `plugin.action` pairs are now *protective*: the quarantine plugin's
 `quarantine.quarantine`, `quarantine.unquarantine`, `quarantine.status` and `quarantine.whitelist`,
-and the Guardian rule push `__guard__.push_rules`. No plugin-enablement gate refuses them any more:
+the firewall plugin's four containment actions `firewall.quarantine`, `firewall.release`,
+`firewall.quarantine_status` and `firewall.quarantine_allow`, and the Guardian rule push
+`__guard__.push_rules`. No plugin-enablement gate refuses them any more:
 not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-presence read), not
-the plugin-presence filter, and not a degraded plugin-config store. The set is closed. The four
-quarantine actions are **newly** exempt; before this change only the containment gate exempted
-them. Decision record: the 2026-10-12 update in [ADR-3005](../adr/3005-plugin-config-store.md).
+the plugin-presence filter, and not a degraded plugin-config store. The set is closed: the other
+firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The four quarantine actions are
+**newly** exempt; before this change only the containment gate exempted them. The firewall four were
+added to the set later, so a kill-switch row you hold on one of them stops taking effect on
+upgrade. The containment gate's own exemption is a separate, narrower predicate and still names the
+quarantine plugin only: while the quarantine store cannot be read for longer than a minute, that gate
+refuses every non-exempt dispatch, whichever device it names, including the four firewall actions, until
+the store answers again (the follow-up that moves the containment gate onto the firewall plugin is #7437).
+Decision record: the 2026-10-12 and 2026-11-13 updates in
+[ADR-3005](../adr/3005-plugin-config-store.md).
 
 A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
-inert**: it no longer stops dispatch. A plugin-level `quarantine` / `__guard__` row never stops the
+inert**: it no longer stops dispatch. A plugin-level `quarantine` / `firewall` / `__guard__` row never stops the
 plugin's protective actions either, and still gates any non-protective action the plugin declares
-(none today: `quarantine` declares only the four, and `__guard__` dispatches only `push_rules`). A
+(`quarantine` declares only its four and `__guard__` dispatches only `push_rules`; a plugin-level
+`firewall` row still gates `firewall.state` and `firewall.rules`). A
 `PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
-detail and logs a warning. If you stopped Guardian rule delivery by switching
+detail (`protective_exempt=partial` for a plugin-level `firewall` row, which still gates `state` and
+`rules`) and logs a warning. If you stopped Guardian rule delivery by switching
 `__guard__.push_rules` off, that stop **ends when you upgrade**: rules deploy on the next Baseline
 deploy or heartbeat reconcile.
 
@@ -3881,8 +3925,8 @@ deploy or heartbeat reconcile.
 
 1. **Find held rows.** There is no list route. Search the audit log for
    `plugin_config.kill_switch.set` entries whose `target_id` is `__guard__.push_rules`,
-   `quarantine.<action>` or the plugin-level `__guard__` / `quarantine`, each with an optional `@<os>`
-   suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
+   `quarantine.<action>`, `firewall.<action>` (one of the four containment actions) or the plugin-level
+   `__guard__` / `quarantine` / `firewall`, each with an optional `@<os>` suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
    `enabled=true` supersedes an earlier OFF, so take the latest `result=success` row per `target_id`.
    Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
    plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant, reading `source` in the response: it names the row that wins.
@@ -3893,25 +3937,27 @@ deploy or heartbeat reconcile.
    already in flight. No lever stops delivery while leaving armed Guards armed: the old switch did
    that, but disabling or removing a rule disarms it on the next reconcile. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
    (remove). `PluginConfig:Write` alone no longer stops anything, and a service-scoped token is
-   denied on rule writes. A `quarantine.*` hold has no replacement switch: those actions are
-   governed by their permission (`Security:Execute` on the catalogue rows) and any approval policy,
-   not by enablement.
+   denied on rule writes. A `quarantine.*` or `firewall.<containment action>` hold has no
+   replacement switch: those actions are governed by their permission (`Security:Execute` on the
+   catalogue rows) and any approval policy, not by enablement. A plugin-level `firewall` row you hold
+   keeps gating `firewall.state` and `firewall.rules`.
 
 Also be aware of:
 
 - **Rollback.** An older server has no exemption and honours stored OFF rows again, which can strand
   a quarantine release or hold back a rule push. Before rolling back, `PUT enabled=true` on every
-  protective-pair OFF row you found (each layer and OS), then roll back.
+  protective-pair OFF row you found (each layer and OS, including the `firewall` rows), then roll back.
 - **Mixed versions.** During a rolling upgrade an older replica still honours a held row (or a degraded store or
   plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
   heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
   `enforce` rules, so expect a burst of arming rather than a gradual one.
-- **Agents without the quarantine plugin.** The server no longer withholds a protective dispatch
-  because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
+- **Agents without the quarantine or firewall plugin.** The server no longer withholds a protective
+  dispatch because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
   plugin registry **accepted the frame**; it is never proof of isolation. A
   device whose agent lacks the plugin answers its own "plugin not found", and
-  `YuzuQuarantineEndpointUnconfirmed` can fire for it. Verify containment with `quarantine.status`,
-  and upgrade agents before you rely on quarantine.
+  `YuzuQuarantineEndpointUnconfirmed` can fire for a quarantine-plugin containment of it (no alert covers a firewall containment yet). Verify containment with `quarantine.status` (or
+  `firewall.quarantine_status` for a firewall containment), and upgrade agents before you rely on
+  quarantine.
 - **Integrations.** The kill-switch `GET` and `PUT` responses are unchanged: `enabled=false` for a
   protective pair is a stored row, not the dispatch decision. The `os_gate_unreadable`,
   `plugin_not_found` and `kill_switched_os` zero-reach causes are never produced for a protective
@@ -4237,22 +4283,19 @@ plus one new prerequisite.**
   your scope." instead of "No executions yet.", because out-of-scope executions may exist. Until an
   in-scope agent replies, a confined caller sees no trace of an execution they did not dispatch,
   because per-agent status rows are written as responses arrive; the panel can therefore show this
-  text while an execution is in flight. MCP `list_executions` shows a confined caller only the
+  text while an execution is in flight. MCP `list_executions` shows a management-group-confined caller only the
   executions they dispatched, not the in-scope executions of others (see
-  `docs/user-manual/mcp.md`). The
+  `docs/user-manual/mcp.md`); a service-scoped token is the exception, since #5557 (see the
+  behaviour-change section at the top of this page). The
   per-row status badge is still the execution's fleet-wide status while the counters are projected
   to the caller's agents (the same as the REST twin, SSE and the MCP detail view).
 - **Owner disjunct.** Ordinary callers keep it: a principal's own dispatches are shown even when
   none of their agents replied, with the counters still projected. Service-scoped tokens do NOT get
-  it on `GET /fragments/executions`. **Known limit (#5557):** a service-scoped token's session
-  username is the account that minted it. On `GET /api/v1/executions`, `/{id}`, `/children`, MCP
-  `get_execution_status`, MCP `list_executions`, legacy `/api/executions*`, the detail fragment,
-  the SSE channel `/sse/executions/{id}` and `GET /api/v1/events`, a service-scoped token is
-  therefore also shown executions its MINTER dispatched, even outside the service scope (counters
-  projected, but id, definition, status and timing visible). Mint service tokens from an account
-  that dispatches only inside the service scope. Executions the minting account has already
-  dispatched stay visible to its service tokens on those surfaces, so a token minted from an
-  account with unscoped history is exposed to that history.
+  it on `GET /fragments/executions`, and since #5557 they get it on no other execution surface
+  either: a service-scoped token's session username is the account that minted it, so the rule
+  would otherwise show it executions its minter dispatched outside the service scope. It sees an
+  execution only once an agent in its service scope has a status row for it (see the
+  behaviour-change section at the top of this page).
 - **Audit and SIEM.** For `kind=execution`, a CONFINED caller whose id is absent or outside scope
   now produces `action=mcp.summarize_working_set`, `result=denied`, detail
   `not found or outside caller's fleet-read scope: <id>` (the id is neutralised for `k=v` and

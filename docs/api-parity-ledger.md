@@ -190,6 +190,8 @@ stays `twinned` on the paged shape; the gap is recorded here so it is not silent
 
 **New REST route with its MCP twin pending (SAM-17).** `GET /api/v1/inventory/software/components` (components found inside applications: instances, devices, last poll, status) is a REST v1 capability whose MCP twin is built by SAM-21. The ledger keys no row on it: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (it is in `paths`). The pending twin is recorded here so it is not silent, and in the same 2026-11-09 ADR-1005 exception entry (revisit by 2026-12-31).
 
+**Find software panel (SAM-18).** `GET /fragments/inventory/software/find` (the Find software panel on `/software`) runs the model of `GET /api/v1/inventory/software` call for call, so the row is `twinned` on that route and `query_installed_software` like the devices fragment, and carries the same lookup-field asymmetry recorded above. Its Java, Python and Node chips answer from `GET /api/v1/inventory/software/components` (no ledger row; MCP twin pending, above), and the lookup-field gap is tracked by issue #7396 (revisit by 2026-12-31). The panel adds no REST or MCP route.
+
 **New REST routes with their MCP twins pending.** `GET /api/v1/inventory/software/hosts`, `GET /api/v1/inventory/software/hosts/{agent_id}`, `GET /api/v1/inventory/software/changes`, `GET /api/v1/inventory/software/summary` and `GET /api/v1/inventory/software/plugin-health` (per-host collection health, the install-change feed, the fleet summary and per-collector health) are REST v1 capabilities with no MCP tool yet. The ledger keys no row on them: only legacy and fragment routes carry rows, and a REST v1 route is tracked by the OpenAPI check (each is in `paths`). The pending twins are tracked by issue #7765, which rides with #7396, and are recorded here so they are not silent.
 
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
@@ -214,7 +216,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | Domain | Rows | Twinned | Untwinned |
 |---|---:|---:|---:|
 | devices | 24 | 14 | 10 |
-| inventory | 4 | 4 | 0 |
+| inventory | 5 | 5 | 0 |
 | dex | 31 | 22 | 9 |
 | guardian | 18 | 10 | 8 |
 | echo | 12 | 3 | 9 |
@@ -237,7 +239,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 34 | 48 |
-| **Total** | **351** | **156** | **195** |
+| **Total** | **352** | **157** | **195** |
 
 Registered `/api/vN/*` routes: 302. OpenAPI `paths` entries: 301. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 230.
 

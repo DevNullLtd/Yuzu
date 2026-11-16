@@ -95,13 +95,20 @@ Execution make_exec(const std::string& dispatched_by, int agents_targeted) {
     return e;
 }
 
+// The ownership key a plain human session of that username derives (#5557).
+ExecutionOwnerKey owner_key(const std::string& username) {
+    auth::Session s;
+    s.username = username;
+    return execution_owner_key(s);
+}
+
 } // namespace
 
 // ── execution_visible ──────────────────────────────────────────────────────
 
 TEST_CASE("execution_visible: unconfined caller sees everything", "[execution][scope][3789]") {
     auto exec = make_exec("alice", 1);
-    CHECK(execution_visible(exec, {}, std::nullopt, "bob"));
+    CHECK(execution_visible(exec, {}, std::nullopt, owner_key("bob")));
 }
 
 TEST_CASE("execution_visible: empty username never matches an empty dispatched_by",
@@ -109,7 +116,7 @@ TEST_CASE("execution_visible: empty username never matches an empty dispatched_b
     Execution exec; // dispatched_by defaults to ""
     exec.agents_targeted = 0;
     authz::VisibleSet scope = authz::deny_all();
-    CHECK_FALSE(execution_visible(exec, {}, scope, /*username=*/""));
+    CHECK_FALSE(execution_visible(exec, {}, scope, owner_key("")));
 }
 
 TEST_CASE("execution_visible: dispatcher sees their own execution before any "
@@ -117,7 +124,7 @@ TEST_CASE("execution_visible: dispatcher sees their own execution before any "
           "[execution][scope][3789]") {
     auto exec = make_exec("bob", 3);
     authz::VisibleSet scope = authz::deny_all();
-    CHECK(execution_visible(exec, {}, scope, "bob"));
+    CHECK(execution_visible(exec, {}, scope, owner_key("bob")));
 }
 
 TEST_CASE("execution_visible: a non-dispatcher confined caller with zero status "
@@ -125,7 +132,7 @@ TEST_CASE("execution_visible: a non-dispatcher confined caller with zero status 
           "[execution][scope][3789]") {
     auto exec = make_exec("alice", 3);
     authz::VisibleSet scope = authz::deny_all();
-    CHECK_FALSE(execution_visible(exec, {}, scope, "bob"));
+    CHECK_FALSE(execution_visible(exec, {}, scope, owner_key("bob")));
 }
 
 TEST_CASE("execution_visible: a visible agent's status row admits a non-dispatcher",
@@ -133,7 +140,7 @@ TEST_CASE("execution_visible: a visible agent's status row admits a non-dispatch
     auto exec = make_exec("alice", 1);
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
-    CHECK(execution_visible(exec, statuses, scope, "bob"));
+    CHECK(execution_visible(exec, statuses, scope, owner_key("bob")));
 }
 
 TEST_CASE("execution_visible: an out-of-scope agent's status row does not admit",
@@ -141,7 +148,7 @@ TEST_CASE("execution_visible: an out-of-scope agent's status row does not admit"
     auto exec = make_exec("alice", 1);
     std::vector<AgentExecStatus> statuses{make_status("alice-agent", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
-    CHECK_FALSE(execution_visible(exec, statuses, scope, "bob"));
+    CHECK_FALSE(execution_visible(exec, statuses, scope, owner_key("bob")));
 }
 
 TEST_CASE("execution_visible: full scan, no early exit on the first invisible row",
@@ -150,7 +157,7 @@ TEST_CASE("execution_visible: full scan, no early exit on the first invisible ro
     std::vector<AgentExecStatus> statuses{make_status("alice-agent", "success"),
                                           make_status("bob-agent", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
-    CHECK(execution_visible(exec, statuses, scope, "bob"));
+    CHECK(execution_visible(exec, statuses, scope, owner_key("bob")));
 }
 
 // ── confined_projection ────────────────────────────────────────────────────
@@ -209,9 +216,9 @@ TEST_CASE("admit_confined_mutation: zero status rows admits only the dispatcher"
           "[execution][scope][3789]") {
     auto exec = make_exec("bob", 2);
     authz::VisibleSet scope = authz::deny_all();
-    CHECK(admit_confined_mutation(exec, {}, scope, "bob"));
-    CHECK_FALSE(admit_confined_mutation(exec, {}, scope, "alice"));
-    CHECK_FALSE(admit_confined_mutation(exec, {}, scope, /*username=*/""));
+    CHECK(admit_confined_mutation(exec, {}, scope, owner_key("bob")));
+    CHECK_FALSE(admit_confined_mutation(exec, {}, scope, owner_key("alice")));
+    CHECK_FALSE(admit_confined_mutation(exec, {}, scope, owner_key("")));
 }
 
 TEST_CASE("admit_confined_mutation: complete cohort, all in scope, admits — even "
@@ -221,7 +228,7 @@ TEST_CASE("admit_confined_mutation: complete cohort, all in scope, admits — ev
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success"),
                                           make_status("bob-agent-2", "running")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent", "bob-agent-2"}};
-    CHECK(admit_confined_mutation(exec, statuses, scope, "bob"));
+    CHECK(admit_confined_mutation(exec, statuses, scope, owner_key("bob")));
 }
 
 TEST_CASE("admit_confined_mutation: an out-of-scope row denies, even for the "
@@ -231,7 +238,7 @@ TEST_CASE("admit_confined_mutation: an out-of-scope row denies, even for the "
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success"),
                                           make_status("alice-agent", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
-    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, "bob"));
+    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, owner_key("bob")));
 }
 
 TEST_CASE("admit_confined_mutation: an incomplete target ledger denies even when "
@@ -242,7 +249,7 @@ TEST_CASE("admit_confined_mutation: an incomplete target ledger denies even when
     auto exec = make_exec("bob", 2);
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
-    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, "bob"));
+    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, owner_key("bob")));
 }
 
 TEST_CASE("admit_confined_mutation: a row count exceeding agents_targeted also denies",
@@ -251,7 +258,7 @@ TEST_CASE("admit_confined_mutation: a row count exceeding agents_targeted also d
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success"),
                                           make_status("bob-agent-2", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent", "bob-agent-2"}};
-    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, "bob"));
+    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, owner_key("bob")));
 }
 
 TEST_CASE("admit_confined_mutation: a negative agents_targeted denies rather than "
@@ -264,7 +271,7 @@ TEST_CASE("admit_confined_mutation: a negative agents_targeted denies rather tha
     auto exec = make_exec("bob", -1);
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success")};
     authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
-    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, "bob"));
+    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, owner_key("bob")));
 }
 
 // ── Real-rig confinement (PG) ───────────────────────────────────────────────
@@ -282,7 +289,7 @@ TEST_CASE("legacy executions: real fleet-read scope excludes Alice's agent for B
     auto exec = make_exec("someone-else", 2);
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success"),
                                           make_status("alice-agent", "success")};
-    CHECK(execution_visible(exec, statuses, scope, "bob"));
+    CHECK(execution_visible(exec, statuses, scope, owner_key("bob")));
     auto counts = confined_projection(statuses, scope);
     CHECK(counts.agents_targeted == 1); // only bob-agent's row counted
 }
@@ -303,12 +310,12 @@ TEST_CASE("legacy executions: Bob's global Execute grant admits a complete, "
 
     auto exec = make_exec("bob", 1);
     std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success")};
-    CHECK(admit_confined_mutation(exec, statuses, scope, "bob"));
+    CHECK(admit_confined_mutation(exec, statuses, scope, owner_key("bob")));
 
     // Alice's execution, targeting only Alice's agent, must still be denied.
     auto alice_exec = make_exec("alice", 1);
     std::vector<AgentExecStatus> alice_statuses{make_status("alice-agent", "success")};
-    CHECK_FALSE(admit_confined_mutation(alice_exec, alice_statuses, scope, "bob"));
+    CHECK_FALSE(admit_confined_mutation(alice_exec, alice_statuses, scope, owner_key("bob")));
 }
 
 // ── Source tripwires ─────────────────────────────────────────────────────────
@@ -374,7 +381,10 @@ TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
     const std::string& source = stripped_source("execution_routes.cpp");
     const auto list_route = route_block(source, R"(sink.Get("/api/executions",)");
     CHECK(list_route.find("query_executions_checked") != std::string::npos);
-    CHECK(list_route.find("ExecutionListScope") != std::string::npos);
+    // #5557: the engaged scope is built by the ONE owner-key constructor, never a hand-filled
+    // ExecutionListScope that could carry a service-scoped session's minting account.
+    CHECK(list_route.find("confined_list_scope(") != std::string::npos);
+    CHECK(list_route.find("ExecutionListScope") == std::string::npos);
     CHECK(list_route.find("get_agent_statuses_for_executions_checked") != std::string::npos);
     // Exact statement, not a bare "500" substring — a 5000ms retry_after_ms
     // literal in the same block would false-green a "500" find (#3789

@@ -24,24 +24,28 @@ ca(Name) ->
 %% @doc The same, with the key type: `ec' (P-384), `rsa' (2048), `ed25519' or `ed448'.
 -spec ca(string(), ec | rsa | ed25519 | ed448) -> #{cert := binary(), key := term()}.
 ca(Name, ec) ->
-    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, secp384r1}}]);
+    %% OTP otherwise defaults to SHA-1, which host crypto policies can refuse.
+    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, ?'secp384r1'}}, {digest, sha384}]);
 ca(Name, rsa) ->
-    public_key:pkix_test_root_cert(Name, [{key, {rsa, 2048, 65537}}]);
+    public_key:pkix_test_root_cert(Name, [{key, {rsa, 2048, 65537}}, {digest, sha256}]);
 ca(Name, ed25519) ->
-    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, ed25519}}]);
+    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, ?'id-Ed25519'}}]);
 ca(Name, ed448) ->
-    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, ed448}}]).
+    public_key:pkix_test_root_cert(Name, [{key, {namedCurve, ?'id-Ed448'}}]).
 
 %% @doc The DER of a leaf certificate issued by `Ca'.
 -spec leaf(#{cert := binary(), key := term()}) -> binary().
 leaf(#{key := CaKey} = Ca) ->
     PeerKey = case CaKey of
                   #'RSAPrivateKey'{} -> {rsa, 2048, 65537};
-                  #'ECPrivateKey'{parameters = {namedCurve, ?'id-Ed25519'}} -> {namedCurve, ed25519};
-                  #'ECPrivateKey'{parameters = {namedCurve, ?'id-Ed448'}} -> {namedCurve, ed448};
-                  _ -> {namedCurve, secp256r1}
+                  #'ECPrivateKey'{parameters = {namedCurve, ?'id-Ed25519'}} -> {namedCurve, ?'id-Ed25519'};
+                  #'ECPrivateKey'{parameters = {namedCurve, ?'id-Ed448'}} -> {namedCurve, ?'id-Ed448'};
+                  _ -> {namedCurve, ?'secp256r1'}
               end,
-    Config = public_key:pkix_test_data(#{root => Ca, peer => [{key, PeerKey}]}),
+    %% EdDSA chooses its own hash; OTP ignores digest for those keys. EC leaves
+    %% are signed by the P-384 CA above, regardless of the leaf's own key size.
+    Digest = case CaKey of #'RSAPrivateKey'{} -> sha256; _ -> sha384 end,
+    Config = public_key:pkix_test_data(#{root => Ca, peer => [{key, PeerKey}, {digest, Digest}]}),
     proplists:get_value(cert, Config).
 
 -spec serial(binary()) -> non_neg_integer().
