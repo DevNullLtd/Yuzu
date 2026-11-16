@@ -3135,7 +3135,7 @@ TEST_CASE("EchoDatabase: a fresh open lands at schema_version 10", "[echo][store
     CHECK(opened->schema_version() == 10);
 }
 
-// QE-2: the template helper itself, so a template that silently stops building (every fixture then
+// The template helper itself, so a template that silently stops building (every fixture then
 // falls back to a plain open and the CI speed-up is gone) is a failure, not an unobserved slowdown.
 TEST_CASE("echo_test_db: the migrated template is built and a copy opens at schema_version 10",
           "[echo][store][test_helper]") {
@@ -3143,6 +3143,11 @@ TEST_CASE("echo_test_db: the migrated template is built and a copy opens at sche
 
     yuzu::test::TempDbFile copy{"yuzu_test_echo_helper_"};
     REQUIRE(yuzu::test::seed_echo_db_from_template(copy.path));
+    // The copy is the whole template file, not an empty or truncated one that open() would quietly
+    // rebuild through the full ladder (which would also read schema_version 10).
+    CHECK(fs::file_size(copy.path) ==
+          fs::file_size(yuzu::test::detail::echo_db_template().file.path));
+    CHECK_FALSE(fs::exists(fs::path{copy.path.string() + ".tmp"}));
     {
         auto opened = EchoDatabase::open(copy.path);
         REQUIRE(opened.has_value());

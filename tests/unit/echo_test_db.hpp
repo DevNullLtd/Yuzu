@@ -1,9 +1,10 @@
 // Fast fresh-database opens for the echo unit tests.
 //
 // A fresh `EchoDatabase::open` walks the whole schema ladder (v2 to v10), one committed write per
-// step, about 25 fsyncs in all. The suite opens ~455 databases, so on a disk with slow fsync (the
+// step, about 25 fsyncs in all. The suite opens about 470 databases, so on a disk with slow fsync (the
 // shared Windows CI box) the run time is the fsync count times the commit latency: about 50 to
-// 85 s when the disk is quiet, past the 180 s meson timeout when it is not (#7135, #7872).
+// 85 s when the disk is quiet (51 s on a CI runner and 82 s on a standalone Windows host, see
+// tests/meson.build), past the 180 s meson timeout when it is not (#7135, #7872).
 //
 // `open_echo_db` builds ONE migrated database per process, checkpoints it with a TRUNCATE
 // checkpoint (closing alone does not fold the WAL, see the constructor) and closes it, then copies
@@ -16,6 +17,9 @@
 // version, a corrupt or colliding file, the open's log lines, a seeded legacy table) or about
 // durability or crash behaviour must keep calling `EchoDatabase::open` on a path it prepared.
 //
+// Call it from the test's own thread: it contains a Catch2 REQUIRE, which is not safe off the thread
+// that runs the test case.
+//
 // For the yuzu_echo_tests executable only. That executable links Catch2WithMain, so the template's
 // static destructor runs at exit. An executable built on test_runner_main.cpp leaves through
 // hard_exit() on Windows and macOS, which skips static destructors and would strand the template
@@ -27,7 +31,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <cstdint>
 #include <cstdio>
 #include <expected>
 #include <filesystem>
@@ -99,19 +102,30 @@ inline const EchoDbTemplate& echo_db_template() {
 } // namespace detail
 
 /// Copy the migrated template to `dest` when `dest` does not exist yet. Returns true when the copy
-/// was made. A failure leaves `dest` absent, so the open that follows is an ordinary fresh one. A
-/// `dest` that already existed is never touched or removed.
+/// was made. The copy is written to `<dest>.tmp` and renamed into place, so `dest` is never a
+/// partial file: a failure leaves `dest` absent and the open that follows is an ordinary fresh one.
+/// A `dest` that already existed is never touched or removed.
 inline bool seed_echo_db_from_template(const std::filesystem::path& dest) {
     const auto& tpl = detail::echo_db_template();
     std::error_code ec;
     if (!tpl.ready || std::filesystem::exists(dest, ec))
         return false;
+    const std::filesystem::path staging{dest.string() + ".tmp"};
     ec.clear();
-    if (std::filesystem::copy_file(tpl.file.path, dest, std::filesystem::copy_options::none, ec))
-        return true;
-    if (ec != std::errc::file_exists) // not ours to remove if someone else made it meanwhile
-        std::filesystem::remove(dest, ec);
-    return false;
+    if (!std::filesystem::copy_file(tpl.file.path, staging, std::filesystem::copy_options::none,
+                                    ec)) {
+        if (ec != std::errc::file_exists) // not ours to remove if someone else made it meanwhile
+            std::filesystem::remove(staging, ec);
+        return false;
+    }
+    // rename() does not replace a destination created in the meantime on Windows, and replaces it
+    // on POSIX; either way `dest` is complete or absent.
+    std::filesystem::rename(staging, dest, ec);
+    if (ec) {
+        std::filesystem::remove(staging, ec);
+        return false;
+    }
+    return true;
 }
 
 /// `EchoDatabase::open(path)` on a database that starts at the current schema version, with
