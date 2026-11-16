@@ -6,5 +6,4 @@
   A new alert `YuzuDeviceCiWritesPaused` ships in `docs/prometheus/yuzu-alerts.yml` and fires only when that file is loaded.
   Writes and reads resume by themselves, with no restart, within about a minute of the repair (reindex first, then `ALTER DATABASE ... REFRESH COLLATION VERSION`; deduplicate first if a unique reindex fails on duplicate rows), and the agents catch up over their backoff.
   Not covered: other stores' text-keyed unique indexes (for example `endpoint_state`) and agent registration are not gated; drift that begins while the server runs is seen up to about an hour later, per replica; a write that passed the check just before the gate flipped is not stopped; rows duplicated before the pause are not repaired by it.
-  This replaces the earlier statement that the check only reports and stops no read or write.
   See the PostgreSQL collation version note in `server-admin.md`.

@@ -66,7 +66,7 @@ Invariants:
      "stale anchor" and names the step, rather than reporting a collation-wiring defect.
 
   14. The recheck `start()` is wrapped in try/catch(const std::exception&) that resets the unstarted
-     recheck: a refused thread creation (a task or thread limit) must degrade a report-only feature,
+     recheck: a refused thread creation (a task or thread limit) must degrade a best-effort check,
      not abort the boot (found by an external review; one mutant).
 
   15. The collation GATE (the lock-free atomic the check publishes, which pauses device_ci writes)
@@ -164,7 +164,7 @@ START_CATCH = "} catch (const std::exception& e) {"
 RESET_ARM = "pg_collation_recheck_.reset();"
 MSG_START_UNGUARDED = ("the PgCollationRecheck start() is not wrapped in try/catch(const std::exception&) "
                        "that resets the unstarted recheck: a refused thread creation would abort the "
-                       "boot of a report-only feature")
+                       "boot of a best-effort check")
 GATE_ARG = "&collation_gate_"
 WRITE_GATE = "device_inventory_store_->set_write_gate(&collation_gate_);"
 GATE_DECL = "std::atomic<pg::CollationGate> collation_gate_"

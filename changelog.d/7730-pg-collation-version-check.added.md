@@ -1,5 +1,5 @@
 - **The server now checks the PostgreSQL collation version at start and repeats the check.**
-  On the first start after the upgrade, a database that has already drifted logs one error naming the database and both versions and sets `yuzu_pg_collation_version_mismatch` to `1`; nothing else changes, because the check only reports and does not stop the server or change the database.
+  On the first start after the upgrade, a database that has already drifted logs one error naming the database and both versions and sets `yuzu_pg_collation_version_mismatch` to `1`; the check itself does not stop the server or change the database (what a detected mismatch pauses is described in the device-CI write pause entry).
   The check compares the database's recorded collation version with the version the operating system of the PostgreSQL server reports, which can differ after an operating-system or libc upgrade without a reindex.
   The first check runs in the server's constructor and can delay the listener bind by about 15 seconds in practice (about 35 seconds on a network that drops packets) when the database answers slowly.
   The check repeats every hour once a readable check has concluded, and every minute while a mismatch stands, no check has concluded yet or the latest one could not run.
