@@ -19,7 +19,7 @@
 > `docs/adr/2002-high-availability-architecture.md` §8).
 >
 > 0.15.0 supports initial deployment into a fresh database only: restore a backup
-> taken from a 0.15.0 deployment, not one written by an earlier build, and start
+> taken from this deployment, not one written by an earlier build (the released v0.15.0 included), and start
 > with no leftover `enrollment-tokens.cfg` or `pending-agents.cfg` in `--data-dir` or the
 > directory holding `yuzu-server.cfg` (the server imports them without checking where
 > they came from).

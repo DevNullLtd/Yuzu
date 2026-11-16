@@ -750,10 +750,13 @@ time they sign in. Reactivation first removes any session the account still has
 failed mirror write, which signs the user out again). If that removal does not
 persist, Yuzu answers `500`, the account stays inactive and the IdP must retry;
 configure the connector to retry a `500`, as for a deprovision. A sign-in after
-the reactivation is a new sign-in, with one residual: a login whose first factor
-was verified before the deactivation can still complete after the reactivation,
-because the post-mint recheck compares only role, credential hash and active
-state; deactivation clears the TOTP secret and recovery codes, so a pending MFA
+the reactivation is a new sign-in, with one residual: a login that carries no
+bound MFA proof, whose first factor was verified before the deactivation, can
+still complete after the reactivation, because the post-mint recheck compares
+the role, credential hash and active state, and for a login whose bound
+MFA proof was earned before the deactivation also the factor generation, which a
+deactivation changes;
+deactivation clears the TOTP secret and recovery codes, so a pending MFA
 login cannot complete unless the user enrols again inside the pending window.
 
 ## SCIM failure-mode matrix

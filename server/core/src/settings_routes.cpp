@@ -37,6 +37,8 @@
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "rbac_text.hpp"        // rbac_text_is_clean: the shared clean-text predicate
+#include "session_store.hpp" // LocalMfaProof: the enrolment's verified {generation, instant} (#6079)
+#include "step_up_gate.hpp" // StepUpVerdict / render_step_up_refusal: the unwired factor-credential gate (#6079)
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
@@ -150,8 +152,9 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
-// A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
-// A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// A refused MFA step-up on an htmx form: `step_up_fn_` (or, on the two factor-credential routes,
+// their own gate) has already written the refusal (a 401/403/503 A4 envelope). htmx swaps no
+// 4xx/5xx body, so without a toast the button looks dead. Show the
 // envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
 // token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
 // An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
@@ -171,6 +174,34 @@ void toast_step_up_refusal(httplib::Response& res) {
     }
     const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
     res.set_header("HX-Trigger", toast.dump());
+}
+
+// #6079: the two factor-credential routes have no gate wired (a construction fault, never a
+// production shape): answer the step-up gate's own unwired 503 and mutate nothing, so a missing
+// closure can only deny, never leave the route ungated.
+void refuse_factor_credential_gate_unwired(const httplib::Request& req, httplib::Response& res,
+                                           const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: no factor-credential gate wired; failing closed ({})", label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kUnwired;
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
+}
+
+// #6079: the gate hands back an admission only for a local interactive session, so a
+// non-local one here is a gate defect, never a production shape. Re-check it where the
+// admission is consumed (the generation it carries is only meaningful for a local account)
+// and answer the gate's own 403, mutating nothing.
+void refuse_factor_credential_not_local(const httplib::Request& req, httplib::Response& res,
+                                        const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: factor-credential admission is not local; failing closed ({})", label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kFactorCredentialNonLocal;
+    v.reason = "factor_credential_requires_local_session";
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
 }
 
 // True when a Content-Type header names application/json (any parameters, any case).
@@ -1927,6 +1958,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     return html;
 }
 
+void SettingsRoutes::respond_mfa_factor_changed(httplib::Response& res,
+                                                const auth::Session& session,
+                                                std::string_view route) {
+    if (metrics_registry_) {
+        metrics_registry_
+            ->counter("yuzu_auth_mfa_factor_changed_total", {{"route", std::string(route)}})
+            .increment();
+    }
+    constexpr const char* kMessage =
+        "Your MFA factor changed while this request was in flight. Reload the page; if you are "
+        "asked to sign in again, do so.";
+    res.status = 409;
+    // htmx swaps no 4xx body, so say it in a toast as well (the dashboard's conflict posture,
+    // respond_last_administrator_refused). The constant is safe in the hand-built JSON.
+    const nlohmann::json toast = {{"showToast", {{"message", kMessage}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump());
+    res.set_content(render_mfa_fragment(session, {}, {}, {}, {}, kMessage),
+                    "text/html; charset=utf-8");
+}
+
 std::string SettingsRoutes::render_mfa_fragment(const auth::Session& session,
                                                 const std::string& new_otpauth_uri,
                                                 const std::string& new_secret_b32,
@@ -3447,6 +3498,17 @@ void SettingsRoutes::register_routes(
     oidc_provider_ = &oidc_provider;
     metrics_registry_ = metrics_registry;
     step_up_fn_ = std::move(step_up_fn);
+    // The closed route set of the factor-changed refusal, pre-seeded so increase() sees the first
+    // event of each series (#5177). Registered here because only this file increments it.
+    if (metrics_registry_) {
+        metrics_registry_->describe(
+            "yuzu_auth_mfa_factor_changed_total",
+            "Factor-credential requests refused 409 because the account's MFA factor changed "
+            "between the step-up gate and the mutation, by route (recovery_codes|disable)",
+            "counter");
+        for (const char* route : {"recovery_codes", "disable"})
+            metrics_registry_->counter("yuzu_auth_mfa_factor_changed_total", {{"route", route}});
+    }
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -8147,7 +8209,7 @@ void SettingsRoutes::register_routes(
                   }
                   // Enrolment has just committed, and the code that committed it IS a fresh proof
                   // of the factor: stamp the CURRENT cookie session's step-up proof (the same
-                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // `stamp_session_mfa_proof` as POST /login/mfa/stepup, so the DB-clock
                   // authoring and every replica's cache refresh are that primitive's), so the
                   // operator can regenerate recovery codes or disable MFA from this very session
                   // without a separate step-up. Only a local cookie session is stamped, and only
@@ -8162,9 +8224,9 @@ void SettingsRoutes::register_routes(
                   // again to earn a proof. Never reached on a failed or rejected verification (all
                   // return above).
                   // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
-                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
-                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
-                  // or logger throw must not escape the catch and drop the codes reveal.
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a
+                  // log storm. `what()` is text an exception chose, so it is sanitised. Guarded: a
+                  // formatter or logger throw must not escape the catch and drop the codes reveal.
                   const auto note_stamp_threw = [](const char* what) noexcept {
                       try {
                           static std::atomic<uint64_t> stamp_threw_hits{0};
@@ -8181,7 +8243,14 @@ void SettingsRoutes::register_routes(
                       } catch (...) { // NOLINT(bugprone-empty-catch)
                       }
                   };
+                  // #6079: the stamp carries the enrolment's own proof, the generation its UPDATE
+                  // produced and the database instant its loading statement captured before the
+                  // TOTP check (so it precedes `mfa_enrolled_at`), never the stamp's now(). The
+                  // stamp refuses a future-dated instant and, after it commits, clears itself if
+                  // the factor generation changed since (`factor_changed`); the enrolment and the
+                  // codes below stand either way.
                   bool proof_stamped = false;
+                  const char* not_stamped_why = "";
                   try {
                       if (auth_mgr_ && session->auth_source == "local") {
                           const auto cookie_token = AuthRoutes::extract_session_cookie(req);
@@ -8191,23 +8260,35 @@ void SettingsRoutes::register_routes(
                                   cookie_session->username == session->username) {
                                   if (stamp_fault_hook_) // test seam, empty in production
                                       stamp_fault_hook_();
-                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                                  using Outcome = auth::AuthManager::MfaStampOutcome;
+                                  const auto outcome = auth_mgr_->stamp_session_mfa_proof(
+                                      cookie_token,
+                                      LocalMfaProof{codes_res->factor_gen, codes_res->verified_ms});
+                                  proof_stamped = outcome == Outcome::kStamped;
+                                  if (outcome == Outcome::kFactorChanged)
+                                      not_stamped_why = ";factor_changed";
+                                  else if (outcome == Outcome::kFutureDated)
+                                      not_stamped_why = ";verification_future_dated";
                               }
                           }
                       }
                   } catch (const std::exception& ex) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(ex.what());
                   } catch (...) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(nullptr);
                   }
                   audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
-                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
+                            proof_stamped
+                                ? std::string("step_up_proof=stamped")
+                                : std::string("step_up_proof=not_stamped") + not_stamped_why);
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes_res),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, codes_res->recovery_codes),
                                   "text/html; charset=utf-8");
               });
 
@@ -8224,11 +8305,24 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
-                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
-                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
-                  if (step_up_fn_ &&
-                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                  // credential that satisfies the step-up challenge itself, and disabling MFA
+                  // removes the factor the gate checks; both need a fresh proof first. Before any
+                  // mutation. The gate also hands back the factor generation it admitted the
+                  // request at; the regeneration compares it under the users row lock (#6079).
+                  if (!factor_credential_gate_fn_) {
+                      refuse_factor_credential_gate_unwired(
+                          req, res, *session, "POST /api/settings/mfa/recovery-codes");
+                      return;
+                  }
+                  const auto admission = factor_credential_gate_fn_(
+                      req, res, *session, "POST /api/settings/mfa/recovery-codes");
+                  if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/recovery-codes");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -8239,7 +8333,23 @@ void SettingsRoutes::register_routes(
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  auto codes = db->mfa_regenerate_recovery_codes(session->username);
+                  if (factor_credential_barrier_)
+                      factor_credential_barrier_("recovery_codes");
+                  auto codes =
+                      db->mfa_regenerate_recovery_codes(session->username, admission->factor_gen);
+                  if (!codes && codes.error() == AuthDBError::FactorChanged) {
+                      // The factor was replaced after the gate admitted this request: nothing was
+                      // regenerated, so the new factor's codes are untouched.
+                      audit_fn_(req, "mfa.recovery_codes.generated", "denied", "User",
+                                session->username,
+                                std::format("reason=factor_changed expected_gen={}",
+                                            admission->factor_gen));
+                      // #6940: every MFA fragment response is no-store; set here, not in the shared
+                      // helper (the disable handler already sets it once, and set_header appends).
+                      set_no_store(res);
+                      respond_mfa_factor_changed(res, *session, "recovery_codes");
+                      return;
+                  }
                   if (!codes) {
                       // #6995: a refused regeneration is counted like its siblings. A CSPRNG
                       // fault goes to yuzu_secure_random_failure_total; any other store fault to
@@ -8294,9 +8404,22 @@ void SettingsRoutes::register_routes(
                   set_no_store(res);
                   // MFA step-up gate (see recovery-codes above): stripping the factor the gate
                   // checks needs a fresh proof. Before the enforcement guard and any mutation.
-                  if (step_up_fn_ &&
-                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                  // The gate also hands back the factor generation it admitted the request at; the
+                  // clear compares it under the users row lock (#6079).
+                  if (!factor_credential_gate_fn_) {
+                      refuse_factor_credential_gate_unwired(req, res, *session,
+                                                            "POST /api/settings/mfa/disable");
+                      return;
+                  }
+                  const auto admission = factor_credential_gate_fn_(
+                      req, res, *session, "POST /api/settings/mfa/disable");
+                  if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/disable");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -8380,7 +8503,19 @@ void SettingsRoutes::register_routes(
                   // The pre-image comes from the clear's own row lock, so it cannot miss an
                   // enrolment verified in between. A failed clear leaves it unknown, which counts
                   // as enrolled: the fail-safe is to end sessions.
-                  auto r = db->mfa_disable_report(session->username);
+                  if (factor_credential_barrier_)
+                      factor_credential_barrier_("disable");
+                  auto r = db->mfa_disable_report(session->username, admission->factor_gen);
+                  if (!r && r.error() == AuthDBError::FactorChanged) {
+                      // The factor changed after the gate admitted this request (an enrolled
+                      // account rotated, or an un-enrolled one finished enrolling): nothing was
+                      // cleared and no session ends. The session may be legitimate after a
+                      // re-prove.
+                      audit("denied", std::format("reason=factor_changed expected_gen={}",
+                                                  admission->factor_gen));
+                      respond_mfa_factor_changed(res, *session, "disable");
+                      return;
+                  }
                   if (!r) {
                       // The clear may have committed with its acknowledgement lost, so the
                       // sessions end anyway (#6079).

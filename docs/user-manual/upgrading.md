@@ -2,6 +2,13 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+**Deploying the MFA factor-binding build (#6079)?** It is a hard cutover: a fresh database only, with no upgrade path
+and no rollback. An enrolled account that reads factor generation `0` (a database this build did not write) is refused
+on the step-up routes, approvals and JIT elevation until `yuzu-server --mfa-reset` clears its factor. A database written by the released v0.15.0 build or by any earlier release is a database
+written by an earlier build: deploy a fresh database. Read
+[the cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079).
+A statement elsewhere on this page that a rollback, a mixed fleet or an in-place upgrade is safe or supported describes that one change in an earlier release and does not apply to this build; the "Deployment contract (hard cutover)" governs.
+
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
 ## ⚠️ Breaking: management-group create and member writes are refused (503) while the audit store is unavailable, and REST create answers a store fault with 503 (#7074)
@@ -420,7 +427,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What to do.** Keep the connector's retry enabled, and configure it to retry a `500`: this case answers `500`, not `503` with `Retry-After` (tracked separately). There is no break-glass: while the session store is degraded a deprovision cannot complete. Wait for PostgreSQL to recover, then re-run the deprovision (the IdP's own retry, or the dashboard delete again). The `YuzuSessionStoreDegraded` alert needs the session-store degrade counter to rise for a full 10 minutes, so a short outage may never fire it; search the audit log for `partial` results on the four actions above (see the SCIM guide, "SCIM failure-mode matrix", and the [runbook](../ops-runbooks/auth-db-recovery.md#scim--dashboard-deprovision-returns-500-sessions_db_error)). Some identity providers pause or quarantine the provisioning app after repeated 5xx responses (Microsoft Entra does); after the store recovers, confirm the provisioning job is running and re-trigger a sync.
 
-**If the session wipe after the deactivation itself fails.** The account is deactivated and the durable session row survives, but a session whose local account is inactive or deleted is now rejected at validation, on every replica, once every replica runs this build (a replica on an earlier build keeps the earlier behaviour; mixed-version operation is outside the deployment contract, see "Deployment contract (hard cutover)" further down this page). A deactivation also advances the durable session generation in the same transaction, so a replica's session cache is cleared on its next poll: about one second on a healthy generation poll, at most about 30 seconds while a replica's poll fails. The deactivation fails as a store error (the account stays active, `503` on the SCIM and dashboard routes) when that generation write cannot complete. The surviving row is removed when the account is reactivated, which now deletes the account's sessions first and fails, leaving the account inactive, when that delete does not persist (SCIM answers `500`). A sign-in after the reactivation is a new sign-in, with one residual: a login whose first factor was verified before the deactivation can still complete after the reactivation, because the post-mint recheck compares only role, credential hash and active state. A SCIM retry of an already-deactivated resource does not re-run the wipe (it meets the role guard's `404` first, [#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)); the dashboard `DELETE` path does re-run it; and `DELETE /api/v1/sessions?username=<name>` removes the row in either case. OIDC and SAML sessions are not checked against an account row (the linked-identity revoke of the deprovision ends them), and API-token sessions are unchanged.
+**If the session wipe after the deactivation itself fails.** The account is deactivated and the durable session row survives, but a session whose local account is inactive or deleted is now rejected at validation, on every replica, once every replica runs this build (a replica on an earlier build keeps the earlier behaviour; mixed-version operation is outside the deployment contract, see "Deployment contract (hard cutover)" further down this page). A deactivation also advances the durable session generation in the same transaction, so a replica's session cache is cleared on its next poll: about one second on a healthy generation poll, at most about 30 seconds while a replica's poll fails. The deactivation fails as a store error (the account stays active, `503` on the SCIM and dashboard routes) when that generation write cannot complete. The surviving row is removed when the account is reactivated, which now deletes the account's sessions first and fails, leaving the account inactive, when that delete does not persist (SCIM answers `500`). A sign-in after the reactivation is a new sign-in, with one residual: a login that carries no bound MFA proof, whose first factor was verified before the deactivation, can still complete after the reactivation, because the post-mint recheck compares the role, credential hash and active state, and for a login whose bound MFA proof was earned before the deactivation also the factor generation, which a deactivation changes. A SCIM retry of an already-deactivated resource does not re-run the wipe (it meets the role guard's `404` first, [#5214](https://github.com/Tr3kkR/Yuzu/issues/5214)); the dashboard `DELETE` path does re-run it; and `DELETE /api/v1/sessions?username=<name>` removes the row in either case. OIDC and SAML sessions are not checked against an account row (the linked-identity revoke of the deprovision ends them), and API-token sessions are unchanged.
 
 **Rollback.** Returning to an earlier build is not supported (see "Deployment contract (hard cutover)" further down this page). If it happens regardless, note that rows this build only refuses, the durable sessions of deactivated local accounts, become servable again on an earlier build until they expire. Before returning, run the lingering-sessions query in the [runbook](../ops-runbooks/auth-db-recovery.md#sessions-of-deactivated-accounts) and end those users' sessions with `DELETE /api/v1/sessions?username=<name>`.
 
@@ -752,7 +759,7 @@ Not covered by this change, among others: `POST /api/command`, MCP `execute_inst
 
 **Who is affected.** SIEM rules that match `user.role_change` with result `denied` or detail `user_not_found` and were (unknowingly) counting outages; scripts that treat a `404` from the role route as permanent; IdP connectors that treated the old `200` as success.
 
-**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover. The `404` that a store error in the provenance or role read could still produce when deactivating a resource whose mirror reads active was closed afterwards (#6836, next entry).
+**What to do.** Retry on `503`. Add `store_unavailable` to any `failure` rule on these actions. The one `503` not to retry is the sticky one an enrolled administrator can get on the role route when the account reads factor generation `0` (only a database an earlier build wrote holds one, which is unsupported): its error envelope has `retry_after_ms: null` (a transient step-up 503 has `5000`; neither sets a `Retry-After` header), it is audited as `mfa.step_up.required` (not `user.role_change`) with `reason=mfa_proof_unavailable`, and clears only after `yuzu-server --mfa-reset <user>` (see "Breaking: MFA proofs are bound to the factor they were earned with" below). See the SCIM guide, "When the user store cannot answer a deactivation", for what the SCIM change does not cover. The `404` that a store error in the provenance or role read could still produce when deactivating a resource whose mirror reads active was closed afterwards (#6836, next entry).
 
 ## ⚠️ Breaking: a user-store fault in a SCIM provenance or role check is now a retryable 503, not a 404 (#6836)
 
@@ -1451,7 +1458,8 @@ human roles first and follow the prerequisites in [Role-Based Access Control](rb
 A fresh MFA proof is required on 41 named high-risk routes (the list is in
 [REST API](rest-api.md#step-up-envelope-on-high-risk-endpoints), which also names the three
 JIT-elevation routes) for MFA-enrolled local accounts and OIDC sessions per `--mfa-enforcement`;
-un-enrolled accounts and API-token and MCP-token callers pass, and engine principals are denied.
+un-enrolled accounts and API-token and MCP-token callers pass (except on the two Settings MFA
+routes named below, which accept only a local session), and engine principals are denied.
 "High-risk" names these routes; it is not a claim that every high-risk operation is covered. Other
 mutating routes and all MCP tools are not MFA-step-up gated in this release. The check on those 41
 routes now runs in one place, in the server's request pipeline, instead of inside each handler,
@@ -1468,7 +1476,14 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   only, because enrolment confirmation records a fresh proof for that session (the audit row
   `mfa.enroll.verified` says `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the
   session could not be stamped: a bearer principal, an absent or mismatched cookie, or a store
-  failure). An account with no MFA enrolled is not affected.
+  failure). An account with no MFA enrolled is not affected. These two routes are stricter than the
+  rest (#6079): they use the approver window, `min(--mfa-step-up-window-secs, 300)` and 300 when
+  that setting is `0` or less, so `--mfa-step-up-window-secs=0` does not switch them off; only a
+  signed-in local session can use them (an API token, an SSO identity or an engine principal is
+  refused `403`; neither route has a REST v1 or MCP twin, so no documented automation is affected);
+  and a request whose account factor changed after the step-up check admitted it is refused `409`
+  with nothing written. See "Breaking: MFA proofs are bound to the factor they were earned
+  with" below.
 - **What is newly gated, measured against the last release (v0.14.1).** Only the two Settings MFA
   routes above are gated for the first time by this change. Of the other 39, 25 already called the
   step-up check from their handlers in v0.14.1. The remaining fourteen were gated in their handlers
@@ -1533,16 +1548,16 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   factor cannot be decrypted, answers `503` to local (password) sessions only, since those are the
   only sessions whose enrollment is read from the store; API-token and MCP-token callers pass
   before any store read, and OIDC sessions are judged on the identity provider's assertion. The
-  `503` still carries `meta.mfa_step_up_required: true`, with no `challenge_url`, and writes an
+  `503` still carries `meta.mfa_step_up_required: true` (the binding refusals that carry a `reason` carry `false`; see the MFA factor-binding cutover section below), with no `challenge_url`, and writes an
   `mfa.step_up.required` audit row whose `detail` names the cause (an unexpected failure inside the
   check itself, or a session that could not be fingerprinted, is recorded as
-  `reason=chokepoint_exception`). Retry; re-proving cannot help. A client
-  must treat a `503` as "retry shortly" and prompt for a code only on a `401`. See the
+  `reason=chokepoint_exception`). Re-proving cannot help. A client
+  must treat a `503` as "retry shortly" only while `error.retry_after_ms` is a number (`5000`), stop on `null`, and prompt for a code only on a `401`. See the
   [recovery runbook](../ops-runbooks/auth-db-recovery.md#step-up-returns-503-while-the-authentication-store-is-unavailable).
   The new alert `YuzuStepUpGateUnavailable` fires on it.
 - **SAML sessions cannot satisfy step-up in this release.** They receive `403` on all 41 routes (reason
   `saml_session_no_mfa_this_release`, see #4935), unless `--mfa-step-up-window-secs` is `0` or less:
-  the disabled window is checked before the SAML refusal, so SAML sessions then pass all 41. A
+  the disabled window is checked before the SAML refusal, so SAML sessions then pass the 39 ordinary routes (the two Settings MFA routes ignore the setting and refuse every non-local session). A
   deployment whose only interactive sign-in is SAML has no session route to any of them. The
   refusal's remediation says SAML sessions cannot satisfy step-up in this release (re-authenticating
   does not help) and to use an existing untiered, unscoped API token where the route accepts one, or
@@ -1573,8 +1588,10 @@ three JIT-elevation routes keep their own handler gate. What an operator or scri
   rolling deployment halts because the new replica never becomes ready. **This can only happen on a
   fork or a custom build:** every stock build is checked by compiled and source-scan tests before it
   ships, so a release binary never trips it. The fix is a row in `step_up_policy.hpp` and a rebuild,
-  never a flag. To recover a deployment in the meantime, roll back to the previous binary or image;
-  nothing is migrated, so a rollback needs no data step.
+  never a flag. Rolling back to the previous binary or
+  image is not supported on this build (see the [hard-cutover section](#breaking-mfa-proofs-are-bound-to-the-factor-they-were-earned-with-hard-cutover-with-no-upgrade-path-or-rollback-6079)):
+  the authentication and session stores are opened before this check, so the `auth` v3 and `session_store` v3
+  migrations have already run.
 - **How a refusal appears in the dashboard.** A refused htmx request (on a dashboard route or an
   `/api/v1/` route, such as Settings > Users "Revoke sessions") now carries an `HX-Trigger` error
   toast, so the button no longer appears to do nothing; MCP never gets one. The Guardian page's
@@ -1603,12 +1620,128 @@ v0.14.1, six existing routes that needed no fresh proof now need one inside the 
 Settings MFA routes (gated by this change) and the four existing routes listed under "What is newly gated"
 above (gated earlier in this release cycle). The ten routes that are new in this release need one too.
 `--mfa-step-up-window-secs 0` (or less) disables
-the stale-proof requirement on the 41 routes and still logs a startup `WARN`. While it is in
+the stale-proof requirement on the 39 ordinary routes (not on the two Settings MFA routes, which use a window of at most 300 s) and still logs a startup `WARN`. While it is in
 force no stale proof is refused (so none is recorded), and the SAML refusal and the
 authentication-store read are skipped too, so SAML sessions also pass; engine denials and
 unwired-store refusals still apply and are still recorded. The JIT-elevation routes keep a 300 s window (the global
 window when it is positive, else 300 s). The new alert `YuzuStepUpWindowDisabled` fires while the
 window is 0 or less. This release has no supported return to v0.14.1 (see "Deployment contract (hard cutover)"). v0.14.1 does not gate the two Settings routes or the four existing routes listed under "What is newly gated" above in their handlers, and it does not have the ten routes that are new in this release. A server whose `/metrics` lacks `yuzu_auth_mfa_step_up_gate_total` and `yuzu_auth_mfa_step_up_window_seconds` has no step-up gate on these routes at all, and `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled` cannot fire there: their silence is not evidence that the gate is on.
+
+## Breaking: MFA proofs are bound to the factor they were earned with; hard cutover with no upgrade path or rollback (#6079)
+
+**This build is a hard cutover.** It supports initial deployment into a fresh database only (see "Deployment
+contract (hard cutover)" under the Forensics-tier note below). It has no upgrade path, no rolling or mixed-version
+window (mixed-version operation is unsupported) and no rollback of its migrations. A database or backup written by an
+earlier build is outside the supported population, and the executable does not check which build wrote the database it
+opens. Recovery means rolling forward on this build, or restoring this build's own backups into a fresh deployment.
+
+The `auth` v3 migration seeds nothing and starts every existing row at factor generation `0`; the trigger
+assigns a value only from the next enrolment change. So an enrolled account that reads generation `0` (only a
+database written by an earlier build holds one) is refused `503` (audit `reason=mfa_proof_unavailable`; sticky:
+`retry_after_ms` is `null`) on the 41 step-up routes (the 39
+ordinary rows, approve and reject among them, and the 2 factor-credential routes) and on the 3 JIT-elevation
+routes (they probe the same factor state), and stays refused until `yuzu-server --mfa-reset <user>` clears its
+factor. The central check on the 39 ordinary rows refuses only while `--mfa-step-up-window-secs` is above 0 (at 0 it
+passes them without reading the store); approve and reject are two of those 39 but also run the approver rule in their
+own handler, which refuses regardless of the setting, as do the 2 factor-credential routes and the elevation routes. Settings self-disable and recovery-code regeneration are
+two of those routes, so such an account cannot use them to recover. An administrator API token passes the 39
+ordinary rows at the central check (issuing it was the step-up moment), but is refused `403` on the 2
+factor-credential routes and cannot approve or reject; and an administrator at generation `0` cannot mint one while
+the window is above 0, because creating a token is itself an ordinary step-up row.
+
+**Rigs that ran an earlier build of this change.** A development or UAT database that ran an earlier iteration of this branch can already record `auth` 3 and `session_store` 3 with an older trigger body. The version number is the same, so the migration is skipped, and the server refuses to start because the boot check pins the trigger function body byte for byte. Recreate such a database. The trigger repair in the auth-store recovery runbook can restore the trigger bodies, but it does not account for any other difference an earlier iteration left, so it is not a supported way to carry a development database across.
+
+**Not affected.** Accounts that are not enrolled are not refused by the binding (nothing is seeded for them). API-token
+and MCP-token callers pass the 39 ordinary rows as before, and a reset does not touch API tokens (the 2 factor-credential
+routes and approval refuse them, as described above). OIDC sessions are judged on their
+identity-provider assertion, not on the local factor generation, and the session store's rebind guard does not apply to
+them. Endpoint agents and gateways are unchanged.
+
+**If an enrolled account reads generation `0`.** Such an account can exist only in a database that an earlier build
+wrote, which this build does not support: the supported remedy is a fresh deployment. The server does not repair it
+for you, and it refuses the account on the routes above until `yuzu-server --mfa-reset <user>` clears its factor (a
+host-shell command; see [the `--mfa-reset` CLI](../ops-runbooks/auth-db-recovery.md) in the auth store recovery
+runbook). That command clears the factor and ends the account's sessions; it is not a way to carry a database across
+builds. To list the accounts in this state:
+
+```sql
+SELECT username FROM auth.users WHERE is_active AND mfa_enrolled_at IS NOT NULL AND mfa_factor_gen <= 0;
+```
+
+A non-administrator cannot enrol again by itself under `--mfa-enforcement=optional` or `admin-only` (the Settings
+enrolment routes need the administrator role), so after a reset such an account stays refused on approvals and JIT
+elevation until an administrator enrols it
+([Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver)). Under
+`--auth-mode=sso-only`, read the runbook's "Break-glass arm (IdP outage under `--auth-mode=sso-only`)" before you
+reset the break-glass account: the next start under `sso-only` refuses to boot until it carries a second factor
+again.
+
+**What changed.** A step-up proof of a local, MFA-enrolled account now counts only for the factor
+that was enrolled when the code was verified. The central step-up check (the 39 ordinary rows), JIT
+elevation and approve and reject all compare a generation stored with the session's proof against the
+account's current one, so disabling MFA and enrolling again, or an administrator clearing the factor
+with `yuzu-server --mfa-reset`, makes every earlier proof stop counting. The generic check also holds a
+local proof to the window on the database clock, to the millisecond, as well as on the server's own
+clock. Two schema migrations run at the first start: `auth` v3 adds `users.mfa_factor_gen` (every row
+starts at `0`) and a trigger that assigns it a fresh random value on every enrolment change, and `session_store` v3 adds two columns and a trigger that
+unbinds a proof written without a generation. Both triggers are checked at every start: a server whose
+database does not have them in force refuses to start (the log says `Failed to open the Postgres auth
+store (migration or MFA trigger check failed; see the preceding AuthDB log line)` or `session store
+migration/open failed`). Only the two host-CLI one-shots `yuzu-server --mfa-reset` and
+`--break-glass-arm` open their bootstrap `AuthDB` past a missing or altered binding trigger (with a loud
+`WARN`; see [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed));
+serving and every other mode, `--generate-tokens` for example, refuse to start; `--mfa-reset` also opens
+the session store it uses to end the account's sessions the same way.
+
+**What you will see.**
+
+- **An enrolled operator gets `503` where they used to be asked for a code.** On the step-up routes and JIT
+  elevation, the dashboard shows a toast and a REST caller gets `503` with the message "this account's
+  second-factor state cannot be verified; if it persists, ask an administrator to follow the MFA binding enforcement runbook" (`mfa_step_up_required: false`, a remediation that names the MFA binding enforcement
+  runbook, and `retry_after_ms`: `5000` when a retry may clear it, `null` when there is no retry hint: see below); the `mfa.step_up.required` audit row carries
+  `reason=mfa_proof_unavailable` and `yuzu_auth_secret_unavailable_total{route="mfa_binding"}` rises. Approve and
+  reject answer that central message only while `--mfa-step-up-window-secs` is above 0; at 0 the approver rule
+  answers with its own message, "the approver's MFA binding cannot be verified, so the decision was not recorded"
+  (or "the approver's MFA state could not be read, so the decision was not recorded", with a retry hint, when the
+  cause is transient), and an `approver_assurance:mfa_store_unavailable` audit row. The message does not say
+  whether the cause is permanent; the REST envelope of the central check carries `retry_after_ms`: `5000` for a
+  failed read (a retry may clear it), `null` when there is no hint (a refusal only an administrator repairs, or one this
+  gate cannot tell from a transient one). The MCP rendering is implemented and tested, but no MCP tool is step-up gated
+  yet. A client that retries on `503` must stop on `null`. It is persistent for an enrolled account whose factor generation is not positive (only a database an earlier build
+  wrote holds one, which is unsupported; the query under "If an enrolled account reads generation `0`" above lists it; an administrator then runs
+  `yuzu-server --mfa-reset <user>` on the host, after checking that the account reads `mfa_factor_gen <= 0`, see the
+  runbook) and for a binding trigger that is not in force (`reason=mfa_binding_unenforced` for the account store;
+  restore the auth store's MFA binding triggers and restart the server; this gate cannot tell a trigger seen not in force from a validation that could not run, so it answers `null` for both, and the cause may still clear by itself). It is transient for a failed read, an inconclusive trigger validation (the `binding_inconclusive` latch,
+  which clears on the next valid check) or an unusable database clock reading. The audit `reason=` token and the
+  server log (a warning is logged once per inconclusive episode) tell the causes apart; the
+  `yuzu_auth_mfa_binding_enforcement_ok` gauge shows only the sticky trigger case (it still reads 1 while the
+  latch is set, and only `YuzuStepUpGateUnavailable` fires), and that query shows only generation-0
+  accounts. Retry once; if it persists, follow the runbook and check first: reset only an account that reads
+  `mfa_factor_gen <= 0`, and do not run `--mfa-reset` on the strength of this message alone. A `503` whose message is "authentication store is temporarily unavailable" is
+  the plain transient one.
+- **Clearing a factor is unchanged apart from the generation check.** `yuzu-server --mfa-reset` and Disable in
+  Settings still write an `attempted` intent row first and an outcome row after, clear the factor and the
+  recovery codes in one transaction and end the account's sessions in a separate step (a failed session delete
+  is `result=partial` and `--mfa-reset` then exits non-zero), exactly as described in the `--mfa-reset` notice
+  below. The Settings Disable additionally compares the factor generation the step-up check admitted with the
+  account's current one under the row lock and refuses with `409` (audit `denied`, `reason=factor_changed
+  expected_gen=<n>`) if they differ. `--mfa-reset` opens its bootstrap auth store and the session store it
+  uses to end the sessions without refusing on a missing or altered binding trigger, and prints a `WARN`
+  for each.
+- **Regenerating recovery codes and disabling MFA are local-session-only.** An API token or an SSO
+  session that reached these two Settings routes before now gets `403`, and `--mfa-step-up-window-secs=0`
+  no longer switches their step-up off (they use a window of at most 300 seconds). A request whose factor
+  changed while it was in flight is refused `409`; reload the page and prove again if asked.
+- **New monitoring.** `yuzu_auth_mfa_binding_enforcement_ok{store="auth"|"session"}` should read `1` on
+  every replica once it has started; `0` means a validation observed a trigger not in force, every
+  local binding decision then answers `503` until a restart, and the shipped `YuzuMfaBindingNotEnforced`
+  alert fires. The reason token depends on the store: `mfa_binding_unenforced` for `store="auth"`, but
+  `mfa_proof_unavailable` (plus `yuzu_auth_session_store_degrade_total{op="rebind_guard"}`) for
+  `store="session"`, which SSO sessions do not see; key SIEM rules on both (`mfa_proof_unavailable` is also the
+  answer for an enrolled account whose factor generation is not positive, see
+  [Post-restore verification](../ops-runbooks/auth-db-recovery.md#post-restore-verification)). The alert
+  ships in `docs/prometheus/yuzu-alerts.yml`. The procedure is
+  [MFA binding enforcement failed](../ops-runbooks/auth-db-recovery.md#mfa-binding-enforcement-failed).
 
 ## Behaviour change: /health and /api/health per-source budget
 
@@ -1682,34 +1815,24 @@ upgrading, run the read-only check and rename anything it lists**: see
 
 **2. Approvals schema migration v3 (store `approval_manager`).** It adds three text columns to
 `approvals` (`request_json`, `request_digest`, `excluded_roots`), each `NOT NULL DEFAULT ''`, so
-every existing row reads as "binds no request, excludes nobody" and behaves as before. The
+a row that sets none of them reads as "binds no request, excludes nobody". The
 migration is additive and needs no operator step, but it takes a brief `ACCESS EXCLUSIVE` lock on
-`approvals`. If a long-running or idle-in-transaction session holds that table, the upgraded
-replica cannot finish the migration and refuses to start (`Refusing to start: approval manager
+`approvals`. If a long-running or idle-in-transaction session holds that table, the replica
+cannot finish the migration and refuses to start (`Refusing to start: approval manager
 migration/open failed`) rather than serve with a half-migrated schema; end the session and start
 it again. It follows the data-only v2 step of the scheduled-approval change (#6096, below), which
-claimed v2 first, so a database upgraded from a build with neither change runs v2 and then v3 in
-two separate transactions, and one already at v2 runs only v3. The v3 step is idempotent
-(`ADD COLUMN IF NOT EXISTS`), so a development or UAT database that ran an earlier build of this
-branch, which recorded the same columns as version 2, upgrades cleanly instead of failing on a
-column that already exists.
+claimed v2 first, so a fresh database applies each approvals step in its own transaction. The v3
+step is idempotent (`ADD COLUMN IF NOT EXISTS`).
 
-- **Rolling upgrade.** An older replica never touches the new columns and keeps redeeming the
-  tickets it and this build mint, all of which are unbound. The migration runner applies only
-  versions above the one stored for the store and has no newer-schema refusal, so an older binary
-  starts against a newer database: a build with neither change against a v2 or v3 database, and a
-  build with the #6096 change but not this one (highest version 2) against a v3 database. That is
-  established by reading the runner; it has not been exercised as a live rolling restart.
-- **Rollback to the previous build** is therefore expected to work while no bound ticket exists,
-  which is the case for this whole release: the previous build ignores the columns and the
-  default-empty values lose nothing. Rolling back across the #6096 change as well has its own
-  consequences, described in that section.
-- **Rollback is NOT supported once a bound ticket exists.** The previous build does not read
-  `excluded_roots`, so a reviewer who was barred from a bound ticket could approve it, and it
-  redeems without comparing the frozen request. The change that first creates a bound ticket
-  (#6063) must not do so until every replica runs a build that includes this migration, and must
-  define what rollback means after that point. Until it does, a row with a non-empty
-  `request_json` is not expected to exist; if you find one, do not roll back.
+- **Mixed builds are outside the contract.** This release supports a fresh database only (see
+  "Deployment contract (hard cutover)" in the Forensics section of this page), so running this build
+  beside an earlier one is not supported.
+- **A return to the previous build** is outside the "Deployment contract (hard cutover)" in the
+  Forensics section of this page, so it is not a supported operation.
+- **A bound ticket needs every replica on this build.** The change that first creates a bound ticket
+  (#6063) must not mint one on a deployment where any replica runs an earlier build; that is outside the
+  "Deployment contract (hard cutover)". Until it ships, a row with a non-empty `request_json` is not expected
+  to exist; if you find one, the database was written outside that contract.
 
 **3. A new audit action and metric: `approval.precondition_denied` and
 `yuzu_approval_precondition_denied_total{origin}`.** When an approved ticket is refused at
@@ -1995,15 +2118,15 @@ A refused request writes no quarantine record and releases none. The `403` bodie
 
 ## ⚠️ Breaking: approving or rejecting a request now needs an interactive session and an enrolled MFA factor with a fresh proof; MCP cannot approve (#6061, #6079)
 
-**Before you upgrade (checklist).**
+**Before you bring approvers into service (checklist).**
 
-1. List your administrators and everyone who holds `Approval:Approve` (see "Find affected automation before you upgrade" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
+1. List your administrators and everyone who holds `Approval:Approve` (see "Find automation that approves without a signed-in browser session" below). With RBAC enforcement off (the shipped default) the approvers are exactly the accounts with `role = 'admin'`; the step-0 query in step 2 returns the local ones that are not yet enrolled.
 2. Check who is enrolled: run the step-0 SQL, the first block of [Path A in the recovery runbook](../ops-runbooks/auth-db-recovery.md#path-a-an-enrolment-sign-in-window). On a Linux package install the `psql "$YUZU_POSTGRES_DSN"` blocks in this section fail in an interactive shell, because the DSN lives only in the env file, which is readable only by root and the `yuzu` account; read the value into a shell variable (do not source the file, because a DSN containing `&` or spaces breaks as shell) with `YUZU_POSTGRES_DSN=$(sudo sed -n 's/^YUZU_POSTGRES_DSN=//p' /etc/yuzu/yuzu-server.env)` and then run each block as written.
 3. Enrol each administrator in Settings → Security and sign-in → Two-factor sign-in; another administrator cannot do it for them.
 4. Plan each non-administrator approver (possible only once RBAC enforcement is on): it needs the runbook path, not Settings.
 5. A SAML deployment has no approver path (#6098); give those approvers a local or OIDC account first.
 6. Have at least two enrolled approvers: a submitter cannot review their own request, so a single enrolled approver cannot decide that approver's own requests.
-7. After the upgrade, run the approvals-refused query (step 6 of "After upgrading, verify approvals on a test request" below) to see whether approvals are being refused and why.
+7. Once the deployment is running, run the approvals-refused query (step 6 of "Verify approvals on a test request" below) to see whether approvals are being refused and why.
 8. Owners of scripts that run `yuzu-server --mfa-reset`, and of SIEM rules on `mfa.disabled` or `mfa.reset.breakglass`: `--mfa-reset` now exits `1` when ending the sessions fails (`result=partial`), when the audit store refuses its intent row, and when the clear itself fails; every clear writes two audit rows; a failed session delete is `result=partial`, not `success` (details in the `--mfa-reset` notice below).
 
 **What changed.** Approve and reject (`POST /api/approvals/{id}/approve`, `POST /api/approvals/{id}/reject`,
@@ -2031,9 +2154,10 @@ principal and not an engine principal. The existing rule that the reviewer canno
   generic step-up gate can only ask for a factor the account has, so it passed an account with none; approve and
   reject now use their own rule, in every `--mfa-enforcement` mode:
   - **Local account:** it must have an enrolled TOTP factor, or the decision is refused `403`
-    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must not
-    predate the account's current enrolment (disabling MFA and enrolling again invalidates older proofs; the
-    response is the usual step-up `401`).
+    `approver_assurance_required:mfa_not_enrolled`. The proof must also be no older than the window and must be
+    bound to the factor enrolled now (disabling MFA and enrolling again replaces the factor, so older proofs
+    stop counting; the response is the usual step-up `401`, with `reason=proof_factor_mismatch`,
+    `proof_factor_unbound` or `mfa_proof_missing` in the `mfa.step_up.required` audit detail).
   - **OIDC session:** the identity provider must have asserted an MFA-method `amr` (with an `iat`) on the ID
     token at sign-in. If it did not (no MFA `amr`, or `iat` missing or not positive), the decision is refused
     `403` `approver_assurance_required:mfa_proof_missing` (with step-up on, typed only when `--mfa-enforcement` does not
@@ -2064,13 +2188,13 @@ principal and not an engine principal. The existing rule that the reviewer canno
   - **A non-admin cannot enrol itself** under `--mfa-enforcement=optional` or `admin-only` (login enrols only the
     accounts the mode protects, and the Settings enrolment routes are administrator-only). The seeded `Operator`
     role holds `Approval:Approve`, so with RBAC enforcement on, every such approver is refused `mfa_not_enrolled`
-    after the upgrade until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
+    until an administrator enrols them, either with a temporary enrolment sign-in window or by promoting each account to
     administrator just long enough to enrol and then demoting it; see
     [Enrolling a non-admin approver](../ops-runbooks/auth-db-recovery.md#enrolling-a-non-admin-approver),
     including the identity-proofing step (under the window, whoever signs in first with the password enrols the
-    factor) and each path's consequences. Plan this **before** upgrading, and make sure at least one
-    enrolled, authorised approver exists who is not the submitter of each request you expect to be decided: until
-    then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
+    factor) and each path's consequences. Plan this before the first decision is needed, and make sure at least two
+    enrolled, authorised approvers exist, so that for each request you expect to be decided one of them is not its
+    submitter: until then nothing can be approved. A seeded administrator that has never enrolled is in the same position. Self-service
     enrolment for non-admins is a planned follow-up and is not part of this change. `yuzu-server --mfa-reset`
     ends the account's sessions, and disabling MFA in Settings ends every session of the account, the one you
     are using included (neither ends API tokens). **`--mfa-reset` now exits non-zero when ending the sessions fails**
@@ -2086,9 +2210,9 @@ principal and not an engine principal. The existing rule that the reviewer canno
     approver achieves nothing until RBAC enforcement is turned on.
   - **When the approver rule's own read fails** (an unreadable stored session proof for any approver, or, for a local
     approver, an MFA-store fault at the approver's own read: with the step-up window at `0` or negative, or a fault
-    between the central check's read and that one), the answer is `503` with `retry_after_ms`, counted as
+    between the central check's read and that one; or a binding condition), the answer is `503` with `retry_after_ms: 5000` for the transient causes, and with **no** `retry_after_ms` for the three persistent ones, which no retry clears until an operator repairs them (the account-store binding trigger observed not in force, `mfa_binding_unenforced`; the session store's rebind guard latched not in force, `mfa_proof_unavailable`; and an enrolled account whose factor generation is not positive, `mfa_proof_unavailable`), counted as
     `yuzu_auth_secret_unavailable_total{route="approval"}`; nothing is decided. While step-up is on, a local approver
-    whose MFA store is unreadable is refused first by the central check: `503` without `retry_after_ms`, counted as
+    whose MFA store is unreadable is refused first by the central check: `503` (`retry_after_ms: 5000` for a failed read, `null` where there is no retry hint (a cause only an administrator repairs, or one this gate cannot tell from a transient one)), counted as
     `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` and
     `yuzu_auth_mfa_step_up_gate_total{outcome="unavailable"}`.
   - **An OIDC approver whose stored MFA proof is dated after the database clock** (the replica that took the sign-in ran
@@ -2136,14 +2260,13 @@ non-admin approver under `optional` or `admin-only` is in the same position and 
 
 **If you set `--mfa-step-up-window-secs=0`,** approval no longer loses its MFA requirement: approve and reject use a
 300-second window instead, and still require an enrolled factor. The setting still switches the step-up gate off for
-the other step-up endpoints. Decisions made **before** the upgrade, and in particular any made with the setting at
-`0`, gain no retroactive assurance: review every `approval.approve` audit row with `result=success` from that period,
-and check every `attempted` row that has no outcome row (compare counts per `target_id`). A build that has #6061
-also writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
-leaves only the `attempted` row (see [Audit Log](audit-log.md)). A build that predates #6061 writes no
-`attempted` row, only the outcome row.
+the other step-up endpoints. Decisions already in the audit log gain no retroactive assurance, in particular any made with the setting at
+`0`: review every `approval.approve` audit row with `result=success` from that period,
+and check every `attempted` row that has no outcome row (compare counts per `target_id`). The approver gate
+writes a `result=attempted` row first, so do not count both, and a decision whose outcome row failed to write
+leaves only the `attempted` row (see [Audit Log](audit-log.md)).
 
-**Find affected automation before you upgrade.** Nothing is listed for you, so search the audit log for
+**Find automation that approves without a signed-in browser session.** Nothing is listed for you, so search the audit log for
 callers that approved or rejected without a signed-in browser session.
 
 - **Over MCP.** Audit rows with action `mcp.approve_request` or `mcp.reject_request` are MCP approvals. The
@@ -2166,19 +2289,18 @@ callers that approved or rejected without a signed-in browser session.
   `user_agent` and `source_ip` for those.
 
 The search only sees what the audit retention window still holds, so an empty result is not proof that nothing
-approves by token. Before upgrading, also check which service accounts and API tokens hold `Approval:Approve`
+approves by token. Also check which service accounts and API tokens hold `Approval:Approve`
 and move each approval step to a person on a signed-in session. No audit query lists a token or service account
-that holds `Approval:Approve` but has never approved: after this change it is refused anyway, so the check is
+that holds `Approval:Approve` but has never approved: it is refused anyway, so the check is
 about finding automation to move, not about finding exposure. To list what is granted, read the RBAC grants
 (`GET /api/v1/rbac/roles/assignments`, or the Access Reviews export `GET /api/v1/access-reviews/export`; both
 need `AccessReview:Read`) and match each principal's roles against the roles that carry `Approval:Approve`.
 `GET /api/v1/tokens` lists only the calling user's own tokens, so check each token owner's grants.
 
 **What that search cannot see.** The audit query finds token and MCP approvers only. The approvers most likely
-to hit the new behaviour are human accounts, which carry `principal_class = 'human'` and so look the same before
-and after the upgrade: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
-`amr` (now refused `mfa_proof_missing`; before this change they passed unless `--mfa-enforcement=required`), and local
-accounts with no enrolled factor (now refused `mfa_not_enrolled`; before this change they passed without a second factor). To
+to hit the new behaviour are human accounts, which carry `principal_class = 'human'`, so that query does not single them out: SAML users (refused), OIDC users whose identity provider asserts no MFA-method
+`amr` (refused `mfa_proof_missing`), and local
+accounts with no enrolled factor (refused `mfa_not_enrolled`). To
 list the SAML and `amr`-less OIDC operators who have signed in, query the login rows in the audit store (the
 retention window applies):
 
@@ -2207,11 +2329,11 @@ ORDER BY username;
 ```
 
 `role` is the account's legacy role column, not its RBAC grants, so compare the result with who holds
-`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`) after the upgrade, so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
+`Approval:Approve`. An account listed here is refused as an approver (`mfa_not_enrolled`), so enrol it first if it is meant to approve; a non-admin needs the enrolment sign-in window described above.
 With RBAC enforcement off (the shipped default), a non-admin account is refused `403` "admin role required" before
 the MFA check, so `mfa_not_enrolled` is what an administrator sees, and a non-admin sees it only once enforcement is on.
 
-**After upgrading, verify approvals on a test request.** Use a test device and a harmless, read-only
+**Verify approvals on a test request.** Use a test device and a harmless, read-only
 instruction, and do not skip the safety notes in step 1: an execute call that is not held for approval really
 dispatches.
 
@@ -2297,158 +2419,19 @@ dispatches.
    being refused `503` because their proof is dated after the database clock; the fix is clock synchronisation (see
    [OIDC approvers refused with a clock-skew 503](../ops-runbooks/auth-db-recovery.md#oidc-approvers-refused-with-a-clock-skew-503)).
 
-**Rolling back, or running mixed versions.** The approver-assurance change itself adds no schema; the separate
-scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index, both of which an
-older binary ignores, so a rollback starts cleanly. What changes is which checks run.
+**Schema and agents.** The approver-assurance change adds two schema migrations, in the `auth` schema (a
+`users.mfa_factor_gen` column and a trigger that assigns it) and in the session store (the `mfa_factor_gen`
+and `mfa_bind_seq` columns on `sessions` and a guard trigger). They run at the first start of a fresh deployment, like the
+other schema migrations of this build. The
+separate scheduled-approval change (#6096, below) adds a data-only approvals step and a command-outbox index.
 
-> **Warning: mixed versions silently weaken the approver control.** The enrolled-factor and fresh-proof
-> requirement (#6079) is in force **only while every replica that serves `/api/approvals/*` runs a build that
-> has it.** Behind one load balancer, an old replica keeps the weaker gate: it passes an approver who has no
-> enrolled factor, and a build that predates #6061 also accepts bearer and MCP approvals. The same person can
-> therefore get `403` `mfa_not_enrolled` from one replica and succeed on the next request, and nothing in the
-> response says which replica answered. Rolling those replicas first shortens the exposure window; the gap closes
-> only when approval traffic reaches upgraded replicas only (pin or drain approvals), and stop-all, upgrade, start-all is
-> the default recommendation. Running more than one server replica is unsupported today (the safe-to-scale gate,
-> `docs/ha-delivery-matrix.md`), so this describes a rolling upgrade and is not a statement that a multi-replica
-> deployment is supported. **Rolling back to an
-> older build is a security-policy downgrade**, not only a convenience: it re-opens the weaker gate, and tickets
-> decided before the upgrade gain no retroactive assurance.
->
-> If you are about to roll, write down each replica's upgrade time (in UTC) in the change ticket as you go; see
-> "Mixed-version admission" below for why it matters and for the queries that use it.
-
-- A replica or a rolled-back binary that predates this change still accepts bearer and MCP approvals, and does
-  not check an approved ticket's age when it is consumed or when `ScheduleRunner` fires it. While any such
-  replica serves traffic, the assurance is only as strong as that replica; drain it, or send approval traffic
-  to upgraded replicas only.
 - Endpoint agents need no change.
-- An older binary does not write the `result=attempted` row, and does not read it. Rows written by the new
-  binary stay in the audit store and are ignored by the old one; a `denied` row with
-  `detail=approver_assurance:<reason>` simply stops appearing.
-- **Telling old and new rows apart.** The `attempted` and `success` rows of an approve or reject written by a
-  build with #6079 carry `detail=approver_assurance:enrolled_fresh_mfa`. A row without it was written before
-  the control, or by a replica that does not have it. Use that token as the cutover marker when sampling
-  decisions, and to spot an old replica still serving approvals during a roll. The audit row does not name the
-  replica; your load balancer's access log is the place to find which one answered.
-- **Mixed versions and clearing a factor.** Until every replica and the CLI image run this build, an old binary's
-  `--mfa-reset` or Settings disable clears the factor without ending the account's sessions, so its existing
-  sessions stay live. Afterwards run the new
-  binary's `--mfa-reset` (before the user enrols again, because it clears the factor) or
-  `DELETE /api/v1/sessions?username=<name>`. To find the accounts cleared during the mixed window, list the
-  `mfa.disabled` and `mfa.reset.breakglass` rows in it. The bounds follow the same rules as the approval query below
-  (UTC, an explicit `+00` on each, widened by a margin for clock skew). A row written by an old binary has no
-  `sessions_ended=` in its `detail`; every `ok` or `success` outcome row from this build has one, except `no verified factor to clear`
-  (a cancelled, unfinished enrolment, which cleared nothing); an `error` row from the CLI has none. This build also writes an `attempted` intent row before it
-  clears anything, and that row has no `sessions_ended=` either; the `result IN ('ok', 'success')` filter is what keeps
-  those rows out of the list, so do not drop it.
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT to_timestamp(timestamp) AS at, principal, action, result, target_id, detail
-       FROM audit_store.audit_events
-      WHERE action IN ('mfa.disabled', 'mfa.reset.breakglass')
-        AND result IN ('ok', 'success')
-        AND COALESCE(detail, '') NOT LIKE '%sessions_ended=%'
-        AND COALESCE(detail, '') <> 'no verified factor to clear'
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
-      ORDER BY timestamp;"
-  ```
-
-  Each row's `target_id` is an account whose sessions were left live. End them as above. An empty list is not
-  evidence that none were cleared: it has the same blind spots as the approval query below (bounds that miss the
-  window, an audit store restored or purged, a lost audit write), so run the same count control over the same bounds.
-- **Mixed-version admission is a documented known limitation of a rolling upgrade.** The approver
-  gate is stateless and no minimum-version check exists, so while a rolling upgrade is in progress an old replica
-  can admit a decision the new gate would refuse. The Yuzu project maintainer accepted this on 2026-10-28 as inherent to
-  the upgrade method, on the condition that the upgrade is controlled; the acceptance is recorded in the ADR-1005
-  exception ledger (`docs/adr/1005-headless-platform-use-case-engines.md`, entry of 2026-10-28) as a working-session
-  statement, not a signed decision. The condition is: record each
-  replica's upgrade timestamp (in UTC) in the change ticket (SOC 2 CC8.1) **as you roll**, because the audit row does
-  not name the replica. A decision row **without**
-  `approver_assurance:enrolled_fresh_mfa` was written before the control existed, by a replica that did not have
-  it, or after a rollback. To list the decisions in a window that carry no marker, set the start to the first
-  replica's upgrade time minus a margin and the end to the last replica's upgrade time plus a margin, or to the
-  present time if a rollback happened or a replica may still be old. **Both bounds are UTC.** The command's first
-  statement pins the session to UTC, because `psql` otherwise reads a bare `timestamptz` literal in the session's
-  own time zone (the server default, the role's setting, `PGTZ` or a DSN option), which shifts the window by whole
-  hours and returns no rows without any error; write each bound with an explicit `+00`, for example
-  `2026-10-20 09:55+00`. If the times in your change ticket are local times, convert them to UTC first.
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT to_timestamp(timestamp) AS at, principal, action, target_type, target_id, result, source_ip, detail
-       FROM audit_store.audit_events
-      WHERE (   (action IN ('approval.approve', 'approval.reject')
-                 AND result IN ('attempted', 'success')
-                 AND detail <> 'approver_assurance:enrolled_fresh_mfa')
-             OR (action IN ('mcp.approve_request', 'mcp.reject_request')
-                 AND result = 'success'))
-        AND timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>')
-      ORDER BY timestamp;"
-  ```
-
-  The `at` column is shown in UTC. Match each row against the ticket's per-replica timestamps and the load balancer
-  log, and review the decision it records. Only `attempted` and `success` rows are listed for the REST actions,
-  because a refusal (`denied`) never carries the marker. Rows before the window are pre-upgrade decisions and gain no
-  retroactive assurance. Rows inside the leading margin, before the first replica was upgraded, are also
-  pre-upgrade decisions: expect them in the list, they are not old-replica admissions.
-
-  **A list with no rows is not evidence of a clean upgrade.** The same output appears when the bounds miss the
-  window, when the audit store is empty or was restored from an earlier copy, and when an audit write was lost (the
-  `success` row of a REST decision is best effort). Run this control over the SAME bounds. It counts every audit row
-  in the window, whatever the action:
-
-  ```bash
-  psql -q "$YUZU_POSTGRES_DSN" -c \
-    "SET TIME ZONE 'UTC';
-     SELECT count(*), to_timestamp(min(timestamp)) AS earliest, to_timestamp(max(timestamp)) AS latest
-       FROM audit_store.audit_events
-      WHERE timestamp >= extract(epoch FROM timestamptz '<first replica upgraded, minus margin, UTC with +00>')
-        AND timestamp <  extract(epoch FROM timestamptz '<last replica upgraded, plus margin, UTC with +00>');"
-  ```
-
-  For a window in which the deployment was running, `count` must be above zero and `earliest` and `latest` must
-  fall inside the bounds. A `count` of zero means the bounds or the audit store are wrong (check that both bounds
-  are UTC, that the start is earlier than the end, and that the audit store was not restored or purged), not that
-  the upgrade was clean; do not use an empty list as evidence until the control is above zero. A non-zero count shows
-  the bounds select audit rows, not that every decision left a row. Attach both command texts, with the bounds
-  filled in, and their output to the change ticket.
-
-  The `mcp.approve_request` and `mcp.reject_request` rows are listed for a different reason. A decision made
-  over MCP never carries the marker, because the upgraded binaries refuse MCP approvals and rejections, so any
-  `success` row for these actions inside the window came from a replica that had not been upgraded yet, or from
-  a rollback. For those rows `target_type` is `mcp_tool` and `target_id` is the tool name; the approval ticket id
-  is in `detail`. The MCP query in "Find affected automation before you upgrade", above, finds the same actions
-  across the whole retention period; this one limits them to the window.
-
-  The `timestamp` column is written from the clock of the replica that wrote the row, while the bounds you
-  recorded in the change ticket come from wherever you read the time, so widen both bounds by a margin that
-  covers the NTP skew between your replicas (the observed skew, or a few minutes if you have not measured it).
-  The margin covers clock skew only. It does not cover a time-zone offset, which is why the bounds must be UTC
-  and the session is pinned to UTC. A replica that wrote no row is invisible to these queries, so also attach
-  the load balancer log excerpt for the window, together with the per-replica upgrade timestamps.
-  Re-run both commands, with the end bound set to the present time, until every replica is confirmed upgraded and
-  no rollback or re-creation from an old image is possible, and attach the final run.
-- A ticket approved by an older replica carries a `reviewed_at` stamped from that replica's own clock. The new
-  binaries judge it against database time, so a replica whose clock runs more than 5 minutes ahead of the
-  database produces a ticket the new binaries treat as not yet live (a recall over MCP answers
-  `approval expired (past its 7-day lifetime)`, although the ticket is in fact ahead of the clock), and a replica
-  running behind shortens the ticket's life by the same amount. Once the next accepted approval submission on any
-  replica has run, such a ticket is `expired` for good, with only an info log line as a trace, and correcting the
-  clock does not bring it back, so request approval again. Until that submission has run nothing has been
-  written, so correcting the clock first makes the ticket live again: if the query in `docs/clock-guarded-retention.md` finds
-  held-back tickets, fix the clock before anyone submits an approval request. (A submission refused because the pending queue is full
-  rolls its sweeps back, so the ticket stays `approved` and unusable until a later submission is accepted.) A
-  query that lists approved tickets ahead of the database clock (until that sweep runs) is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness". The same applies to a
-  database host whose own clock is stepped backwards by more than 5 minutes: an approved, unused ticket whose review
-  time is more than 5 minutes ahead of the new database time (roughly, one reviewed within the last
-  (step size minus 5 minutes) before the step) is expired permanently once an accepted submission has swept it
-  (until then correcting the clock restores it), and older approved tickets stay live
-  (observability tracked in #6098).
+- Review time (`reviewed_at`) is stamped from the database clock. A database host whose own clock is stepped
+  backwards by more than 5 minutes expires an approved, unused ticket whose review time is more than 5 minutes ahead
+  of the new database time (roughly, one reviewed within the last (step size minus 5 minutes) before the step)
+  permanently, once an accepted submission has swept it (until then correcting the clock restores it); older
+  approved tickets stay live (observability tracked in #6098). A query that lists approved tickets ahead of the
+  database clock is in `docs/clock-guarded-retention.md`, "ApprovalManager ticket liveness".
 - Submission time (`submitted_at`) now also comes from the database, like the review and use times, so a server
   whose own clock is wrong can no longer lengthen or shorten how long its pending requests live. A recurring
   schedule no longer decides that an approval is spent by comparing clocks: when the occurrence an approved ticket
@@ -2456,51 +2439,36 @@ older binary ignores, so a rollback starts cleanly. What changes is which checks
   occurrence), so one approval runs at most one occurrence whatever the clocks say (#6096). A used ticket keeps its
   status (`approved` or `rejected`); only its use time and user are filled in. The schedule's own run times are
   still stamped by the server that advances it; they only decide when an occurrence is due.
-- **Scheduled approvals are retired once on upgrade (#6096).** Before this release a spent scheduled ticket was
-  never marked used; it was recognised as spent by comparing clocks. The approvals schema step (v2) therefore marks
-  every outstanding approved or rejected ticket that belongs to a schedule as used, once per database, with no clock
-  comparison. A schedule that was holding an occurrence for an approval you had already given (approved but not yet
-  fired when you upgraded) asks again for that held occurrence, and a rejection you had already given no longer skips
-  that occurrence: the schedule asks again. Pending requests, requests from the dashboard and MCP, and tickets
-  already used are untouched. Nothing to do. The step is data only (no table or column changes). It touches
-  every unsettled approved or rejected scheduled ticket, including old rejected ones (rejected tickets never expire
-  and are never swept); that is normally small. It runs inside the upgrade transaction under a 300 s statement
-  timeout and is skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied,
-  and the approvals store does not open (the server logs a schema migration failure for that store); investigate
-  the table size and restart. The command outbox also gains a small index on its approval id
-  (`outbox_approval_idx`) at the same upgrade; its build is bounded by the same 300 s timeout.
-- **Upgrade one replica first when the outbox table is large (#6096).** Building `outbox_approval_idx` takes a share
-  lock on the outbox table for up to 300 s, so enqueue and claim on other replicas wait meanwhile. A second replica
-  that boots at the same time waits on the migration advisory lock under the pool's default lock and statement
-  timeouts and may fail its boot closed; restarting it recovers, because the migration is then applied. The
-  recommendation is to start ONE replica, wait for it to finish migrating, then start the others. These are not
-  measured numbers.
-- **Where the legacy marker lives (#6096).** The retired tickets carry `consumed_by = 'schedule:legacy-6096'` in
-  `approval_manager.approvals`. It is readable only by SQL; no API returns it. Tickets the outbox showed had already
-  been used by an earlier occurrence carry the related marker `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`;
-  tickets settled by a normal fire or skip carry `schedule:<schedule id>:<n>`. To list the legacy ones:
+- **The approvals v2 step is data only (#6096).** A scheduled ticket is marked used when its occurrence is queued
+  (a rejected ticket when it skips its occurrence), not recognised as spent by comparing clocks. The approvals
+  schema step (v2) marks every outstanding approved or rejected ticket that belongs to a schedule as used, once per
+  database, with no clock comparison. On a fresh deployment the table is empty, so it changes nothing. It is data
+  only (no table or column changes), runs inside the migration transaction under a 300 s statement timeout and is
+  skipped on every later start. If the 300 s timeout is hit the step fails, nothing is applied, and the approvals
+  store does not open (the server logs a schema migration failure for that store); investigate the table size and
+  restart. The command outbox gains a small index on its approval id (`outbox_approval_idx`) in its own schema
+  step (outbox v2, also under a 300 s statement timeout); if that build fails, it is the outbox store that does not open.
+- **Start one replica first (#6096).** Building `outbox_approval_idx` takes a share lock on the outbox table for up
+  to 300 s on a large table, so enqueue and claim on other replicas wait meanwhile. A second replica that boots at
+  the same time waits on the migration advisory lock under the pool's default lock and statement timeouts and may
+  fail its boot closed; restarting it recovers, because the migration is then applied. Start ONE replica, wait for
+  it to finish migrating, then start the others. These are not measured numbers. A fresh database has no large
+  outbox, so the index build is short there; the concurrent-boot wait still applies.
+- **Where the used marker lives (#6096).** A ticket's `consumed_by` in `approval_manager.approvals` records what
+  settled it. It is readable only by SQL; no API returns it. A ticket the outbox showed had already been used by an
+  earlier occurrence carries `consumed_by = 'schedule:ledger-spent:<schedule id>:<n>'`; a ticket settled by a normal
+  fire or skip carries `schedule:<schedule id>:<n>`. The value `schedule:legacy-6096` is written only by the v2
+  step, so a fresh deployment has none. To list the scheduled tickets and what settled them:
 
   ```sql
-  SELECT id, status, schedule_id, consumed_at
+  SELECT id, status, schedule_id, consumed_at, consumed_by
   FROM approval_manager.approvals
-  WHERE consumed_by = 'schedule:legacy-6096';
+  WHERE schedule_id <> '' AND consumed_by LIKE 'schedule:%';
   ```
-- **Mixed versions and rollback for scheduled approvals (#6096).** Recommended practice: drain or stop every replica
-  that predates this change before anyone approves scheduled work. The command outbox records which approval ticket
-  each scheduled run used, and the new binary refuses to fire a ticket the outbox shows was already used by an
-  earlier occurrence, so a ticket fired by an older leader is inert after the upgrade. A rolled-back binary does
-  not consult the outbox ledger or the used marker, so an older binary can re-fire a ticket the new binary marked
-  used (the old clock comparison); rolling back restores the old behaviour, including that exposure. After a rollback
-  followed by a second upgrade, run this once, because a rejected ticket spent under the older binary would
-  otherwise skip one occurrence. It also retires approved-but-unfired scheduled tickets, which then ask again:
-
-  ```sql
-  UPDATE approval_manager.approvals
-  SET consumed_at = EXTRACT(EPOCH FROM now())::bigint, consumed_by = 'schedule:legacy-6096'
-  WHERE schedule_id <> '' AND consumed_at = 0 AND status IN ('approved','rejected');
-  ```
-- Tickets already approved when you upgrade keep their original `reviewed_at`; the seven days are counted
-  from it.
+- This build records in the command outbox which approval ticket each scheduled run used, and refuses to fire a
+  ticket the outbox shows was already used by an earlier occurrence. Running it beside an earlier build is outside
+  the "Deployment contract (hard cutover)" and not supported.
+- The seven days of an approved ticket are counted from its `reviewed_at`.
 
 ## Behaviour change: plugin-enablement tables and the continuity anchor (`plugin_config_store` schema v3, ADR-3006)
 
@@ -2633,7 +2601,8 @@ customer-distribution lane. Before switching lanes, read the
 | after 0.15.x (next) | 0.12.0 | 0.12.0 | **Gateway: the shipped reference configs now admit the server by its identity (#6016, release N+1; gateway restart required, breaking for own-certificate installs that take the new config).** The reference gateway configs (`gateway/config/sys.config.prod`, `deploy/docker/reference-gateway-sys.config`) set `{mgmt_peer_auth_mode, identity}` with no pin. An unset mode is still `pin` (the boot logs a WARN), so a config of your own that does not set the key is unchanged. Bring-your-own certificates, `--no-default-certs` and a server given its own `--cert`/`--key` carry no identity: **set `{mgmt_peer_auth_mode, pin}` and keep your pin before you take the new config**, or every command is refused `no_uri_san`. Upgrade the server first (the gateway needs a server that mints the identity, #6072). Read "Behaviour change: the shipped gateway configs admit the server by its identity" below. |
 | 0.16.x (next) | 0.12.0 | 0.12.0 | **Gateway: the reference gateway config now reads the CA's CRL and refuses a withdrawn server certificate (#6016 PR 4b; gateway restart required; breaking for a gateway on the reference config whose server's 8443 certificate is not issued by the install CA or lacks the URL host in its names: every management stream is refused `revocation_unknown`).** `deploy/docker/reference-gateway-sys.config` sets `{mgmt_crl_source, {url, "https://server:8443/api/v1/ca/crl"}}`; `sys.config.prod` carries it commented. This is a **gateway** release change: a `0.15.0` gateway image ignores the key (no CRL check, no warning, and `YuzuGatewayMgmtCrlNotLoaded` cannot fire because the series is absent), so mount the new config only with a gateway image that carries it, and pin `YUZU_VERSION` accordingly. Upgrade the server first: it serves the CRL on 8443 (a pre-48-hour server's 7-day CRL also works). A gateway with no source logs a WARN under `identity` or `identity_or_pin` (on a management listener that enforces peer authorization) and reads no CRL; a later release will refuse to boot there. The gateway now also needs an outbound path to the server's HTTPS port (8443) and waits up to about 5.5 seconds at start for the first CRL. Alerts: `YuzuGatewayMgmtCrlNotLoaded` (critical), `YuzuGatewayMgmtCrlStale` and `YuzuGatewayMgmtCrlRefreshStalled` (warning). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Breaking, fresh deployment only: stored responses of Forensics-tier plugins are served only to callers holding `Forensics:Read` (#4990).** Applies to every stored-response read path (REST, MCP, dashboard) and to the server-side consumers of those rows (bundle collation, result-set membership, policy checks, the live output stream, execution error text), with the limits listed under "Known limits" in that section; other readers see the rows as absent, with counts and caps computed over what they may read, so an empty result no longer implies no data. Viewer, Operator, PlatformEngineer and ITServiceOwner, and with RBAC off every non-administrator session, no longer see these rows. New built-in `ForensicsAnalyst` role (read-only, assign it fleet-wide with RBAC on) and new audit action `response.forensics.read`. A read whose authority cannot be determined is refused with a retryable error rather than a partial result. This release is a hard cutover: it supports initial deployment into a fresh database only and provides no upgrade path from an earlier server's database (see "Deployment contract" in the section; the agent and gateway columns above are the minimum agent and gateway versions, not a supported upgrade starting point for the database). See "Behaviour change: stored responses of Forensics-tier plugins need `Forensics:Read` (#4990, fresh deployment only)". |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 41 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; roll back to recover). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
+| 0.16.x (next) | 0.12.0 | 0.12.0 | **MFA step-up is enforced by one central check on 41 named routes, before the route's own checks (breaking order of checks; server restart only, no agent or gateway change, no migration).** A stale or missing MFA proof is now answered with the `401` step-up envelope before the route's own `403` (permission, `token_session`, `not_local`; a cross-site cookie write is answered `403` by the server-wide same-site check before the step-up check); engine principals receive `403` on every step-up-gated route regardless of grants (audited as `mfa.step_up.required`, no longer as the per-route handler denial row); a server with no wired authentication store answers `503` on these routes, and an unreadable store answers `503` to local sessions; `POST /api/settings/mfa/recovery-codes` and `POST /api/settings/mfa/disable` are newly gated; SAML sessions still cannot satisfy step-up (`403`, unless the window is disabled with `--mfa-step-up-window-secs 0`). The server now exits with status `1` at boot when a mutating route has no step-up classification, which can only happen on a fork or custom build (a restart policy turns it into a restart loop; the fix is a row in `step_up_policy.hpp` and a rebuild). Other mutating routes and all MCP tools are not MFA-step-up gated in this release. New metric `yuzu_auth_mfa_step_up_gate_total` and alerts `YuzuStepUpGateUnavailable` and `YuzuStepUpWindowDisabled`. See [Breaking: MFA step-up is checked once](#breaking-mfa-step-up-is-checked-once-before-the-routes-own-checks-and-two-more-routes-need-a-fresh-proof). |
+| 0.16.x (next) | 0.12.0 | 0.12.0 | **MFA proofs are bound to the factor they were earned with, and approve and reject require an enrolled factor (hard cutover: fresh database only, no upgrade path, no rollback, no rolling or mixed-version window; no agent or gateway change; #6079).** An enrolled account that reads factor generation `0` (only a database an earlier build wrote holds one, which this build does not support) is refused `503` (audit `reason=mfa_proof_unavailable`) on the 41 step-up routes (the 39 ordinary rows only while `--mfa-step-up-window-secs` is above 0; approve, reject and the 2 factor-credential routes regardless) and on the 3 JIT-elevation routes until `yuzu-server --mfa-reset <user>` clears its factor. See "Breaking: MFA proofs are bound to the factor they were earned with" above. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Seven runtime-config keys are administrator-only on `PUT /api/config/{key}` (breaking for non-administrator and MCP-tier callers; server restart only, no agent or gateway change, no migration).** `plugin_signing_required`, `dex_alert_routing`, `dex_blast_min_devices`, `dex_blast_window_seconds`, `dex_blast_cooldown_seconds`, `dex_cohort_export_key` and `audit_retention_days` now answer `403` to a supervised-tier MCP token and, with RBAC on, to a non-administrator role that holds `Infrastructure:Write`; every other config key is unchanged. Server restart only; see the first section on this page. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The runtime-configuration read shows a caller only the overrides it could write (breaking for MCP-tier and non-administrator readers; server restart only, no agent or gateway change, no migration).** `GET /api/config`, `GET /api/v1/config` and the MCP tool `get_runtime_config` leave out the `oidc_*`, `plugin_signing_required`, DEX alert and `audit_retention_days` overrides unless the caller could write them; an administrator account's `GET /api/config` body is unchanged apart from `log_level` reading `warn`. `heartbeat_timeout` is limited to 30 to 86400 seconds on every write route. Mixed-version fleets are not a concern (server-side only). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **The Settings Engine Principals panel needs EnginePrincipal:Read (breaking for an account administrator without it; server restart only, no agent or gateway change, no migration).** See the section above. |
@@ -3028,8 +2997,10 @@ API-token Create and Revoke buttons) now apply the same step-up check as the RES
   it has not (under `sso-only` it is enrolled by construction), and it must hold an administrator
   role). If a deployment has neither an existing token nor a usable break-glass
   account, the only remaining route is to restart with `--mfa-step-up-window-secs 0` as a
-  temporary measure: it disables the stale-proof requirement on every gated endpoint, not only
-  these two (see [Authentication](authentication.md)), so restore the window afterwards.
+  temporary measure: it disables the stale-proof requirement on every ordinary gated endpoint, not only
+  these two (see [Authentication](authentication.md)), so restore the window afterwards. It does not
+  switch off approval approve/reject or the two factor-credential rows (recovery-code regeneration and
+  MFA disable), which keep a window of at most 300 s.
 - **OIDC sessions** are gated only when the identity provider attests MFA (`amr`) or
   `--mfa-enforcement` protects the role. An OIDC-only `--auth-mode=sso-only` deployment is not
   exempt: with no `amr` claim and `--mfa-enforcement=admin-only` or `required`, the session fails
@@ -7961,6 +7932,8 @@ The check warns rather than refusing so that a start in a situation outside the 
 
 ### Linux (systemd)
 
+> **Fresh deployment only.** The in-place recipe below is historical and is not a supported upgrade procedure for an earlier build's database (see "Deployment contract (hard cutover)" in the Forensics section of this page).
+
 ```bash
 # 1. Stop the server
 sudo systemctl stop yuzu-server
@@ -9504,7 +9477,7 @@ behave identically.
 cleanly into `failed` instead of spinning. Recovery procedure:
 [`docs/ops-runbooks/auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md).
 
-**Rollback to a pre-AuthDB release** (only if you have not yet
+**Rollback to a pre-AuthDB release** (historical: v0.12.0, the retired SQLite `auth.db`; not a supported rollback for this build. Applies only if you have not yet
 written user state via the new dashboard):
 
 1. Stop the v0.12.0 server.
@@ -9594,17 +9567,15 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 
 **If your automation alerts on `status|failed`/`status|release_uncertain`/`status|update_uncertain` from `quarantine` actions, you may see these fire more often after upgrading** — this is expected. Nothing got more broken; the plugin's failure reporting simply got more honest about cases it previously reported as clean success. No action is required beyond expecting the change.
 
-> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade path from an earlier build's database.
+> **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
 ## Rollback
 
-If an upgrade causes issues:
-
-1. Stop the new version
-2. Restore the backed-up `.db` and `.cfg` files
-3. Start the previous version binary
-
-**Important:** Rolling back after a schema migration requires restoring the database files from backup. The old binary cannot read the new schema.
+A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this
+page, and this page documents no rollback procedure. Recovery is to roll forward on the build that wrote the
+database, or to restore a backup taken from this deployment into a fresh deployment (see "Backup recommendation" in [Server Administration](server-admin.md));
+a database or backup written by an earlier build is unsupported. Whether an earlier binary works against a newer
+schema depends on the migration (see "When a server build finds its database ahead of it").
 
 ## Troubleshooting
 
