@@ -1907,7 +1907,7 @@ flip, with a red-first test each:
     lane), 16 hung verifications stall every arm and re-arm, including Guardian registry-rule re-arming after a fire,
     until they return (a residual, not a measured event); and a write in the renamed (ghost) tree during the Faulted
     window can still deliver one `Fired` for the registered key (an accepted residual, #7877 item 34, adjudicated LOW
-    by an independent non-author reviewer; the emission is pre-existing, this change only bounds the window): it
+    by a governance review agent that did not write the change; see #7877 item 34; the emission is pre-existing, this change only bounds the window): it
     costs one idempotent evaluation that re-reads live state, ends at the retry, and the File mechanism suppresses
     it (the "no Fired event between Faulted and Recovered" case above is a File case). Cost and audit: one
     detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
@@ -2320,8 +2320,8 @@ flip, with a red-first test each:
     plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
     (REG-01, REG-02, REG-03 and the test-side REG-07) and one owner-accepted row (REG-04). REG-01, REG-02 and REG-04 are
     ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above); REG-03 is
-    adjudicated separately. Two commits follow `5731eb0632`: a test commit (`96882cae88`, whole-repo tree `6086bb292f87b1e7633c3fdbd25590180704c618`; REG-07: the
-    `ProbeGate` hook of the Registry cases now owns its state by value) and a documentation and comment commit (no behaviour
+    adjudicated separately. Four commits follow `5731eb0632`: a test commit (`96882cae88`, whole-repo tree `6086bb292f87b1e7633c3fdbd25590180704c618`; REG-07: the
+    `ProbeGate` hook of the Registry cases now owns its state by value) and three documentation and comment commits (`9c04408b6a`, `1beb84467e`, `b330b7c60a`; no behaviour
     change: `git diff -U0` over `spark_registry.cpp` and `spark_mechanism.hpp` shows comment lines only). **Rig run of the final
     bytes** (author-reported, weecolin Windows rig, not a CI run; md5 `499383dc23c13432a92e2137bc6506a8` for
     `test_spark_mechanism.cpp`, `8b9507c896a2dbc9b5b48548a8b6a106` for `spark_registry.cpp`, `d5edb42d65297f641c0912fab06c2c72`
@@ -2336,6 +2336,10 @@ flip, with a red-first test each:
     then changed seven lines of comment in `spark_registry.cpp` (the Faulted-window residual; md5
     `08542dfb794b1b0072a3d157e8a11de6` at `1beb84467e`, recomputed with `git show 1beb84467e:agents/core/src/spark_registry.cpp | md5sum`)
     and no code line, so it was not re-run; the rig-run md5 `8b9507c8...` above is the `9c04408b6a` blob.
+    `b330b7c60a` changed three more comment lines in `spark_registry.cpp` (md5 `c9a84156f7b9c2c517b37bed9f067f55` at
+    `b330b7c60a`, recomputed with `git show b330b7c60a:agents/core/src/spark_registry.cpp | md5sum`): every change to
+    `spark_registry.cpp` after `5731eb0632` is comment-only and was not re-run, and the rig-run bytes remain those of
+    `9c04408b6a`. The commit after `b330b7c60a` changes documentation and comments only.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then
