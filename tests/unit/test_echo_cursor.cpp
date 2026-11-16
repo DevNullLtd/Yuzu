@@ -753,7 +753,9 @@ TEST_CASE("cursor retry: one success clears the backoff", "[echo][cursor][retry]
     r.note_success();
     CHECK(r.due(161));
     CHECK(r.failures == 0);
+    CHECK(r.first_failure_ts == 0); // the first failure time is forgotten
     r.note_failure(200, 60); // the streak starts again at one tick, not three
+    CHECK(r.first_failure_ts == 200); // a fresh streak, not the old first failure
     CHECK(r.due(260));
 }
 
@@ -764,19 +766,6 @@ TEST_CASE("cursor retry: a clock stepped back before the first failure makes the
     r.note_failure(1'000'300, 300);
     CHECK_FALSE(r.due(1'000'301));
     CHECK(r.due(999'999)); // the clock went back past the first failure
-}
-
-TEST_CASE("cursor retry: a success after failures makes the source due at once and forgets the "
-          "first failure time",
-          "[echo][cursor][retry]") {
-    CursorRetry r;
-    r.note_failure(500, 60);
-    REQUIRE(r.first_failure_ts == 500);
-    r.note_success();
-    CHECK(r.due(0));
-    CHECK(r.first_failure_ts == 0);
-    r.note_failure(900, 60);
-    CHECK(r.first_failure_ts == 900); // a fresh streak, not the old first failure
 }
 
 TEST_CASE("cursor retry: the tick period comes from the config string, defaulting to 300",

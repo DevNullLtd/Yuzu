@@ -361,9 +361,15 @@ is not an attempt: `<source>_last_status`, `<source>_last_status_at` and
 failure count rises only when the source is actually tried. The first tick that
 completes ends the backoff and the line disappears (a tick that returns
 `cursor_lost` counts as completing). Disabling or re-enabling the source, or
-restarting the agent, also ends it. Power and removable lose nothing while
-backed off, because they re-read from an unchanged cursor, so a late source is
-at most one backoff interval behind.
+restarting the agent, also ends it. Running `collect_slow` or `snapshot` by hand
+does not force a retry: a backed-off source is skipped there too, and `snapshot`
+reports it among its skipped sources (a partial result) until
+`<source>_next_retry_at`. Power and removable re-read from an unchanged cursor,
+so a backed-off source is normally only late, by at most one backoff interval.
+Two limits apply while it waits: subscription events are held in a queue of
+4,096 that drops its oldest entry when full, and an OS log can wrap past the
+stored cursor. Either is counted and recorded as a `capture_gap` row on the next
+tick that completes, never dropped silently.
 
 **Write failures.** Snapshot-diff sources (`process`, `tcp`, `service`, `user`,
 `software`, `arp`, `dns`, `mapdrive`) commit a tick's events and their baseline in

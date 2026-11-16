@@ -1368,7 +1368,8 @@ private:
     std::mutex health_mu_;
     yuzu::echo::SourceHealthLedger health_;
     // Cursor-driver retry backoff per source (echo_cursor.hpp CursorRetry). Guarded by
-    // collect_mu_, touched only by the cursor loop in collect_slow_impl.
+    // collect_mu_: touched by the cursor loop in collect_slow_impl and erased at a cursor
+    // source's enable/disable edge in do_configure.
     std::map<std::string, yuzu::echo::CursorRetry> cursor_retry_;
     std::atomic<int64_t> procperf_procs_seen_{0};
     // Set when the stream-fallback baseline seed failed: the poll must re-seed
@@ -4405,6 +4406,12 @@ private:
                             // outcome, and it is logged loudly because a source
                             // that throws here has an un-honoured P-002 contract.
                             try {
+                                // A real enable/disable edge ends any retry backoff, as
+                                // the collect-time disabled gate does: a pause shorter than
+                                // one slow tick never reaches that gate, and the next
+                                // enable must not inherit the old backoff.
+                                cursor_retry_.erase(src_name);
+                                note_next_retry(src_name, std::nullopt);
                                 cs->on_enabled_changed(v == "true");
                             } catch (const std::exception& e) {
                                 spdlog::error("ECHO: {} on_enabled_changed threw ({}) -- the "

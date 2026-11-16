@@ -3235,6 +3235,7 @@ TEST_CASE("registry source: a commit that fails for three ticks then succeeds re
     REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
 
     const std::string lost_before = t.db.get_config("registry_etw_lost", "");
+    const auto kept = count_rows(t.db); // what the warehouse held before the failures
 
     // Three ticks whose commit is refused. Each has a loss row, so it has a row to fail on.
     std::int64_t first_failure = 0;
@@ -3250,6 +3251,7 @@ TEST_CASE("registry source: a commit that fails for three ticks then succeeds re
     }
     CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
               .rows.at(0).at(0) == "0"); // nothing was committed while it failed
+    CHECK(count_rows(t.db) == kept);
 
     // The trap is gone: the next tick commits the loss it re-derived and the stall window.
     f.clock += 10 * SEC;
@@ -3266,12 +3268,14 @@ TEST_CASE("registry source: a commit that fails for three ticks then succeeds re
           std::format("gap:commit_stalled:commit:{}:{}", first_failure, recovered));
     CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
               .rows.at(0).at(0) == "2"); // the loss row and the stall row
+    CHECK(count_rows(t.db) == kept + 2); // and the warehouse kept both, in the one commit
 
     // The window is consumed: a later commit adds no second stall row.
     f.clock += 10 * SEC;
     tick(t.db, *src);
     CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
               .rows.at(0).at(0) == "1");
+    CHECK(count_rows(t.db) == kept + 2);
 }
 
 TEST_CASE("registry source: a commit that never failed records no commit stalled gap",

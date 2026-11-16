@@ -228,11 +228,15 @@ extra tick. The order per source is enable gate, backoff check, cursor read, col
 tick writes `echo|collect_<src>|0|retry_backoff`, adds the source to `skipped_sources`, and is NOT
 recorded in the health ledger; `status` shows `config|<src>_next_retry_at|<epoch>` for as long as
 it lasts. Any tick that returns ends the backoff, `CursorLost` included (the source has committed a
-re-baseline and there is nothing to re-read). The enable gate drops the record, so a pause or
-re-enable never inherits one. The state is in memory: a restart retries at once. Log-based sources
-replay from an unchanged cursor and lose nothing; `registry` re-derives its loss accounting, so its
-next committed tick after commit failures also writes one `gap:commit_stalled` row whose key carries
-the window (rule 3b), unless a restart intervened.
+re-baseline and there is nothing to re-read). The enable gate drops the record, and so does a real
+enable/disable edge in `do_configure` (under `collect_mu_`), so two toggles between slow ticks
+cannot inherit one. The state is in memory: a restart retries at once. A failed commit itself loses
+nothing for the log-based sources, which replay from an unchanged cursor, but a longer wait widens
+two limits: the subscription legs' `BoundedPendingQueue` drops its oldest entry at 4096 (rule 6)
+and an OS log can wrap past the cursor (rule 2); both are counted and written as a `capture_gap`
+row on the next tick that completes. `registry` re-derives its loss accounting, so its next
+committed tick after commit failures also writes one `gap:commit_stalled` row whose key carries the
+window (rule 3b), unless a restart intervened.
 
 **Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
 counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
