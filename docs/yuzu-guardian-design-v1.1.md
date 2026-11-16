@@ -3009,8 +3009,10 @@ Guardian ladder must check these.
   never silent. The tag counts
   failed persist passes, firewalled throws, each failed ATTEMPT to stage a capture
   (an allocation failure) or capture displaced from staging (a retarget over a
-  still-unpersisted capture) and a capture staged with no KV store (logged once,
-  kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
+  still-unpersisted capture) and, as defence in depth that production cannot reach (an
+  engine without a KV store arms no rule, so nothing is staged; only a test exercises it), a
+  capture staged with no KV store (logged once, kept). Stop-time losses that are NOT counted:
+  a stop flush that ran out of its wall
   budget with captures left, and one skipped (it started 18 s or more after the mark and this
   stop had shown a slow store: a slow failed write or a stage that ran slow), each logged with
   its own

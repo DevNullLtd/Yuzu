@@ -968,15 +968,20 @@ flip, with a red-first test each:
   **Flip-time refresh item (#5605; part of the same checklist row):** at the flip, (4)
   refresh every statement that says Spark or `prefer_spark` is off, or that the gauge is
   absent, in every released agent today. List them with
-  `git grep -n -i "released agent" -- docs/ server/core/src/ agents/core/` and
-  `git grep -n "prefer_spark.*off" -- docs/ server/core/src/ agents/core/` over: the HELP
+  `git grep -n -i "released agent" -- docs/ server/core/src/ agents/core/ | grep -i -E
+  'baseline|spark|guardian'` and
+  `git grep -n "prefer_spark.*off" -- docs/ server/core/src/ agents/core/ | grep -i -E
+  'baseline|spark|guardian'`. The hits are a superset (they include other Spark families
+  that the flip also refreshes); the files this change owns are: the HELP
   strings in `server/core/src/guardian_baseline_fleet_tags.hpp`,
   `docs/user-manual/metrics.md`, `docs/user-manual/guaranteed-state.md`,
-  `docs/user-manual/upgrading.md`, the alert comment and description in
-  `docs/prometheus/yuzu-alerts.yml`, and the runbook "Fleet monitoring of baseline
-  persistence". The agent side has two comments that state the flag is off or defaults to
-  false: `agents/core/src/guardian_baseline_heartbeat.hpp` (the unpersisted tag is "dormant
-  (prefer_spark off ...)") and `agents/core/include/yuzu/agent/guardian_engine.hpp`
+  `docs/user-manual/upgrading.md`, `docs/user-manual/server-admin.md` (the exit-code-4
+  paragraph), `docs/yuzu-guardian-design-v1.1.md` (section 24),
+  `docs/spark-legacy-delta-registry.md` (its "#4045 prose" entry), the alert comment and
+  description in `docs/prometheus/yuzu-alerts.yml`, and the runbook "Fleet monitoring of
+  baseline persistence". The agent side has two comments that state the flag is off or
+  defaults to false: `agents/core/src/guardian_baseline_heartbeat.hpp` (the unpersisted tag
+  is "dormant (prefer_spark off ...)") and `agents/core/include/yuzu/agent/guardian_engine.hpp`
   ("prefer_spark_ defaults false" and "live in every released agent today"); the switch
   itself is the hardcoded `/*prefer_spark=*/false` in `agents/core/src/agent.cpp`. To tell
   which agents are on the Spark path, use the

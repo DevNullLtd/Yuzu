@@ -332,14 +332,15 @@ public:
     /// and drain worker), staging attempts that failed (an allocation failure, once per
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
-    /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped because it started late AND this stop had
-    /// shown a slow store) is logged, NOT counted here. A capture that could not be
-    /// staged again at stop IS counted (per failed attempt, like any staging failure) and
-    /// logged, but the count dies with the exiting process, so the log line is the evidence;
-    /// the same holds for a flush cut short by a firewalled throw (counted in the persister's
-    /// firewalled-exception count, and logged). A stop cut off by the shutdown watchdog leaves
-    /// not even a log line (exit code 4). Zero while
+    /// with no KV store to write it to (defence in depth: production cannot reach it, because
+    /// an engine without a store arms no rule, so nothing is staged). A stop-time loss that is
+    /// not a failed write (the stop flush ran out of wall budget, or was skipped because it
+    /// started late AND this stop had shown a slow store) is logged, NOT counted here. A
+    /// capture that could not be staged again at stop IS counted (per failed attempt, like any
+    /// staging failure) and logged, but the count dies with the exiting process, so the log
+    /// line is the evidence; the same holds for a flush cut short by a firewalled throw
+    /// (counted in the persister's firewalled-exception count, and logged). A stop cut off by
+    /// the shutdown watchdog leaves not even a log line (exit code 4). Zero while
     /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
     /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
     /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it

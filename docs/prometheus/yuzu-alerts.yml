@@ -7230,14 +7230,14 @@ groups:
             left-open). No per-device view of the underlying tag exists: this gauge is a fleet
             sum and the alert cannot name the affected endpoints. If you ship agent logs to a
             central store, search them for "failed to persist captured baseline" and for the
-            ERROR lines logged at stop; otherwise check the logs on the affected hosts. Then
-            fix the store (a full or read-only data directory, permissions, a locked
-            kv_store.db). Fix the store first. A graceful restart while the store is still
-            failing loses the staged capture, because the stop-time flush uses the same store.
-            After the store is healthy, the worker retries without a restart (backoff 5 s up
-            to 60 s). A crash or a forced kill loses the capture regardless; the next boot then
-            captures whatever the file holds at that moment, which is the gap this alert exists
-            to expose. An agent whose log shows "Failed to open KV store" at boot arms no
+            ERROR lines logged at stop; otherwise check the logs on the affected hosts. Fix the
+            store first (a full or read-only data directory, permissions, a locked
+            kv_store.db). A graceful restart while the store is still failing loses the staged
+            capture, because the stop-time flush uses the same store. After the store is
+            healthy, the worker retries without a restart (backoff 5 s up to 60 s). A crash
+            or a forced kill loses the capture regardless; the next boot then captures
+            whatever the file holds at that moment, which is the gap this alert exists to
+            expose. An agent whose log shows "Failed to open KV store" at boot arms no
             Guardian rules at all, so it cannot raise this alert; that is a separate fault:
             repair the agent data directory and restart the agent. This covers the Spark path
             only: persist failures on the legacy detection path are logged and are not counted.
