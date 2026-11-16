@@ -1560,6 +1560,8 @@ struct OfflineMountTick {
     // The start-up sweep of leftover YUZU_HIVE_* mounts has not completed (see
     // run_pending_hive_sweep). Cleared only when its worker returned.
     bool sweep_pending{true};
+    // A completed sweep that could not list HKEY_USERS has used its one retry (settle_sweep).
+    bool sweep_listing_retried{false};
 };
 
 // Runs the start-up sweep of leftover `YUZU_HIVE_*` mounts once, through the same gate and bounded
@@ -1582,7 +1584,13 @@ void run_pending_hive_sweep(OfflineMountTick& tick) {
         return yuzu::echo::sweep_leftover_hive_mounts();
     });
     if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {
-        tick.sweep_pending = false;
+        // A listing that failed or never settled keeps the sweep pending for exactly one retry (at
+        // the first offline mount), then completes with one warning.
+        const auto settle = yuzu::echo::settle_sweep(*bounded.value, tick.sweep_listing_retried);
+        tick.sweep_pending = settle.pending;
+        if (settle.warn)
+            spdlog::warn("Echo registry: hku_list_incomplete -- HKEY_USERS could not be listed "
+                         "twice, so leftover hive mounts were not swept this start");
         return;
     }
     const auto decision = yuzu::echo::decide_mount_call(
@@ -1745,7 +1753,14 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
         // before it unloads) can be unloaded here; an out-of-process mount is unguarded
         // (win_reg_handle.hpp), and that is the default shape on the shared CI pools.
         const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");
-        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);
+        // A failed or unstable listing is not "no mounts are left": nothing is offered to the unload
+        // and the result says so (listing_incomplete), so the caller does not settle on it.
+        const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
+        if (!listing.error.empty()) {
+            r.listing_incomplete = true;
+            return r;
+        }
+        stale = select_stale_hive_mounts(listing.names, prefix);
         if (stale.empty())
             return r;
         // RegUnLoadKeyW needs SeRestorePrivilege, which the agent account already holds

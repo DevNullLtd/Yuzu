@@ -16,11 +16,18 @@
  * _WIN32 guard needed.
  */
 
+#include "list_walk.hpp"
 #include "value_enumeration.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
 using namespace yuzu::win;
+using namespace yuzu::shared;
 
 TEST_CASE("value_enumeration_is_complete: ordinary case, nothing cut short",
           "[value_enumeration]") {
@@ -63,4 +70,113 @@ TEST_CASE("value_enumeration_is_complete: cap below count AND a mid-enum failure
           "still just incomplete, not double-counted",
           "[value_enumeration]") {
     CHECK_FALSE(value_enumeration_is_complete(5000, 4096, 2000));
+}
+
+// ── list_walk.hpp: walk_enumeration and stable_walk (pure; no registry) ─────────────────
+
+namespace {
+using Script = std::vector<std::pair<ListStep, std::string>>;
+
+ListWalk scripted_walk(const Script& script) {
+    return walk_enumeration([&](unsigned i, std::string& name, std::string& err) {
+        REQUIRE(i < script.size()); // the walk never asks past a terminal answer
+        const auto& [step, text] = script[i];
+        (step == ListStep::Item ? name : err) = text;
+        return step;
+    });
+}
+
+// One scripted listing per walk attempt, and one scripted stamp per stamp call.
+struct StableFixture {
+    std::vector<std::optional<int>> stamps;
+    std::vector<std::vector<std::string>> walks;
+    std::size_t stamp_calls = 0;
+    std::size_t walk_calls = 0;
+
+    ListWalk run(unsigned max_attempts = 3) {
+        return stable_walk(
+            [&]() -> std::optional<int> {
+                REQUIRE(stamp_calls < stamps.size());
+                return stamps[stamp_calls++];
+            },
+            [&] {
+                REQUIRE(walk_calls < walks.size());
+                return ListWalk{walks[walk_calls++], {}};
+            },
+            max_attempts);
+    }
+};
+} // namespace
+
+TEST_CASE("index walk: a walk that reaches the end is complete", "[list_walk]") {
+    const auto w = scripted_walk({{ListStep::Item, "a"}, {ListStep::Item, "b"}, {ListStep::End, ""}});
+    CHECK(w.error.empty());
+    CHECK(w.names == std::vector<std::string>{"a", "b"});
+}
+
+TEST_CASE("index walk: an error part-way empties the list and names the index", "[list_walk]") {
+    const auto w = scripted_walk({{ListStep::Item, "a"},
+                                  {ListStep::Item, "b"},
+                                  {ListStep::Error, "rc=5"},
+                                  {ListStep::Item, "never reached"}});
+    CHECK(w.error == "index 2 (rc=5)");
+    CHECK(w.names.empty()); // the two names found so far are not handed out
+}
+
+TEST_CASE("index walk: an error at index zero is a failed walk and not an empty list",
+          "[list_walk]") {
+    const auto w = scripted_walk({{ListStep::Error, "rc=6"}});
+    CHECK(w.error == "index 0 (rc=6)");
+    CHECK(w.names.empty());
+    // An empty list that DID end is the other answer, and carries no error.
+    CHECK(scripted_walk({{ListStep::End, ""}}).error.empty());
+}
+
+TEST_CASE("stable walk: an unchanged stamp accepts the first walk", "[list_walk]") {
+    StableFixture f{{1, 1}, {{"a", "b"}}};
+    const auto w = f.run();
+    CHECK(w.error.empty());
+    CHECK(w.names == std::vector<std::string>{"a", "b"});
+    CHECK(f.walk_calls == 1);
+}
+
+TEST_CASE("stable walk: a changed stamp walks again and accepts the stable pass", "[list_walk]") {
+    StableFixture f{{1, 2, 2, 2}, {{"a"}, {"a", "b"}}};
+    const auto w = f.run();
+    CHECK(w.error.empty());
+    CHECK(w.names == std::vector<std::string>{"a", "b"}); // the second pass, not the first
+    CHECK(f.walk_calls == 2);
+}
+
+TEST_CASE("stable walk: a stamp that never settles reports unstable after three attempts",
+          "[list_walk]") {
+    StableFixture f{{1, 2, 3, 4, 5, 6}, {{"a"}, {"b"}, {"c"}}};
+    const auto w = f.run(3);
+    CHECK(w.error == kStampUnstable);
+    CHECK(w.names.empty());
+    CHECK(f.walk_calls == 3);
+}
+
+TEST_CASE("stable walk: a stamp that cannot be taken before the walk is an incomplete listing",
+          "[list_walk]") {
+    StableFixture f{{std::nullopt}, {{"a"}}};
+    const auto w = f.run();
+    CHECK(w.error == kStampFailed);
+    CHECK(w.names.empty());
+    CHECK(f.walk_calls == 0); // no walk is trusted without a stamp to compare it with
+}
+
+TEST_CASE("stable walk: two failed stamps do not match and the listing is incomplete",
+          "[list_walk]") {
+    // The stamp before the walk is fine and the one after it fails: absent == absent must never
+    // read as "unchanged".
+    StableFixture f{{1, std::nullopt}, {{"a"}}};
+    const auto w = f.run();
+    CHECK(w.error == kStampFailed);
+    CHECK(w.names.empty());
+
+    // A walk that itself failed is returned as it is, whatever the stamps say.
+    const auto failed = stable_walk([] { return std::optional<int>{1}; },
+                                    [] { return ListWalk{{}, "index 0 (rc=5)"}; }, 3);
+    CHECK(failed.error == "index 0 (rc=5)");
 }

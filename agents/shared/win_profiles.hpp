@@ -32,6 +32,7 @@
 #endif
 #include <windows.h>
 
+#include "list_walk.hpp"
 #include "user_profile_model.hpp"
 #include "value_enumeration.hpp"
 #include "win_hive_file_probe.hpp"
@@ -44,11 +45,13 @@
 // header-local static cannot do this job (#2771 code-review CFX-1).
 #include <yuzu/agent/offline_hive_mutex.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -252,18 +255,52 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
 // Subkey names directly under HKEY_USERS -- live-loaded hive roots, plus any
 // "<SID>_Classes" siblings. This is the input to
 // yuzu::profiles::classify_hive_state.
-inline std::vector<std::string> enumerate_hku_subkeys() {
-    std::vector<std::string> out;
+//
+// A CHECKED listing: `error` is empty exactly when the walk ended at the list's end (an
+// RegEnumKeyExW answer of ERROR_NO_MORE_ITEMS) AND the list did not change while it was read.
+// Any other RegEnumKeyExW answer, a list that cannot be read, or one that never settled
+// (yuzu::shared::stable_walk, three attempts) is a FAILED READ with no names -- never a short
+// list. A caller that acts on the names (hive-state classification, a sweep, a per-user read)
+// must refuse on a non-empty `error` and not treat the listing as "no one is logged on".
+//
+// The stamp is the sorted name list of a second checked walk: a hive that loads or unloads
+// between the walks changes it, including a swap that leaves the count unchanged. (A cheaper
+// RegQueryInfoKeyW count-plus-last-write stamp is not used: it is not shown to move on a
+// same-count swap.)
+inline yuzu::shared::ListWalk enumerate_hku_subkeys_checked() {
     constexpr DWORD kNameBufLen = 256;
-    wchar_t name_buf[kNameBufLen]{};
-    DWORD idx = 0;
-    DWORD name_len = kNameBufLen;
-    while (RegEnumKeyExW(HKEY_USERS, idx++, name_buf, &name_len, nullptr, nullptr, nullptr,
-                         nullptr) == ERROR_SUCCESS) {
-        out.push_back(from_wide(name_buf, static_cast<int>(name_len)));
-        name_len = kNameBufLen;
-    }
-    return out;
+    const auto walk_once = [] {
+        return yuzu::shared::walk_enumeration(
+            [](unsigned idx, std::string& name, std::string& err) {
+                wchar_t name_buf[kNameBufLen]{};
+                DWORD name_len = kNameBufLen;
+                const LSTATUS rc = RegEnumKeyExW(HKEY_USERS, idx, name_buf, &name_len, nullptr,
+                                                 nullptr, nullptr, nullptr);
+                if (rc == ERROR_SUCCESS) {
+                    name = from_wide(name_buf, static_cast<int>(name_len));
+                    return yuzu::shared::ListStep::Item;
+                }
+                if (rc == ERROR_NO_MORE_ITEMS)
+                    return yuzu::shared::ListStep::End;
+                err = "RegEnumKeyExW rc=" + std::to_string(rc);
+                return yuzu::shared::ListStep::Error;
+            });
+    };
+    const auto stamp = [&]() -> std::optional<std::vector<std::string>> {
+        auto w = walk_once();
+        if (!w.error.empty())
+            return std::nullopt;
+        std::sort(w.names.begin(), w.names.end());
+        return std::move(w.names);
+    };
+    constexpr unsigned kMaxAttempts = 3;
+    return yuzu::shared::stable_walk(stamp, walk_once, kMaxAttempts);
+}
+
+// The names only, empty when the checked listing failed. Prefer enumerate_hku_subkeys_checked:
+// this form cannot tell "no hives loaded" from "the listing failed".
+inline std::vector<std::string> enumerate_hku_subkeys() {
+    return enumerate_hku_subkeys_checked().names;
 }
 
 // Result of enumerate_value_names(): the names actually collected, plus

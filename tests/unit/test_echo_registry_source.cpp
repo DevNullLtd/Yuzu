@@ -1355,6 +1355,38 @@ TEST_CASE("select_stale_hive_mounts: a prefix only narrows the set; one that is 
     CHECK(select_stale_hive_mounts(hku, "YUZU_").empty());
 }
 
+TEST_CASE("registry sweep: an incomplete HKU listing stays pending for one retry and then completes with one warning",
+          "[echo][registry][pure]") {
+    bool retried = false;
+    HiveSweepResult listed; // the listing was complete (whatever it found)
+    HiveSweepResult unlisted;
+    unlisted.listing_incomplete = true;
+
+    // A complete listing settles at once and never spends the retry.
+    auto settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK_FALSE(retried);
+
+    // The first incomplete listing keeps the sweep pending, silently, for exactly one retry.
+    settle = settle_sweep(unlisted, retried);
+    CHECK(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK(retried);
+
+    // The second one completes it with the one warning: a deterministic failure is not retried
+    // every tick.
+    settle = settle_sweep(unlisted, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK(settle.warn);
+
+    // A retry that does list completes without a warning.
+    retried = true;
+    settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+}
+
 TEST_CASE("sweep_hive_mounts: each name is offered once in order; a refusal is retained and the rest are still attempted",
           "[echo][registry][pure]") {
     const std::vector<std::string> names{"YUZU_HIVE_a_0000000000000000_0",
@@ -6212,6 +6244,15 @@ TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount a
         CHECK(freed.retained.empty());
         CHECK_FALSE(offline_fake_mount_present());
     }
+}
+
+TEST_CASE("registry live: the checked HKU listing is complete and holds this process's loaded hives",
+          "[echo][registry][windows]") {
+    const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
+    INFO("error=" << listing.error);
+    CHECK(listing.error.empty());
+    // .DEFAULT is always loaded, so an empty answer is a failed listing read as complete.
+    CHECK(std::find(listing.names.begin(), listing.names.end(), ".DEFAULT") != listing.names.end());
 }
 
 TEST_CASE("registry live: a root under an HKU hive that is not mounted reads Unreadable (hive_unloaded), never Absent",
