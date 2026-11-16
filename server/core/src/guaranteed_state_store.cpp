@@ -1959,9 +1959,10 @@ constexpr const char* kCensusLockAll =
 // docs/user-manual/guaranteed-state.md, "What the server does with the pair". The executable model
 // of those rules is the model in `test_census_pair_harness.cpp`, a C++ port of the original Python
 // `pend.py` (that header says where the Python is); it replays seeded schedules through this store
-// and compares after every delivery. The text was transcribed from the generated form of the
-// original Python model (at the commit that header names) and carries one deliberate,
-// semantics-preserving deviation from it: `YUZU_CENSUS_SEEN_MAX_SEQ_` below has a `+ 0` (P-1). It
+// and compares after every delivery. The clauses mirror the rules of the original Python model
+// (`pend.py` at the commit that header names); the prototype they were transcribed from was
+// generated from it and is not kept in the tree. They carry one deliberate, semantics-preserving
+// deviation from that prototype: `YUZU_CENSUS_SEEN_MAX_SEQ_` below has a `+ 0` (P-1). The text
 // is checked by the harness differential, which replays seeded schedules against this store. A
 // clause is not to be edited by hand-copying: change the model and the harness in the same change.
 #define YUZU_CENSUS_IN_EPOCH_ "$9::bigint"
@@ -2920,7 +2921,7 @@ agent_order_step(PGconn* conn,
     // The lock bound plus a margin as a statement timeout (M1): lock_timeout is per lock WAIT, and
     // a share lock taken by a Repair does not queue behind this step's waiting FOR UPDATE, so a
     // chain of overlapping Repairs can keep one wait going past the lock bound. The statement
-    // timeout counts the whole statement, waits included, so it is the total ceiling for the
+    // timeout counts the whole statement, waits included, so it is the ceiling for each of the
     // step's statements while the lock bound ends a single wait (see the Timeouts paragraph above
     // for the margin). A 57014 takes the failed-step path below, as a 55P03 does.
     if (!control(
