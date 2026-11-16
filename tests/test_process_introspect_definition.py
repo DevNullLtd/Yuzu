@@ -53,10 +53,26 @@ class ProcessIntrospectDefinitionParameters(unittest.TestCase):
     def test_pid_and_start_time_patterns(self):
         props = self._params()["properties"]
         pid = re.compile(props["pid"]["validation"]["pattern"])
-        for ok in ("1", "4242", "2147483647"):
+        for ok in ("1", "9", "10", "4242", "99999999", "1999999999", "2147483647"):
             self.assertTrue(pid.fullmatch(ok), ok)
-        for bad in ("", "0", "01", "-1", "1 ", "abc", "12345678901"):
+        for bad in ("", "0", "01", "-1", "1 ", "abc", "12345678901",
+                    "2147483648", "2999999999", "3999999999", "9999999999"):
             self.assertFalse(pid.fullmatch(bad), bad)
+            # the server matches unanchored (RE2 PartialMatch): a dropped outer group would
+            # let `^a|b$` match a longer string on one arm only, so search must refuse too
+            self.assertFalse(pid.search(bad), bad)
+        # Exactness at every arm edge: for each prefix of INT32_MAX padded to ten digits with
+        # 0s and with 9s, the values one either side must be accepted iff 1..INT32_MAX.
+        max_pid, digits = 2147483647, str(2147483647)
+        for pad in "09":
+            for cut in range(len(digits) + 1):
+                edge = int((digits[:cut] + pad * len(digits))[:len(digits)])
+                for n in (edge - 1, edge, edge + 1):
+                    if n < 0:
+                        continue
+                    with self.subTest(n=n):
+                        self.assertEqual(bool(pid.fullmatch(str(n))), 1 <= n <= max_pid, n)
+                        self.assertEqual(bool(pid.search(str(n))), 1 <= n <= max_pid, n)
         st = re.compile(props["start_time"]["validation"]["pattern"])
         for ok in ("", "0123abcd.1", "0123abcd.18446744073709551615"):
             self.assertTrue(st.fullmatch(ok), ok)

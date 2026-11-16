@@ -84,7 +84,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 | `pid_reused` | Terminal for that token | The pid was recycled; inspect again without `start_time` |
 | `torn_read` | Retryable | The process changed during the read; run again |
 | `permission_denied`, `<facet>:permission_denied` | Retryable after a mount or policy change | `hidepid=1` hides other accounts' processes from an unprivileged agent |
-| `<facet>:read_failed`, `<facet>:malformed`, `<facet>:oversized` | Terminal for that kernel | The facet's source is missing, unexpected or too large on this kernel |
+| `<facet>:read_failed`, `<facet>:malformed`, `<facet>:oversized` | Terminal for that kernel | A required key is missing or has an unexpected value (`malformed`), the read failed (`read_failed`) or the source is over its byte cap (`oversized`) on this kernel. A source file that is absent after identity was read answers `torn_read` instead. |
 
 ### Where the data goes
 
@@ -101,7 +101,7 @@ Every read sets a typed result status; a degraded read is `CONSTRAINED`, never a
 ## Caveats and known gaps
 
 1. **One switch and one permission cover every facet.** The plugin has a single kill switch and a single `Forensics:Read` catalogue row. File or memory contents, environment values, socket payloads and command-line arguments are a new action with its own row, never a new facet.
-2. **A hidden process reads as not found.** On a `/proc` mounted `hidepid=2` or above, a not-found pid answers `no_such_process_or_hidden` because the two cannot be told apart. `gid=` and `CAP_SYS_PTRACE` exemptions are not evaluated, and a mount table over 1 MiB reads as unknown, so those hosts get the weaker, still true answer.
+2. **A hidden process reads as not found.** On a `/proc` mounted `hidepid=2` or above, a not-found pid answers `no_such_process_or_hidden` because the two cannot be told apart. `gid=` and `CAP_SYS_PTRACE` exemptions are not evaluated, and a mount table over 1 MiB reads as unknown, so those hosts get the weaker, still true answer. A bare numeric pid addresses the agent's own `/proc` and pid namespace, so a pid that exists only in a sibling pid namespace is not found there and answers `no_such_process` (`no_such_process_or_hidden` under `hidepid=2` or above).
 3. **Torn reads are detected on exit only.** A process that exits during the read gives `torn_read`. An exec keeps the pid and start time, so values may straddle it and that is not detected. A thread id is accepted by `/proc` and reads that thread. The pending and blocked signal masks, the capability sets, the seccomp state and the scheduling values (policy, nice, realtime priority and allowed CPUs) belong to the thread the id names, which is the main thread for a process id; the shared pending, ignored and caught masks, the limits and the OOM values are process-wide.
 4. **Linux masks are 16 hex digits.** A platform with 128 signals would report `sigmasks:malformed` and no mask rows, never `OK`.
 5. **Other facets and operating systems are planned.** Listing facets for Linux, then a macOS leg and a Windows leg, are later changes; today macOS and Windows answer one `unsupported` status row.
