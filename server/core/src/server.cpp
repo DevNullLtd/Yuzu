@@ -1942,10 +1942,19 @@ public:
         // only sees the sessions its own gRPC listener holds). Seeded at 0
         // for both label values so a healthy fleet with nothing unconfirmed
         // renders as an explicit 0, not an absent series.
-        for (const char* reachability : {"connected", "offline"})
+        for (const char* reachability : {"connected", "offline"}) {
             metrics_.gauge("yuzu_server_quarantine_endpoint_unconfirmed",
                            {{"reachability", reachability}})
                 .set(0);
+            // Releasing records (a release asked for, the device not yet confirmed) and records
+            // an operator ended by force whose device still owes a release.
+            metrics_.gauge("yuzu_server_quarantine_release_pending",
+                           {{"reachability", reachability}})
+                .set(0);
+            metrics_.gauge("yuzu_server_quarantine_forced_release_owed",
+                           {{"reachability", reachability}})
+                .set(0);
+        }
         // Freshness signal for the gauge above (#3425 review, Doomgoose
         // #3567): pre-seeded optimistic (1) since the reconciler's tick
         // thread starts within a boot-time window measured in seconds, not
@@ -14296,16 +14305,16 @@ private:
     /// dispatch sites (`dispatch_confined` below, the four `/api/command`
     /// arms, `forward_legacy_command`).
     ///
-    /// The quarantine plugin's OWN control channel is exempted WITHOUT
-    /// touching `quarantine_store_` at all: `is_quarantine_control_plugin`
+    /// The firewall plugin's four containment actions are exempted WITHOUT
+    /// touching `quarantine_store_` at all: `is_firewall_control_plugin`
     /// (common/include/yuzu/protective_actions.hpp) is pure, so a Postgres
     /// outage that fails every other dispatch closed cannot also block the one
     /// action (release) that would end it.
     /// Keyed on the `(plugin, ACTION)` pair against a closed four-action set,
-    /// NOT on the plugin name — a fifth action added later arrives gated
-    /// rather than inheriting the bypass. See that predicate's own doc
-    /// comment for why all four of today's actions are on the list and why
-    /// `unquarantine` alone is not enough.
+    /// NOT on the plugin name — `firewall.state`, `firewall.rules` and any action
+    /// added later arrive gated rather than inheriting the bypass. See that
+    /// predicate's own doc comment for why all four containment actions are on
+    /// the list and why `release` alone is not enough.
     ///
     /// Otherwise, `quarantine_store_->list_quarantined()` runs EXACTLY ONCE
     /// and the result — success or the collapsed-to-nullopt failure —
@@ -14328,7 +14337,7 @@ private:
         // property the spec asks for — the release path must survive a store
         // outage, so it must not depend on a query — without giving this
         // function a second, untested copy of the enforcement decision.
-        const bool exempt = yuzu::server::is_quarantine_control_plugin(plugin, action);
+        const bool exempt = yuzu::server::is_firewall_control_plugin(plugin, action);
         const bool store_unavailable = !quarantine_store_ || !quarantine_store_->is_open();
         // #881: sampled BEFORE the store read, not after — the 60s budget in
         // `evaluate_quarantine_degradation` is meant to bound the age of the
@@ -14590,7 +14599,7 @@ private:
 
         // #881: the ONE store read for this whole dispatch (never per-agent —
         // a fleet broadcast must not become N queries). Exempts the
-        // quarantine plugin's own control channel without touching the store
+        // firewall plugin's containment actions without touching the store
         // at all, so release keeps working through a Postgres outage that
         // would otherwise fail every OTHER dispatch closed.
         const auto containment_gate = make_containment_gate(plugin, norm_action);
@@ -18974,13 +18983,12 @@ private:
         // reconnected. Same shared dispatch lambda as every other
         // background engine. The shared protective predicate
         // (yuzu::protective::is_protective_action, built on
-        // is_quarantine_control_plugin and is_firewall_control_plugin) lets
-        // the quarantine plugin's own actions (and the firewall plugin's four
-        // containment actions) through every enablement gate unmodified: the
+        // is_firewall_control_plugin) lets the firewall plugin's four
+        // containment actions through every gate unmodified: the #881 containment gate, the
         // per-plugin/action kill switch (incl. a degraded store), the per-OS
         // withhold and its presence read, and the plugin-presence filter. The
-        // #881 containment gate's own exemption names the quarantine plugin's
-        // four only (the firewall four follow in #7437).
+        // #881 containment gate's own exemption is the same predicate, so a
+        // contained device always accepts all four.
         // Joined BEFORE the stores in stop().
         quarantine_reconciler_ =
             std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{

@@ -85,8 +85,8 @@ ADMIN_PASS='YuzuUatAdmin1!'
 # When `--as-user USER` is passed, the yuzu-agent process is launched
 # via `sudo -u USER -H env ...` instead of as the current user. This
 # exercises the privilege model defined in docs/agent-privilege-model.md
-# end-to-end: the agent itself is unprivileged, but the quarantine /
-# services / firewall plugins shell out via `sudo -n` to the narrow
+# end-to-end: the agent itself is unprivileged, but the firewall containment /
+# services plugins shell out via `sudo -n` to the narrow
 # NOPASSWD entries in /etc/sudoers.d/yuzu-agent.
 #
 # Prerequisites the script verifies before launching:
@@ -465,7 +465,7 @@ verify_as_user_prereqs() {
 
     # 2. Sudoers grant present (proxy for "install script ran successfully")
     if [ ! -f /etc/sudoers.d/yuzu-agent ]; then
-        fail "/etc/sudoers.d/yuzu-agent is missing — quarantine and other"
+        fail "/etc/sudoers.d/yuzu-agent is missing — firewall containment and other"
         fail "  privileged plugins will not work"
         info "  fix: sudo bash scripts/install-agent-user.sh"
         ((errs++))
@@ -530,7 +530,7 @@ verify_as_user_prereqs() {
     fi
     if ! sudo -u "$target_user" -n sudo -n $probe_cmd >/dev/null 2>&1; then
         warn "'$target_user' cannot exercise its sudoers grant non-interactively"
-        warn "  quarantine + services.set_start_mode + flush_dns will fail"
+        warn "  firewall containment + services.set_start_mode + flush_dns will fail"
         info "  fix: sudo bash scripts/install-agent-user.sh --check"
         # Not a hard failure — agent will still start, just degraded
     else

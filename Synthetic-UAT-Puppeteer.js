@@ -257,7 +257,7 @@ const COMMANDS = [
   ['chargen chargen_stop',   'Chargen stop',  'any'],
 
   // ─── Quarantine (status check only) ───
-  ['quarantine status', 'Quarantine status', 'any'],
+  ['firewall quarantine_status', 'Quarantine status', 'any'],
 
   // ─── Discovery ───
   ['discovery scan_subnet subnet=127.0.0.1/32', 'Loopback subnet scan', 'any'],

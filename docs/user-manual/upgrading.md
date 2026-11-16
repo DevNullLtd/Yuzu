@@ -11,6 +11,30 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: device containment is the firewall plugin's four actions; the `quarantine` agent plugin is removed
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**What changed.**
+- The `quarantine` agent plugin and its four actions (`quarantine`, `unquarantine`, `status`, `whitelist`) are gone from the agent, the packages, the gateway plugin list and the capability catalogue. There is no alias. Device containment is the `firewall` plugin's four actions: `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and `firewall.quarantine_allow`. They are the only actions that reach a contained device, and the kill switches never stop them.
+- The four definition ids are renamed: `security.quarantine.isolate`, `.release`, `.status` and `.whitelist` become `security.firewall.quarantine`, `.release`, `.quarantine_status` and `.quarantine_allow`. The `--instructions-quarantine` mode of `/test` and its ceremony scripts are removed.
+- A release is recorded only on the device's own answer. `DELETE /api/v1/quarantine/{agent_id}` asks the device to lift its rules and waits up to 5 seconds: `200` with `state: released` when the device answers, `202` with `state: releasing` otherwise. A record with a release in flight reads `releasing`, stays listed and keeps refusing commands to the device until the device answers `inactive`. The new `DELETE ...?force=true` (REST only) ends the record without the device's answer and answers `200` with `forced: true, device_confirmed: false`: **it does not release the device, which may still be contained**, and the server still owes it a release (see "Device Quarantine" in [Security Hardening](security-hardening.md)).
+- A record ends in two ways only: the device's `inactive` answer after a release, and an operator's forced end. A device that reads `inactive` while its record is active is treated as drift and re-applied; a time limit on the device (set by a `firewall.quarantine` dispatch outside the quarantine routes) does not end the record.
+- A new record for a device that is already contained is applied differently from before. `firewall.quarantine` to a contained device keeps the exceptions in force, and the old plugin put the new whitelist on the device every time. When the device says it kept other exceptions, a record that was never confirmed stays unconfirmed (audit `quarantine.reapply`, `allow_set_not_applied`; `YuzuQuarantineEndpointUnconfirmed` fires) and its whitelist is not on the device. Release the device and quarantine it again to apply it.
+- The whitelist on `POST /api/v1/quarantine` and the MCP `quarantine_device` tool is stricter. It accepts bare IPv4 and IPv6 addresses only, at most 32, and refuses a port, a prefix length, an IPv4-mapped form, an IPv4 octet with a leading zero and a host name with `400`. It was a charset check before.
+- The reconciler re-reads a confirmed record's status every 5 minutes and re-applies on drift, and a device whose rules were removed is re-contained without waiting for a reconnect. New: gauges `yuzu_server_quarantine_release_pending{reachability}` and `yuzu_server_quarantine_forced_release_owed{reachability}`, alert `YuzuQuarantineReleasePending`, and the `released` and `release_sent` values of `yuzu_server_quarantine_reapply_total{result}`.
+- `scripts/install-agent-user.sh` no longer grants a bare `/sbin/pfctl` (macOS) or `iptables-save`/`iptables-restore`/`ip6tables-save`/`ip6tables-restore` (Linux). The macOS grant is the narrowed `pfctl` argv of the firewall plugin; Linux keeps the bare `iptables` and `ip6tables` grants for the firewall plugin's fallback when `nft` is absent.
+
+**Who is affected.** Anyone who runs the old definition ids or the `quarantine` plugin by name (scripts, saved instructions, schedules, MCP or REST clients, SIEM rules matching `quarantine.*` plugin or action names), anyone who sends `whitelist` entries that are not bare addresses, and anyone who reads `DELETE` as "released". An instruction naming the removed plugin or ids no longer resolves. Audit rows keep the `quarantine.enable`, `quarantine.disable` and `quarantine.reapply` action names; a `quarantine.disable` row with result `pending` now also means a release sent and awaiting the device's answer.
+
+**Not covered.** Earlier agents, earlier hosts and records carried forward from an earlier build are unsupported: reprovision them into a fresh deployment of this build. This build neither removes nor detects containment rules a build with the removed plugin left on a device (the Windows rules named `YuzuQuarantine_*`, the Linux `yuzu-quarantine` chain, on macOS a main ruleset replaced by that plugin); on such a device the firewall plugin's apply fails `anchor_not_referenced` on macOS.
+
+**What to do.**
+- Update scripts and saved instructions to the new definition ids or to `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and `firewall.quarantine_allow`.
+- Send whitelist entries as bare addresses, listing both families for the management server.
+- Treat a `202` or `releasing` as "not yet released", and read the device's status before relying on a `200` from a forced end.
+- Alert on `YuzuQuarantineReleasePending` for a device whose release does not finish.
+
 ## ⚠️ Breaking: management-group create and member writes are refused (503) while the audit store is unavailable, and REST create answers a store fault with 503 (#7074)
 
 **What changed.**
@@ -3906,28 +3930,25 @@ plugin and action rows read back unchanged, so nothing flips on upgrade.
 
 ## Behaviour change: protective actions exempt from plugin enablement
 
-**What changed.** Nine `plugin.action` pairs are now *protective*: the quarantine plugin's
-`quarantine.quarantine`, `quarantine.unquarantine`, `quarantine.status` and `quarantine.whitelist`,
-the firewall plugin's four containment actions `firewall.quarantine`, `firewall.release`,
-`firewall.quarantine_status` and `firewall.quarantine_allow`, and the Guardian rule push
-`__guard__.push_rules`. No plugin-enablement gate refuses them any more:
-not the per-plugin/action kill switch, not the per-OS kill switch (or its agent-presence read), not
-the plugin-presence filter, and not a degraded plugin-config store. The set is closed: the other
-firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The four quarantine actions are
-**newly** exempt; before this change only the containment gate exempted them. The firewall four were
-added to the set later, so a kill-switch row you hold on one of them stops taking effect on
-upgrade. The containment gate's own exemption is a separate, narrower predicate and still names the
-quarantine plugin only: while the quarantine store cannot be read for longer than a minute, that gate
-refuses every non-exempt dispatch, whichever device it names, including the four firewall actions, until
-the store answers again (the follow-up that moves the containment gate onto the firewall plugin is #7437).
-Decision record: the 2026-10-12 and 2026-11-13 updates in
-[ADR-3005](../adr/3005-plugin-config-store.md).
+**What changed.** Five `plugin.action` pairs are *protective*: the firewall plugin's four containment
+actions `firewall.quarantine`, `firewall.release`, `firewall.quarantine_status` and
+`firewall.quarantine_allow`, and the Guardian rule push `__guard__.push_rules`. No plugin-enablement
+gate refuses them: not the per-plugin/action kill switch, not the per-OS kill switch (or its
+agent-presence read), not the plugin-presence filter, and not a degraded plugin-config store. The set
+is closed: the other firewall actions (`firewall.state`, `firewall.rules`) stay ordinary. The firewall
+four were added to the set in 2026-11, so a kill-switch row you hold on one of them stops taking
+effect on upgrade. The same predicate is the containment gate's exemption, so a quarantined device
+still accepts all four: while the quarantine store cannot be read for longer than a minute, that gate
+refuses every other dispatch, whichever device it names, and still lets those four through. (The
+earlier `quarantine` plugin's own four actions were protective too; that plugin is removed, see
+"Breaking: device containment is the firewall plugin's four actions" above.) Decision record: the
+2026-10-12 and 2026-11-13 updates in [ADR-3005](../adr/3005-plugin-config-store.md).
 
 A kill-switch row for one of these pairs is still accepted and displayed, but it is **kept and
-inert**: it no longer stops dispatch. A plugin-level `quarantine` / `firewall` / `__guard__` row never stops the
+inert**: it no longer stops dispatch. A plugin-level `firewall` / `__guard__` row never stops the
 plugin's protective actions either, and still gates any non-protective action the plugin declares
-(`quarantine` declares only its four and `__guard__` dispatches only `push_rules`; a plugin-level
-`firewall` row still gates `firewall.state` and `firewall.rules`). A
+(`__guard__` dispatches only `push_rules`; a plugin-level `firewall` row still gates `firewall.state`
+and `firewall.rules`). A
 `PUT` on one is audited with `protective_exempt=true` in the `plugin_config.kill_switch.set`
 detail (`protective_exempt=partial` for a plugin-level `firewall` row, which still gates `state` and
 `rules`) and logs a warning. If you stopped Guardian rule delivery by switching
@@ -3938,8 +3959,8 @@ deploy or heartbeat reconcile.
 
 1. **Find held rows.** There is no list route. Search the audit log for
    `plugin_config.kill_switch.set` entries whose `target_id` is `__guard__.push_rules`,
-   `quarantine.<action>`, `firewall.<action>` (one of the four containment actions) or the plugin-level
-   `__guard__` / `quarantine` / `firewall`, each with an optional `@<os>` suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
+   `firewall.<action>` (one of the four containment actions) or the plugin-level
+   `__guard__` / `firewall`, each with an optional `@<os>` suffix. Each write leaves two rows (`attempted`, then `success` or `failure`) and a later
    `enabled=true` supersedes an earlier OFF, so take the latest `result=success` row per `target_id`.
    Confirm each with `GET /api/v1/plugin-config/<plugin>/kill-switch` at every layer: the
    plugin row, the action row (`?action=<action>`) and each `?os=windows|linux|darwin` variant, reading `source` in the response: it names the row that wins.
@@ -3950,7 +3971,7 @@ deploy or heartbeat reconcile.
    already in flight. No lever stops delivery while leaving armed Guards armed: the old switch did
    that, but disabling or removing a rule disarms it on the next reconcile. It needs `GuaranteedState:Write` (disable) or `GuaranteedState:Delete`
    (remove). `PluginConfig:Write` alone no longer stops anything, and a service-scoped token is
-   denied on rule writes. A `quarantine.*` or `firewall.<containment action>` hold has no
+   denied on rule writes. A `firewall.<containment action>` hold has no
    replacement switch: those actions are governed by their permission (`Security:Execute` on the
    catalogue rows) and any approval policy, not by enablement. A plugin-level `firewall` row you hold
    keeps gating `firewall.state` and `firewall.rules`.
@@ -3964,13 +3985,12 @@ Also be aware of:
   plugin-inventory gap) and refuses a protective dispatch while an upgraded replica delivers it, so the outcome depends on which replica serves the
   heartbeat or the reconcile. Lifting a hold arms rules fleet-wide on the next reconcile, including
   `enforce` rules, so expect a burst of arming rather than a gradual one.
-- **Agents without the quarantine or firewall plugin.** The server no longer withholds a protective
+- **Agents without the firewall plugin.** The server no longer withholds a protective
   dispatch because the agent's reported plugin inventory lacks the plugin. `dispatch_confirmed` means the
   plugin registry **accepted the frame**; it is never proof of isolation. A
   device whose agent lacks the plugin answers its own "plugin not found", and
-  `YuzuQuarantineEndpointUnconfirmed` can fire for a quarantine-plugin containment of it (no alert covers a firewall containment yet). Verify containment with `quarantine.status` (or
-  `firewall.quarantine_status` for a firewall containment), and upgrade agents before you rely on
-  quarantine.
+  `YuzuQuarantineEndpointUnconfirmed` fires for the record that never confirms. Verify containment with
+  `firewall.quarantine_status`, and upgrade agents before you rely on quarantine.
 - **Integrations.** The kill-switch `GET` and `PUT` responses are unchanged: `enabled=false` for a
   protective pair is a stored row, not the dispatch decision. The `os_gate_unreadable`,
   `plugin_not_found` and `kill_switched_os` zero-reach causes are never produced for a protective
