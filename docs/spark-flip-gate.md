@@ -2756,18 +2756,23 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   lifecycle-journal records still pending at stop. Compensating control, PARTIAL: the
   boot-scan tag `yuzu.guardian_baseline_rebaselined_at_boot` (gauge
   `yuzu_fleet_guardian_baseline_rebaselined_at_boot`) counts only a boot re-arm whose seed
-  read found NO persisted record (an Absent read). It does not see a Malformed record, a boot
-  read error or a fingerprint mismatch (a retarget), all of which also re-baseline, nor a
-  retarget whose new capture was never written before a crash (the old record still reads
-  Ok), nor, when an older record for that target exists, a capture that was never staged
-  (with no older record the next boot reads it as Absent and the boot-scan counts it), nor a
-  malformed record that is overwritten at boot N, which reads Ok at boot N+1, nor a rule that
-  was disabled at boot and enabled later, which is never counted; and it says nothing about
-  journal records. It cannot prove that a capture was lost or that the previous stop was an
-  exit-4 (a never-captured target, a failed arm and a lost capture all read the same). On
-  Linux and macOS no file mechanism arms, so such a rule reads Absent at every boot and the
-  tag is non-zero on every boot there, so it is not a baseline-loss signal there and
-  meaningful readings come from Windows agents only. The only
+  read found NO persisted record (an Absent read). It does NOT see:
+
+  - (a) a Malformed record, a boot read error or a fingerprint mismatch (a retarget), all of
+    which also re-baseline;
+  - (b) a retarget whose new capture was never written before a crash (the old record still
+    reads Ok);
+  - (c) a capture that was never staged while an older record for that target exists (with no
+    older record the next boot reads it as Absent and the boot-scan counts it);
+  - (d) a malformed record that is overwritten at boot N, which reads Ok at boot N+1;
+  - (e) a rule that was disabled at boot and enabled later, which is not counted at that boot
+    (a later boot with an absent record would count it).
+
+  The tag also says nothing about journal records. It cannot prove that a capture was lost or
+  that the previous stop was an exit-4 (a never-captured target, a failed arm and a lost
+  capture all read the same). On Linux and macOS no file mechanism arms, so such a rule reads
+  Absent at every boot and the tag is non-zero on every boot there, so it is not a
+  baseline-loss signal there and meaningful readings come from Windows agents only. The only
   stop-time trace is the agent-local ERROR lines added by PR #5645 (the #5604 stop busy
   budget), which a watchdog-cut stop does not write. **Revisit trigger: before the first
   production fleet or the first post-flip exit-4.** (The earlier wording, "Owner: to be
