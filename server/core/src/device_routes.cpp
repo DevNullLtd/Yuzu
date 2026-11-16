@@ -10,6 +10,7 @@
 #include "authz_model.hpp"            // authz::VisibleSet / authz::in_scope
 #include "live_kinds.hpp"             // shared live-read kind table + parser (S2)
 #include "http_route_sink.hpp"
+#include "result_parsing.hpp"       // split_all_pipes (escape-aware split, #7040)
 #include "rest_a4_envelope_http.hpp"  // detail::a4_denial
 #include "rest_audit.hpp"             // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"              // html_escape
@@ -482,7 +483,12 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
                     raw_rows.push_back(l);
                 continue;
             }
-            auto f = pipe_fields(l);
+            // The hardware plugin writes a literal pipe in firmware text as `\|` (and folds a
+            // backslash to `/`) on every OS, so its rows are split on an UNESCAPED pipe and
+            // unescaped (#7040); a CPU model or DIMM slot holding a pipe stays in its cell. Other
+            // plugins feeding this generic table do not all fold backslashes (a Windows mount
+            // point ends in one), so they keep the raw split.
+            auto f = lk.plugin == "hardware" ? split_all_pipes(l) : pipe_fields(l);
             if (f.empty()) continue;
             f.erase(f.begin()); // drop the prefix token itself
             f.resize(lk.columns.size()); // pad short / trim long rows to the declared width

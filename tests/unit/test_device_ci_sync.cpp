@@ -1136,6 +1136,34 @@ TEST_CASE("build_device_ci_record: a pipe inside a CPU model or DIMM locator shi
     }
 }
 
+TEST_CASE("build_device_ci_record: a pipe-free device still hashes to the frozen cross-pin (#7040)",
+          "[sync][device_ci][pipe][hash]") {
+    // The byte-level frozen-seam proof: plugin rows with no pipe, backslash or newline in the model
+    // or locators go through the REAL builder and must reproduce the cross-pin record, blob and
+    // hash, exactly. A change to the v1 cpu/dimm aggregation that moves one byte fails here.
+    using yuzu::agent::build_device_ci_record;
+    using yuzu::agent::CiPluginOutputs;
+    CiPluginOutputs o;
+    o.manufacturer = "manufacturer|Dell Inc.";
+    o.model = "model|Latitude 7420";
+    o.system = "serial|ABC123\nsystem_uuid|4C4C4544-0042-1234-5678-AABBCCDDEEFF";
+    o.bios = "bios_vendor|Dell Inc.\nbios_version|1.27.0\nbios_date|2024-03-15";
+    o.processors = "cpu|0|Intel(R) Core(TM) i7-1185G7|4|8|2800|-|-";
+    o.memory = "dimm|ChannelA-DIMM0|8192|DDR4|3200|-|-|-\ndimm|ChannelB-DIMM0|8192|DDR4|3200|-|-|-";
+    o.disks = "disk|0|Samsung SSD 980|512|SSD|NVMe";
+    o.device_name = "device_name|WS-001";
+    o.domain = "domain|corp.example";
+    o.ou = "ou|OU=Laptops,DC=corp,DC=example";
+    o.os_name = "os_name|Windows 11 Pro";
+    o.os_version = "os_version|10.0.22631";
+    o.os_build = "os_build|22631";
+    o.os_arch = "os_arch|x86_64";
+    o.adapters = "adapter|eth0|00:11:22:33:44:55|1000|up\nadapter|eth1|aa:bb:cc:dd:ee:ff|1000|up";
+    const auto r = build_device_ci_record(o);
+    CHECK(device_ci_canonical_blob(r) == device_ci_canonical_blob(sample()));
+    CHECK(sha256_hex(device_ci_canonical_blob(r)) == kCrossPinHash);
+}
+
 TEST_CASE("build_device_ci_record parses + aggregates plugin outputs", "[sync][device_ci]") {
     using yuzu::agent::build_device_ci_record;
     using yuzu::agent::CiPluginOutputs;

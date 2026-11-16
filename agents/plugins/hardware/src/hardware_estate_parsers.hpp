@@ -43,6 +43,7 @@
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
+#include <format>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -419,6 +420,18 @@ inline constexpr std::uint32_t kArchX64 = 9;
 }
 
 // -- Windows cpu / dimm row formatters --------------------------------------------------------------
+
+/// The Linux and macOS `cpu|idx|model|cores|threads|mhz|-|-` row: those legs read no socket
+/// designation or stepping, so both stay the literal `-`. `model` is /proc/cpuinfo or sysctl text and
+/// is escaped here (a '|' in it would shift every later column, a newline would forge a row), so the
+/// device-CI parse and the live-info card read the right core and thread columns (#7040). `mhz` is
+/// rounded to a whole number as `{:.0f}` always did. ONE builder for both OS legs, so the escape
+/// cannot be dropped from one of them and a unit test covers it on any host.
+[[nodiscard]] inline std::string format_cpu_row_sampled(int idx, std::string_view model, int cores,
+                                                        int threads, double mhz) {
+    return std::format("cpu|{}|{}|{}|{}|{:.0f}|-|-", idx, yuzu::util::safe_output_field(model),
+                       cores, threads, mhz);
+}
 
 /// `cpu|idx|name|cores|threads|clock_mhz|socket_designation|stepping`. `name` is WMI text and is
 /// escaped here (a '|' in it would shift every later column, a newline would forge a row);
