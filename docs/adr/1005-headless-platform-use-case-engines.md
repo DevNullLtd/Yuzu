@@ -1650,8 +1650,9 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `last_synced_before` or the new result fields, and there is no tool for the
      status route.
      - **No MCP twin of the new surface - tracked follow-up, not a permanent
-       exception.** Delivery row **SAM-21** of the software estate roadmap (the
-       tool's schema and wording, the two arguments, a status tool). **Revisit by
+       exception.** Delivery row **SAM-21** of the software estate roadmap, tracked
+       as issue #7984 (the tool's schema and wording, the two arguments, a status
+       tool). **Revisit by
        2026-12-31.** The twin takes the same engine and the same execution-record
        read, so no second copy of any rule is created. This entry retires when the
        twin merges. No parity-ledger row is added: v1 routes are held to the

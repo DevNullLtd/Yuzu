@@ -35,6 +35,7 @@ struct Rig {
     bool admin = true;
     bool persist_ok = true;
     bool dispatch_throws = false;
+    bool throws_non_std = false; // with dispatch_throws: throw something that is not a std::exception
     std::optional<std::size_t> accept; // frames the registry accepts; unset = all
     bool last_seen_ok = true;
     std::unordered_map<std::string, std::int64_t> seen;
@@ -76,8 +77,11 @@ struct Rig {
             dispatches.push_back({ids, delay, execution_id});
             if (on_dispatch)
                 on_dispatch();
-            if (dispatch_throws)
+            if (dispatch_throws) {
+                if (throws_non_std)
+                    throw 42;
                 throw std::runtime_error("boom");
+            }
             return ss::DispatchResult{accept.value_or(ids.size()), "__sync__-test"};
         };
         e.caller_unfiltered = [this](const auth::Session& s) { return unfiltered_of(s.username); };
@@ -786,24 +790,30 @@ TEST_CASE("sync runner: a partly accepted send reports the frames accepted and k
 
 TEST_CASE("sync runner: a dispatch that throws keeps its budget, is neither joinable nor cooling, and is 503",
           "[server][software_sync][runner]") {
-    Rig rig;
-    rig.live(1000);
-    rig.dispatch_throws = true;
-    ss::Runner runner(rig.env());
-    const auto out = runner.run(session_of("alice"), group("g"), rig.audit());
-    CHECK(out.status == ss::Status::NoneReachable);
-    CHECK(out.http == 503);
-    CHECK(out.retry_after_ms.value_or(0) > 0);
-    CHECK(saw(rig, "note:failure")); // dispatch_threw is on the record
-    CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
-    // The key's run state is gone: a retry is a new run, not a join and not a 429...
-    rig.dispatch_throws = false;
-    const auto again = runner.run(session_of("alice"), group("g"), rig.audit());
-    REQUIRE(again.status == ss::Status::Accepted);
-    CHECK(again.summary["joined"] == false);
-    // ...but the runner could not prove nothing was sent, so the first attempt's reservation stands
-    // until its spread ends: the retry got half of the remaining half.
-    CHECK(rig.dispatches.back().delay == 80);
+    // Any throw type behaves alike: a std::exception and one that is not (an unlisted type must not
+    // slip past the handler and release the budget with no audit row and an open record).
+    for (const bool non_std : {false, true}) {
+        CAPTURE(non_std);
+        Rig rig;
+        rig.live(1000);
+        rig.dispatch_throws = true;
+        rig.throws_non_std = non_std;
+        ss::Runner runner(rig.env());
+        const auto out = runner.run(session_of("alice"), group("g"), rig.audit());
+        CHECK(out.status == ss::Status::NoneReachable);
+        CHECK(out.http == 503);
+        CHECK(out.retry_after_ms.value_or(0) > 0);
+        CHECK(saw(rig, "note:failure")); // dispatch_threw is on the record
+        CHECK(rig.cancelled == std::vector<std::string>{"exec-1"});
+        // The key's run state is gone: a retry is a new run, not a join and not a 429...
+        rig.dispatch_throws = false;
+        const auto again = runner.run(session_of("alice"), group("g"), rig.audit());
+        REQUIRE(again.status == ss::Status::Accepted);
+        CHECK(again.summary["joined"] == false);
+        // ...but the runner could not prove nothing was sent, so the first attempt's reservation stands
+        // until its spread ends: the retry got half of the remaining half.
+        CHECK(rig.dispatches.back().delay == 80);
+    }
 }
 
 TEST_CASE("sync runner: the whole-fleet row goes through persist_fleet_wide when it is bound",

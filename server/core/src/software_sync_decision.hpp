@@ -29,6 +29,7 @@
 
 #include "authz_model.hpp"           // authz::VisibleSet, authz::filter_to_scope (std-only header)
 #include "dispatch_target_shape.hpp" // DispatchArm, classify_dispatch_arm, kBroadcastScope
+#include "mcp_policy.hpp"            // mcp::tier_allows (std-only header)
 
 #include <yuzu/log_token.hpp>
 
@@ -239,6 +240,41 @@ struct Selector {
 /// could not be determined is `false`).
 [[nodiscard]] inline bool fleet_wide_denied(DispatchArm arm, bool caller_unfiltered, bool fleet_admin) {
     return arm == DispatchArm::Broadcast && !(caller_unfiltered && fleet_admin);
+}
+
+/// What `fleet_admin_answer` needs to know about a session. The three grants are callables so the
+/// store is read only when the gate's order reaches that branch; an unset callable denies.
+struct FleetAdminFacts {
+    bool service_scoped = false;
+    bool elevated = false;
+    bool engine = false;
+    std::string_view mcp_tier; ///< "" when the session is not an MCP token
+    /// ManagementGroup:Write for an engine principal (an undeterminable read is false).
+    std::function<bool()> engine_grant;
+    /// ManagementGroup:Write by RBAC; nullopt while RBAC enforcement is off (an undeterminable read
+    /// is false).
+    std::function<std::optional<bool>()> rbac_grant;
+    bool legacy_admin = false; ///< the legacy rule: the administrator role
+};
+
+/// ManagementGroup:Write as a GLOBAL grant, decided from a session alone: the answer
+/// `require_permission` gives, in its order (elevation, engine principal, MCP tier, RBAC, legacy
+/// role), with a service-scoped token never fleet-wide. The MCP tier precedes RBAC, so a token of a
+/// tier that does not allow the write (the operator tier does not) is refused whatever its creator
+/// holds. Anything that cannot be determined is false.
+[[nodiscard]] inline bool fleet_admin_answer(const FleetAdminFacts& f) {
+    if (f.service_scoped)
+        return false;
+    if (f.elevated)
+        return true;
+    if (f.engine)
+        return f.engine_grant && f.engine_grant();
+    if (!f.mcp_tier.empty() && !mcp::tier_allows(f.mcp_tier, "ManagementGroup", "Write"))
+        return false;
+    if (f.rbac_grant)
+        if (const auto granted = f.rbac_grant())
+            return *granted;
+    return f.legacy_admin;
 }
 
 /// A whole group or the whole fleet is one click for a very large number of devices, so it must

@@ -292,6 +292,83 @@ TEST_CASE("sync fleet: only an unfiltered caller who is also a fleet administrat
     }
 }
 
+TEST_CASE("sync fleet admin: the gate's order, and an MCP tier that does not allow the write refuses first",
+          "[server][software_sync][security]") {
+    // A session whose RBAC grant (enforcement on) or administrator role (enforcement off) says yes.
+    const auto admin_facts = [] {
+        ss::FleetAdminFacts f;
+        f.rbac_grant = [] { return std::optional<bool>(true); };
+        f.legacy_admin = true;
+        return f;
+    };
+    CHECK(ss::fleet_admin_answer(admin_facts()));
+
+    // An operator-tier token minted by an administrator: the tier allows Execution:Execute (so the
+    // tool is reachable) but not ManagementGroup:Write, so it never names the fleet, with RBAC on or off.
+    {
+        auto f = admin_facts();
+        f.mcp_tier = "operator";
+        CHECK_FALSE(ss::fleet_admin_answer(f));
+        f.rbac_grant = [] { return std::optional<bool>(); }; // enforcement off: the legacy role
+        CHECK_FALSE(ss::fleet_admin_answer(f));
+    }
+    CHECK_FALSE(ss::fleet_admin_answer([&] { auto f = admin_facts(); f.mcp_tier = "readonly"; return f; }()));
+    // Supervised allows the write: the tier then falls through to the creator's own authority.
+    {
+        auto f = admin_facts();
+        f.mcp_tier = "supervised";
+        CHECK(ss::fleet_admin_answer(f));
+        f.rbac_grant = [] { return std::optional<bool>(false); };
+        CHECK_FALSE(ss::fleet_admin_answer(f)); // RBAC says no, whatever the legacy role
+    }
+
+    // RBAC enforcement off: the legacy administrator role decides.
+    {
+        ss::FleetAdminFacts f;
+        f.rbac_grant = [] { return std::optional<bool>(); };
+        f.legacy_admin = true;
+        CHECK(ss::fleet_admin_answer(f));
+        f.legacy_admin = false;
+        CHECK_FALSE(ss::fleet_admin_answer(f));
+        f.rbac_grant = nullptr; // no RBAC subsystem wired: the same legacy rule
+        f.legacy_admin = true;
+        CHECK(ss::fleet_admin_answer(f));
+    }
+
+    // A service-scoped token never has fleet-wide authority; elevation does, ahead of any grant read.
+    {
+        auto f = admin_facts();
+        f.service_scoped = true;
+        CHECK_FALSE(ss::fleet_admin_answer(f));
+        ss::FleetAdminFacts e;
+        e.elevated = true;
+        e.rbac_grant = [] { return std::optional<bool>(false); };
+        CHECK(ss::fleet_admin_answer(e));
+    }
+
+    // An engine principal has RBAC authority only: the legacy role and the RBAC thunk never apply,
+    // and a missing or failing grant read denies.
+    {
+        auto f = admin_facts();
+        f.engine = true;
+        CHECK_FALSE(ss::fleet_admin_answer(f)); // no engine grant bound
+        f.engine_grant = [] { return true; };
+        CHECK(ss::fleet_admin_answer(f));
+        f.engine_grant = [] { return false; };
+        CHECK_FALSE(ss::fleet_admin_answer(f));
+    }
+
+    // The store is read only when the order reaches it.
+    {
+        int reads = 0;
+        ss::FleetAdminFacts f;
+        f.mcp_tier = "operator";
+        f.rbac_grant = [&] { ++reads; return std::optional<bool>(true); };
+        CHECK_FALSE(ss::fleet_admin_answer(f));
+        CHECK(reads == 0);
+    }
+}
+
 TEST_CASE("sync confirm: a whole group or the whole fleet needs confirm; a device or expression never does",
           "[server][software_sync]") {
     CHECK(ss::confirmation_required(DispatchArm::Group, false));

@@ -14023,24 +14023,30 @@ private:
 
     /// ManagementGroup:Write as a GLOBAL grant, decided from a session alone (the sync Runner has no
     /// request to hand `require_permission`): the same answer that gate gives while RBAC enforcement
-    /// is on, off, or the session is elevated, an engine principal or service-scoped. The Runner
-    /// ANDs it with its own unfiltered-Execution:Execute check; both together are "fleet
-    /// administrator", the only callers who may name the whole fleet. Anything that cannot be
-    /// determined is false.
+    /// is on, off, or the session is elevated, an engine principal, a tiered MCP token or
+    /// service-scoped. The ordering is `software_sync::fleet_admin_answer`'s (pure, unit-tested); this
+    /// only supplies the store reads. The Runner ANDs it with its own unfiltered-Execution:Execute
+    /// check; both together are "fleet administrator", the only callers who may name the whole fleet.
+    /// Anything that cannot be determined is false.
     [[nodiscard]] bool software_sync_fleet_admin(const auth::Session& sess) {
-        // A service-scoped token never has fleet-wide authority.
-        if (!sess.token_scope_service.empty())
-            return false;
-        if (auth::is_elevated(sess))
-            return true;
-        if (sess.is_engine())
+        yuzu::server::software_sync::FleetAdminFacts facts;
+        facts.service_scoped = !sess.token_scope_service.empty();
+        facts.elevated = auth::is_elevated(sess);
+        facts.engine = sess.is_engine();
+        facts.mcp_tier = sess.mcp_tier;
+        facts.engine_grant = [&] {
             return engine_grant_checked(rbac_store_.get(), sess.username, "ManagementGroup", "Write")
                 .value_or(false);
-        if (rbac_store_ && rbac_enforcement_in_effect(rbac_store_.get()))
+        };
+        facts.rbac_grant = [&]() -> std::optional<bool> {
+            if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_.get()))
+                return std::nullopt;
             return rbac_store_->check_permission_checked(sess.username, "ManagementGroup", "Write")
                 .value_or(false);
+        };
         // RBAC enforcement off: the legacy rule, a write needs the administrator role.
-        return auth::effective_role(sess) == auth::Role::admin;
+        facts.legacy_admin = auth::effective_role(sess) == auth::Role::admin;
+        return yuzu::server::software_sync::fleet_admin_answer(facts);
     }
 
     /// The tracker row of one dispatch, created BEFORE it is sent so a fast reply cannot beat it. The

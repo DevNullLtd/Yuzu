@@ -408,7 +408,10 @@ private:
         bool threw = false;
         try {
             sent = env_.dispatch(session, plan.targets, delay_max_s, execution_id);
-        } catch (const std::exception&) {
+        } catch (...) {
+            // Any throw, not only std::exception: one that skipped this branch would unwind through
+            // the Reservation's defaults, releasing the ledger entry with no audit row and the
+            // execution record left open.
             // The audit row is already stored. The runner cannot prove nothing was sent, so the
             // pacing reservation stays until its spread ends; the key is neither joinable nor in
             // cooldown (it was not accepted), and the answer is the retryable "nothing reachable".

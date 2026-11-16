@@ -556,8 +556,11 @@ whole source name.
 - **Sync now can be spread too.** The agent's `__sync__.now` command takes a
   list of sources and an optional `delay_max_s` (0 to 86400 seconds); with it
   the agent reports at a stable offset within that many seconds instead of
-  immediately. Nothing in the console sends either yet, so Sync now is
-  immediate today. If its first send fails (the server is unreachable), the
+  immediately. A Sync now for a group, a scope or the whole fleet sends
+  `delay_max_s` whenever the run needs spreading: an estimate of the spread
+  that keeps the fleet's reports under one budget (the agent keeps a sync it
+  already armed sooner, so a device may still report earlier). A single device
+  stays immediate. If its first send fails (the server is unreachable), the
   retries follow the pattern in Gentle catch-up, so it can arrive up to about
   45 minutes after the click.
 - **Sections and deltas.** The installed-software report is sectioned per source (see "The
