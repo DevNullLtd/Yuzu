@@ -273,6 +273,45 @@ TEST_CASE("process_introspect parse_status reports absent and invalid separately
     CHECK(bad.no_new_privs.presence == Presence::invalid);
 }
 
+TEST_CASE("process_introspect parse_status: each of the ten mask keys fills its own field only",
+          "[process_introspect]") {
+    struct Key {
+        const char* name;
+        TextField StatusFields::*field;
+        const char* value; // unique to this key, so a swapped assignment cannot pass
+    };
+    const Key keys[] = {
+        {"SigPnd", &StatusFields::sig_pnd, "0000000000000001"},
+        {"ShdPnd", &StatusFields::shd_pnd, "0000000000000002"},
+        {"SigBlk", &StatusFields::sig_blk, "0000000000000003"},
+        {"SigIgn", &StatusFields::sig_ign, "0000000000000004"},
+        {"SigCgt", &StatusFields::sig_cgt, "0000000000000005"},
+        {"CapInh", &StatusFields::cap_inh, "0000000000000006"},
+        {"CapPrm", &StatusFields::cap_prm, "0000000000000007"},
+        {"CapEff", &StatusFields::cap_eff, "0000000000000008"},
+        {"CapBnd", &StatusFields::cap_bnd, "0000000000000009"},
+        {"CapAmb", &StatusFields::cap_amb, "000000000000000a"},
+    };
+    for (const Key& k : keys) {
+        for (const bool valid : {false, true}) {
+            const auto s =
+                parse_status(std::string{k.name} + ":\t" + (valid ? k.value : "not-hex") + "\n");
+            for (const Key& other : keys) {
+                const TextField& f = s.*other.field;
+                INFO("key present: " << k.name << (valid ? " (valid)" : " (invalid)")
+                                     << ", field checked: " << other.name);
+                if (&other == &k) {
+                    CHECK(f.presence == (valid ? Presence::ok : Presence::invalid));
+                    CHECK(f.value == (valid ? std::string{k.value} : std::string{}));
+                } else {
+                    CHECK(f.presence == Presence::absent);
+                    CHECK(f.value.empty());
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("process_introspect parse_status Seccomp values", "[process_introspect]") {
     CHECK(parse_status("Seccomp:\t0\n").seccomp.value == 0u);
     CHECK(parse_status("Seccomp:\t1\n").seccomp.value == 1u);

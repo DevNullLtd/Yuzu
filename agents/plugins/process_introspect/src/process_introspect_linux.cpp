@@ -54,7 +54,7 @@ int run_linux(yuzu::CommandContext& ctx, const Request& req) {
     // The descriptor lives for this dispatch only (released when `dir` goes out of scope).
     const auto dir = yuzu::shared::open_dir_no_follow("/proc/" + std::to_string(req.pid));
     ProcSource src;
-    src.open_errno = dir.opened() ? 0 : (dir.err != 0 ? dir.err : EIO);
+    src.open_errno = dir.err;
     const int fd = dir.dir.fd();
     src.read = [fd](const char* name, std::size_t cap) {
         return to_raw(yuzu::shared::read_file_no_follow_at(fd, name, cap));

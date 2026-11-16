@@ -298,14 +298,12 @@ inline constexpr std::size_t kOomCap = 64;
     case Facet::resource_limits:
         if (fetch("limits", kLimitsCap, text)) {
             const LimitsParse lp = parse_limits(text);
-            if (!lp.header_seen || lp.rows.empty()) {
+            if (!lp.header_seen || lp.rows.empty())
                 fail("malformed");
-            } else {
-                for (const auto& r : lp.rows)
-                    rows.push_back(format_limit(r));
-                if (lp.unknown_rows > 0)
-                    fail("unknown_row");
-            }
+            for (const auto& r : lp.rows)
+                rows.push_back(format_limit(r));
+            if (lp.unknown_rows > 0)
+                fail("unknown_row");
         }
         break;
     case Facet::sigmasks:

@@ -20,7 +20,7 @@
 /// its own row here, never a new facet of this one.
 ///
 /// Grouped under the SAME `Forensics` securable execution_artifacts, privacy_permissions and
-/// process_introspect use (`rbac_store.cpp`'s seeded `types[]` entry; the string below MUST
+/// remote_access_audit use (`rbac_store.cpp`'s seeded `types[]` entry; the string below MUST
 /// equal that seed literal byte-for-byte, validated by `test_capability_catalogue`'s
 /// seeded-securable-types check) -- reusing `Forensics` gets
 /// `dispatch_destructive_gate.hpp`'s `kForensicsSecurable`/`requires_explicit_targets`

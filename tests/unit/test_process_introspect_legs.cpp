@@ -282,6 +282,9 @@ TEST_CASE("process_introspect a hidden /proc never asserts the process is gone",
         fk.mount = m;
         const auto r = run(fk, Facet::oom);
         CHECK(r.reason == tok("no_such_process_or_hidden"));
+        CHECK(r.rows.empty());
+        CHECK(fk.reads.empty());
+        CHECK(fk.mount_calls == 1);
     }
 }
 
@@ -542,6 +545,16 @@ TEST_CASE("process_introspect limits: unknown row and empty file", "[process_int
         const auto r = run(fk, Facet::resource_limits);
         CHECK(r.status == StatusState::constrained);
         CHECK(has_token(r, tok("resource_limits:malformed")));
+        CHECK(facet_rows(r).empty());
+    }
+    {
+        Fake fk; // the header and only lines this plugin does not know: both rules fire
+        fk.set("limits", ok("Limit                     Soft Limit           Hard Limit           Units     \n"
+                            "Max invented              1                    2                    bytes     \n"));
+        const auto r = run(fk, Facet::resource_limits);
+        CHECK(r.status == StatusState::constrained);
+        CHECK(has_token(r, tok("resource_limits:malformed")));
+        CHECK(has_token(r, tok("resource_limits:unknown_row")));
         CHECK(facet_rows(r).empty());
     }
 }
