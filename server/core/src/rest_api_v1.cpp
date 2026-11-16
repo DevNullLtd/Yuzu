@@ -1720,10 +1720,10 @@ const std::string& openapi_spec() {
       "docs": []
     }},
     {"name": "Events", "description": "Follow a running instruction execution as a JSON event stream, and read executions, their responses and their child executions once they exist.", "x-yuzu-guide": {
-      "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope."],
+      "overview": ["An execution is one dispatch of an instruction to a set of devices. This group has a live view and a stored view. The live view is a Server-Sent Events stream for one running execution, built for agentic workers that need to react as devices report. The stored view lists executions, returns one execution with optional per-device detail, returns its responses, and lists the executions it spawned.", "Every call is confined to what the caller may see. A caller limited to some management groups sees only executions that involve a device in scope, or that they dispatched themselves, and sees counts and event detail trimmed to that scope. A service-scoped API token is the exception: an execution its minting account dispatched is not visible to it merely because that account dispatched it, and it sees an execution only once an agent in its service scope has a status row for it."],
       "how_it_works": [{"title": "Dispatch", "text": "Dispatching an instruction creates an execution with an id. That id is the only handle the stream needs."}, {"title": "Subscribe", "text": "Call the events stream with execution_id. An execution that is missing, or outside your scope, gives the same 404. An execution that has already finished gives 410."}, {"title": "Stream", "text": "Events arrive as JSON envelopes with numeric ids. A heartbeat event keeps the connection alive while nothing else is sent."}, {"title": "Resume", "text": "After a disconnect, reconnect with since or Last-Event-ID to replay what you missed. If the buffer no longer holds those events, a replay-gap event says which ids are missing."}, {"title": "Read final state", "text": "When the execution is complete, read GET /executions/{id}, its responses and its children to get the final picture."}],
       "tables": [{"title": "Stream event types", "caption": "The last column shows what a caller confined to some management groups receives.", "columns": ["Type", "Meaning", "Confined caller"], "rows": [["agent-transition", "One device changed status", "Only devices in scope"], ["execution-progress", "Running totals for the whole execution", "Not sent"], ["execution-completed", "The execution reached a final state", "Status only"], ["heartbeat", "Liveness signal, empty data", "Sent"], ["replay-gap", "Events between missing_from and missing_to are no longer buffered", "Sent"], ["events-dropped", "This connection fell behind and events were discarded", "Sent"]]}],
-      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row when it answers 404.", "execution.read, written as a denied row by the children call when a confined caller asks about an execution they cannot see.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller.", "A plain list, a plain detail call and a successful children call write no audit row."]},
+      "access": {"permissions": ["Execution:Read, via the fleet-read check, gates /events, /executions, /executions/{id} and /executions/{id}/children.", "Response:Read, via the fleet-read check, gates /executions/{id}/responses. It is a different securable from Execution:Read, so holding one does not give the other.", "Execution:Execute and then Execution:Read, via the fleet-read check, gate POST /executions/{id}/cancel and POST /executions/{id}/rerun. Neither sends anything to a device: cancel marks the stored execution cancelled, and rerun creates a pending record."], "audit": ["api.v1.events.subscribe, written on each successful subscribe, and as a denied row when the execution is missing or outside the caller's scope. If the success row cannot be saved the stream still starts and the response carries Sec-Audit-Failed: true. A rejected since writes no success row.", "execution.detail.fetch, written when the responses call succeeds and when the detail call is made with include=agents. Both fail with 503 if the row cannot be saved. The detail call also writes a denied row whenever it answers 404, for every caller class. A service-scoped API token that polls before an agent in its service scope has replied writes one such row per poll.", "execution.read, written as a denied row by the children call when a caller whose fleet-read scope is engaged (a management-group-confined caller or a service-scoped API token) asks about an execution they cannot see or that does not exist.", "execution.cancel and execution.rerun, written by the cancel and rerun calls: an attempted row before the change (503 with Sec-Audit-Failed: true, and no change, if it cannot be saved), then success, denied or failure. A confined caller's denial is identical for a hidden and a nonexistent execution."], "notes": ["The execution's dispatcher is admitted to see it so that a just-dispatched execution does not look missing. This does not bypass the trimming of counts and events for a confined caller. A service-scoped API token has no dispatcher admission: it sees an execution only once an agent in its service scope has a status row for it, so an execution its minting account dispatched reads as not found until an in-scope agent responds.", "A plain list, a plain detail call that succeeds and a successful children call write no audit row."]},
       "good_to_know": [{"label": "Execution id required", "text": "The stream needs execution_id, matching letters, digits, underscore and hyphen, up to 128 characters. There is no stream across all executions."}, {"label": "Replay window", "text": "Replay comes from a bounded in-memory buffer of 1000 events per execution. With neither since nor Last-Event-ID the buffer is replayed from its start. A since that is not one non-negative whole number is a 400, answered before the stream budget is used and before any success audit row is written. A Last-Event-ID header that is malformed gives no error and replays nothing, so the stream is live only."}, {"label": "Slow readers", "text": "Each connection queues up to 500 events. When it is full the oldest are discarded and an events-dropped event reports how many."}, {"label": "Stream limits", "text": "Each open stream uses a worker from the shared stream budget (--max-sse-streams). Over the limit you get 429 with retry_after_ms. A single principal may hold 16 event streams at once."}, {"label": "Paging does not page", "text": "The list returns up to limit rows with no cursor. limit defaults to 100 and is held between 1 and 500, and a limit that is not a whole number is a 400. pagination.total is the number of rows returned, and page_size always reads 50."}, {"label": "Confined view", "text": "For a confined caller, scope_expression and parameter_values read (redacted - confined view), and the agent counts include only devices in scope. Counts can run low because they only include devices that have already responded."}, {"label": "Per-device detail", "text": "include=agents adds per-device rows and a kpi summary. The match is a substring test on the include value, and this expansion is audited."}, {"label": "Responses paging", "text": "The responses call rejects offset with 400 because the order changes while an execution runs. Use limit (up to 1000) and since. Rows have a narrower shape than the general responses calls."}, {"label": "Children cap", "text": "The children call returns at most 100 executions and sets result_truncated_by_cap inside data when there were more. It has no pagination object."}, {"label": "Degraded reads", "text": "If the execution tracker or response store cannot be read, these calls answer 503 with retry_after_ms. They do not answer 404 or an empty list."}],
       "docs": ["docs/user-manual/rest-api.md", "docs/user-manual/response-store.md"]
     }},
@@ -2516,7 +2516,7 @@ const std::string& openapi_spec() {
       "get": {"operationId": "getExecutions", "summary": "List executions, fleet-confined", "tags": ["Events"], "description": "REST v1 twin of the dashboard /fragments/executions list fragment and the MCP list_executions tool; all three return the same row shape. Gated on the fleet-read check (Execution:Read), the same check the fragment uses. Rows carry the definition name (resolved + memoized per request) and a truncated last_error_detail preview alongside the existing agents_targeted/responded/success/failure split.", "parameters": [{"name": "definition_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Execution list", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "pagination", "meta"], "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/ExecutionListRow"}}, "meta": {"$ref": "#/components/schemas/ApiMeta"}, "pagination": {"$ref": "#/components/schemas/ApiPagination"}}}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "503": {"description": "Execution tracker not initialised or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}": {
-      "get": {"operationId": "getExecutionsById", "summary": "Fetch the final state of a single execution, optional per-agent expansion", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the fleet-read check (Execution:Read): an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted. The execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion. error_detail (per agent, and last_error_detail): for a command of a Forensics-tier plugin a failure message is kept only when it is a short machine token (scope:cause[:detail], for example windows:amcache:hive_locked); any other text is replaced by the fixed value forensics_error, while status and exit_code are unchanged.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/ExecutionDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"operationId": "getExecutionsById", "summary": "Fetch the final state of a single execution, optional per-agent expansion", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the fleet-read check (Execution:Read): an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted. The execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller. A service-scoped API token has no dispatcher admission: it sees an execution only once an agent in its service scope has a status row for it, so an execution its minting account dispatched 404s until an in-scope agent responds. ?include=agents adds a confined per-agent status/duration array (agent_id/status/dispatched_at/first_response_at/completed_at/exit_code/error_detail) plus a kpi object (total/succeeded/failed/p50_ms/p95_ms) to the response; this expansion IS audited (execution.detail.fetch, REST fail-closed) because it discloses raw agent identities, unlike the bare request. Response bodies are a SEPARATE route (GET .../responses) on a different securable (Response:Read), not part of this expansion. error_detail (per agent, and last_error_detail): for a command of a Forensics-tier plugin a failure message is kept only when it is a short machine token (scope:cause[:detail], for example windows:amcache:hive_locked); any other text is replaced by the fixed value forensics_error, while status and exit_code are unchanged.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "include", "in": "query", "required": false, "schema": {"type": "string", "enum": ["agents"]}, "description": "When \"agents\", adds the per-agent array + kpi object described above."}], "responses": {"200": {"description": "Final execution state, optionally with agents[]/kpi", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "required": ["data", "meta"], "properties": {"data": {"$ref": "#/components/schemas/ExecutionDetail"}, "meta": {"$ref": "#/components/schemas/ApiMeta"}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded, or (when include=agents) the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },)json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the merge of the Forensics
         // notes (#4990) and the typed-response schemas grew this segment past the gate ceiling.
@@ -12804,6 +12804,7 @@ void RestApiV1::register_routes(
 
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             if (gate.scope) {
                 auto session = auth_fn(req, res);
                 if (!session)
@@ -12821,10 +12822,8 @@ void RestApiV1::register_routes(
                         "application/json");
                     return;
                 }
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto execs_opt = execution_tracker->query_executions_checked(q, scope_arg);
@@ -12877,7 +12876,7 @@ void RestApiV1::register_routes(
                     auto it = statuses_opt->find(e.id);
                     const auto& statuses =
                         it != statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(e, statuses, gate.scope, username))
+                    if (!execution_visible(e, statuses, gate.scope, owner))
                         continue;
                     auto counts = confined_projection(statuses, gate.scope);
                     ExecutionListRow row;
@@ -13727,8 +13726,10 @@ void RestApiV1::register_routes(
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
+            // #5557: the ownership disjunct takes the owner KEY, never the raw username (a
+            // service-scoped session's username is its minter's).
             const bool owns_execution =
-                exec_opt && exec_opt->dispatched_by == session->username;
+                exec_opt && execution_owner_key(*session).owns(*exec_opt);
             const bool visible = !gate.scope || owns_execution || has_visible_agent;
             if (!exec_opt || !visible) {
                 // #1634 (governance Gate 4 consistency-auditor finding): a
@@ -13907,6 +13908,7 @@ void RestApiV1::register_routes(
 
             auto exec_id = req.matches[1].str();
             std::string username;
+            yuzu::server::ExecutionOwnerKey owner; // empty unless a confined, resolved session
             yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             if (gate.scope) {
                 auto session = auth_fn(req, res);
@@ -13933,10 +13935,8 @@ void RestApiV1::register_routes(
                 // the cap-before-scope defect where an invisible sibling
                 // could displace this caller's own visible children out of
                 // the capped window.
-                yuzu::server::ExecutionListScope s;
-                s.owner = username;
-                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                scope_arg = std::move(s);
+                owner = execution_owner_key(*session);
+                scope_arg = confined_list_scope(owner, gate.scope);
             }
 
             auto exec_r = execution_tracker->get_execution_checked(exec_id);
@@ -13964,7 +13964,7 @@ void RestApiV1::register_routes(
 
             const bool parent_visible =
                 exec_opt.has_value() &&
-                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
             if (!exec_opt || !parent_visible) {
                 // #3789: audit ONLY under an engaged scope -- matches the
                 // legacy route's identical rationale (compliance-officer F2).
@@ -14013,7 +14013,7 @@ void RestApiV1::register_routes(
                     auto it = child_statuses_opt->find(c.id);
                     const auto& c_statuses =
                         it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                    if (!execution_visible(c, c_statuses, gate.scope, owner))
                         continue;
                     arr.add_raw(execution_child_row_json(c).dump());
                 }
@@ -14227,6 +14227,8 @@ void RestApiV1::register_routes(
             mreq.what = ExecutionMutation::kCancel;
             mreq.execution_id = req.matches[1].str();
             mreq.username = session->username;
+            // #5557: admission key; `username` stays the real audit identity.
+            mreq.owner = execution_owner_key(*session);
             mreq.scope = gate.scope;
             mreq.audit_context = "surface=rest-v1 cid=" + cid;
             const auto outcome = apply_execution_mutation(
@@ -14326,6 +14328,7 @@ void RestApiV1::register_routes(
             if (!session)
                 return; // auth_fn wrote the 401.
             mreq.username = session->username;
+            mreq.owner = execution_owner_key(*session); // #5557: see the cancel arm
             const auto outcome = apply_execution_mutation(
                 execution_mutation_ports, mreq,
                 [&](const std::string& action, const std::string& result,
@@ -22798,8 +22801,8 @@ void RestApiV1::register_routes(
             for (const auto& a : *agents_opt)
                 has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
         }
-        const bool owns_execution =
-            exec_opt && exec_opt->dispatched_by == session->username;
+        // #5557: the ownership disjunct takes the owner KEY, never the raw username.
+        const bool owns_execution = exec_opt && execution_owner_key(*session).owns(*exec_opt);
         const bool visible = !gate.scope || owns_execution || has_visible_agent;
         if (!exec_opt || !visible) {
             // Keep nonexistent and outside-scope cases caller-identical. The

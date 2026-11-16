@@ -1492,11 +1492,16 @@ public:
             st.reset(raw); // owned even when prepare reports an error
             REQUIRE(rc == SQLITE_OK);
         }
-        while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        int rc;
+        while ((rc = sqlite3_step(st.get())) == SQLITE_ROW) {
             const auto* o = sqlite3_column_text(st.get(), 0);
             const auto* k = sqlite3_column_text(st.get(), 1);
             out.push_back({static_cast<char>(o ? o[0] : '?'),
                            k ? reinterpret_cast<const char*>(k) : ""});
+        }
+        if (rc != SQLITE_DONE) {
+            throw std::runtime_error("KV probe read failed (" + std::to_string(rc) +
+                                     "): " + sqlite3_errmsg(db_));
         }
         return out;
     }
@@ -1576,6 +1581,39 @@ void first_push(KvRig& k, const KvRules& s, const std::string& bytes) {
 }
 
 } // namespace
+
+TEST_CASE("KV effect probe rejects failed reads instead of reporting no mutations",
+          "[spark][guardian][reconcile][4415kv][kv-probe]") {
+    yuzu::test::TempDbFile db{"yuzu_test_kv_probe_"};
+    auto kv = KvStore::open(db.path);
+    REQUIRE(kv.has_value());
+    KvProbe probe;
+    probe.install(db.path);
+    REQUIRE(probe.ops().empty()); // a successful empty read remains a useful oracle
+    REQUIRE(kv->set(kKvNs, "rule:first", "first"));
+    REQUIRE(kv->set(kKvNs, "rule:second", "second"));
+    REQUIRE(probe.writes() == std::vector<std::string>{"rule:first", "rule:second"});
+
+    probe.exec("ALTER TABLE yuzu_test_kvlog RENAME TO yuzu_test_kvlog_saved");
+    // abs(INT64_MIN) prepares successfully and fails when SQLite evaluates a
+    // row. Cover both failure before any evidence and after a valid prefix.
+    SECTION("first row fails") {
+        probe.exec("CREATE VIEW yuzu_test_kvlog AS SELECT seq, abs(-9223372036854775808) AS op, k "
+                   "FROM yuzu_test_kvlog_saved");
+    }
+    SECTION("a later row fails") {
+        probe.exec("CREATE VIEW yuzu_test_kvlog AS SELECT seq, "
+                   "CASE WHEN k='rule:second' THEN abs(-9223372036854775808) ELSE op END AS op, k "
+                   "FROM yuzu_test_kvlog_saved");
+    }
+    REQUIRE_THROWS_AS(probe.ops(), std::runtime_error);
+    REQUIRE_THROWS_AS(probe.deletes(), std::runtime_error);
+    probe.exec("DROP VIEW yuzu_test_kvlog");
+    probe.exec("ALTER TABLE yuzu_test_kvlog_saved RENAME TO yuzu_test_kvlog");
+    CHECK(probe.writes() == std::vector<std::string>{"rule:first", "rule:second"});
+    probe.clear();
+    CHECK(probe.ops().empty());
+}
 
 // -------------------------------------------------------------------------------------------------
 // KV-1. An identical full_sync re-push of R rules: ZERO rule-row deletes and ZERO rule-row writes.

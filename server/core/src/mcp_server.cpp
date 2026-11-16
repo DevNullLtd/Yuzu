@@ -1225,6 +1225,9 @@ static const ToolDef kTools[] = {
      "execution's dispatcher is admitted to VIEW the execution (avoids a false "
      "not-found on a just-dispatched execution with no responses yet) but gets "
      "the SAME redacted counts/scope_expression as any other confined caller. "
+     "A service-scoped token has no dispatcher admission: it sees an execution only "
+     "once an agent in its service scope has a status row for it, so an execution its "
+     "minting account dispatched reads as not found until an in-scope agent responds. "
      "#4030: include:[\"agents\"] adds a confined per-agent status/duration array "
      "plus a kpi summary (total/succeeded/failed/p50_ms/p95_ms) — audited "
      "separately from the bare call because it discloses raw agent identities. "
@@ -1248,7 +1251,8 @@ static const ToolDef kTools[] = {
      "and - per #3789 - a visible parent does NOT by itself disclose a "
      "child dispatched by, or targeting, someone else: each child "
      "independently passes the same visible-agent-or-owner test the parent "
-     "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
+     "did (a service-scoped token has no owner disjunct: only an in-scope agent "
+     "status row admits a child). Mirrors GET /api/v1/executions/{id}/children and the legacy "
      "GET /api/executions/{id}/children (same shared row builder, "
      "docs/api-twin-recipe.md Rule 1). The underlying query is hard-capped "
      "at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1) with no "
@@ -1310,7 +1314,11 @@ static const ToolDef kTools[] = {
      "caller admitted through a management-group grant (rather than a global permission) "
      "sees only executions they themselves dispatched — a narrower interim mechanism than "
      "the visible-agent filtering other read tools apply, since execution rows carry no "
-     "single agent_id to filter by. #4030: rows now also carry the resolved definition "
+     "single agent_id to filter by. A service-scoped token is the exception: it lists "
+     "every execution with a status row for an agent in its service scope, whoever "
+     "dispatched it, with counts projected to those agents; executions its minting "
+     "account dispatched that no in-scope agent has answered are not listed, and a "
+     "service scope with no tagged agent lists nothing. #4030: rows now also carry the resolved definition "
      "name, the agents_success/agents_failure split, and a truncated error preview — "
      "reconciled onto the dashboard fragment's fuller field set.",
      R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256},"status":{"type":"string","maxLength":64},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
@@ -2822,6 +2830,9 @@ static const ToolDef kTools[] = {
      "query_responses by execution_id, or list_executions if you never learned one). NEVER re-send this call, which would run the action a second time. Progress is always BEST-EFFORT: even after supplying a "
      "token you MUST still be prepared to poll (a reservation can silently degrade under load "
      "and zero progress frames is indistinguishable from 'nothing has happened yet'). "
+     "SCOPE: a caller whose Execution:Read is limited to a management group (or absent, or "
+     "unresolvable) receives no progress notifications and a final result without "
+     "agents_success/agents_failure; poll get_execution_status for the counts it may see. "
      "FALLBACK when not streaming: poll query_responses with the "
      "returned execution_id - an EMPTY result means the run is still in flight, so wait ~2-5s "
      "and retry a few times (or call get_execution_status to confirm a terminal state), or "
@@ -5706,6 +5717,15 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // Implemented write tools
     {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
     {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
+    // execute_instruction stays `confined` although cancel/rerun above are `denied` for the same
+    // pair (#7817 weighed relabelling it). `confined` is true here by mcp_tool_registry.hpp's own
+    // definition: the dispatch chokepoint confines to `exec_visible`, and compose_exec_visible
+    // resolves a service-scoped token's tag scope FIRST and never as unfiltered, a real
+    // service-scope mechanism (cancel/rerun have only admit_confined_mutation, a management-group
+    // one). It is not USABLE by a service-scoped token: perm_fn(Execution, Execute) below refuses
+    // it, since the pair is not on the empty kServiceScopeGlobalSafe. `denied` would move that
+    // refusal to the C8 short-circuit, which answers with its own message and audit row, a
+    // behaviour change for a service-scoped caller that this label is not worth.
     {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
     // #2146: the REST twin gates on the plain, global Execution:Execute pair, which a
     // service-scoped token cannot clear (kServiceScopeGlobalSafe is seeded empty), so this is
@@ -15198,7 +15218,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     for (const auto& a : agents)
                         has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                 }
-                const bool owns_execution = exec && exec->dispatched_by == session->username;
+                // #5557: ownership is keyed on the owner key, never on `username` (a
+                // service-scoped credential's `username` is its MINTING account).
+                const bool owns_execution = exec && execution_owner_key(*session).owns(*exec);
                 const bool visible = !gate.scope || owns_execution || has_visible_agent;
                 if (!exec || !visible) {
                     spdlog::debug("get_execution_status: {} exec_id={}",
@@ -15341,14 +15363,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto exec_id = param_str(args, "execution_id");
-                std::string username;
-                ExecutionScope scope_arg; // nullopt = unrestricted
+                // #5557: the visibility key. Empty for a service-scoped session (whose
+                // `username` is its minting account); the guard below stays on the RAW
+                // username, never on the key.
+                const ExecutionOwnerKey owner = execution_owner_key(*session);
                 if (gate.scope) {
                     // #1634/#3789 precedent (list_executions below): an empty
                     // username under an engaged scope must never silently
                     // widen to "no owner filter" -- fail closed instead.
-                    username = session->username;
-                    if (username.empty()) {
+                    if (session->username.empty()) {
                         spdlog::error("get_execution_children: confined session has empty "
                                       "username; failing closed rather than risk an unfiltered "
                                       "read");
@@ -15356,17 +15379,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
-                    // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
-                    // visible-agent admission predicate into
-                    // get_children_checked's SQL below (execution_routes.cpp's
-                    // list route precedent) -- closes the cap-before-scope
-                    // defect where an invisible sibling could displace this
-                    // caller's own visible children out of the capped window.
-                    ExecutionListScope s;
-                    s.owner = username;
-                    s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
-                    scope_arg = std::move(s);
                 }
+                // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
+                // visible-agent admission predicate into
+                // get_children_checked's SQL below (execution_routes.cpp's
+                // list route precedent) -- closes the cap-before-scope
+                // defect where an invisible sibling could displace this
+                // caller's own visible children out of the capped window.
+                // nullopt (unrestricted) when the gate returned no scope.
+                const auto scope_arg = confined_list_scope(owner, gate.scope);
 
                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
                 if (!exec_r) {
@@ -15393,7 +15414,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 const bool parent_visible =
                     exec_opt.has_value() &&
-                    execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                    execution_visible(*exec_opt, parent_statuses, gate.scope, owner);
                 if (!exec_opt || !parent_visible) {
                     // #3789: audit ONLY under an engaged scope -- mirrors the
                     // REST twins' identical rationale (compliance-officer F2).
@@ -15441,7 +15462,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         auto it = child_statuses_opt->find(c.id);
                         const auto& c_statuses =
                             it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
-                        if (!execution_visible(c, c_statuses, gate.scope, username))
+                        if (!execution_visible(c, c_statuses, gate.scope, owner))
                             continue;
                         arr.add_raw(execution_child_row_json(c).dump());
                     }
@@ -15485,12 +15506,15 @@ McpServer::HandlerFn McpServer::build_handler(
             // a per-execution agent-status lookup per row — an N+1 pattern
             // (ADR-0017 INV-10). A batched status read exists and is used
             // below to project the counts, but LIST ADMISSION stays owner-only
-            // (no visible-agent disjunct, unlike REST GET /api/v1/executions):
-            // a confined caller is restricted to their OWN dispatches
-            // (`dispatched_by` pushed into the SQL WHERE,
+            // for a management-group-confined caller (no visible-agent disjunct,
+            // unlike REST GET /api/v1/executions): they are restricted to their
+            // OWN dispatches (`dispatched_by` pushed into the SQL WHERE,
             // ExecutionQuery::dispatched_by): cheap, provably safe (never
             // another operator's execution), and consistent with the
-            // dispatcher-ownership precedent elsewhere.
+            // dispatcher-ownership precedent elsewhere. #5557: a SERVICE-SCOPED session is
+            // the exception (see docs/auth-architecture.md clause (7) item 3). It has no
+            // owner key, so it takes the engaged fleet-read scope through the checked query
+            // (the REST list twin's admission), never the owner-only filter.
             if (tool_name == "list_executions") {
                 if (!fleet_read_fn_) {
                     spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
@@ -15526,8 +15550,33 @@ McpServer::HandlerFn McpServer::build_handler(
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
-                if (gate.scope)
-                    eq.dispatched_by = session->username;
+                // #5557: a service-scoped session's owner key is EMPTY, and an
+                // empty `eq.dispatched_by` means "no filter" -- clearing the key here would
+                // widen a confined caller to the whole list. So the two confined classes take
+                // different, EXPLICIT paths (service-scoped is decided by the session's scope,
+                // not by the key):
+                //   - service-scoped: the engaged fleet-read scope through the checked query
+                //     (agent evidence only, no owner disjunct; a present-empty scope lists
+                //     nothing, `AND 1=0`), the same admission as the REST list twin;
+                //   - any other confined caller: the owner-only filter, exactly as before.
+                const ExecutionOwnerKey owner = execution_owner_key(*session);
+                const bool service_scoped = !session->token_scope_service.empty();
+                // Fail closed locally: both gates already refuse to admit a service-scoped
+                // session unrestricted, and without a scope this would list the whole fleet.
+                if (service_scoped && !gate.scope) {
+                    spdlog::error("list_executions: service-scoped session admitted without a "
+                                  "scope; failing closed rather than risk an unrestricted list");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (gate.scope && !service_scoped)
+                    // Non-empty: the raw username was guarded above.
+                    eq.dispatched_by = owner_only_filter(owner);
+                // An unrestricted (default) VisibleSet pushes down nothing.
+                const authz::VisibleSet unrestricted;
+                const auto query_scope =
+                    confined_list_scope(owner, service_scoped ? gate.scope : unrestricted);
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 // #4030: reconciled onto the fragment's fuller field set —
                 // populate last_error_detail so the error preview below is
@@ -15541,7 +15590,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // GET /api/v1/executions above (rest_api_v1.cpp), which
                 // already has this checked/error shape, and mirrors the
                 // list_schedules fix immediately below in this same file.
-                auto execs_opt = execution_tracker->query_executions_checked(eq);
+                auto execs_opt = execution_tracker->query_executions_checked(eq, query_scope);
                 if (!execs_opt) {
                     res.set_content(
                         a4_error(kInternalError, "execution tracker degraded", {},
@@ -22801,9 +22850,38 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             stream_lease.emplace(std::move(acquired.lease));
                         }
+                        // #7817: the bridge relays this execution's counts to the
+                        // dispatcher, so it applies the same confined projection as
+                        // GET /api/v1/events, from the dispatcher's Execution:Read scope.
+                        // Derived through the one gate every Execution read uses here
+                        // (fleet_read_fn_, as get_execution_status does), on a scratch
+                        // response because a refusal here must not answer THIS request.
+                        // FAIL CLOSED: not admitted, unwired or a throw resolves to
+                        // deny-all (progress dropped, terminal sanitized), never to
+                        // nullopt (unrestricted). Only an admitted, unfiltered gate yields
+                        // nullopt, which keeps that caller's frames unchanged.
+                        yuzu::server::authz::VisibleSet bridge_fleet_scope =
+                            yuzu::server::authz::deny_all();
+                        try {
+                            if (fleet_read_fn_) {
+                                httplib::Response scratch;
+                                auto fleet_gate =
+                                    fleet_read_fn_(req, scratch, "Execution", "Read");
+                                if (fleet_gate.admitted)
+                                    bridge_fleet_scope = std::move(fleet_gate.scope);
+                            } else {
+                                spdlog::error("execute_instruction: fleet_read_fn_ unwired; "
+                                              "progress bridge uses its most restricted view");
+                            }
+                        } catch (...) {
+                            spdlog::error("execute_instruction: Execution:Read scope derivation "
+                                          "threw; progress bridge uses its most restricted view");
+                            bridge_fleet_scope = yuzu::server::authz::deny_all();
+                        }
                         auto rr = bridge->reserve(bridge_sid, binding, id,
                                                   std::move(bridge_token),
-                                                  /*streamed_intent=*/streamed_mode);
+                                                  /*streamed_intent=*/streamed_mode,
+                                                  std::move(bridge_fleet_scope));
                         if (rr.ok) {
                             bridge_active = true;
                             streamed_active = streamed_mode;
@@ -23358,9 +23436,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #2712: structuredContent is baked into `result` HERE, before it
                 // is handed to bridge->arm() below as result_base - a streamed or
                 // parked final's build_real_final() parse-merges result_base and
-                // only ADDS top-level status/agents_success/agents_failure keys
-                // (mcp_stream_bridge.cpp), so structuredContent survives into every
-                // final shape unchanged. This is a deliberate, pinned decision, not
+                // only ADDS top-level status keys, plus agents_success/agents_failure
+                // when the terminal payload carries them (it does not for a
+                // scope-confined dispatcher) (mcp_stream_bridge.cpp), so
+                // structuredContent survives into every final shape unchanged.
+                // This is a deliberate, pinned decision, not
                 // an accident of construction order - see the bridge byte-pin test
                 // added alongside this change.
                 auto result = tool_result(payload, kObjectOutputSchema);
@@ -23368,7 +23448,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the latched progress snapshot to the projector, which publishes
                 // progress LIVE onto this session's GET stream. `result` is passed as the
                 // result_base (B5): a parked record's real final re-emits today's
-                // result object with status/agents_* added as top-level keys.
+                // result object with status (and agents_success/agents_failure when the
+                // terminal payload carries them) added as top-level keys.
                 // The plain JSON below answers this POST either way - GET-only
                 // mode NEVER emits a second final response (no pin, no final
                 // frame; the H2/G9-class byte test pins this).
@@ -25302,7 +25383,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         exec_agents = std::move(*agents_opt);
                     }
                     if (exec && execution_visible(*exec, exec_agents, gate.scope,
-                                                  session->username)) {
+                                                  execution_owner_key(*session))) {
                         int agents_targeted = exec->agents_targeted;
                         int agents_responded = exec->agents_responded;
                         if (gate.scope) {
@@ -28718,6 +28799,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kCancel;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.audit_context = "surface=mcp";
                 const auto outcome = apply_execution_mutation(
@@ -28814,6 +28897,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 mreq.what = ExecutionMutation::kRerun;
                 mreq.execution_id = *exec_id;
                 mreq.username = session->username;
+                // #5557: admission key; `username` stays the real audit identity.
+                mreq.owner = execution_owner_key(*session);
                 mreq.scope = gate.scope;
                 mreq.failed_only = *failed_only;
                 mreq.audit_context = "surface=mcp";
@@ -33028,8 +33113,10 @@ McpServer::HandlerFn McpServer::build_get_handler(AuthFn auth_fn, AuditFn audit_
                 error_response_null_a4(kPermissionDenied,
                                        "service-scoped tokens may not open the MCP stream channel",
                                        cid,
-                                       "use a token without scope_service; durable results "
-                                       "remain fetchable by execution_id"));
+                                       "use a token without scope_service for the stream channel; "
+                                       "a service-scoped token can read an execution by "
+                                       "execution_id only after an agent in its service scope "
+                                       "has a status row for it"));
             return;
         }
         // The SSE channel itself (session gate, Accept negotiation, replay, caps,

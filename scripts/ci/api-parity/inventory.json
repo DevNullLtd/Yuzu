@@ -23,6 +23,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/inventory/software/find",
+    "capability_id": "get.fragments-inventory-software-find",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/inventory/software"
+    },
+    "mcp_twin": "query_installed_software",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/inventory/software/versions",
     "capability_id": "get.fragments-inventory-software-versions",
     "rest_v1_twin": {

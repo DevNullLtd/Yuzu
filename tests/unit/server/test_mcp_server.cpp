@@ -44,10 +44,13 @@
 #include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_response_execution_authz_pg_helper.hpp"
+#include "test_execution_owner_engine.hpp"    // #5557: corrupted service-scoped engine credentials
+#include "test_execution_owner_scope_rig.hpp" // #5557: shared real-gate rig + the real-session seam below
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
 #include "approval_model.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
+#include "mcp_admission.hpp"         // #5557: make_admission_auth_fn for the real-session seam
 #include "sqlite_raii.hpp"
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
@@ -1348,6 +1351,19 @@ struct McpTestServer {
     std::function<bool(const std::string& securable, const std::string& op)>
         perm_override_for_test{};
 
+    /// #5557: TEST-ONLY real-session seam. When `real_session_auth_for_test` is set, the
+    /// fixture's authentication hook is that resolver wrapped in the PRODUCTION admission
+    /// (`mcp::make_admission_auth_fn`, the same composition server.cpp registers), so a tierless
+    /// token or a cookie session is refused 403 before any tool runs and `mock_username`,
+    /// `mock_tier`, `mock_token_scope_service`, `mock_role`, `mock_principal_kind` and
+    /// `mock_auth_source` are all ignored. When `real_perm_fn_for_test` is set it replaces the
+    /// permissive mock permission hook (and `perm_override_for_test`). Both default empty, which
+    /// leaves every pre-existing test on the historical mocks. `ExecutionOwnerRig::wire_mcp`
+    /// sets them together with the real `fleet_read_fn_for_test`/`list_read_fn_for_test`, so one
+    /// `AuthRoutes` is the session source for authentication, permission and fleet-read.
+    yuzu::server::mcp::McpServer::AuthFn real_session_auth_for_test{};
+    yuzu::server::mcp::McpServer::PermFn real_perm_fn_for_test{};
+
     /// ADR-0016: optionally wire a typed SoftwareInventoryStore so
     /// query_installed_software is exercised end-to-end. Default nullptr keeps
     /// existing tests on the "Software inventory store unavailable" path.
@@ -1634,7 +1650,7 @@ private:
         mock_tier = tier;
 
         // Mock auth: returns a session with the configured tier (or nullopt)
-        auto auth_fn =
+        yuzu::server::mcp::McpServer::AuthFn auth_fn =
             [this](const httplib::Request& /*req*/,
                    httplib::Response& res) -> std::optional<yuzu::server::auth::Session> {
             if (!mock_auth_enabled) {
@@ -1654,9 +1670,9 @@ private:
 
         // Mock permission: always allow, unless a test wires perm_override_for_test
         // to deny a specific securable/op (then mimic require_permission's 403).
-        auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                              const std::string& securable_type,
-                              const std::string& operation) -> bool {
+        yuzu::server::mcp::McpServer::PermFn perm_fn =
+            [this](const httplib::Request&, httplib::Response& res,
+                   const std::string& securable_type, const std::string& operation) -> bool {
             if (perm_override_for_test && !perm_override_for_test(securable_type, operation)) {
                 res.status = 403;
                 res.set_content(R"({"error":"forbidden"})", "application/json");
@@ -1692,6 +1708,17 @@ private:
                 return audit_succeeds_for_action_(action);
             return audit_succeeds_;
         };
+
+        // #5557: the real-session seam. The resolver is wrapped in the PRODUCTION admission
+        // (the one composition server.cpp registers for every MCP verb), with the fixture's own
+        // audit recorder as the admission audit sink, so a refused credential leaves its
+        // `mcp.session.reject` row in `audit_log` exactly as production would write it.
+        if (real_session_auth_for_test) {
+            auth_fn = yuzu::server::mcp::make_admission_auth_fn(real_session_auth_for_test,
+                                                                audit_fn, metrics_for_test);
+        }
+        if (real_perm_fn_for_test)
+            perm_fn = real_perm_fn_for_test;
 
         // Mock agents: return two test agents
         auto agents_fn = [this]() -> nlohmann::json {
@@ -49135,6 +49162,32 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: a confined caller need
     }
 }
 
+TEST_CASE("MCP cancel_execution / record_execution_rerun: the zero-row window admits the "
+          "dispatcher's own owner key only, and the effect names the real principal",
+          "[mcp][execution][mutation][confinement][security][owner_key][5557]") {
+    for (const char* tool : {"cancel_execution", "record_execution_rerun"}) {
+        for (const char* dispatcher : {"test-user", "alice"}) {
+            McpExecFake fs;
+            fs.exec = mcp_exec(dispatcher, 1); // no status rows yet
+            McpTestServer ts;
+            ts.execution_mutation_ports_for_test = fs.ports();
+            ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                           const std::string&, const std::string&)
+                -> yuzu::server::authz::FleetReadGate {
+                return {true, mcp_exec_scope({"a"})};
+            };
+            ts.start("operator");
+            auto res = exec_tool_call(ts, tool, R"({"execution_id":"exec-1"})");
+            REQUIRE(res);
+            const bool own = std::string(dispatcher) == "test-user";
+            INFO(tool << " dispatcher=" << dispatcher);
+            CHECK(fs.effects() == (own ? 1 : 0));
+            if (own)
+                CHECK(fs.effect_user == "test-user");
+        }
+    }
+}
+
 TEST_CASE("MCP cancel_execution / record_execution_rerun: an empty principal is refused, never "
           "run as 'unknown'",
           "[mcp][execution][mutation][security][2146]") {
@@ -55349,6 +55402,984 @@ TEST_CASE("MCP create_result_set_from_inventory_query: a pending parent is refus
         REQUIRE(child->has_value());
         CHECK((*child)->agents_failed == 2);
         CHECK((*child)->agents_unanswered == 3);
+    }
+}
+
+// ── #5557: the test-only real-session seam ─────────────────────────────────────────────────────
+//
+// `ExecutionOwnerRig::wire_mcp` makes ONE real AuthRoutes the session source for MCP
+// authentication (wrapped in the production admission), permission, fleet-read and list-read.
+// The admission case is a permanent control (tierless and cookie credentials never reach a
+// tool); the cases after it assert the exact execution ids each credential class sees.
+namespace {
+
+std::vector<std::string> mcp_list_execution_ids(const std::unique_ptr<httplib::Response>& res) {
+    std::vector<std::string> ids;
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    for (const auto& e : body["result"]["structuredContent"]["executions"])
+        ids.push_back(e["id"].get<std::string>());
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+std::unique_ptr<httplib::Response> mcp_list_executions_as(McpTestServer& ts,
+                                                          const std::string& token) {
+    return ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5557,"params":{"name":"list_executions","arguments":{"definition_id":"def-owner-rig"}}})",
+        {{"Authorization", "Bearer " + token}});
+}
+
+} // namespace
+
+TEST_CASE("MCP real-session seam: production admission refuses a tierless service token and a "
+          "cookie session before any tool runs",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly"); // ignored by the seam: the tier comes from the real credential
+
+    auto expect_refused = [&](std::unique_ptr<httplib::Response> res) {
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(res->body.find("requires an MCP-tier bearer token") != std::string::npos);
+        // No execution data of any kind in a refused response.
+        for (const auto& id : r.all_seeded_ids())
+            CHECK(res->body.find(id) == std::string::npos);
+    };
+    // A tierless SERVICE-SCOPED token (valid on REST) and a cookie session (valid on REST).
+    expect_refused(mcp_list_executions_as(ts, r.creds.svc_a));
+    {
+        const auto cookie = r.cookie_session("mina");
+        expect_refused(ts.call_raw(
+            "POST",
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5557,"params":{"name":"list_executions"}})",
+            {{"Cookie", "yuzu_session=" + cookie}}));
+    }
+    // The refusal is the production admission's own audit row, written through the fixture sink.
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") ==
+          2);
+}
+
+namespace {
+
+using OwnerRig = yuzu::test::ExecutionOwnerRig;
+
+/// A tools/call as `token` through the real session seam. `args_json` is the arguments object.
+std::unique_ptr<httplib::Response> mcp_tool_as(McpTestServer& ts, const std::string& token,
+                                               const std::string& tool,
+                                               const std::string& args_json) {
+    return ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5557,"params":{"name":")" + tool +
+            R"(","arguments":)" + args_json + "}}",
+        {{"Authorization", "Bearer " + token}});
+}
+
+nlohmann::json mcp_structured(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    return body["result"]["structuredContent"];
+}
+
+bool mcp_is_error(const std::unique_ptr<httplib::Response>& res) {
+    return res && nlohmann::json::parse(res->body).contains("error");
+}
+
+std::string mcp_error_message(const std::unique_ptr<httplib::Response>& res) {
+    REQUIRE(res);
+    const auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    return body["error"]["message"].get<std::string>();
+}
+
+std::string replace_all(std::string text, const std::string& from, const std::string& to) {
+    for (std::size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + 1))
+        text.replace(at, from.size(), to);
+    return text;
+}
+
+std::vector<std::string> mcp_children_ids(const std::unique_ptr<httplib::Response>& res) {
+    std::vector<std::string> ids;
+    for (const auto& c : mcp_structured(res)["children"])
+        ids.push_back(c["id"].get<std::string>());
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+/// The seeded ids a credential can read through `get_execution_status`.
+std::vector<std::string> mcp_status_visible_ids(McpTestServer& ts, const OwnerRig& r,
+                                                const std::string& token) {
+    std::vector<std::string> visible;
+    for (const auto& id : r.all_seeded_ids()) {
+        auto res = mcp_tool_as(ts, token, "get_execution_status",
+                               R"({"execution_id":")" + id + R"("})");
+        REQUIRE(res);
+        if (!mcp_is_error(res))
+            visible.push_back(id);
+    }
+    return visible;
+}
+
+} // namespace
+
+// The exact id sets the five confined/unconfined caller classes see, shared by the list and the
+// status cases. `bob_owner` is what MCP's owner-only list shows a non-service
+// confined caller; status keeps the owner-or-visible-agent rule for him.
+TEST_CASE("MCP execution tools: list_executions serves exact sets through the real session",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    auto list_as = [&](const std::string& token,
+                       const std::string& args = R"({"definition_id":"def-owner-rig"})") {
+        return mcp_tool_as(ts, token, "list_executions", args);
+    };
+
+    SECTION("a service-scoped credential sees the agent-evidence set, never the minter's rows") {
+        // service A = {a1,a2}: minter_out (z1) and minter_pending (no rows) are gone, minter_in_a
+        // stays because an in-scope agent answered it.
+        auto svc = list_as(r.creds.mcp_svc_a);
+        REQUIRE(svc);
+        CHECK(svc->status == 200);
+        CHECK(mcp_list_execution_ids(svc) == r.service_a_ids());
+        for (const auto& hidden : {r.ids.minter_out, r.ids.minter_pending, r.ids.foreign,
+                                   r.ids.empty_pending, r.ids.bob_out, r.ids.bob_pending})
+            CHECK(svc->body.find(hidden) == std::string::npos);
+
+        // service B = {b1}: only the two executions with a b1 row, none of the minter's.
+        auto b = list_as(r.creds.mcp_svc_b);
+        REQUIRE(b);
+        CHECK(mcp_list_execution_ids(b) == OwnerRig::sorted({r.ids.mixed, r.ids.run}));
+
+        // A service with no tagged agent is ADMITTED with an empty scope: an empty list, never
+        // the owner-only list and never the unfiltered one (the empty-key-widens defect).
+        auto none = list_as(r.creds.mcp_svc_none);
+        REQUIRE(none);
+        CHECK(none->status == 200);
+        CHECK(mcp_list_execution_ids(none).empty());
+
+        // Minter bob (group-scoped to a1): service A meet his scope = {a1}. a2-ONLY is excluded,
+        // which separates {a1} from the widened {a1,a2}; his own dispatches give nothing.
+        auto bob_a = list_as(r.creds.mcp_svc_bob_a);
+        REQUIRE(bob_a);
+        CHECK(mcp_list_execution_ids(bob_a) ==
+              OwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a}));
+        CHECK(bob_a->body.find(r.ids.a2) == std::string::npos);
+        CHECK(bob_a->body.find(r.ids.bob_out) == std::string::npos);
+        CHECK(bob_a->body.find(r.ids.bob_pending) == std::string::npos);
+    }
+
+    SECTION("projection: counts cover only the in-scope agents and running is not responded") {
+        auto row_of = [](const nlohmann::json& payload, const std::string& id) {
+            for (const auto& e : payload["executions"])
+                if (e["id"] == id)
+                    return e;
+            return nlohmann::json{};
+        };
+        auto a = mcp_structured(list_as(r.creds.mcp_svc_a));
+        const auto mixed = row_of(a, r.ids.mixed);
+        CHECK(mixed["agents_targeted"] == 1);
+        CHECK(mixed["agents_responded"] == 1);
+        CHECK(mixed["agents_success"] == 1);
+        CHECK(mixed["agents_failure"] == 0);
+        const auto run = row_of(a, r.ids.run);
+        CHECK(run["agents_targeted"] == 2); // a1 running + a2 success
+        CHECK(run["agents_responded"] == 1);
+        CHECK(run["agents_success"] == 1);
+        CHECK(run["agents_failure"] == 0);
+        CHECK(nlohmann::json(a).dump().find("SECRET-B-ERR") == std::string::npos);
+
+        auto b = mcp_structured(list_as(r.creds.mcp_svc_b));
+        const auto b_mixed = row_of(b, r.ids.mixed);
+        CHECK(b_mixed["agents_targeted"] == 1);
+        CHECK(b_mixed["agents_failure"] == 1);
+        CHECK(b_mixed["error_preview"].get<std::string>().find("SECRET-B-ERR") !=
+              std::string::npos);
+        const auto b_run = row_of(b, r.ids.run);
+        CHECK(b_run["agents_targeted"] == 1); // b1 running
+        CHECK(b_run["agents_responded"] == 0);
+    }
+
+    SECTION("the owner key is dropped in SQL before the page LIMIT") {
+        // 60 NEWER minter rows on z1 would fill a limit-50 page under minter-keyed admission.
+        (void)r.seed_starvation(60);
+        auto svc = list_as(r.creds.mcp_svc_a, R"({"definition_id":"def-owner-rig","limit":50})");
+        REQUIRE(svc);
+        CHECK(svc->status == 200);
+        CHECK(mcp_list_execution_ids(svc) == r.service_a_ids());
+    }
+
+    SECTION("non-service callers keep the owner-only list") {
+        // Confined non-service bob: owner-only. NONE of carol's a1 executions on MCP.
+        auto bob = list_as(r.creds.mcp_bob);
+        REQUIRE(bob);
+        CHECK(mcp_list_execution_ids(bob) == OwnerRig::sorted({r.ids.bob_out, r.ids.bob_pending}));
+        for (const auto& carol : {r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a})
+            CHECK(bob->body.find(carol) == std::string::npos);
+        // Global mina: unconfined.
+        auto mina = list_as(r.creds.mcp_mina);
+        REQUIRE(mina);
+        CHECK(mcp_list_execution_ids(mina) == r.all_seeded_ids());
+        // dan holds no Execution:Read: refused at the real gate (403), distinct from the
+        // admitted-empty service C answer above.
+        auto dan = list_as(r.creds.mcp_dan);
+        REQUIRE(dan);
+        CHECK(dan->status == 403);
+        for (const auto& id : r.all_seeded_ids())
+            CHECK(dan->body.find(id) == std::string::npos);
+    }
+
+    SECTION("RBAC off: service-scoped is refused, non-service stays unconfined") {
+        r.rbac.set_rbac_enabled(false);
+        auto svc = list_as(r.creds.mcp_svc_a);
+        REQUIRE(svc);
+        CHECK(svc->status == 403);
+        for (const auto& id : r.all_seeded_ids())
+            CHECK(svc->body.find(id) == std::string::npos);
+        auto mina = list_as(r.creds.mcp_mina);
+        REQUIRE(mina);
+        CHECK(mcp_list_execution_ids(mina) == r.all_seeded_ids());
+    }
+}
+
+TEST_CASE("MCP execution tools: get_execution_status serves exact sets and a normalized not-found",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+
+    SECTION("exact visible id sets per credential") {
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_a) == r.service_a_ids());
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_b) ==
+              OwnerRig::sorted({r.ids.mixed, r.ids.run}));
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_none).empty());
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_svc_bob_a) ==
+              OwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a}));
+        // Non-service controls: bob keeps the owner disjunct (his own pending row) beside his
+        // visible agent a1; mina is unconfined.
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_bob) ==
+              OwnerRig::sorted({r.ids.in_a, r.ids.mixed, r.ids.run, r.ids.minter_in_a,
+                                r.ids.bob_out, r.ids.bob_pending}));
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_mina) == r.all_seeded_ids());
+        // No Execution:Read grant: the gate refuses before any lookup.
+        auto dan = mcp_tool_as(ts, r.creds.mcp_dan, "get_execution_status",
+                               R"({"execution_id":")" + r.ids.in_a + R"("})");
+        REQUIRE(dan);
+        CHECK(dan->status == 403);
+        CHECK(dan->body.find(r.ids.in_a) == std::string::npos);
+    }
+
+    SECTION("the minter's out-of-scope and pending executions read as not found, normalized") {
+        auto not_found = [&](const std::string& id) {
+            const auto audit_before = ts.audit_log.size();
+            auto res = mcp_tool_as(ts, r.creds.mcp_svc_a, "get_execution_status",
+                                   R"({"execution_id":")" + id + R"("})");
+            REQUIRE(res);
+            REQUIRE(mcp_is_error(res));
+            // The error echoes the requested id (MCP's own shape): compare it normalized.
+            std::string audit_detail;
+            std::size_t denied = 0;
+            for (std::size_t i = audit_before; i < ts.audit_log.size(); ++i)
+                if (ts.audit_log[i] == "mcp.get_execution_status|denied") {
+                    ++denied;
+                    audit_detail = replace_all(ts.audit_details[i], id, "<ID>");
+                }
+            CHECK(denied == 1);
+            return std::make_pair(replace_all(mcp_error_message(res), id, "<ID>"), audit_detail);
+        };
+        const auto absent = not_found("exec-never-existed");
+        CHECK(absent.first == "Execution not found: <ID>");
+        CHECK(not_found(r.ids.minter_out) == absent);
+        CHECK(not_found(r.ids.minter_pending) == absent);
+        CHECK(not_found(r.ids.foreign) == absent);
+    }
+
+    SECTION("projection and the per-agent expansion are confined to the service scope") {
+        auto status = [&](const std::string& token, const std::string& id, bool agents = false) {
+            return mcp_structured(mcp_tool_as(
+                ts, token, "get_execution_status",
+                R"({"execution_id":")" + id + R"(")" +
+                    (agents ? R"(,"include":["agents"])" : "") + "}"));
+        };
+        const auto mixed = status(r.creds.mcp_svc_a, r.ids.mixed);
+        CHECK(mixed["agents_targeted"] == 1);
+        CHECK(mixed["agents_responded"] == 1);
+        CHECK(mixed["agents_success"] == 1);
+        CHECK(mixed["agents_failure"] == 0);
+        CHECK(mixed["scope_expression"] == "(redacted - confined view)");
+        const auto run = status(r.creds.mcp_svc_a, r.ids.run, /*agents=*/true);
+        CHECK(run["agents_targeted"] == 2);
+        CHECK(run["agents_responded"] == 1);
+        CHECK(run["agents_success"] == 1);
+        CHECK(run["agents_failure"] == 0);
+        std::vector<std::string> agent_ids;
+        for (const auto& a : run["agents"])
+            agent_ids.push_back(a["agent_id"].get<std::string>());
+        std::sort(agent_ids.begin(), agent_ids.end());
+        CHECK(agent_ids == std::vector<std::string>{"a1", "a2"});
+        // Quoted, so a random hex execution id that happens to contain "b1" cannot match.
+        CHECK(run.dump().find("\"b1\"") == std::string::npos);
+        CHECK(status(r.creds.mcp_svc_a, r.ids.mixed, true).dump().find("SECRET-B-ERR") ==
+              std::string::npos);
+        // Service B reads the same execution and DOES see its own failure text.
+        CHECK(status(r.creds.mcp_svc_b, r.ids.mixed, true).dump().find("SECRET-B-ERR") !=
+              std::string::npos);
+    }
+
+    SECTION("RBAC off: service-scoped refused, non-service unconfined") {
+        r.rbac.set_rbac_enabled(false);
+        auto svc = mcp_tool_as(ts, r.creds.mcp_svc_a, "get_execution_status",
+                               R"({"execution_id":")" + r.ids.in_a + R"("})");
+        REQUIRE(svc);
+        CHECK(svc->status == 403);
+        CHECK(svc->body.find(r.ids.in_a) == std::string::npos);
+        CHECK(mcp_status_visible_ids(ts, r, r.creds.mcp_mina) == r.all_seeded_ids());
+    }
+}
+
+TEST_CASE("MCP execution tools: get_execution_children serves exact sets and honours the cap",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    const auto c = r.seed_children();
+    const auto cap = r.seed_children_cap();
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    auto children_as = [&](const std::string& token, const std::string& parent) {
+        return mcp_tool_as(ts, token, "get_execution_children",
+                           R"({"execution_id":")" + parent + R"("})");
+    };
+
+    SECTION("a service-scoped credential sees only the in-scope children of a visible parent") {
+        auto in = children_as(r.creds.mcp_svc_a, c.parent_in);
+        REQUIRE_FALSE(mcp_is_error(in));
+        CHECK(mcp_children_ids(in) == std::vector<std::string>{c.c_in});
+        // The minter's z1 and pending children and carol's b1 child are all absent.
+        for (const auto& hidden : {c.c_minter_out, c.c_minter_pending, c.c_b})
+            CHECK(in->body.find(hidden) == std::string::npos);
+
+        // parent_minter_out is a z1-only execution the MINTER dispatched: hidden parent, even
+        // though it has a visible child (c_x on a1).
+        const auto hidden_parent = children_as(r.creds.mcp_svc_a, c.parent_minter_out);
+        REQUIRE(mcp_is_error(hidden_parent));
+        const auto absent = children_as(r.creds.mcp_svc_a, "exec-never-existed");
+        REQUIRE(mcp_is_error(absent));
+        CHECK(replace_all(mcp_error_message(hidden_parent), c.parent_minter_out, "<ID>") ==
+              replace_all(mcp_error_message(absent), "exec-never-existed", "<ID>"));
+        CHECK(hidden_parent->body.find(c.c_x) == std::string::npos);
+
+        // Service B cannot see parent_in (a1 only); service C (empty scope) sees nothing.
+        CHECK(mcp_is_error(children_as(r.creds.mcp_svc_b, c.parent_in)));
+        CHECK(mcp_is_error(children_as(r.creds.mcp_svc_none, c.parent_in)));
+        // Minter bob (service A meet {a1}): the same children as service A here.
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_svc_bob_a, c.parent_in)) ==
+              std::vector<std::string>{c.c_in});
+    }
+
+    SECTION("the cap applies to the caller's own visible children (scope before LIMIT)") {
+        // kRigChildrenOverCap NEWER minter children on z1 sit above ONE older in-scope child:
+        // the scope clause precedes ORDER BY ... LIMIT, so the visible child survives and the
+        // truncation marker (which reports the SCOPED row set) is absent.
+        auto svc = children_as(r.creds.mcp_svc_a, cap.parent_cap);
+        REQUIRE_FALSE(mcp_is_error(svc));
+        CHECK(mcp_children_ids(svc) == std::vector<std::string>{cap.c_old_in});
+        CHECK_FALSE(mcp_structured(svc).contains("result_truncated_by_cap"));
+        // Control: unconfined mina's raw set exceeds the cap and says so.
+        auto mina = children_as(r.creds.mcp_mina, cap.parent_cap);
+        REQUIRE_FALSE(mcp_is_error(mina));
+        CHECK(mcp_structured(mina)["result_truncated_by_cap"] == true);
+    }
+
+    SECTION("non-service callers keep today's behaviour") {
+        // mina is unconfined: every child, including the minter's.
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_mina, c.parent_in)) ==
+              OwnerRig::sorted({c.c_in, c.c_minter_out, c.c_minter_pending, c.c_b}));
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_mina, c.parent_minter_out)) ==
+              std::vector<std::string>{c.c_x});
+        // Group-scoped bob (visible a1): his parent is visible by agent evidence, and each child
+        // passes the same owner-or-visible-agent test independently.
+        CHECK(mcp_children_ids(children_as(r.creds.mcp_bob, c.parent_in)) ==
+              std::vector<std::string>{c.c_in});
+        auto dan = children_as(r.creds.mcp_dan, c.parent_in);
+        REQUIRE(dan);
+        CHECK(dan->status == 403);
+        CHECK(dan->body.find(c.c_in) == std::string::npos);
+    }
+
+    SECTION("a denial for a service-scoped credential is audited and names the parent only") {
+        const auto before = ts.audit_log.size();
+        REQUIRE(mcp_is_error(children_as(r.creds.mcp_svc_a, c.parent_minter_out)));
+        std::size_t denied = 0;
+        for (std::size_t i = before; i < ts.audit_log.size(); ++i)
+            if (ts.audit_log[i] == "execution.read|denied")
+                ++denied;
+        CHECK(denied == 1);
+    }
+}
+
+TEST_CASE("MCP execution tools: summarize_working_set kind=execution keys on the owner key",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    // The tool's first gate is a GLOBAL Infrastructure:Read; give group-scoped bob that grant so
+    // the call reaches the execution branch (his Execution:Read stays group-scoped to {a1}).
+    REQUIRE(r.rbac.create_role({"InfraReader5557", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"InfraReader5557", "Infrastructure", "Read", "allow"})
+                .has_value());
+    REQUIRE(r.rbac.assign_role({"user", "bob", "InfraReader5557"}).has_value());
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    auto summarize_as = [&](const std::string& token, const std::string& id) {
+        return mcp_tool_as(ts, token, "summarize_working_set",
+                           R"({"kind":"execution","id":")" + id + R"("})");
+    };
+    // The tool is `denied` for a service-scoped token by its ServiceScopeClass today, so the
+    // conversion is reachable here only for non-service callers. Pin both: a service-scoped
+    // credential never reaches the minter's execution, and a confined non-service owner still
+    // reads his own pending one (the owner disjunct is the key, not a regression).
+    auto svc = summarize_as(r.creds.mcp_svc_a, r.ids.minter_pending);
+    REQUIRE(svc);
+    CHECK(svc->body.find(r.ids.minter_pending + " is running") == std::string::npos);
+    auto bob = summarize_as(r.creds.mcp_bob, r.ids.bob_pending);
+    REQUIRE(bob);
+    CHECK(bob->body.find("is running") != std::string::npos);
+    auto bob_other = summarize_as(r.creds.mcp_bob, r.ids.minter_pending);
+    REQUIRE(bob_other);
+    CHECK(bob_other->body.find("was not found") != std::string::npos);
+}
+
+// The MCP twin of the REST/legacy permit-all cases in test_execution_mutation_owner_key.cpp: the
+// per-tool Execute / Infrastructure permission check is replaced by a permit-all, so the ONLY thing
+// between a service-scoped token and the mutation handlers (and the execution branch of
+// summarize_working_set) is the C8 service-scope default-deny. The handlers also key on
+// `execution_owner_key(*session)`, but that layer sits behind this one and is not separately
+// reachable from a service-scoped session, so a revert of those three conversions is NOT
+// observable here: this pins the outer layer (refused, no mutation port called, tracker unchanged).
+TEST_CASE("MCP execution tools: past a permit-all permission check a service-scoped token is "
+          "still refused by the default-deny on cancel, rerun and summarize",
+          "[pg][mcp][execution][owner_rig][owner_key][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.real_perm_fn_for_test = [](const httplib::Request&, httplib::Response&, const std::string&,
+                                  const std::string&) { return true; };
+    const auto real_ports = yuzu::server::make_tracker_mutation_ports(&r.tracker);
+    int effects = 0;
+    auto ports = real_ports;
+    ports.mark_cancelled = [&](const std::string& id, const std::string& user) {
+        ++effects;
+        return real_ports.mark_cancelled(id, user);
+    };
+    ports.create_rerun = [&](const std::string& id, const std::string& user, bool failed_only) {
+        ++effects;
+        return real_ports.create_rerun(id, user, failed_only);
+    };
+    ts.execution_mutation_ports_for_test = ports;
+    ts.start("readonly");
+
+    const auto before = r.tracker.get_execution(r.ids.minter_pending);
+    REQUIRE(before.has_value());
+    const std::string id_arg = R"({"execution_id":")" + r.ids.minter_pending + R"("})";
+    for (const auto& [tool, args] : std::vector<std::pair<std::string, std::string>>{
+             {"cancel_execution", id_arg},
+             {"record_execution_rerun", id_arg},
+             {"summarize_working_set",
+              R"({"kind":"execution","id":")" + r.ids.minter_pending + R"("})"}}) {
+        INFO(tool);
+        const auto res = mcp_tool_as(ts, r.creds.mcp_svc_a, tool, args);
+        REQUIRE(mcp_is_error(res));
+        CHECK(mcp_error_message(res) == "service-scoped tokens cannot call this tool");
+        CHECK(res->body.find(r.ids.minter_pending + " is running") == std::string::npos);
+    }
+    CHECK(effects == 0); // neither mutation port was called
+    const auto after = r.tracker.get_execution(r.ids.minter_pending);
+    REQUIRE(after.has_value());
+    CHECK(after->status == before->status);
+}
+
+// #5557: a corrupted service-scoped ENGINE credential gets no unrestricted list_executions.
+// Through the real-session seam, so the production admission and the real fleet-read gate decide.
+namespace {
+
+void check_mcp_engine_refusal(bool rbac_on) {
+    yuzu::MetricsRegistry metrics; // before the rig: AuthManager keeps a pointer to it
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ExecutionOwnerRig r{db.dsn()};
+    yuzu::test::OwnerEngineCreds engines{r, metrics};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.start("readonly");
+    yuzu::test::check_engine_fleet_read_scenario(
+        r, engines, rbac_on, [&](const std::string& token) {
+            auto res = mcp_list_executions_as(ts, token);
+            REQUIRE(res);
+            yuzu::test::EngineListResult out{res->status, res->body, {}};
+            if (res->status == 200 && !mcp_is_error(res))
+                out.ids = mcp_list_execution_ids(res);
+            return out;
+        });
+}
+
+} // namespace
+
+TEST_CASE("MCP list_executions: a service-scoped engine row is refused 403, RBAC on",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    check_mcp_engine_refusal(/*rbac_on=*/true);
+}
+
+TEST_CASE("MCP list_executions: a service-scoped engine row is refused 403, RBAC off",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    check_mcp_engine_refusal(/*rbac_on=*/false);
+}
+
+// #5557: the tool's own fail-closed. Both real gates refuse to admit a service-scoped session
+// unrestricted, so this injects the defect they guard against (an admit carrying no scope) and
+// asserts the tool still lists nothing for the service-scoped credential.
+TEST_CASE("MCP list_executions: a service-scoped session admitted without a scope lists nothing",
+          "[pg][mcp][execution][owner_rig][5557]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    McpTestServer ts;
+    r.wire_mcp(ts);
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::nullopt}; // the defect: admitted, unrestricted
+    };
+    ts.start("readonly");
+
+    const auto res = mcp_list_executions_as(ts, r.creds.mcp_svc_a);
+    REQUIRE(res);
+    CHECK(mcp_is_error(res));
+    CHECK(mcp_error_message(res) == "service unavailable");
+    for (const auto& id : r.all_seeded_ids())
+        CHECK(res->body.find(id) == std::string::npos);
+}
+
+// ── #7817 - execute_instruction hands the dispatcher's Execution:Read scope to the bridge ──
+//
+// This case FAKES the gate (`fleet_read_fn_for_test`) so it can drive each arm of the handler's
+// derivation: scoped, refused, unwired, throwing, and admitted-unfiltered. It pins what the
+// handler does with the gate's answer, not the gate. The REAL gate (a real RbacStore, a global
+// Execution:Execute with a management-group-scoped Execution:Read) is driven by the owner-rig
+// case "a REAL RbacStore mixed grant is projected" below.
+TEST_CASE("MCP execute_instruction bridge: a scope-confined dispatcher gets no progress and a count-free final (#7817)",
+          "[pg][mcp][integration][execute][bridge][7817]") {
+    namespace smcp = yuzu::server::mcp;
+    using yuzu::server::authz::FleetReadGate;
+    using yuzu::server::authz::VisibleSet;
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::ExecutionEventBus bus;
+    tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    smcp::McpSessionRegistry sessions{smcp::McpSessionRegistry::Config{}, {}, &metrics};
+    smcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+
+    auto minted = sessions.mint(test_user_binding("operator"));
+    REQUIRE(minted.ok);
+    const auto sid = minted.session_id;
+    auto stream = sessions.stream_for(sid, test_user_binding("operator"));
+    REQUIRE(stream != nullptr);
+
+    const auto exec_body = [](int id) {
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"},"_meta":{"progressToken":"tok-1"}}})";
+    };
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 2, .command_id = "cmd-7817"};
+    };
+    const auto exec_of = [](const std::string& body) {
+        auto j = nlohmann::json::parse(body);
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        return text["execution_id"].get<std::string>();
+    };
+    // One success and one failure: the terminal is "completed" with counts 1 and 1.
+    const auto finish = [&](const std::string& exec_id) {
+        yuzu::server::AgentExecStatus a1;
+        a1.agent_id = "agent-001";
+        a1.status = "success";
+        tracker.update_agent_status(exec_id, a1);
+        yuzu::server::AgentExecStatus a2;
+        a2.agent_id = "agent-002";
+        a2.status = "failure";
+        tracker.update_agent_status(exec_id, a2);
+    };
+    const auto progress_frames = [&] {
+        std::size_t n = 0;
+        for (const auto& f : bridge_ring(*stream, "test-user")) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (j.is_object() && j.value("method", "") == "notifications/progress")
+                ++n;
+        }
+        return n;
+    };
+    const auto wait_phase = [&](int request_id, smcp::McpStreamBridge::Phase want) {
+        return bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(request_id));
+            return p.has_value() && *p == want;
+        });
+    };
+    const auto confined_to_agent_001 = [](const httplib::Request&, httplib::Response&,
+                                          const std::string&, const std::string&) -> FleetReadGate {
+        return {true, VisibleSet{std::unordered_set<std::string>{"agent-001"}}};
+    };
+    const auto unfiltered = [](const httplib::Request&, httplib::Response&, const std::string&,
+                               const std::string&) -> FleetReadGate {
+        return {true, std::nullopt};
+    };
+    // GET-only: dispatch, publish progress, settle the execution, then assert on the settled
+    // state (no bare absence poll). `expect_progress` is the positive control.
+    const auto run_get_only = [&](int request_id, bool expect_progress) {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        auto res = ts.call_raw("POST", exec_body(request_id), {{"Mcp-Session-Id", sid}});
+        REQUIRE(res->status == 200); // the dispatch itself is unaffected
+        const auto exec_id = exec_of(res->body);
+        bus.publish(exec_id, "execution-progress", R"({"agents_responded":1,"agents_targeted":2})");
+        finish(exec_id);
+        REQUIRE(wait_phase(request_id, smcp::McpStreamBridge::Phase::kDone));
+        if (expect_progress)
+            CHECK(progress_frames() > 0);
+        else
+            CHECK(progress_frames() == 0);
+    };
+    // Streamed: the response is released at the end of the inner block, which parks the record
+    // (as the pin-slot tests above rely on); the agents answer only afterwards. Returns the
+    // pinned final's result object.
+    const auto run_streamed = [&](int request_id) {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        {
+            auto res = ts.call_raw("POST", exec_body(request_id),
+                                   {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
+            REQUIRE(res->status == 200);
+        }
+        REQUIRE(wait_phase(request_id, smcp::McpStreamBridge::Phase::kRingOnly));
+        const auto rows = tracker.query_executions({});
+        REQUIRE(!rows.empty());
+        const std::string exec_id = rows.front().id;
+        finish(exec_id);
+        REQUIRE(bridge_poll([&] { return stream->pinned_count() == 1; }));
+        std::optional<nlohmann::json> result;
+        for (const auto& f : bridge_ring(*stream, "test-user")) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (j.is_object() && j.contains("result"))
+                result = j["result"];
+        }
+        REQUIRE(result.has_value());
+        CHECK((*result)["execution_id"] == exec_id);
+        return *result;
+    };
+    const auto check_count_free = [](const nlohmann::json& result) {
+        CHECK(result["status"] == "completed");
+        CHECK_FALSE(result.contains("agents_success"));
+        CHECK_FALSE(result.contains("agents_failure"));
+        CHECK_FALSE(result.contains("agents_responded"));
+    };
+
+    SECTION("GET-only: an admitted, scoped gate - no progress frame, the record still settles") {
+        // Recorded on the httplib worker thread and asserted here on the main thread.
+        std::mutex asked_mu;
+        std::vector<std::pair<std::string, std::string>> asked;
+        ts.fleet_read_fn_for_test = [&](const httplib::Request& rq, httplib::Response& rs,
+                                        const std::string& type,
+                                        const std::string& op) -> FleetReadGate {
+            {
+                std::lock_guard<std::mutex> lk(asked_mu);
+                asked.emplace_back(type, op);
+            }
+            return confined_to_agent_001(rq, rs, type, op);
+        };
+        run_get_only(7817, /*expect_progress=*/false);
+        std::lock_guard<std::mutex> lk(asked_mu);
+        REQUIRE(asked.size() >= 1);
+        CHECK(std::find(asked.begin(), asked.end(),
+                        std::pair<std::string, std::string>{"Execution", "Read"}) != asked.end());
+    }
+
+    SECTION("GET-only: a gate that refuses fails CLOSED, never unrestricted") {
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            return {false, std::nullopt};
+        };
+        run_get_only(7818, false);
+    }
+
+    SECTION("GET-only: an unwired gate fails CLOSED, never unrestricted") {
+        ts.fleet_read_fn_for_test = {};
+        run_get_only(7820, false);
+    }
+
+    SECTION("GET-only: a gate that THROWS fails CLOSED and the dispatch still answers 200") {
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            throw std::runtime_error("rbac read failed");
+        };
+        run_get_only(7821, false);
+    }
+
+    SECTION("GET-only positive control: an admitted, UNFILTERED gate still gets progress") {
+        ts.fleet_read_fn_for_test = unfiltered;
+        run_get_only(7822, /*expect_progress=*/true);
+    }
+
+    SECTION("streamed: a scoped gate - the pinned final has the real status and no counts") {
+        ts.fleet_read_fn_for_test = confined_to_agent_001;
+        const auto result = run_streamed(7819);
+        check_count_free(result);
+        CHECK(progress_frames() == 0);
+    }
+
+    SECTION("streamed: a gate that THROWS - the pinned final is count-free too") {
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                       const std::string&, const std::string&) -> FleetReadGate {
+            throw std::runtime_error("rbac read failed");
+        };
+        check_count_free(run_streamed(7823));
+        CHECK(progress_frames() == 0);
+    }
+
+    SECTION("streamed positive control: an UNFILTERED gate's final carries the counts") {
+        ts.fleet_read_fn_for_test = unfiltered;
+        const auto result = run_streamed(7824);
+        CHECK(result["status"] == "completed");
+        CHECK(result["agents_success"] == 1);
+        CHECK(result["agents_failure"] == 1);
+    }
+}
+
+// ── #7817 - the same scenario through a REAL RbacStore and the REAL require_fleet_read ──
+//
+// The ExecutionOwnerRig wires one production-shaped AuthRoutes (real RbacStore, management-group
+// store, API-token store and AuditStore) as the session source for authentication, permission
+// and fleet-read, so nothing about the gate is faked here. Three principals, each holding a
+// GLOBAL Execution:Execute grant:
+//   bob   Execution:Read only through a management group holding {a1}  (the #7817 case)
+//   mina  GLOBAL Execution:Read                                        (control: unchanged)
+//   dan   no Execution:Read at all                                     (deny-all, one denial row)
+// What stays faked: the dispatch callback (it returns `sent = 2` without reaching an agent) and
+// the agents' answers, which the test writes into the real tracker itself.
+TEST_CASE("MCP execute_instruction bridge: a REAL RbacStore mixed grant is projected, an unrestricted Read is not (#7817)",
+          "[pg][mcp][integration][execute][bridge][7817][owner_rig]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    OwnerRig r{db.dsn()};
+    REQUIRE(r.rbac.create_role({"Executor7817", "", false, 0}).has_value());
+    REQUIRE(r.rbac.set_permission({"Executor7817", "Execution", "Execute", "allow"}).has_value());
+    for (const char* user : {"bob", "mina", "dan"})
+        REQUIRE(r.rbac.assign_role({"user", user, "Executor7817"}).has_value());
+
+    yuzu::server::ExecutionEventBus bus;
+    r.tracker.set_event_bus(&bus);
+    yuzu::MetricsRegistry metrics;
+    mcp::McpSessionRegistry sessions{mcp::McpSessionRegistry::Config{}, {}, &metrics};
+    mcp::McpStreamBridge bridge{&bus, &sessions, &metrics};
+    yuzu::server::detail::StreamBudget budget{
+        yuzu::server::detail::StreamBudget::Config{.global_cap = 8}};
+
+    McpTestServer ts;
+    r.wire_mcp(ts); // the real auth, permission and fleet-read hooks, and the rig's tracker
+    ts.session_registry_for_test = &sessions;
+    ts.metrics_for_test = &metrics;
+    ts.stream_budget_for_test = &budget;
+    ts.start_with_dispatch(
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-7817-real"};
+        },
+        "operator");
+    ts.mcp.set_stream_bridge(&bridge);
+
+    const auto bob_tok = r.mint("bob", {}, "operator");
+    const auto mina_tok = r.mint("mina", {}, "operator");
+    const auto dan_tok = r.mint("dan", {}, "operator");
+
+    // What the REAL gate resolves for each, before any dispatch: the scenario is what it claims.
+    {
+        const auto bob = r.fleet_scope(OwnerRig::bearer(bob_tok));
+        REQUIRE(bob.admitted);
+        REQUIRE(bob.agents.has_value());
+        CHECK(*bob.agents == std::vector<std::string>{"a1"});
+        const auto mina = r.fleet_scope(OwnerRig::bearer(mina_tok));
+        REQUIRE(mina.admitted);
+        CHECK_FALSE(mina.agents.has_value()); // unfiltered
+        const auto dan = r.fleet_scope(OwnerRig::bearer(dan_tok));
+        CHECK_FALSE(dan.admitted);
+        CHECK(dan.status == 403);
+    }
+    // The probe above wrote dan's denial row; the dispatch below must add exactly one more.
+    const auto denial_rows_before = r.audit("auth.fleet_read_required").size();
+
+    struct SessionHandle {
+        std::string sid;
+        std::shared_ptr<mcp::McpStreamState> stream;
+        std::string principal;
+    };
+    const auto session_for = [&](const std::string& token) {
+        auto sess = r.session_of_token(token);
+        REQUIRE(sess.has_value());
+        auto binding = mcp::binding_for(*sess);
+        auto minted = sessions.mint(binding);
+        REQUIRE(minted.ok);
+        auto stream = sessions.stream_for(minted.session_id, binding);
+        REQUIRE(stream != nullptr);
+        return SessionHandle{minted.session_id, std::move(stream), binding.principal};
+    };
+    const auto exec_body = [](int id) {
+        return std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":)") +
+               std::to_string(id) +
+               R"(,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"},"_meta":{"progressToken":"tok-1"}}})";
+    };
+    const auto exec_of = [](const std::string& body) {
+        auto j = nlohmann::json::parse(body);
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        return text["execution_id"].get<std::string>();
+    };
+    // One success and one failure answer: the terminal is "completed" with counts 1 and 1.
+    const auto finish = [&](const std::string& exec_id) {
+        yuzu::server::AgentExecStatus a1;
+        a1.agent_id = "agent-001";
+        a1.status = "success";
+        r.tracker.update_agent_status(exec_id, a1);
+        yuzu::server::AgentExecStatus a2;
+        a2.agent_id = "agent-002";
+        a2.status = "failure";
+        r.tracker.update_agent_status(exec_id, a2);
+    };
+    struct Outcome {
+        int http_status{0};
+        std::size_t progress_frames{0};
+        std::optional<nlohmann::json> final_result; // streamed only
+    };
+    // GET-only: progress rides the session GET ring; there is no final frame.
+    const auto run_get_only = [&](const std::string& token, int request_id) {
+        const auto h = session_for(token);
+        const auto& sid = h.sid;
+        const auto& stream = h.stream;
+        const auto& principal = h.principal;
+        auto res = ts.call_raw("POST", exec_body(request_id),
+                               {{"Mcp-Session-Id", sid}, {"Authorization", "Bearer " + token}});
+        Outcome out;
+        out.http_status = res->status;
+        REQUIRE(res->status == 200);
+        const auto exec_id = exec_of(res->body);
+        bus.publish(exec_id, "execution-progress", R"({"agents_responded":1,"agents_targeted":2})");
+        finish(exec_id);
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(request_id));
+            return p.has_value() && *p == mcp::McpStreamBridge::Phase::kDone;
+        }));
+        for (const auto& f : bridge_ring(*stream, principal)) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (j.is_object() && j.value("method", "") == "notifications/progress")
+                ++out.progress_frames;
+        }
+        return out;
+    };
+    // Streamed: the response closes (parking the record), the agents answer, the final is pinned.
+    const auto run_streamed = [&](const std::string& token, int request_id) {
+        const auto h = session_for(token);
+        const auto& sid = h.sid;
+        const auto& stream = h.stream;
+        const auto& principal = h.principal;
+        Outcome out;
+        std::string exec_id;
+        // The rig seeds executions dispatched by bob and mina, so find THIS call's execution as
+        // the one that was not there before it.
+        std::unordered_set<std::string> before;
+        for (const auto& e : r.tracker.query_executions({}))
+            before.insert(e.id);
+        {
+            auto res = ts.call_raw("POST", exec_body(request_id),
+                                   {{"Mcp-Session-Id", sid},
+                                    {"Authorization", "Bearer " + token},
+                                    {"Accept", "text/event-stream"}});
+            out.http_status = res->status;
+            REQUIRE(res->status == 200);
+        }
+        REQUIRE(bridge_poll([&] {
+            auto p = bridge.phase_for(sid, nlohmann::json(request_id));
+            return p.has_value() && *p == mcp::McpStreamBridge::Phase::kRingOnly;
+        }));
+        for (const auto& e : r.tracker.query_executions({}))
+            if (!before.contains(e.id))
+                exec_id = e.id;
+        REQUIRE(!exec_id.empty());
+        finish(exec_id);
+        REQUIRE(bridge_poll([&] { return stream->pinned_count() == 1; }));
+        for (const auto& f : bridge_ring(*stream, principal)) {
+            auto j = nlohmann::json::parse(f.data, nullptr, false);
+            if (!j.is_object())
+                continue;
+            if (j.value("method", "") == "notifications/progress")
+                ++out.progress_frames;
+            if (j.contains("result"))
+                out.final_result = j["result"];
+        }
+        return out;
+    };
+    const auto check_count_free = [](const Outcome& o) {
+        CHECK(o.progress_frames == 0);
+        REQUIRE(o.final_result.has_value());
+        CHECK((*o.final_result)["status"] == "completed");
+        CHECK_FALSE(o.final_result->contains("agents_success"));
+        CHECK_FALSE(o.final_result->contains("agents_failure"));
+        CHECK_FALSE(o.final_result->contains("agents_responded"));
+    };
+
+    SECTION("GET-only: global Execute + scoped Read gets no progress frame") {
+        const auto o = run_get_only(bob_tok, 7001);
+        CHECK(o.progress_frames == 0);
+    }
+    SECTION("streamed: global Execute + scoped Read gets a count-free final and no progress") {
+        check_count_free(run_streamed(bob_tok, 7002));
+    }
+    SECTION("GET-only control: a GLOBAL Execution:Read gets its progress frames") {
+        const auto o = run_get_only(mina_tok, 7003);
+        CHECK(o.progress_frames > 0);
+    }
+    SECTION("streamed control: a GLOBAL Execution:Read's final carries the counts") {
+        const auto o = run_streamed(mina_tok, 7004);
+        CHECK(o.progress_frames > 0);
+        REQUIRE(o.final_result.has_value());
+        CHECK((*o.final_result)["status"] == "completed");
+        CHECK((*o.final_result)["agents_success"] == 1);
+        CHECK((*o.final_result)["agents_failure"] == 1);
+    }
+    SECTION("Execute without any Read: deny-all projection, dispatch still 200, one denial row") {
+        const auto o = run_streamed(dan_tok, 7005);
+        CHECK(o.http_status == 200);
+        check_count_free(o);
+        const auto rows = r.audit("auth.fleet_read_required");
+        CHECK(rows.size() == denial_rows_before + 1);
+        CHECK(rows.back().rfind("denied|", 0) == 0);
     }
 }
 

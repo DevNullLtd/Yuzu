@@ -13,6 +13,10 @@ name: Docs Lint
 # a digest-pinned Prometheus image from Docker Hub and a hash-pinned PyYAML from
 # PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
 # `cbom-schema` reaches one too, a hash-pinned jsonschema from PyPI.
+# `execution-owner-key-selftest` is split off for run time, not for a registry: its
+# half minute of CPU must not eat into the required check's budget. It is advisory (only
+# "CHANGELOG order" is required here, and the owner may add it to branch protection); the
+# same self-test also gates through the meson `docs` suite on the required Linux leg.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -99,6 +103,17 @@ jobs:
 
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
+
+      # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey, never a
+      # service-scoped session's username, and neither list gate hands a service-scoped session
+      # unrestricted authority. Best-effort lexical (not a control-flow proof): the dispatched_by
+      # uses, scope constructions, scope arguments, predicate calls, mutation requests, raw-username
+      # guards and gate refusals are frozen exact sets. Its self-test, which mutates the sources in
+      # memory and proves every mutation is caught, runs in the separate `execution-owner-key-selftest`
+      # job below: it costs about half a minute of CPU, and this job is the required check with a
+      # five minute budget.
+      - name: Execution owner key tripwire (#5557)
+        run: python3 -I tests/test_execution_owner_key_tripwire.py
 
       # The one set_known_plugins(...) line in server.cpp bounds the yuzu_fleet_plugin_init_failed
       # label; no unit test builds ServerImpl, so dropping it leaves every test green.
@@ -438,6 +453,25 @@ jobs:
         env:
           YUZU_REQUIRE_JSONSCHEMA: "1"
         run: python3 tests/test_cbom_schema.py
+
+  # #5557: the self-test of the execution owner key tripwire that `changelog-order` runs. It mutates
+  # the server sources in memory and proves each mutation is caught. ITS OWN JOB, deliberately,
+  # for a different reason than the three above: it needs no registry, but it costs about half a
+  # minute of CPU (more on a hosted runner), which does not belong in the required "CHANGELOG
+  # order" check's five minute budget. Stdlib only, no build, no checkout history. The tripwire
+  # itself stays in `changelog-order`, where it is cheap. Also registered in tests/meson.build
+  # for local `meson test --suite docs` parity.
+  execution-owner-key-selftest:
+    name: Execution owner key tripwire self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Execution owner key tripwire self-test (#5557)
+        run: python3 -I tests/test_execution_owner_key_tripwire_selftest.py
 
   # Definition-description lint: shipped definitions (content/definitions and
   # content/packs, as embed_content.py walks them) must carry
