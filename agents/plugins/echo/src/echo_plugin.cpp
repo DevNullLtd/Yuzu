@@ -4167,57 +4167,77 @@ private:
         }
 
         // ── Phase 2: persist (every parameter above is already validated) ────
-        if (budget_bytes) {
-            // The only checked write, so it goes FIRST: this control gates deletes, a value that
-            // did not persist must not be reported as applied, and its failure must leave nothing
-            // else half-applied.
-            if (!db_->set_config(std::string{yuzu::echo::kDbBudgetKey},
-                                 std::to_string(*budget_bytes))) {
-                ctx.write_output("error|db_budget_bytes could not be saved");
-                return 1;
-            }
-            ctx.write_output(std::format("config|db_budget_bytes|{}", *budget_bytes));
+        // Every write below is checked (#2155). `applied` is the keys that persisted, in order:
+        // exit code and status agree, non-zero = at least one requested change did not persist,
+        // PARTIAL = some did. Nothing applied is the flat error alone.
+        std::vector<std::string> applied;
+        const auto persist = [&](const std::string& key, const std::string& value) {
+            if (!db_->set_config(key, value))
+                return false;
+            applied.push_back(key);
             changed = true;
+            return true;
+        };
+        const auto fail = [&](const std::string& error_line) {
+            if (!applied.empty()) {
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "echo:configure_partial_commit");
+                ctx.write_output(yuzu::echo::format_configure_partial(applied));
+            }
+            ctx.write_output(error_line);
+            return 1;
+        };
+        const auto key_failed = [&](const std::string& key) {
+            return fail(std::format("error|{} could not be saved", key));
+        };
+        if (budget_bytes) {
+            // The budget goes FIRST: this control gates deletes, a value that did not persist
+            // must not be reported as applied, and its failure must leave nothing else
+            // half-applied.
+            if (!persist(std::string{yuzu::echo::kDbBudgetKey}, std::to_string(*budget_bytes)))
+                return key_failed(std::string{yuzu::echo::kDbBudgetKey});
+            ctx.write_output(std::format("config|db_budget_bytes|{}", *budget_bytes));
         }
         if (fast_secs > 0) {
-            db_->set_config("fast_interval_seconds", std::string{fast_interval});
+            if (!persist("fast_interval_seconds", std::string{fast_interval}))
+                return key_failed("fast_interval_seconds");
             ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
-            changed = true;
         }
         if (slow_secs > 0) {
-            db_->set_config("slow_interval_seconds", std::string{slow_interval});
+            if (!persist("slow_interval_seconds", std::string{slow_interval}))
+                return key_failed("slow_interval_seconds");
             ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
-            changed = true;
         }
         if (software_provided) {
-            db_->set_config("software_interval_seconds", std::to_string(software_secs));
+            if (!persist("software_interval_seconds", std::to_string(software_secs)))
+                return key_failed("software_interval_seconds");
             ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
-            changed = true;
         }
         if (netconn_lookback_provided) {
             // Persist the CLAMPED value so the stored config and the echo agree
             // with what the collect legs will actually read (nq_clamp_lookback is
             // applied again on read, defensively). 0 => forward-only.
-            db_->set_config("netconn_lookback_seconds", std::to_string(netconn_lookback_secs));
+            if (!persist("netconn_lookback_seconds", std::to_string(netconn_lookback_secs)))
+                return key_failed("netconn_lookback_seconds");
             ctx.write_output(
                 std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
-            changed = true;
         }
         if (power_lookback_provided) {
-            db_->set_config("power_lookback_seconds", std::to_string(power_lookback_secs));
+            if (!persist("power_lookback_seconds", std::to_string(power_lookback_secs)))
+                return key_failed("power_lookback_seconds");
             ctx.write_output(std::format("config|power_lookback_seconds|{}", power_lookback_secs));
-            changed = true;
         }
         if (removable_lookback_provided) {
-            db_->set_config("removable_lookback_seconds", std::to_string(removable_lookback_secs));
+            if (!persist("removable_lookback_seconds", std::to_string(removable_lookback_secs)))
+                return key_failed("removable_lookback_seconds");
             ctx.write_output(
                 std::format("config|removable_lookback_seconds|{}", removable_lookback_secs));
-            changed = true;
         }
         if (have_redaction) {
-            db_->set_config("redaction_patterns", std::string{redaction});
+            if (!persist("redaction_patterns", std::string{redaction}))
+                return key_failed("redaction_patterns");
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
-            changed = true;
         }
         for (const auto& [src_name, v] : source_toggles) {
             bool transition_ok;
@@ -4380,12 +4400,12 @@ private:
                 // is one transaction, so a failure leaves the source in its previous
                 // state. This is an apply-time I/O failure (a busy DB), not a
                 // validation failure -- Phase 1 already validated every parameter.
-                ctx.write_output(std::format(
+                return fail(std::format(
                     "error|{}_enabled transition failed: could not persist (database busy); "
                     "source left in its previous state",
                     src_name));
-                return 1;
             }
+            applied.push_back(src_name + "_enabled");
             ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
             // Consent clarity (#1831 review): enabling procperf does more than
             // collect on-device — the top-N per-app names + versions feed the
@@ -4416,14 +4436,14 @@ private:
                                 "implemented; collector will continue polling",
                                 net_method));
             }
-            db_->set_config("network_capture_method", net_method);
+            if (!persist("network_capture_method", net_method))
+                return key_failed("network_capture_method");
             ctx.write_output(std::format("config|network_capture_method|{}", net_method));
-            changed = true;
         }
         if (have_excl) {
-            db_->set_config("process_stabilization_exclusions", std::string{excl_param});
+            if (!persist("process_stabilization_exclusions", std::string{excl_param}))
+                return key_failed("process_stabilization_exclusions");
             ctx.write_output(std::format("config|process_stabilization_exclusions|{}", excl_param));
-            changed = true;
         }
 
         // Phase 1 returns early on any invalid parameter, so reaching here with

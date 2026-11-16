@@ -16,6 +16,8 @@
 
 #include <yuzu/agent/echo_db_legacy_rename.hpp> // tar.db -> echo.db adoption
 
+#include <sqlite_quarantine.hpp> // prune_old_quarantines: the quarantine bound (#2155)
+
 #include <sqlite3.h> // raw handle for the reopen-after-DROP upgrade simulation
 
 #include <catch2/catch_test_macros.hpp>
@@ -4168,6 +4170,164 @@ TEST_CASE("EchoDatabase: a genuinely corrupt echo.db is still quarantined and it
     sqlite3_busy_timeout(o.db, 0);
     CHECK(sqlite3_exec(o.db, "BEGIN EXCLUSIVE", nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_exec(o.db, "ROLLBACK", nullptr, nullptr, nullptr);
+}
+
+// #2155. Repeated corruption must not fill the volume: after a quarantine only the newest three
+// `echo.db.corrupt-*` groups stay. The groups below are seeded with epochs far older than "now",
+// so the one this open creates is the newest.
+TEST_CASE("quarantine: a fourth corrupt database leaves the newest three groups (#2155)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qbound_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    for (const char* sfx : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    for (const char* epoch : {"100", "200", "300"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "old evidence");
+    spit_file(db, "this is not a SQLite database -- fourth corruption");
+
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+
+    auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    std::sort(names.begin(), names.end());
+    auto expected = std::vector<std::string>{
+        "echo.db.corrupt-200", "echo.db.corrupt-300",
+        "echo.db.corrupt-" + std::to_string(*reopened->quarantined_this_open())};
+    std::sort(expected.begin(), expected.end());
+    CHECK(names == expected); // the oldest seeded group (100) went; the new one stayed
+}
+
+TEST_CASE("quarantine: the group just created is never removed even when its name sorts oldest (#2155)",
+          "[echo][store][corruption]") {
+    // A backward clock step makes the new group's epoch the smallest: ordered by name alone it
+    // would be the first candidate, and the prune would delete the evidence it was just handed.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qclock_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"1", "500", "600", "700"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-1", 3);
+
+    CHECK(pruned.notes.empty());
+    auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    std::sort(names.begin(), names.end());
+    // 4 groups, keep 3: the oldest NON-protected group (500) goes, never the protected "1".
+    CHECK(names == std::vector<std::string>{"echo.db.corrupt-1", "echo.db.corrupt-600",
+                                            "echo.db.corrupt-700"});
+}
+
+TEST_CASE("quarantine: a group's sidecars are removed with it (#2155)", "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qside_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"}) {
+        for (const char* sfx : {"", "-wal", "-shm", "-journal"})
+            spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch + sfx), "evidence");
+    }
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 4); // the main file and its three sidecars
+    CHECK(pruned.notes.empty());
+    const auto names = names_with_prefix(dir.path, "echo.db.corrupt-");
+    CHECK(names.size() == 12); // three groups of four remain, none partial
+    CHECK(std::none_of(names.begin(), names.end(), [](const std::string& n) {
+        return n.starts_with("echo.db.corrupt-10");
+    }));
+}
+
+TEST_CASE("quarantine: planted files and look-alike names are never touched (#2155)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qlook_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    const std::vector<std::string> untouched = {
+        "echo.db.planted-5",        // a different recovery's evidence
+        "echo.db.corrupt-",         // no digits
+        "echo.db.corrupt-5x",       // trailing junk
+        "echo.db.corrupt--5",       // a sign
+        "echo.db.corrupt-5-bak",    // not a sidecar suffix
+        "echo.db.corrupt-1-2-3",    // a third number
+        "other.db.corrupt-5",       // another database's quarantine
+        "echo.db",                  // the live database
+        "echo.db-wal",
+    };
+    for (const auto& n : untouched)
+        spit_file(dir.path / n, "not ours");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 1);
+    for (const auto& n : untouched) {
+        INFO(n);
+        CHECK(fs::exists(dir.path / n));
+        CHECK(slurp_file(dir.path / n) == "not ours");
+    }
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10"));
+}
+
+TEST_CASE("quarantine: a group with one file that cannot be removed loses its other files and the stuck file is reported and left (#2155)",
+          "[echo][store][corruption]") {
+    // A non-empty directory under a quarantine name cannot be removed by std::filesystem::remove,
+    // on any platform: the stand-in for a file another process holds open.
+    yuzu::test::TempDir dir{"yuzu_test_echo_qstuck_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"10", "20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    spit_file(dir.path / "echo.db.corrupt-10-wal", "evidence");
+    const auto stuck = dir.path / "echo.db.corrupt-10-shm";
+    REQUIRE(fs::create_directories(stuck));
+    spit_file(stuck / "inside", "held");
+
+    const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+
+    CHECK(pruned.removed.size() == 2); // the main file and the -wal went
+    REQUIRE(pruned.notes.size() == 1);
+    CHECK(pruned.notes[0].find(stuck.string()) != std::string::npos);
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10"));
+    CHECK_FALSE(fs::exists(dir.path / "echo.db.corrupt-10-wal"));
+    CHECK(fs::exists(stuck)); // reported and left
+    for (const char* epoch : {"20", "30", "40"})
+        CHECK(fs::exists(dir.path / (std::string{"echo.db.corrupt-"} + epoch)));
+}
+
+TEST_CASE("quarantine: a stuck file left by an earlier prune is counted as a group and removed by a later one (#2155)",
+          "[echo][store][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_qretry_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    for (const char* epoch : {"20", "30", "40"})
+        spit_file(dir.path / (std::string{"echo.db.corrupt-"} + epoch), "evidence");
+    // What an earlier prune left: group 10 reduced to the one file that could not be removed.
+    const auto stuck = dir.path / "echo.db.corrupt-10-shm";
+    REQUIRE(fs::create_directories(stuck));
+    spit_file(stuck / "inside", "held");
+
+    // Still held: it counts as a fourth group, is tried, is reported, and stays.
+    auto first = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+    CHECK(first.removed.empty());
+    CHECK(first.notes.size() == 1);
+    CHECK(fs::exists(stuck));
+
+    // Released: the next prune removes it.
+    fs::remove(stuck / "inside");
+    auto second = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+        db, dir.path / "echo.db.corrupt-40", 3);
+    CHECK(second.notes.empty());
+    CHECK(second.removed.size() == 1);
+    CHECK_FALSE(fs::exists(stuck));
 }
 
 // #1527. A link at the database path (or a sidecar) is refused before anything is opened, moved or

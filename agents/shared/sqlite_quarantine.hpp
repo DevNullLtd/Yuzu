@@ -61,13 +61,17 @@
 /// and skipping the change would leave that evidence at its live mode.
 ///
 /// Names have the exact form `<file><suffix><epoch>[-<n>]` (suffix `.corrupt-` or `.planted-`),
-/// which the dedup store's prune parser relies on.
+/// which `parse_quarantine_name` / `prune_old_quarantines` (below) rely on.
 
+#include <charconv>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -415,6 +419,114 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
                                                "remain beside the fresh database",
                                                side.string(), rm.message()));
         }
+    }
+    return result;
+}
+
+/// All of `s` is ASCII digits and fits a long long. `from_chars` alone is NOT enough: it accepts a
+/// leading '-' (so "-0" would pass a `< 0` check).
+inline bool parse_digits(std::string_view s, long long& out) {
+    if (s.empty())
+        return false;
+    for (char c : s) {
+        if (c < '0' || c > '9')
+            return false;
+    }
+    const char* last = s.data() + s.size();
+    auto r = std::from_chars(s.data(), last, out);
+    return r.ec == std::errc{} && r.ptr == last;
+}
+
+/// `<stem><epoch>[-<n>]` with an optional -wal/-shm/-journal suffix -> (epoch, n); `stem` is
+/// `<db filename>.corrupt-`. Digits only: no sign, no '+', no whitespace, no overflow. Leading
+/// zeros are accepted and fold into the canonical key.
+inline std::optional<std::pair<long long, long long>> parse_quarantine_name(std::string_view stem,
+                                                                           std::string_view name) {
+    if (!name.starts_with(stem))
+        return std::nullopt;
+    name.remove_prefix(stem.size());
+    for (std::string_view sfx : kSidecars) {
+        if (name.ends_with(sfx)) {
+            name.remove_suffix(sfx.size());
+            break;
+        }
+    }
+    long long epoch = 0;
+    long long n = 0;
+    const auto dash = name.find('-');
+    if (dash == std::string_view::npos)
+        return parse_digits(name, epoch) ? std::optional{std::pair{epoch, 0LL}} : std::nullopt;
+    if (!parse_digits(name.substr(0, dash), epoch) || !parse_digits(name.substr(dash + 1), n))
+        return std::nullopt;
+    return std::pair{epoch, n};
+}
+
+/// What `prune_old_quarantines` did, for the caller to log: the files it removed, and a note for
+/// every problem (an unlistable directory, a file that could not be removed, an exception).
+struct PruneResult {
+    std::vector<std::filesystem::path> removed;
+    std::vector<std::string> notes;
+};
+
+/// Keep only the newest `keep` quarantined groups of `db_path` (`<db filename>.corrupt-<epoch>[-n]`
+/// plus sidecars) in the database's own directory. COUNT-based, not a wall-clock cutoff. Groups are
+/// ordered by the (epoch, n) parsed from the NAME, which a backward clock step can mis-order, so
+/// `just_created` (the file this very recovery made) is never a candidate. Only names of the exact
+/// form `<db filename>.corrupt-<digits>[-<digits>][-wal|-shm|-journal]` are touched (`.planted-`
+/// files and look-alikes are not). Best effort and NEVER throws: removal is per file, so a file
+/// that cannot be removed is a note and stays while the group's other files are still removed (a
+/// group can be left partial; the stuck file still parses as its group, so the next recovery
+/// counts it and tries again). An unlistable directory deletes nothing.
+inline PruneResult prune_old_quarantines(const std::filesystem::path& db_path,
+                                         const std::filesystem::path& just_created,
+                                         std::size_t keep) noexcept {
+    PruneResult result;
+    try {
+        const std::string stem = db_path.filename().string() + ".corrupt-";
+        const auto keep_key = parse_quarantine_name(stem, just_created.filename().string());
+        auto dir = db_path.parent_path();
+        if (dir.empty())
+            dir = ".";
+
+        std::map<std::pair<long long, long long>, std::vector<std::filesystem::path>> groups;
+        std::error_code ec;
+        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            if (auto key = parse_quarantine_name(stem, it->path().filename().string()))
+                groups[*key].push_back(it->path());
+        }
+        if (ec) {
+            result.notes.push_back(std::format(
+                "could not list {} to prune old quarantined databases: {}", dir.string(),
+                ec.message()));
+            return result;
+        }
+        if (groups.size() <= keep)
+            return result;
+        std::size_t excess = groups.size() - keep;
+        for (const auto& [key, files] : groups) { // ascending: oldest name first
+            if (excess == 0)
+                break;
+            if (keep_key && key == *keep_key)
+                continue;
+            for (const auto& f : files) {
+                std::error_code rec;
+                std::filesystem::remove(f, rec);
+                if (rec) {
+                    result.notes.push_back(std::format(
+                        "could not remove old quarantined database {}: {}", f.string(),
+                        rec.message()));
+                } else {
+                    result.removed.push_back(f);
+                }
+            }
+            --excess;
+        }
+    } catch (const std::exception& e) {
+        result.notes.push_back(
+            std::format("pruning old quarantined databases stopped early: {}", e.what()));
+    } catch (...) {
+        result.notes.push_back("pruning old quarantined databases stopped early");
     }
     return result;
 }

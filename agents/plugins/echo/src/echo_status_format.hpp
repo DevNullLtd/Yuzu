@@ -19,6 +19,7 @@
  * exists to let a test assert. See `echo.yaml` and `docs/user-manual/echo.md`.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -83,6 +84,22 @@ inline constexpr std::string_view kFreeSpaceRefusalPrefix = "not enough free dis
                                                        int64_t last_epoch) {
     return std::string{"db_health|"} + (quarantined_this_open ? "quarantined|" : "ok|") +
            std::to_string(last_epoch);
+}
+
+/// `partial|applied|<k1,k2,...>` (#2155): the line `echo.configure` writes, ahead of its error
+/// line, when a write failed AFTER some earlier ones persisted. Keys are the config keys that did
+/// persist, in the order they were written. Empty (no line at all) when nothing persisted: that
+/// reply is the flat error alone, never a "partial" one.
+[[nodiscard]] inline std::string format_configure_partial(const std::vector<std::string>& applied) {
+    if (applied.empty())
+        return {};
+    std::string line = "partial|applied|";
+    for (std::size_t i = 0; i < applied.size(); ++i) {
+        if (i != 0)
+            line += ',';
+        line += applied[i];
+    }
+    return line;
 }
 
 } // namespace yuzu::echo
