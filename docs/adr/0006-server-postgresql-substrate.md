@@ -5,9 +5,16 @@ owner: Nathan Dornbrook (platform)
 deciders: Nathan Dornbrook (decision); @fjarvis + FortitudeEtc (requested a standalone server DB); @lesault (indifferent)
 scope: platform — every server-side store; supersedes the "SQLite for embedded storage" principle on the server only
 generalises: ADR-0004 (which introduced server Postgres for the vuln-graph derived state — now the first instance of this mandate)
+related: 0035-server-is-linux-only-windows-is-agent-only (the server is now single-OS as well as single-backend)
 ---
 
 # 0006 — PostgreSQL is the server-side storage substrate; SQLite-everywhere is retired for the server
+
+> **Update (2026-11-14, against dev @ 2c49b4ea0).** Every server store is now Postgres-native except
+> `nvd_db` (`server/core/src/nvd_db.cpp`), the one residual server SQLite store; ADR-2002 withdraws
+> it from the HA list and ADR-1005 moves it to a use-case engine. The other SQLite opens left in
+> `server/core/src` are read-only legacy-file probes. Since ADR-0035 (accepted 2026-11-10) the
+> server is also Linux-only.
 
 ## Context
 

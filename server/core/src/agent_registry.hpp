@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -30,6 +31,7 @@
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
+#include "dex_types.hpp" // DexObserverState (pure enum)
 #include "dispatch_denial.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
@@ -941,6 +943,14 @@ public:
     // wired), this is byte-identical to the pre-WS-5 local-only behavior.
     std::vector<std::string> all_ids() const;
 
+    // The ids of the sessions held ON THIS REPLICA only, under the same lock all_ids() takes, and
+    // with NO presence read at all: nothing here can fail, be truncated or hit Postgres. The
+    // Hardware list uses it for the part of "online" the database cannot know (a session whose
+    // row has not recorded a session id yet) and takes the rest of "online" from the roster read
+    // itself (#7566), so a failed or truncated presence read can no longer turn connected devices
+    // into Offline. Everything that must see other replicas' agents keeps using all_ids().
+    [[nodiscard]] std::vector<std::string> local_ids() const;
+
     // Count of `all_ids()` (local sessions UNION cached durable presence)
     // without materialising the id list. Unlike `all_ids()`, a degraded
     // presence read is a typed `std::unexpected` — never a silently
@@ -1416,6 +1426,11 @@ static_assert(kGuardianBackendPause >= std::chrono::microseconds{1} &&
               "the pause must be real (it is what lets ingest in) and must stay small (it is paid "
               "once per slice on the request thread)");
 
+/// The heartbeat tag the agent's DEX crash and hang observer reports ("1" armed, "0" disarmed).
+/// Emitted on Windows, Linux and macOS agents with the observer enabled; absent otherwise. The
+/// fleet gauge and `AgentHealthStore::dex_observer_for` read this one constant.
+inline constexpr std::string_view kDexObserverArmedTag = "yuzu.dex_observer_armed";
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
@@ -1446,6 +1461,15 @@ public:
         std::function<void(const std::string& agent_id, int64_t corruption_total,
                            const std::string& quarantine_last)>;
     void set_corruption_sink(CorruptionSink sink);
+
+    /// Bounds the `plugin` label of `yuzu_fleet_plugin_init_failed` to these names (lowercase, as
+    /// `catalogue_plugin_names` returns them; plugin_init_failed_labels.hpp). The heartbeat tag is
+    /// agent-supplied, so an agent must never choose the labels: a well-formed token that is not in
+    /// the set is summed under `plugin="unknown"` and counted in
+    /// `yuzu_fleet_plugin_init_failed_rejected`. A store that is never given a set (production
+    /// always gives one) fails closed: every name reads as unknown. Call once at boot, before the
+    /// first sweep.
+    void set_known_plugins(std::vector<std::string> names);
 
     void remove(const std::string& agent_id);
 
@@ -1500,10 +1524,25 @@ public:
     [[nodiscard]] std::optional<std::string_view>
     guardian_backend_of(const std::string& agent_id, std::chrono::seconds staleness) const;
 
+    /// The DEX observer state of each input id, ALIGNED by index (duplicates and all), read with
+    /// the same slicing, pause and staleness contract as `guardian_backend_for`; pass
+    /// kAgentHealthStaleness. Tag "1" is Armed, "0" is Disarmed; an absent tag, any other value,
+    /// an unknown id or a stale snapshot is NoneReported (an agent that opted out and one on a
+    /// build with no observer are indistinguishable: neither sends the tag). Counts only reach
+    /// the Apps page, never an id. Not for a hot path.
+    [[nodiscard]] std::vector<DexObserverState>
+    dex_observer_for(std::span<const std::string> agent_ids, std::chrono::seconds staleness) const;
+
 private:
+    /// The one sliced read loop behind `guardian_backend_for` and `dex_observer_for`: for each id,
+    /// in order, `fn(snapshot_or_null, now)` runs with mu_ held, mu_ is released between slices.
+    template <typename Fn>
+    void for_each_snapshot_sliced(std::span<const std::string> agent_ids, Fn&& fn) const;
+
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
     CorruptionSink corruption_sink_;
+    std::set<std::string, std::less<>> known_plugins_; // guarded by mu_; empty = nothing known
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

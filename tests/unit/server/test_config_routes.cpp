@@ -26,6 +26,8 @@
 #include "test_route_sink.hpp"
 
 #include "key_provider.hpp"
+#include "openapi_body_check.hpp"
+#include "openapi_spec_access.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -224,8 +226,10 @@ TEST_CASE("config_routes: PUT /api/config/dex_score_policy is refused with a typ
     CHECK(b["error"]["code"] == 400);
     CHECK(b["error"]["message"].get<std::string>().find("PUT /api/v1/dex/score-policy") !=
           std::string::npos);
+    CHECK(b["error"]["message"].get<std::string>().ends_with("(over MCP: set_dex_score_policy)"));
     CHECK(b["error"]["remediation"] ==
-          "send the whole policy document to PUT /api/v1/dex/score-policy with If-Match");
+          "send the whole policy document to PUT /api/v1/dex/score-policy with If-Match (over MCP: "
+          "set_dex_score_policy with if_match)");
     CHECK(h.audits.empty());
     // The permission gate still runs first.
     REQUIRE(h.perm_calls.size() == 1);
@@ -2057,4 +2061,152 @@ TEST_CASE("config_routes: wiring -- server.cpp still calls register_config_route
     const auto block = src.substr(dev, 900);
     CHECK(block.find(".probe_fn =") != std::string::npos);
     CHECK(block.find("auth_routes_->has_permission(") != std::string::npos);
+}
+
+// #6500 item 7: the real 200 bodies of GET /api/v1/config and PUT /api/v1/config/{key}, taken from
+// the real handlers over a real RuntimeConfigStore, checked at VALUE level against the served
+// ConfigState and ConfigSetResult schemas: every member is declared with the matching JSON type,
+// every required member is present, nothing undeclared appears, and the union of the bodies
+// carries every declared member and every `effect` value. The store is Postgres (there is no
+// store-free 200: build_config_view answers 503 for an unopened store), so this case SKIPS when
+// YUZU_TEST_POSTGRES_DSN is unset, like every [pg] case in this file; CI sets it.
+TEST_CASE("config_routes: the v1 200 bodies conform to the served ConfigState and ConfigSetResult "
+          "schemas at value level",
+          "[pg][server][routes][config_routes][openapi][value]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, config_routes_tpl);
+    namespace oa = yuzu::test::openapi;
+    LogLevelGuard restore_level;
+    const json spec = json::parse(openapi_spec_json());
+    const json state_schema = oa::ok_response_schema(spec, "/config", "get");
+    const json set_schema = oa::ok_response_schema(spec, "/config/{key}", "put");
+    REQUIRE(state_schema.is_object());
+    REQUIRE(set_schema.is_object());
+    // A const operator[] on a missing member asserts instead of failing, so require them first.
+    REQUIRE(state_schema.contains("$ref"));
+    REQUIRE(set_schema.contains("$ref"));
+    CHECK(state_schema["$ref"] == "#/components/schemas/ConfigState");
+    CHECK(set_schema["$ref"] == "#/components/schemas/ConfigSetResult");
+
+    PgWired w{db.dsn()};
+    MockHarness h; // an administrator
+    h.runtime_config_store = &w.store;
+    h.wire();
+
+    std::set<std::string> seen_state, seen_set, effects;
+    std::vector<json> state_bodies, set_bodies;
+    const auto conforms = [&](const json& schema, std::set<std::string>& seen,
+                              const std::string& what, const httplib::Response& res) {
+        INFO("answer: " << what);
+        REQUIRE(res.status == 200);
+        const json b = body(res.body);
+        const auto violations = oa::body_violations(spec, schema, b);
+        INFO(json(violations).dump(2));
+        // REQUIRE, not CHECK: the lines below index members the schema requires, and a const
+        // operator[] on a missing member asserts (undefined behaviour under NDEBUG) instead of
+        // failing. Optional members are read with .at(), which throws and fails the test.
+        REQUIRE(violations.empty());
+        // meta is declared through ApiMeta; its one member is pinned here too.
+        CHECK(b["meta"] == json{{"api_version", "v1"}});
+        const auto paths = oa::seen_member_paths(b);
+        seen.insert(paths.begin(), paths.end());
+        (&seen == &seen_state ? state_bodies : set_bodies).push_back(b);
+        return b;
+    };
+    const auto put = [&](const std::string& key, const std::string& raw_body) {
+        auto res = h.sink.Put("/api/v1/config/" + key, raw_body);
+        REQUIRE(res);
+        return conforms(set_schema, seen_set, "PUT " + key, *res);
+    };
+
+    // The three effects, a numeric JSON value (echoed as its text), a secret (no value member).
+    const auto stored_only = put("response_retention_days", R"({"value":120})");
+    CHECK(stored_only.at("data").at("value") == "120"); // a string, even for a number sent
+    effects.insert(stored_only["data"]["effect"].get<std::string>());
+    effects.insert(put("log_level", R"({"value":"debug"})")["data"]["effect"].get<std::string>());
+    effects.insert(
+        put("dex_blast_min_devices", R"({"value":"5"})")["data"]["effect"].get<std::string>());
+    const auto secret = put("oidc_client_secret", R"({"value":"s3cret"})");
+    CHECK_FALSE(secret["data"].contains("value")); // never echoed
+    CHECK(secret["data"]["applied"] == true);
+    CHECK(secret.dump().find("s3cret") == std::string::npos);
+    CHECK(effects == std::set<std::string>{"immediate", "deferred", "stored_only"});
+
+    // A lost outcome row: the change is applied and the body says so.
+    h.audits.clear();
+    h.audit_fails_at = 1;
+    const auto lost = put("response_retention_days", R"({"value":"121"})");
+    CHECK(lost.at("data").at("audit_persisted") == false);
+    h.audit_fails_at = -1;
+    CHECK_FALSE(put("response_retention_days", R"({"value":"122"})")["data"].contains(
+        "audit_persisted"));
+
+    // GET as the administrator: every key of config, an override of each shape.
+    const auto admin_get = h.sink.Get("/api/v1/config");
+    REQUIRE(admin_get);
+    const auto admin = conforms(state_schema, seen_state, "GET, administrator", *admin_get);
+    const json& cfg = admin["data"]["config"];
+    // `config` and `overrides.*` are declared as free-form objects, so the schema cannot catch
+    // a wrong type there. The members its description names are pinned here instead.
+    CHECK(cfg.size() == 6);
+    for (const char* k : {"heartbeat_timeout", "response_retention_days", "audit_retention_days",
+                          "guardian_event_retention_days"}) {
+        INFO(k);
+        REQUIRE(cfg.contains(k));
+        CHECK(cfg[k].is_number_integer());
+    }
+    REQUIRE(cfg.contains("auto_approve_enabled"));
+    CHECK(cfg["auto_approve_enabled"].is_boolean());
+    REQUIRE(cfg.contains("log_level"));
+    CHECK(cfg["log_level"].is_string());
+    REQUIRE(admin["data"]["overrides"].size() >= 3);
+    for (const auto& [key, ov] : admin["data"]["overrides"].items()) {
+        INFO("override " << key);
+        CHECK(ov.at("updated_by").is_string());
+        CHECK(ov.at("updated_at").is_number_integer()); // an integer timestamp; the schema leaves it untyped
+        // Exactly one of value (a string) and is_set (true, for a secret key).
+        CHECK(ov.contains("value") != ov.contains("is_set"));
+        if (ov.contains("value"))
+            CHECK(ov["value"].is_string());
+        if (ov.contains("is_set"))
+            CHECK(ov["is_set"] == true);
+    }
+    CHECK(admin.at("data").at("overrides").at("oidc_client_secret").contains("is_set"));
+    CHECK(admin.at("data").at("overrides").at("response_retention_days").at("value") == "122");
+
+    // GET as a plain user: the same shape, with withheld_keys non-empty and
+    // audit_retention_days out of config.
+    MockHarness user;
+    user.runtime_config_store = &w.store;
+    user.session_role = auth::Role::user;
+    user.wire();
+    const auto user_get = user.sink.Get("/api/v1/config");
+    REQUIRE(user_get);
+    const auto plain = conforms(state_schema, seen_state, "GET, plain user", *user_get);
+    CHECK(plain["data"]["withheld_keys"].size() > 0);
+    CHECK(plain["data"]["config"].size() == 5);
+    CHECK_FALSE(plain["data"]["config"].contains("audit_retention_days"));
+
+    // Coverage: every member the two schemas declare was carried by a real body.
+    const auto covered = [&](const json& schema, const std::set<std::string>& seen,
+                             const char* what) {
+        std::set<std::string> missing;
+        for (const auto& d : oa::declared_member_paths(spec, schema))
+            if (!seen.contains(d))
+                missing.insert(d);
+        INFO(what << " declared but never carried by a real body: " << json(missing).dump());
+        CHECK(missing.empty());
+    };
+    covered(state_schema, seen_state, "ConfigState");
+    covered(set_schema, seen_set, "ConfigSetResult");
+
+    // The other direction: a member every real body carries must be declared required, so a
+    // `required` entry dropped from the schema text is caught (a conforming body cannot show it).
+    // `value` and `audit_persisted` are not on this list because some bodies lack them.
+    for (const char* level : {"$", "$.data"}) {
+        INFO("object level: " << level);
+        CHECK(oa::always_present_not_required(spec, state_schema, state_bodies, level) ==
+              std::set<std::string>{});
+        CHECK(oa::always_present_not_required(spec, set_schema, set_bodies, level) ==
+              std::set<std::string>{});
+    }
 }

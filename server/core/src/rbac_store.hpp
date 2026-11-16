@@ -177,6 +177,15 @@ namespace auth {
 enum class Role; // yuzu/server/auth.hpp (the column values 'user' / 'admin')
 }
 
+/// How `RbacStore::deactivate_account` treats the durable session write-generation. There is
+/// deliberately no default: every caller states it, so a deactivation can never silently skip
+/// telling the session caches that an account went inactive.
+enum class SessionGenerationMode {
+    kBumpSessionGeneration, ///< bump `session_store.session_meta` `write_generation` in the
+                            ///< deactivation transaction (a `SessionStore` is wired)
+    kNoSessionStore,        ///< touch no `session_store` object (no `SessionStore` is wired)
+};
+
 /// Outcome of `RbacStore::deactivate_account` (#4966). A closed answer, never a flag pair.
 struct AccountDeactivationResult {
     enum class Kind {
@@ -601,8 +610,10 @@ public:
     /// last member of a protected population; it does NOT prove anyone can still sign in
     /// (lockout, MFA, sso-only accounts and IdP state are outside it). Applies no cache
     /// generation: no `principal_roles` / `rbac_meta` row changes. The caller (AuthManager)
-    /// owns the post-commit session wipe and cache erase.
-    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username);
+    /// owns the post-commit session wipe and cache erase. `session_mode` has no default: the
+    /// caller states whether a `SessionStore` is wired (`SessionGenerationMode`).
+    [[nodiscard]] AccountDeactivationResult deactivate_account(const std::string& username,
+                                                               SessionGenerationMode session_mode);
 
     /// #4966: the guarded role-column write behind `AuthManager::update_role_checked` (the
     /// demotion twin of `deactivate_account`). Thin delegation to

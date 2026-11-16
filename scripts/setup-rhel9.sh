@@ -471,11 +471,16 @@ export PATH
 
 export VCPKG_ROOT=${VCPKG_ROOT_Q}
 
-# ccache wrappers, matching .github/workflows/ci.yml. ccache is EPEL-only on
-# RHEL/Rocky/Alma, so fall back to the bare compilers when it is absent.
-if command -v ccache >/dev/null 2>&1; then
-  export CC="ccache gcc"
-  export CXX="ccache g++"
+# ccache through its compiler symlinks (/usr/lib64/ccache/gcc, g++): one path,
+# no spaces. Not the two-word "ccache gcc" form .github/workflows/ci.yml uses:
+# vcpkg hands CC/CXX to its meson-built ports, and libpq's configure then fails
+# with "Unknown compiler(s): [['/usr/bin/ccache', '-fPIC', '-g']]". The symlink
+# runs the next gcc on PATH, which is gcc-toolset's (enabled above). ccache is
+# EPEL-only on RHEL/Rocky/Alma, so fall back to the bare compilers when its
+# symlinks are absent.
+if [ -x /usr/lib64/ccache/gcc ] && [ -x /usr/lib64/ccache/g++ ]; then
+  export CC="/usr/lib64/ccache/gcc"
+  export CXX="/usr/lib64/ccache/g++"
 else
   export CC="gcc"
   export CXX="g++"

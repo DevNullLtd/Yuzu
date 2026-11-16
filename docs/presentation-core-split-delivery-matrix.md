@@ -285,7 +285,7 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   scan covers `path: .` incl. `vcpkg_installed`, per this PR's changelog fragment — so SBOM pickup is
   NOT a WS-B2 deferral.)
   **Superseded by ADR-0035 ladder step 1 (2026-11-10):** the Windows and macOS legs of `ci.yml`
-  configure with `-Dbuild_server=false`, so the Drogon canary now builds on Linux only and the
+  are agent-only (`-Dbuild_server=false` at step 1, the `server` option's `auto` since step 3), so the Drogon canary now builds on Linux only and the
   Windows dynamic-DLL LOAD assertion above no longer runs in CI. The #4296 "the canary must not
   silently stop running" tripwire is moot for Windows: the server, and every Drogon-linked binary,
   is Linux-only under ADR-0035 (Decision 6 amends ADR-0031 Gate G10 accordingly).
@@ -510,9 +510,9 @@ MCP file is picked up by the lane; the MCP tool count is measured (not "—") an
   `supervised` (`operator` is refused `Infrastructure:Write` at the generic gate, before the handler), and build
   arguments from the tool's required list (`list_crypto_library_devices` needs `family`). (9) a registry tool must be named as an `mcp_twin` in the API-parity ledger
   (`test_twin_completeness.cpp`), and the ledger keys rows on fragment/legacy routes: a family whose REST twin is
-  v1-only has no legal row, so check this before carving. Three crypto tools (`export_crypto_cbom`,
-  `list_crypto_widgets`, `set_crypto_dashboard_layout`) are in `kLedgerBackfill` under an owner ruling until #6700
-  decides the row shape.
+  v1-only has no legal row, so check this before carving. `kLedgerBackfill` holds four names: three crypto tools (`export_crypto_cbom`,
+  `list_crypto_widgets`, `set_crypto_dashboard_layout`) under an owner ruling, and `list_hardware_ci_records`, until
+  #6700 decides the row shape.
 - What the lane does and does not say: it include-closure-checks against the LISTED store-header patterns — a store
   owner no pattern names passes, and it proves nothing about linkage. It also says nothing about HOW a family's
   mutators reach data (`ToolDeps` carries read-oriented provider closures today); that is the open write-side

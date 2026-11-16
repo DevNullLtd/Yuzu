@@ -195,6 +195,16 @@ TEST_CASE("kill_switch_denial: control — echo.sql is still refused / still car
 
     CountingSwitch os_off{IdSet{"windows"}};
     CHECK(finalize(kEchoSql, os_off.fn()).kill_switched_os() == IdSet{"windows"});
+
+    // An ordinary firewall action is not exempt: the closed set stops at the four.
+    CountingSwitch fw_off{std::nullopt};
+    const auto fw = yuzu::server::detail::kill_switch_denial(protective_cap("firewall", "state"),
+                                                              fw_off.fn());
+    REQUIRE_FALSE(fw.has_value());
+    CHECK(*fw_off.calls == 1);
+    CountingSwitch fw_os_off{IdSet{"windows"}};
+    CHECK(finalize(protective_cap("firewall", "state"), fw_os_off.fn()).kill_switched_os() ==
+          IdSet{"windows"});
 }
 
 TEST_CASE("ids_missing_plugin: protective pairs are never reported missing",
@@ -444,9 +454,13 @@ TEST_CASE("kill_switch_row_covers_protective: labels rows that can never gate di
     CHECK(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "", "linux"}));
     // Everything else is an ordinary, effective row.
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"__guard__", "get_status", ""}));
-    // firewall's ordinary actions are not covered even though the plugin owns protective ones.
+    // The firewall plugin owns four protective actions and declares ordinary ones too: a
+    // plugin-level row is labelled (it never stops the four) and an ordinary action-level
+    // row is not.
+    CHECK(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "quarantine", "linux"}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "state", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"firewall", "rules", "linux"}));
+    // The removed plugin's name covers nothing.
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"quarantine", "", ""}));
     CHECK_FALSE(kill_switch_row_covers_protective(KillSwitchScope{"echo", "sql", ""}));
 

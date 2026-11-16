@@ -1,9 +1,12 @@
 #include "oidc_provider.hpp"
 #include "oidc_vetted_host.hpp"
 
+#include "bounded_resolver.hpp"
 #include "evp_raii.hpp"
 #include "oidc_abandoned_ledger.hpp"
 #include "oidc_egress_policy.hpp"
+#include "refusal_log_throttle.hpp"
+#include "resolver_host_admission.hpp"
 #include "sha256_steps.hpp"
 
 #include <httplib.h>
@@ -922,14 +925,19 @@ std::string_view truncate_utf8(std::string_view s, std::size_t max) {
 constexpr const char* kEgressRefusedReason = OidcProvider::kEgressRefused;
 constexpr const char* kEgressCleartextPublicReason = OidcProvider::kEgressCleartextPublicRefused;
 constexpr const char* kEgressUnresolvedReason = "the host name did not resolve";
+// The lookup was refused because the pool was full, no worker could be created, the name already
+// had 8 lookups outstanding, lookups for 64 names were already outstanding, the name was refused or
+// timed out within the last 3 s, or the admission check did not complete (POSIX only).
+// Nothing was learned about the name, so callers must not remember it as a failure.
+constexpr const char* kEgressLookupBusyReason = "the host name lookup was not started";
 
 // Decides where ONE fetch may connect, BEFORE any socket exists. A host that is an IP literal is
 // classified directly (no DNS). Any other host (a name, or a numeric spelling the OS resolver might
-// read differently, such as `127.1`) is resolved here, with httplib's own resolver, and EVERY
-// returned address is classified by its bytes. On a glibc build that resolver is not held to the
-// caller's time bound: a lookup against an unresponsive resolver can take about 30 s. Returns the
-// numeric addresses the connection may be PINNED to (the permitted ones, in resolver order, at most
-// kMaxPinnedAddresses), or an EMPTY list when the host is an IP literal that needs no pin. A
+// read differently, such as `127.1`) is resolved here (the OIDC name lookup: on POSIX a
+// detached worker through `net::bounded_resolve`, so the wait ends at the caller's time bound), and
+// EVERY returned address is classified by its bytes. Returns the numeric addresses the connection
+// may be PINNED to (the permitted ones, in resolver order, at most kMaxPinnedAddresses), or an
+// EMPTY list when the host is an IP literal that needs no pin. A
 // refusal or a resolver failure is a fixed reason (never the address, never resolver text). Pinning
 // closes the window between this check and the connect: httplib is told to connect to that numeric
 // address and does no second lookup, so a DNS answer that changes in between cannot redirect the
@@ -955,10 +963,60 @@ struct ResolvedAddress {
     std::array<unsigned char, 16> bytes{};
 };
 
-// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. The lookup is cancelled
-// after `timeout_sec` seconds, except on a glibc build where httplib then waits for the resolver
-// itself (about 30 s against an unresponsive one). False when the name did not resolve or the
-// lookup timed out. Own function per platform because httplib's helper cannot be consumed
+// Name lookups on POSIX run through `net::bounded_resolve` with a pool of their own, so they never
+// share slots with CRL source registration (the process pool). The pool is a leaked function-local
+// static, like `detail::process_pool()` in bounded_resolver.hpp: it stays valid for late callers
+// and for the 15 s gauge read during shutdown. Not a member of OidcProvider: providers are swapped
+// on Settings save and `vet_egress_target` is a free function.
+const std::shared_ptr<net::ResolverPool>& oidc_resolver_pool_ref() {
+    static const std::shared_ptr<net::ResolverPool>& p =
+        *new std::shared_ptr<net::ResolverPool>(std::make_shared<net::ResolverPool>());
+    return p;
+}
+
+#ifndef _WIN32
+// The admission in front of the POSIX name lookup: the per-name limit and the refusal memory
+// (resolver_host_admission.hpp). A leaked function-local static, like the pool above: a request
+// thread can reach it while statics are being destroyed at exit. Not used on Windows, whose lookup
+// is `resolve_host_addresses`.
+const std::shared_ptr<net::HostLookupAdmission>& oidc_lookup_admission_ref() {
+    static const std::shared_ptr<net::HostLookupAdmission>& a =
+        *new std::shared_ptr<net::HostLookupAdmission>(net::HostLookupAdmission::create());
+    return a;
+}
+#endif
+
+// The pool-full warning, the NAT64 "not started" warning and the two warnings for a lookup refused
+// before the pool (a name refused or timed out moments ago; a name at its limit of outstanding
+// lookups) are written at most once per 60 s each (one key each, four in all, the throttle's whole
+// budget); later ones in the window go to debug. The lookups counter carries every
+// occurrence, and for a host lookup so does the failing request's own error. The timeout warning is
+// not throttled. A leaked function-local static, with the same precedent and reason as the pool
+// above and `detail::process_pool()` in bounded_resolver.hpp: a request thread can log through it
+// while statics are being destroyed at exit, so it is never destroyed.
+RefusalLogThrottle& oidc_resolver_log_throttle() {
+    static RefusalLogThrottle& t = *new RefusalLogThrottle(std::chrono::seconds(60), 4);
+    return t;
+}
+
+// The test hook (OidcProvider::set_bounded_lookup_for_test): empty in production, which means the
+// system lookup, the OIDC pool and the process-wide admission.
+struct BoundedLookupHook {
+    std::mutex mu;
+    net::LookupFn lookup;
+    std::shared_ptr<net::ResolverPool> pool;
+    std::shared_ptr<net::HostLookupAdmission> admission;
+};
+BoundedLookupHook& bounded_lookup_hook() {
+    static BoundedLookupHook h;
+    return h;
+}
+
+// Resolves `host` (a name, not a literal) to its IPv4 and IPv6 addresses. On POSIX the caller
+// stops waiting after `timeout_sec` seconds (the lookup itself may run on until the resolver
+// returns, holding one pool slot). On Windows this is `resolve_host_addresses` and a failure is
+// false; on POSIX it is `resolve_host_addresses_status`, which says why (name did not resolve,
+// lookup timed out, pool full). Own function per platform because httplib's helper cannot be consumed
 // generically: on Windows it returns a GetAddrInfoExW result cast to `addrinfo`, whose layout
 // differs after ai_addr (the blob, blob length and provider fields precede ai_next) and which must
 // be released with FreeAddrInfoExW, so walking it as `addrinfo` misses addresses and freeing it
@@ -1071,43 +1129,153 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
     return true;
 }
 #else
-bool resolve_host_addresses(const std::string& host, int timeout_sec,
-                            std::vector<ResolvedAddress>& out) {
-    struct addrinfo hints;
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    struct addrinfo* result = nullptr;
-    if (::httplib::detail::getaddrinfo_with_timeout(host.c_str(), "0", &hints, &result,
-                                                    static_cast<time_t>(timeout_sec)) != 0 ||
-        result == nullptr)
-        return false;
-    struct Freer {
-        struct addrinfo* p;
-        Freer(struct addrinfo* list) : p(list) {}
-        Freer(const Freer&) = delete;
-        Freer& operator=(const Freer&) = delete;
-        ~Freer() { ::freeaddrinfo(p); }
-    } freer{result};
-    for (const struct addrinfo* ai = result; ai != nullptr; ai = ai->ai_next) {
+// Whether a lookup goes through the admission (the per-name limit and the refusal memory). The
+// NAT64 probe is exempt: it takes no lease, is not refused by the admission and does not feed it,
+// so only the pool's cap applies to it, as before the admission existed. Its only bound is the
+// pool's cap; a probe that started and failed arms the 1 minute negative window below, and one the
+// pool refused arms none.
+enum class LookupAdmission { kApply, kExempt };
+
+// The throttled warning for a lookup refused before the pool was asked: a name already at its
+// limit of outstanding lookups, a full table of names with lookups outstanding, a name refused or
+// timed out moments ago, or an admission check that did not complete. The keys are fixed, never
+// derived from the host, so the throttle's key set stays bounded.
+void log_lookup_refused_before_pool(const std::string& host,
+                                    net::HostLookupAdmission::Verdict verdict,
+                                    const net::HostLookupAdmission::Limits& limits) {
+    using Verdict = net::HostLookupAdmission::Verdict;
+    const char* key = "oidc_lookup_refused_recent";
+    switch (verdict) {
+    case Verdict::kRefusedNameLimit:
+    case Verdict::kRefusedTableFull:
+        key = "oidc_lookup_refused_name_limit";
+        break;
+    case Verdict::kRefusedRecent:
+    case Verdict::kAdmitted:
+    case Verdict::kRefusedError:
+        break;
+    }
+    // The throttle is consulted for every refusal, so its window advances. A line it demotes to
+    // debug is not built at all unless the logger takes debug.
+    const auto level = oidc_resolver_log_throttle().should_warn(key) ? spdlog::level::warn
+                                                                     : spdlog::level::debug;
+    if (!spdlog::default_logger_raw()->should_log(level))
+        return;
+    std::string cause;
+    switch (verdict) {
+    case Verdict::kRefusedNameLimit:
+        cause = std::to_string(limits.per_name_in_flight) +
+                " lookups for this name are already outstanding";
+        break;
+    case Verdict::kRefusedTableFull:
+        cause = "lookups for " + std::to_string(limits.max_names_in_flight) +
+                " names are already outstanding";
+        break;
+    case Verdict::kRefusedRecent:
+        cause = "a lookup for this name was refused or timed out in the last " +
+                std::to_string(std::chrono::duration_cast<std::chrono::seconds>(limits.refusal_ttl)
+                                   .count()) +
+                " s";
+        break;
+    case Verdict::kAdmitted:
+    case Verdict::kRefusedError:
+        cause = "the admission check did not complete";
+        break;
+    }
+    spdlog::log(level,
+                "OIDC egress: the name lookup for '{}' was not started: {} (this warning is "
+                "written at most once per 60 s; "
+                "yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} has the full count)",
+                ::yuzu::log_key_token(host), cause);
+}
+
+// Reports why a lookup failed (kBusy: nothing was started). kOk with no parsable address is
+// kNotFound. A lookup that admission refuses (the name's limit, or the refusal memory) is kBusy and
+// is counted once, as busy, in the pool's outcomes, and takes no slot (`bounded_resolve` counts
+// every lookup it runs, so the two never both count one call). An exempt lookup never reaches the
+// admission, so it is refused only by the pool (full, or no worker).
+net::ResolveStatus resolve_host_addresses_status(const std::string& host, int timeout_sec,
+                                                 std::vector<ResolvedAddress>& out,
+                                                 LookupAdmission mode = LookupAdmission::kApply) {
+    net::LookupFn lookup;
+    std::shared_ptr<net::ResolverPool> pool;
+    std::shared_ptr<net::HostLookupAdmission> admission;
+    {
+        std::lock_guard lock(bounded_lookup_hook().mu);
+        lookup = bounded_lookup_hook().lookup;
+        pool = bounded_lookup_hook().pool;
+        admission = bounded_lookup_hook().admission;
+    }
+    // A test driving the seam (a lookup or a pool installed) gets no admission unless it passed
+    // one; with the hook empty the process-wide instance is used.
+    if (!admission && !lookup && !pool)
+        admission = oidc_lookup_admission_ref();
+    if (mode == LookupAdmission::kExempt)
+        admission.reset(); // no lease, no refusal, no memory: only the pool's cap applies
+    if (!pool)
+        pool = oidc_resolver_pool_ref();
+    const int pool_cap = pool->cap;
+    if (admission) {
+        auto admitted = admission->admit(host);
+        if (admitted.verdict != net::HostLookupAdmission::Verdict::kAdmitted) {
+            pool->note_outcome(net::ResolveStatus::kBusy);
+            log_lookup_refused_before_pool(host, admitted.verdict, admission->limits());
+            return net::ResolveStatus::kBusy;
+        }
+        // The lookup holds the name's count until it returns, even if this caller stops waiting.
+        try {
+            lookup = net::hold_lease_during(std::move(lookup), std::move(admitted.lease));
+        } catch (...) {
+            pool->note_outcome(net::ResolveStatus::kBusy);
+            log_lookup_refused_before_pool(host, net::HostLookupAdmission::Verdict::kRefusedError,
+                                           admission->limits());
+            return net::ResolveStatus::kBusy;
+        }
+    }
+    const auto resolved = net::bounded_resolve(host, std::chrono::seconds(timeout_sec),
+                                               std::move(lookup), std::move(pool));
+    if (admission)
+        admission->note_outcome(host, resolved.status);
+    switch (resolved.status) {
+    case net::ResolveStatus::kOk:
+        break;
+    case net::ResolveStatus::kBusy:
+        spdlog::log(oidc_resolver_log_throttle().should_warn("oidc_lookup_busy")
+                        ? spdlog::level::warn
+                        : spdlog::level::debug,
+                    "OIDC egress: the name lookup for '{}' was not started: the lookup pool ({} "
+                    "slots) is full or a worker could not be created (this warning is written "
+                    "at most once per 60 s; yuzu_server_oidc_resolver_lookups_total{{outcome=\"busy\"}} "
+                    "has the full count)",
+                    ::yuzu::log_key_token(host), pool_cap);
+        return net::ResolveStatus::kBusy;
+    case net::ResolveStatus::kTimeout:
+        spdlog::warn("OIDC egress: the name lookup for '{}' did not answer within {} s; its slot "
+                     "is held until the resolver returns",
+                     ::yuzu::log_key_token(host), timeout_sec);
+        return net::ResolveStatus::kTimeout;
+    case net::ResolveStatus::kNotFound:
+    case net::ResolveStatus::kTemporary:
+        return resolved.status;
+    case net::ResolveStatus::kCount: // not a status; treated as a failed lookup
+        return net::ResolveStatus::kTemporary;
+    }
+    // The worker returns numeric text; the vetting classifies bytes, so convert back. Text that
+    // does not parse is skipped.
+    const auto before = out.size();
+    for (const auto& text : resolved.addresses) {
         ResolvedAddress address;
-        // ai_family names the sockaddr type ai_addr points at (the documented BSD sockets
-        // contract), and ai_addrlen is checked before the address bytes are read.
-        if (ai->ai_family == AF_INET && ai->ai_addr != nullptr &&
-            ai->ai_addrlen >= sizeof(sockaddr_in)) {
+        if (text.find(':') != std::string::npos) {
+            if (::inet_pton(AF_INET6, text.c_str(), address.bytes.data()) == 1) {
+                address.family = AF_INET6;
+                out.push_back(address);
+            }
+        } else if (::inet_pton(AF_INET, text.c_str(), address.bytes.data()) == 1) {
             address.family = AF_INET;
-            std::memcpy(address.bytes.data(),
-                        &reinterpret_cast<const sockaddr_in*>(ai->ai_addr)->sin_addr, 4);
-            out.push_back(address);
-        } else if (ai->ai_family == AF_INET6 && ai->ai_addr != nullptr &&
-                   ai->ai_addrlen >= sizeof(sockaddr_in6)) {
-            address.family = AF_INET6;
-            std::memcpy(address.bytes.data(),
-                        &reinterpret_cast<const sockaddr_in6*>(ai->ai_addr)->sin6_addr, 16);
             out.push_back(address);
         }
     }
-    return true;
+    return out.size() > before ? net::ResolveStatus::kOk : net::ResolveStatus::kNotFound;
 }
 #endif
 
@@ -1117,7 +1285,8 @@ bool resolve_host_addresses(const std::string& host, int timeout_sec,
 // really translated IPv4 destinations. Process-wide, because the prefix belongs to the network the
 // server sits on and not to one provider. A failed or empty lookup is "none discovered", not a
 // refusal: DNS64 is absent on most networks and a transient resolver error must not break every
-// IPv6 destination.
+// IPv6 destination. A refusal because the lookup pool was full is retried on the next fetch rather
+// than remembered (no negative window is armed for it).
 //
 // LEARNED PREFIXES NEVER SHRINK. The cache is a set that only grows: an answered refresh MERGES
 // (set union, under the cache mutex) into it, so an empty, A-only or different answer adds nothing
@@ -1150,10 +1319,14 @@ Nat64DiscoveryCache& nat64_discovery_cache() {
     return c;
 }
 
-// The IPv6 answers for `ipv4only.arpa`. False when the lookup failed or timed out (no answer at
-// all); an answer with no IPv6 address is true and empty.
-bool lookup_ipv4only_answers(int dns_timeout_ms,
-                             std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
+// How one `ipv4only.arpa` probe ended. kBusy: the lookup was not started (pool full or no worker),
+// so nothing was learned about the name; kFailed: it was started and gave no answer.
+enum class ProbeOutcome { kAnswered, kFailed, kBusy };
+
+// The IPv6 answers for `ipv4only.arpa`. kFailed when the lookup failed or timed out (no answer at
+// all); an answer with no IPv6 address is kAnswered and empty. kBusy is reported on POSIX only.
+ProbeOutcome lookup_ipv4only_answers(int dns_timeout_ms,
+                                     std::vector<::yuzu::server::oidc::egress::Ipv6>& out) {
     namespace egress = ::yuzu::server::oidc::egress;
     OidcProvider::ResolverForTest test_resolver;
     {
@@ -1165,19 +1338,31 @@ bool lookup_ipv4only_answers(int dns_timeout_ms,
             if (text.find(':') != std::string::npos)
                 if (const auto v6 = egress::parse_ipv6(text))
                     out.push_back(*v6);
-        return true;
+        return ProbeOutcome::kAnswered;
     }
     std::vector<ResolvedAddress> resolved;
-    if (!resolve_host_addresses(kNat64ProbeName, std::max(1, (dns_timeout_ms + 999) / 1000),
-                                resolved))
-        return false;
+    const int timeout_sec = std::max(1, (dns_timeout_ms + 999) / 1000);
+#ifdef _WIN32
+    if (!resolve_host_addresses(kNat64ProbeName, timeout_sec, resolved))
+        return ProbeOutcome::kFailed;
+#else
+    switch (resolve_host_addresses_status(kNat64ProbeName, timeout_sec, resolved,
+                                          LookupAdmission::kExempt)) {
+    case net::ResolveStatus::kOk:
+        break;
+    case net::ResolveStatus::kBusy:
+        return ProbeOutcome::kBusy;
+    default:
+        return ProbeOutcome::kFailed;
+    }
+#endif
     for (const auto& address : resolved)
         if (address.family == AF_INET6) {
             egress::Ipv6 bytes{};
             std::memcpy(bytes.data(), address.bytes.data(), bytes.size());
             out.push_back(bytes);
         }
-    return true;
+    return ProbeOutcome::kAnswered;
 }
 
 // The prefixes learned from `ipv4only.arpa`, from the cache while it is fresh. nullopt = the
@@ -1196,7 +1381,22 @@ discovered_nat64_prefixes(int dns_timeout_ms) {
         }
     }
     std::vector<egress::Ipv6> answers;
-    const bool answered = lookup_ipv4only_answers(dns_timeout_ms, answers);
+    const auto outcome = lookup_ipv4only_answers(dns_timeout_ms, answers);
+    if (outcome == ProbeOutcome::kBusy) {
+        // Not started: no negative window, so the next IPv6 fetch probes again. Learned prefixes
+        // and an earlier overflow stay as they are.
+        spdlog::log(oidc_resolver_log_throttle().should_warn("oidc_nat64_probe_busy")
+                        ? spdlog::level::warn
+                        : spdlog::level::debug,
+                    "OIDC egress: the NAT64 prefix lookup (ipv4only.arpa) was not started; it "
+                    "will be retried on the next fetch, and IPv6 destinations are classified "
+                    "without it until then (this warning is written at most once per 60 s)");
+        std::lock_guard lock(cache.mu);
+        if (cache.overflowed)
+            return std::nullopt;
+        return cache.prefixes;
+    }
+    const bool answered = outcome == ProbeOutcome::kAnswered;
     std::vector<egress::Nat64Prefix> found;
     for (const auto& answer : answers)
         if (const auto prefix = egress::discover_prefix_from_ipv4only_answer(answer))
@@ -1342,8 +1542,16 @@ vet_egress_target(const std::string& host, bool allow_private, bool cleartext, i
     } else {
         std::vector<ResolvedAddress> resolved;
         const int dns_timeout_sec = std::max(1, (dns_timeout_ms + 999) / 1000);
+#ifdef _WIN32
         if (!resolve_host_addresses(host, dns_timeout_sec, resolved) || resolved.empty())
             return std::unexpected(kEgressUnresolvedReason);
+#else
+        const auto status = resolve_host_addresses_status(host, dns_timeout_sec, resolved);
+        if (status == net::ResolveStatus::kBusy)
+            return std::unexpected(kEgressLookupBusyReason);
+        if (status != net::ResolveStatus::kOk || resolved.empty())
+            return std::unexpected(kEgressUnresolvedReason);
+#endif
         for (const auto& address : resolved) {
             char text[INET6_ADDRSTRLEN] = {};
             if (address.family == AF_INET) {
@@ -2328,8 +2536,7 @@ OidcProvider::http_get_bounded(const std::string& url, bool skip_tls_verify,
             return std::unexpected("request failed: no file descriptor available");
         // Egress policy: resolve and classify the target BEFORE any socket exists, then pin the
         // connect to a vetted address (see vet_egress_target). Name resolution is part of the
-        // total bound below, except on a glibc build where it can run to about 30 s against an
-        // unresponsive resolver.
+        // total bound below: on POSIX the caller stops waiting for it at the per-lookup bound.
         const auto pins = vet_egress_target(target->host, allow_private_networks, target->cleartext,
                                             timeout_ms, nat64_prefixes);
         if (!pins)
@@ -2547,7 +2754,16 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
             spdlog::error("OidcProvider: discovery failed for issuer {}: {}",
                           ::yuzu::log_key_token(config_.issuer),
                           ::yuzu::log_key_token(doc.error()));
-            discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
+            // A refusal because the lookup pool was full, no worker could be created, the name
+            // already had 8 lookups outstanding, lookups for 64 names were already outstanding,
+            // the name was refused or timed out moments ago or the admission check did not
+            // complete learned nothing about the issuer: retried next attempt, not remembered.
+            // Matched by equality with the one text http_get_bounded composes, so IdP-controlled
+            // text cannot match.
+            const std::string busy_error =
+                std::string("request failed: ") + kEgressLookupBusyReason;
+            if (doc.error() != busy_error)
+                discovery_retry_after_ = std::chrono::steady_clock::now() + discovery_retry_window_;
             return std::unexpected(std::string(kDiscoveryUnavailable));
         }
         // IdP-controlled values: neutralize control bytes and Unicode line breaks for the log
@@ -2564,6 +2780,42 @@ std::expected<std::string, std::string> OidcProvider::ensure_discovered(Need nee
 void OidcProvider::set_resolver_for_test(ResolverForTest resolver) {
     std::lock_guard lock(test_resolver_mutex());
     test_resolver_slot() = std::move(resolver);
+}
+
+void OidcProvider::set_bounded_lookup_for_test(
+    BoundedLookupForTest lookup, std::shared_ptr<net::ResolverPool> pool,
+    std::shared_ptr<net::HostLookupAdmission> admission) {
+    std::lock_guard lock(bounded_lookup_hook().mu);
+    bounded_lookup_hook().lookup = std::move(lookup);
+    bounded_lookup_hook().pool = std::move(pool);
+    bounded_lookup_hook().admission = std::move(admission);
+}
+
+std::shared_ptr<net::HostLookupAdmission> OidcProvider::production_lookup_admission_for_test() {
+#ifdef _WIN32
+    return {}; // the Windows lookup has no admission
+#else
+    return oidc_lookup_admission_ref();
+#endif
+}
+
+int oidc_resolver_in_flight() {
+    return oidc_resolver_pool_ref()->in_flight.load();
+}
+
+int oidc_resolver_pool_capacity() {
+    return oidc_resolver_pool_ref()->cap;
+}
+
+static_assert(net::kResolveStatusCount == 5,
+              "oidc_resolver_outcome_counts() in oidc_provider.hpp is declared with five members");
+
+std::array<std::uint64_t, 5> oidc_resolver_outcome_counts() {
+    return oidc_resolver_pool_ref()->outcome_counts();
+}
+
+void OidcProvider::reset_resolver_log_throttle_for_test() {
+    oidc_resolver_log_throttle().clear();
 }
 
 void OidcProvider::clear_nat64_discovery_cache_for_test() {

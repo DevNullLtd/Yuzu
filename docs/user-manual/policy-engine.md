@@ -625,3 +625,9 @@ spec:
   inputs:
     <key>: <value>
 ```
+
+## Routed-concern invariants
+
+Moved verbatim from the `Compliance evaluation pipeline` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Compliance evaluation pipeline — `PolicyEvaluator` background thread (10s tick, 15s grace, ≥60s floor, 3600s default) drives check→verdict→status; `policy_eval_thread_` joins before stores in `~ServerImpl`/`stop()`. Mints `polchk-*` ids `notify_exec_tracker` skips (no tracker row, no SSE — NOT in the executions drawer). Remediation is operator-gated only. Dispatch due-ness is a durable, fleet-wide single-sweeper claim on Postgres (`PolicyStore::claim_due_policies`, `policy_dispatch_state`, ADR-0056) — NOT the evaluator's own in-memory state; never fork a second claim path or reintroduce an in-memory throttle.

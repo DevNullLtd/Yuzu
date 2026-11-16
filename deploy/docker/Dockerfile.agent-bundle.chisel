@@ -9,7 +9,7 @@
 # It deliberately does NOT run the agents: a Linux container cannot execute a
 # Windows .exe or a macOS Mach-O, and the Windows (MSVC) / macOS (Apple Clang)
 # binaries cannot be cross-built in a Linux Docker stage at all. They therefore
-# come from the signed/notarized GitHub *release* archives of the pinned version
+# come from the GitHub *release* archives (not code-signed or notarized) of the pinned version
 # — see scripts/build-agent-bundle.sh, which downloads, verifies, and lays out
 # the /opt/yuzu-agents tree this Dockerfile copies in.
 #

@@ -13,6 +13,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/browser_policy/README', slug: 'plugins/browser_policy', title: 'browser_policy' },
   { file: 'agents/plugins/certificates/README', slug: 'plugins/certificates', title: 'certificates' },
   { file: 'agents/plugins/chargen/README', slug: 'plugins/chargen', title: 'chargen' },
+  { file: 'agents/plugins/component_inventory/README', slug: 'plugins/component_inventory', title: 'component_inventory' },
   { file: 'agents/plugins/content_dist/README', slug: 'plugins/content_dist', title: 'content_dist' },
   { file: 'agents/plugins/device_identity/README', slug: 'plugins/device_identity', title: 'device_identity' },
   { file: 'agents/plugins/diagnostics/README', slug: 'plugins/diagnostics', title: 'diagnostics' },

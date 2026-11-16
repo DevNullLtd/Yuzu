@@ -1,8 +1,8 @@
 // Registry-resident hardware CI tools (see mcp_tool_registry.hpp): the MCP twins of
-// GET /api/v1/hardware (list_hardware_ci) and GET /api/v1/hardware/{id}
-// (get_hardware_ci).
+// GET /api/v1/hardware (list_hardware_ci), GET /api/v1/hardware/{id} (get_hardware_ci) and
+// GET /api/v1/hardware-ci (list_hardware_ci_records, the bulk keyset page of stored CI rows).
 //
-// Both are CONFINED READS gated by fleet_read_fn alone (ADR-0017 admit-then-filter,
+// All three are CONFINED READS gated by fleet_read_fn alone (ADR-0017 admit-then-filter,
 // Inventory:Read): the gate already covers the MCP tier ladder and RBAC, so neither
 // handler calls tier_allows or ctx.perm_fn (stacking either is the BLOCKING defect
 // authz_gates.hpp documents). They reach the data only through ToolDeps, the SAME
@@ -29,6 +29,7 @@
 #include "mcp_tool_registry.hpp"
 
 #include "authz_model.hpp"         // authz::in_scope
+#include "hardware_ci_page_model.hpp" // the bulk CI page (params, cursor, scope walk, JSON)
 #include "hardware_list_model.hpp" // the shared list / record core and JSON builders
 #include "mcp_jsonrpc.hpp"         // kInternalError, kInvalidParams, success_response
 #include "mcp_retry.hpp"           // kMcpStoreFaultRetryMs
@@ -56,10 +57,13 @@ static_assert(auth::kMaxAgentIdLength == 256,
               "get_hardware_ci's agent_id maxLength literal must match auth::kMaxAgentIdLength");
 
 constexpr const char* kListOutputSchema =
-    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"os_label":{"type":"string"},"online":{"type":"boolean"},"stale":{"type":"boolean"},"last_seen":{"type":"string"},"last_seen_ms":{"type":"integer"},"ci_present":{"type":"boolean"},"serial":{"type":["string","null"]},"model":{"type":["string","null"]},"manufacturer":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"domain":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"agent_version":{"type":["string","null"]},"ips":{"type":["array","null"],"items":{"type":"string"}},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"}},"required":["key","value"]}},"dex_score":{"type":["integer","null"]}},"required":["agent_id","hostname","os","os_label","online","stale","last_seen","last_seen_ms","ci_present","serial","model","manufacturer","cpu_model","cpu_cores","cpu_threads","ram_bytes","os_name","os_version","os_build","arch","domain","primary_mac","agent_version","ips","tags","dex_score"]}},"count":{"type":"integer"},"total_matching":{"type":"integer"},"devices_omitted":{"type":"integer","description":"Roster devices outside the caller scope. Present only for a caller with global read, where it is 0; a confined caller gets scope_basis instead."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: every figure in this result describes only devices within that scope. A status, set whether or not any device was hidden."},"ci_degraded":{"type":"boolean"},"tags_degraded":{"type":"boolean"},"kpis":{"type":"object","properties":{"total":{"type":"integer"},"online":{"type":"integer"},"offline":{"type":"integer"},"stale":{"type":"integer"},"with_ci":{"type":["integer","null"]}},"required":["total","online","offline","stale","with_ci"]},"query":{"type":"object","properties":{"q":{"type":"string"},"os":{"type":"string"},"status":{"type":"string"},"sort":{"type":"string"},"dir":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"tag":{"type":"string"}},"required":["q","os","status","sort","dir","limit","offset","tag"]}},"required":["devices","count","total_matching","ci_degraded","tags_degraded","kpis","query"]})j";
+    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"os_label":{"type":"string"},"online":{"type":"boolean"},"stale":{"type":"boolean"},"last_seen":{"type":"string"},"last_seen_ms":{"type":"integer"},"ci_present":{"type":"boolean"},"serial":{"type":["string","null"]},"model":{"type":["string","null"]},"manufacturer":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"domain":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"agent_version":{"type":["string","null"]},"ips":{"type":["array","null"],"items":{"type":"string"}},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"}},"required":["key","value"]}},"dex_score":{"type":["integer","null"]}},"required":["agent_id","hostname","os","os_label","online","stale","last_seen","last_seen_ms","ci_present","serial","model","manufacturer","cpu_model","cpu_cores","cpu_threads","ram_bytes","os_name","os_version","os_build","arch","domain","primary_mac","agent_version","ips","tags","dex_score"]}},"count":{"type":"integer"},"total_matching":{"type":"integer"},"devices_omitted":{"type":"integer","description":"Roster devices outside the caller scope. Present only for a caller with global read, where it is 0; a confined caller gets scope_basis instead."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: every figure in this result describes only devices within that scope. A status, set whether or not any device was hidden."},"ci_degraded":{"type":"boolean"},"tags_degraded":{"type":"boolean"},"roster_truncated":{"type":"boolean","description":"True when more devices exist than the roster read returns (the newest roster_cap by last heartbeat are listed). Then total_matching and every kpis.* figure are LOWER BOUNDS and a search or filter that returns nothing does not prove a device is absent: confirm a specific device with get_hardware_ci. Clears by itself when the fleet is back under the cap."},"roster_cap":{"type":"integer","description":"The roster row cap that roster_truncated refers to."},"kpis":{"type":"object","properties":{"total":{"type":"integer"},"online":{"type":"integer"},"offline":{"type":"integer"},"stale":{"type":"integer"},"with_ci":{"type":["integer","null"]}},"required":["total","online","offline","stale","with_ci"]},"query":{"type":"object","properties":{"q":{"type":"string"},"os":{"type":"string"},"status":{"type":"string"},"sort":{"type":"string"},"dir":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer"},"tag":{"type":"string"}},"required":["q","os","status","sort","dir","limit","offset","tag"]}},"required":["devices","count","total_matching","ci_degraded","tags_degraded","roster_truncated","roster_cap","kpis","query"]})j";
 
 constexpr const char* kGetOutputSchema =
     R"j({"type":"object","properties":{"agent_id":{"type":["string","null"]},"hostname":{"type":["string","null"]},"os":{"type":["string","null"]},"online":{"type":"boolean"},"last_seen":{"type":["string","null"]},"identity_state":{"type":"string","enum":["found","absent","degraded"]},"ci":{"type":["object","null"],"properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]},"sections":{"type":["array","null"],"description":"Per-section status and rows in registry order. Not emitted as null today: a failed sections read is the retryable error, and an unreadable record makes ci itself null. An empty array means none stored, not that the device has none.","items":{"type":"object","properties":{"kind":{"type":"string"},"status":{"type":["string","null"]},"reason":{"type":["string","null"]},"source":{"type":["string","null"]},"complete":{"type":"boolean"},"rows":{"type":"array","items":{"type":"object","description":"Cells are strings; parse numerics using the unit in the column name. Unread values are null.","additionalProperties":{"type":["string","null"]}}}},"required":["kind","status","reason","source","complete","rows"]}}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source","sections"]},"ci_state":{"type":"string","enum":["found","absent","degraded"]},"sections_state":{"type":"string","enum":["found","absent","degraded"],"description":"found: sections are stored. absent: none stored (an older agent or none reported), not that the device has none. degraded: ci itself could not be read (ci is null). A failed sections read is a retryable error instead, never this value."},"software":{"type":["array","null"],"items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"}},"required":["name","version","publisher","install_date"]}},"software_truncated":{"type":"boolean"},"tags":{"type":["array","null"],"items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"},"updated_at":{"type":"integer"}},"required":["key","value","source","updated_at"]}},"agent_version":{"type":["string","null"]},"sync_supported":{"type":"boolean"},"software_last_seen":{"type":["integer","null"]}},"required":["agent_id","hostname","os","online","last_seen","identity_state","ci","ci_state","sections_state","software","software_truncated","tags","agent_version","sync_supported","software_last_seen"]})j";
+
+constexpr const char* kRecordsOutputSchema =
+    R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"],"description":"The hostname in the stored CI record (the last daily sync); null when empty or the literal unknown."},"ci":{"type":"object","properties":{"manufacturer":{"type":["string","null"]},"model":{"type":["string","null"]},"serial":{"type":["string","null"]},"system_uuid":{"type":["string","null"]},"domain":{"type":["string","null"]},"ou":{"type":["string","null"]},"bios_vendor":{"type":["string","null"]},"bios_version":{"type":["string","null"]},"bios_date":{"type":["string","null"]},"cpu_model":{"type":["string","null"]},"cpu_cores":{"type":["integer","null"]},"cpu_threads":{"type":["integer","null"]},"ram_bytes":{"type":["integer","null"]},"disks_summary":{"type":["string","null"]},"primary_mac":{"type":["string","null"]},"macs_summary":{"type":["string","null"]},"nic_count":{"type":["integer","null"]},"os_name":{"type":["string","null"]},"os_version":{"type":["string","null"]},"os_build":{"type":["string","null"]},"arch":{"type":["string","null"]},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"chassis_type":{"type":["string","null"]},"chassis_serial":{"type":["string","null"]},"chassis_asset_tag":{"type":["string","null"]},"chassis_source":{"type":["string","null"]},"board_vendor":{"type":["string","null"]},"board_product":{"type":["string","null"]},"board_serial":{"type":["string","null"]},"board_source":{"type":["string","null"]},"machine_id_hash":{"type":["string","null"]},"machine_id_algorithm":{"type":["string","null"]},"machine_id_source":{"type":["string","null"]}},"required":["manufacturer","model","serial","system_uuid","domain","ou","bios_vendor","bios_version","bios_date","cpu_model","cpu_cores","cpu_threads","ram_bytes","disks_summary","primary_mac","macs_summary","nic_count","os_name","os_version","os_build","arch","first_seen","last_seen","chassis_type","chassis_serial","chassis_asset_tag","chassis_source","board_vendor","board_product","board_serial","board_source","machine_id_hash","machine_id_algorithm","machine_id_source"]},"content_hash":{"type":["string","null"],"description":"The stored hash of the device's CI record. Equal to your copy means the stored record is unchanged apart from first_seen and last_seen, which can move without a hash change (always take last_seen from the row); unequal means re-read it (it also covers section rows this tool does not return)."},"blob_version":{"type":"integer","description":"1 = the older 22-field record (chassis, board and machine-id values are null), 2 = the versioned record."}},"required":["agent_id","hostname","ci","content_hash","blob_version"]}},"next_cursor":{"type":"string","description":"Pass it back as cursor for the next page. Empty means there is nothing further to read."},"scope_basis":{"type":"string","enum":["authority_scoped"],"description":"Present when the caller's read is confined to a scope: the pages describe only devices within that scope. A status, set whether or not any device was hidden."}},"required":["devices","next_cursor"]})j";
 
 // ── shared answers ─────────────────────────────────────────────────────────
 
@@ -144,6 +148,7 @@ void handle_list_hardware_ci(const ToolCallContext& ctx) {
     }
     auto [scoped, omitted] = scoped_roster(all, gate.scope);
     HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+    page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
     if (deps->dex_score_fn)
         for (auto& row : page.rows)
             row.dex_score = deps->dex_score_fn(row.agent_id);
@@ -157,7 +162,8 @@ void handle_list_hardware_ci(const ToolCallContext& ctx) {
     const bool authority_scoped = gate.scope.has_value();
     const std::string detail = "hardware list (MCP): devices=" + std::to_string(page.total_matching) +
                                (authority_scoped ? " scope=authority_scoped"
-                                                 : " omitted=" + std::to_string(omitted));
+                                                 : " omitted=" + std::to_string(omitted)) +
+                               (page.roster_truncated ? " roster_truncated=1" : "");
     const bool domain_ok = yuzu::server::detail::try_persist_audit(
         deps->audit_fn, ctx.req, "inventory.devices", "success", "Inventory", "fleet", detail);
     const bool generic_ok = ctx.audit("success", detail);
@@ -172,6 +178,93 @@ void handle_list_hardware_ci(const ToolCallContext& ctx) {
         body["scope_basis"] = "authority_scoped";
     }
     answer(ctx, success_response(ctx.id, ctx.tool_result(dump_replace(body), kListOutputSchema)));
+}
+
+// ── list_hardware_ci_records ───────────────────────────────────────────────
+
+void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
+    const ToolDeps* deps = ctx.deps;
+    if (deps == nullptr || !deps->fleet_read_fn || !deps->ci_page_reader || !deps->audit_fn) {
+        answer_unwired(ctx, "hardware service unavailable", "hardware provider unwired",
+                       {"inventory.devices.ci", "Inventory", "fleet"});
+        return;
+    }
+    // The SOLE gate (confined read, ADR-0017). A refusal has already written its own A4
+    // body and status; the handler writes nothing and audits nothing more.
+    const auto gate = deps->fleet_read_fn(ctx.req, ctx.res, "Inventory", "Read");
+    if (!gate.admitted)
+        return;
+
+    // Input is judged before the store is read; the shared strict parser refuses what REST would
+    // clamp.
+    const auto rq = hardware_ci_page::request_from_args(ctx.args);
+    if (!rq) {
+        // An over-long or non-text cursor reads exactly like one that fails to decode below: the
+        // same remediation and the same audit detail, so a caller and the audit trail see one
+        // refusal.
+        const bool cursor_refused = rq.error().fault == hardware_ci_page::ArgFault::kCursorRefused;
+        const bool audit_ok = ctx.audit("denied", cursor_refused
+                                                      ? std::string(hardware_ci_page::kCursorRefusedAuditDetail)
+                                                      : "invalid arguments: " + rq.error().message);
+        // retry-hint-exempt: caller-input rejection
+        answer(ctx, ctx.a4_error(kInvalidParams, rq.error().message,
+                                 cursor_refused ? std::string(hardware_ci_page::kCursorRefusedRemediation)
+                                                : std::string("fix the argument and re-call"),
+                                 -1, {}, audit_ok));
+        return;
+    }
+    const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope);
+    if (!read) {
+        // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
+        const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
+        if (f.unavailable) {
+            // A failed store read is never an empty page (ADR-0016 section 7).
+            answer_store_unreadable(ctx, std::string(f.message).c_str(), "inventory.devices.ci",
+                                    hardware_ci_page::audit_target_type(*rq).c_str(),
+                                    hardware_ci_page::audit_target_id(*rq), f.audit_detail);
+            return;
+        }
+        // A refusal (scope too wide: TERMINAL, the caller's own scope is the cause and no store
+        // read ran; or a refused cursor). The domain verb's row is written only where the
+        // description says so (scope too wide), the generic row always; neither carries a count.
+        const bool domain_ok =
+            !f.domain_audit_row ||
+            yuzu::server::detail::try_persist_audit(
+                deps->audit_fn, ctx.req, "inventory.devices.ci", std::string(f.audit_outcome),
+                hardware_ci_page::audit_target_type(*rq), hardware_ci_page::audit_target_id(*rq),
+                f.audit_detail);
+        const bool generic_ok = ctx.audit(std::string(f.audit_outcome), f.audit_detail);
+        // retry-hint-exempt: caller-input rejection (the store-unreadable arm above carries its hint)
+        answer(ctx, ctx.a4_error(kInvalidParams, std::string(f.message), std::string(f.remediation), -1,
+                                 {}, domain_ok && generic_ok));
+        return;
+    }
+    const hardware_ci_page::Page& page = *read;
+
+    // Both rows are attempted (no short-circuit) so a drop of one never hides the other. A
+    // confined caller never receives an out-of-scope row, id or count: the scope is applied in SQL,
+    // so no row is filtered after the read and neither the body, the cursor nor the audit detail
+    // has anything to carry. Confinement is reported as a STATUS instead (the same rule REST applies,
+    // hardware_ci_page::apply_scope_disclosure). A named device outside the scope gets the same
+    // empty page as a device with no record; only the audit outcome differs: a `denied` row
+    // (the domain row, plus the generic MCP row) instead of a `success` row.
+    const bool authority_scoped = gate.scope.has_value();
+    const char* outcome = page.target_denied ? "denied" : "success";
+    const std::string detail_text = page.target_denied
+                                        ? hardware_ci_page::audit_detail_target_denied("MCP")
+                                        : hardware_ci_page::audit_detail(page, *rq, "MCP", authority_scoped);
+    const bool domain_ok = yuzu::server::detail::try_persist_audit(
+        deps->audit_fn, ctx.req, "inventory.devices.ci", outcome,
+        hardware_ci_page::audit_target_type(*rq), hardware_ci_page::audit_target_id(*rq), detail_text);
+    const bool generic_ok = ctx.audit(outcome, detail_text);
+    if (!domain_ok || !generic_ok) {
+        answer_audit_withheld(ctx);
+        return;
+    }
+
+    nlohmann::json body = hardware_ci_page::page_json(page);
+    hardware_ci_page::apply_scope_disclosure(body, authority_scoped);
+    answer(ctx, success_response(ctx.id, ctx.tool_result(dump_replace(body), kRecordsOutputSchema)));
 }
 
 // ── get_hardware_ci ────────────────────────────────────────────────────────
@@ -281,7 +374,7 @@ constexpr ToolRecord kToolRecords[] = {
      "7-day DEX score, and KPIs over the devices you may read (independent of the filters; "
      "with_ci is null when ci_degraded). Use it to answer 'which devices are X' (filter by q, "
      "os, status, tag; sort by one of the listed sort values) and to get the agent_id that "
-     "get_hardware_ci takes for one device's full record. The hardware facts are the snapshot "
+     "get_hardware_ci takes for one device's full record; to pull the stored CI rows of every device in bulk use list_hardware_ci_records. The hardware facts are the snapshot "
      "from each device's last daily sync; online, last_seen, agent_version, ips and tags are "
      "current server state. For a live read of a device use execute_instruction, and for "
      "installed software across the fleet use query_installed_software. Read-only, paged: limit 1..200 (default 50); more "
@@ -291,7 +384,13 @@ constexpr ToolRecord kToolRecords[] = {
      "disclosed, so devices_omitted appears only for a global-read caller, where it is 0). "
      "Every figure, including kpis, then describes only the devices you may read and is never "
      "a statement about the fleet. An empty devices array with total_matching 0 means nothing "
-     "you may read matches; with total_matching above 0 the offset is past the end. A failed roster read is a retryable error, never an "
+     "you may read matches; with total_matching above 0 the offset is past the end. When "
+     "roster_truncated is true the fleet has more devices than the roster read returns (the "
+     "newest roster_cap by last heartbeat are listed, and the read is still a success): "
+     "the device counts (total_matching and every kpis count) are then lower "
+     "bounds; the list cannot be paged past the roster_cap, and an empty result for "
+     "a search does not prove a device is absent, so confirm a specific device with "
+     "get_hardware_ci, which reads that one device exactly. A failed roster read is a retryable error, never an "
      "empty list. ci_present false means no serial or model has synced for the device. "
      "ci_degraded or "
      "tags_degraded true means that enrichment could not be read, so a null or empty field "
@@ -301,6 +400,55 @@ constexpr ToolRecord kToolRecords[] = {
      R"j({"type":"object","properties":{"q":{"type":"string","maxLength":256,"description":"Search text: whitespace-separated tokens, all must match; only the first 8 tokens are used (hostname, id, model, serial, chassis asset tag, chassis serial, board serial and similar). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Operating-system family filter. Case-sensitive lowercase token."},"status":{"type":"string","enum":["all","online","offline"],"default":"all","description":"Connection-state filter. Case-sensitive lowercase token."},"sort":{"type":"string","enum":["name","os","status","last_seen","manufacturer","model","serial","cpu","ram","os_version","version","ip"],"default":"name","description":"Column to sort by (version is the agent version). Case-sensitive lowercase token."},"dir":{"type":"string","enum":["asc","desc"],"default":"asc","description":"Sort direction. Case-sensitive lowercase token."},"tag":{"type":"string","maxLength":256,"description":"Tag filter: key (any value) or key=value (exact). At most 256 bytes (maxLength counts characters in JSON Schema; the server enforces bytes)."},"offset":{"type":"integer","minimum":0,"default":0,"description":"Rows to skip, for paging, 0 to 9223372036854775807 (a larger value is refused). Advance by the returned count while offset + count < total_matching."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50,"description":"Maximum rows returned, 1..200."}}})j",
      kListOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
      "List hardware CI records", &handle_list_hardware_ci},
+    {"list_hardware_ci_records",
+     "Pull the stored hardware CI records of many devices, one page at a time: one row per device "
+     "with the full scalar CI block (manufacturer, model, serial, system UUID, BIOS, CPU, RAM, "
+     "disks summary, MACs, OS, first_seen, last_seen, and the chassis_*, board_* and machine_id_* "
+     "values) plus the stored content_hash and blob_version. For agentic workers: every row is "
+     "personal data that lands in your context, so pass limit up to 20 (the default here is 20) "
+     "or an agent_id. A scheduled pull into an external CMDB belongs on the REST route GET "
+     "/api/v1/hardware-ci instead, which serves the same pages and cursor with limit up to 1000 "
+     "(default 100). To walk the records: call with no arguments, pass next_cursor back as cursor "
+     "until next_cursor is empty, and compare content_hash with your copy (equal means the stored "
+     "record is unchanged apart from first_seen and last_seen, which move without a hash change, "
+     "so always take last_seen from the row; unequal means re-read). A complete walk is not a "
+     "snapshot: a device registered, removed or newly in your scope during the walk can be missed "
+     "or can vanish, so confirm a device with agent_id before you retire it, and never retire a device "
+     "only because it is absent from a walk: after a database collation change, writes can leave duplicate "
+     "rows and keep decommissioned devices stored (see the server administration guide). The data is each "
+     "device's last daily-sync snapshot: normally refreshed daily while the agent reports, but a "
+     "record can be arbitrarily old until the device is decommissioned, and last_seen is the "
+     "staleness signal. "
+     "Rows are in byte order of agent_id (not locale order); limit is 1..1000 (default 20); "
+     "agent_id restricts the read to one "
+     "device (take agent_id values from list_hardware_ci) and an empty devices array with an "
+     "agent_id means no record or outside your scope, which are indistinguishable by design. An "
+     "empty devices array without agent_id means no stored CI records exist for the devices you "
+     "may read (none has synced one yet), not an error. It "
+     "reads the stored CI table, not the device roster, so a device that has been offline for more "
+     "than 30 days is still returned while its record exists (a record is removed when the "
+     "device's stored data is removed), and it carries no online state, tags or DEX score: for "
+     "those use list_hardware_ci, and for one device's section rows (CPU, DIMM, disk, volume, "
+     "partition) and installed software use get_hardware_ci. "
+     "Read-only. A cursor belongs to the agent_id it was issued with; a refused cursor (malformed, "
+     "over 2048 bytes, or used with a different agent_id) is -32602: omit cursor to restart. "
+     "Confined: results are narrowed to the devices the caller may read and carry scope_basis authority_scoped (a "
+     "status, set whether or not any device was hidden); no count of hidden devices is ever "
+     "returned. Confinement applies only while RBAC enforcement is on: with it off every "
+     "non-engine caller the gate admits reads the whole fleet and a service-scoped token is "
+     "refused. An engine principal is resolved by RBAC alone (refused without an explicit "
+     "Inventory:Read grant, and always while RBAC is off; with the grant it reads fleet-wide), "
+     "and a token whose tier does not allow Inventory:Read is refused. A caller whose scope "
+     "covers more than 10000 devices and passes no agent_id gets "
+     "-32602 (a credential with global read has no such limit; otherwise pass agent_id or narrow "
+     "the scope); that is terminal, do not retry it. A failed "
+     "store read is a retryable error (wait retry_after_ms, 5000, then call once more; do not "
+     "loop), never an empty page. Serial, system UUID, MAC and the chassis and board serials are "
+     "personal data: every served page is audited as inventory.devices.ci and, unlike most MCP "
+     "reads, fails CLOSED (no data, retryable error) when that audit row cannot be persisted.",
+     R"j({"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":1000,"default":20,"description":"Maximum devices in the page, 1..1000. Default 20; prefer 20 or less for agentic use."},"cursor":{"type":"string","maxLength":2048,"description":"The next_cursor of the previous page. Omit it for the first page. Valid only with the same agent_id it was issued with."},"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Read only this device's record: at most 256 bytes, no byte below 0x20 (maxLength counts characters in JSON Schema; the server enforces bytes)."}}})j",
+     kRecordsOutputSchema, "Inventory", "Read", ServiceScopeClass::confined, ToolEffect::ReadOnly, true,
+     "List hardware CI records (bulk)", &handle_list_hardware_ci_records},
     {"get_hardware_ci",
      "Get one device's full hardware record: identity, the synced CI blob (manufacturer, "
      "model, serial, system UUID, BIOS, CPU, RAM, disks, MACs, OS), installed software "

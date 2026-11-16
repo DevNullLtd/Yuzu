@@ -5,9 +5,16 @@ owner: Nathan Dornbrook (platform)
 deciders: Nathan Dornbrook; grill-with-docs design session 2026-06-09
 scope: platform — the shared server Postgres substrate layer (server/core/src/pg/)
 builds-on: ADR-0006 (Postgres substrate), ADR-0007 (single-backend)
+related: 0035-server-is-linux-only-windows-is-agent-only (the server is Linux-only; see the Update below)
 ---
 
 # 0008 — Postgres substrate architecture: libpq + in-house RAII, shared pool, schema-per-store
+
+> **Update (2026-11-14): the server is Linux-only (ADR-0035, accepted 2026-11-10).** The Windows
+> constraints below (the MSVC static-linkage triplet, the libpq DLL canary, dynamic libpq riding the
+> release-zip DLL sweep) were true when written and are kept as history. They no longer apply to
+> the server, which is not built for Windows or macOS (the meson `server` feature option, ADR-0035
+> step 3). "Linux/macOS remain fully static" now means Linux only for the server.
 
 ## Context
 

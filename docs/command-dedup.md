@@ -45,19 +45,17 @@ regressible — nothing fails loudly when one is broken.
    quarantined and recreated, once, rather than leaving the agent degraded on every boot.
    `CommandDedupStore::open` moves the main file to `command_dedup.db.corrupt-<unix-epoch-seconds>[-n]`
    (never overwriting an earlier one, even against a second process recovering in the same second: the name is
-   claimed with an atomic hard link; if the hard link fails for any reason other than the name being taken, it
-   falls back to check-then-rename, for which that guarantee does not hold; if every `-n` is taken it fails
-   instead), carries any non-empty
-   `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty or unmovable sidecars are removed, best
-   effort), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
-   (header-only, unit-tested directly). The claim protects the quarantined EVIDENCE only: two agent daemons on
+   claimed with an atomic hard link; if the hard link fails for any reason other than the name being taken, or
+   if every `-n` is taken, it fails closed instead and the file stays where it is), carries any non-empty
+   `-wal`/`-shm`/`-journal` with it as `<that name>-wal` etc (empty sidecars are removed; one that cannot be
+   renamed is copied, then removed; one whose quarantine name is already taken, or whose copy fails, is removed and not kept, and the note says so), and opens a fresh store. The filesystem half lives in `agents/core/src/command_dedup_quarantine.hpp`
+   (header-only, unit-tested directly). When the original name is replaced or removed only after the claim landed, the judged main file is kept under its `.corrupt-` name with its `-wal`, `-shm` and `-journal` files left at the live names, and the store degrades (`yuzu.dedup_degraded`, fail-open, observable) rather than open a fresh one; a self-consistent stale `-wal` that a later fresh store replays can only make old command_ids read as duplicates (no re-execution). The claim protects the quarantined EVIDENCE only: two agent daemons on
    one data dir are unsupported (no instance lock covers the dedup store; the Guardian boot-epoch lock guards only the epoch claim), and one can still drop the fresh store the other
-   just created. What counts is deliberately narrow:
+   just created. The store passes no verdict-time identity (the connection that failed is already closed), so the move is bound to the regular file at the name at the moment of the claim; a link or directory there is refused, and a regular file swapped in before the claim is not told apart. What counts is deliberately narrow:
    - `SQLITE_CORRUPT` / `SQLITE_NOTADB` from any open step (open, the `journal_mode`/`synchronous` pragmas,
      creating the two tables). Damage confined to the unused `meta` table is tolerated: the
      `schema_version` seed that touches it only logs a warning. BUSY, IOERR, FULL, CANTOPEN and PERM are NOT corruption and never quarantine (that
-     would discard good history). Do not copy echo's `integrity_ok`, which treats any prepare failure as
-     corrupt.
+     would discard good history). Echo's `classify_integrity_rc` makes the same rc split (#7286); Echo also quarantines on a non-`ok` `integrity_check` row, which this store never runs.
    - **There is no whole-file integrity scan, by owner ruling.** A file that opens but has a few damaged pages
      keeps serving the ids on intact pages (in one experiment with a single damaged leaf page nearly every id
      still resolved; damage to an interior or root page costs many more), and only the claims that touch a bad
@@ -95,9 +93,12 @@ regressible — nothing fails loudly when one is broken.
      owner shipped it without the marker, so the enterprise-architect ruling on #6912 ("consumer and durable marker
      ship together"; recorded in `governance.d/3665-dedup-corrupt-db-recovery.yrFs4G.jsonl`) is deferred, not
      satisfied, until #6933 lands.
-   - The helper is a copy of echo's `quarantine_corrupt_db` (`echo_db.cpp`). Hoisting both into
-     `agents/shared` is tracked in #6914. Echo does not yet have this code's
-     no-overwrite claim or negative-epoch clamp.
+   - The move is the shared `agents/shared/sqlite_quarantine.hpp`, also used by echo's `echo_db.cpp` (#6914). It
+     never overwrites an earlier quarantine, which needs a filesystem with hard links (NTFS, ReFS, ext4, xfs, APFS
+     and tmpfs all have them): without them the claim fails closed, the file is left in place and this store
+     degrades observably, because there is deliberately no check-then-rename fallback. A sidecar that cannot be
+     renamed is copied to its quarantine name before the original is removed, and the helper returns notes that
+     the store logs.
    - Tracked follow-ups: a Windows rename retry and a Windows test leg for the hard-link claim (#6913); moving the
      sidecars before the main file so a crash cannot lose the newest WAL (#6915).
 

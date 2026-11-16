@@ -107,6 +107,9 @@ TEST_CASE("mcp step-up policy: the lookup finds each row once and refuses a near
 
 TEST_CASE("mcp step-up policy: every kExempt reason is from the named class list",
           "[stepup][mcp][policy]") {
+    // The closed list: 7 reasons before #2146 batch C added kContentAuthoring for the instruction
+    // authoring writes (a new reason is a reviewed addition, never a quiet one).
+    CHECK(step_up_mcp_detail::kMcpExemptReasons.size() == 8);
     for (const auto& e : kMcpStepUpPolicy) {
         INFO("tool: " << std::string(e.tool) << " reason: " << std::string(e.reason));
         if (e.cls == StepUpClass::kExempt) {
@@ -268,16 +271,18 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     CHECK(pending_rows() == 50);
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
-    // The MCP table shape: 75 rows, 25 exempt, 50 pending (#6087 added the two DEX score policy
+    // The MCP table shape: 82 rows, 32 exempt, 50 pending (#6087 added the two DEX score policy
     // write twins, both exempt kOperationalData; #2146 batch B added the two
     // execution twins, both exempt: cancel_execution kCancelsRecord, record_execution_rerun
     // kCreatesRerunRecord; and execute_instruction_definition and execute_workflow, both exempt
-    // kExecutionDispatch; ADR-0070 R1 added the four revocation-source mutations, all pending).
-    CHECK(std::size(kMcpStepUpPolicy) == 75);
+    // kExecutionDispatch; ADR-0070 R1 added the four revocation-source mutations, all pending;
+    // #2146 batch C added the seven instruction-definition / instruction-set authoring writes,
+    // all exempt kContentAuthoring).
+    CHECK(std::size(kMcpStepUpPolicy) == 82);
     std::size_t exempt = 0;
     for (const auto& e : kMcpStepUpPolicy)
         exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;
-    CHECK(exempt == 25);
+    CHECK(exempt == 32);
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",
@@ -290,7 +295,8 @@ TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is n
         INFO("twin: " << std::string(e.rest_method) << " " << std::string(e.rest_pattern));
         const auto* twin = step_up_policy_for(e.rest_method, e.rest_pattern);
         REQUIRE(twin != nullptr);
-        if (twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kPendingRuling)
+        if (twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kFactorCredential ||
+            twin->cls == StepUpClass::kPendingRuling)
             CHECK(e.cls != StepUpClass::kExempt);
     }
 }

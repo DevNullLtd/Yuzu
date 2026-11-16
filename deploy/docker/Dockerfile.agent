@@ -33,7 +33,7 @@ ENV VCPKG_ROOT=/opt/vcpkg
 
 WORKDIR /src
 COPY vcpkg.json vcpkg-configuration.json ./
-# Agent-only: the meson configure below is -Dbuild_server=false -Dbuild_tests=false,
+# Agent-only: the meson configure below is -Dserver=disabled -Dbuild_tests=false,
 # so opt out of vcpkg.json's default `server` + `tests` features (libpq, xmlsec,
 # drogon, catch2). Add --x-feature=agent here once that feature has content, and
 # --x-feature=tests if -Dbuild_tests=true is ever set below (tests/meson.build needs Catch2).
@@ -55,7 +55,7 @@ RUN meson setup builddir \
     -Dcmake_prefix_path=/src/vcpkg_installed/${TRIPLET} \
     -Dpkg_config_path=/src/vcpkg_installed/${TRIPLET}/lib/pkgconfig \
     -Dbuild_tests=false \
-    -Dbuild_server=false \
+    -Dserver=disabled \
     && meson compile -C builddir ${YUZU_BUILD_JOBS:+-j "${YUZU_BUILD_JOBS}"}
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────

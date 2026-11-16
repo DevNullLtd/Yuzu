@@ -26,6 +26,7 @@
 #include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
 #include "hardware_section_integrity.hpp"
+#include "offline_endpoint_store.hpp" // kQueryRowCap vs the emitted roster_cap
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -560,6 +561,30 @@ TEST_CASE("hardware_list_json: with_ci renders the real count when not degraded"
     CHECK(j["ci_degraded"] == false);
     CHECK(j["tags_degraded"] == false);
     CHECK(j["query"]["dir"] == "asc");
+    // #5712: the partial-roster fields are ALWAYS present (a stable schema), false when complete.
+    CHECK(j["roster_truncated"] == false);
+    CHECK(j["roster_cap"] == kOfflineRosterRowCap);
+}
+
+// #5712. Kills: dropping the flag from the shared REST+MCP body, deriving it from the row count
+// instead of the page's typed bit, and emitting a different cap than the store enforces.
+TEST_CASE("hardware_list_json: a truncated roster is reported as a lower bound, not hidden",
+          "[hardware][model][json][roster_truncated]") {
+    const std::vector<InventoryDeviceRow> roster{make_row("a1")};
+    HardwareListQuery q;
+    q.sort = "name";
+    q.limit = 50;
+    auto page = build_hardware_list_page(roster, q);
+    CHECK_FALSE(page.roster_truncated); // build_hardware_list_page sees rows only, never the bit
+    page.roster_truncated = true;
+
+    const auto j = hardware_list_json(page, /*ci_degraded=*/false, /*devices_omitted=*/0,
+                                      /*tags_degraded=*/false);
+    CHECK(j["roster_truncated"] == true);
+    CHECK(j["roster_cap"] == kOfflineRosterRowCap);
+    CHECK(j["roster_cap"] == OfflineEndpointStore::kQueryRowCap);
+    CHECK(j["ci_degraded"] == false); // a partial is not a degraded read
+    CHECK(j["count"] == 1);           // still served
 }
 
 // ── agent_supports_sync_now ──────────────────────────────────────────────────
@@ -904,20 +929,33 @@ TEST_CASE(
 // ── #5531: the pure store-to-bit mappings server.cpp's closures delegate to ───
 
 // Kills: apply_roster_read treating a failed read as healthy (returns true / leaves a degraded
-// bit unset), and a healthy read being flagged degraded.
+// bit unset), a healthy read being flagged degraded, and (#5712) a truncated read being treated
+// as a failure (refused / degraded) or its truncated bit being dropped.
 TEST_CASE("apply_roster_read: failed read sets every degraded bit; healthy read touches nothing",
-          "[hardware][model]") {
+          "[hardware][model][roster_truncated]") {
     InventoryDevicesResult failed;
     CHECK_FALSE(apply_roster_read(failed, OfflineRosterRead{std::unexpected(PresenceReadError::DbError)}));
     CHECK(failed.roster_degraded);
     CHECK(failed.ci_degraded);
     CHECK(failed.tags_degraded);
+    CHECK_FALSE(failed.roster_truncated); // an unread roster says nothing about the cap
 
     InventoryDevicesResult healthy;
-    CHECK(apply_roster_read(healthy, OfflineRosterRead{std::vector<OfflineEndpoint>{}}));
+    CHECK(apply_roster_read(healthy, OfflineRosterRead{OfflineRoster{}}));
     CHECK_FALSE(healthy.roster_degraded);
     CHECK_FALSE(healthy.ci_degraded);
     CHECK_FALSE(healthy.tags_degraded);
+    CHECK_FALSE(healthy.roster_truncated);
+}
+
+TEST_CASE("apply_roster_read: a truncated roster is served and flagged, never degraded (#5712)",
+          "[hardware][model][roster_truncated]") {
+    InventoryDevicesResult partial;
+    CHECK(apply_roster_read(partial, OfflineRosterRead{OfflineRoster{{make_offline_ep("a1", 1)}, true}}));
+    CHECK(partial.roster_truncated);
+    CHECK_FALSE(partial.roster_degraded); // the refusal trap (#5371): a partial is not an outage
+    CHECK_FALSE(partial.ci_degraded);
+    CHECK_FALSE(partial.tags_degraded);
 }
 
 // Kills: a failed key read collapsed to "no keys" (blank Tags column reads as authoritative), a
@@ -971,25 +1009,27 @@ TEST_CASE("apply_tag_read: every failed read degrades and every healthy read pop
 }
 
 // Kills: offline_identity_row swallowing the read error into an empty optional ("not found"); and
-// the stale-boundary mutant (`>=` for `>` on kHardwareStaleAfterMs).
+// the stale-boundary mutant (`>=` for `>` on kHardwareStaleAfterMs). #5712: it now maps the POINT
+// read (`find_within`), whose empty answer is a CONFIRMED absence.
 TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullopt",
-          "[hardware][model]") {
+          "[hardware][model][roster_truncated]") {
     const auto err = offline_identity_row(
-        OfflineRosterRead{std::unexpected(PresenceReadError::StoreUnavailable)}, "a1", 10 * kDayMs, fake_age);
+        OfflineEndpointRead{std::unexpected(PresenceReadError::StoreUnavailable)}, 10 * kDayMs, fake_age);
     REQUIRE_FALSE(err.has_value());
     CHECK(err.error() == PresenceReadError::StoreUnavailable);
 
-    const OfflineRosterRead roster{std::vector<OfflineEndpoint>{make_offline_ep("a1", 9 * kDayMs)}};
-    const auto hit = offline_identity_row(roster, "a1", 10 * kDayMs, fake_age);
+    const OfflineEndpointRead found{std::optional<OfflineEndpoint>{make_offline_ep("a1", 9 * kDayMs)}};
+    const auto hit = offline_identity_row(found, 10 * kDayMs, fake_age);
     REQUIRE(hit.has_value());
     REQUIRE(hit->has_value());
+    CHECK((*hit)->agent_id == "a1");
     CHECK((*hit)->hostname == "host-a1");
     CHECK_FALSE((*hit)->online);
     CHECK_FALSE((*hit)->stale); // 1 day old
     CHECK((*hit)->last_seen == "aged");
 
     const auto old = offline_identity_row(
-        OfflineRosterRead{std::vector<OfflineEndpoint>{make_offline_ep("a1", 0)}}, "a1", 10 * kDayMs, fake_age);
+        OfflineEndpointRead{std::optional<OfflineEndpoint>{make_offline_ep("a1", 0)}}, 10 * kDayMs, fake_age);
     REQUIRE(old.has_value());
     CHECK((*old)->stale);
 
@@ -997,21 +1037,70 @@ TEST_CASE("offline_identity_row: error propagates; hit is offline; miss is nullo
     // pinned separately; at the edge is fresh, one millisecond over is stale.
     CHECK(kHardwareStaleAfterMs == 2 * kDayMs);
     const auto at_edge = offline_identity_row(
-        OfflineRosterRead{
-            std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs)}},
-        "a1", 10 * kDayMs, fake_age);
+        OfflineEndpointRead{std::optional<OfflineEndpoint>{
+            make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs)}},
+        10 * kDayMs, fake_age);
     REQUIRE(at_edge.has_value());
     CHECK_FALSE((*at_edge)->stale);
     const auto past_edge = offline_identity_row(
-        OfflineRosterRead{
-            std::vector<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs - 1)}},
-        "a1", 10 * kDayMs, fake_age);
+        OfflineEndpointRead{std::optional<OfflineEndpoint>{
+            make_offline_ep("a1", 10 * kDayMs - kHardwareStaleAfterMs - 1)}},
+        10 * kDayMs, fake_age);
     REQUIRE(past_edge.has_value());
     CHECK((*past_edge)->stale);
 
-    const auto miss = offline_identity_row(roster, "zzz", 10 * kDayMs, fake_age);
+    // A confirmed absence is nullopt, never an error and never a row.
+    const auto miss = offline_identity_row(OfflineEndpointRead{std::optional<OfflineEndpoint>{}},
+                                           10 * kDayMs, fake_age);
     REQUIRE(miss.has_value());
     CHECK_FALSE(miss->has_value());
+}
+
+// Kills (#7551): the offline fallback hard-coding online=false, so a device connected to ANOTHER
+// replica read as offline on its own record, REST GET /hardware/{id} and MCP get_hardware_ci.
+TEST_CASE("offline_identity_row: a row the database says is live reads online, not offline",
+          "[hardware][model]") {
+    OfflineEndpoint live = make_offline_ep("a1", 10 * kDayMs - 5000); // heartbeat five seconds ago
+    live.live = true;
+    const auto hit = offline_identity_row(OfflineEndpointRead{std::optional<OfflineEndpoint>{live}},
+                                          10 * kDayMs, fake_age);
+    REQUIRE(hit.has_value());
+    REQUIRE(hit->has_value());
+    CHECK((*hit)->online);
+    CHECK((*hit)->last_seen == "now");              // the list's own wording for a connected device
+    CHECK((*hit)->last_seen_ms == 10 * kDayMs);     // the read's clock, as the list does
+    CHECK_FALSE((*hit)->stale);
+
+    // The same row without the flag (a read that was not given a TTL, or a departed device) is the
+    // offline row it always was: the flag is the ONLY thing that changes it.
+    const auto not_live = offline_identity_row(
+        OfflineEndpointRead{std::optional<OfflineEndpoint>{make_offline_ep("a1", 10 * kDayMs - 5000)}},
+        10 * kDayMs, fake_age);
+    REQUIRE(not_live.has_value());
+    REQUIRE(not_live->has_value());
+    CHECK_FALSE((*not_live)->online);
+    CHECK((*not_live)->last_seen == "aged");
+    CHECK((*not_live)->last_seen_ms == 10 * kDayMs - 5000);
+}
+
+// #7566: a roster row reads Online when the database says it is live OR this replica holds its
+// session. Kills: dropping the `live` half (a device connected to ANOTHER replica reads Offline
+// again), dropping the local half (a session whose row has not recorded a session id reads Offline),
+// and treating "nothing says so" as Online.
+TEST_CASE("roster_row_online: live OR local session, nothing else", "[hardware][model]") {
+    OfflineEndpoint e = make_offline_ep("a1", 1000);
+    const std::unordered_set<std::string> none;
+    const std::unordered_set<std::string> local{"a1", "other"};
+    const std::unordered_set<std::string> elsewhere{"zzz"};
+
+    CHECK_FALSE(roster_row_online(e, none));
+    CHECK_FALSE(roster_row_online(e, elsewhere));
+    CHECK(roster_row_online(e, local)); // local session only: the database lags
+
+    e.live = true; // the database says it is connected (another replica)
+    CHECK(roster_row_online(e, none));
+    CHECK(roster_row_online(e, elsewhere));
+    CHECK(roster_row_online(e, local));
 }
 
 // Kills: apply_identity_read never setting identity_degraded, or setting it on a clean miss.

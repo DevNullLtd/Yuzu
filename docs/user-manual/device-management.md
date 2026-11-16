@@ -264,7 +264,7 @@ Every per-device route is scoped to the device's management group (a global gran
 
 A device with zero reported guards and no pending evidence renders "No guards evaluated" even if the fleet-wide rule catalogue read is itself degraded — the per-device read no longer depends on the catalogue's own health for a zero-row device (a small, disclosed rendering delta from the ADR-0031 WS-A4 seam rewire).
 
-A device with no census rows but with pending evidence renders the notice and "No guards in the compliance census" instead. If the pending-evidence read itself times out (most likely a large retained pending backlog; a lock wait, a loaded database or an administrator cancel can also cause it), the tab shows "Guardian pending-evidence read timed out" and says reloading usually will not help until the cause clears; any other store failure shows "Guardian store degraded.". Either way the open is audited as `guardian.device.view` with result `failure`.
+A device with no census rows but with pending evidence renders the notice and "No guards in the compliance census" instead. If the pending-evidence read itself times out (most likely a large retained pending backlog; a lock wait, a loaded database or an administrator cancel can also cause it), the tab shows "Guardian pending-evidence read timed out" and says reloading usually will not help until the cause clears; any other store failure shows "Guardian store degraded.". A failed read of the device's emit-order state is such a failure: the tab shows "Guardian store degraded." instead of the guard rows (the tab does not render ordering), and the failed read is counted on `yuzu_server_guardian_read_degrade_total{source="guardian_census_device"}`. Either way the open is audited as `guardian.device.view` with result `failure`.
 
 #### Get live info
 
@@ -740,3 +740,9 @@ curl -s http://localhost:8080/api/deployment-jobs/{job_id} \
 curl -s -X DELETE http://localhost:8080/api/deployment-jobs/{job_id} \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+## Routed-concern invariants
+
+Moved verbatim from the `Device pages` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Device pages (`/devices` + `/device?id=`) — SHARED device surface: Device info / DEX / Guardian lens tabs + "Get live info" dispatch-and-poll snapshot; every kind has its own `device.live.<kind>` audit verb — usage-class reads stay separately countable (works-council). CRITICAL: (1) ALL behavioural-PII access-audit funnels through `server/core/src/rest_audit.hpp` (`emit_behavioral_audit`, #1647) — REST fail-closed 503 + `Sec-Audit-Failed`, dashboard HTML + MCP set-and-proceed; NEVER reintroduce an inline bool-capture on a new PII route (last un-migrated: `device.live.*` REST; #1703). (2) Result polls scoped at the store seam — `ResponsesFn` threads `agent_id` into `ResponseQuery{.agent_id}` (#1634); post-filter is defense-in-depth only.

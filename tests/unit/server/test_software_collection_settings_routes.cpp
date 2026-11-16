@@ -41,6 +41,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -511,8 +512,15 @@ TEST_CASE("collection settings routes: a caller without the global grant is refu
     const auto boss = rig.global_admin();
     REQUIRE(rig.call("PUT", rig.doc_path(rig.group_p), boss, put_body(7200))->status == 200);
     const auto version = rig.store->get(rig.group_p)->value().version;
-    // An ITServiceOwner row on P (no route authors one; the store can) carries no authority here.
-    REQUIRE(rig.mgmt.assign_role({rig.group_p, "user", "gowner", "ITServiceOwner"}).has_value());
+    // An ITServiceOwner row on P carries no authority here. No route authors one and the store
+    // now refuses one, so the row is planted by direct SQL (the shape an older build left).
+    yuzu::test::plant_group_role_row(rig.mgmt_bundle.dsn(),
+                                     {rig.group_p, "user", "gowner", "ITServiceOwner"});
+    // The row must be there, or "carries no authority" below would hold trivially.
+    const auto planted = rig.mgmt.get_group_roles(rig.group_p);
+    REQUIRE(std::ranges::any_of(planted, [](const GroupRoleAssignment& r) {
+        return r.principal_id == "gowner" && r.role_name == "ITServiceOwner";
+    }));
     const auto expiry = now_secs() + 3600;
     const auto owner = rig.cookie("gowner");
     auto plain = rig.api_tokens->create_token("plain", "gowner", expiry);

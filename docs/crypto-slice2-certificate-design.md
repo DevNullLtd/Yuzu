@@ -636,7 +636,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
 (`reason=decommissioned`).
 - **No race.** Ingest (`pg_try_advisory_xact_lock`, deferring when busy) and `delete_agent` (the same lock, waited for under a bounded `lock_timeout`) both take the same per-agent lock first, on a hash of the agent id, so a decommission cannot commit between the
   ingest's tombstone read and its commit.
-- **What decommission does today (verified).** The decommission cascade erases seven data stores on `dev` today, and **eight once 2a-2a merges** (the certificate inventory is the eighth; `agent_decommission.cpp` on the 2a-2a branch)
+- **What decommission does today (verified).** The decommission cascade erases seven data stores on `dev` today, and **eight once 2a-2a merges** (the certificate inventory is the eighth; `agent_decommission.cpp` on the 2a-2a branch; update 2026-11-09: the cascade is now nine stores, the Guardian compliance census `guaranteed_state` (#5675) being the ninth)
   and no auth store (`server.cpp:10019-10029`, `agent_decommission.hpp:117-125`); the only
   `pending_agents` delete is pending-only (`auth_db.cpp:2765`). So an approved agent's enrolment
   record survives decommission. If that agent is still running, it re-registers through the

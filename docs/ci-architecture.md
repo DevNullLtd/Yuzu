@@ -34,7 +34,7 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   see "PG push-leg policy" below. PR coverage is unaffected (the PR `exclude:`
   already trims the matrix to gcc-15/debug alone, which always resolves to
   `pg_mode: full`). **Since ADR-0035 ladder step 1**, the Windows and macOS legs
-  are agent-only (`-Dbuild_server=false`): they build and test no server code and
+  are agent-only (the `server` option is `auto`, off on any non-Linux target; step 1 passed `-Dbuild_server=false`): they build and test no server code and
   run no Postgres suite, so `pg_mode` exists on the Linux matrix only. (From the
   Windows test-phase split, #3443 on 2026-08-28, until then the Windows matrix
   carried the same `pg_mode` key: debug=full, release=smoke.)
@@ -332,15 +332,28 @@ code.
 
 ### Browser smoke (`/test` Phase 5, `tests/puppeteer/ui-smoke.mjs`)
 
-A local gate in `/test`, not a CI job. It drives a headless browser against the running
-dashboard: it crawls every route the shell nav links to (200, the `Content-Security-Policy`
-header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
+A gate in two parts. The live scenarios run from `/test` only: they need a running dashboard, so they
+are not a required CI job. The selftest pair also runs in CI, in the path-filtered, non-required
+`ui-smoke-selftest` workflow (`.github/workflows/ui-smoke-selftest.yml`, described below). In `/test`
+the gate drives a headless browser against the running dashboard: it crawls every route the shell nav
+links to (200, the `Content-Security-Policy` header, no page error, `console.error` or HTTP status of 400 or more), cross-checks the
 discovered routes against `EXPECTED`, a hand-copied list of the nav in `app_shell.cpp`, in both
 directions, checks that submit controls stay inside their form or dialog at two viewport sizes,
-and runs four scenarios (stubbed where they write: those requests are answered in the browser,
-so nothing reaches the server). The gate first runs
+and runs nine scenarios (five that each force their own precondition, with writes answered by a
+request stub in the browser so nothing reaches the server; the DEX Apps tab: a live keyboard half
+plus a committed golden page served through a GET stub; a held Apps response superseded by Overview;
+the DEX controls operated from the keyboard; and the Find software panel on `/software`: live
+searches plus Load more served through a GET stub). The gate first runs
 `ui-smoke.mjs --selftest`, which checks against a local fixture (no stack) that each crawl and
-layout check fails when it should; a selftest failure fails the gate. A failure records FAIL (the
+layout check fails when it should, and that the Apps expander check fails on the committed golden when
+its `:has()` rules are removed; a selftest failure fails the gate.
+
+The selftest half also runs in CI: the path-filtered `ui-smoke-selftest` workflow
+(`.github/workflows/ui-smoke-selftest.yml`) runs `node tests/puppeteer/ui-smoke.mjs --selftest` on a
+hosted `ubuntu-24.04` runner when `server/core/src/*_ui.cpp`, `server/core/src/dex_pane.hpp`,
+`server/core/src/dex_routes.cpp`, `server/core/src/plural.hpp`, `server/core/static/**`, `tests/puppeteer/**`, the Apps goldens or the install script change. It is **not a required check**: it
+is path-filtered, and the `dev` ruleset blocks a merge on a required check that was skipped. The live
+half (the scenarios against a running dashboard) stays in `/test`, because it needs the UAT stack. A failure records FAIL (the
 older `Puppeteer` gate is warn-only). `/test` Phase 0b runs `scripts/test/ensure-puppeteer.sh`,
 which installs the Node dependencies and Chrome for Testing when absent and proves the browser
 launches headless; if it cannot, the run aborts before the build. A missing
@@ -428,6 +441,11 @@ the `release` job needs `docker-publish`, `docker-publish-postgres` and
 `docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
 `:latest`) first (the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
+An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
+`docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
+(`build-linux`, `build-gateway`, `build-windows`, `build-macos`; ADR-0035 step 3,
+a success gate, not an artifact dependency), so a failed build, including a failed
+agent packaging step, pushes no versioned image.
 `docker-publish-chisel` joined the release's needs in #5242, so the release
 waits for the chisel builds (minutes with a warm cache, much longer cold) and
 the three chisel images' SBOMs are always release assets, inside `SHA256SUMS`;
@@ -691,12 +709,30 @@ runs that suite, "Test suites by leg" below), so the ratchet is enforced on the 
 `Linux gcc-15 debug` leg without depending on the advisory job. A PR that changes only `docs/**` or root `*.md` builds nothing (see "Docs-only changes"),
 but it cannot touch `content/` or the baseline, which are classified as code.
 
+### Execution owner key tripwire and self-test (`docs` suite + `docs-lint.yml`, #5557)
+
+`tests/test_execution_owner_key_tripwire.py` is a best-effort lexical check, not a control-flow
+proof, that execution admission is keyed on the owner key and that neither list gate hands a
+service-scoped session unrestricted authority; its self-test
+(`tests/test_execution_owner_key_tripwire_selftest.py`) mutates the server sources in memory and
+proves each mutation is caught. The tripwire runs as a step of the `changelog-order` job (check
+name "CHANGELOG order", the required one). The self-test costs about half a minute of CPU, more on
+a hosted runner, so it is its own job, `execution-owner-key-selftest` (check name "Execution owner
+key tripwire self-test"), which keeps it out of the required check's five minute budget. That job
+is **advisory**: the workflow's own header names only "CHANGELOG order" as required, and the
+repository owner may add the job to branch protection. Both tests are also registered in
+`tests/meson.build` (suite `docs`), and the `linux` job of `ci.yml` lists `--suite docs`, so the
+self-test still gates on the required `Linux gcc-15 debug` leg without depending on the advisory
+job. A red self-test job means a frozen set no longer matches or a mutation went undetected; it is
+fixed by reviewing the edit, not by re-running the job.
+
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — six parser families
-under `server/core/src/` plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — seven parser families
+(six under `server/core/src/`, the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
@@ -1064,11 +1100,12 @@ pin fails `unpinned_leaf_is_refused`. It cannot skip: the script has no skip pat
 prerequisite exits non-zero, and `YUZU_REAL_UPSTREAM_STRICT=1` turns a check the suite cannot make
 (server unreachable, `/metrics` unreadable) into a failure. The four runner agents share one OS
 identity (#1871), so every named resource is per-run: all 8 ports come from the OS in one
-allocation (`--free-ports`), the Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
+allocation (`--free-ports`). A start-up that loses one to another process before binding it is retried, up to 3 attempts, on an unambiguous bind failure only, and a retry is a `::warning::` annotation and a step-summary line (#7538). The Postgres database is `yuzu_test_<epoch>_gwint_<random>` created on
 the job's `YUZU_TEST_POSTGRES_DSN` and dropped on exit, the work directory is a `mktemp` name under
 `runner.temp`, and the gateway's Erlang node name and cookie carry a random salt (the release's own
 fixed `yuzu_gw` short name would contest the shared EPMD). A failed run keeps its work directory and
-the step "Upload gateway real-wire logs on failure" uploads its logs (`failure() &&` leads the
+the step "Upload gateway real-wire logs on failure" uploads its logs, including each retried
+attempt's `server.attemptN.log` / `gateway.attemptN.log` (`failure() &&` leads the
 condition) and the Common Test logs, never the run's throwaway CA or agent keys. The burst's own log
 (`mgmt_driver.log`) is among the uploaded `*.log` files.
 
@@ -1123,8 +1160,11 @@ tooling, not a CI gate (the CI coverage job is `nightly.yml`'s, with its own gco
 invocation). Its behaviour (build-dir lock, inconclusive runs, DB-write handling, the
 Linux-only refusal, option and baseline validation) is pinned by the mock-based harness
 `tests/shell/test_pr2_gates.sh`. Preflight's "Shell gate tests" step runs the fast
-scenarios only, `CH-18 CH-20 CH-21 CH-22 CH-24` (about 25 s; bash, python3 with sqlite3, procps
-and findutils, all on the hosted image; the fixtures stub `ps`, `find` and `ln`). The
+scenarios only, `CH-6 CH-18 CH-20 CH-21 CH-22 CH-24 CH-25 CH-26` (bash, python3 with sqlite3, procps
+and findutils, all on the hosted image). CH-6/CH-25 check performance parser,
+requested-scale and evidence-write verdicts. CH-26 captures coverage at two real
+Git revisions and again at the same revision, retaining distinct evidence identities.
+The coverage fixtures stub disk space as well as `ps`, `find` and `ln`, so host capacity cannot change the expected result. The
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
@@ -1217,7 +1257,7 @@ telemetry start step exports the same values for already-running listeners.
 ### Windows test-phase concurrency gate
 
 **Update (ADR-0035 ladder step 1).** The Windows leg is now agent-only: it
-configures with `-Dbuild_server=false` into `build-windows-agent-{debug,release}`
+configures agent-only (step 1 passed `-Dbuild_server=false`; since step 3 it passes nothing and the `server` option's `auto` is off on Windows) into `build-windows-agent-{debug,release}`
 and has one test step, `Test (non-pg suites)`, selecting `--suite agent --suite
 platform --suite proto --suite echo --suite gateway`. The `Ensure Postgres`,
 `Resolve pg_mode + assert Postgres DSN`, `Test (pg shards, full)` and `Test (pg
@@ -1284,18 +1324,27 @@ label still fails loud.
 
 `Test (non-pg suites)` also carries the registry plugin's real-registry cases (#6488). It sets
 `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1`, so a case that would skip (no `registry.dll`, or a process that
-cannot write `HKLM`; the job runs as LOCAL SYSTEM, which can) fails instead. The job-level
+cannot write `HKLM`) fails instead. The one exception is the Echo bam live case (#6898): a runner account can be refused
+(error 5) creating its scratch keys under `HKLM\SYSTEM\CurrentControlSet\Services\bam` (measured on one test host as an elevated non-SYSTEM
+user: a key directly under `bam` was allowed, `bam\State\UserSettings` was refused; LOCAL SYSTEM could write both on that host; the Windows CI leg's own account is not LOCAL SYSTEM and was refused at `bam\State\UserSettings` in CI run 43294719354, #7637), and then
+the case SKIPs even with the flag set. The exclusion is proven live only where the account may write (e.g. a LOCAL SYSTEM
+host), so while the Windows runner's account stays refused CI does not run it (#7637; the missing test of the skip
+decision is #7638). Any other failure of that case still fails the job, including a refusal to open `bam\State` for reading, which has not been measured (#7637). The job-level
 `YUZU_TEST_REGISTRY_SCOPE` (`<run id>-<attempt>-<build type>`) puts every scratch key under
 `YuzuTest-<scope>-`, so two test phases sharing a box through the 2-slot gate judge only their own keys. The script
-scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node` and `HKCU\Software`; the
+scans only the direct children named `YuzuTest-*` of `HKLM\SOFTWARE`, its `Wow6432Node`, `HKCU\Software` and (for the
+#6898 Echo bam-exclusion live case) `HKLM\SYSTEM\CurrentControlSet\Services\bam` and its `State\UserSettings`; the
 local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys (`test_registry_local_dispatcher.cpp:228,248`) are
 outside the scan.
-Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans and proves both decisions of
+Before the suite, `Self-test the registry leftover check` plants a probe key under each root the script scans (except a `bam` root the runner account is refused at, below) and proves both decisions of
 `scripts/ci/check-registry-test-leftovers.ps1` (the probe's own scope: exit 1 with an `::error` naming it; any
-other scope: exit 0 with a `::warning`); after it, `Assert this job left no YuzuTest-* registry keys behind` runs
+other scope: exit 0 with a `::warning`). A probe under one of the two `bam` roots where the runner account is refused
+is replaced by a check that the script still lists that root, with a `::warning` that also names the runner's identity
+and says the bam live case is expected to skip; the three other roots always need a live probe. After the self-test,
+`Assert this job left no YuzuTest-* registry keys behind` runs
 the same script with the job's scope; a root it cannot list fails the step (a missing root is skipped). The
 could-not-list arm has no self-test of its own (accepted residual): a persistent listing failure is caught pre-suite,
-because the self-test's probes go unnamed. It reports and never deletes (a leftover can be a registry link, and a
+because the other-scope self-test arm expects exit 0 and a failed listing makes it exit 1. The check reports and never deletes (a leftover can be a registry link, and a
 tree delete follows links), so a key orphaned by a cancelled job stays as a warning in later jobs until a human
 removes it.
 
@@ -1303,6 +1352,11 @@ Removing a leftover is the job of whoever owns the runner. For each `YuzuTest-*`
 progress, open the key with `REG_OPTION_OPEN_LINK` and `DELETE` access, then call `NtDeleteKey` on that handle (a key
 with subkeys: delete them first, leaf first, the same way). Never use `Remove-Item -Recurse` or `RegDeleteTreeW`:
 both follow a registry link and can delete its target.
+
+The Echo bam live case (#6898) sets a deny-read DACL for Everyone on its scratch key under `bam\State\UserSettings`,
+so a leaf it left behind (a killed run) is expected to refuse `Get-Item`, `Remove-Item` and `reg delete`, which open the key for read
+first. The recipe above still applies: the deny covers read only, so open the key with `DELETE` access and call
+`NtDeleteKey`; its sibling directly under `bam` carries the default DACL.
 
 **Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
 `YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
@@ -2268,6 +2322,78 @@ saving is an estimate until measured:
   set `YUZU_CI_SEQUENTIAL_HALVES=1`, record why here, and revisit.
 - Record the samples, run and job ids, SHAs, runner names and slot waits here.
 
+**Measured (2026-11-13), after the merge (#7460, merge commit `0f8a891fb2`, 2026-11-10).**
+The per-entry 1.5x check failed in 2 of the 10 candidate runs, and the median job wall
+time fell 35%, from 18.8 min to 12.2 min. The owner kept the concurrency (2026-11-13),
+accepting the misses as the cost of sharing the CPUs, not as a revert trigger. Both
+results are recorded below, so the next change to this step starts from them.
+
+- Samples. The candidate is the first 10 successful `dev`-push runs of the job after the
+  merge, not a same-SHA pair: the PR's own same-SHA samples are not recorded (not in the
+  PR, its ledger fragment or this doc). One run in that window (42913101361, 2026-11-10
+  22:17, 0.1 min) is excluded because its job skipped every step. The baseline is the 12
+  successful `dev`-push runs before the merge. All 22 ran on Big Tam
+  (`yuzu-bigtam-linux-0` to `-3`), and every `with-test-slot` acquisition in every run
+  waited 0 s.
+- Job wall time (jobs API, `started_at` to `completed_at`): baseline median 18.8 min
+  (range 17.6 to 24.8), candidate median 12.2 min (range 10.6 to 16.6), so 35% below the
+  baseline against the 10% bar.
+- 80% of timeout: no entry of either half reached it. The closest was
+  `gateway eunit shard A`, at 267 s of 600 s (45%); the slowest pg shard, A, reached
+  187 s of 700 s (27%).
+- 1.5x baseline mean (entries of 5 s or more): **failed in 2 of 10 runs**, by two pg
+  shards on the same two adjacent runs (2026-11-10 21:11 and 21:45): shard O at 79.9 s
+  and 82.9 s against a 48.0 s mean (1.73x worst), and shard E at 146.5 s and 147.9 s
+  against a 93.9 s mean (1.57x worst). In the other 8 runs no entry exceeded 1.5x; the
+  next-worst entries were pg shards G (1.49x) and D (1.47x).
+- What the misses show: the halves share the job's CPUs, and the pg shards pay for it. The
+  14 pg shards' serial time per run rose from a 1,482 s baseline mean to a 1,710 s
+  candidate median (+15%; per-run sums, mean of the 12 baseline runs against median of the
+  10 candidates), while the pg half still finishes in 448 s to 578 s. Not all of that rise
+  is contention: the shard definitions are unchanged across the window, but they select by
+  tag, and 117 files under `tests/unit/server/` changed between the first baseline and the
+  last candidate SHA, so the shards also gained tests. Neither half dominates: the non-pg
+  half took 471 s to 488 s in every run.
+- None of the revert triggers above fired in the 10 candidate runs: no meson test
+  failed (so nothing was retried as a flake), no entry raised the over-80%-of-timeout
+  warning, and no pg shard timed out. The triggers still apply unchanged; setting
+  `YUZU_CI_SEQUENTIAL_HALVES=1` on one of them is the way back, and the accepted 1.5x
+  misses are not one of them.
+- Per-entry values come from the meson summary lines in each job log (the `OK <secs>s`
+  column). Runs:
+
+Candidate (after the merge):
+
+| Run | Job | SHA | Runner | Job wall | Slot wait | non-pg / pg half |
+|---|---|---|---|---|---|---|
+| 42895515198 | 130107665542 | `0f8a891fb2` | `yuzu-bigtam-linux-0` | 16.5 min | 0 s | 476 s / 513 s |
+| 42902526001 | 130132146775 | `9d7ee88511` | `yuzu-bigtam-linux-3` | 14.9 min | 0 s | 484 s / 576 s |
+| 42908124262 | 130151599835 | `f4c2c95aa7` | `yuzu-bigtam-linux-2` | 12.4 min | 0 s | 480 s / 578 s |
+| 42991568006 | 130425661643 | `7e3e782456` | `yuzu-bigtam-linux-0` | 11.9 min | 0 s | 471 s / 449 s |
+| 43005450029 | 130471818809 | `43e65ea5e1` | `yuzu-bigtam-linux-0` | 10.6 min | 0 s | 471 s / 461 s |
+| 43008185580 | 130481028464 | `71519912c4` | `yuzu-bigtam-linux-1` | 11.2 min | 0 s | 483 s / 503 s |
+| 43011603201 | 130492527502 | `b357fe186e` | `yuzu-bigtam-linux-3` | 16.6 min | 0 s | 488 s / 542 s |
+| 43035122774 | 130572045791 | `dcd9a0a29e` | `yuzu-bigtam-linux-1` | 10.8 min | 0 s | 480 s / 448 s |
+| 43038808720 | 130584994620 | `5814e80383` | `yuzu-bigtam-linux-1` | 11.6 min | 0 s | 482 s / 522 s |
+| 43064481453 | 130675854942 | `7088f0cf2b` | `yuzu-bigtam-linux-0` | 13.4 min | 0 s | 481 s / 483 s |
+
+Baseline (before the merge):
+
+| Run | Job | SHA | Runner | Job wall | Slot wait |
+|---|---|---|---|---|---|
+| 42879744786 | 130052739576 | `cd163fe4dd` | `yuzu-bigtam-linux-3` | 18.6 min | 0 s |
+| 42865414562 | 130002550762 | `8846f70cfc` | `yuzu-bigtam-linux-1` | 17.6 min | 0 s |
+| 42832393723 | 129885791745 | `97122a2f26` | `yuzu-bigtam-linux-0` | 24.8 min | 0 s |
+| 42822889919 | 129852765513 | `1f2698663b` | `yuzu-bigtam-linux-1` | 19.4 min | 0 s |
+| 42816558875 | 129831141504 | `a7721dced7` | `yuzu-bigtam-linux-2` | 18.2 min | 0 s |
+| 42674958480 | 129353923619 | `f362bc7bb0` | `yuzu-bigtam-linux-1` | 19.0 min | 0 s |
+| 42658377286 | 129303139031 | `a11b1660d6` | `yuzu-bigtam-linux-3` | 17.7 min | 0 s |
+| 42640706924 | 129240990338 | `4482311586` | `yuzu-bigtam-linux-1` | 18.5 min | 0 s |
+| 42620776217 | 129172220558 | `dcadb36a85` | `yuzu-bigtam-linux-1` | 20.5 min | 0 s |
+| 42614415550 | 129150732618 | `29df02ac0b` | `yuzu-bigtam-linux-3` | 18.9 min | 0 s |
+| 42607751220 | 129128112839 | `6bb06db296` | `yuzu-bigtam-linux-1` | 19.3 min | 0 s |
+| 42593254595 | 129079839035 | `bc4296f651` | `yuzu-bigtam-linux-0` | 18.3 min | 0 s |
+
 This is a topology change; measure it on its own, as for the ladder below,
 before bundling it with a width push.
 
@@ -2295,6 +2421,7 @@ delta is attributable to one axis ("never bundled with a topology change"):
 | 2a | Linux np 2 → 4 on the cheap-suites invocation only (see Push 2a below) | width | | | | | | |
 | 2b | `gateway eunit` meson `priority: 120`, so it starts first in the cheap-suites invocation (see Push 2b below) | ordering | | | | | | |
 | 2c | Linux np 2 → 4 on the pg-shards step only (see Push 2c below) | width | | | | | | |
+| 2d | Gateway EUnit shards without cover, three shards, `gateway ct` `priority: 120` (see Push 2d below) | cost + ordering | | | | | | |
 | 2 | Linux np 2 → 4 on the server-shard invocation (not planned: that invocation is about 66 s of wall time, Push 2a, so there is little to gain); Windows pg 6 → 8 (moot: the step was removed by ADR-0035 step 1), non-pg 4 → 6 (held) | width | | | | | | |
 | 3 | tmpfs PGDATA, cap from the push-1 probe (see "Postgres for server tests") | storage | | | | | | |
 | 4 | Linux np 4 → 6, then stop | width | | | | | | |
@@ -2776,7 +2903,172 @@ and 1.96 to 1.97 at np=2. Shard times show no change from the width beyond the
 about the 12-shard regime, which only the post-merge watch can reach. The
 max_connections and `pg_stat_activity` peak were not measured.
 
+**Push 2d (gateway EUnit shards without cover, three shards, `gateway ct` at
+`priority: 120`).** Three changes to the gateway entries of the Linux cheap-suites
+invocation, made together because each one alone leaves the gateway as that
+invocation's tail. (1) The EUnit shards run with the `test` profile's
+`cover_enabled` false (`gateway/eunit_shard.config.script`; a plain
+`rebar3 eunit --dir` and `gateway ct` keep cover). meck preserves cover data on
+every `meck:new`/`meck:unload` of a cover-compiled module, and the foreach
+fixtures pay that per test: the whole suite took 459 s with cover and 268 s
+without, the same 2807 tests passing, and nothing reads a shard's cover data.
+(2) Three shards instead of two, balanced by weights measured without cover
+(`scripts/gateway_eunit_shards.py`). (3) `gateway ct`, last to finish in all 22
+sampled runs because it had no priority and is defined after every `tests/`
+entry, gets the shards' `priority: 120`, so the four gateway entries start at t=0.
+
+*Baseline.* The concurrent-halves runs (2026-11-10 to -13): shard A 234 s to
+267 s, shard B 191 s to 214 s, `gateway ct` 124 s to 136 s, cheap-suites
+invocation 362 s to 375 s where the log carries per-line timestamps.
+*Expectation (an estimate).* A replay of a four-worker list scheduler in meson's
+priority order, which reproduces two observed baseline walls to within 3 s, gives
+269 s to 279 s with the shards at about 100 s and `gateway ct` at 130 s to 160 s,
+and 290 s to 302 s with the shards at 130 s; the invocation only gets longer than
+today if each shard runs past about 190 s. This takes the `gateway ct` half of the
+rung Push 2b named, at the shards' 120 rather than its own duration: ct is no
+longer the 37 s entry Push 2b measured but 124 s to 136 s under the concurrent
+halves, so it needs to start with the shards. Local runs, all four entries at
+once: 92 s to 100 s per shard on a quiet box, 131 s to 175 s under a load average
+of 20 to 60. The new tail is `blocked log sink SIGTERM harness` (59 s, no
+priority); a priority for it is the next rung. The non-pg half should fall from
+about 480 s to about 390 s to 400 s, which leaves the pg half the longer one.
+*Measurement and rule* are Push 2b's (two same-SHA samples, attempt-specific
+logs), judged on the cheap-suites invocation wall and the non-pg half's wall:
+(a) the invocation median improves by 10% or more; (b) no entry of 5 s or more
+other than the gateway entries takes more than 1.5x its baseline; (c) no entry
+reaches 80% of its own meson timeout, and the EUnit test count across the three
+shards equals a contemporaneous `dev` push's (2807 at the time of writing; a test
+module added to `dev` meanwhile would move it). Windows (Wee Tam) runs the same entries: its
+`agent tsan-heavy checkpoints` barrier (`is_parallel: false`) now waits for C and
+`gateway ct` as well as A and B, which should still be shorter than the two
+covered shards were, but is not measured; read its first runs. Unfiltered nightly
+runs now start `gateway ct` with the shards, after the pg shards. Faster code
+without cover can move a race: watch about five runs per leg for a gateway flake
+and name the module before any re-run. To revert, take the shards back to two in
+the root `meson.build` table, `REQUIRED` in `scripts/ci/assert-gateway-tests.py`
+and the names in `tests/test_gateway_test_summary.py` (and the shard count in
+`docs/erlang-gateway-build.md`, `docs/testing/integration-tests.md` and
+`docs/rhel9-build-setup.md`),
+delete the `NoCover` wrapper from the config script, and delete `gateway ct`'s
+priority; each of the three is separable.
+*Samples (measured, 2026-11-13 to -14).* Three same-SHA samples per leg on the
+PR #7703 head `f17fcc7c26`, run 43456524845 (Linux attempts 1, 2 and 4, jobs
+131992161922, 132062790009, 132464908320; Windows attempts 1, 3 and 5, jobs
+131992161930, 132075575242, 132467714240). Every gateway entry passed on its
+first attempt in all six.
+
+| Leg | Shard A (s) | Shard B (s) | Shard C (s) | `gateway ct` (s) | non-pg half (s) |
+|---|---|---|---|---|---|
+| Linux | 100, 98, 103 | 107, 103, 113 | 130, 127, 109 | 143, 145, 142 | 411, 401, 394 |
+| Windows | 154, 155, 154 | 149, 152, 145 | 170, 170, 165 | 48, 49, 48 | — |
+
+The cheap-suites invocation's wall is not printed on its own (the half's log is
+written at its end); taking the non-pg half less the server-shard invocation
+(about 95 s to 110 s at two workers, from its entries' durations) gives about
+290 s to 300 s in each Linux sample, against the 362 s to 375 s baseline: rule
+(a) holds (about 19%), and the non-pg half fell from about 480 s to 394 s to
+411 s. Rule (c): the longest shard is 130 s on Linux (22% of its 600 s meson
+timeout) and 170 s on Windows (31% of the wrapper's 540 s deadline). Not
+checked from CI: rule (b) entry by entry, and the EUnit test count (a green run
+uploads no test logs, and meson's summary shows each shard passing, not its
+count); the 2807 is from the local cover-off run. The Windows job took 7.6 to
+10.3 min; its barrier wait is not measured separately.
+
+### Contract migration evidence
+
+The Linux gcc-15 debug leg enables `build_contract_tests` in the dedicated
+`build-linux-contracts-gcc15-debug` directory and runs all six registered
+migration pilots after the regular suites, under the same three-slot
+Big Tam admission limit. PostgreSQL contracts use
+the job's test database; gateway and plugin contracts retain their native
+reports. The collector's default portable bundle is uploaded after success or
+failure with the GitHub run ID and attempt in its artifact name, retained for
+30 days. Raw local inputs are excluded from that upload. A failed contract
+fails the step; its evidence does not replace the regular suite verdicts.
+See `docs/testing/contract-evidence.md` for the obligations and bundle format.
+
+The step compiles the pilots' build targets (the union of `build_targets` in
+`tests/contracts/pilots.json`) at the leg's full `YUZU_BUILD_JOBS` width
+**before** it takes a slot, then runs the collector inside the slot; the
+collector's own `meson compile -j 2` finds nothing to do. Before this, that
+compile ran inside the slot at two jobs: across the 20 gcc-15 debug jobs of
+2026-11-15 and -16 the step took 6 to 50 min (slot wait included), and in one
+sampled run the build was 996 s and the six pilots ran in 26 s, all while
+holding one of the three slots the Linux test step also needs. A compile error
+in the precompile is a warning only: the collector repeats the build and
+records the failure in its evidence. A precompile that runs past the job's
+90-minute limit cancels the job, which uploads no bundle, as a slow collector
+build could before. The Configure step sets `CCACHE_NOHASHDIR=1` for this leg
+only: ccache otherwise hashes the working directory for a `-g` compile, so the
+contract build directory never reused the standard build's objects (the two
+directories' compile commands are identical). The cost is debug info only: an
+object's recorded compile directory may name the other build directory, or,
+for a source compiled with no workspace-specific flag, another runner's
+workspace, and nothing in this leg reads it. The step prints the precompile's
+wall time with its own ccache hit and miss counts (from a per-step stats log,
+since the cache's global counters mix all four runners), and the collector's
+time including its slot wait. The contract build's compiles, previously ccache
+misses, now mostly hit, so the job's overall ccache hit rate is not comparable
+with earlier runs. The first gcc-15 debug run on each runner after this change
+rebuilds that leg cold once, because the cache keys change (most sources are
+compiled with include paths that name the runner's own workspace, so the
+runners share few of these entries).
+
 ### Persistent runner-local test history
+
+The local `/test` recorder now uses schema v4. `test_gates` remains the latest
+observation for each run/gate, while `test_gate_attempts` appends every recorded
+write in the same transaction. An observation is not necessarily a fresh test
+execution: repeated reporting also creates an entry. `--latest` shows repeated
+gate history and JSON exports include `gate_attempts`. Migration preserves each
+surviving v3 gate with an unknown recording time; it cannot reconstruct results
+already overwritten by older clients.
+
+**Compatibility and rollback:** schema v4 is a one-way local test-history
+migration, not a product database migration. Older v3 recorders reject v4;
+older `/test` preflight checks fail, and nonblocking CI telemetry may warn and
+skip recording. Before the first upgrade, take a consistent SQLite backup
+(using SQLite's backup API or `.backup`, not a lone copy of a live WAL-mode
+file). When switching to an older checkout, set `YUZU_TEST_DB` to a separate
+v3 database. To restore pre-upgrade history instead, stop its writers, retain
+the v4 database and its logs separately, and restore the pre-upgrade backup;
+there is no in-place downgrade or automatic merge of later v4 observations.
+The newer recorder can still read and migrate the retained v3 history.
+
+Finalization keeps earlier gate FAIL/ABORTED/WARN evidence, treats unfinished gates or
+an empty run as ABORTED, and reports an all-skipped run as SKIP. An explicit
+`run-finish --status` can worsen the result but cannot improve it; its floor
+survives refinalization and late gate observations. A late observation reopens
+the run until it is finalized again. Manual run IDs keep their original source
+identity and start time; writes from another revision require a new run ID.
+An ABORTED observation remains ABORTED after a later PASS; an ordinary
+RUNNING → PASS transition completes the gate. For hand-run coverage captures,
+`bash scripts/test/coverage-gate.sh --capture-baselines` generates a fresh
+`manual-<UUID>` when `--run-id` is omitted. This preserves separate captures on
+the same revision as well as across revisions.
+The recorder still cannot detect a required gate that was never recorded: a
+declared execution plan is future work. Metrics/timings still replace values,
+and preserving a log path does not preserve overwritten log bytes.
+
+The gateway's Meson, local, `/test` and release EUnit entrypoints share strict
+summary grading: nonzero exits, cancellation, failed summaries and zero executed
+tests fail. The old `cancel-tolerant` CLI spelling remains a strict compatibility
+alias. The wrapper retains its deadline after output EOF and shares one budget
+across retries/backoff, leaving separate bounded cleanup headroom. This does not
+yet establish a complete per-case execution inventory.
+
+The Instructions gate requires terminal SUCCESS from every agent counted in an
+untargeted dispatch's `agents_reached`, reads response pages, validates command
+and agent identities, and rejects any failure or malformed/incomplete evidence.
+Earlier RUNNING chunks are allowed when that agent has terminal success. The
+opt-in destructive/forensic path retains its separate stricter grading. These
+checks establish reported execution success, not action-specific postconditions.
+
+The performance gate remains measure-only: thresholds are not enforced. A failed
+requested perf/scale process, missing metrics from either requested suite, or a
+failed evidence write cannot produce PASS. Workflow shell tests select actual
+YAML `jobs.*.steps` entries using the already-required PyYAML dependency; missing
+or ambiguous selectors and step-shaped text inside script literals are refused.
 
 Every self-hosted runner agent owns a separate `test-runs.db` outside its
 checkout. Big Tam stores it below that agent's registered tool cache at
@@ -2788,7 +3080,7 @@ deliberately per-agent rather than per-host: telemetry must not introduce a
 shared SQLite writer lock between the four jobs whose contention it measures.
 
 The Linux and Windows jobs in `ci.yml` call `scripts/ci/ci-telemetry.py` near
-job start and from an `always()` finalizer. Schema v3 records GitHub run attempt,
+job start and from an `always()` finalizer. Schema v4 retains the v3 GitHub run attempt,
 job/platform/runner, commit/branch/event, conclusion and wall time, ccache ratio,
 each Meson test entry's result/duration/timeout, and any listed flake recovered
 by `flake-retry`. A cancelled job normally finalizes as `cancelled`; a hard kill
@@ -2939,17 +3231,20 @@ Which contexts are required is a repository ruleset setting ("Protect Main",
 
 The meson `docs` suite is OS-independent (lexical gates, selftests, lint
 tests) and runs on the **Linux leg only**. Its "runs on every leg" premise was
-false at the test-file level: nine entries pin OS-specific behaviour inside the
-test file or script itself, not behind a meson guard. Those nine carry the
+false at the test-file level: platform entries pin OS-specific behaviour inside
+the test file or script itself, not behind a meson guard. Twelve entries now carry the
 `platform` suite instead, which every leg runs (except where an entry is not
 registered: since ADR-0035 ladder step 1 the Windows and macOS legs configure
-with `-Dbuild_server=false`, so a `build_server`-gated entry runs on Linux only):
+agent-only (the `server` option is off for a non-Linux target), so a `build_server`-gated entry runs on Linux only):
 
 | Entry | Why it is OS-contract |
 |---|---|
 | `gateway build wrapper` | the Windows-only taskkill case and win32 branches in `tests/test_build_gateway.py`; its POSIX stdio and Ctrl-C behaviour must also keep running on Linux |
 | `gateway OTP pin resolution` | pins the `erl.exe` resolution that `scripts/erlang_toolchain.py` branches on for win32 (`tests/test_erlang_toolchain_otp.py`) |
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
+| `gateway wrapper guard selftest` | exercises the real wrapper subprocess, native exit/status handling and diagnostic captures on each OS, including Windows pipe decoding |
+| `contract evidence selftest` | exercises subprocess deadlines, child cleanup and native-path evidence handling; Windows task-tree termination and POSIX signals need separate observations |
+| `local test runner platform selftest` | drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |
@@ -2982,14 +3277,16 @@ ADR-0006 decision 8: every tier that runs the server **`[pg]`** suite gets a
 real PostgreSQL and exports `YUZU_TEST_POSTGRES_DSN`. The shipped substrate is
 **PostgreSQL 18** (`deploy/docker/Dockerfile.postgres`), and the Linux/docker
 legs test against it; the server SQL is version-agnostic (13+), so a
-runner-native cluster on an older major still exercises the suites correctly.
+runner-native cluster on an older major still exercises the suites correctly,
+except where a step sets `YUZU_TEST_PG_CLONE_STRATEGY` (the Linux test step's
+pg half does), which needs 15+.
 One script implements it everywhere — `scripts/ci/ensure-postgres.sh`, inserted
 as an `Ensure Postgres (server tests)` step between Build and Test in ci.yml
 (linux) and nightly.yml (asan / tsan / coverage).
 
 **Only Linux runs the server suites (ADR-0035 ladder step 1).** The Windows and
-macOS legs of `ci.yml` configure with `-Dbuild_server=false`, so they build no
-server code, register no server suite and need no Postgres; the Windows job no
+macOS legs of `ci.yml` configure agent-only (`server` option `auto`, off on any
+non-Linux target), so they build no server code, register no server suite and need no Postgres; the Windows job no
 longer runs `Ensure Postgres`. Wee Tam's per-agent PostgreSQL services stay
 provisioned until ladder step 4 deprovisions them, and
 `deploy/windows/Assert-Toolchain.ps1` still health-checks them in the Windows
@@ -3065,17 +3362,44 @@ Resolution order inside the script:
    bumping the label again. Docker Linux path only. Probe output and the
    decision: pending — filled by the push that applies or declines it.
 
-   **Clone-strategy A/B knob (2026-11-10, pending measurement).** Every
+   **Clone-strategy knob (2026-11-10; measured and wired 2026-11-14).** Every
    template-cloned `[pg]` case runs `CREATE DATABASE ... TEMPLATE ...`
    (`PostgresTestDb`, `tests/unit/test_helpers.hpp`). Setting
    `YUZU_TEST_PG_CLONE_STRATEGY` to `wal_log` or `file_copy` (any case) appends
    `STRATEGY WAL_LOG` or `STRATEGY FILE_COPY` to that statement; unset leaves the
    SQL unchanged (the server default, `WAL_LOG` on PostgreSQL 15+), and any other
-   value fails the fixture with a message naming the variable. No CI job sets it.
-   It exists so the two strategies can be compared on the pg step's wall time,
-   on the same terms as the tmpfs experiment above (two same-SHA samples, kept
-   only on a gain); if `FILE_COPY` wins, wiring it into CI is a separate change.
-   Result: pending. Contract: `docs/testing/unit-test-conventions.md`.
+   value fails the fixture with a message naming the variable. Measured on Big
+   Tam in two runs of draft PR #7701, each running the `server-pg` suite four
+   times in one job (default, file_copy, file_copy, default) so that load drift
+   hits both strategies alike:
+
+   | Run | default (wall / serial) | file_copy (wall / serial) | default (wall / serial) |
+   |---|---|---|---|
+   | 1 | 751 s / 2633 s | 739 s / 2625 s, 711 s / 2499 s | 807 s / 2850 s |
+   | 2 | 927 s / 3303 s | 869 s / 3133 s, 870 s / 3136 s | not finished (step timeout) |
+
+   Every default pass was slower than both file_copy passes of its run: about
+   6-7% wall and 5-7% serial. Run 2 was on a busier box (all of its numbers
+   about 20% higher), so compare within a run, not across. Result: the Linux
+   test step's `pg_half` exports `YUZU_TEST_PG_CLONE_STRATEGY=file_copy` for
+   both `pg_mode`s (a value leaking in from the runner is warned about and
+   overridden; `tests/shell/test_linux_concurrent_step.sh` pins both). The
+   checkpoint `FILE_COPY` forces stays inside the job's own per-runner
+   Postgres container. No other workflow sets it. It needs PostgreSQL 15+ (every
+   Big Tam agent runs the pinned 18 image), and it is only a gain with
+   `fsync=off`, as `ensure-postgres.sh`'s Docker cluster runs: on that image a
+   25 MB template cloned in 44 ms against 65 ms (`WAL_LOG`) with fsync off, but
+   636 ms against 68 ms with fsync on. The pg half sets it whatever the
+   cluster, so a Linux runner whose pre-set DSN or native fallback reaches a
+   durable cluster would lose time instead (no Big Tam agent does). It moves the
+   pg step's baseline: pg-step samples for a later push (the tmpfs push, Push 3)
+   compare only against runs that include it, and samples taken before it (the
+   concurrent-halves runs, and #7703's Push 2d samples) do not. Revert:
+   `git revert -m 1` the merge commit of the PR that wired it. The
+   concurrent-halves kill switch (`YUZU_CI_SEQUENTIAL_HALVES=1`) does not undo
+   it: if a pg-half revert trigger persists with the switch set, revert this
+   next. Contract:
+   `docs/testing/unit-test-conventions.md`.
 3. **brew** (GHA-hosted macOS, no docker) — `postgresql@18` bottle +
    throwaway trust-auth cluster under `$RUNNER_TEMP` on
    `127.0.0.1:15432`.
@@ -3165,8 +3489,8 @@ value sets it itself.
 |---|---|---|---|
 | Linux (gcc-15/debug, every PR + primary push) | full (14 shards) | run | ADR-0006 reference platform |
 | Linux (other legs: clang-21 debug on a push; release legs on a `main` push or Tier 2b dispatch) | smoke (`[pg-smoke]`, 11 cases) | run | #3443 Phase 2 |
-| Windows | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
-| macOS | none (ADR-0035 step 1: agent-only, `-Dbuild_server=false`) | n/a | server is Linux-only |
+| Windows | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
+| macOS | none (ADR-0035: agent-only, `server` option off) | n/a | server is Linux-only |
 
 Until ADR-0035 ladder step 1, Windows debug (every PR and push) ran the full
 14 shards and Windows release (a `main` push or a Tier 2b dispatch) the smoke
@@ -3276,6 +3600,8 @@ sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`
 (per-triplet, outside workspace). macOS joined this model with the BigMags
 cutover; its former `actions/cache@v5` round-trip was removed.
+
+**Install profile (ADR-0035 ladder step 3).** The key deliberately has no install-profile term. Every Windows and macOS workflow now installs an agent-only profile with no `server` feature (`--x-no-default-features`, plus `--x-feature=tests` where tests build; `release.yml` omits `tests`), so the persistent self-hosted tree (each Wee Tam runner keeps its own `vcpkg_installed/x64-windows` in its workspace, under its own work root, and the CI, nightly and CodeQL Windows jobs it picks up reuse it) is never reconciled between a full and an agent-only shape in steady state (when main and dev carry different `VCPKG_COMMIT` values the sentinel key changes and the tree is wiped and rebuilt instead). Linux legs install the full manifest; the Linux agent images use the agent-only profile in their own containers. A workflow that mixes profiles on one tree pays an incremental vcpkg reconcile on each switch (`docs/build-guide.md` "Dependency features"); do not add a second profile on Wee Tam without updating that section and the pins in `scripts/ci/test_runner_health_check.py`.
 
 The script must run cleanly under MSYS2 bash on Windows. **Do NOT use
 `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under
@@ -3545,7 +3871,7 @@ a stale build instead of queueing behind it, and a 120-min timeout. Since
 failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
-release's own signed agent archives) on a GitHub-hosted runner — no
+release's own agent archives, after verifying the release `SHA256SUMS` cosign signature) on a GitHub-hosted runner — no
 compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
 attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
 jobs.

@@ -42,45 +42,33 @@ namespace detail {
 }
 } // namespace detail
 
-/// #881: case-insensitive predicate for the containment control-channel
-/// exemption. Pure — no store access — so a test can bind it directly without
-/// a live `QuarantineStore`. Normalises to lowercase itself
-/// (`ServerImpl::dispatch_confined` already lowercases the ACTION at its own
-/// call site, never the plugin) so `"Firewall"`/`"FIREWALL"` exempt exactly like
-/// `"firewall"`.
+/// The firewall plugin's containment actions: a CLOSED four-action set, keyed on the
+/// (plugin, ACTION) pair, never on the plugin alone (the plugin declares exactly these
+/// four containment actions in its action table in
+/// `agents/plugins/firewall/src/firewall_plugin.cpp`; `state` and `rules` are ordinary
+/// actions and stay gated, and a fifth action gets no exemption). Case-insensitive,
+/// normalising the plugin name itself (`ServerImpl::dispatch_confined` already
+/// lowercases the ACTION at its own call site, never the plugin).
 ///
-/// Keyed on the `(plugin, ACTION)` pair against a CLOSED set — not on the
-/// plugin name alone. `firewall` also registers `state` and `rules`, which are
-/// ordinary actions and stay gated: exempting the whole plugin would let them,
-/// and any action added later, inherit the bypass silently with nothing in
-/// review to notice. All four containment actions are exempt, deliberately:
-/// narrowing it to `release` alone would break re-isolation (a fresh `quarantine`
-/// against an already-contained device), allow-list repair of a contained
-/// device's exceptions, and the reconciler's re-apply and status reads — all of
-/// which are the plugin managing its OWN containment state, not an operator
-/// reaching a quarantined agent through some other plugin.
-[[nodiscard]] inline bool is_quarantine_control_plugin(std::string_view plugin,
-                                                       std::string_view action) {
+/// This is the ONE predicate for two decisions, never two lists: the #881 containment
+/// gate's control-channel exemption (`dispatch_confined_arms.hpp`) and, with
+/// `__guard__.push_rules`, the protective set below. All four are exempt, deliberately:
+/// `release` IS the way out of a containment; `quarantine_status` is read-only and
+/// answering it for a contained host is the point (it is also how the server confirms a
+/// release); `quarantine_allow` repairs a contained host's exceptions, and gating it would
+/// make a host whose allow-list is wrong unrecoverable remotely; and `quarantine` on an
+/// already-contained host is the re-dispatch #3127 relies on. Narrowing it to `release`
+/// alone would break re-isolation, allow-list repair and the reconciler's re-apply and
+/// status reads, all of which are the plugin managing its OWN containment state, not an
+/// operator reaching a quarantined agent through some other plugin.
+[[nodiscard]] inline bool is_firewall_control_plugin(std::string_view plugin,
+                                                     std::string_view action) {
     using detail::iequals;
-    constexpr std::string_view kContainmentPlugin{"firewall"};
-    if (!iequals(plugin, kContainmentPlugin))
+    if (!iequals(plugin, "firewall"))
         return false;
-
-    // Keyed on the (plugin, ACTION) pair, not the plugin alone; closed against the
-    // plugin's four containment actions (`acts[]` in firewall_plugin.cpp). Anything
-    // else, `state` and `rules` included, is gated.
-    //
-    // Why all four rather than release alone: `release` IS the release path;
-    // `quarantine_status` is read-only and answering it for a contained host is the
-    // point (it is also how the server confirms a release); `quarantine_allow` is
-    // how a management path is repaired, and gating it would make a host whose
-    // allow-list is wrong unrecoverable remotely — the stranding this control
-    // exists to avoid; and `quarantine` on an already-contained host is the
-    // re-dispatch #3127 relies on. An action NOT on this list gets no exemption
-    // even on this plugin.
-    for (const auto allowed :
-         {std::string_view{"quarantine"}, std::string_view{"release"},
-          std::string_view{"quarantine_status"}, std::string_view{"quarantine_allow"}}) {
+    for (const auto allowed : {std::string_view{"quarantine"}, std::string_view{"release"},
+                               std::string_view{"quarantine_status"},
+                               std::string_view{"quarantine_allow"}}) {
         if (iequals(action, allowed))
             return true;
     }
@@ -91,7 +79,7 @@ namespace detail {
 /// rule push `__guard__.push_rules` (a contained device must keep receiving
 /// the rules that make containment meaningful). Case-insensitive.
 [[nodiscard]] inline bool is_protective_action(std::string_view plugin, std::string_view action) {
-    if (is_quarantine_control_plugin(plugin, action))
+    if (is_firewall_control_plugin(plugin, action))
         return true;
     using detail::iequals;
     return iequals(plugin, "__guard__") && iequals(action, "push_rules");
@@ -107,6 +95,16 @@ namespace detail {
 [[nodiscard]] inline bool plugin_owns_protective_actions(std::string_view plugin) {
     using detail::iequals;
     return iequals(plugin, "firewall") || iequals(plugin, "__guard__");
+}
+
+/// True iff `plugin` owns protective actions AND declares ordinary ones beside them (today only
+/// `firewall`: `state`, `rules`), so a plugin-level kill-switch row for it exempts the protective
+/// actions yet still gates the rest. `__guard__` declares only protective actions.
+/// Kept beside `plugin_owns_protective_actions` so the plugin names are spelled in this header
+/// only. It feeds the kill-switch AUDIT LABEL only (`protective_exempt=partial`); no enablement,
+/// presence, zero-reach or dispatch decision consults it.
+[[nodiscard]] inline bool plugin_mixes_protective_and_ordinary_actions(std::string_view plugin) {
+    return detail::iequals(plugin, "firewall");
 }
 
 } // namespace yuzu::protective

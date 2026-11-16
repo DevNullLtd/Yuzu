@@ -29,6 +29,7 @@
  */
 
 #include "baseline_store.hpp"
+#include "guardian_model.hpp"
 #include "guardian_routes.hpp"
 #include "guaranteed_state_store.hpp"
 #include "pg/pg_pool.hpp"
@@ -2494,5 +2495,83 @@ TEST_CASE("every compliance figure shows an uncertain pair beside it (#5690)",
         CHECK(res->body.find("1 uncertain") != std::string::npos);
         CHECK(res->body.find(pointer) != std::string::npos);
         CHECK(note_contains_pointer(res->body, phrase + ": the figures above"));
+    }
+}
+
+// -- #5675: the dashboard and the shared rollup agree after a device's census is deleted --
+//
+// Every figure is read BEFORE and AFTER `delete_agent`: a test that only looked at the cascade
+// outcome would pass with an empty-bodied method.
+TEST_CASE("a decommissioned device leaves the Guardian overview, the guard views and the rollup "
+          "(#5675)",
+          "[pg][guardian_routes][decommission]") {
+    Harness h;
+    h.seed_rule(make_rule_with_spark("r1", "GuardOne", "service-status-change"));
+    h.seed_rule(make_rule_with_spark("r2", "GuardTwo", "service-status-change"));
+    h.seed_baseline("bl1", "bl1", {"r1", "r2"});
+    {
+        auto dep = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                   "application/x-www-form-urlencoded");
+        REQUIRE(dep != nullptr);
+        REQUIRE(dep->status == 200);
+    }
+    h.agents_json = R"([{"agent_id":"WS-1","hostname":"ws-one-host","os":"linux"},)"
+                    R"({"agent_id":"WS-2","hostname":"ws-two-host","os":"linux"}])";
+    // r1 is errored on both devices, r2 on WS-1 only.
+    h.seed_status("a1", "WS-1", "r1", "guard.errored");
+    h.seed_status("a2", "WS-2", "r1", "guard.errored");
+    h.seed_status("a3", "WS-1", "r2", "guard.errored");
+
+    const auto page = [&](const char* path) {
+        auto res = h.sink.Get(path);
+        REQUIRE(res != nullptr);
+        REQUIRE(res->status == 200);
+        return res->body;
+    };
+    const auto unhealthy_card = [](int n) {
+        return "<div class=\"stat-num bad\">" + std::to_string(n) +
+               "</div><div class=\"stat-label\">Unhealthy Guards</div>";
+    };
+    const auto rollup_errored = [&] {
+        const auto rollup = guardian_status_rollup(*h.store, std::nullopt);
+        REQUIRE(rollup.has_value());
+        return rollup->errored_rules;
+    };
+
+    // Before.
+    {
+        const std::string fleet = page("/fragments/guardian/status?view=fleet");
+        CHECK(has(fleet, unhealthy_card(2)));
+        CHECK(rollup_errored() == 2);
+        const std::string by_guard = page("/fragments/guardian/status?view=guard");
+        CHECK(has(by_guard, "enforcement failing on 2"));
+        CHECK(has(by_guard, "enforcement failing on 1"));
+        const std::string r1 = page("/fragments/guardian/guard/r1/page");
+        CHECK(has(r1, "Error <b>2</b>"));
+        CHECK(has(r1, "ws-one-host"));
+        CHECK(has(r1, "ws-two-host"));
+    }
+
+    REQUIRE(h.store->delete_agent("WS-1"));
+
+    // After: WS-1 is gone from every census read, WS-2 is untouched, and the shared rollup agrees
+    // with the fragment (r2 was errored on WS-1 only, so one fewer rule is errored).
+    {
+        const std::string fleet = page("/fragments/guardian/status?view=fleet");
+        CHECK(has(fleet, unhealthy_card(1)));
+        CHECK_FALSE(has(fleet, unhealthy_card(2)));
+        CHECK(rollup_errored() == 1);
+        const std::string by_guard = page("/fragments/guardian/status?view=guard");
+        CHECK(has(by_guard, "enforcement failing on 1"));
+        CHECK_FALSE(has(by_guard, "enforcement failing on 2"));
+        CHECK(has(by_guard, "No device reports yet")); // r2 had no other reporter
+        const std::string r1 = page("/fragments/guardian/guard/r1/page");
+        CHECK(has(r1, "Error <b>1</b>"));
+        CHECK_FALSE(has(r1, "Error <b>2</b>"));
+        CHECK_FALSE(has(r1, "ws-one-host"));
+        CHECK(has(r1, "ws-two-host"));
+        const auto left = h.store->agent_rule_statuses_for_agent("WS-1");
+        REQUIRE(left.has_value());
+        CHECK(left->empty());
     }
 }

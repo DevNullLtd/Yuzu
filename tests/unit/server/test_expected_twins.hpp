@@ -63,6 +63,17 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"list_definitions", "InstructionDefinition", "Read", true},
     {"get_definition", "InstructionDefinition", "Read", true},
     {"export_definition", "InstructionDefinition", "Read", true},
+    // #2146 batch C: the instruction-definition / instruction-set authoring twins, pinned against
+    // instruction_authoring_routes.cpp (the v1 routes) and mcp_instruction_authoring.cpp.
+    {"create_definition", "InstructionDefinition", "Write", false},
+    {"update_definition", "InstructionDefinition", "Write", false},
+    {"delete_definition", "InstructionDefinition", "Delete", false},
+    {"import_definition", "InstructionDefinition", "Write", false},
+    {"save_definition_yaml", "InstructionDefinition", "Write", false},
+    {"validate_definition_yaml", "InstructionDefinition", "Read", true},
+    {"list_instruction_sets", "InstructionSet", "Read", true},
+    {"create_instruction_set", "InstructionSet", "Write", false},
+    {"delete_instruction_set", "InstructionSet", "Delete", false},
     // #4029: product-pack read twins, pinned against product_pack_model.hpp /
     // the new GET /api/v1/product-packs* routes.
     {"list_product_packs", "ProductPack", "Read", true},
@@ -211,6 +222,9 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // same Inventory:Read gate through fleet_read_fn.
     {"list_hardware_ci", "Inventory", "Read", true},
     {"get_hardware_ci", "Inventory", "Read", true},
+    // The bulk CI page, pinned against GET /api/v1/hardware-ci (hardware_routes.cpp): the same
+    // Inventory:Read gate through fleet_read_fn.
+    {"list_hardware_ci_records", "Inventory", "Read", true},
     // Seam PR2: list_quarantined_devices, pinned against GET /api/v1/quarantine
     // (rest_api_v1.cpp): the same Security:Read gate through require_fleet_read.
     {"list_quarantined_devices", "Security", "Read", true},

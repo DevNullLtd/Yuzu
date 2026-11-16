@@ -49,6 +49,7 @@
 /// #4027 ledger row for the recorded `exception:` reasoning. Revisit once Batch C
 /// lands a `/run` twin that mints pcmd/tcmd/hcmd (and a token) directly over the API.
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include "authz_gates.hpp"     // yuzu::server::authz::FleetReadGate (#4027 fix round — CDX-P1-01/K4)
@@ -94,8 +95,9 @@ class HttpRouteSink;
 /// and stamps `online=true` unconditionally, so in production every row this
 /// builder actually sees is online — `online` is honest per-row but the list is
 /// NOT offline-inclusive today despite the builder's own online-agnostic contract.
-/// Wiring a genuinely offline-inclusive producer (the pattern at
-/// `server.cpp:20057-20091`, `OfflineEndpointStore::query_stale_within`) is a
+/// Wiring a genuinely offline-inclusive producer (the pattern in
+/// `build_hw_roster`, server.cpp: `OfflineEndpointStore::query_stale_within`, which returns a
+/// capped roster with a `truncated` flag, #5712) is a
 /// tracked follow-up, not done in this fix round.
 std::string echo_process_tree_frame_json(const std::vector<DeviceRow>& devices);
 
@@ -195,6 +197,32 @@ public:
                                            const std::string& securable_type,
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
+    /// Counts the capture-sources push by outcome (`yuzu_echo_sources_push_total{result}`:
+    /// pushed / none_applied / audit_unavailable / permission_revoked / dispatch_denied /
+    /// dispatch_exception). Post-registration setter like set_fleet_read_fn; every use is
+    /// guarded, so an unset registry counts nothing.
+    void set_metrics(yuzu::MetricsRegistry* m);
+
+    /// Audit writer for a session the handler already resolved, used by the capture-sources push
+    /// for every row it writes: the request-resolving `AuditFn` stamps an empty principal once
+    /// the session is gone, which is exactly when the push writes its `permission_revoked` row.
+    /// Same `std::function` type as `AuthRoutes::AuditAsSessionFn`; server.cpp binds
+    /// `AuthRoutes::audit_as_session_fn()`. Unset = the push refuses (503), like an `attempted`
+    /// row that cannot be stored. No other route reads it.
+    using AuditAsSessionFn = std::function<bool(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id, const std::string& detail)>;
+    void set_audit_as_session_fn(AuditAsSessionFn fn) { audit_as_session_fn_ = std::move(fn); }
+
+    /// HTTP status of a push whose dispatch the chokepoint refused (`ConfinedDispatchOutcome::denied`):
+    /// 403 for the permission-class reasons, 500 for an unclassified or ambiguous catalogue fault.
+    /// Injected so this TU stays store-definition-free (the classifier lives in
+    /// dispatch_denial_text.hpp, whose closure reaches the store headers); server.cpp binds it.
+    /// Unset = 500.
+    using DenialStatusFn = std::function<int(const ConfinedDispatchOutcome&)>;
+    void set_denial_status_fn(DenialStatusFn fn) { denial_status_fn_ = std::move(fn); }
 
     /// External colleague review on PR #4143 (Doomgoose, BLOCKING, confirmed
     /// against ADR-0017 INV-4/INV-7 by direct source inspection): the two REST
@@ -326,6 +354,9 @@ private:
     ResponsesFn responses_fn_;
     AuditFn audit_fn_;
     CallerFn caller_fn_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    AuditAsSessionFn audit_as_session_fn_;
+    DenialStatusFn denial_status_fn_;
 
     std::mutex cache_mu_;
     std::unordered_map<std::string, ReconEntry> cache_;

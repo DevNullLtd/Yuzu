@@ -334,8 +334,19 @@ TEST_CASE("kill_switch_set_detail without a reason is the unchanged evidence for
     const KillSwitchScope plain{"echo", "sql", ""};
     CHECK(kill_switch_set_detail(plain, false) == "enabled=false");
     CHECK(kill_switch_set_detail(plain, true, "") == "enabled=true");
-    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false) ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", ""}, false) ==
           "enabled=false, protective_exempt=true");
+    // A plugin-level firewall row exempts the protective four but still gates state and rules:
+    // labelled `partial`, never the complete-exemption `true`. An action-level firewall row is
+    // exact.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false) ==
+          "enabled=false, protective_exempt=partial");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"Firewall", "", "linux"}, true, "drill") ==
+          "enabled=true, protective_exempt=partial, reason=\"drill\"");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "release", ""}, false) ==
+          "enabled=false, protective_exempt=true");
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "state", ""}, false) ==
+          "enabled=false");
 }
 
 TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped reason",
@@ -344,8 +355,11 @@ TEST_CASE("kill_switch_set_detail appends a quoted, bounded, control-stripped re
     CHECK(kill_switch_set_detail(plain, false, "incident INC-42") ==
           "enabled=false, reason=\"incident INC-42\"");
     // Protective marker first, then the reason.
-    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false, "drill") ==
+    CHECK(kill_switch_set_detail(KillSwitchScope{"__guard__", "", ""}, false, "drill") ==
           "enabled=false, protective_exempt=true, reason=\"drill\"");
+    // A plugin-level firewall row is `partial` (it still gates state and rules); the reason follows.
+    CHECK(kill_switch_set_detail(KillSwitchScope{"firewall", "", ""}, false, "drill") ==
+          "enabled=false, protective_exempt=partial, reason=\"drill\"");
     // Quote and backslash cannot close the field; tab and other controls flatten to a space.
     CHECK(kill_switch_set_detail(plain, false, "a\"b\\c\td\x01" "e") ==
           "enabled=false, reason=\"a\\\"b\\\\c d e\"");

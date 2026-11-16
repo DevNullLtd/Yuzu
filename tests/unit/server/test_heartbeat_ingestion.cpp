@@ -398,7 +398,7 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence r
     const auto roster = store.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the read is typed
     const OfflineEndpoint* row = nullptr;
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == "yuzu_test_hb_nonowner")
             row = &e;
     REQUIRE(row != nullptr);
@@ -529,7 +529,7 @@ TEST_CASE("HeartbeatIngestion: a presence store that recovers mid-batch is detec
     auto present = [&](const std::string& agent) {
         const auto roster = store.query_stale_within(std::chrono::hours(1));
         REQUIRE(roster.has_value());
-        for (const auto& e : *roster)
+        for (const auto& e : roster->rows)
             if (e.agent_id == agent)
                 return true;
         return false;
@@ -585,7 +585,7 @@ TEST_CASE("HeartbeatIngestion: an isolated presence failure skips nothing when t
     auto present = [&](const std::string& agent) {
         const auto roster = store.query_stale_within(std::chrono::hours(1));
         REQUIRE(roster.has_value());
-        for (const auto& e : *roster)
+        for (const auto& e : roster->rows)
             if (e.agent_id == agent)
                 return true;
         return false;

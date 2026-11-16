@@ -1,15 +1,24 @@
-# High Availability Architecture
-
 ---
 status: accepted
 owner: Fraser Jarvis (@fjarvis)
 ---
+
+# High Availability Architecture
 
 **Authors:** Fraser Jarvis (@fjarvis)
 **Review:** hardened after adversarial review by the `enterprise-architect` validator and
 `gpt-5.6-sol` (both read the codebase), then revised again per the PR #3320 `CHANGES_REQUESTED`
 review; see *Guarantees and non-guarantees*, *Deployment topology and replication axes*, and the two
 *Review findings incorporated* rounds below.
+
+> **Implementation state (2026-11-14, against dev @ 2c49b4ea0).** Partially implemented; one server
+> replica is still the only supported shape. `LeaderElector` (`leader_elector.{hpp,cpp}`) is built
+> and constructed at boot in `server.cpp`, and the singleton-loop gate (`leader_gate.hpp`, classes
+> from `background_jobs.hpp`) is wired at five `leader_gate_permits` sites: `ca.publish_crl`,
+> `policy_evaluator.dispatch_due`, `quarantine_reconciler.tick`, `command_outbox.deliver` and
+> `schedule_runner.tick`. The **safe-to-scale gate is not lifted**: the per-workstream status and
+> the open gate clauses are in `docs/ha-delivery-matrix.md`, which tracks what ships (this ADR
+> wins on conflict about the decisions).
 
 ## Context
 
@@ -2913,3 +2922,9 @@ core-only work to the DB-less presentation tier. Fixed:
 - **WS-2** now names the **core→presentation event spine** as an ADR-0031 prerequisite.
 - Wording: "gateway forwards **transparently (unconditionally)**" (not "idempotently"); coordination
   language qualified to **core** (§6/§10, `CONTEXT.md`); stale round-2 citation/phrasing corrected.
+
+## Leader-election standing invariants
+
+The canonical full statement of these catastrophic-if-violated invariants. The always-loaded routed-concern table carries only a compressed trigger for them.
+
+**Fenced leader election — `LeaderElector` + the singleton-loop gate (WS-3, ADR-2002 §3/§6/§10).** A COORDINATION concern parked here for the per-file ceiling; `security-guardian` territory as fenced leadership stops a second replica DOUBLE-DISPATCHING destructive commands. CATASTROPHIC: (1) `is_leader()` is the ATTEMPT gate ONLY — the guarantee against a paused ex-leader is the monotonic-epoch `epoch_fence_sql()` predicate embedded in a LEADER-DRIVEN claim's WRITE (slice 3.3's command outbox), NEVER a cached "I am leader" bool (§6); the operator-synchronous remediation claim (slice 3.4) uses its OWN guarded CAS in `PolicyStore`, never this epoch (clause 3). (2) The runtime loop gate MUST consume WS-10's `background_jobs.hpp` classification via `background_job_class()`/`leader_gate_permits` — never a second "which loops are leader-only" list. Only `FencedLeaderOnly` consults the elector; `DisabledUntilFixed` → runs (held back by the DEPLOYMENT safe-to-scale gate — denying it silently disables a live single-replica pass). (3) NEVER epoch-fence an operator-SYNCHRONOUS path, INCLUDING a shared sub-pass its COMPLETION depends on (two-dispatch-planes rule) — gate the background tick site, not the shared primitive: the CRL background re-publish is gated, the operator-revoke publish is not; `PolicyEvaluator::tick` gates ONLY `dispatch_due` while `collect_ready` (the only path that matures an operator record to a verdict) runs per-replica — gating the whole `tick` stranded remediations as `fixing` forever (PR #4134). (4) The elector owns ONE dedicated, never-recycled connection (§10), never a pooled / txn-mode-pooler lease; `is_leader()`/`epoch()` are LOCK-FREE reads so a stalled probe never blocks a worker tick (#4013). `quarantine_reconciler.tick` MUST be reclassified stream-partitioned at WS-4 (#4119). (5) **Epoch = `GREATEST((GREATEST(tl, prev>>32) << 32) + nextval(seq), prev + 1)` (#6535)** — never a bare sequence, a floor without the timeline, or `pg_control_checkpoint()` for the timeline (it lags a promotion; read `pg_walfile_name(pg_current_wal_lsn())` INSIDE the mint); pack with `+`. Not-covered list: ADR-2002 §3 Update (2026-11-01); never restate as covered.

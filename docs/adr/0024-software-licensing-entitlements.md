@@ -431,7 +431,8 @@ Decision numbers are stable, since other documents cite them.
     Decision 5) — a globally-granted engine acting for a group-confined operator reaches
     only that operator's groups. SLE's in-server gates use the fail-closed
     `rbac_enforcement_in_effect()` primitive, not the `is_rbac_enabled()` shape whose
-    corrupt-rbac.db fail-open is tracked by #1717. *Rejected: an ad-hoc per-row filter for
+    corrupt-rbac.db fail-open is tracked by #1717 (SQLite-era wording; RBAC is the Postgres
+    `rbac_store` schema since ADR-0041, noted 2026-11-14). *Rejected: an ad-hoc per-row filter for
     the fan-out reads — exactly the pattern ADR-0017 exists to replace.*
 
 11. **Per-user discovery is a contained ADR-0016 deviation, pseudonymous by default. [core]**
@@ -476,6 +477,15 @@ Decision numbers are stable, since other documents cite them.
     `CertificateInventoryStore` (schema `certificate_inventory_store`, the fleet certificate inventory of
     ADR-0070 D12) joined, and its `delete_agent` erases its rows in one transaction. Its read securable,
     `CertificateInventory`, arrives in PR 2a-2b.)*
+    *(Update 2026-11-09, #5675: the cascade now covers **nine** stores. `GuaranteedStateStore` (schema
+    `guaranteed_state_store`, public key `guaranteed_state`) joined: its `delete_agent` erases the device's
+    compliance-census rows (`guardian_agent_rule_status`) and retires its pending census evidence in one
+    transaction, so a decommissioned agent stops counting in `errored_rules` and `uncertain_rules`. Its
+    read securable is `GuaranteedState:Read`, which makes it the second `GuaranteedState`-governed member
+    after `AppPerfDailyStore`. The Guardian event log and DEX observations are NOT erased by this
+    decommission; they are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Widening the erasure to them is a separate follow-up (#7531) that needs an
+    ADR-0038 Update. The "five per-agent stores" list in Decisions 9 and 11 is left as written; it is history.
+    A still-running agent re-creates its census row on its next census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), so stop the agent first.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
     production trigger is `DELETE /api/v1/sle/agents/{id}`, authorized by the scoped
     `SoftwareLicensing:Delete` **AND** `Inventory:Delete` **AND** `GuaranteedState:Delete`

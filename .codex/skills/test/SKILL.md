@@ -36,7 +36,7 @@ they do not share one host-wide SQLite file:
 - Wee Tam: `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`
 
 `ci.yml`'s Linux and Windows jobs initialize and write these databases
-automatically. Schema v3 preserves GitHub rerun attempts separately and stores
+automatically. Schema v4 preserves GitHub rerun attempts separately and stores
 job outcome/duration, platform, runner, commit/branch/event, ccache hit ratio,
 Meson suite result/duration/timeout, and recovered known-flake events. Query one
 on its host by setting `YUZU_TEST_DB`, for example:
@@ -62,6 +62,8 @@ passes CI if an isolated retry recovers; each recovery is also persisted in
 `ci_flake_events` so recurrence can be measured instead of inferred from logs.
 
 Initialize each manual orchestration with a `RUN_ID`, `TEST_DIR=/tmp/yuzu-test-$RUN_ID`, `LOG_DIR=$HOME/.local/share/yuzu/test-runs/$RUN_ID`, `COMMIT`, `BRANCH`, and `BUILDDIR=$(build_dir)` from `scripts/test/_portable.sh`. Record gates with `scripts/test/test-db-write.sh`.
+
+For manual coverage capture, run `bash scripts/test/coverage-gate.sh --capture-baselines`; it generates a fresh run ID for every capture. See `docs/ci-architecture.md` → "Persistent runner-local test history" for schema-v4 compatibility and rollback instructions.
 
 ## Phase Order
 
@@ -95,7 +97,7 @@ Phase 8 must not stop the native UAT stack from `scripts/start-UAT.sh`. A succes
 
 ## Perf Status
 
-Perf is measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` records metrics and exits PASS; humans inspect trend and distribution shape using the test-runs DB and `docs/perf-baseline-calibration-2026-05-03.md`.
+Perf thresholds are measure-only as of 2026-05-03. `scripts/test/perf-gate.sh` records metrics and passes only when every requested suite completes and its metrics are recorded; failed, incomplete or unrecorded execution fails. Humans inspect trend and distribution shape using the test-runs DB and `docs/perf-baseline-calibration-2026-05-03.md`.
 
 ## Mode Shortcuts
 

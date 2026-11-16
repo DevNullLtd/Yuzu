@@ -106,6 +106,8 @@ EXPECTED_FAMILIES = {
             "server/core/src/dex_read_model.hpp",
             "server/core/src/dex_api.hpp",
             "server/core/src/dex_api_local.hpp",
+            "server/core/src/dex_apps_ui.hpp",
+            "server/core/src/dex_apps_ui.cpp",
         ],
     },
     "dex_perf": {

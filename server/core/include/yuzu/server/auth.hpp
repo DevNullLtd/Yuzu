@@ -53,6 +53,8 @@ class AuthDB;
 class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
 struct SessionRow;        // session_store.hpp — the durable row shape
 struct SessionWriteParams; // session_store.hpp — duration-based create params (DB-clock authoring)
+struct LocalMfaProof; // session_store.hpp: a carried MFA proof, {factor generation, DB instant}
+                      // (#6079)
 class CredentialChangeOwner;    // credential_change_owner.hpp — #5342 one-transaction credential change
 class RbacStore;                // rbac_store.hpp, #4966 last-Administrator guard for account lifecycle
 struct CredentialChangeRequest; // credential_change_owner.hpp
@@ -365,11 +367,16 @@ inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
 /// proof instant (an OIDC session carries the IdP-asserted instant, clamped at login) and
 /// `db_now_ms` the database clock read in the SAME SELECT, so `db_now_ms - mfa_verified_ms`
 /// is a proof age that no replica clock, steady or wall, can stretch (ADR-2002 s4). Only
-/// `kRow` carries the two instants. A value-initialised result is `kUnavailable`: a caller
-/// that forgets to fill it fails closed. So does an `AuthManager` with no SessionStore
-/// attached: a serving process always has one (the server refuses to boot without Postgres),
-/// so that shape is a wiring fault and is reported as an unavailable read, never aged on a
-/// replica clock.
+/// `kRow` carries the two instants and the factor generation. A value-initialised result is
+/// `kUnavailable`: a caller that forgets to fill it fails closed. So does an `AuthManager` with
+/// no SessionStore attached: a serving process always has one (the server refuses to boot
+/// without Postgres), so that shape is a wiring fault and is reported as an unavailable read,
+/// never aged on a replica clock. A LOCAL session's read is also turned `kUnavailable` by
+/// `AuthRoutes::durable_mfa_proof_for` while the session store's rebind guard is not observed in
+/// force (`AuthManager::stored_binding_trustworthy`), and for the read whose validation could
+/// not run (`guard_unverified`, `AuthManager::stored_binding_read_confirmed`): a binding that
+/// cannot be trusted is never read as one. The raw `read_durable_mfa_proof` does not apply that,
+/// because an SSO session carries no binding.
 struct DurableMfaProof {
     enum class Source {
         kUnavailable, ///< read degraded or no store attached: fail closed, never "no proof"
@@ -379,6 +386,21 @@ struct DurableMfaProof {
     Source source{Source::kUnavailable};
     std::int64_t mfa_verified_ms{0}; ///< 0 = the row carries no proof
     std::int64_t db_now_ms{0};
+    /// The factor generation the stored proof is bound to
+    /// (`session_store.sessions.mfa_factor_gen`). 0 = UNBOUND: a legacy row, a row the rebind guard
+    /// unbound, or a proof written before the binding existed. A binding decision treats an unbound
+    /// proof as no proof. Meaningful only for `kRow`.
+    std::int64_t mfa_factor_gen{0};
+    /// With `kUnavailable` only: the read itself succeeded but the stored generation cannot be
+    /// trusted because the session store's rebind guard is not observed in force
+    /// (`AuthRoutes::durable_mfa_proof_for`). That state is sticky until an operator repairs the
+    /// guard and restarts, unlike a failed read, so a caller must not advertise a retry for it.
+    bool binding_untrusted{false};
+    /// With `kRow` only: the session store's rebind guard could not be validated on this read (a
+    /// catalog query that did not run; see `FoundSession::guard_unverified`). The row is real and
+    /// an SSO approver may use it, but a LOCAL binding decision must refuse the read as
+    /// unavailable and transient (`AuthManager::stored_binding_read_confirmed`).
+    bool guard_unverified{false};
 };
 static_assert(DurableMfaProof{}.source == DurableMfaProof::Source::kUnavailable,
               "a default-constructed DurableMfaProof must refuse (fail closed)");
@@ -691,7 +713,8 @@ enum class RemoveUserOutcome : std::uint8_t {
                               ///< can complete it; an IdP retry of a SCIM request is NOT
                               ///< promised to (#5214)
     RemovedSessionWipeFailed, ///< the account IS deactivated (committed) but the durable session
-                              ///< wipe failed, so a live session may survive: a repeated
+                              ///< wipe failed, so the session row may survive (a local
+                              ///< session is refused at validation): a repeated
                               ///< `remove_user_checked` re-runs the wipe (the dashboard DELETE
                               ///< offers that); a SCIM retry is NOT promised to repeat it
                               ///< (#5214)
@@ -752,11 +775,45 @@ public:
     [[nodiscard]] std::expected<VerifiedCredential, VerifyFailure>
     verify_password(const std::string& username, const std::string& password);
 
-    /// Create a session for a user who has already cleared the password
-    /// and any required MFA checks. Mirrors create_oidc_session but with
-    /// `auth_source="local"`. If `mfa_verified` is true, stamps
-    /// `mfa_verified_at = system_clock::now()` so the step-up window
-    /// covers immediate high-risk actions taken right after login.
+    /// Why `create_local_session` returned an empty token, for a caller that needs the cause
+    /// for its audit row (#6079). `kNone` while a token was issued.
+    enum class MintDenial : std::uint8_t {
+        kNone,
+        kPersistFailed,           ///< the durable session write failed (or no row came back)
+        kVerificationFutureDated, ///< the carried instant was later than the DB clock: refused
+        kRoleChanged,             ///< the post-mint recheck found the role changed
+        kCredentialChanged,       ///< ... the stored credential changed
+        kFactorChanged,           ///< ... the MFA factor generation changed since verification
+        kRecheckUnavailable,      ///< ... the recheck itself hit a store error / removed account
+    };
+
+    /// Why `stamp_session_mfa_proof` did not leave a fresh bound proof on the session (#6079).
+    enum class MfaStampOutcome : std::uint8_t {
+        kStamped,       ///< the proof is stored (and, when bound, survived the recheck)
+        kNoSession,     ///< no such session
+        kStoreError,    ///< the durable write (or the recheck) hit a store error: nothing admitted
+        kInvalidProof,  ///< a proof needs an instant > 0 and a non-negative generation
+        kFutureDated,   ///< the carried instant was later than the DB clock: stored as no proof
+        kFactorChanged, ///< the account's factor generation changed after the stamp: cleared
+    };
+
+    /// Create a session for a user who has already cleared the password, with NO MFA proof
+    /// (password-only login; a step-up stamps one later). Same contract as the overload below
+    /// for everything but the proof. #6079.
+    std::string create_local_session(const std::string& username, Role role,
+                                     const std::string& expected_hash_hex);
+
+    /// Create a session for a user who has already cleared the password AND an MFA check,
+    /// carrying the proof that check produced (#6079): `proof.factor_gen` is the factor
+    /// generation the verifier read under the `auth.users` row lock and `proof.verified_ms` the
+    /// DATABASE instant its loading statement captured, before any cryptographic check. Both
+    /// are stored on the session as given; an instant later than the writing statement's
+    /// `now()` is REFUSED (the session is revoked and an empty token returned, `denial` =
+    /// `kVerificationFutureDated`), never clamped to an age-zero proof. After the write the
+    /// post-mint recheck compares `proof.factor_gen` with the account's current generation
+    /// under the row lock and revokes-and-denies on divergence (`kFactorChanged`), exactly as
+    /// it does for a role or credential change. `{0, v > 0}` is a legal UNBOUND proof;
+    /// `{g > 0, 0}` and negative values are a caller bug and mint nothing.
     ///
     /// Requires the account to already have an AuthDB `users` row when
     /// `auth_db_` is configured: post_mint_role_recheck (see its own doc)
@@ -779,8 +836,10 @@ public:
     /// An empty value never matches a stored hash and so DENIES (fail closed);
     /// it never disables the check. Ignored in cfg-file-only mode (no AuthDB,
     /// no concurrent credential writer).
-    std::string create_local_session(const std::string& username, Role role, bool mfa_verified,
-                                     const std::string& expected_hash_hex);
+    std::string create_local_session(const std::string& username, Role role,
+                                     const std::string& expected_hash_hex,
+                                     const yuzu::server::LocalMfaProof& proof,
+                                     MintDenial* denial = nullptr);
 
     /// TEST-ONLY: `create_local_session` WITHOUT the credential anchor — the
     /// post-mint role/active recheck still runs, only the stored-hash compare
@@ -789,14 +848,33 @@ public:
     /// Production code MUST NOT call this — no caller in `server/core/src/**`
     /// references it; every production mint follows a real password
     /// verification and passes its hash to `create_local_session`.
+    ///
+    /// `mfa_verified == true` (#6079) binds the proof to the LIVE identity: when an AuthDB knows
+    /// the user and it is enrolled, the proof carries that account's current factor generation
+    /// and the database clock from the same read; an un-enrolled user gets an UNBOUND proof at
+    /// the database clock; any error, no AuthDB, or no SessionStore (the legacy path, judged on
+    /// this host's clock) gets an unbound proof at the wall clock (test-only: the store still
+    /// refuses an instant later than its own `now()`). So no
+    /// existing call site changes. A test that enrols the user AFTER minting holds an unbound
+    /// proof by design.
     std::string create_local_session_for_test(const std::string& username, Role role,
                                               bool mfa_verified);
 
-    /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
-    /// Returns true if the session existed and was updated. Used by the
-    /// /login/mfa/stepup route (PR 2) to mark an already-issued session
-    /// as freshly MFA-verified.
-    bool mark_session_mfa_verified(const std::string& token);
+    /// Stamp a carried MFA proof on the named session (#6079) and say why it did not take.
+    /// The durable write stores `proof` as given (`{0, v > 0}` is a legal UNBOUND proof); an
+    /// instant later than the writing statement's `now()` stores NO proof and NO binding
+    /// (`kFutureDated`). A bound proof is then rechecked under the account's `auth.users` row
+    /// lock (comparison only): if the factor generation changed since the verification, the
+    /// stamp is cleared after the lock releases (`kFactorChanged`); a failed clear leaves a
+    /// proof bound to the OLD generation, which a binding gate refuses by equality, and this
+    /// replica's cached copy is dropped regardless. Nothing is admitted on any non-`kStamped`
+    /// outcome.
+    [[nodiscard]] MfaStampOutcome stamp_session_mfa_proof(const std::string& token,
+                                                          const yuzu::server::LocalMfaProof& proof);
+
+    /// `stamp_session_mfa_proof(token, proof) == kStamped`.
+    bool mark_session_mfa_verified(const std::string& token,
+                                   const yuzu::server::LocalMfaProof& proof);
 
     /// JIT admin elevation: set `elevated_until = min(now + duration,
     /// session.expires_at)` on the named session, so its effective role is admin
@@ -890,6 +968,32 @@ public:
     /// interval (#6079). Does not touch the cached generation or the stale-serve
     /// anchor. Production code MUST NOT call this.
     void expire_session_generation_poll_for_test();
+
+    /// TEST-ONLY: age the last SUCCESSFUL session-generation refresh by `age`, so the
+    /// stale-serve bound (`kSessionGenStaleServeBoundMs`) can be crossed without waiting it
+    /// out. Does not touch the cached generation or the poll gate. Production code MUST NOT
+    /// call this.
+    void age_session_generation_refresh_for_test(std::chrono::milliseconds age);
+
+    /// TEST-ONLY: installs a callback fired in `validate_session_durable` after the
+    /// session to serve has been obtained (from the cache, or from the store on a
+    /// miss) and before the tail's cache insert, with NO lock held. It lets a test
+    /// hold one validation open while another manager signs the session out or a
+    /// generation poll clears this manager's cache, to prove the late insert is
+    /// dropped. A hook shared by several threads must select its own thread (it also
+    /// fires for the validations the test itself makes). Production code MUST NOT
+    /// call this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default; install it before any concurrent validation starts.
+    void set_validate_pre_cache_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired in `reactivate_user` and `update_role_checked`
+    /// BETWEEN the local cache erase and the durable session wipe, with NO lock held. It lets a
+    /// test run a validation inside that gap, which reads the still-present row and caches the
+    /// pre-change session, to prove the cache is dropped again after the wipe. It also fires for
+    /// the validations the test itself makes there. Production code MUST NOT call this - no
+    /// caller in `server/core/src/**` references it. A no-op (nullptr) by default; install it
+    /// before the call under test.
+    void set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook);
 
     /// TEST-ONLY: installs a callback fired inside
     /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
@@ -990,6 +1094,19 @@ public:
     [[nodiscard]] DurableMfaProof read_durable_mfa_proof(const std::string& token,
                                                          std::string_view expected_username) const;
 
+    /// Whether a `kRow` read's stored factor generation may be judged as a binding: true only
+    /// while the session store's rebind guard is observed in force (`rebind_guard_ok()`). The
+    /// binding applies to LOCAL sessions, so only `AuthRoutes::durable_mfa_proof_for` asks; an
+    /// SSO approver reading its IdP-seeded proof does not. A false answer is logged and counted
+    /// here (`yuzu_auth_session_store_degrade_total{op="rebind_guard"}`), the one site that does.
+    [[nodiscard]] bool stored_binding_trustworthy() const;
+
+    /// The per-read companion of `stored_binding_trustworthy`: false when THIS read's rebind-guard
+    /// validation could not run (`DurableMfaProof::guard_unverified`), a transient condition the
+    /// next read re-checks. Logged and counted as a `validate` degrade, not as the sticky
+    /// `rebind_guard` latch. Same caller: `AuthRoutes::durable_mfa_proof_for`, local sessions only.
+    [[nodiscard]] bool stored_binding_read_confirmed(const DurableMfaProof& proof) const;
+
 private:
     /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative
     /// `SessionStore::find`, with the same absolute-expiry + idle-timeout gates
@@ -999,6 +1116,15 @@ private:
     /// silent grant.
     std::optional<Session> validate_session_durable(const std::string& token,
                                                     bool idle_enabled) const;
+
+    /// Account gate for a session built from a store row (the only way a session reaches the
+    /// `validate_session_durable` cache). Closed three-way on `auth_source`: `local` is
+    /// served only while its `auth.users` account is active (skipped when no AuthDB is wired,
+    /// test wiring only); `oidc` and `saml` pass (their principal need not be a local
+    /// account); ANY other value, empty included, is refused. On every refusal the cache entry
+    /// for `key` is also erased, so a copy cached before a stale-distrust window cannot flip
+    /// a refusal back to a grant when trust returns. Called with no lock held.
+    [[nodiscard]] bool session_account_admits(const std::string& key, const Session& session) const;
 
 public:
 
@@ -1627,14 +1753,56 @@ private:
     /// that commit and then see the new hash (deny + revoke), instead of
     /// reading the old hash past an uncommitted write whose session DELETE
     /// already ran before this session existed.
+    ///
+    /// #6079: `expected_factor_gen` (engaged only for a BOUND local proof) is the factor
+    /// generation the MFA verifier read under the row lock. The same locked read hands the
+    /// account's CURRENT generation to the callback, which compares it (a value compare, no
+    /// I/O) and treats a difference like a role change: revoke-and-deny, the token is never
+    /// released. `why` (optional) receives the cause.
     [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
                                               const std::optional<std::string>& expected_hash_hex,
-                                              std::string_view context);
+                                              std::optional<std::int64_t> expected_factor_gen,
+                                              std::string_view context, MintDenial* why = nullptr);
 
-    /// Shared body of `create_local_session` / `create_local_session_for_test`.
-    [[nodiscard]] std::string
-    mint_local_session(const std::string& username, Role role, bool mfa_verified,
-                       const std::optional<std::string>& expected_hash_hex);
+    /// Outcome of the post-stamp recheck (#6079).
+    enum class StampRecheck : std::uint8_t { kHolds, kFactorChanged, kUnverifiable };
+
+    /// The stamp half of the same pattern, for `stamp_session_mfa_proof` (#6079): after the
+    /// stamp commits, re-read the account's factor generation under its `auth.users` row lock
+    /// (comparison only: no I/O, no mutex in the callback) and, when it is not `stamped_gen`
+    /// (or cannot be read), clear the proof with `SessionStore::clear_mfa_proof` AFTER the
+    /// lock has released. The clear is hygiene: the stored generation already differs from the
+    /// account's, which a binding gate refuses by equality, so after a CHANGED factor a clear
+    /// that fails leaves a refused proof, never an admissible one. After an UNVERIFIABLE
+    /// recheck the stored proof stays bound to the verifier's generation, which a binding gate
+    /// would admit unless a change raced; that is benign (the proof was earned with a valid
+    /// code) and the withdrawal is best-effort. This replica's cached proof is blanked or
+    /// re-derived in place, not erased. Returns `kHolds` when the generation still matches.
+    [[nodiscard]] StampRecheck post_stamp_factor_recheck(const std::string& username,
+                                                         const std::string& token_hash,
+                                                         std::int64_t stamped_gen);
+
+    /// Live MFA state for `create_local_session_for_test`: one `AuthDB::mfa_status` read.
+    /// nullopt when no AuthDB is attached or the read fails.
+    struct LiveMfaState {
+        bool enrolled{false};
+        std::int64_t factor_gen{0};
+        std::int64_t db_now_ms{0};
+    };
+    [[nodiscard]] std::optional<LiveMfaState>
+    read_live_mfa_state(const std::string& username) const;
+
+    /// Drop the proof from this replica's cached copy of `key` (no durable write).
+    void drop_cached_mfa_proof(const std::string& key);
+
+    /// The username of the session behind `key`: the cache first, else the durable row.
+    [[nodiscard]] std::optional<std::string> session_username_for_key(const std::string& key) const;
+
+    /// Shared body of `create_local_session` / `create_local_session_for_test`. `proof` is
+    /// nullptr for no proof; otherwise it is stored as given (see the public doc).
+    [[nodiscard]] std::string mint_local_session(
+        const std::string& username, Role role, const yuzu::server::LocalMfaProof* proof,
+        const std::optional<std::string>& expected_hash_hex, MintDenial* denial = nullptr);
 
     /// Backing field for `set_role_recheck_race_hook_for_test` - see that
     /// method's doc. Invoked (if set) from inside
@@ -1657,6 +1825,16 @@ private:
     /// as `role_recheck_race_hook_for_test_` above - see that field's
     /// Resource Ledger entry, which covers this one too.
     std::function<void()> post_mint_race_hook_for_test_;
+
+    /// Backing field for `set_validate_pre_cache_hook_for_test` - see that method's
+    /// doc. Invoked (if set) from `validate_session_durable` only. Same shape/
+    /// lifetime/production-reachability as `role_recheck_race_hook_for_test_` above.
+    std::function<void()> validate_pre_cache_hook_for_test_;
+
+    /// Backing field for `set_between_local_erase_and_wipe_hook_for_test` - see that method's
+    /// doc. Invoked (if set) from `reactivate_user` and `update_role_checked` only, with no lock
+    /// held. Same shape/lifetime/production-reachability as the hooks above.
+    std::function<void()> between_local_erase_and_wipe_hook_for_test_;
 
     /// #5342: the credential-change query owner (`set_credential_change_owner`).
     /// Borrowed, never owned; null ⇒ no credential writes.
@@ -1697,6 +1875,10 @@ private:
     /// counters). No-op when no MetricsRegistry is wired (tests/CLI).
     void note_session_store_degrade(const char* op) const;
 
+    /// `stored_binding_read_confirmed` logs its first refusal and every this-many-th after it.
+    static constexpr std::uint64_t kUnverifiedReadLogEvery = 100;
+    mutable std::atomic<std::uint64_t> unverified_read_refusals_{0};
+
     /// Reconstruct a cache `Session` from a durable `SessionRow` PLUS the DB
     /// clock at read time (`db_now_ms`, from `SessionStore::find`). Sets the
     /// authored wall-clock absolutes AND the local monotonic steady deadlines
@@ -1712,8 +1894,15 @@ private:
     /// the durable row exactly. In the legacy no-store path the timestamps are
     /// authored from this host's wall clock. Returns false on durable-write
     /// failure; always true legacy. Caller must NOT hold `mu_`.
+    ///
+    /// #6079: a carried local proof instant (`params.local_mfa.verified_ms > 0`) later than the
+    /// authoring clock's `now()` is stored as NO proof by the store (never clamped). That is a
+    /// REFUSAL, not a session: the just-written row is deleted (this token only), nothing is
+    /// cached, `yuzu_auth_mfa_verification_future_dated_total` counts it, and this returns
+    /// false with `*future_dated` set so the caller can name the cause.
     [[nodiscard]] bool persist_new_session(const std::string& raw_token,
-                                           const yuzu::server::SessionWriteParams& params);
+                                           const yuzu::server::SessionWriteParams& params,
+                                           bool* future_dated = nullptr);
 
     /// Durably delete every session for a username (bumps the generation so all
     /// replicas drop the cached copies). Called from the role-change / demote /
@@ -1732,6 +1921,14 @@ private:
     /// idempotent, so an operator retry after a false return is safe. No-op
     /// (true) without a store. Caller must NOT hold `mu_`.
     [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
+
+    /// `wipe_user_sessions_durable`, then drop the user's cached sessions AGAIN (and advance the
+    /// cache epoch) once it has returned, success or not. A cold validation that began after
+    /// the caller's first local erase can read the row before the durable delete commits, pass
+    /// the account gate and cache the pre-change session; the second drop erases whatever such a
+    /// validation inserted and makes one still in flight drop its insert. Other replicas clear
+    /// at their next generation poll. Same return and `mu_` contract as the wrapped call.
+    [[nodiscard]] bool wipe_user_sessions_then_drop_cache(const std::string& username);
 
     /// #4966: after a guarded lifecycle write answered StoreFailure (it MAY have committed: a
     /// lost COMMIT ack), evict the TARGET's `users_` entry and in-memory sessions and attempt the
@@ -1783,6 +1980,26 @@ private:
     // store row key too), by the raw token in the legacy in-memory-only mode.
     // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
+    // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
+    // section as every `sessions_.clear()` (the generation poll) and every targeted
+    // erase that revokes a session (`drop_cached_session_locked`,
+    // `drop_cached_user_sessions_locked`). Expiry and idle hygiene drops do not move it.
+    // `validate_session_durable` captures it under its step-1 shared lock and inserts
+    // its session at the tail only if it is unchanged, so a validation that straddles
+    // a clear or a revoke cannot put the session back (ADR-0012 section 4, rule 2). The
+    // generation poll alone cannot do that for a revoke on THIS replica: it sees its own
+    // bump only on the next poll.
+    mutable std::uint64_t session_cache_epoch_ = 0;
+
+    /// Targeted cache erase for a revoke, wipe, account removal or gate refusal: erases
+    /// from `sessions_` AND advances `session_cache_epoch_` in the SAME critical section.
+    /// The caller MUST hold `mu_` exclusively. Never erase `sessions_` for one of those
+    /// purposes directly: a validation held across the erase would re-insert its session.
+    void drop_cached_session_locked(const std::string& key) const;
+
+    /// As `drop_cached_session_locked`, for every cached session of `username`. Returns
+    /// how many entries were erased. The epoch advances even when none were.
+    std::size_t drop_cached_user_sessions_locked(const std::string& username) const;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;

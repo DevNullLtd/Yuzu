@@ -318,18 +318,18 @@ TEST_CASE("the containment action constants are exactly the closed protective se
           "on the firewall plugin is",
           "[server][quarantine][reapply]") {
     using yuzu::protective::is_protective_action;
-    using yuzu::protective::is_quarantine_control_plugin;
+    using yuzu::protective::is_firewall_control_plugin;
     for (const auto action : {kContainmentApplyAction, kContainmentStatusAction,
                               kContainmentReleaseAction, std::string_view{"quarantine_allow"}}) {
         CAPTURE(action);
-        CHECK(is_quarantine_control_plugin(kContainmentPlugin, action));
+        CHECK(is_firewall_control_plugin(kContainmentPlugin, action));
         CHECK(is_protective_action(kContainmentPlugin, action));
     }
     // A renamed constant would be refused here instead of in production, and an action added to the
     // firewall plugin later does not inherit the exemption.
-    CHECK_FALSE(is_quarantine_control_plugin(kContainmentPlugin, "state"));
-    CHECK_FALSE(is_quarantine_control_plugin(kContainmentPlugin, "rules"));
-    CHECK_FALSE(is_quarantine_control_plugin("os_info", kContainmentApplyAction));
+    CHECK_FALSE(is_firewall_control_plugin(kContainmentPlugin, "state"));
+    CHECK_FALSE(is_firewall_control_plugin(kContainmentPlugin, "rules"));
+    CHECK_FALSE(is_firewall_control_plugin("os_info", kContainmentApplyAction));
 }
 
 TEST_CASE("the whitelist refusal texts name the limits the constants set", "[server][quarantine][reapply]") {

@@ -552,7 +552,7 @@ constexpr char kDashOverlays[] = R"HTM(  <!-- ── About Modal ─────
       <p id="about-details">Loading...</p>
       <p>Built with C++23, gRPC, Protobuf, SQLite</p>
       <p>
-        <a href="https://github.com/anthropics/yuzu" target="_blank">GitHub</a>
+        <a href="https://github.com/DevNullLtd/Yuzu" target="_blank" rel="noopener noreferrer">GitHub</a>
         &nbsp;&middot;&nbsp;
         <a href="/help">Documentation</a>
       </p>
@@ -1156,8 +1156,8 @@ constexpr char kDashJs6[] = R"HTM(
 
           var activeCls = i === cmdPalette.selectedIndex ? ' active' : '';
           html += '<div class="cmd-result' + activeCls + '" data-index="' + i + '"'
-            + ' onmouseenter="cmdPalette.selectedIndex=' + i + ';cmdPalette.render()"'
-            + ' onclick="cmdPalette.select()">'
+            + ' onmouseenter="cmdPalette.highlight(' + i + ')"'
+            + ' onclick="cmdPalette.selectedIndex=' + i + ';cmdPalette.select()">'
             + '<span class="cmd-result-name">' + escapeHtml(r.name) + '</span>'
             + '<span class="cmd-result-desc">' + escapeHtml(r.desc) + '</span>'
             + '<span class="cmd-result-type badge ' + badgeCls + '">' + escapeHtml(r.type) + '</span>'
@@ -1169,6 +1169,20 @@ constexpr char kDashJs6[] = R"HTM(
         /* Scroll active item into view */
         var active = container.querySelector('.cmd-result.active');
         if (active) active.scrollIntoView({ block: 'nearest' });
+      },
+
+      /* Hover moves the highlight in place. It must never re-render: rebuilding
+         #cmd-results replaces the row under the pointer, the next mouse move fires
+         mouseenter on the new row and rebuilds again, so mousedown and mouseup land
+         on different elements and the browser never fires click. No scrolling here
+         either: scrolling under a hovering pointer would move it onto another row. */
+      highlight: function(i) {
+        if (i === cmdPalette.selectedIndex) return;
+        cmdPalette.selectedIndex = i;
+        var rows = document.querySelectorAll('#cmd-results .cmd-result');
+        for (var j = 0; j < rows.length; j++) {
+          rows[j].classList.toggle('active', rows[j].getAttribute('data-index') === String(i));
+        }
       },
 
       navigate: function(delta) {
@@ -1501,8 +1515,13 @@ constexpr char kDashJs8[] = R"HTM(
         body: form.toString()
       }).then(function(resp) {
         if (!resp.ok) {
-          alert('MFA step-up failed — verify your code and try again.');
-          return;
+          /* 503: the server names the cause (the code was not checked, or it was spent and
+             could not be recorded), so show its own message rather than guess. */
+          var fallback = 'MFA step-up failed: verify your code and try again.';
+          if (resp.status !== 503) { alert(fallback); return; }
+          return resp.json().then(function(b) {
+            alert((b && b.error && typeof b.error.message === 'string' && b.error.message) || fallback);
+          }, function() { alert(fallback); });
         }
         /* Replay the original request via htmx.ajax. The original
            triggering element is in evt.detail.elt; pass it as the

@@ -249,7 +249,10 @@ under `pagination` and a 10-field CSV trailer.
 **POST /api/export/json-to-csv**
 
 A generic endpoint that accepts any JSON array in the request body and returns
-a CSV file. This can be used with data from any Yuzu API.
+a CSV file. This can be used with data from any Yuzu API. The request is limited
+to 16 MiB of JSON and 1,000,000 values, and the CSV to 16 MiB; a larger export
+answers `413`, so split it into several requests (limits and errors:
+[REST API](rest-api.md)).
 
 ```bash
 curl -s -b cookies.txt \

@@ -5,7 +5,7 @@ Headless-browser checks against a running Yuzu dashboard.
 | Script | Role |
 |---|---|
 | `ui-smoke.mjs` | The gate. Run by `/test` Phase 5 as "Browser smoke"; exit 1 fails the gate. |
-| `lib/harness.mjs` | Shared helpers: launch, login, error collection, CSP and layout assertions, request stubs. |
+| `lib/harness.mjs` | Shared helpers: launch, login, error collection, CSP and layout assertions, request stubs (including a held response and abort detection). |
 | everything else | Older one-off probes. Not gates; `dashboard-help-test.mjs` is the warn-only "Puppeteer" gate. |
 
 ## Install
@@ -73,8 +73,16 @@ The selftest needs only puppeteer: no server, database or login. It serves a fak
 local `127.0.0.1` fixture and bends it one way per case, asserting that the real crawl and
 overflow checks fail for the right reason: a nav without `/`, an href outside `EXPECTED`, errors
 raised after load, a missing or `unsafe-eval` CSP, a submit button outside its form, a form with
-no submit control, and a 404 route. A baseline case first proves the clean fixture passes. `/test`
-runs it before the live run, and a selftest failure fails the gate. Add a case when you add a check.
+no submit control, and a 404 route. A baseline case first proves the clean fixture passes. Two more
+cases serve the committed Apps golden (`apps__versions.html`) from the fixture: the page as committed
+must pass the versions-expander check, and the same bytes with every CSS rule that uses `:has()` removed
+must fail it through the named wait ("version rows shown after opening the expander"), so the expander
+check is proven able to fail. `/test` runs the selftest before the live run, and a selftest failure
+fails the gate. Add a case when you add a check.
+
+Which half runs where: the selftest also runs in CI, in the path-filtered `ui-smoke-selftest` workflow
+(it is not a required check). The live half, the scenarios against a running dashboard, needs the UAT
+stack and runs only in `/test` Phase 5.
 
 ## What it checks
 
@@ -83,10 +91,22 @@ runs it before the live run, and a selftest failure fails the gate. Add a case w
    `app_shell.cpp` means editing that list in the same change.
 2. Overflow: submit controls on the plugin upload form, the add-user dialog and the new-token
    dialog stay inside their form or dialog and the viewport at 1400x900 and 1024x768.
-3. Scenarios, each forcing its own precondition (writes are answered by a request stub, so none
-   reaches the server):
-   upload rollout percentage and a failing upload, add user, the Ctrl+K guard on a focused field,
-   and the PKI audit-failed banner and load-error text.
+3. Scenarios, nine in all. Five force their own precondition (writes are answered by a request
+   stub, so none reaches the server): upload rollout percentage and a failing upload, add user,
+   the Ctrl+K guard on a focused field, the PKI audit-failed banner and load-error text, and the
+   Engine Principals audit-failed notice. The sixth is the DEX Apps tab: a live half (the tab opens
+   and a platform chip is pressed from the keyboard) and a golden half (the committed
+   `apps__versions.html` is served through a GET stub, so the version expander, the score
+   decomposition, a long application name and the expander's accessibility tree are exercised on
+   every run whatever the stack holds). The seventh, `dex-pane-sync`, holds the Apps response in the
+   browser, opens Overview, asserts the page cancelled the held request, then releases it and asserts
+   it replaced nothing. The eighth, `dex-keyboard`, operates the Apps tab, a window chip and an
+   application link with focus and Enter only. The ninth, `find-software`, is the Find software
+   panel on `/software`: a live half (an Applications search, Copy REST call against a clipboard
+   stub, and the Java chip and back, each answering with a result or a real zero, never the
+   "Inventory store unavailable" banner) and a stub half (a first page and its continuation are
+   served through GET stubs, so Load more and where focus lands are exercised on every run whatever
+   the stack holds).
 
 It does not check: WebGL scenes (the Fleet and Host maps), non-administrator roles, a write that
 really reaches the server, or any route the shell does not link to. The nav list it compares
@@ -94,6 +114,12 @@ against is hand-copied, so a new nav entry fails the smoke until `EXPECTED` is e
 Node 22.12 or newer (the pinned `puppeteer` requires it); `scripts/test/ensure-puppeteer.sh` checks it.
 
 ## Writing a scenario
+
+A stub may carry `hold`, a promise: the request is recorded in `rule.calls` when it arrives and is
+answered only once `hold` settles, so a scenario can supersede it first. When the page cancels the
+request while it is held, the call entry and the rule gain `aborted = true` (from the browser's
+request-failed event, with htmx's `htmx:xhr:abort` as a second signal), and `waitAborted(page, rule)`
+waits for it. The abort is read from those events, never from `respond()` failing.
 
 Use the harness; do not sleep. Wait on `settled(page)` or `page.waitForFunction`, and call
 `quiesce(page)` before reading a `watch()` collector. Install a `stub()` before the request it

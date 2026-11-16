@@ -1260,6 +1260,18 @@ TEST_CASE("timing stat: the direct Subscribe path relays only a plain millisecon
     CHECK(marker == 0); // free text after the sentinel never reaches the shared bus
 }
 
+TEST_CASE("result-set producers: only a non-Forensics plugin may seed a set",
+          "[server][forensics_tier][security]") {
+    const auto& set = test::forensics_plugin_set();
+    CHECK_FALSE(plugin_may_seed_result_set(test::kForensicsPlugin, &set));
+    CHECK_FALSE(plugin_may_seed_result_set("BROWSER_INVENTORY", &set)); // the fold is ASCII-case-blind
+    CHECK(plugin_may_seed_result_set(test::kOrdinaryPlugin, &set));
+    CHECK(plugin_may_seed_result_set("echo", &set));
+    // An unwired set (a test harness; the server will not boot without it) refuses nothing.
+    CHECK(plugin_may_seed_result_set(test::kForensicsPlugin, nullptr));
+    CHECK(kSourceNotSupportedMessage.starts_with("RESULT_SET_SOURCE_NOT_SUPPORTED: "));
+}
+
 TEST_CASE("result-set materializer: membership is never derived from a Forensics plugin's rows",
           "[pg][server][forensics_tier][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, leaks_responsestore_tpl);
