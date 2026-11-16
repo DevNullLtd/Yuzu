@@ -123,6 +123,7 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
     PgPool rbac_pool_fx_{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};                               \
     REQUIRE(rbac_pool_fx_.valid());                                                                 \
     RbacStore store_var{rbac_pool_fx_};                                                             \
+    store_var.use_no_session_store_for_test(); /* no session_store schema in this fixture */        \
     REQUIRE(store_var.is_open())
 
 // Fixture for the A2 last-Administrator guard (governance BLOCKING #1,
@@ -143,6 +144,7 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
 #define RBAC_STORE_WITH_AUTH(store_var, auth_var)                                                 \
     yuzu::test::AuthDbPg auth_var;                                                                \
     RbacStore store_var{auth_var.pool()};                                                         \
+    store_var.use_no_session_store_for_test(); /* no session_store schema in this fixture */      \
     REQUIRE(store_var.is_open())
 
 /// Seed an ACTIVE auth.users row for `username` (a genuinely authenticatable

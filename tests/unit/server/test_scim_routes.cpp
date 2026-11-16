@@ -145,6 +145,7 @@ struct Fixture {
         rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool(),
                                                                lifecycle_lock_timeout);
         REQUIRE(rbac_guard->is_open());
+        rbac_guard->use_no_session_store_for_test(); // no session_store schema in this fixture
         auth_mgr.set_rbac_store(rbac_guard.get());
         // A second active admin: cases that demote/remove an admin test the write path, not the
         // last-Administrator refusal (that has its own cases).
@@ -2938,6 +2939,7 @@ struct ScimIntegrationServer {
         auth_mgr.set_auth_db(auth_db.get());
         rbac_guard = std::make_unique<yuzu::server::RbacStore>(auth_db.pool());
         REQUIRE(rbac_guard->is_open());
+        rbac_guard->use_no_session_store_for_test(); // no session_store schema in this fixture
         auth_mgr.set_rbac_store(rbac_guard.get());
         // A second active admin: cases that demote/remove an admin test the write path, not the
         // last-Administrator refusal (that has its own cases).

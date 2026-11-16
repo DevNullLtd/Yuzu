@@ -148,8 +148,10 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 // connection (an orphaned backend, until the OS TCP keepalive reaps it) would otherwise block
 // every guarded lifecycle write for that long. A lock WAIT is not idle time (the backend is
 // executing a statement), so a waiter is unaffected; only a holder that stops sending statements
-// is cut. Fixed, not configurable. It does NOT cover `unassign_role`, `set_enforcement` or
-// `provision_first_admin`: those transactions keep only the pool defaults. A transaction-local
+// is cut. Fixed, not configurable. It covers `unassign_role` ONLY when the removed grant is a
+// user's Administrator grant (the transaction that also takes the target's session rows); it does
+// NOT cover `set_enforcement` or `provision_first_admin`, and the other unassigns: those
+// transactions keep only the pool defaults. A transaction-local
 // setting also OVERRIDES a stricter operator-set `idle_in_transaction_session_timeout` upward to
 // 15 s for these two transactions.
 constexpr std::chrono::milliseconds kLifecycleIdleInTxnTimeout{15000};
@@ -254,7 +256,8 @@ std::string lifecycle_failure_text(pg::PgPool& pool, const std::string& err, std
 RbacAdminAuthorityOwner::UnassignOutcome
 RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
                                        const std::string& principal_id,
-                                       const std::string& role_name) const {
+                                       const std::string& role_name,
+                                       SessionGenerationMode session_mode) const {
     // A value that is not clean text is refused up front.
     if (!rbac_text_is_clean(role_name) || !rbac_text_is_clean(principal_type) ||
         !rbac_text_is_clean(principal_id)) {
@@ -265,8 +268,17 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
     std::optional<std::uint64_t> new_gen;
     bool last_admin_reject = false;
     bool removed = false;
+    int elevations_cleared = 0;
     std::string err;
+    // The one case that also ends the target's live elevation (see the banner): removing a
+    // USER's Administrator grant. Every other unassign keeps the pool-default timeouts and
+    // touches no session_store object.
+    const bool user_admin_unassign = role_name == "Administrator" && principal_type == "user";
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // 0. Bound every lock wait of this transaction (it can wait on the target's session
+        // rows while holding every counted Administrator grant row), as the FIRST statement.
+        if (user_admin_unassign && !set_txn_timeouts(c, lifecycle_lock_timeout_, err))
+            return false;
         // A2 last-Administrator guard ("A2 — Global human
         // role assignment/unassignment"). Scoped to role_name=="Administrator"
         // ONLY — every other unassign (including both existing engine-only
@@ -444,14 +456,18 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
         //      re-counts against its outcome. Still outside it: direct SQL against
         //      `auth.users`, which is break-glass.
         // Lock order in this transaction: `principal_roles` rows, then this one
-        // `auth.users` row, then the `rbac_meta` `write_generation` row (taken by
-        // `bump_generation_in_txn` at the end). A path that holds an `auth.users`
+        // `auth.users` row, then (user Administrator removal in `kBumpSessionGeneration` only)
+        // the target's `session_store.sessions` rows, then the `rbac_meta` `write_generation` row
+        // (taken by `bump_generation_in_txn` at the end), then `session_meta` last (only when an
+        // elevation was cleared). A path that holds an `auth.users`
         // row lock and then waits on `principal_roles` or `rbac_meta` would deadlock
         // against it. auth_db.cpp has no `principal_roles` or `rbac_store` SQL (the
         // `auth_db*` seam rule in tests/test_rbac_query_owner_seam.py pins that), and
         // `deactivate_account` / `set_local_role` (#4966) honour this order rather than
         // invert it. A lock
-        // wait here is bounded by the pool's `lock_timeout` (10 s by default; the
+        // wait here is bounded, for a user Administrator removal, by the lifecycle
+        // `lock_timeout` installed as step 0 (2000 ms), and otherwise by the pool's
+        // `lock_timeout` (10 s by default; the
         // pool does not inject it when the DSN sets its own `options` or `PGOPTIONS` is
         // set, and the wait is then bounded only if that setting, or the server or role
         // default, sets a `lock_timeout`); on timeout the statement errors and this
@@ -473,10 +489,41 @@ RbacAdminAuthorityOwner::unassign_role(const std::string& principal_type,
             }
         }
 
+        // End the target's live elevation in THIS transaction (the removed grant and the
+        // elevation commit together or not at all). Reached only after the recount passed (a
+        // last-Administrator refusal returned above) and the DELETE removed a row. All
+        // session_store SQL is in session_store_sql_helpers.hpp; any failure aborts the
+        // transaction, so the DELETE rolls back (fail closed). Order: the target's session rows
+        // (a SEPARATE statement from the clear, so the clear's fresh snapshot sees any elevation
+        // a writer committed while we waited), the clear, the RBAC bump below, and session_meta
+        // LAST.
+        const bool clear_elevations =
+            user_admin_unassign && removed &&
+            session_mode == SessionGenerationMode::kBumpSessionGeneration;
+        if (clear_elevations) {
+            if (!session_sql::lock_user_session_rows_in_txn(c, principal_id, err))
+                return false;
+            const auto cleared = session_sql::clear_user_elevations_in_txn(c, principal_id, err);
+            if (!cleared)
+                return false;
+            elevations_cleared = *cleared;
+        }
+
         new_gen = bump_generation_in_txn(c);
-        return new_gen.has_value();
+        if (!new_gen.has_value())
+            return false;
+
+        // session_meta is the one lock every session create/revoke in the fleet shares: take it
+        // LAST and only when a row changed (a zero-row clear needs no bump). Nothing waits after.
+        if (clear_elevations && elevations_cleared > 0 && !session_sql::bump_generation_in_txn(c)) {
+            err = std::string("session write-generation bump failed: ") + PQerrorMessage(c);
+            return false;
+        }
+        return true;
     });
-    return {ok, last_admin_reject, removed, new_gen, err};
+    UnassignOutcome out{ok, last_admin_reject, removed, new_gen, err};
+    out.elevations_cleared = ok ? elevations_cleared : 0;
+    return out;
 }
 
 // See this file's header banner for the full rule and lock order. Guard

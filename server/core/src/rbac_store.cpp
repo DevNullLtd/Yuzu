@@ -2326,20 +2326,62 @@ std::expected<void, std::string> RbacStore::assign_role(const PrincipalRole& pr)
 std::expected<bool, std::string> RbacStore::unassign_role(const std::string& principal_type,
                                                            const std::string& principal_id,
                                                            const std::string& role_name) {
+    auto detailed = unassign_role_detailed(principal_type, principal_id, role_name);
+    if (!detailed)
+        return std::unexpected(std::move(detailed.error()));
+    return detailed->removed;
+}
+
+bool RbacStore::set_local_session_drop(std::function<void(const std::string&)> fn) {
+    if (!fn || local_session_drop_)
+        return false;
+    local_session_drop_ = std::move(fn);
+    return true;
+}
+
+std::expected<RbacStore::UnassignResult, std::string>
+RbacStore::unassign_role_detailed(const std::string& principal_type,
+                                  const std::string& principal_id, const std::string& role_name) {
     if (!open_)
         return std::unexpected("database not open");
     const RbacAdminAuthorityOwner::UnassignOutcome outcome =
-        RbacAdminAuthorityOwner{pool_}.unassign_role(principal_type, principal_id, role_name);
+        RbacAdminAuthorityOwner{pool_, lifecycle_lock_timeout_}.unassign_role(
+            principal_type, principal_id, role_name, session_mode_);
     if (outcome.last_admin_reject)
         return std::unexpected("cannot remove the last remaining Administrator role grant — "
                                "the fleet would be left with " +
                                std::string(kRbacLastAdminRefusalMarker));
+    const bool user_admin = role_name == "Administrator" && principal_type == "user";
+    // The transaction has returned: no lease is held and no lock is held here. Drop this
+    // replica's cached sessions of the target. A throw is logged and counted, never propagated:
+    // the removal is (or may be) durable, so it must not be reported as a failure.
+    const auto drop_local = [&] {
+        if (!local_session_drop_)
+            return;
+        try {
+            local_session_drop_(principal_id);
+        } catch (...) {
+            local_session_drop_failures_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::warn("RbacStore: local session drop for '{}' threw after an Administrator "
+                         "unassign; the generation poll will converge",
+                         ::yuzu::log_key_token(principal_id));
+        }
+    };
     // `!outcome.new_gen` is unreachable while the owner's lambda returns
     // `new_gen.has_value()`; it guards the dereference below if that ever changes.
-    if (!outcome.ok || !outcome.new_gen)
+    if (!outcome.ok || !outcome.new_gen) {
+        // An empty `err` means the transaction did not report a statement failure of its own: a
+        // lost COMMIT ack may have committed the removal, so fail toward re-authentication (the
+        // `AuthManager::evict_target_after_indeterminate_write` posture). A statement failure
+        // (non-empty `err`) rolled back and changed nothing.
+        if (user_admin && !outcome.ok && outcome.err.empty())
+            drop_local();
         return std::unexpected(outcome.err.empty() ? "unassign_role failed" : outcome.err);
+    }
     apply_local_generation(*outcome.new_gen);
-    return outcome.removed;
+    if (user_admin && outcome.removed)
+        drop_local();
+    return UnassignResult{outcome.removed, outcome.elevations_cleared};
 }
 
 // See rbac_store.hpp for the full contract. Thin delegation to

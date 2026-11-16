@@ -46,6 +46,7 @@
 #include <chrono>
 #include <cstdint>
 #include <expected>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -581,6 +582,52 @@ public:
                                                     const std::string& principal_id,
                                                     const std::string& role_name);
 
+    /// What `unassign_role_detailed` reports on a committed unassign.
+    struct UnassignResult {
+        bool removed{false};         ///< a row was actually removed (same as `unassign_role`)
+        int elevations_cleared{0};   ///< durable session rows whose elevation this unassign cleared
+    };
+
+    /// `unassign_role`, plus the number of durable elevations the transaction cleared (see below).
+    /// `unassign_role` delegates here and keeps its bool-only signature.
+    ///
+    /// REMOVING A USER'S `Administrator` GRANT ENDS THAT USER'S LIVE JIT ELEVATION in the SAME
+    /// transaction (the grant removal and the durable clear commit together or not at all; a
+    /// clear/bump failure rolls the removal back and this returns the store error: fail closed).
+    /// The durable clear is the DEFAULT; the only opt-out is
+    /// `use_no_session_store_for_test()`. It does NOT stop a later re-elevation (`/elevate` checks
+    /// eligibility, not the grant). After a confirmed commit (or an indeterminate failure that may
+    /// have committed) of a user Administrator unassign, the local-drop callback installed by
+    /// `set_local_session_drop` runs once, OUTSIDE the transaction and with no lease held; a
+    /// throwing callback is logged, counted (`local_session_drop_failures`) and never changes the
+    /// result.
+    std::expected<UnassignResult, std::string>
+    unassign_role_detailed(const std::string& principal_type, const std::string& principal_id,
+                           const std::string& role_name);
+
+    /// Install the in-process callback that drops this replica's cached sessions of one user
+    /// (called with the username) after a user Administrator unassign, so the local cache does
+    /// not keep serving the ended elevation until the next generation poll. Set ONCE during
+    /// single-threaded startup before serving, read without synchronisation on serving
+    /// threads (the `set_metrics` precedent); a second non-empty set is refused (returns false,
+    /// first one stays). It is NEVER cleared at teardown: the callee must outlive every request
+    /// thread. The callback must not block or call back into this store.
+    bool set_local_session_drop(std::function<void(const std::string& username)> fn);
+
+    /// Number of times the local-drop callback threw (the unassign still succeeded).
+    [[nodiscard]] std::uint64_t local_session_drop_failures() const noexcept {
+        return local_session_drop_failures_.load(std::memory_order_relaxed);
+    }
+
+    /// TEST-ONLY opt-out of the durable elevation clear: switches the unassign to
+    /// `SessionGenerationMode::kNoSessionStore`, which issues no `session_store` SQL (for
+    /// fixtures that have no `session_store` schema). Production code MUST NEVER call this
+    /// (tests/test_session_account_gate_wiring.py pins it): a production store without the
+    /// durable clear would answer success while the elevation survives.
+    void use_no_session_store_for_test() noexcept {
+        session_mode_ = SessionGenerationMode::kNoSessionStore;
+    }
+
     /// Fresh-install RBAC-safe-by-default bootstrap (third
     /// `RbacAdminAuthorityOwner` consumer, same delegation shape as
     /// `unassign_role`/`set_rbac_enforcement` above). Inserts the FIRST
@@ -814,6 +861,12 @@ private:
 
     pg::PgPool& pool_;
     const std::chrono::milliseconds lifecycle_lock_timeout_;
+    /// Durable-clear mode of the Administrator unassign. Default = the durable clear (a missing
+    /// `session_store` schema then fails the statement and the unassign rolls back). Only
+    /// `use_no_session_store_for_test()` changes it, before the store is shared across threads.
+    SessionGenerationMode session_mode_{SessionGenerationMode::kBumpSessionGeneration};
+    std::function<void(const std::string&)> local_session_drop_; ///< set-once, never cleared
+    std::atomic<std::uint64_t> local_session_drop_failures_{0};
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
     // Cached by set_metrics() — see that method's doc comment. Null whenever
