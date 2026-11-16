@@ -69,6 +69,16 @@ Invariants:
      recheck: a refused thread creation (a task or thread limit) must degrade a report-only feature,
      not abort the boot (found by an external review; one mutant).
 
+  15. The collation GATE (the lock-free atomic the check publishes, which pauses device_ci writes)
+     is wired at all three ends: both report sites (the constructor-time `report_collation_check(`
+     and the `PgCollationRecheck` construction) pass `&collation_gate_`, and
+     `device_inventory_store_->set_write_gate(&collation_gate_);` appears exactly once. A dropped
+     argument leaves the gate Unproven for the life of the process (writes never pause); a dropped
+     `set_write_gate` leaves the store with no gate (the default), so a mismatch pauses nothing.
+     Both compile and pass every unit test.
+  16. The `collation_gate_` member is declared before the `device_inventory_store_` member that
+     borrows a pointer to it, so it outlives the store.
+
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
 the preprocessor-dead branches of `#if 0` / `#if 1 ... #else` (nested, with `#elif`) are removed,
@@ -155,6 +165,16 @@ RESET_ARM = "pg_collation_recheck_.reset();"
 MSG_START_UNGUARDED = ("the PgCollationRecheck start() is not wrapped in try/catch(const std::exception&) "
                        "that resets the unstarted recheck: a refused thread creation would abort the "
                        "boot of a report-only feature")
+GATE_ARG = "&collation_gate_"
+WRITE_GATE = "device_inventory_store_->set_write_gate(&collation_gate_);"
+GATE_DECL = "std::atomic<pg::CollationGate> collation_gate_"
+STORE_DECL = "std::unique_ptr<DeviceInventoryStore> device_inventory_store_;"
+MSG_REPORT_NO_GATE = "the report_collation_check call does not pass &collation_gate_"
+MSG_MAKE_NO_GATE = "the PgCollationRecheck is not given &collation_gate_"
+MSG_WRITE_GATE = ("server.cpp must call `" + WRITE_GATE + "` exactly once: without it the "
+                  "device_ci store has no gate and a collation mismatch pauses nothing")
+MSG_GATE_DECL_ORDER = ("the collation_gate_ member is not declared before the "
+                       "device_inventory_store_ member that borrows a pointer to it")
 MSG_DECL_ORDER = ("the pg_collation_recheck_ member is not declared after the pg_pool_ member it "
                   "borrows")
 
@@ -337,6 +357,8 @@ def recheck_problems(t, report_pos):
             out.append(MSG_MAKE_BEFORE_CHECK)
         if "collation_state_" not in t[pos:end]:
             out.append(MSG_MAKE_NO_STATE)
+        if GATE_ARG not in t[pos:end]:
+            out.append(MSG_MAKE_NO_GATE)
         window = t[max(0, pos - 300):pos]
         if "lifecycle_mu_" not in window or START_GUARD not in window:
             out.append(MSG_UNLOCKED)
@@ -391,6 +413,14 @@ def problems(src):
         out.append(MSG_STARTUP_FAILED)
     if "collation_state_" not in t[pos:end]:
         out.append(MSG_NO_STATE)
+    if GATE_ARG not in t[pos:end]:
+        out.append(MSG_REPORT_NO_GATE)
+    if len(re.findall(re.escape(WRITE_GATE), t)) != 1:
+        out.append(MSG_WRITE_GATE)
+    gate_decl = t.find(GATE_DECL)
+    store_decl = t.find(STORE_DECL)
+    if gate_decl < 0 or store_decl < 0 or gate_decl > store_decl:
+        out.append(MSG_GATE_DECL_ORDER)
     seeds = [m.start() for m in re.finditer(re.escape(SEED), t)]
     if len(seeds) != 1 or seeds[0] > pos:
         out.append(MSG_SEED)
@@ -453,6 +483,40 @@ class PgCollationCheckWiring(unittest.TestCase):
         j = self.src.index("collation_state_,", i)
         m = self.src[:j] + "pg::CollationState{}," + self.src[j + len("collation_state_,"):]
         self.assertEqual(problems(m), [MSG_MAKE_NO_STATE])
+
+    def test_report_call_not_passed_the_gate(self):
+        i = self.src.index(REPORT)
+        j = self.src.index(GATE_ARG, i)
+        m = self.src[:j] + "nullptr" + self.src[j + len(GATE_ARG):]
+        self.assertEqual(problems(m), [MSG_REPORT_NO_GATE])
+
+    def test_recheck_not_given_the_gate(self):
+        i = self.src.index(MAKE)
+        j = self.src.index(GATE_ARG, i)
+        m = self.src[:j] + "nullptr" + self.src[j + len(GATE_ARG):]
+        self.assertEqual(problems(m), [MSG_MAKE_NO_GATE])
+
+    def test_store_write_gate_not_wired(self):
+        m = self.src.replace(WRITE_GATE, "(void)0;", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertEqual(problems(m), [MSG_WRITE_GATE])
+
+    def test_store_write_gate_wired_twice(self):
+        m = self.src.replace(WRITE_GATE, WRITE_GATE + "\n" + WRITE_GATE, 1)
+        self.assertEqual(problems(m), [MSG_WRITE_GATE])
+
+    def test_store_write_gate_in_if_0_fails(self):
+        m = self.src.replace(WRITE_GATE, "\n#if 0\n" + WRITE_GATE + "\n#endif\n", 1)
+        self.assertEqual(problems(m), [MSG_WRITE_GATE])
+
+    def test_gate_declared_after_the_store(self):
+        i = self.src.index(GATE_DECL)
+        j = self.src.index(";", i) + 1
+        decl = self.src[i:j]
+        rest = self.src[:i] + self.src[j:]
+        k = rest.index(STORE_DECL) + len(STORE_DECL)
+        m = rest[:k] + "\n    " + decl + rest[k:]
+        self.assertEqual(problems(m), [MSG_GATE_DECL_ORDER])
 
     def test_recheck_start_deleted(self):
         m = self.src.replace(START, "(void)0;", 1)

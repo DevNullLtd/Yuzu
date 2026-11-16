@@ -2118,6 +2118,7 @@ if build_server
       'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
       'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
+      'unit/server/test_device_ci_write_pause.cpp', # #7730: write pause + ingest-seam gate
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
       'unit/server/test_app_perf_ingestion.cpp',
