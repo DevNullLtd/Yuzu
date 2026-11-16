@@ -223,8 +223,9 @@ std::string_view read_error_message(ReadError e) {
         return "hardware CI records are refused: the database collation version is not verified. "
                "Either it changed under the stored CI keys (a database repair is needed), or no "
                "check has concluded yet (it has not run, could not read the version, or is held by "
-               "an invalid index; no repair may be needed). The read is refused until the check "
-               "concludes (see PostgreSQL collation version in server-admin.md)";
+               "an invalid index, which must be dropped or rebuilt; otherwise no repair may be "
+               "needed). The read is refused until the check concludes (see PostgreSQL collation "
+               "version in server-admin.md)";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -263,8 +264,9 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         return f;
     case ReadError::kOrderingUnverified:
         // Not kDegraded: the store answers, but its answer cannot be trusted. Retryable (the
-        // recheck clears it once the database is repaired), audited like the other fail-closed
-        // `inventory.devices.ci` refusals, and no read ran.
+        // recheck clears it once the database is repaired), audited with an
+        // `inventory.devices.ci` failure row (written best effort on REST: a row that does not
+        // persist marks the response Sec-Audit-Failed, hardware_routes.cpp), and no read ran.
         f.unavailable = true;
         f.retry_after_ms = device_ci_read_gate::kOrderingRetryAfterMs;
         f.remediation = kOrderingUnverifiedRemediation;

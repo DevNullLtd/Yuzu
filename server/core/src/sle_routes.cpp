@@ -319,8 +319,8 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 // the device_inventory store; any OTHER failed store is a different fault and is
                 // worded separately, so the message never blames every failure on the pause.
                 const std::int64_t paused_n = static_cast<std::int64_t>(paused.size());
-                const std::int64_t other_failed =
-                    r.failed > paused_n ? static_cast<std::int64_t>(r.failed) - paused_n : 0;
+                const std::int64_t failed_n = static_cast<std::int64_t>(r.failed);
+                const std::int64_t other_failed = failed_n > paused_n ? failed_n - paused_n : 0;
                 std::string msg;
                 if (paused.empty()) {
                     msg = "agent decommission incomplete — one or more stores failed (" +

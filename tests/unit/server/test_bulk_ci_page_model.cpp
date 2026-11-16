@@ -887,8 +887,9 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "hardware CI records are refused: the database collation version is not verified. "
          "Either it changed under the stored CI keys (a database repair is needed), or no "
          "check has concluded yet (it has not run, could not read the version, or is held by "
-         "an invalid index; no repair may be needed). The read is refused until the check "
-         "concludes (see PostgreSQL collation version in server-admin.md)",
+         "an invalid index, which must be dropped or rebuilt; otherwise no repair may be "
+         "needed). The read is refused until the check concludes (see PostgreSQL collation "
+         "version in server-admin.md)",
          true, "failure", "hardware CI records (REST) state=collation ordering unverified",
          "hardware CI records (MCP) state=collation ordering unverified",
          "wait retry_after_ms and call once more, then restart the walk from the first page (do not "

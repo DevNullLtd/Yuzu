@@ -682,7 +682,7 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
                  "the database collation check has not verified the text keys, so device-CI reads are "
                  "held until it concludes (see PostgreSQL collation version in the server "
                  "administration guide). This is <b>not</b> \"no CI record\" &mdash; reads here are "
-                 "authoritative. Retry shortly.</div>";
+                 "authoritative.</div>";
         } else if (!detail.ci->has_value()) {
             h += "<div class=\"hw-empty\">No CI record synced yet for this device (device-CI daily "
                  "sync, ADR-0016 &mdash; a freshly enrolled agent populates within ~24h, or on "
