@@ -887,6 +887,7 @@ struct WinEtw {
     std::wstring session_name;
     std::shared_ptr<RegistryEtwBuffer> buffer;
     std::atomic<bool> running{false};
+    std::atomic<ULONG> last_start_rc{0}; // what the last start() ended with (tests name the cause)
     std::atomic<std::uint64_t> decode_failed{0};
     std::unordered_map<std::uint32_t, std::string> pid_name; // ProcessTrace thread only
     std::int64_t pid_name_flushed{0};                        // ProcessTrace thread only
@@ -1827,6 +1828,7 @@ RegistryReader make_windows_registry_reader() {
     };
     r.now_ts = [] { return filetime_now(); };
     r.etw_running = [etw] { return etw->running.load(); };
+    r.etw_start_error = [etw] { return static_cast<unsigned long>(etw->last_start_rc.load()); };
     r.session_loss = [etw] { return etw->loss(); };
     r.current_control_set = [] { return read_current_control_set(); };
     r.watch_roots = [watcher](const std::vector<std::string>& roots) { watcher->watch(roots); };
@@ -1839,7 +1841,9 @@ RegistryReader make_windows_registry_reader() {
         // profile's NTUSER.DAT locked, so it must not outlive the restart that could release it.
         // Bounded and gated like a mount; a sweep it cannot run here waits for the first offline read.
         run_pending_hive_sweep(*tick);
-        if (const ULONG rc = etw->start(); rc != ERROR_SUCCESS)
+        const ULONG rc = etw->start();
+        etw->last_start_rc.store(rc);
+        if (rc != ERROR_SUCCESS)
             spdlog::warn("Echo registry: Kernel-Registry ETW session unavailable (Win32 error {}; "
                          "5 = the agent is not elevated) -- the key watch still runs, rows will "
                          "carry attr:off",
