@@ -62,11 +62,12 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 8> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 9> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
     step_up_detail::kCancelsRecord,     step_up_detail::kCreatesRerunRecord,
     kReadOnlyOperation,                 step_up_detail::kContentAuthoring,
+    step_up_detail::kCollectionSettings,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -107,6 +108,10 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::exempt ("execute_instruction_definition",       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/instructions/([^/]+)/execute)"),
     step_up_mcp_detail::exempt ("reevaluate_result_set",                step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)"),
     step_up_mcp_detail::exempt ("sync_hardware_software",               step_up_detail::kSyncTrigger,       "POST",   R"(/api/v1/hardware/sync)"),
+    // ManagementGroup:Write (SAM-35): the REST twin is exempt (kCollectionSettings, owner decision). The
+    // MCP tier ladder is stricter: ticketed at the supervised tier (requires_approval keys on the
+    // (ManagementGroup, Write) pair), audited ahead of the write.
+    step_up_mcp_detail::exempt ("set_software_collection_settings",     step_up_detail::kCollectionSettings, "PUT",   R"(/api/v1/inventory/software/collection-settings/([a-f0-9]+))"),
     // GuaranteedState:Delete / Push / Write
     step_up_mcp_detail::pending("delete_guardian_rule",                 "DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))"),
     step_up_mcp_detail::pending("push_guardian_rules",                  "POST",   R"(/api/v1/guaranteed-state/push)"),

@@ -213,6 +213,19 @@ inline constexpr TwinRow kExpectedTwins[] = {
     // Inventory:Read gate the REST routes take through require_fleet_read.
     {"query_software_catalogue", "Inventory", "Read", true},
     {"get_software_versions", "Inventory", "Read", true},
+    // SAM-35 software read model + collection settings twins, pinned against the SAM-33 routes
+    // (software_read_routes.cpp: fleet_read_fn Inventory:Read), the SAM-34 routes
+    // (software_collection_settings_routes.cpp: ManagementGroup:Read/Write for the list, the group
+    // and the PUT; the device-scoped Inventory:Read for the effective read).
+    {"list_software_hosts", "Inventory", "Read", true},
+    {"get_software_host", "Inventory", "Read", true},
+    {"list_software_changes", "Inventory", "Read", true},
+    {"get_software_summary", "Inventory", "Read", true},
+    {"get_software_plugin_health", "Inventory", "Read", true},
+    {"list_software_collection_settings", "ManagementGroup", "Read", true},
+    {"get_software_collection_settings", "ManagementGroup", "Read", true},
+    {"set_software_collection_settings", "ManagementGroup", "Write", false},
+    {"get_software_host_collection_settings", "Inventory", "Read", true},
     // /crypto slice 1 twins, pinned against GET /api/v1/crypto/libraries{,/devices}
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},

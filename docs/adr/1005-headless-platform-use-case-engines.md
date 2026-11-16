@@ -1531,6 +1531,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      `GET`/`PUT /api/v1/inventory/software/collection-settings/{group_id}` and
      `GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings` have
      no MCP tool.
+     - **Retired 2026-11-16.** The four twins landed under SAM-35
+       (`list_software_collection_settings`, `get_software_collection_settings`,
+       `set_software_collection_settings`, `get_software_host_collection_settings`),
+       together with the five twins of the installed-software v3 reads
+       (`list_software_hosts`, `get_software_host`, `list_software_changes`,
+       `get_software_summary`, `get_software_plugin_health`). Each calls the same
+       function as its REST route. The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as roadmap row **3.7a-mcp** in the software estate roadmap; **revisit by
        2026-12-31**. The MCP twin and the dashboard Collection tab (roadmap row
