@@ -197,6 +197,19 @@ row_sum() { # md5 of the whole device_ci row, or ROW-ABSENT
 log "server $BIN; throwaway database $DB; web :$WEB_PORT grpc :$GRPC_PORT mgmt :$MGMT_PORT"
 psql_admin -c "CREATE DATABASE \"$DB\""
 
+# Precondition: the throwaway database must record a collation version and the host must report one.
+# A database on the C/POSIX collation records none (and reports none), so the forced catalog UPDATE in
+# step 2 would produce recorded-set / actual-NULL, which the server treats as Unproven, not Mismatch:
+# the gauge would stay absent, the decommission would not be paused and every later step would fail
+# with no hint of the cause. Use a cluster whose template database uses a libc or ICU locale
+# (postgres:18.4-bookworm does).
+COLL_FACTS="$(psql_admin -At -F '|' -c "SELECT (datcollversion IS NOT NULL), (pg_database_collation_actual_version(oid) IS NOT NULL) FROM pg_database WHERE datname = '$DB'")"
+if [ "$COLL_FACTS" != "t|t" ]; then
+    echo "FAIL: throwaway database $DB does not record a collation version (recorded set / actual reported: '$COLL_FACTS', expected 't|t')." >&2
+    echo "      Its template database is probably on the C or POSIX collation. Use a cluster initialised with a libc or ICU locale, for example postgres:18.4-bookworm." >&2
+    exit 1
+fi
+
 # ── 1. healthy ────────────────────────────────────────────────────────────────
 log "1. boot 1: healthy database"
 start_server
