@@ -3504,22 +3504,29 @@ identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned`
 Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
 unassigning a role the principal did not hold still returns success.
 
-**Removing a user's `Administrator` grant also ends that user's live JIT
-elevation window**, in the same database transaction as the removal: the
-removal and the clear commit together or not at all, so if the clear cannot be
-done nothing is removed and the route answers `503`. This replica drops its
-cached sessions of the user after the commit; other replicas converge within
-about a second (up to about 30 seconds while their session-generation read is
-failing). It does not change the user's elevation eligibility and does not block
-a later `POST /api/v1/elevate`: an eligible user can open a new window. To end
-elevated access for good, first call
+**Removing a user's `Administrator` grant also ends that user's JIT elevation
+window**, in the same database transaction as the removal: the removal and the
+clear commit together or not at all, so if the clear cannot be done the removal
+is rolled back and the route answers `503`. The clear runs only when a grant row
+was actually removed. Unassigning an `Administrator` grant the user does not
+hold (the usual case for a just-in-time user who elevates through eligibility
+alone) is an idempotent no-op: it answers success, the audit detail records
+`removed=false`, and no elevation is ended. This replica drops its cached
+sessions of the user after the commit; other replicas converge within about a
+second (up to about 30 seconds while their session-generation read is failing
+or slow). It does not change the user's elevation eligibility and does not
+block a later `POST /api/v1/elevate`: an eligible user can open a new window. To
+end elevated access for good, first call
 `POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}`
-(it also ends live elevations), then remove the grant. A request already past
-its authorization check when the clear lands is not recalled, and an open
-event stream is not re-checked for elevation. For this case the transaction
-bounds each lock wait at 2000 ms (other unassigns keep the pool default), so
-it can answer a retryable `503` when it cannot take its locks in time. See
-"Fleet-Wide Role Assignment" in `rbac.md`.
+(it refuses service-scoped and MCP-tier tokens, and it also ends live
+elevations); for a user with no grant that call is the only step needed. A
+request already past its authorization check when the clear lands is not
+recalled, and an open event stream is not re-checked for elevation. For this
+case the transaction bounds each lock wait at 2000 ms (other unassigns keep the
+pool default), so it can answer a retryable `503` when it cannot take its locks
+in time. A server log warning `rbac.role.unassigned store fault` and the
+counter `yuzu_server_rbac_lifecycle_store_failure_total{op="unassign"}` record
+such a fault. See "Fleet-Wide Role Assignment" in `rbac.md`.
 
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
@@ -3554,14 +3561,20 @@ RBAC store is unavailable (including when the admin gate itself cannot
 confirm durable authority — logged and audited as a `denied` row), a
 genuine store/query fault removing the grant (for a user `Administrator`
 grant this includes a lock wait over 2000 ms, a deadlock, or a failure to clear
-the elevation: nothing is removed, so retry), or (on an otherwise-successful
-unassignment) its audit row could not persist — treat the removal as
-unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`; when the
-removal ended N > 0 live elevations, its `detail` ends with
+the elevation: the removal is rolled back and a retry is safe, but if the
+database's commit acknowledgement was lost the removal and the clear may have
+committed, so read the grant list before assuming nothing changed), or (on an
+otherwise-successful unassignment) its audit row could not persist — the
+removal is already committed, so treat it as unconfirmed and reconcile via a
+read; do not repeat the call to restore the missing row (a repeat reports
+`removed=false` and writes neither addition). Audited `rbac.role.unassigned`;
+when the clear changed N > 0 session rows that held an elevation window (an
+expired window not yet reaped is counted), its `detail` ends with
 ` elevations_cleared=N` and one `role.elevation.revoked` row
 (`detail=reason=administrator_unassign cleared=N role=Administrator`, target the
 user) is written too, either failing to persist giving the same audit-gap `503`.
-The response body is the same in every case. See
+A no-op unassign, and a retry after a lost commit acknowledgement, write
+neither addition. The response body is the same in every case. See
 `docs/user-manual/audit-log.md`.
 
 MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see

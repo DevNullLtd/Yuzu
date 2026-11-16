@@ -1979,7 +1979,8 @@ private:
     void evict_target_after_indeterminate_write(const std::string& username);
 
     /// #4966: `yuzu_server_rbac_lifecycle_store_failure_total{op}` (deactivate | set_role |
-    /// would_strand | grant_read). No-op without a MetricsRegistry.
+    /// would_strand | grant_read; the fifth op, `unassign`, is counted by `RbacStore`, not here).
+    /// No-op without a MetricsRegistry.
     void note_lifecycle_store_failure(const char* op) const;
 
     /// Poll the durable write-generation on an interval; when it has changed

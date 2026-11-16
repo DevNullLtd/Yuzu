@@ -2354,7 +2354,10 @@ RbacStore::unassign_role_detailed(const std::string& principal_type,
     const bool user_admin = role_name == "Administrator" && principal_type == "user";
     // The transaction has returned: no lease is held and no lock is held here. Drop this
     // replica's cached sessions of the target. A throw is logged and counted, never propagated:
-    // the removal is (or may be) durable, so it must not be reported as a failure.
+    // the removal is (or may be) durable, so it must not be reported as a failure. The production
+    // callback (`AuthManager::drop_local_sessions_of_user`) is `noexcept` and swallows and logs
+    // its own exceptions, so this catch and the counter are a defensive backstop (exercised by
+    // tests with a throwing callback); in production they cannot fire.
     const auto drop_local = [&] {
         if (!local_session_drop_)
             return;
@@ -2367,13 +2370,18 @@ RbacStore::unassign_role_detailed(const std::string& principal_type,
                          ::yuzu::log_key_token(principal_id));
         }
     };
-    // `!outcome.new_gen` is unreachable while the owner's lambda returns
-    // `new_gen.has_value()`; it guards the dereference below if that ever changes.
+    // `!outcome.new_gen` is unreachable while the owner's lambda returns false whenever its
+    // `new_gen` is empty; it guards the dereference below if that ever changes.
     if (!outcome.ok || !outcome.new_gen) {
-        // An empty `err` means the transaction did not report a statement failure of its own: a
-        // lost COMMIT ack may have committed the removal, so fail toward re-authentication (the
-        // `AuthManager::evict_target_after_indeterminate_write` posture). A statement failure
-        // (non-empty `err`) rolled back and changed nothing.
+        // An empty `err` means the transaction reported no statement failure of its own. That is
+        // wider than a lost COMMIT acknowledgement: it is also a pool lease that could not be
+        // acquired in time, a failed BEGIN, a failed RBAC generation bump (the owner leaves `err`
+        // unset there), an aborted-transaction refusal at COMMIT, and a COMMIT that failed. Only
+        // a COMMIT whose acknowledgement was lost may have committed the removal, and nothing
+        // here can tell it from the others, so fail toward re-authentication (the
+        // `AuthManager::evict_target_after_indeterminate_write` posture): the drop costs one
+        // durable re-read and is harmless when nothing committed. A failure with a non-empty `err`
+        // (a statement failure) rolled back and changed nothing.
         if (user_admin && !outcome.ok && outcome.err.empty())
             drop_local();
         // A store fault, not a refusal: the last-Administrator refusal returned above, and a

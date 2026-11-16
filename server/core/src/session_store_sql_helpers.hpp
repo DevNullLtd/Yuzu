@@ -3,12 +3,15 @@
 /// @file session_store_sql_helpers.hpp
 /// Internal OWN-SCHEMA libpq helpers shared by `SessionStore` (session_store.cpp)
 /// and the ADR-0012 §3 query owners `CredentialChangeOwner`
-/// (credential_change_owner.cpp, #5342) and `RbacAdminAuthorityOwner`
-/// (`deactivate_account` calls `bump_generation_in_txn` only), mirroring
-/// rbac_store_sql_helpers.hpp's role for `RbacStore`/`RbacAdminAuthorityOwner`: ONE definition of
-/// each statement, never a second copy. Not a public API. Every function runs on the CALLER's
-/// already-open transaction (`PGconn*` from `with_txn_for`) and issues only `session_store`-schema
-/// SQL; cross-schema SQL never belongs here.
+/// (credential_change_owner.cpp, #5342) and `RbacAdminAuthorityOwner` (`deactivate_account` calls
+/// `bump_generation_in_txn`; the user Administrator `unassign_role` calls
+/// `lock_user_session_rows_in_txn`, `clear_user_elevations_in_txn` and `bump_generation_in_txn`),
+/// mirroring rbac_store_sql_helpers.hpp's role for `RbacStore`/`RbacAdminAuthorityOwner`: one
+/// definition of each statement, with ONE known exception: the statement in
+/// `clear_user_elevations_in_txn` is also written out in `SessionStore::clear_user_elevations`
+/// (session_store.cpp), see the note on that helper. Not a public API. Every function runs on the
+/// CALLER's already-open transaction (`PGconn*` from `with_txn_for`) and issues only
+/// `session_store`-schema SQL; cross-schema SQL never belongs here.
 ///
 /// Lock note for callers: `bump_generation_in_txn` takes the row lock on the
 /// single `session_store.session_meta` `write_generation` row and holds it to
@@ -26,16 +29,20 @@
 /// COMMIT).
 ///
 /// A cross-schema caller that must revoke a user's elevation inside its own transaction
-/// (the planned Administrator-grant unassign in `RbacAdminAuthorityOwner`; none calls
-/// these yet) uses `lock_user_session_rows_in_txn`, then `clear_user_elevations_in_txn`,
+/// (today only the user Administrator unassign in `RbacAdminAuthorityOwner`) uses
+/// `lock_user_session_rows_in_txn`, then `clear_user_elevations_in_txn`,
 /// and calls `bump_generation_in_txn` LAST. Required order: `principal_roles` rows → one
 /// `auth.users` row (when taken) → the target's `session_store.sessions` rows (ordered by
 /// `token_hash`) → the RBAC `rbac_meta` write-generation → this `session_meta` row →
 /// COMMIT. The sessions rows are a lock class the grant path did not previously take.
 /// Single-row session writers take one sessions row and then only `session_meta`, so the
 /// order stays acyclic; two multi-row writers on one user's rows (`invalidate_user`, the
-/// reaper's DELETE, `delete_user_sessions_in_txn`) can still deadlock on row order, and
+/// reaper's DELETE, `delete_user_sessions_in_txn`, `SessionStore::clear_user_elevations`, which
+/// the eligibility revoke runs) can still deadlock on row order, and
 /// Postgres aborts one victim, which the caller's rollback turns into a retryable failure.
+/// There is no per-user cap on session rows, so the row lock and the clear touch as many rows as
+/// the user holds; that count is bounded only by the 8 h absolute session lifetime
+/// (`AuthManager::kSessionDuration`) and the session reaper.
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_raii.hpp"
@@ -87,7 +94,8 @@ inline bool lock_user_session_rows_in_txn(PGconn* c, const std::string& username
 /// `elevated_until_ms` is nonzero, IN THE CALLER'S TXN, WITHOUT bumping the
 /// write-generation. Returns the number of rows changed, or nullopt (with `err` set)
 /// on a statement failure; the caller must then abort its transaction. The predicate
-/// is `<>0`, so an EXPIRED but not yet reaped (nonzero) window is matched and counted.
+/// is `<>0`, so an EXPIRED but not yet reaped (nonzero) window is matched and counted: the
+/// count is the number of session rows that held a nonzero window, not of windows still live.
 /// A caller that sees a count above zero MUST call `bump_generation_in_txn`, LAST,
 /// before it commits (see the lock note above); a 0-row clear needs no bump.
 /// NOTE: this duplicates the statement in `SessionStore::clear_user_elevations`

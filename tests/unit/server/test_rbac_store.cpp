@@ -1601,7 +1601,8 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard WAITS for a "
     std::string b_error;
     // If a REQUIRE below throws while the worker is blocked, ScopedJoin rolls back
     // lease_a before joining, which releases the row lock the worker waits on, so the
-    // failure surfaces immediately instead of after the pool's lock_timeout.
+    // failure surfaces immediately instead of after the unassign's lock_timeout (2000 ms for a
+    // user Administrator unassign).
     ScopedJoin unassign_thread{std::thread([&] {
         auto res = store.unassign_role("user", "ghostadmin", "Administrator");
         b_ok = res.has_value();
@@ -1729,11 +1730,14 @@ TEST_CASE("RbacStore: unassign_role's guard WAITS for an in-flight reactivation 
 }
 
 // The lock-wait bound: when the reactivation stays in flight longer than the
-// pool's lock_timeout, the recheck errors, the transaction rolls back (the DELETE
+// lock_timeout, the recheck errors, the transaction rolls back (the DELETE
 // is undone), and the failure is NOT a last-Administrator refusal (callers map it
 // to 503 / an MCP internal error with a retry hint, never to the 409 refusal).
-// A second store on a pool with a 300 ms lock_timeout keeps the test fast; the
-// call is synchronous (the statement times out on its own), so no thread is needed.
+// A user Administrator unassign installs the store's own lifecycle lock_timeout (2000 ms,
+// kDefaultLifecycleLockTimeout) as its first statement, which overrides the 300 ms the second
+// pool below carries, so this test waits about 2 s, not 300 ms; the 300 ms pool does not bound
+// this wait. The call is synchronous (the statement times out on its own), so no thread is
+// needed.
 TEST_CASE("RbacStore: unassign_role's recheck lock wait times out as a store "
           "fault and rolls the DELETE back (FOR UPDATE; PR #4985 round 3)",
           "[rbac_store][pg]") {
@@ -1749,7 +1753,9 @@ TEST_CASE("RbacStore: unassign_role's recheck lock wait times out as a store "
     {
         // Fail fast if `-c lock_timeout` did not reach the session (a DSN carrying
         // `options`, or PGOPTIONS set): the synchronous call below would otherwise
-        // wait on a lock held by this same thread.
+        // wait on a lock held by this same thread. (The unassign below overrides this value with
+        // its own 2000 ms, so this probe checks the pool setting only; it no longer proves the
+        // bound of the call.)
         auto probe = short_pool.acquire();
         REQUIRE(probe);
         pg::PgResult lt = pg::exec_params(probe.get(), "SELECT current_setting('lock_timeout')",
@@ -1943,11 +1949,11 @@ TEST_CASE("RbacStore: unassign_role's last-Administrator guard serializes two "
     // (before the explicit .join() call further down) can never leave this thread
     // live-and-unguarded (governance NICE finding); it also rolls back lease_a first.
     // Runtime bound, stated explicitly (governance SHOULD #11 / NICE):
-    // `unassign_thread` blocks on connection A's row lock for at most
-    // PgPool's default `lock_timeout_ms` (10000ms, pg_pool.hpp:94), never
-    // indefinitely. If a REQUIRE above connection A's COMMIT fails, ScopedJoin
-    // rolls back lease_a first, so the worker unblocks at once instead of waiting
-    // out that timeout.
+    // `unassign_thread` blocks on connection A's row lock for at most the
+    // lifecycle `lock_timeout` a user Administrator unassign installs (2000 ms,
+    // `kDefaultLifecycleLockTimeout`), never indefinitely. If a REQUIRE above connection
+    // A's COMMIT fails, ScopedJoin rolls back lease_a first, so the worker unblocks at once
+    // instead of waiting out that timeout.
     ScopedJoin unassign_thread{std::thread([&] {
         b_started = true;
         auto res = store.unassign_role("user", "raceadmin2", "Administrator");

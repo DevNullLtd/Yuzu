@@ -1258,7 +1258,7 @@ curl -s -X POST -H "Cookie: yuzu_session=$ADMIN_COOKIE" \
   https://yuzu.example.com/api/v1/users/alice/elevation-eligibility
 ```
 
-Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds.
+Eligibility is the per-user `users.elevation_eligible` flag — distinct from holding standing admin, and enumerable for access reviews. An admin **cannot** grant their own eligibility (another admin must). Revoking it (`{"eligible":false}`) immediately ends any elevation the user currently holds. Removing the user's `Administrator` RBAC grant also ends a live elevation, but only when that grant actually exists and is removed: a user who elevates through eligibility alone (no grant) is not affected, so revoking eligibility is the step that ends that access (see "Fleet-Wide Role Assignment" in [RBAC](rbac.md)).
 
 **2. The eligible operator elevates** when they need admin (from the dashboard: **Access → Users and roles → Your elevation**, which shows the server's refusal text as it comes, formats the expiry it returns, and can **Step down**; the page cannot show whether the session is currently elevated, and a failed or unconfirmed elevation tells the user to step down to be sure). A second factor is **mandatory** to elevate, regardless of `--mfa-enforcement` — but which second factor depends on how the operator signed in:
 

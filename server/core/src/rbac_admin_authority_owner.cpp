@@ -142,9 +142,11 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
     return names;
 }
 
-// The longest a LIFECYCLE guard transaction (`deactivate_account` and `set_local_role`, the two
-// that call `set_txn_timeouts`) may sit idle BETWEEN statements. The first lock each of them takes
-// is the fleet-wide `rbac_enabled` row lock, so a holder whose client died without closing the
+// The longest a LIFECYCLE guard transaction (`deactivate_account`, `set_local_role` and the user
+// Administrator `unassign_role`, the three that call `set_txn_timeouts`) may sit idle BETWEEN
+// statements. The first lock `deactivate_account` and `set_local_role` take is the fleet-wide
+// `rbac_enabled` row lock (the unassign's first is the counted Administrator grant rows), so a
+// holder whose client died without closing the
 // connection (an orphaned backend, until the OS TCP keepalive reaps it) would otherwise block
 // every guarded lifecycle write for that long. A lock WAIT is not idle time (the backend is
 // executing a statement), so a waiter is unaffected; only a holder that stops sending statements
@@ -153,12 +155,15 @@ std::optional<std::vector<std::string>> list_active_local_admin_accounts(PGconn*
 // NOT cover `set_enforcement` or `provision_first_admin`, and the other unassigns: those
 // transactions keep only the pool defaults. A transaction-local
 // setting also OVERRIDES a stricter operator-set `idle_in_transaction_session_timeout` upward to
-// 15 s for these two transactions.
+// 15 s for these three transactions.
 constexpr std::chrono::milliseconds kLifecycleIdleInTxnTimeout{15000};
 
-// Installs the bound on EVERY lock wait inside `deactivate_account` and `set_local_role` (the
-// `rbac_enabled` row, the counted grant set, the target's grant row, the target's `auth.users`
-// row) as the FIRST statement of each transaction, plus the idle-in-transaction bound above.
+// Installs the bound on EVERY lock wait inside `deactivate_account`, `set_local_role` and the user
+// Administrator `unassign_role` (the `rbac_enabled` row, the counted grant set, the target's grant
+// row, the target's `auth.users` row; the unassign takes no `rbac_enabled` lock, and the user
+// Administrator unassign also waits on the target's session rows and the `session_meta` row: the
+// order is in the header banner) as the FIRST statement of each transaction, plus the
+// idle-in-transaction bound above.
 // #4966 installs 2000 ms (`kDefaultLifecycleLockTimeout` in rbac_store.hpp; `RbacStore`'s
 // constructor parameter lets a test shorten it, production never does). `rbac_sql::kWriteTimeout`
 // (4000 ms) bounds only the pool ACQUIRE and the pool's own `lock_timeout` defaults to 10000 ms

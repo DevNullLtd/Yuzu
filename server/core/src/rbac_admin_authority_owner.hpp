@@ -54,13 +54,16 @@
 /// writer takes an RBAC or account lock (session_store.cpp touches the `session_store` schema
 /// only) and `CredentialChangeOwner` takes `auth.users` before `session_meta` too. Two multi-row
 /// writers on one user's sessions (the unassign's row lock, `invalidate_user`, the reaper's
-/// DELETE, `delete_user_sessions_in_txn`) can still deadlock on row order; Postgres aborts one
+/// DELETE, `delete_user_sessions_in_txn`, `SessionStore::clear_user_elevations`, which the
+/// eligibility revoke runs) can still deadlock on row order; Postgres aborts one
 /// victim and the unassign then rolls back as a retryable store failure.
 ///
 /// The user Administrator unassign also ENDS the target's live JIT elevation in this same
 /// transaction (`session_sql::lock_user_session_rows_in_txn`, then
 /// `session_sql::clear_user_elevations_in_txn`, then the `session_meta` bump when any row
-/// changed): any failure rolls the grant removal back (fail closed). All of that SQL lives in
+/// changed): any failure rolls the grant removal back (fail closed). The clear runs only when the
+/// DELETE actually removed a grant row (`removed`); an unassign of an Administrator grant the user
+/// does not hold removes nothing, clears nothing and still succeeds. All of that SQL lives in
 /// session_store_sql_helpers.hpp, never in the owner. `provision_first_admin` is a DISJOINT lock path:
 /// it never touches the `rbac_enabled` row at all, and its `auth.users` interaction is a plain
 /// INSERT of a NEW row (there is nothing existing to lock; the table is, by

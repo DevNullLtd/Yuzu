@@ -3738,10 +3738,18 @@ static const ToolDef kTools[] = {
      "principal is never counted as a surviving Administrator, so a refusal can happen even "
      "when other Administrator grants nominally exist. "
      "Idempotent: unassigning a role the principal did not hold still returns success. "
-     "Removing a user's Administrator grant also ends that user's live JIT elevation window "
-     "in the same transaction (if the clear fails, nothing is removed). It does not change "
-     "the user's elevation eligibility, so an eligible user can elevate again: to end "
-     "elevated access for good, revoke eligibility first. "
+     "Removing a user's Administrator grant also ends that user's JIT elevation window "
+     "in the same transaction: the removal and the clear commit together, and if the clear "
+     "fails the removal is rolled back (an internal error with a retry hint; after a lost "
+     "commit acknowledgement the removal may have committed, so read the grant list before "
+     "assuming nothing changed). The clear runs only when a grant was actually removed: "
+     "unassigning an Administrator grant the user does not hold still succeeds but ends no "
+     "elevation. It does not change the user's elevation eligibility, so an eligible user "
+     "can elevate again. To end elevated access for good, revoke the user's elevation "
+     "eligibility first with the REST route POST /api/v1/users/{name}/elevation-eligibility; "
+     "there is no MCP equivalent yet, so an MCP-only caller cannot take that step. If the "
+     "error says the audit record could not be persisted, the removal is already committed: "
+     "verify with a read and do not repeat the call. "
      "Destructive — verify the target doesn't need this role before calling. Requires "
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -29796,12 +29804,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // tell an actual revoke apart from an idempotent no-op from
                 // the log alone.
                 //
-                // PR-S10: an Administrator unassign that ended live elevations says so on this
+                // An Administrator unassign that ended elevations says so on this
                 // row (suffix) and on one dedicated `role.elevation.revoked` row, both only when
                 // N > 0 and both attempted even if the first fails. Either failing takes the same
                 // 503 as the success row alone always did: the removal and the clear are already
                 // committed, so it reports the audit gap, never a failed removal. The response
-                // payload is unchanged.
+                // payload is unchanged. A no-op (`removed=false`: the user held no such grant)
+                // clears nothing, so it carries neither addition; nor does a retry after a lost
+                // COMMIT acknowledgement, which finds the grant already gone.
                 const int cleared = result->elevations_cleared;
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,

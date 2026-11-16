@@ -7541,11 +7541,15 @@ public:
                 // does not exist until this block. Nulled at teardown beside
                 // set_credential_change_owner(nullptr).
                 auth_mgr_.set_rbac_store(rbac_store_.get());
-                // PR-S10: an Administrator unassign clears the target's durable elevations in
+                // An Administrator unassign clears the target's durable elevations in
                 // its own transaction (the RbacStore default mode; this file never opts out).
                 // That clear needs the session_store schema, which only an OPEN SessionStore
-                // guarantees, so refuse to boot without one rather than serve a console where
-                // every user Administrator unassign fails. The callback then drops THIS
+                // guarantees. The SessionStore construction block earlier in this startup path
+                // already sets `startup_failed_` when the store fails to open, and this block
+                // runs only while `startup_failed_` is false, so the check below is a backstop
+                // against a future reordering, not a new boot refusal in a healthy configuration;
+                // it exists so a console where every user Administrator unassign would fail is
+                // never served. The callback then drops THIS
                 // replica's cached sessions of the user (other replicas converge on their next
                 // generation poll). `auth_mgr_` is a reference to main.cpp's AuthManager, which
                 // outlives ServerImpl; the callback is never cleared at teardown (it is

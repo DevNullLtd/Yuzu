@@ -248,7 +248,8 @@ struct RbacEnforcementError {
 };
 
 /// Production bound on every lock wait inside the #4966 account-lifecycle transactions
-/// (`deactivate_account` / `set_local_role`), installed as a transaction-local `lock_timeout`.
+/// (`deactivate_account` / `set_local_role`) and the user Administrator `unassign_role`, installed
+/// as a transaction-local `lock_timeout`.
 /// `RbacStore`'s constructor takes it as a parameter so a test can shorten it; nothing in
 /// production passes anything but this default.
 inline constexpr std::chrono::milliseconds kDefaultLifecycleLockTimeout{2000};
@@ -267,8 +268,9 @@ public:
     /// `is_open()` is false if the lease was empty or the migration failed
     /// (fail-closed, every authz read then DENIES, the right posture for the
     /// authorization substrate). `lifecycle_lock_timeout` bounds the lock waits of the
-    /// account-lifecycle guard (#4966); the default is the production value and is a constructor
-    /// parameter, never a mutable member, so it is fixed for the store's lifetime. The value is
+    /// account-lifecycle guard (#4966) and of the user Administrator `unassign_role`; the default
+    /// is the production value and is a constructor parameter, never a mutable member, so it is
+    /// fixed for the store's lifetime. The value is
     /// clamped into [`kMinLifecycleLockTimeout`, `kMaxLifecycleLockTimeout`] (1 ms to 60000 ms):
     /// below the floor Postgres would read 0 as "no bound" or reject a negative value, above the
     /// ceiling it would reject a value over 2^31-1 ms.
@@ -562,9 +564,12 @@ public:
     /// same order.) Every other
     /// role/principal_type combination — including both existing
     /// engine-only callers (the engine-principal unassign in `rest_api_v1.cpp`
-    /// and `mcp_server.cpp`) — is unaffected: a pure idempotent DELETE, exactly as
+    /// and `mcp_server.cpp`) — is unaffected by this guard and touches no `session_store`
+    /// object: a pure idempotent DELETE, exactly as
     /// before (an Administrator grant held by a non-user principal still runs the
-    /// candidate lock query but is never counted). The
+    /// candidate lock query but is never counted). The user Administrator removal alone
+    /// ALSO ends the target's elevations in the same transaction: see
+    /// `unassign_role_detailed` below. The
     /// refusal's error string always contains `kRbacLastAdminRefusalMarker`
     /// (below) — callers that need to distinguish this business-rule
     /// refusal from a genuine store/query failure match on that constant
@@ -573,7 +578,11 @@ public:
     /// Returns `true` iff a row was actually removed (idempotent — an
     /// unassign of a role the principal never held returns `false`, not an
     /// error) — surfaced so a caller's audit trail can distinguish an actual
-    /// revoke from a no-op, rather than auditing both identically.
+    /// revoke from a no-op, rather than auditing both identically. This bool form delegates to
+    /// `unassign_role_detailed`, so a user Administrator removal through it runs the same
+    /// transaction (including the durable elevation clear) and the same post-commit local drop;
+    /// only the cleared count is not returned. The production routes that must audit that count
+    /// call `unassign_role_detailed`.
     ///
     /// Same caller-identity contract as `assign_role` above: takes none of
     /// its own, so a REST/MCP handler acting on behalf of a human operator
@@ -596,11 +605,24 @@ public:
     /// clear/bump failure rolls the removal back and this returns the store error: fail closed).
     /// The durable clear is the DEFAULT; the only opt-out is
     /// `use_no_session_store_for_test()`. It does NOT stop a later re-elevation (`/elevate` checks
-    /// eligibility, not the grant). After a confirmed commit (or an indeterminate failure that may
-    /// have committed) of a user Administrator unassign, the local-drop callback installed by
-    /// `set_local_session_drop` runs once, OUTSIDE the transaction and with no lease held; a
-    /// throwing callback is logged, counted (`local_session_drop_failures`) and never changes the
-    /// result.
+    /// eligibility, not the grant).
+    ///
+    /// The clear runs only when the DELETE removed a grant row (`removed`). Unassigning an
+    /// Administrator grant the user does not hold is an idempotent no-op: it answers success with
+    /// `removed == false` and `elevations_cleared == 0`, ends no elevation, and does not run the
+    /// local drop. A user whose elevated access rests on eligibility alone (no grant) is not
+    /// affected by this call; revoking elevation eligibility is what ends that access. (Pinned by
+    /// test case S10-11 in tests/unit/server/test_rbac_account_lifecycle_guard.cpp.)
+    ///
+    /// After a confirmed commit that removed a row, or after a failure with an empty error text
+    /// (see the comment at the call site: that includes, but is wider than, a lost COMMIT
+    /// acknowledgement), of a user Administrator unassign, the local-drop callback installed by
+    /// `set_local_session_drop` runs once, OUTSIDE the transaction and with no lease held. A
+    /// throw from the callback is caught here, logged and counted (`local_session_drop_failures`)
+    /// and never changes the result. The production callback
+    /// (`AuthManager::drop_local_sessions_of_user`) is `noexcept` and swallows and logs its own
+    /// exceptions, so in production this catch is a defensive backstop that the production
+    /// callback cannot reach; it is exercised by tests with a throwing callback.
     std::expected<UnassignResult, std::string>
     unassign_role_detailed(const std::string& principal_type, const std::string& principal_id,
                            const std::string& role_name);
@@ -614,7 +636,9 @@ public:
     /// thread. The callback must not block or call back into this store.
     bool set_local_session_drop(std::function<void(const std::string& username)> fn);
 
-    /// Number of times the local-drop callback threw (the unassign still succeeded).
+    /// Number of times the local-drop callback threw (the unassign still succeeded). A test and
+    /// defence signal: it is not exported as a metric, and the production callback cannot move it
+    /// (see `unassign_role_detailed`).
     [[nodiscard]] std::uint64_t local_session_drop_failures() const noexcept {
         return local_session_drop_failures_.load(std::memory_order_relaxed);
     }
@@ -864,6 +888,11 @@ private:
     /// Durable-clear mode of the Administrator unassign. Default = the durable clear (a missing
     /// `session_store` schema then fails the statement and the unassign rolls back). Only
     /// `use_no_session_store_for_test()` changes it, before the store is shared across threads.
+    /// This is a member, unlike `deactivate_account` / `set_local_role`, which take their
+    /// `SessionGenerationMode` per call from `AuthManager`: the REST and MCP unassign handlers
+    /// call this store directly, so a per-call argument would have to be threaded through both
+    /// and could be forgotten. The member's default is the safe direction (the clear runs), and
+    /// the single opt-out is the test-only setter.
     SessionGenerationMode session_mode_{SessionGenerationMode::kBumpSessionGeneration};
     std::function<void(const std::string&)> local_session_drop_; ///< set-once, never cleared
     std::atomic<std::uint64_t> local_session_drop_failures_{0};

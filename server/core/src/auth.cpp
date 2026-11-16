@@ -503,7 +503,7 @@ bool AuthManager::derive_session_deadlines(Session& s, std::int64_t created_ms,
 
     // Fail-closed sentinels FIRST, so an early return below leaves EVERY steady
     // field in the defined {} state — even when re-deriving a LIVE cached session
-    // (mark_mfa / elevate re-derive `it->second` in place), where a partially-set
+    // (`post_stamp_factor_recheck` re-derives `it->second` in place), where a partially-set
     // false path would otherwise leave a stale steady_elevated_until/mfa live
     // (adversarial-review K2). A false return means "do not honor / do not cache".
     s.steady_expires = {};
@@ -1501,8 +1501,9 @@ AuthManager::stamp_session_mfa_proof(const std::string& token,
         const std::string key = hash_token(token);
         // Durable write FIRST (bumps the generation → every replica's cache drops the
         // stale copy on its next refresh); the store writes the CARRIED instant and
-        // generation (never its own now()) and RETURNs every time field, so the cache
-        // re-derives exactly.
+        // generation (never its own now()) and RETURNs the row's time fields; the future-dated
+        // check below reads `mfa_verified_ms`, and the cached copy is then dropped rather than
+        // re-derived (see the drop after the recheck).
         auto r = session_store_->mark_mfa(key, proof);
         if (!r) {
             spdlog::error("mark_session_mfa_verified: durable write failed ({})",
