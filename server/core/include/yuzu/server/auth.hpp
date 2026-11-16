@@ -1777,7 +1777,7 @@ private:
     /// recheck the stored proof stays bound to the verifier's generation, which a binding gate
     /// would admit unless a change raced; that is benign (the proof was earned with a valid
     /// code) and the withdrawal is best-effort. This replica's cached proof is blanked or
-    /// re-derived in place, not erased. Returns `kHolds` when the generation still matches.
+    /// re-derived in place, not erased (the cache epoch advances with that edit). Returns `kHolds` when the generation still matches.
     [[nodiscard]] StampRecheck post_stamp_factor_recheck(const std::string& username,
                                                          const std::string& token_hash,
                                                          std::int64_t stamped_gen);
@@ -1792,7 +1792,9 @@ private:
     [[nodiscard]] std::optional<LiveMfaState>
     read_live_mfa_state(const std::string& username) const;
 
-    /// Drop the proof from this replica's cached copy of `key` (no durable write).
+    /// Drop the proof from this replica's cached copy of `key` (no durable write). Advances
+    /// `session_cache_epoch_` in the same critical section, whether or not `key` is cached,
+    /// so a validation held across the drop does not cache its pre-drop copy (#8010).
     void drop_cached_mfa_proof(const std::string& key);
 
     /// The username of the session behind `key`: the cache first, else the durable row.
@@ -1981,9 +1983,12 @@ private:
     // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
     // Cache epoch (guarded by `mu_`): incremented in the same unique-lock critical
-    // section as every `sessions_.clear()` (the generation poll) and every targeted
+    // section as every `sessions_.clear()` (the generation poll), every targeted
     // erase that revokes a session (`drop_cached_session_locked`,
-    // `drop_cached_user_sessions_locked`). Expiry and idle hygiene drops do not move it.
+    // `drop_cached_user_sessions_locked`) and every in-place edit of a cached entry's MFA
+    // proof (`drop_cached_mfa_proof` and the re-derives in `stamp_session_mfa_proof` and
+    // `post_stamp_factor_recheck`; bumped whether or not the entry is cached, #8010).
+    // Expiry and idle hygiene drops do not move it.
     // `validate_session_durable` captures it under its step-1 shared lock and inserts
     // its session at the tail only if it is unchanged, so a validation that straddles
     // a clear or a revoke cannot put the session back (ADR-0012 section 4, rule 2). The

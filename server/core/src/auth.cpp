@@ -1178,6 +1178,11 @@ AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::stri
     } else if (cleared->has_value()) {
         const auto& a = cleared->value();
         std::unique_lock lock(mu_);
+        // The in-place re-derive below edits a cached entry's MFA proof, so it moves the
+        // cache epoch in this same critical section (even when the entry is absent): a
+        // cold validation that read the row before the clear holds a pre-clear copy and
+        // must not cache it. See the tail of validate_session_durable (#8010).
+        ++session_cache_epoch_;
         if (auto it = sessions_.find(token_hash); it != sessions_.end())
             (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
                                            a.last_activity_ms, a.mfa_verified_ms,
@@ -1190,6 +1195,11 @@ AuthManager::StampRecheck AuthManager::post_stamp_factor_recheck(const std::stri
 
 void AuthManager::drop_cached_mfa_proof(const std::string& key) {
     std::unique_lock lock(mu_);
+    // The epoch moves whenever this critical section runs, whether or not `key` is cached:
+    // a cold validation in flight holds a copy read before this proof change and must not
+    // cache it (the entry is edited in place, not erased, so the erase paths' bump does
+    // not cover it; #8010).
+    ++session_cache_epoch_;
     if (auto it = sessions_.find(key); it != sessions_.end()) {
         it->second.steady_mfa_verified = {};
         it->second.mfa_verified_at = tp_from_ms(0);
@@ -1543,6 +1553,10 @@ AuthManager::stamp_session_mfa_proof(const std::string& token,
                 return MfaStampOutcome::kStoreError;
         }
         std::unique_lock lock(mu_);
+        // As in post_stamp_factor_recheck: the re-derive edits the cached MFA proof in
+        // place, so the cache epoch moves in this critical section, entry present or not
+        // (#8010).
+        ++session_cache_epoch_;
         if (auto it = sessions_.find(key); it != sessions_.end())
             (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
                                            a.last_activity_ms, a.mfa_verified_ms,
@@ -2249,9 +2263,11 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         std::unique_lock wlock(mu_);
         // Insert only if no cache invalidation ran since this validation started
         // (ADR-0012 section 4, rule 2). The epoch moves with every clear of the cache
-        // (the generation poll) and every targeted erase (drop_cached_session_locked,
-        // drop_cached_user_sessions_locked), so a revoke, wipe, account removal or refusal on
-        // THIS replica also drops a validation held across it. On a mismatch the session is
+        // (the generation poll), every targeted erase (drop_cached_session_locked,
+        // drop_cached_user_sessions_locked) and every in-place edit of a cached entry's MFA
+        // proof (drop_cached_mfa_proof and the re-derives after a stamp or a post-stamp clear),
+        // so a revoke, wipe, account removal or refusal on THIS replica, or a proof stamp or
+        // clear, also drops a validation held across it. On a mismatch the session is
         // still returned to THIS caller, whose request is concurrent with the invalidation
         // and linearises before it, but it is not cached: a refusal here would reject an
         // unrelated in-flight request whenever any session anywhere is created or revoked,
