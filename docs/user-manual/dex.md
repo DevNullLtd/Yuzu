@@ -866,8 +866,7 @@ per-application figures. The Echo performance sampler is disabled with
 `perf_enabled=false` (see [Echo configuration](echo.md#configuration)); the
 [DEX guide](../dex/collectors-and-plugins.md#what---dex-disable-stops) lists
 what each switch stops. There is no server-side runtime
-toggle today; per-category collection toggles and an individual-view kill switch
-are named roadmap items (see the enterprise-readiness plan).
+toggle and no per-category toggle.
 
 ## No mock data
 

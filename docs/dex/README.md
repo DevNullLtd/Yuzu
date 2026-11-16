@@ -61,9 +61,10 @@ rather than copying it.
   `GuaranteedState:Read` and `Forensics:Read` needs the administrator role; see
   [RBAC](../user-manual/rbac.md#enabling-rbac).
 - **Data arrives in stages.** Signals appear as events happen. Application
-  performance and usage arrive with the daily sync, which sends completed days
-  only, so a new install shows nothing there until a UTC day has passed and the
-  sync has run.
+  performance arrives with the daily sync, which sends completed UTC days only,
+  so a new install shows nothing there until a UTC day has passed and the sync
+  has run. Application usage arrives with the same sync and is not limited to
+  completed days.
 
 ## Quick start
 
@@ -81,7 +82,8 @@ rather than copying it.
 Collection is controlled on each agent, at deploy time. The agent's `--dex-disable`
 switch stops the DEX observer and the heartbeat performance and network tags on
 that device. It does not stop Echo's sampling, which is switched off separately,
-source by source, in Echo's settings. Do not read it as "all DEX collection off".
+source by source, in Echo's settings, and it does not stop the daily sync, which
+`--inventory-disable` stops. Do not read it as "all DEX collection off".
 See [collectors and plugins](collectors-and-plugins.md) for exactly what each
 switch stops and what keeps running.
 

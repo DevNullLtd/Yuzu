@@ -5,7 +5,7 @@ same read models:
 
 - the **dashboard** at `/dex`, for people;
 - the **REST API** under `/api/v1/dex/`, for scripts and integrations;
-- the **MCP server** at `/mcp/v1/`, for agentic workers.
+- the **MCP (Model Context Protocol) server** at `/mcp/v1/`, for agentic workers.
 
 This page explains how each surface behaves, shows one worked example of each,
 and ends with the capability map: one row per capability, naming the dashboard
@@ -77,9 +77,10 @@ per-device app-usage route (see the map below). Conventions:
   retained history) answer `503` with a `retry_after_ms` hint. The Overview,
   Health score, Trends, the signal rollup, scope and signal drill-down, the
   application drill-down, the catalogue family drill-down and a device's signal
-  history do not: if their read fails they answer `200` with empty or zero
-  figures, and a single observation reads as `404`. An empty answer from those
-  is not proof of a quiet fleet. Every failed read is counted on
+  history do not: if their read fails they answer `200` with empty figures, the
+  crash-free rate reads 100 percent and the health score carries no deductions,
+  and a single observation reads as `404`. A clean answer from those is not
+  proof of a quiet fleet. Every failed read is counted on
   `yuzu_server_guardian_read_degrade_total`, labelled by reason and source;
   check it before you trust a surprisingly empty answer.
 - **Audit.** Routes that name individual devices write an audit row before

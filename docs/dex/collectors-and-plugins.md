@@ -41,8 +41,8 @@ as well, switch the Echo sources off.
 Switching collection off does not recall what was already captured. The
 per-application performance sync covers the last two completed days, so rows
 captured before the switch can still arrive in the next syncs. Nothing already
-on the server is deleted by any of these switches: it expires by the windows in
-[what is kept and for how long](#what-is-kept-and-for-how-long).
+on the server is deleted by any of these switches: it stays for as long as
+[what is kept and for how long](#what-is-kept-and-for-how-long) says.
 
 The agent's own `--help` text for the flag mentions only the crash recorder. The
 checks for the flag in the agent's code show the wider scope given above.
@@ -139,8 +139,9 @@ through `echo.sql`; they are reachable only through the Forensics-gated
 
 **Privacy.** On the device, per-application data records process names only,
 never command lines, and the per-connection rows are joined to the name of the
-owning process. Redaction patterns apply to the per-application names, not to
-the process source or to that owning-process name. A connection's destination is
+owning process. Redaction patterns apply to the per-application names and to the
+command lines the process source reads, not to process names in the process
+source or to that owning-process name. A connection's destination is
 stored only as a coarse class. What reaches the server is described in
 [app performance](app-performance.md#what-feeds-it-and-how-to-enable-it) and
 [app usage](app-usage.md#what-feeds-it-and-how-to-enable-it): per-device,
@@ -183,7 +184,7 @@ normal dispatch path and waits for the answer. The route supports the two kinds
 below; the device page offers more, described in
 [device management](../user-manual/device-management.md#get-live-info). DEX
 keeps no copy of its own, but the device's reply is held in the response store
-like any instruction result, for `response_retention_days` (90 days by default).
+like any instruction result, for the server's `--response-retention-days` (90 days by default).
 The device performance and Top applications panels dispatch an Echo query the
 same way, so their replies are held there too.
 
@@ -207,11 +208,11 @@ its own window and caps the whole database; see the
 
 | Data | Kept on the server | Removed when the device is decommissioned | Switch off |
 |---|---|---|---|
-| Signal observations | 30 days by default, set by `guardian_event_retention_days` | No; they expire by that window | `--dex-disable` |
+| Signal observations | 30 days by default, set by the server's `--guardian-event-retention-days` | No; they expire by that window | `--dex-disable` |
 | Per-device application performance | 31 days | Yes | Echo `procperf_enabled`; `--inventory-disable` stops the sync |
 | Fleet application trend, with no per-device rows | 180 days | Nothing to remove: it holds no device identity | As the row above |
 | Per-device app usage | The last report, until the next one replaces it | Yes | Echo `usage_enabled`; `--inventory-disable` stops the sync |
-| Replies to on-demand reads (live info, device performance, Top applications) | `response_retention_days`, 90 days by default | No; they expire by that window | Not applicable: a read runs only when someone asks |
+| Replies to on-demand reads (live info, device performance, Top applications) | The server's `--response-retention-days`, 90 days by default | No; they expire by that window | Not applicable: a read runs only when someone asks |
 
 ## Related pages
 
