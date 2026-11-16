@@ -2837,7 +2837,16 @@ Guardian ladder must check these.
   KV seed read (empty, before the write) and attach_core's staged read (empty,
   after the erase), and neither read would see it. Do not replace either piece
   with a bare earlier drain. Lock order `mtx_` -> `persist_mu_` -> `registry_mu_`;
-  the worker takes `persist_mu_` -> `registry_mu_` and never `mtx_`. Because every
+  the worker takes `persist_mu_` -> `registry_mu_` and never `mtx_`. (#5605) The
+  heartbeat reads the CURRENT unpersisted backlog without any of those three locks: the
+  runtime mirrors `staged_baselines_.size()` into the atomic `staged_baseline_count_`
+  (written only under `registry_mu_`, by `store(size())` at the two sites that change the
+  size; a mismatch found when a snapshot or an erase runs is repaired there by the same
+  `store(size())` under `registry_mu_`, counted and logged once, and never aborts the
+  agent), which the persister co-owns by `shared_ptr` and reads relaxed through
+  `pending_captures()`, reached via the atomic `baseline_persister_published_` (a
+  `rollback_spark_wiring_locked` unpublishes that pointer, leaving the persister object
+  alive, so a failed wiring reads as no persister and never as a live zero). Because every
   pass is budgeted, a Worker pass yields, and the worker backs off after a failed
   pass (5 s doubling to 60 s; `apply_rules` and `stop()` ignore the backoff), a
   seed fence waits for ONE in-flight write behind a Worker pass and for at most
@@ -2992,12 +3001,18 @@ Guardian ladder must check these.
   deliberate fail-open (the rule keeps its in-memory baseline): the capture stays
   staged and is retried, counted, error-logged, and exported on the sparse
   heartbeat tag `yuzu.guardian_baseline_persist_failures` (Spark path only,
-  cumulative, readable from the per-agent heartbeat only: no server gauge exists,
-  so the agent error log is the primary signal), never silent. The tag counts
+  cumulative; the server rolls it up into the monitor-only fleet gauge
+  `yuzu_fleet_guardian_baseline_persist_failures` (#5605), and the CURRENT backlog is the
+  separate heartbeat tag `yuzu.guardian_baseline_unpersisted` with its own gauge and the
+  `YuzuGuardianBaselineUnpersisted` warning alert; the agent error log remains the
+  per-incident evidence, and a legacy-path persist failure is logged and counted nowhere),
+  never silent. The tag counts
   failed persist passes, firewalled throws, each failed ATTEMPT to stage a capture
   (an allocation failure) or capture displaced from staging (a retarget over a
-  still-unpersisted capture) and a capture staged with no KV store (logged once,
-  kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
+  still-unpersisted capture) and, as defence in depth that production cannot reach (an
+  engine without a KV store arms no rule, so nothing is staged; only a test exercises it), a
+  capture staged with no KV store (logged once, kept). Stop-time losses that are NOT counted:
+  a stop flush that ran out of its wall
   budget with captures left, and one skipped (it started 18 s or more after the mark and this
   stop had shown a slow store: a slow failed write or a stage that ran slow), each logged with
   its own
