@@ -43,9 +43,9 @@
 #include <yuzu/string_utils.hpp>
 
 #include <algorithm>
-#include <format>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>

@@ -462,6 +462,32 @@ TEST_CASE("estate: the Linux/macOS cpu row builder is byte-identical for ordinar
     CHECK(est::format_cpu_row_sampled(0, "A\\B", 1, 1, 1.0) == "cpu|0|A/B|1|1|1|-|-");
 }
 
+TEST_CASE("estate: the Linux and macOS cpu rows are written through format_cpu_row_sampled "
+          "(lexical pin, #7040)",
+          "[hardware_estate]") {
+    // LEXICAL, not behavioural: /proc/cpuinfo and sysctl are not injectable, so the two call sites
+    // are pinned by reading hardware_plugin.cpp (comments dropped). Reverting either leg to an
+    // inline std::format drops the escape again with every other test green; the macOS block is
+    // not compiled on a Linux host, so this is the only check on it that runs here.
+    const auto path = std::filesystem::path(YUZU_PLUGIN_SRC_DIR) / "hardware" / "src" / "hardware_plugin.cpp";
+    std::ifstream in(path);
+    REQUIRE(in.good());
+    std::string code, line;
+    while (std::getline(in, line)) {
+        const auto cut = line.find("//");
+        code += (cut == std::string::npos ? line : line.substr(0, cut));
+        code += '\n';
+    }
+    auto count = [&](std::string_view needle) {
+        std::size_t n = 0;
+        for (auto pos = code.find(needle); pos != std::string::npos; pos = code.find(needle, pos + 1))
+            ++n;
+        return n;
+    };
+    CHECK(count("format_cpu_row_sampled(") == 2); // the Linux leg and the macOS leg
+    CHECK(count("{:.0f}|-|-") == 0);               // no inline cpu row format is left
+}
+
 TEST_CASE("estate: dimm row formatter escapes the slot and keeps the column order", "[hardware_estate]") {
     CHECK(est::format_dimm_row("Controller1-ChannelA-DIMM0", 32768, "DDR5", 5600, "Micron Technology",
                                "CT32G56C46S5.C8BA", "0A1B2C3D") ==
