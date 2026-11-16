@@ -21684,6 +21684,17 @@ private:
         // pre-existing `/fragments/echo/...` HTML routes stay on perm_fn_ this
         // round — see the recorded-exception comment at their registration.
         echo_tree_routes_->set_fleet_read_fn(fleet_read_fn);
+        echo_tree_routes_->set_metrics(&metrics_); // yuzu_echo_sources_push_total
+        // The capture-sources push stamps its rows from the session it resolved (never re-resolved).
+        echo_tree_routes_->set_audit_as_session_fn(auth_routes_->audit_as_session_fn());
+        // A refused push dispatch answers 403 (permission-class reasons) or 500 (catalogue fault),
+        // the mapping respond_echo_dispatch_denied uses; injected so the route TU stays store-free.
+        echo_tree_routes_->set_denial_status_fn([](const ConfinedDispatchOutcome& o) {
+            const auto cls = describe_dispatch_denial(o.denied->reason, "echo", "configure",
+                                                      *o.denied, DenialSurface::kRest)
+                                 .cls;
+            return cls == DispatchDenialClass::kPermissionDenied ? 403 : 500;
+        });
         // #4143 review fix — same unfiltered source list_agents' DeviceApi and
         // GET /api/v1/devices (#4033) read from; gate.scope (fleet_read_fn_
         // above) is the SOLE filter now, not an intersection with devices_fn's
@@ -21718,9 +21729,10 @@ private:
         // request, so setting it afterwards would race the request threads.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
         // ADR-0033 section 9: every DashboardRoutes mutation (each console send,
-        // group-from-results, Echo re-enable and purge; not EchoTreeRoutes' capture-sources push)
-        // writes its `attempted` row through this persist-reporting sink BEFORE it acts (#3619;
-        // unwired = those mutations refuse with 503).
+        // group-from-results, Echo re-enable and purge) writes its `attempted` row through this
+        // persist-reporting sink BEFORE it acts (#3619; unwired = those mutations refuse with
+        // 503). EchoTreeRoutes' capture-sources push does the same, but writes through the
+        // session-bound writer wired above and refuses (503) when that is unset.
         dashboard_routes_->set_persist_audit_fn(audit_fn);
         // #1712 / #3290 Phase 2 — same conversion lambda already wired into
         // McpServer's query_installed_software (fleet_read_fn, defined
