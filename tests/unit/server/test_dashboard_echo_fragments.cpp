@@ -12,9 +12,11 @@
  * handlers are drivable here with no acceptor thread (#438 TSan trap).
  *
  * Pinned per handler:
- *   - the permission tier — Infrastructure:Delete for purge, Execution:Execute
- *     for reenable (a tier downgrade must fail here), plus the denied audit +
- *     `result="denied"` metric on rejection,
+ *   - the permission tier, asked of the per-device scoped gate (#2540, the REST
+ *     twin's chokepoint) on the posted device — Infrastructure:Delete for purge,
+ *     Execution:Execute for reenable (a tier downgrade must fail here); a denial
+ *     collapses to the offline 404, a store outage answers 503, an unwired gate
+ *     fails closed, and the gate is asked again after the attempted row,
  *   - the CSRF same-site gate — cross-origin AND header-less POSTs are 403'd
  *     BEFORE dispatch (these fragments are stricter than the shared
  *     `origin_is_same_site` helper, which permits header-less non-browser
@@ -26,7 +28,7 @@
  *     an endorsement of it,
  *   - the {process,tcp,service,user} source allowlist and the
  *     required-field check → 400, no dispatch,
- *   - the per-device RBAC visibility gate → 404 collapsed with the offline
+ *   - the per-device scoped denial → 404 collapsed with the offline
  *     case (no existence oracle) + a `scope_violation` audit recording the
  *     real reason server-side,
  *   - the offline (0 agents reached) path → 404 + `agent_not_connected`,
@@ -41,6 +43,7 @@
 #include "agent_registry.hpp" // detail::classify_and_authorize_dispatch (#7114)
 #include "dashboard_routes.hpp"
 #include "management_group_store.hpp"
+#include "rest_api_v1.hpp" // the REST purge twin (#2540 parity case)
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_real_capability_registry.hpp"
 #include "test_route_sink.hpp"
@@ -60,6 +63,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -71,6 +75,9 @@ constexpr const char* kUser = "frag-op";
 constexpr const char* kHost = "yuzu.example:8080";
 constexpr const char* kPurgePath = "/fragments/echo/retention-paused/purge";
 constexpr const char* kReenablePath = "/fragments/echo/retention-paused/reenable";
+/// The 404 body for "not yours" and "not connected" alike (#2540: byte-identical).
+constexpr const char* kEchoAgentNotReachableBody =
+    "<span class=\"echo-row-error\">Agent not reachable.</span>";
 
 struct DispatchCall {
     std::string plugin, action, scope_expr;
@@ -87,6 +94,10 @@ struct AuditRow {
 };
 struct PermCall {
     std::string securable_type, op;
+};
+/// One probe of the per-device scoped gate (#2540).
+struct ScopedCall {
+    std::string securable_type, op, agent_id;
 };
 
 /// Make `agents` visible to kUser: members of a group on which kUser holds a
@@ -130,12 +141,17 @@ struct FragmentHarness {
     std::vector<DispatchCall> calls;
     std::vector<AuditRow> audits;
     std::vector<PermCall> perms;
+    std::vector<ScopedCall> scoped_calls;
     /// #3619: "audit:<action>/<result>" and "dispatch", in call order — proves an `attempted`
     /// row precedes the dispatch it covers.
     std::vector<std::string> order;
     /// #3619: whether the audit store persists a given row (read live per row). Default: all do.
     std::function<bool(const AuditRow&)> audit_persists{[](const AuditRow&) { return true; }};
     bool perm_allow{true}; ///< perm_fn verdict (false → handler's 403 path)
+    /// #2540: devices the scoped gate admits (read live per probe; clear() == grant withdrawn).
+    std::unordered_set<std::string> scoped_allowed{"dev-A", "dev-B"};
+    /// Status the scoped gate writes on a refusal: 403 = plain denial, 503 = store outage.
+    int scoped_deny_status{403};
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
     std::string auth_source{"local"}; ///< resolved session source; "local" = a cookie session
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
@@ -169,7 +185,9 @@ struct FragmentHarness {
     /// @param wire_exec_visible false → register with an EMPTY CallerFn so
     ///        the production handler's own fail-closed branch (unwired → present-
     ///        empty deny-all) is exercised (CDX-R7-02).
-    explicit FragmentHarness(bool with_dispatch = true, bool wire_exec_visible = true) {
+    /// @param wire_scoped false → leave the #2540 scoped gate unwired (fail closed, 503).
+    explicit FragmentHarness(bool with_dispatch = true, bool wire_exec_visible = true,
+                             bool wire_scoped = true) {
         // A failed open would make get_visible_agents return empty and quietly
         // turn every scope assertion into a pass-for-the-wrong-reason.
         REQUIRE(mg.is_open());
@@ -206,6 +224,17 @@ struct FragmentHarness {
             return ok;
         };
         routes.set_persist_audit_fn(audit_fn);
+        if (wire_scoped) {
+            routes.set_scoped_perm_fn([this](const httplib::Request&, httplib::Response& res,
+                                             const std::string& type, const std::string& op,
+                                             const std::string& agent) -> bool {
+                scoped_calls.push_back({type, op, agent});
+                if (scoped_allowed.count(agent) != 0)
+                    return true;
+                res.status = scoped_deny_status;
+                return false;
+            });
+        }
         DashboardRoutes::DispatchFn dispatch =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
@@ -307,34 +336,215 @@ bool contains(const std::string& hay, std::string_view needle) {
 
 // ── Permission tier ─────────────────────────────────────────────────────────
 
-TEST_CASE("fragment purge: gates on Infrastructure:Delete; denial audits + counts, no dispatch",
-          "[pg][server][echo][purge][fragment]") {
+TEST_CASE("fragment purge: the scoped gate is asked for Infrastructure:Delete on the posted device "
+          "and a denial collapses to the offline 404 body",
+          "[pg][server][echo][purge][fragment][2540]") {
     FragmentHarness h;
-    h.perm_allow = false;
-    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
-    CHECK(res->status == 403);
-    REQUIRE(h.perms.size() == 1);
-    CHECK(h.perms[0].securable_type == "Infrastructure");
-    CHECK(h.perms[0].op == "Delete");
+    auto allowed = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(allowed->status == 200);
+    // Asked once at admission and once more after the attempted row, for the posted device.
+    REQUIRE(h.scoped_calls.size() == 2);
+    for (const auto& c : h.scoped_calls) {
+        CHECK(c.securable_type == "Infrastructure");
+        CHECK(c.op == "Delete");
+        CHECK(c.agent_id == "dev-A");
+    }
+    CHECK(h.perms.empty()); // the global gate is no longer consulted
+    h.scoped_allowed.clear();
+    h.calls.clear();
+    auto denied = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(denied->status == 404);
+    h.dispatch_sent = 0;
+    h.scoped_allowed = {"dev-A"};
+    auto offline = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(denied->status == offline->status);
+    CHECK(denied->body == offline->body); // no distinguishing marker
+    CHECK(h.audit_detail("echo.source.purge", "failure") == "scope_violation source=process");
+    CHECK(h.metric("yuzu_echo_source_purge_total", "scope_violation") == 1.0);
+}
+
+TEST_CASE("fragment reenable: the scoped gate is asked for Execution:Execute on the posted device "
+          "and a denial collapses to the offline 404 body",
+          "[pg][server][echo][reenable][fragment][2540]") {
+    FragmentHarness h;
+    auto allowed = h.post(kReenablePath, "device_id=dev-A&source=process");
+    CHECK(allowed->status == 200);
+    REQUIRE(h.scoped_calls.size() == 2);
+    for (const auto& c : h.scoped_calls) {
+        CHECK(c.securable_type == "Execution");
+        CHECK(c.op == "Execute");
+        CHECK(c.agent_id == "dev-A");
+    }
+    CHECK(h.perms.empty());
+    h.scoped_allowed.clear();
+    h.calls.clear();
+    auto denied = h.post(kReenablePath, "device_id=dev-A&source=process");
+    CHECK(denied->status == 404);
+    h.dispatch_sent = 0;
+    h.scoped_allowed = {"dev-A"};
+    auto offline = h.post(kReenablePath, "device_id=dev-A&source=process");
+    CHECK(denied->status == offline->status);
+    CHECK(denied->body == offline->body);
+    CHECK(h.audit_detail("echo.source.reenable", "failure") == "scope_violation source=process");
+    CHECK(h.metric("yuzu_echo_source_reenable_total", "scope_violation") == 1.0);
+}
+
+TEST_CASE("fragment purge and reenable: an unwired scoped gate refuses with 503 and dispatches "
+          "nothing",
+          "[pg][server][echo][purge][reenable][fragment][security][2540]") {
+    FragmentHarness h{/*with_dispatch=*/true, /*wire_exec_visible=*/true, /*wire_scoped=*/false};
+    for (const auto& [path, action] : {std::pair{kPurgePath, "echo.source.purge"},
+                                       std::pair{kReenablePath, "echo.source.reenable"}}) {
+        DYNAMIC_SECTION(action) {
+            auto res = h.post(path, "device_id=dev-A&source=process");
+            CHECK(res->status == 503);
+            CHECK(res->body != kEchoAgentNotReachableBody); // not the 404 collapse
+            CHECK(h.audits_for(action, "attempted") == 0);
+        }
+    }
     CHECK(h.calls.empty());
-    CHECK(h.audits_for("echo.source.purge", "denied") == 1);
-    CHECK(h.audit_detail("echo.source.purge", "denied") == "rbac_denied");
+}
+
+TEST_CASE("fragment purge: an authorization store outage answers 503 and not the 404 collapse",
+          "[pg][server][echo][purge][fragment][security][2540]") {
+    FragmentHarness h;
+    h.scoped_allowed.clear();
+    h.scoped_deny_status = 503;
+    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(res->status == 503);
+    CHECK(res->body != kEchoAgentNotReachableBody);
+    CHECK(h.calls.empty());
+    CHECK(h.audits_for("echo.source.purge", "attempted") == 0);
+    CHECK(h.audits_for("echo.source.purge", "failure") == 0); // not a scope violation
+    CHECK(h.audit_detail("echo.source.purge", "denied") == "scoped_gate_unavailable source=process");
+}
+
+TEST_CASE("fragment purge: a grant withdrawn after the attempted row dispatches nothing and audits "
+          "permission_revoked",
+          "[pg][server][echo][purge][fragment][audit][security][2540]") {
+    FragmentHarness h;
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "echo.source.purge" && r.result == "attempted")
+            h.scoped_allowed.clear(); // revoked mid-write
+        return true;
+    };
+    auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
+    CHECK(res->status == 404);
+    CHECK(res->body == kEchoAgentNotReachableBody);
+    CHECK(h.calls.empty());
+    REQUIRE(h.scoped_calls.size() == 2); // admission, then the recheck of the SAME pair
+    CHECK(h.scoped_calls[1].securable_type == "Infrastructure");
+    CHECK(h.scoped_calls[1].op == "Delete");
+    CHECK(h.scoped_calls[1].agent_id == "dev-A");
+    CHECK(h.audits_for("echo.source.purge", "attempted") == 1);
+    CHECK(h.audit_detail("echo.source.purge", "failure") == "permission_revoked device=dev-A source=process");
+    CHECK(h.audits_for("echo.source.purge", "success") == 0);
     CHECK(h.metric("yuzu_echo_source_purge_total", "denied") == 1.0);
 }
 
-TEST_CASE("fragment reenable: gates on Execution:Execute; denial audits + counts, no dispatch",
-          "[pg][server][echo][reenable][fragment]") {
+TEST_CASE("fragment reenable: a grant withdrawn after the attempted row dispatches nothing and "
+          "audits permission_revoked",
+          "[pg][server][echo][reenable][fragment][audit][security][2540]") {
     FragmentHarness h;
-    h.perm_allow = false;
+    h.audit_persists = [&h](const AuditRow& r) {
+        if (r.action == "echo.source.reenable" && r.result == "attempted")
+            h.scoped_allowed.clear(); // revoked mid-write
+        return true;
+    };
     auto res = h.post(kReenablePath, "device_id=dev-A&source=process");
-    CHECK(res->status == 403);
-    REQUIRE(h.perms.size() == 1);
-    CHECK(h.perms[0].securable_type == "Execution");
-    CHECK(h.perms[0].op == "Execute");
+    CHECK(res->status == 404);
+    CHECK(res->body == kEchoAgentNotReachableBody);
     CHECK(h.calls.empty());
-    CHECK(h.audits_for("echo.source.reenable", "denied") == 1);
-    CHECK(h.audit_detail("echo.source.reenable", "denied") == "rbac_denied");
+    REQUIRE(h.scoped_calls.size() == 2);
+    CHECK(h.scoped_calls[1].securable_type == "Execution");
+    CHECK(h.scoped_calls[1].op == "Execute");
+    CHECK(h.scoped_calls[1].agent_id == "dev-A");
+    CHECK(h.audits_for("echo.source.reenable", "attempted") == 1);
+    CHECK(h.audit_detail("echo.source.reenable", "failure") ==
+          "permission_revoked device=dev-A source=process");
+    CHECK(h.audits_for("echo.source.reenable", "success") == 0);
     CHECK(h.metric("yuzu_echo_source_reenable_total", "denied") == 1.0);
+}
+
+TEST_CASE("fragment and REST purge: a confined operator is denied for the same out-of-scope device "
+          "on both surfaces",
+          "[pg][server][echo][purge][fragment][security][2540]") {
+    // ONE scope policy behind both chokepoints, as server.cpp wires ONE scoped_perm_fn into both.
+    const std::unordered_set<std::string> confined{"dev-A"};
+
+    FragmentHarness h;
+    h.scoped_allowed = confined;
+
+    yuzu::MetricsRegistry rest_metrics;
+    RestApiV1 api;
+    std::vector<std::string> rest_dispatched;
+    auto rest_auth = [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session sess;
+        sess.username = kUser;
+        sess.role = auth::Role::admin;
+        return sess;
+    };
+    auto rest_perm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                        const std::string&) { return true; };
+    auto rest_audit = [](const httplib::Request&, const std::string&, const std::string&,
+                         const std::string&, const std::string&, const std::string&) { return true; };
+    RestApiV1::ScopedPermFn rest_scoped = [&confined](const httplib::Request&, httplib::Response& res,
+                                                      const std::string&, const std::string&,
+                                                      const std::string& agent) -> bool {
+        if (confined.count(agent) != 0)
+            return true;
+        res.status = 403;
+        return false;
+    };
+    RestApiV1::CommandDispatchFn rest_dispatch =
+        [&rest_dispatched](const std::string&, const std::string&, const std::vector<std::string>& ids,
+                           const std::string&,
+                           const std::unordered_map<std::string, std::string>&, const std::string&,
+                           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        rest_dispatched.insert(rest_dispatched.end(), ids.begin(), ids.end());
+        return {.sent = 1, .command_id = "cmd-rest"};
+    };
+    yuzu::server::test::TestRouteSink rest_sink; // declared after `api`: destroyed first
+    api.register_routes(
+        rest_sink, rest_auth, rest_perm, rest_audit,
+        /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr, /*token_store=*/nullptr,
+        /*quarantine_store=*/nullptr, /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+        /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr, /*approval_manager=*/nullptr,
+        /*tag_store=*/nullptr, /*audit_store=*/nullptr, /*service_group_fn=*/{},
+        /*tag_push_fn=*/{}, /*inventory_store=*/nullptr, /*product_pack_store=*/nullptr,
+        /*sw_deploy_store=*/nullptr, /*device_token_store=*/nullptr, /*license_store=*/nullptr,
+        /*guaranteed_state_store=*/nullptr, &rest_metrics, /*session_revoke_fn=*/{},
+        /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr, rest_dispatch,
+        /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{}, /*network_api=*/{},
+        /*lockout_clear_fn=*/{}, /*baseline_store=*/nullptr, rest_scoped,
+        /*software_inventory_store=*/nullptr,
+        /*response_scope_fn=*/{},
+        /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+        /*auth_db=*/nullptr, /*directory_sync=*/nullptr, /*stream_budget=*/nullptr,
+        RestApiV1::ExecVisibleFn{[](const auth::Session&) -> yuzu::server::authz::VisibleSet {
+            return yuzu::server::authz::VisibleSet{};
+        }});
+
+    const auto rest_post = [&](const std::string& device) {
+        auto res = rest_sink.dispatch(
+            "POST", "/api/v1/echo/retention-paused/purge",
+            "{\"device_id\":\"" + device + "\",\"source\":\"process\"}");
+        REQUIRE(res != nullptr);
+        return res->status;
+    };
+
+    // dev-B is a real, connected device the operator holds in the fixture's visibility group, but
+    // the shared scoped policy excludes it: BOTH surfaces refuse and dispatch nothing for it.
+    CHECK(rest_post("dev-B") == 403);
+    CHECK(h.post(kPurgePath, "device_id=dev-B&source=process")->status == 404);
+    CHECK(rest_dispatched.empty());
+    CHECK(h.calls.empty());
+    // ...and both admit the device the policy admits.
+    CHECK(rest_post("dev-A") == 200);
+    CHECK(h.post(kPurgePath, "device_id=dev-A&source=process")->status == 200);
+    CHECK(rest_dispatched == std::vector<std::string>{"dev-A"});
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].agent_ids == std::vector<std::string>{"dev-A"});
 }
 
 // ── CSRF same-site gate ─────────────────────────────────────────────────────
@@ -1076,8 +1286,8 @@ TEST_CASE("fragment purge/reenable audit: a refused request writes no attempted 
             FragmentHarness h;
             CHECK(h.post(path, "device_id=dev-A&source=not-a-source")->status == 400);
             CHECK(h.post(path, "device_id=dev-Z&source=process")->status == 404); // out of scope
-            h.perm_allow = false;
-            CHECK(h.post(path, "device_id=dev-A&source=process")->status == 403);
+            h.scoped_allowed.clear();
+            CHECK(h.post(path, "device_id=dev-A&source=process")->status == 404);
             CHECK(h.audits_for(action, "attempted") == 0);
             CHECK(h.calls.empty());
         }
@@ -1107,12 +1317,12 @@ TEST_CASE("fragment purge/reenable audit: refusal rows that are not persisted ke
         DYNAMIC_SECTION(action) {
             FragmentHarness h;
             h.audit_persists = [](const AuditRow&) { return false; };
-            h.perm_allow = false;
+            h.scoped_allowed.clear();
             auto denied = h.post(path, "device_id=dev-A&source=process");
-            CHECK(denied->status == 403);
+            CHECK(denied->status == 404);
             CHECK(denied->get_header_value("Sec-Audit-Failed") == "true");
 
-            h.perm_allow = true;
+            h.scoped_allowed = {"dev-A", "dev-B"};
             auto out_of_scope = h.post(path, "device_id=dev-Z&source=process");
             CHECK(out_of_scope->status == 404);
             CHECK(out_of_scope->get_header_value("Sec-Audit-Failed") == "true");
@@ -1253,41 +1463,6 @@ TEST_CASE("dashboard execute audit (#3619 UP-5): authority revoked while the att
     CHECK(h.calls[0].exec_visible->count("dev-B") == 0); // the revocation reached the send
 }
 
-TEST_CASE("fragment purge/reenable audit (#3619 UP-5): the route permission revoked while the "
-          "attempted row is written dispatches nothing and records the outcome",
-          "[pg][server][echo][purge][reenable][fragment][audit][security][3619]") {
-    // The route gate (Infrastructure:Delete for purge, Execution:Execute for re-enable) ran
-    // before the wait. With RBAC off the dispatch seam admits every human principal, so a JIT
-    // elevation that lapses during the wait is caught only by deciding the permission again.
-    for (const auto& [path, action] : kEchoMutations) {
-        DYNAMIC_SECTION(action) {
-            FragmentHarness h;
-            const std::string act = action;
-            h.audit_persists = [&h, act](const AuditRow& r) {
-                if (r.action == act && r.result == "attempted")
-                    h.perm_allow = false; // revoked mid-write
-                return true;
-            };
-            auto res = h.post(path, "device_id=dev-A&source=process");
-            CHECK(res->status == 403);
-            CHECK(h.calls.empty());
-            // Admission, then the recheck after the attempted row -- of the ROUTE's own
-            // permission (Gate 3 QE-1: purge must not recheck the weaker Execution:Execute).
-            REQUIRE(h.perms.size() == 2);
-            const bool purge = act == "echo.source.purge";
-            CHECK(h.perms[1].securable_type == (purge ? "Infrastructure" : "Execution"));
-            CHECK(h.perms[1].op == (purge ? "Delete" : "Execute"));
-            CHECK(h.audits_for(action, "attempted") == 1);
-            REQUIRE(h.audits_for(action, "failure") == 1);
-            CHECK(h.audit_detail(action, "failure") == "permission_revoked device=dev-A source=process");
-            CHECK(h.audits_for(action, "success") == 0);
-            const std::string metric =
-                purge ? "yuzu_echo_source_purge_total" : "yuzu_echo_source_reenable_total";
-            CHECK(h.metric(metric, "denied") == 1.0);
-        }
-    }
-}
-
 TEST_CASE("dashboard execute audit (#3619 UP-5): Execution:Execute revoked while the attempted "
           "row is written sends nothing and records the outcome",
           "[pg][server][dashboard][execute][audit][security][3619]") {
@@ -1328,12 +1503,12 @@ TEST_CASE("fragment purge audit (#3619 UP-5, Gate 5 CH-1): a recheck refusal who
             return false; // the audit store fails after the attempted row
         if (r.action == "echo.source.purge" && r.result == "attempted") {
             attempted_seen = true;
-            h.perm_allow = false; // revoked mid-write
+            h.scoped_allowed.clear(); // revoked mid-write
         }
         return true;
     };
     auto res = h.post(kPurgePath, "device_id=dev-A&source=process");
-    CHECK(res->status == 403);
+    CHECK(res->status == 404);
     CHECK(h.calls.empty());
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     CHECK(h.audits_for("echo.source.purge", "attempted") == 1);

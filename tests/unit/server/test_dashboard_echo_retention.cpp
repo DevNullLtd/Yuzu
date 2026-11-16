@@ -33,6 +33,7 @@
 #include "response_store.hpp"
 #include "echo_tree_routes.hpp" // EchoRetentionPausedScan's full definition (#4143 review fix test)
 #include "test_mgmt_group_pg_helper.hpp"
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -40,6 +41,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <initializer_list>
 #include <stdexcept>
 #include <string>
@@ -287,7 +289,7 @@ TEST_CASE("gather_echo_retention_paused: extra_scope_is_authoritative bypasses "
 
     const authz::VisibleSet gate_scope{std::unordered_set<std::string>{"agent-A", "agent-C"}};
 
-    SECTION("default (fragment caller): visible_set is ANDed in — agent-C stays dropped") {
+    SECTION("default (no gate scope to defer to): visible_set is ANDed in — agent-C stays dropped") {
         const auto scan = acc.routes.gather_echo_retention_paused(kUser, gate_scope);
         bool found_c = false;
         for (const auto& r : scan.rows) if (r.agent_id == "agent-C") found_c = true;
@@ -656,6 +658,153 @@ TEST_CASE("retention-paused page: a scan cut by the payload cap does not overwri
         (void)acc.render(kUser);
     }
     CHECK(process_gauge.value() == 7.0);
+}
+
+// #2540: GET /fragments/echo/retention-paused is gated by the fleet read chokepoint (like its REST
+// twin) and renders only gate.scope; its row buttons stay on the GLOBAL permission probe.
+namespace {
+struct FrameHarness {
+    DashboardEchoRetentionTestAccess acc;
+    yuzu::server::test::TestRouteSink sink; // declared after `acc`: destroyed first
+    std::vector<std::string> fleet_calls;   ///< "<type>:<op>" per fleet-read probe
+    authz::VisibleSet gate_scope{std::unordered_set<std::string>{}};
+    bool gate_admits{true};
+    bool global_exec{true};   ///< global Execution:Execute probe
+    bool global_delete{true}; ///< global Infrastructure:Delete probe
+
+    void wire(bool with_fleet_gate, ResponseStore* rs, ManagementGroupStore* mg) {
+        acc.set_stores(rs, mg);
+        if (with_fleet_gate) {
+            acc.routes.set_fleet_read_fn([this](const httplib::Request&, httplib::Response& res,
+                                                const std::string& type, const std::string& op)
+                                             -> authz::FleetReadGate {
+                fleet_calls.push_back(type + ":" + op);
+                if (!gate_admits) {
+                    res.status = 403;
+                    return {};
+                }
+                return {.admitted = true, .scope = gate_scope};
+            });
+        }
+        acc.routes.register_routes(
+            sink,
+            [](const httplib::Request&, httplib::Response&) -> std::optional<auth::Session> {
+                auth::Session sess;
+                sess.username = kUser;
+                sess.role = auth::Role::admin;
+                return sess;
+            },
+            [this](const httplib::Request&, httplib::Response&, const std::string& type,
+                   const std::string& op) -> bool {
+                if (type == "Execution" && op == "Execute")
+                    return global_exec;
+                if (type == "Infrastructure" && op == "Delete")
+                    return global_delete;
+                return true;
+            },
+            [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+               const std::string&, const std::string&) { return true; },
+            rs, mg, /*registry=*/nullptr, /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+            /*agents_json_fn=*/[] { return std::string{"[]"}; },
+            /*dispatch_fn=*/DashboardRoutes::DispatchFn{}, /*caller_fn=*/DashboardRoutes::CallerFn{},
+            /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; });
+    }
+    std::unique_ptr<httplib::Response> get() {
+        auto res = sink.dispatch("GET", "/fragments/echo/retention-paused");
+        REQUIRE(res != nullptr);
+        return res;
+    }
+};
+} // namespace
+
+TEST_CASE("retention-paused frame: the fragment is gated by the fleet read chokepoint and shows "
+          "only in-scope agents",
+          "[pg][server][echo][retention-render][2540]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A", "agent-B"}); // direct membership: A and B, never C
+    rs.store(mk_resp("agent-A", 10, "config|process_enabled|false\n"));
+    rs.store(mk_resp("agent-B", 10, "config|process_enabled|false\n"));
+    rs.store(mk_resp("agent-C", 10, "config|process_enabled|false\n"));
+
+    FrameHarness h;
+    h.wire(/*with_fleet_gate=*/true, &rs, &mg);
+    h.acc.set_scan(kUser, kScan, 3, 1);
+    // The gate's scope is the SOLE filter: B is a direct member the gate excludes, C is an
+    // ancestor-scoped device the gate admits.
+    h.gate_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A", "agent-C"}};
+
+    auto res = h.get();
+    CHECK(res->status == 200);
+    REQUIRE(h.fleet_calls == std::vector<std::string>{"Infrastructure:Read"});
+    CHECK(contains(res->body, "data-device=\"agent-A\""));
+    CHECK(contains(res->body, "data-device=\"agent-C\""));
+    CHECK_FALSE(contains(res->body, "agent-B"));
+
+    SECTION("a refusal by the gate renders nothing") {
+        h.gate_admits = false;
+        auto denied = h.get();
+        CHECK(denied->status == 403);
+        CHECK_FALSE(contains(denied->body, "agent-A"));
+    }
+}
+
+TEST_CASE("retention-paused frame: an unwired fleet read gate refuses with 503",
+          "[pg][server][echo][retention-render][security][2540]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A"});
+    rs.store(mk_resp("agent-A", 10, "config|process_enabled|false\n"));
+
+    FrameHarness h;
+    h.wire(/*with_fleet_gate=*/false, &rs, &mg);
+    h.acc.set_scan(kUser, kScan, 1, 1);
+
+    auto res = h.get();
+    CHECK(res->status == 503);
+    CHECK_FALSE(contains(res->body, "agent-A"));
+}
+
+TEST_CASE("retention-paused frame: a scoped operator sees in-scope rows without action buttons "
+          "and a global grant holder sees both buttons",
+          "[pg][server][echo][retention-render][2540]") {
+    // The Re-enable and Purge buttons keep the GLOBAL permission probe (#2540 decision): a
+    // per-row scoped probe would write an audit denial per refused probe. A management-group
+    // scoped operator is admitted to the frame and both POSTs but acts through the REST twin.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    grant_visibility(mg, {"agent-A"});
+    rs.store(mk_resp("agent-A", 10, "config|process_enabled|false\n"));
+
+    FrameHarness h;
+    h.wire(/*with_fleet_gate=*/true, &rs, &mg);
+    h.acc.set_scan(kUser, kScan, 1, 1);
+    h.gate_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    SECTION("scoped operator: no global grant") {
+        h.global_exec = false;
+        h.global_delete = false;
+        auto res = h.get();
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "agent-A")); // the in-scope row renders
+        CHECK_FALSE(contains(res->body, "Re-enable"));
+        CHECK_FALSE(contains(res->body, "Purge data"));
+    }
+    SECTION("global grant holder") {
+        auto res = h.get();
+        CHECK(res->status == 200);
+        CHECK(contains(res->body, "Re-enable"));
+        CHECK(contains(res->body, "Purge data"));
+    }
 }
 
 } // namespace yuzu::server

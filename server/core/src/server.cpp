@@ -21751,6 +21751,9 @@ private:
         // above); wiring it here too so /fragments/results migrates onto
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
+        // #2540: the Echo purge/re-enable POSTs authorize through the SAME per-device scoped
+        // gate as the REST purge twin (set before register_routes, per the ordering note above).
+        dashboard_routes_->set_scoped_perm_fn(scoped_perm_fn);
         dashboard_routes_->set_forensics_plugin_set(forensics_plugins()); // #4990
         dashboard_routes_->set_forensics_visibility_fn(forensics_visibility_fn);
         // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
