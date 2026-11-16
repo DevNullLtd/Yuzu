@@ -156,7 +156,7 @@ TEST_CASE("usage ambiguity: subjects differing only by case are both marked when
 TEST_CASE("usage cells: fleet is one cell, platform sends an unknown os to other",
           "[dex][usage_model]") {
     const std::vector<std::pair<std::string, std::string>> pop{
-        {"a", "windows"}, {"b", "linux"}, {"c", "macos"}, {"d", "plan9"}, {"e", ""}};
+        {"a", "windows"}, {"b", "linux"}, {"c", "macos"}, {"d", "other-os"}, {"e", ""}};
     const auto fleet = dex_usage_assign_cells(pop, {DexUsageSliceKind::Fleet, ""}, {}, {});
     REQUIRE(fleet.defs.size() == 1);
     CHECK(fleet.defs[0].label == "fleet");

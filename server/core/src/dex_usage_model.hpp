@@ -440,7 +440,10 @@ struct DexExposureOutcome {
 /// is unbounded or longer than the retention (see the file banner). The interval
 /// level is the caller's `confidence`; dex_floored_rate is not used because it
 /// fixes both the floor and the level. Reason precedence: unbounded_window,
-/// window_exceeds_retention, zero_usage, no_statistic.
+/// window_exceeds_retention, zero_usage, no_statistic. The sibling
+/// DexAppVersionFailuresOwner clamps to retention - 1 only because its window
+/// is whole UTC days plus the current day; this rolling window ends at the
+/// request instant and needs no such margin.
 [[nodiscard]] inline DexExposureOutcome dex_usage_exposure(std::int64_t crashes, std::int64_t hangs,
                                                            std::int64_t run_seconds, int window_days,
                                                            int retention_days, double confidence) {
