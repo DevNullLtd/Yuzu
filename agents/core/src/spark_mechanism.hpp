@@ -22,7 +22,9 @@
  * File mechanism itself and NOT coalesced onto the SparkEngine's timer wheel.
  * The Windows Registry mechanism does the same per idle, healthy Target-mode watch
  * (#7836): every 5 s it re-opens the key's path on its existing probe lane (one
- * short-lived detached worker per watched key per interval).
+ * short-lived detached worker per watched key per interval; the detection bound is
+ * one interval plus a sweep wake plus the probe latency, plus the admission backoff
+ * when the lane refused a launch).
  *
  * The seam is what keeps this PR testable off Windows: the real IOCP / TP_WAIT
  * impls are Windows-only (spark_file.cpp / spark_registry.cpp), but a test

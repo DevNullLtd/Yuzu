@@ -1781,12 +1781,19 @@ flip, with a red-first test each:
       streak.
     - #7875: a lost path whose cancelled read never drains gets a deadline-driven recovery, or the owner re-accepts
       the residual (it is also in section 5).
-    - #7876: a runtime off switch exists for the Spark File mechanism as a whole (the owner widened it to cover the
-      Registry verification of #7836 as well; see item (2) of the File list below, applied by reference).
-    - #7877: the umbrella of the remaining File verification residuals is triaged.
+    - #7876: a runtime off switch exists for the Spark File AND Registry mechanisms (the issue now covers both; the
+      knob, cost and audit statement of item (2) of the File list below applies to the Registry verification of #7836
+      by reference). The Registry re-open cost is unmeasured at 50, 200 and 500 watched keys.
+    - #7877: the umbrella of the remaining verification residuals is triaged, File and Registry. The Registry items
+      are item 31 (a rename followed by a re-creation of the path before the next sample is not noticed; ACCEPTED
+      residual, Dave, no independent adjudicator) and two more accepted residuals found by the #7836 governance
+      review: an undecided verification keeps the old handle and so misses a rename it saw until the next
+      verification that decides, and an Ancestor-mode watch is never verified, so a later rename of its shelter
+      ancestor (including one re-committed in Ancestor mode after a verdict) is missed.
     - #7901: a CI leg installs `dbus-daemon` and sets `YUZU_REQUIRE_SPARK_DBUS_TESTS`, so the Linux Service case runs.
-    - Also below: export of the File debug counters (#7658), the audit, EDR and SMB sign-in check of item (2), and the
-      Gate 5 flip-time scenarios of item (4).
+    - Also below: export of the File debug counters (#7658; the Registry `verify_lost` and `verify_undecided` counters
+      are test-only too and should be exported alongside them, a recommendation: #7658 does not yet say so), the audit,
+      EDR and SMB sign-in check of item (2), and the Gate 5 flip-time scenarios of item (4).
     *Provenance of the figures below.* Anything marked "author-reported" is the author's own report from the Windows
     rig (weecolin, MSVC), made before the governance round: the logs were not retained and it was not re-measured.
     Anything marked "governance-round" was produced on the same rig by the committed cases and the scripted loops and
@@ -1850,7 +1857,8 @@ flip, with a red-first test each:
     the key's PARENT), and the legacy guard was not run on this case, so no parity claim is made either way.
     *The Registry fix.* An idle, healthy Registry watch in Target mode is verified every `kRegPathVerifyInterval` (5 s in
     production; a sampled check, not continuous): the sweeper stages it as a Deferred probe (`RegWatch::verify_probe`)
-    that runs on the existing probe lane, F3-counted, with no new thread; the probe re-opens the registered PATH with
+    that runs on the existing probe lane, F3-counted, with no new long-lived thread but one short-lived detached worker per
+    watched key per check; the probe re-opens the registered PATH with
     `KEY_NOTIFY` and arms a throw-away notify on that fresh handle. If the path resolves to no key (the probe falls
     back to Ancestor mode: the parent was renamed away, or the key deleted before its notification was consumed), the
     live handle is following a renamed tree and is deaf to the path: the watch is faulted with the reason `registry watch
@@ -1858,28 +1866,42 @@ flip, with a red-first test each:
     ordinary backend retry (30 s in production, doubling on repeated failure to a 300 s cap; the retry's commit clears the
     fault, in Ancestor mode while the path is still absent, in Target mode once it exists again). If the path still
     resolves to a key the result is discarded and the live handle stays. A verification that could not decide (open
-    refused, notify refused, the probe threw) is counted (`verify_undecided`, a debug counter) and leaves the watch
-    healthy and unfaulted, with no streak. Detection takes at most one interval plus a sweep wake and the probe's own
-    latency, about 5 s in production (the tests shorten the interval; the figure is a bound from the design, not a
-    measurement). A fire that lands while a verification is outstanding consumes the live notification, so that probe is
+    refused, notify refused, the probe threw) is counted (`verify_undecided`, a debug counter; the File counterpart is
+    `verify_unverifiable`, and the Registry mechanism has no launch-refusal counter of its own beyond `probe_admission_rejected`) and leaves the watch
+    healthy and unfaulted, with no streak. Detection takes at most one interval plus a sweep wake plus the probe's own
+    latency, plus the admission backoff (50 ms doubling to 30 s) on each verification launch the probe lane refused, so
+    it is about 5 s in production only while the lane admits every verification: a refused launch increments the
+    watch's admission attempts and only a commit resets them, so with more than 16 watches verifying together the
+    bound is not 5 s (the tests shorten the interval; the figure is a bound from the design, not a measurement). A fire that lands while a verification is outstanding consumes the live notification, so that probe is
     committed as the watch's re-arm (`resolve_probe_locked` checks `armed`), with the ordinary re-arm grace restarted
     from the fire; a refused or failed verification LAUNCH (lane cap, launch failure) does not mark the watch's coverage
     None, because its notify is still live.
-    **Open residuals of the Registry fix** (none is claimed as covered): a parent renamed away and a key re-created at
-    the original path BEFORE the next sample is not noticed, because the fresh open succeeds and is not compared with
-    the key the watch holds (a held-handle name check, `NtQueryKey(KeyNameInformation)` on a duplicate of the notify
-    handle, was measured to work on the rig, see the Runs paragraph, and is not implemented: it needs a handle
-    duplication under the pass lock, a decision the owner has not made; a test pins the residual); a rename away and
-    back inside one interval is not noticed; an Ancestor-mode watch whose shelter ancestor is renamed is not verified;
+    **Open residuals of the Registry fix** (none is claimed as covered; the first three are ACCEPTED residuals, owner
+    Dave, no independent adjudicator, tracked in #7877): a parent renamed away and a key re-created at
+    the original path BEFORE the next sample is not noticed (#7877 item 31), because the fresh open succeeds and is not
+    compared with the key the watch holds (a held-handle name check, `NtQueryKey(KeyNameInformation)` on a duplicate of
+    the notify handle, was measured to work on the rig, see the Runs paragraph, and is not implemented: it needs a handle
+    duplication under the pass lock; a test pins the residual); an undecided verification keeps the old handle, so a
+    rename the probe saw but could not conclude on (its ancestor walk failed) is missed until the next verification that
+    decides; an Ancestor-mode watch is never verified, so after a verdict re-commits the watch in Ancestor mode a later
+    rename of its shelter ancestor is missed (and an Ancestor-mode watch whose shelter ancestor is renamed is not
+    verified in general); a rename away and back inside one interval is not noticed;
+    a key deleted and re-created around a verification (an installer) can fault a healthy watch with the same reason
+    text and leave it without coverage until the retry, about 30 s, the synthetic fire covering the gap;
     a persistent access-denied on the verification open leaves the watch unverified with no fault and no streak (unlike
     File); HKCR is a merged view, so a user-hive key that appears later changes what the path resolves to; every
-    watch commits at startup with the same stamp, so N watches launch their verifications together against the 16-slot
-    probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not demote
-    coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified. Cost and audit: one
+    watch commits at about the same time at startup, so N watches launch their verifications together against the
+    16-slot probe lane (no fairness queue like File's; a refused launch is retried on the admission backoff and does not
+    demote coverage); a verification that hangs pins one probe-lane slot and that watch stays unverified, and because the
+    Registry verification shares that one 16-slot lane with every Registry arm and re-arm (File has a separate verification
+    lane), 16 hung verifications stall every arm and re-arm, including Guardian registry-rule re-arming after a fire,
+    until they return (a residual, not a measured event). Cost and audit: one
     detached worker launch, one `RegOpenKeyExW`, one `RegNotifyChangeKeyValue`, one event and two or three handle
     closes per watched key per interval, and an object-access audit event on a key that carries an auditing SACL (not
-    measured; no figure is quoted, and the cost statement of item (2) below, the missing off switch and #7876 apply to the
-    Registry verification by reference, which the owner accepted). A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
+    measured; no figure is quoted). The cost statement of item (2) below, the missing off switch and #7876 (now titled for
+    the File and Registry mechanisms) apply to the Registry verification by reference, which the owner accepted; the
+    operator lever until then is `--spark-disable`, a boot-time flag that restarts the agent and switches off all three
+    spark mechanisms. A Registry delete-and-recreate case was not added: the existing RF-6 case (#4340) already covers
     that transition, with a coverage oracle rather than a `fault()` oracle. *Windows Service: NOT covered*, by owner
     ruling: deleting a Windows service needs administrator rights. macOS has no File, Registry or Service
     mechanism, so there is nothing to test there.
@@ -2249,8 +2271,8 @@ flip, with a red-first test each:
     in `d6e800fa53` (the production commit, whole-repo tree `c1895aa3948c56eb0e1cbdc43424d5632a6ae247`; md5
     `914e7ec8c79d9b59edb61d2b3d77b6d9` and `ededdb067f5044c63e1621d3a9c9bf7b`) and `test_spark_mechanism.cpp` as committed in
     `0a8a02a1a6` (the test commit, whole-repo tree `d3b08942f9195f9011f8d46e2c67691440f0d696`; md5
-    `c7307d76df93371c0b9649f942e1ed06`). The commits after `0a8a02a1a6` change documentation and the ledger only and were not
-    run on the rig. All of this is author-reported on the weecolin Windows rig (logs not committed, the scripts are not in
+    `c7307d76df93371c0b9649f942e1ed06`). The commits after `0a8a02a1a6` and before the governance fixes below changed documentation and one changelog
+    fragment only (no ledger file) and were not run on the rig. All of this is author-reported on the weecolin Windows rig (logs not committed, the scripts are not in
     the tree) and was not part of a CI run. **Phase 0 measurements** (ctypes against an HKCU scratch tree): `NtQueryKey`
     with `KeyNameInformation` succeeds on a `KEY_NOTIFY`-only handle; after `RegRenameKey` of the PARENT of a held handle
     the held handle's name is the NEW name and a fresh open of the original path returns `ERROR_FILE_NOT_FOUND`; with the
@@ -2260,7 +2282,7 @@ flip, with a red-first test each:
     notify. Consequence: a name compare between the stored name of the fresh handle and a later fresh handle is blind to
     rename-plus-recreate (both are the path's own name), so it was not implemented; only the HELD handle's name differs,
     and reading it needs a duplicate made under the pass lock (the never-launched job would close it there too), a design
-    change the owner has not ruled on. **Runs.** Normal build (the weecolin debug-type build without debug info):
+    change that is not made: the residual is accepted and tracked in #7877 item 31. **Runs.** Normal build (the weecolin debug-type build without debug info):
     `[mechanism]` 198 cases (5850 assertions), `[5719]` 73 (2271) and `[4415prA]` 105 (3544) green (before the change 192, 67,
     105, with the parked case excluded: the parked case moved into the normal count and five cases were added);
     `[known-gap-5719]` matches no case; the `Registry spark (real mechanism): *` pattern 30 cases (749 assertions) green
@@ -2278,7 +2300,25 @@ flip, with a red-first test each:
     and dropping the grace restart in `on_fire` turned the fire case red at the check that a parked re-arm is reported
     faulted. All seven mutations were caught. Not run: any TSan run, the 50, 200 and 500 key cost measurements (no
     figure is quoted anywhere), the flip-time chaos scenarios, and the object-access audit behaviour on a key with a
-    SACL. No agent review has covered this change yet; it has not been through `/governance`.
+    SACL.
+    **Governance review and the fixes after it (#7836).** A scoped `/governance` run (range `da67bf0371..5731eb0632`, ten
+    governance agents; happy-path, compliance-officer and enterprise-readiness were omitted by the caller, and the chaos
+    plan was written, not executed) was NOT a pass: it raised 43 findings (REG-01 to REG-43), four of them blocking-provisional
+    (REG-01, REG-02, REG-03 and the test-side REG-07) and one owner-accepted row (REG-04). REG-01, REG-02 and REG-04 are
+    ACCEPTED residuals (owner Dave, no independent adjudicator; deferred to #7877, see the residuals above); REG-03 is
+    adjudicated separately. Two commits follow `5731eb0632`: a test commit (`96882cae88`, whole-repo tree `6086bb292f87b1e7633c3fdbd25590180704c618`; REG-07: the
+    `ProbeGate` hook of the Registry cases now owns its state by value) and a documentation and comment commit (no behaviour
+    change: `git diff -U0` over `spark_registry.cpp` and `spark_mechanism.hpp` shows comment lines only). **Rig run of the final
+    bytes** (author-reported, weecolin Windows rig, not a CI run; md5 `499383dc23c13432a92e2137bc6506a8` for
+    `test_spark_mechanism.cpp`, `8b9507c896a2dbc9b5b48548a8b6a106` for `spark_registry.cpp`, `d5edb42d65297f641c0912fab06c2c72`
+    for `spark_mechanism.hpp`; the figures of the Runs paragraph above are for the earlier bytes): `[mechanism]` 198 cases
+    (5851 assertions), `[5719]` 73 (2271) and `[4415prA]` 105 (3544) green; `[known-gap-5719]` matches no case; the
+    `Registry spark (real mechanism): *` pattern 30 cases (749 assertions) green; each of the six Registry cases of this change
+    20 of 20 green, and 50 of 50 green with one busy-loop process per logical core (16); MSVC AddressSanitizer build of the
+    same bytes (same flags as above): the Registry pattern 3 times and `[5719]` green, no AddressSanitizer report. The
+    `ProbeGate` change is verified by code reading plus that AddressSanitizer run, not by a mutation (restoring a by-reference
+    capture does not give a red test, because the destructor's bounded wait keeps the gate alive in every normal run). Not
+    re-run for the final bytes: the File pattern, the seven mutations, the Linux build and suites.
 - **Follow-ups (filed after #5497 merged: FU-1 is #5504; FU-2 to FU-5 are #5505; FU-6 and FU-7 are #5506; FU-8 and FU-9 are #5507).** (1) FU-1: measure the held-hold
   push rate and the endpoint journal eviction during a held period (a flip
   precondition, see AC-1). (2) FU-2: hang a full class quota of compensations, then

@@ -54,20 +54,27 @@
  *     its KEY, so a renamed PARENT key leaves the watch healthy and silent on
  *     the renamed tree. Every kRegPathVerifyInterval the sweeper stages an idle,
  *     armed, Target-mode watch as a Deferred probe (RegWatch::verify_probe) that
- *     runs through the ordinary probe lane, F3-counted, with no new thread. A
+ *     runs through the ordinary probe lane, F3-counted: no new long-lived
+ *     thread, but one short-lived detached worker per watched key per check. A
  *     result that resolves in Ancestor mode (the path no longer names a key)
  *     faults the watch and re-opens the path on the ordinary backend retry; a
  *     Target result or an undecided one (open refused, probe threw) leaves the
- *     live handle in place. Residuals, none fixed here: a rename followed by a
- *     re-creation of the path is not noticed (the fresh open succeeds and is not
- *     compared with the held key); a rename away and back inside one interval is
- *     not noticed; an Ancestor-mode watch whose shelter ancestor is renamed is
- *     not verified; a persistent access-denied on the verification open leaves
- *     the watch unverified with no fault (counted as undecided); HKCR is a merged
+ *     live handle in place. Residuals, none fixed here (the rename-plus-recreate
+ *     family is an ACCEPTED residual, tracked as #7877 item 31): a rename followed
+ *     by a re-creation of the path is not noticed (the fresh open succeeds and is
+ *     not compared with the held key); a rename away and back inside one interval
+ *     is not noticed; an undecided verification keeps the old handle, so a rename
+ *     it saw but could not conclude on is missed until the next verification that
+ *     decides; an Ancestor-mode watch is never verified, including one a verdict
+ *     just re-committed in Ancestor mode, so a later rename of its shelter ancestor
+ *     is missed; a persistent access-denied on the verification open leaves the
+ *     watch unverified with no fault (counted as undecided); HKCR is a merged
  *     view, so a user-hive key appearing later changes what the path resolves to;
- *     every watch starts its interval at the same commit time, so a large fleet
- *     of watches launches its verifications together (probe lane cap, refusals
- *     defer without demoting coverage).
+ *     every watch commits at about the same time at startup, so a large fleet of
+ *     watches launches its verifications together (probe lane cap, refusals
+ *     defer without demoting coverage); a registry open that hangs pins one slot
+ *     of the SHARED 16-slot probe lane (File has a separate verification lane),
+ *     and 16 such opens stall every arm and re-arm until they return.
  *
  * OWNERSHIP / DISPATCH PROTOCOL (plan amendment 5 - the same rules PR-B2/B3
  * apply to File/Service):
@@ -196,8 +203,12 @@ constexpr std::chrono::milliseconds kRegBackendRetryCap{300'000};
 /// follows its KEY, not its path: when a PARENT key is renamed away the handle keeps
 /// working on the renamed tree and nothing signals, so the watch reads healthy while
 /// the registered path no longer names it. SAMPLED, so a rename is noticed up to one
-/// interval (plus a sweep wake and the probe) late, and a rename away and back
-/// within one interval is not noticed at all. Not a measured value; the test control
+/// interval plus a sweep wake plus the probe's own latency late, and plus the
+/// admission backoff (50 ms doubling to kRegAdmissionBackoffCap, 30 s) on each launch
+/// the probe lane refused: a refused verification launch increments admission_attempts
+/// and only a commit resets it, so with more than 16 watches verifying together the
+/// bound is NOT 5 s. A rename away and back within one interval is not noticed at all.
+/// Not a measured value; the test control
 /// RegistryMechanismTestControls::path_verify_interval overrides it.
 constexpr std::chrono::milliseconds kRegPathVerifyInterval{5'000};
 
@@ -1430,11 +1441,17 @@ private:
     ///   - not ok (open or notify refused, hook or probe threw): undecided. The
     ///     watch keeps its handle and is NOT faulted (an unreadable path is not
     ///     proof of a rename), and the next verification is one interval away.
+    ///     ACCEPTED residual (#7877): a rename the probe saw but could not conclude
+    ///     on (its ancestor walk failed) is discarded with it, so the watch keeps
+    ///     the old handle and misses that rename until a later verification decides.
     ///   - Ancestor mode: the target path no longer resolves (a parent was
     ///     renamed away, or the key deleted before its notification was
     ///     consumed). The live handle follows the renamed tree and is deaf to the
     ///     path: fault, owe a synthetic fire, and re-open the path on the
-    ///     ordinary backend retry (which recovers through commit_locked).
+    ///     ordinary backend retry (which recovers through commit_locked). While
+    ///     the path is still absent that retry commits in Ancestor mode, which is
+    ///     never verified: ACCEPTED residual (#7877), a later rename of that
+    ///     watch's shelter ancestor is missed.
     ///   - Target mode: the path still resolves to a key. NOT compared with the
     ///     key the watch holds: a rename that is followed by a re-creation of the
     ///     path is not noticed (documented residual, docs/spark-flip-gate.md).
