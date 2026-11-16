@@ -371,8 +371,8 @@ bool source_enabled(EchoDatabase& db, std::string_view source) {
 // #1572 — retention/budget exemption. Mirrors source_enabled_state()'s read (including the
 // registry default for an absent flag). An "errored" flag is exempt ONLY when `_paused_at`
 // says the source was paused when the flag went bad (> 0) or the marker itself is unreadable
-// or malformed: a damaged hold marker never ages out a forensic hold. An absent or fully
-// parsed 0 marker means no pause was in force, so the normal ceiling applies.
+// or malformed: a damaged hold marker never ages out a forensic hold. An absent or exactly
+// "0" marker means no pause was in force, so the normal ceiling applies.
 bool source_retention_exempt(EchoDatabase& db, std::string_view source) {
     auto r = db.try_get_config(std::format("{}_enabled", source));
     if (!r)
@@ -388,11 +388,7 @@ bool source_retention_exempt(EchoDatabase& db, std::string_view source) {
         return true;
     if (!pa->has_value())
         return false; // errored, never paused
-    const std::string& v = **pa;
-    std::int64_t n = -1;
-    const auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), n);
-    const bool parsed_zero = ec == std::errc{} && end == v.data() + v.size() && n == 0;
-    return !parsed_zero;
+    return **pa != "0"; // the plugin only ever writes the literal "0"; anything else is damaged
 }
 
 namespace {

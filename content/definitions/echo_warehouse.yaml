@@ -768,11 +768,11 @@ metadata:
     Permanently deletes rows older than each tier's retention limit, and then
     enforces the database byte budget (db_budget_bytes): while the database is
     over it, the pass permanently deletes hourly rows older than 48
-    hours (5 days for procperf), even inside their retention window; paused sources,
-    or sources errored while paused, are exempt (an unreadable
-    <source>_enabled is preserved). It may also run the one-off VACUUM that converts an older database
-    to incremental auto_vacuum (collectors, status and configure wait while it
-    runs). Classified Destructive/Irreversible with no approval gate:
+    hours (5 days for procperf), even inside their retention window; paused
+    sources, or sources errored while paused, are exempt (an unreadable
+    <source>_enabled is preserved). It may also run the one-off VACUUM that
+    converts an older database to incremental auto_vacuum (collectors, status
+    and configure wait while it runs). Classified Destructive/Irreversible with no approval gate:
     an operator who can dispatch it deletes history immediately and cannot
     undo it.
   tags: [echo, warehouse, rollup, aggregation]

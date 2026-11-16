@@ -120,6 +120,10 @@ void seed_centered_hourly(EchoDatabase& db, std::string_view source, int64_t t_n
         seed_tier_at(db, source, "hourly", t_now - h * (kHourlyCutoffSec / 24), 1);
 }
 
+// Rows left by one pass over seed_centered_hourly(): hours h=0..24 sit at or inside the cutoff
+// (t_now - h * cutoff/24 >= t_now - cutoff), h=25..47 are older and deleted.
+constexpr int64_t kCenteredSurvivors = 25;
+
 void seed_process_hourly(EchoDatabase& db, int64_t t_now) {
     seed_centered_hourly(db, "process", t_now);
 }
@@ -1031,15 +1035,17 @@ int64_t errored_process_rows_after_retention(const char* tag, std::optional<std:
     if (paused_at)
         REQUIRE(db.set_config("process_paused_at", *paused_at));
     run_retention(db, t_now, guard);
-    CHECK(row_count(db, "tcp_hourly") < 48); // control: the pass ran and pruned
+    CHECK(row_count(db, "tcp_hourly") == kCenteredSurvivors); // control: the pass ran and pruned
     return row_count(db, "process_hourly");
 }
 } // namespace
 
 TEST_CASE("Echo retention: an errored source that was never paused loses rows past its retention",
           "[echo][retention][source-lifecycle][issue1572]") {
-    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_unset_", std::nullopt) < 48);
-    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_zero_", "0") < 48);
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_unset_", std::nullopt) ==
+          kCenteredSurvivors);
+    CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_zero_", "0") ==
+          kCenteredSurvivors);
 }
 
 TEST_CASE("Echo retention: an errored source that was paused when its flag went bad keeps its rows",
@@ -1049,7 +1055,7 @@ TEST_CASE("Echo retention: an errored source that was paused when its flag went 
 
 TEST_CASE("Echo retention: an errored source with a malformed paused_at keeps its rows",
           "[echo][retention][source-lifecycle][issue1572]") {
-    for (const char* bad : {"abc", "-1", "12x", "", "99999999999999999999"})
+    for (const char* bad : {"abc", "-1", "12x", "", "99999999999999999999", "-0", "00"})
         CHECK(errored_process_rows_after_retention("yuzu_test_echo_1572_bad_", bad) == 48);
 }
 

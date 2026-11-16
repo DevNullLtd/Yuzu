@@ -418,12 +418,21 @@ plugin change.
 > **Collect gate and retention both read `canonical_source_enabled`.**
 > `source_enabled()` (`echo_aggregator.cpp`) gates collection; retention and the
 > budget pass decide through `source_retention_exempt()`. Decision (#1572): an `errored` source that was never paused
-> (`<source>_paused_at` absent or fully parsed `0`) gets the normal retention
+> (`<source>_paused_at` absent or exactly `0`) gets the normal retention
 > ceiling and budget eviction; `false`, an unreadable flag, and `errored` with
 > `paused_at` above 0, unreadable or malformed stay preserved, so a damaged hold
-> marker never ages out a forensic hold. `paused_at` lives in the same
-> `echo_config` an endpoint user could edit: the rule narrows the tamper window
-> and does not close it. `canonical_source_enabled(stored_value)` maps anything other than the
+> marker never ages out a forensic hold. The rule opens a release path that did
+> not exist before: a user who can write `echo_config` can release the hold on
+> an errored source by setting its flag to a bad value with `paused_at` at `0`.
+> That grants nothing a direct row delete in `echo.db` does not, and the hold on
+> a paused source holds only while its `paused_at` marker is non-zero.
+> **Accepted residual.** A source paused by an agent older than v0.12.0 carries
+> `_enabled=false` with `paused_at` absent or `0`; if its flag is later corrupted
+> to a non-canonical value, the helper cannot tell it from a fresh errored
+> never-paused source and the normal ceiling applies. Every current disable edge
+> stamps `paused_at` above 0, so the remedy is to re-issue
+> `configure <source>_enabled=false` on such a source, which stamps the marker.
+> Treating absent or `0` as a hold would undo #1572. `canonical_source_enabled(stored_value)` maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
 > **closed** — collection stops *and* retention keeps the rows of a source paused or errored while paused — instead of
@@ -434,12 +443,12 @@ plugin change.
 > source, gate collection on `source_enabled(*db_, "<name>")` and do **not** add
 > a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
 > ...)` read — every collect, retention and purge gate for every registered
-> source goes through the one helper, so the registry's `default_enabled` is
-> the only place a default lives. Collect and retention gates use
-> `source_enabled()` (an unreadable flag skips); discard, drain and purge
-> decisions use `source_enabled_state()`, which distinguishes a confirmed
-> `true`/`false` from an unreadable flag so a destructive path never acts on a
-> failed read.
+> source goes through the helpers below, so the registry's `default_enabled` is
+> the only place a default lives. The collect gate uses `source_enabled()` (an
+> unreadable flag skips); retention and the budget pass use
+> `source_retention_exempt()`; discard, drain and purge decisions use
+> `source_enabled_state()`, which distinguishes a confirmed `true`/`false` from
+> an unreadable flag so a destructive path never acts on a failed read.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`echo_aggregator.cpp`) canonicalises the

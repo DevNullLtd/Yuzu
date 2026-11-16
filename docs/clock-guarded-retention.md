@@ -54,6 +54,9 @@ The retention guards that face this question **each answer it differently, ON PU
 
 - **Echo** treats no-stored-reading as a decline trigger in its own right (the first pass against an
   existing store would otherwise delete under an already-wrong clock with every detector silent).
+  Separately, for an **errored** source (`<source>_enabled` not `true`/`false`), a missing or `"0"`
+  `<source>_paused_at` means "never paused" and the ceiling applies; an unreadable or malformed
+  marker preserves the rows (#1572). The pre-v0.12.0 residual is in `docs/echo-implementer.md`.
 - **`audit_store`** does too since #2579, gated the SAME way — Echo short-circuits on `!has_expired`
   before it computes `no_anchor`, and `classify` returns `None` on `!has_expired` before testing it,
   so neither fires on a fresh install with nothing to lose. *(Do not describe either as narrower than
