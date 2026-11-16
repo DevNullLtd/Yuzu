@@ -8,6 +8,7 @@ named read, the robust migration and the index check at open) and `fd490b9d31` (
 check), `f025c558a0` (the WARN text) and `a8bea07368` (the route rename to `GET /api/v1/hardware-ci`).
 **Branch:** `feat/hardware-ci-bulk-read`
 **Status:** implemented; the residual exposures below were accepted by the owner for release on 2026-11-15, with the review trigger the merge of PR 3 (the `device_ci` write pause). The acceptance is recorded in the section "Owner acceptance of the residual" and is not posted to GitHub.
+Residuals 1, 3 and 4 below, and the Defect section's statements that the server stops no read and no write, describe the state before PR 3; "PR 3 outcome" records what the pause and the gate change.
 **Author of the measurements:** the change author's governance run (Claude Code session). The
 independent reproductions below were made during review, by a separate reviewer in that run.
 
@@ -216,13 +217,78 @@ process started).
 - Other stores' text-keyed unique indexes are not gated (`endpoint_state`, whose text primary key is
   written on every heartbeat, is a named example) and agent registration is not gated.
 - A start whose first check cannot run leaves the gate Unproven (reads refused, writes accepted) until
-  the first repeat concludes, about a minute after the repeat thread starts.
+  a repeat concludes, usually about a minute after the repeat thread starts. **Unproven is not always
+  transient:** when the database records a collation version and the host reports none, or the catalog
+  read is refused, every check is unreadable and the gate stays Unproven for as long as the state
+  stands: the bulk read stays refused, the per-device CI reads stay degraded, writes are NOT paused, and
+  there is no override flag (D3 stands). The documented catalog exit (setting the recorded version to
+  NULL) needs a superuser, which managed PostgreSQL usually does not give (reasoned, not tested) and it
+  also silences detection.
+- A repeat thread that cannot start (a thread or task limit) leaves the gate as the start-time check
+  left it until the next restart: a Mismatch gate then keeps writes paused and reads refused. The
+  server logs an ERROR line; there is no retry of the thread start.
+- The gate follows the version comparison, not proof of a rebuilt index: `REFRESH COLLATION VERSION`
+  before the reindex has finished reopens writes and reads over stale indexes. The one guard, added in
+  this change and HOLD-ONLY, is that a check finding the versions equal while an invalid index exists
+  in the schema `device_inventory_store` (typically a failed `REINDEX ... CONCURRENTLY`) counts as could
+  not run and holds the gate; it never enters Mismatch and never pauses writes.
+- Replicas decide independently (a request behind a load balancer can be refused by one and served by
+  another; a write can land on a replica still reading Trusted); a decommission during a pause leaves
+  the device's CI row stored until the DELETE is re-issued after the repair; on resume every device
+  whose sync fell due resends a full record within about 15 minutes, with no server-side admission
+  limit (the sizing is an estimate: see the server-admin "Resume" paragraph). No audit row marks the
+  start or end of a pause.
 - Unverified, carried over: that `ALTER DATABASE ... REFRESH COLLATION VERSION` cannot record a first
   version when the database records none (measured once, on PostgreSQL 18.4), the emulation figures in
   this note (one run), and the roster-keyed read's misses (same mechanism, not measured separately).
 
+**Why the gate stays although point reads could be made byte-ordered.** The alternative recorded here
+is that the primary-key point reads (`get_device_ci`, the roster-keyed read) could be made correct under
+a collation change by spelling their comparison `agent_id COLLATE "C" = $1`, which the byte-order index
+from migration v4 serves. The gate stays anyway because the write side still arbitrates on the primary
+key: `ON CONFLICT (agent_id)` follows the database collation, so a duplicated device is still written
+twice, and a read of a duplicated device returns more than one row whichever way its comparison is
+spelled. Making the point reads byte-ordered would hide the symptom without stopping the corruption.
+
 **Owner review trigger.** The 2026-11-15 acceptance below names the merge of this change as its review
-trigger, and the owner revisits it then. Nothing in this section records a new acceptance.
+trigger, and the owner revisits it then. Nothing in the "What it closes" and "What stays" lists
+records a new acceptance; the only new owner statements are the session decisions in the next
+subsection, limited to what it lists.
+
+### Owner session decisions, 2026-11-16
+
+Recorded by the orchestrating session from the owner's answers in the working session. They are internal
+decisions: not a signature, not independent review, not an external approval, and not posted to GitHub.
+The first seven are the decisions D1 to D7 of the plan the change was built from; the last four are the
+owner's answers to the governance run's findings on 2026-11-16.
+
+- D1. The bulk read is REFUSED (retryable `503`, `retry_after_ms` 60000) while the gate is not Trusted;
+  no override flag.
+- D2. No ordering epoch in the cursor; the prefix stays `h1` (it means "the last device in byte
+  order", which stays valid across a repair). This knowingly does not deliver the part of #7730's
+  acceptance criterion 3 that asks for cursors bound to the ordering epoch (the other part, open
+  residuals filed or accepted by the owner, is addressed by this section and the follow-up issues to be
+  filed). The consequence is documented for integrators: after a collation refusal restart the walk from
+  the first page.
+- D3. Unproven refuses the reads but does not pause writes (a failed read of the facts is not evidence
+  of a mismatch, and pausing every device's CI for it would be an outage of its own).
+- D4. The per-device and roster-keyed CI reads degrade under the same condition.
+- D5. A refused ingest is a distinct deferred outcome, not an error, decided at the ingest seam before
+  the blob is parsed.
+- D6. The change closes #7730 only once the follow-up issue for the other text-keyed stores (D7) exists;
+  until then it says "Part of #7730".
+- D7. Other stores' text-keyed unique indexes (`endpoint_state`, written on every heartbeat, is a named
+  example) and agent registration are not gated; a follow-up issue is to be filed (to be filed, none
+  exists yet). This is an exposure statement outside residuals 1 to 4 above.
+- 2026-11-16, invalid index: a HOLD-ONLY guard ships in this change (an invalid index in the schema
+  `device_inventory_store` holds the gate, never enters Mismatch).
+- 2026-11-16, Unproven for ever: the case where the database records a version and the host reports
+  none, or the catalog read is refused, is documented plainly; D3 stands; there is no override flag.
+- 2026-11-16, residuals: replica skew, the detection delay of up to about an hour, other text-keyed
+  stores including `endpoint_state` and agent registration, and the resume burst of full resends are
+  accepted as design limits of this change; they are disclosed in the manual and follow-up issues are to
+  be filed (none exist yet).
+- 2026-11-16, repeat thread start failure: an ERROR log and the documentation, no retry machinery.
 
 ## Owner acceptance of the residual
 
