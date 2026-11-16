@@ -43,6 +43,7 @@
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
 
+#include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -3000,6 +3001,45 @@ TEST_CASE("census pair order, Gate 7: a shed Repair logs a sampled warning, and 
          at = logged.find("repair shed", at + 1))
         ++lines;
     CHECK(lines == 1);
+}
+
+TEST_CASE("census pair order, #7149: a refused census decision logs a sampled warning naming the "
+          "agent and rule, and an ordinary decision logs none",
+          PAIR_TAGS) {
+    // The decision counter is fleet-wide and names no agent, so a refusal also writes one sampled
+    // WARN: the first of an episode (and every 100th after it), shared by the four refusal labels.
+    PAIR_FIXTURE();
+    const std::string refused_line = "refused an event: its verdict was not applied";
+    const auto count_lines = [&](const std::string& logged) {
+        std::size_t lines = 0;
+        for (std::size_t at = logged.find(refused_line); at != std::string::npos;
+             at = logged.find(refused_line, at + 1))
+            ++lines;
+        return lines;
+    };
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    // An ordinary decision (applied_pair) advances nothing.
+    CHECK(store.insert_event_classified(with_pair(stamped("o1", "r1", "dup-a", kCompliant, 1000), 5, 3))
+              .outcome == EventInsertOutcome::Inserted);
+    CHECK(count_lines(cap.text()) == 0);
+    // Two refusals inside one quiet gap: the first logs, the second is only counted.
+    const DecisionCounts counts = decision_counts(metrics);
+    CHECK(store.insert_event_classified(with_pair(stamped("o2", "r1", "dup-a", kDrifted, 1010), 5, 3))
+              .outcome == EventInsertOutcome::Inserted);
+    CHECK(store.insert_event_classified(with_pair(stamped("o3", "r1", "dup-a", kDrifted, 1020), 5, 3))
+              .outcome == EventInsertOutcome::Inserted);
+    // A later in-order event applies and logs nothing.
+    CHECK(store.insert_event_classified(with_pair(stamped("o4", "r1", "dup-a", kCompliant, 1030), 5, 4))
+              .outcome == EventInsertOutcome::Inserted);
+    cap.stop();
+    CHECK(decision_delta(counts, decision_counts(metrics)) == "applied_pair,refused_duplicate+2");
+    const std::string logged = cap.text();
+    CHECK(count_lines(logged) == 1);
+    CHECK(logged.find("census refused_duplicate refused an event") != std::string::npos);
+    CHECK(logged.find("agent_id=" + yuzu::log_id_token("dup-a")) != std::string::npos);
+    CHECK(logged.find("rule_id=" + yuzu::log_id_token("r1")) != std::string::npos);
+    CHECK(logged.find("event_id=" + yuzu::log_id_token("o2")) != std::string::npos);
+    CHECK(logged.find("(occurrence 1)") != std::string::npos);
 }
 
 TEST_CASE("census pair order, Gate 7: the Repair admission is released on every exit, an exception "

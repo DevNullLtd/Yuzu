@@ -1789,6 +1789,38 @@ void count_decision(yuzu::MetricsRegistry* metrics,
     }
 }
 
+// Whether a census decision refused the event's verdict (the four `refused_*` labels). A held
+// unpaired event (`held_unpaired`) is a different class, a routine outcome of a mixed fleet, and
+// is deliberately not named here.
+constexpr bool is_census_refusal(CensusDecision d) noexcept {
+    return d == CensusDecision::RefusedRegression || d == CensusDecision::RefusedRetired ||
+           d == CensusDecision::RefusedDuplicate || d == CensusDecision::RefusedStraggler;
+}
+
+// Name the culprit of a census refusal: the decision counter is fleet-wide and carries no agent, so
+// two hosts sharing one agent id, or a stuck retired-epoch fence, would show a rising number and
+// no name (#7149). One sampled WARN per refusal, shared by every refusal decision (the sampler
+// logs the first of an episode and every `kReadDegradeLogSample`th after it). It is consulted for
+// a refusal only, so ordinary decisions never advance it. Best-effort and noexcept, like
+// `count_decision`: spdlog may throw, and that must never reach the ingest thread. Call it after
+// `project_rule_status` returned, never inside a lock.
+void note_refusal(const std::optional<CensusDecision>& decision, const GuaranteedStateEventRow& row,
+                  std::atomic<std::uint64_t>& count, std::atomic<std::int64_t>& last_ts) noexcept {
+    if (!decision || !is_census_refusal(*decision))
+        return;
+    try {
+        if (const auto d = sample_degrade_log(count, last_ts); d.should_log)
+            spdlog::warn("GuaranteedStateStore: census {} refused an event: its verdict was not "
+                         "applied to the census row, which is flagged order_uncertain (over an "
+                         "absent row it is inserted flagged instead) (occurrence {}) "
+                         "event_id={} agent_id={} rule_id={}",
+                         census_decision_label(*decision), d.occurrence,
+                         log_id_token(row.event_id), log_id_token(row.agent_id),
+                         log_id_token(row.rule_id));
+    } catch (...) { // best-effort log
+    }
+}
+
 // Count one Repair shed at the cap (`kGuardianRepairsShedMetric`). Best-effort, like the other
 // counters here: a metrics failure must never reach the ingest thread.
 void count_repair_shed(yuzu::MetricsRegistry* metrics) noexcept {
@@ -3094,6 +3126,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                         decision);
                     count_projection(metrics_, ProjectionSource::Repair, repaired);
                     count_decision(metrics_, decision);
+                    note_refusal(decision, row, census_refusals_, census_refusal_last_ts_);
                     if (repaired == CensusOutcome::Abandoned)
                         return op_error(std::string("census savepoint failed: ") +
                                             PQerrorMessage(conn),
@@ -3207,6 +3240,7 @@ GuaranteedStateStore::insert_event_classified(const GuaranteedStateEventRow& row
                 RepairOrderStep{}, decision);
             count_projection(metrics_, ProjectionSource::FirstDelivery, projected);
             count_decision(metrics_, decision);
+            note_refusal(decision, row, census_refusals_, census_refusal_last_ts_);
             if (projected == CensusOutcome::Abandoned)
                 return op_error(std::string("census savepoint failed: ") + PQerrorMessage(conn),
                                 kReasonQueryError);
@@ -3342,6 +3376,7 @@ GuaranteedStateStore::insert_events(const std::vector<GuaranteedStateEventRow>& 
                 ingest_seq, ordering.capped, step.decision, step.ran, RepairOrderStep{}, decision);
             count_projection(metrics_, ProjectionSource::Batch, projected);
             count_decision(metrics_, decision);
+            note_refusal(decision, row, census_refusals_, census_refusal_last_ts_);
             if (projected == CensusOutcome::Abandoned)
                 return std::unexpected(std::string("census savepoint failed: ") +
                                        PQerrorMessage(conn));

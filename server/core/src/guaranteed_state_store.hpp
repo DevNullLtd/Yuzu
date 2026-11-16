@@ -813,6 +813,9 @@ private:
     std::atomic<int> repairs_in_flight_{0};
     std::atomic<uint64_t> repairs_shed_{0};
     std::atomic<int64_t> repair_shed_last_ts_{0};
+    // The census-refusal log sampler (`note_refusal`): refusals counted, and the last one's time.
+    std::atomic<uint64_t> census_refusals_{0};
+    std::atomic<int64_t> census_refusal_last_ts_{0};
     std::function<void(AgentStepGap, const std::string&)> agent_step_gap_hook_; // test seam, empty in production
     std::function<bool()> unrepresented_pending_fault_; // test seam, empty in production
     std::atomic<int> unrepresented_pending_timeout_ms_{5000}; // test seam, 5000 in production
