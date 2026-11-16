@@ -7,6 +7,7 @@
 
 #include "echo_aggregator.hpp" // run_budget: the failed-measurement case
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_netqual.hpp"
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
@@ -79,7 +80,7 @@ struct TestEchoDb {
 
 static TestEchoDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_");
-    auto result = EchoDatabase::open(tmp);
+    auto result = yuzu::test::open_echo_db(tmp);
     REQUIRE(result.has_value());
     return TestEchoDb{std::move(*result), tmp};
 }

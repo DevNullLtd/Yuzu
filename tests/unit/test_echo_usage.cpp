@@ -11,6 +11,7 @@
  * technique rather than inventing a second one.
  */
 
+#include "echo_test_db.hpp"
 #include "echo_usage.hpp"
 #include "echo_aggregator.hpp" // source_enabled
 #include "test_helpers.hpp"
@@ -44,7 +45,7 @@ struct TestEchoDb {
 
 TestEchoDb make_test_db() {
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_usage_");
-    auto result = EchoDatabase::open(tmp);
+    auto result = yuzu::test::open_echo_db(tmp);
     REQUIRE(result.has_value());
     return TestEchoDb{std::move(*result), tmp};
 }
